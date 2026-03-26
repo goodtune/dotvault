@@ -25,6 +25,7 @@ type Engine struct {
 	state     *StateStore
 	triggerCh chan struct{}
 	mu        sync.Mutex
+	DryRun    bool
 }
 
 // NewEngine creates a new sync engine.
@@ -72,6 +73,15 @@ func (e *Engine) RunLoop(ctx context.Context) error {
 	// Try to subscribe to events
 	eventCh, errCh := e.trySubscribeEvents(ctx)
 
+	// reconnectCh signals the main loop to attempt reconnection.
+	// This avoids a data race where a goroutine would write to
+	// eventCh/errCh while the select loop reads them concurrently.
+	reconnectCh := make(chan struct{}, 1)
+
+	// Exponential backoff for reconnection attempts (1s base, 5m cap).
+	reconnectDelay := 1 * time.Second
+	const maxReconnectDelay = 5 * time.Minute
+
 	ticker := time.NewTicker(e.cfg.Sync.Interval)
 	defer ticker.Stop()
 
@@ -102,16 +112,53 @@ func (e *Engine) RunLoop(ctx context.Context) error {
 			if ok && err != nil {
 				slog.Warn("event subscription error, falling back to poll-only", "error", err)
 				eventCh = nil
-				// Try to reconnect after a delay
-				go func() {
-					time.Sleep(30 * time.Second)
-					newEvents, newErrCh := e.trySubscribeEvents(ctx)
-					if newEvents != nil {
-						eventCh = newEvents
-						errCh = newErrCh
-						slog.Info("event subscription reconnected")
+				errCh = nil
+				// Schedule reconnection with backoff on a goroutine,
+				// but signal back to the main loop via reconnectCh.
+				go func(delay time.Duration) {
+					slog.Info("scheduling event reconnection", "delay", delay)
+					select {
+					case <-time.After(delay):
+						select {
+						case reconnectCh <- struct{}{}:
+						default:
+						}
+					case <-ctx.Done():
 					}
-				}()
+				}(reconnectDelay)
+				// Increase backoff for next failure
+				reconnectDelay *= 2
+				if reconnectDelay > maxReconnectDelay {
+					reconnectDelay = maxReconnectDelay
+				}
+			}
+
+		case <-reconnectCh:
+			// Reconnection attempt runs on the main goroutine, avoiding
+			// any data race on eventCh/errCh.
+			newEvents, newErrCh := e.trySubscribeEvents(ctx)
+			if newEvents != nil {
+				eventCh = newEvents
+				errCh = newErrCh
+				reconnectDelay = 1 * time.Second // reset backoff on success
+				slog.Info("event subscription reconnected")
+			} else {
+				// Subscription failed again; schedule another attempt.
+				go func(delay time.Duration) {
+					slog.Info("reconnection failed, retrying", "delay", delay)
+					select {
+					case <-time.After(delay):
+						select {
+						case reconnectCh <- struct{}{}:
+						default:
+						}
+					case <-ctx.Done():
+					}
+				}(reconnectDelay)
+				reconnectDelay *= 2
+				if reconnectDelay > maxReconnectDelay {
+					reconnectDelay = maxReconnectDelay
+				}
 			}
 		}
 	}
@@ -206,7 +253,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		// Parse rendered output through handler
 		parser, ok := handler.(handlers.Parser)
 		if !ok {
-			return fmt.Errorf("handler for %q does not support Parse", rule.Target.Format)
+			return fmt.Errorf("handler for format %q does not support templates (remove the template field from rule %q)", rule.Target.Format, rule.Name)
 		}
 		incomingData, err = parser.Parse(rendered)
 		if err != nil {
@@ -251,7 +298,12 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		perm = 0600
 	}
 
-	// Write
+	// Write (or log what would be written in dry-run mode)
+	if e.DryRun {
+		log.Info("dry-run: would write file", "path", targetPath, "version", secret.Version, "permissions", fmt.Sprintf("%04o", perm))
+		return nil
+	}
+
 	if err := handler.Write(targetPath, merged, perm); err != nil {
 		return fmt.Errorf("write file: %w", err)
 	}
@@ -289,6 +341,13 @@ func convertToNetrcVaultData(data map[string]any) handlers.NetrcVaultData {
 			// Try to parse as JSON
 			var cred handlers.NetrcCredential
 			if err := parseNetrcJSON(v, &cred); err == nil {
+				result[machine] = cred
+			}
+		case json.Number:
+			// json.Number values are not valid netrc credential structures;
+			// convert to string and attempt JSON parse for consistency.
+			var cred handlers.NetrcCredential
+			if err := parseNetrcJSON(v.String(), &cred); err == nil {
 				result[machine] = cred
 			}
 		}

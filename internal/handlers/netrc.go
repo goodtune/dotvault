@@ -8,6 +8,12 @@ import (
 )
 
 // NetrcHandler handles .netrc files with per-entry merge.
+//
+// NetrcHandler intentionally does not implement the Parser interface because
+// the netrc format does not support templates. When no template is specified,
+// Vault data is converted directly to NetrcVaultData by the sync engine.
+// Configuring a rule with format "netrc" and a template will produce a clear
+// error at sync time.
 type NetrcHandler struct{}
 
 // NetrcCredential represents login+password for a machine.
@@ -47,6 +53,9 @@ func (h *NetrcHandler) Merge(existing any, incoming any) (any, error) {
 	}
 
 	for machine, cred := range vaultData {
+		if machine == "default" {
+			continue
+		}
 		m := n.Machine(machine)
 		if m != nil {
 			// Update existing entry

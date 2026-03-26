@@ -128,8 +128,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				slog.Info("received shutdown signal", "signal", sig)
 				cancel()
 			case syscall.SIGHUP:
-				slog.Info("received SIGHUP, reloading config")
-				// Reload handled by engine restart in future
+				// TODO: Implement config reload on SIGHUP. This is deferred
+				// to a future release. For now, restart the daemon to pick
+				// up config changes.
+				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
 			}
 		}
 	}()
@@ -143,6 +145,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Create and run engine
 	statePath := filepath.Join(paths.CacheDir(), "state.json")
 	engine := sync.NewEngine(cfg, vc, username, statePath)
+	engine.DryRun = flagDryRun
 
 	// Start web UI if enabled
 	if cfg.Web.Enabled {
@@ -187,6 +190,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	statePath := filepath.Join(paths.CacheDir(), "state.json")
 	engine := sync.NewEngine(cfg, vc, username, statePath)
+	engine.DryRun = flagDryRun
 
 	slog.Info("running single sync cycle", "user", username)
 	return engine.RunOnce(ctx)

@@ -1,0 +1,14 @@
+{
+  "name": "dotvault-frontend",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch"
+  },
+  "dependencies": {
+    "preact": "^10.19.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0"
+  }
+}

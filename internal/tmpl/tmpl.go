@@ -49,7 +49,9 @@ func base64DecodeFunc(s string) (string, error) {
 	return string(b), nil
 }
 
-func defaultFunc(val any, fallback string) string {
+// defaultFunc follows Sprig convention: fallback first, value second.
+// This enables idiomatic piping: {{.port | default "8080"}}
+func defaultFunc(fallback string, val any) string {
 	if val == nil {
 		return fallback
 	}

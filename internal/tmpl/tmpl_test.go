@@ -33,13 +33,25 @@ func TestRender(t *testing.T) {
 		},
 		{
 			name:     "default function with value present",
-			template: `port: {{default .port "8080"}}`,
+			template: `port: {{default "8080" .port}}`,
 			data:     map[string]any{"port": "9090"},
 			want:     `port: 9090`,
 		},
 		{
 			name:     "default function with missing value",
-			template: `port: {{default .port "8080"}}`,
+			template: `port: {{default "8080" .port}}`,
+			data:     map[string]any{},
+			want:     `port: 8080`,
+		},
+		{
+			name:     "default function with pipe syntax",
+			template: `port: {{.port | default "8080"}}`,
+			data:     map[string]any{"port": "9090"},
+			want:     `port: 9090`,
+		},
+		{
+			name:     "default function with pipe and missing value",
+			template: `port: {{.port | default "8080"}}`,
 			data:     map[string]any{},
 			want:     `port: 8080`,
 		},

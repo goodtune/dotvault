@@ -3,10 +3,10 @@ package config
 import (
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/paths"
 	"gopkg.in/yaml.v3"
 )
 
@@ -132,7 +132,7 @@ func (c *Config) validate() error {
 		if c.Web.Listen == "" {
 			c.Web.Listen = "127.0.0.1:8200"
 		}
-		if err := validateLoopback(c.Web.Listen); err != nil {
+		if err := paths.ValidateLoopback(c.Web.Listen); err != nil {
 			return fmt.Errorf("web.listen: %w", err)
 		}
 	}
@@ -166,28 +166,3 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func validateLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("invalid address %q: %w", addr, err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// Try resolving hostname
-		addrs, err := net.LookupHost(host)
-		if err != nil {
-			return fmt.Errorf("cannot resolve %q: %w", host, err)
-		}
-		for _, a := range addrs {
-			ip = net.ParseIP(a)
-			if ip != nil && !ip.IsLoopback() {
-				return fmt.Errorf("address %q resolves to non-loopback %s", addr, a)
-			}
-		}
-		return nil
-	}
-	if !ip.IsLoopback() {
-		return fmt.Errorf("address %q is not loopback", addr)
-	}
-	return nil
-}

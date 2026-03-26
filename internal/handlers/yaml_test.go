@@ -3,6 +3,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -120,7 +121,7 @@ func TestYAMLHandler_MergePreservesExistingKeys(t *testing.T) {
 	s := string(got)
 
 	for _, want := range []string{"keep_this: original", "update_this: new", "add_this: added"} {
-		if !contains(s, want) {
+		if !strings.Contains(s, want) {
 			t.Errorf("merged output missing %q:\n%s", want, s)
 		}
 	}
@@ -145,15 +146,3 @@ func TestYAMLHandler_WriteAtomicAndPermissions(t *testing.T) {
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

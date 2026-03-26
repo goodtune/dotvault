@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -40,7 +40,7 @@ type ServerConfig struct {
 
 // NewServer creates a new web server.
 func NewServer(sc ServerConfig) (*Server, error) {
-	if err := validateLoopback(sc.WebCfg.Listen); err != nil {
+	if err := paths.ValidateLoopback(sc.WebCfg.Listen); err != nil {
 		return nil, fmt.Errorf("web.listen: %w", err)
 	}
 
@@ -128,27 +128,3 @@ func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
 }
 
-func validateLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("invalid address %q: %w", addr, err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		addrs, err := net.LookupHost(host)
-		if err != nil {
-			return fmt.Errorf("cannot resolve %q: %w", host, err)
-		}
-		for _, a := range addrs {
-			resolved := net.ParseIP(a)
-			if resolved != nil && !resolved.IsLoopback() {
-				return fmt.Errorf("address %q resolves to non-loopback %s", addr, a)
-			}
-		}
-		return nil
-	}
-	if !ip.IsLoopback() {
-		return fmt.Errorf("address %q is not loopback", addr)
-	}
-	return nil
-}

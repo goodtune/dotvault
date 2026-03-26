@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 func TestValidateLoopback(t *testing.T) {
@@ -21,12 +23,12 @@ func TestValidateLoopback(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.addr, func(t *testing.T) {
-			err := validateLoopback(tt.addr)
+			err := paths.ValidateLoopback(tt.addr)
 			if tt.wantErr && err == nil {
-				t.Errorf("validateLoopback(%q) = nil, want error", tt.addr)
+				t.Errorf("ValidateLoopback(%q) = nil, want error", tt.addr)
 			}
 			if !tt.wantErr && err != nil {
-				t.Errorf("validateLoopback(%q) = %v, want nil", tt.addr, err)
+				t.Errorf("ValidateLoopback(%q) = %v, want nil", tt.addr, err)
 			}
 		})
 	}

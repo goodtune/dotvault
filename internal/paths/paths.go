@@ -2,6 +2,7 @@ package paths
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -94,6 +95,33 @@ func ExpandHome(path string) (string, error) {
 		return filepath.Join(home, path[2:]), nil
 	}
 	return path, nil
+}
+
+// ValidateLoopback checks that addr (host:port) resolves to a loopback address.
+func ValidateLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// Try resolving hostname
+		addrs, err := net.LookupHost(host)
+		if err != nil {
+			return fmt.Errorf("cannot resolve %q: %w", host, err)
+		}
+		for _, a := range addrs {
+			resolved := net.ParseIP(a)
+			if resolved != nil && !resolved.IsLoopback() {
+				return fmt.Errorf("address %q resolves to non-loopback %s", addr, a)
+			}
+		}
+		return nil
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("address %q is not loopback", addr)
+	}
+	return nil
 }
 
 func mustHomeDir() string {

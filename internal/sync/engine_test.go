@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,7 +114,7 @@ func TestEngine_RunOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read gh output: %v", err)
 	}
-	if !containsStr(string(ghData), "ghp_testtoken123") {
+	if !strings.Contains(string(ghData), "ghp_testtoken123") {
 		t.Errorf("gh output missing token:\n%s", ghData)
 	}
 
@@ -190,11 +191,3 @@ func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
 	}
 }
 
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

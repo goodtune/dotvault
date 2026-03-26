@@ -2,7 +2,6 @@ package tmpl
 
 import (
 	"encoding/base64"
-	"os"
 	"testing"
 )
 
@@ -96,8 +95,7 @@ func TestRender(t *testing.T) {
 }
 
 func TestRenderEnvFunction(t *testing.T) {
-	os.Setenv("DOTVAULT_TEST_VAR", "test-value")
-	defer os.Unsetenv("DOTVAULT_TEST_VAR")
+	t.Setenv("DOTVAULT_TEST_VAR", "test-value")
 
 	got, err := Render("env-test", `home: {{env "DOTVAULT_TEST_VAR"}}`, map[string]any{})
 	if err != nil {

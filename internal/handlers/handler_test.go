@@ -3,6 +3,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -68,7 +69,7 @@ func TestYAMLRoundTrip(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	s := string(got)
 	for _, want := range []string{"key1: value1", "key2: updated", "key3: added"} {
-		if !containsStr(s, want) {
+		if !strings.Contains(s, want) {
 			t.Errorf("output missing %q:\n%s", want, s)
 		}
 	}
@@ -91,7 +92,7 @@ func TestJSONRoundTrip(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	s := string(got)
 	for _, want := range []string{`"a": "1"`, `"b": "updated"`, `"c": "added"`} {
-		if !containsStr(s, want) {
+		if !strings.Contains(s, want) {
 			t.Errorf("output missing %q:\n%s", want, s)
 		}
 	}

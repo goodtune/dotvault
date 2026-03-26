@@ -1,3 +1,4 @@
 import { h, render } from 'preact';
+import { App } from './app.jsx';
 
-render(h('div', null, 'dotvault loading...'), document.getElementById('app'));
+render(h(App, null), document.getElementById('app'));

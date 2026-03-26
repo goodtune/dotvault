@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -141,6 +142,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Start token lifecycle manager
+	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
+	lifecycleErrCh := lm.Start(ctx)
+	go func() {
+		for err := range lifecycleErrCh {
+			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
+		}
+	}()
 
 	// Create and run engine
 	statePath := filepath.Join(paths.CacheDir(), "state.json")

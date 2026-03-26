@@ -14,6 +14,7 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/web"
 	"github.com/spf13/cobra"
 )
 
@@ -142,6 +143,28 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Create and run engine
 	statePath := filepath.Join(paths.CacheDir(), "state.json")
 	engine := sync.NewEngine(cfg, vc, username, statePath)
+
+	// Start web UI if enabled
+	if cfg.Web.Enabled {
+		webServer, err := web.NewServer(web.ServerConfig{
+			WebCfg:   cfg.Web,
+			VaultCfg: cfg.Vault,
+			Rules:    cfg.Rules,
+			Vault:    vc,
+			Engine:   engine,
+			Username: username,
+		})
+		if err != nil {
+			slog.Error("failed to create web server", "error", err)
+		} else {
+			go func() {
+				if err := webServer.Start(); err != nil {
+					slog.Error("web server error", "error", err)
+				}
+			}()
+			defer webServer.Shutdown(ctx)
+		}
+	}
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 	return engine.RunLoop(ctx)

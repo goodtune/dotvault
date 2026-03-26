@@ -5,6 +5,8 @@ go 1.25.6
 require (
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
+	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+	golang.org/x/term v0.37.0
 	gopkg.in/ini.v1 v1.67.1
 	gopkg.in/yaml.v3 v3.0.1
 	nhooyr.io/websocket v1.8.17
@@ -27,6 +29,7 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 )

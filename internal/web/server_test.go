@@ -1,6 +1,8 @@
 package web
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -27,5 +29,31 @@ func TestValidateLoopback(t *testing.T) {
 				t.Errorf("validateLoopback(%q) = %v, want nil", tt.addr, err)
 			}
 		})
+	}
+}
+
+func TestServerIntegration(t *testing.T) {
+	s := testServer(t)
+	s.mux = http.NewServeMux()
+	s.registerRoutes()
+
+	ts := httptest.NewServer(s.middleware(s.mux))
+	defer ts.Close()
+
+	// Test CSP header
+	resp, err := http.Get(ts.URL + "/api/v1/status")
+	if err != nil {
+		t.Fatalf("GET /api/v1/status: %v", err)
+	}
+	defer resp.Body.Close()
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp != "default-src 'self'" {
+		t.Errorf("CSP header = %q, want %q", csp, "default-src 'self'")
+	}
+
+	xcto := resp.Header.Get("X-Content-Type-Options")
+	if xcto != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want 'nosniff'", xcto)
 	}
 }

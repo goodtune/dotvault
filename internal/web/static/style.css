@@ -154,6 +154,7 @@ body {
   border-radius: 4px;
   font-family: 'SF Mono', Monaco, monospace;
   font-size: 13px;
+  white-space: pre-wrap;
 }
 .masked { color: #ccc; letter-spacing: 2px; }
 

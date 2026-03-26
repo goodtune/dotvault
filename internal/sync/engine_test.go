@@ -191,3 +191,103 @@ func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
 	}
 }
 
+func TestEngine_RunOnceResyncAfterFileDeleted(t *testing.T) {
+	skipIfNoVault(t)
+
+	vc := testVaultClient(t)
+	seedVaultData(t, vc)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			KVMount:    "secret",
+			UserPrefix: "users/",
+		},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: config.Target{
+					Path:     ghPath,
+					Format:   "yaml",
+					Template: "github.com:\n  oauth_token: \"{{.token}}\"",
+					Merge:    "deep",
+				},
+			},
+		},
+	}
+
+	engine := NewEngine(cfg, vc, "testuser", statePath)
+
+	// First run — should write
+	engine.RunOnce(context.Background())
+	if _, err := os.Stat(ghPath); err != nil {
+		t.Fatalf("file not created after first sync: %v", err)
+	}
+
+	// Delete the target file
+	os.Remove(ghPath)
+
+	// Second run — should re-sync because file is missing
+	engine.RunOnce(context.Background())
+
+	data, err := os.ReadFile(ghPath)
+	if err != nil {
+		t.Fatalf("file not recreated after re-sync: %v", err)
+	}
+	if !strings.Contains(string(data), "ghp_testtoken123") {
+		t.Errorf("re-synced file missing token:\n%s", data)
+	}
+}
+
+func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
+	skipIfNoVault(t)
+
+	vc := testVaultClient(t)
+	seedVaultData(t, vc)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			KVMount:    "secret",
+			UserPrefix: "users/",
+		},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: config.Target{
+					Path:     ghPath,
+					Format:   "yaml",
+					Template: "github.com:\n  oauth_token: \"{{.token}}\"",
+					Merge:    "deep",
+				},
+			},
+		},
+	}
+
+	engine := NewEngine(cfg, vc, "testuser", statePath)
+
+	// First run — should write
+	engine.RunOnce(context.Background())
+
+	// Modify the target file externally (simulates removing a section)
+	os.WriteFile(ghPath, []byte("{}\n"), 0644)
+
+	// Second run — should re-sync because file content changed
+	engine.RunOnce(context.Background())
+
+	data, err := os.ReadFile(ghPath)
+	if err != nil {
+		t.Fatalf("read file after re-sync: %v", err)
+	}
+	if !strings.Contains(string(data), "ghp_testtoken123") {
+		t.Errorf("re-synced file missing token:\n%s", data)
+	}
+}

@@ -83,7 +83,9 @@ export function SecretPanel({ secretPath }) {
             h('td', { class: 'field-name' }, field),
             h('td', { class: 'field-value' },
               revealed[field]
-                ? h('code', null, String(revealed[field]))
+                ? h('code', null, typeof revealed[field] === 'object'
+                    ? JSON.stringify(revealed[field], null, 2)
+                    : String(revealed[field]))
                 : h('span', { class: 'masked' }, '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'),
             ),
             h('td', null,

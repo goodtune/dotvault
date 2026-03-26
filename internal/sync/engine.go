@@ -223,17 +223,22 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return nil
 	}
 
-	// Check version — skip if unchanged
-	currentState := e.state.Get(rule.Name)
-	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
-		log.Debug("secret unchanged, skipping")
-		return nil
-	}
-
 	// Resolve target path
 	targetPath, err := paths.ExpandHome(rule.Target.Path)
 	if err != nil {
 		return fmt.Errorf("expand target path: %w", err)
+	}
+
+	// Check version and target file — skip only if vault secret is unchanged
+	// AND the target file still matches what we last wrote.
+	currentState := e.state.Get(rule.Name)
+	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
+		currentChecksum, _ := FileChecksum(targetPath)
+		if currentChecksum == currentState.FileChecksum {
+			log.Debug("secret unchanged, skipping")
+			return nil
+		}
+		log.Info("target file changed or missing, re-syncing", "path", targetPath)
 	}
 
 	// Get handler

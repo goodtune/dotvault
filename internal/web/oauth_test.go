@@ -10,7 +10,10 @@ func TestOAuthManager_StateValidation(t *testing.T) {
 	om := NewOAuthManager()
 
 	// Generate state
-	state := om.CreateState("test-rule")
+	state, err := om.CreateState("test-rule")
+	if err != nil {
+		t.Fatalf("CreateState() error: %v", err)
+	}
 
 	// Valid state
 	rule, ok := om.ValidateState(state)

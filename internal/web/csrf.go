@@ -8,16 +8,22 @@ import (
 	"sync"
 )
 
+// maxCSRFTokens is the maximum number of CSRF tokens stored at once.
+// When the limit is reached, the oldest token is evicted.
+const maxCSRFTokens = 1000
+
 // CSRFStore manages CSRF token generation and validation.
 type CSRFStore struct {
 	mu     sync.RWMutex
 	tokens map[string]bool
+	order  []string // tracks insertion order for eviction
 }
 
 // NewCSRFStore creates a new CSRF token store.
 func NewCSRFStore() *CSRFStore {
 	return &CSRFStore{
 		tokens: make(map[string]bool),
+		order:  make([]string, 0, maxCSRFTokens),
 	}
 }
 
@@ -59,7 +65,14 @@ func (cs *CSRFStore) generate() (string, error) {
 	token := hex.EncodeToString(b)
 
 	cs.mu.Lock()
+	// Evict the oldest token if we are at capacity.
+	if len(cs.order) >= maxCSRFTokens {
+		oldest := cs.order[0]
+		cs.order = cs.order[1:]
+		delete(cs.tokens, oldest)
+	}
 	cs.tokens[token] = true
+	cs.order = append(cs.order, token)
 	cs.mu.Unlock()
 
 	return token, nil

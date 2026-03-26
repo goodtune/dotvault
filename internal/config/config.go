@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"time"
@@ -77,6 +78,14 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	// Warn if the config file is group or world writable.
+	if info, statErr := os.Stat(path); statErr == nil {
+		perm := info.Mode().Perm()
+		if perm&0022 != 0 {
+			slog.Warn("config file is group or world writable", "path", path, "permissions", fmt.Sprintf("%04o", perm))
+		}
 	}
 
 	var cfg Config

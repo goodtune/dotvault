@@ -15,6 +15,10 @@ type LifecycleManager struct {
 	client        *vault.Client
 	checkInterval time.Duration
 	needsReauth   atomic.Bool
+
+	// Exponential backoff state for check failures.
+	currentDelay time.Duration
+	maxDelay     time.Duration
 }
 
 // NewLifecycleManager creates a new token lifecycle manager.
@@ -22,6 +26,8 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration) *Lif
 	return &LifecycleManager{
 		client:        client,
 		checkInterval: checkInterval,
+		currentDelay:  checkInterval,
+		maxDelay:      5 * time.Minute,
 	}
 }
 
@@ -38,22 +44,31 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 	go func() {
 		defer close(errCh)
 
-		ticker := time.NewTicker(lm.checkInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(lm.currentDelay)
+		defer timer.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				if err := lm.checkAndRenew(ctx); err != nil {
-					slog.Warn("token lifecycle check failed", "error", err)
+					slog.Warn("token lifecycle check failed", "error", err, "next_retry", lm.currentDelay*2)
 					lm.needsReauth.Store(true)
 					select {
 					case errCh <- err:
 					default:
 					}
+					// Exponential backoff on failure, capped at maxDelay
+					lm.currentDelay *= 2
+					if lm.currentDelay > lm.maxDelay {
+						lm.currentDelay = lm.maxDelay
+					}
+				} else {
+					// Reset to base interval on success
+					lm.currentDelay = lm.checkInterval
 				}
+				timer.Reset(lm.currentDelay)
 			}
 		}
 	}()

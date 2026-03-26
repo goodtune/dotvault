@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 )
@@ -16,6 +17,14 @@ func ReadTokenFile(path string) (string, error) {
 		}
 		return "", fmt.Errorf("read token file: %w", err)
 	}
+
+	// Warn if token file has overly permissive permissions.
+	if info, statErr := os.Stat(path); statErr == nil {
+		if perm := info.Mode().Perm(); perm != 0600 {
+			slog.Warn("token file has insecure permissions", "path", path, "permissions", fmt.Sprintf("%04o", perm), "expected", "0600")
+		}
+	}
+
 	return strings.TrimSpace(string(data)), nil
 }
 

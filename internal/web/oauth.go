@@ -23,16 +23,18 @@ func NewOAuthManager() *OAuthManager {
 }
 
 // CreateState generates a cryptographically random state parameter for an OAuth flow.
-func (om *OAuthManager) CreateState(ruleName string) string {
+func (om *OAuthManager) CreateState(ruleName string) (string, error) {
 	b := make([]byte, 32)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate OAuth state: %w", err)
+	}
 	state := hex.EncodeToString(b)
 
 	om.mu.Lock()
 	om.states[state] = ruleName
 	om.mu.Unlock()
 
-	return state
+	return state, nil
 }
 
 // ValidateState checks and consumes a state parameter. Returns the rule name and true if valid.
@@ -47,6 +49,14 @@ func (om *OAuthManager) ValidateState(state string) (string, bool) {
 	return rule, ok
 }
 
+// handleOAuthStart initiates an OAuth2 flow for a given rule.
+//
+// NOTE: This handler is a placeholder. It is not yet wired to the Vault
+// secrets engine API that would provide the real OAuth authorization URL.
+// The current implementation generates a valid CSRF state token but
+// redirects to the local callback with a dummy code. This is acceptable
+// for the current implementation scope and will be completed when the
+// Vault OAuth engine integration is built.
 func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	ruleName := r.PathValue("rule")
 
@@ -57,11 +67,17 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			found = true
 
 			// Generate state
-			state := s.oauth.CreateState(ruleName)
+			state, err := s.oauth.CreateState(ruleName)
+			if err != nil {
+				slog.Error("failed to create OAuth state", "error", err)
+				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+				return
+			}
 
 			// Build auth URL — in a real implementation this would come from
 			// the Vault engine or the OAuth config. For now, construct a
 			// placeholder that the Vault engine would provide.
+			slog.Warn("OAuth start is a placeholder; not yet wired to Vault engine API", "rule", ruleName, "provider", rule.OAuth.Provider)
 			authURL := fmt.Sprintf("/api/v1/oauth/callback?state=%s&code=placeholder", state)
 
 			slog.Info("OAuth flow started", "rule", ruleName, "provider", rule.OAuth.Provider)

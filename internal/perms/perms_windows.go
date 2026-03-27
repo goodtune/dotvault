@@ -17,14 +17,17 @@ var broadSIDTypes = []windows.WELL_KNOWN_SID_TYPE{
 }
 
 // anyAccessMask covers any meaningful access right.
-const anyAccessMask = windows.FILE_ALL_ACCESS |
+const anyAccessMask windows.ACCESS_MASK = windows.STANDARD_RIGHTS_ALL |
+	windows.FILE_GENERIC_READ |
+	windows.FILE_GENERIC_WRITE |
+	windows.FILE_GENERIC_EXECUTE |
 	windows.GENERIC_ALL |
 	windows.GENERIC_READ |
 	windows.GENERIC_WRITE |
 	windows.GENERIC_EXECUTE
 
 // writeAccessMask covers write-related access rights.
-const writeAccessMask = windows.FILE_WRITE_DATA |
+const writeAccessMask windows.ACCESS_MASK = windows.FILE_WRITE_DATA |
 	windows.FILE_WRITE_ATTRIBUTES |
 	windows.FILE_WRITE_EA |
 	windows.FILE_APPEND_DATA |
@@ -47,7 +50,7 @@ func IsGroupWorldWritable(path string) (bool, error) {
 
 // checkBroadSIDsHaveAccess returns true if any DACL entry grants the
 // specified access rights to a well-known broad SID.
-func checkBroadSIDsHaveAccess(path string, mask uint32) (bool, error) {
+func checkBroadSIDsHaveAccess(path string, mask windows.ACCESS_MASK) (bool, error) {
 	// Verify the file exists first to return a consistent os-level error.
 	if _, err := os.Stat(path); err != nil {
 		return false, err
@@ -80,9 +83,9 @@ func checkBroadSIDsHaveAccess(path string, mask uint32) (bool, error) {
 		broadSIDs = append(broadSIDs, sid)
 	}
 
-	for i := uint32(0); i < dacl.AceCount; i++ {
+	for i := uint16(0); i < dacl.AceCount; i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, i, &ace); err != nil {
+		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
 			continue
 		}
 

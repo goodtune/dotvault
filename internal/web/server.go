@@ -15,27 +15,32 @@ import (
 
 // Server is the web UI HTTP server.
 type Server struct {
-	cfg        config.WebConfig
-	vault      *vault.Client
-	engine     *sync.Engine
-	csrf       *CSRFStore
-	oauth      *OAuthManager
-	mux        *http.ServeMux
-	server     *http.Server
-	rules      []config.Rule
-	kvMount    string
-	userPrefix string
-	username   string
+	cfg           config.WebConfig
+	vault         *vault.Client
+	engine        *sync.Engine
+	csrf          *CSRFStore
+	oauth         *OAuthManager
+	mux           *http.ServeMux
+	server        *http.Server
+	rules         []config.Rule
+	kvMount       string
+	userPrefix    string
+	username      string
+	authMount     string
+	authRole      string
+	tokenFilePath string
+	authDone      chan struct{}
 }
 
 // ServerConfig holds all dependencies for the web server.
 type ServerConfig struct {
-	WebCfg   config.WebConfig
-	VaultCfg config.VaultConfig
-	Rules    []config.Rule
-	Vault    *vault.Client
-	Engine   *sync.Engine
-	Username string
+	WebCfg        config.WebConfig
+	VaultCfg      config.VaultConfig
+	Rules         []config.Rule
+	Vault         *vault.Client
+	Engine        *sync.Engine
+	Username      string
+	TokenFilePath string
 }
 
 // NewServer creates a new web server.
@@ -45,16 +50,20 @@ func NewServer(sc ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:        sc.WebCfg,
-		vault:      sc.Vault,
-		engine:     sc.Engine,
-		csrf:       NewCSRFStore(),
-		oauth:      NewOAuthManager(),
-		mux:        http.NewServeMux(),
-		rules:      sc.Rules,
-		kvMount:    sc.VaultCfg.KVMount,
-		userPrefix: sc.VaultCfg.UserPrefix,
-		username:   sc.Username,
+		cfg:           sc.WebCfg,
+		vault:         sc.Vault,
+		engine:        sc.Engine,
+		csrf:          NewCSRFStore(),
+		oauth:         NewOAuthManager(),
+		mux:           http.NewServeMux(),
+		rules:         sc.Rules,
+		kvMount:       sc.VaultCfg.KVMount,
+		userPrefix:    sc.VaultCfg.UserPrefix,
+		username:      sc.Username,
+		authMount:     sc.VaultCfg.AuthMount,
+		authRole:      sc.VaultCfg.AuthRole,
+		tokenFilePath: sc.TokenFilePath,
+		authDone:      make(chan struct{}, 1),
 	}
 
 	s.registerRoutes()
@@ -62,6 +71,10 @@ func NewServer(sc ServerConfig) (*Server, error) {
 }
 
 func (s *Server) registerRoutes() {
+	// Auth routes (OIDC browser-based login)
+	s.mux.HandleFunc("GET /auth/start", s.handleAuthStart)
+	s.mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
+
 	// API routes
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)

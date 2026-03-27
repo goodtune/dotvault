@@ -1,0 +1,11 @@
+{
+  "auths": {
+    "docker.io": {
+      "auth": "new-auth-token"
+    },
+    "ghcr.io": {
+      "auth": "ghcr-token"
+    }
+  },
+  "credsStore": "desktop"
+}

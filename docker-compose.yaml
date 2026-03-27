@@ -1,0 +1,91 @@
+services:
+  vault:
+    image: hashicorp/vault:1.21
+    container_name: dotvault-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - vault-data:/vault/data
+      - ./vault-server.hcl:/vault/config/server.hcl:ro
+    command: ["sh", "-c", "chown -R vault:vault /vault/data && su-exec vault vault server -config=/vault/config/server.hcl"]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-tls-skip-verify"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  vault-init:
+    image: hashicorp/vault:1.21
+    container_name: dotvault-vault-init
+    depends_on:
+      vault:
+        condition: service_started
+    environment:
+      VAULT_ADDR: http://vault:8200
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+
+        echo "==> Waiting for Vault to start..."
+        until vault status 2>&1 | grep -qE '(Sealed\s+true|Sealed\s+false)'; do
+          sleep 1
+        done
+
+        # Initialise if needed (single key, threshold 1 for dev use)
+        if vault status 2>&1 | grep -q 'Initialized.*false'; then
+          echo "==> Initialising Vault..."
+          vault operator init -key-shares=1 -key-threshold=1 \
+            -format=json > /vault/data/init.json
+        fi
+
+        # Extract keys from init output (no jq in vault image)
+        UNSEAL_KEY=$$(sed -n '/unseal_keys_b64/{n;s/.*"\(.*\)".*/\1/p;}' /vault/data/init.json)
+        ROOT_TOKEN=$$(sed -n 's/.*"root_token": *"\([^"]*\)".*/\1/p' /vault/data/init.json)
+
+        # Unseal if sealed
+        if vault status 2>&1 | grep -q 'Sealed.*true'; then
+          echo "==> Unsealing Vault..."
+          vault operator unseal "$$UNSEAL_KEY"
+        fi
+
+        # Authenticate with root token
+        export VAULT_TOKEN="$$ROOT_TOKEN"
+
+        echo "==> Enabling KV v2 secrets engine..."
+        vault secrets enable -path=kv -version=2 kv 2>/dev/null || true
+
+        echo "==> Writing dotvault policy..."
+        vault policy write dotvault - <<'POLICY'
+        path "kv/data/users/*" {
+          capabilities = ["create", "read", "update", "delete", "list"]
+        }
+        path "kv/metadata/users/*" {
+          capabilities = ["read", "list", "delete"]
+        }
+        path "sys/events/subscribe/*" {
+          capabilities = ["read"]
+        }
+        POLICY
+
+        echo "==> Writing sample secrets..."
+        vault kv put kv/users/gary/gh token=ghp_example_token_1234
+        vault kv put kv/users/gary/netrc \
+          play.stirlo.au='{"login":"gary","password":"s3cret"}'
+
+        # Write root token to shared volume for host access
+        echo "$$ROOT_TOKEN" > /vault/data/root-token
+
+        echo "==> Vault ready (root token written to /vault/data/root-token)"
+        echo "==> Run: docker exec dotvault-vault cat /vault/data/root-token"
+    volumes:
+      - vault-data:/vault/data
+
+volumes:
+  vault-data:

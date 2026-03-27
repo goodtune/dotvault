@@ -1,0 +1,7 @@
+github.com:
+  oauth_token: "old-token"
+  user: gary
+  git_protocol: https
+github.example.com:
+  oauth_token: "enterprise-token"
+  user: gary

@@ -1,0 +1,56 @@
+version: 2
+
+before:
+  hooks:
+    - cd internal/web/frontend && npm ci && npm run build
+
+builds:
+  - main: ./cmd/dotvault
+    binary: dotvault
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+
+nfpms:
+  - id: dotvault
+    package_name: dotvault
+    vendor: goodtune
+    homepage: https://github.com/goodtune/dotvault
+    maintainer: Gary Reynolds <gary@touch.au>
+    description: Vault-to-file secret synchronisation daemon
+    license: MIT
+    formats:
+      - rpm
+      - deb
+      - apk
+    bindir: /usr/bin
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

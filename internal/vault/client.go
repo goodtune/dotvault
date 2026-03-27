@@ -170,6 +170,26 @@ func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret
 	return secret, nil
 }
 
+// ServerHealth returns the Vault server health status.
+func (c *Client) ServerHealth(ctx context.Context) (*HealthResponse, error) {
+	resp, err := c.raw.Sys().HealthWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("vault health check: %w", err)
+	}
+	return &HealthResponse{
+		Version:    resp.Version,
+		Enterprise: resp.Enterprise,
+		ClusterName: resp.ClusterName,
+	}, nil
+}
+
+// HealthResponse contains selected fields from the Vault health endpoint.
+type HealthResponse struct {
+	Version     string
+	Enterprise  bool
+	ClusterName string
+}
+
 func isNotFound(err error) bool {
 	if respErr, ok := err.(*vaultapi.ResponseError); ok {
 		return respErr.StatusCode == 404

@@ -70,8 +70,27 @@ func (e *Engine) RunLoop(ctx context.Context) error {
 	// Initial sync
 	e.RunOnce(ctx)
 
-	// Try to subscribe to events
-	eventCh, errCh := e.trySubscribeEvents(ctx)
+	// Check Vault edition — events API requires Enterprise.
+	var eventsAvailable bool
+	if health, err := e.vault.ServerHealth(ctx); err != nil {
+		slog.Warn("unable to check vault edition, assuming community", "error", err)
+	} else {
+		edition := "Community"
+		if health.Enterprise {
+			edition = "Enterprise"
+			eventsAvailable = true
+		}
+		slog.Info("connected to vault", "version", health.Version, "edition", edition, "cluster", health.ClusterName)
+	}
+
+	// Try to subscribe to events (Enterprise only)
+	var eventCh <-chan vault.Event
+	var errCh <-chan error
+	if eventsAvailable {
+		eventCh, errCh = e.trySubscribeEvents(ctx)
+	} else {
+		slog.Info("event subscription requires Vault Enterprise, using poll-only mode")
+	}
 
 	// reconnectCh signals the main loop to attempt reconnection.
 	// This avoids a data race where a goroutine would write to

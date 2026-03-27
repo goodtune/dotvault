@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/goodtune/dotvault/internal/perms"
 )
 
 // ReadTokenFile reads a Vault token from a file, trimming whitespace.
@@ -19,10 +21,8 @@ func ReadTokenFile(path string) (string, error) {
 	}
 
 	// Warn if token file has overly permissive permissions.
-	if info, statErr := os.Stat(path); statErr == nil {
-		if perm := info.Mode().Perm(); perm != 0600 {
-			slog.Warn("token file has insecure permissions", "path", path, "permissions", fmt.Sprintf("%04o", perm), "expected", "0600")
-		}
+	if insecure, checkErr := perms.IsPrivateFile(path); checkErr == nil && insecure {
+		slog.Warn("token file has insecure permissions", "path", path)
 	}
 
 	return strings.TrimSpace(string(data)), nil

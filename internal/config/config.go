@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
 )
 
@@ -81,11 +82,8 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Warn if the config file is group or world writable.
-	if info, statErr := os.Stat(path); statErr == nil {
-		perm := info.Mode().Perm()
-		if perm&0022 != 0 {
-			slog.Warn("config file is group or world writable", "path", path, "permissions", fmt.Sprintf("%04o", perm))
-		}
+	if insecure, checkErr := perms.IsGroupWorldWritable(path); checkErr == nil && insecure {
+		slog.Warn("config file is group or world writable", "path", path)
 	}
 
 	var cfg Config

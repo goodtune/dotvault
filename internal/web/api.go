@@ -12,6 +12,7 @@ import (
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{
 		"authenticated": s.vault != nil && s.vault.Token() != "",
+		"auth_method":   s.authMethod,
 		"time":          time.Now().Format(time.RFC3339),
 	}
 

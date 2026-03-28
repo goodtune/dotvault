@@ -209,6 +209,10 @@ func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
 	}
+	if status.State != "mfa_required" || len(status.MFAMethods) == 0 || !status.MFAMethods[0].UsesPasscode {
+		http.Error(w, `{"error":"passcode not expected for this session"}`, http.StatusBadRequest)
+		return
+	}
 
 	s.login.SubmitTOTP(req.SessionID, req.Passcode)
 

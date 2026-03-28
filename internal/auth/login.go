@@ -32,6 +32,7 @@ type LoginTracker struct {
 	mu       sync.Mutex
 	sessions map[string]*loginSession
 	vault    *vault.Client
+	done     chan struct{}
 }
 
 // NewLoginTracker creates a new LoginTracker.
@@ -39,9 +40,19 @@ func NewLoginTracker(vc *vault.Client) *LoginTracker {
 	lt := &LoginTracker{
 		sessions: make(map[string]*loginSession),
 		vault:    vc,
+		done:     make(chan struct{}),
 	}
 	go lt.gcLoop()
 	return lt
+}
+
+// Close stops the background GC goroutine.
+func (lt *LoginTracker) Close() {
+	select {
+	case <-lt.done:
+	default:
+		close(lt.done)
+	}
 }
 
 // gcLoop periodically purges sessions that have been in a terminal state
@@ -50,16 +61,21 @@ func NewLoginTracker(vc *vault.Client) *LoginTracker {
 func (lt *LoginTracker) gcLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		lt.mu.Lock()
-		now := time.Now()
-		for id, s := range lt.sessions {
-			if !s.completedAt.IsZero() && now.Sub(s.completedAt) > 10*time.Minute {
-				s.cancel()
-				delete(lt.sessions, id)
+	for {
+		select {
+		case <-lt.done:
+			return
+		case <-ticker.C:
+			lt.mu.Lock()
+			now := time.Now()
+			for id, s := range lt.sessions {
+				if !s.completedAt.IsZero() && now.Sub(s.completedAt) > 10*time.Minute {
+					s.cancel()
+					delete(lt.sessions, id)
+				}
 			}
+			lt.mu.Unlock()
 		}
-		lt.mu.Unlock()
 	}
 }
 
@@ -76,6 +92,9 @@ func (lt *LoginTracker) StartLogin(sessionID, mount, username, password string) 
 	}
 
 	lt.mu.Lock()
+	if old, ok := lt.sessions[sessionID]; ok {
+		old.cancel()
+	}
 	lt.sessions[sessionID] = session
 	lt.mu.Unlock()
 

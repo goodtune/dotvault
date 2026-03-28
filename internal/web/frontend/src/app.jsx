@@ -66,7 +66,9 @@ export function App() {
     return h('div', { class: 'login-container' },
       h('div', { class: 'login-card' },
         h('h1', { class: 'login-title' }, 'dotvault'),
-        h('p', null, 'Loading...'),
+        error
+          ? h('p', { class: 'login-error' }, error)
+          : h('p', null, 'Loading...'),
       ),
     );
   }

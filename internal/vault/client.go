@@ -190,6 +190,82 @@ type HealthResponse struct {
 	ClusterName string
 }
 
+// MFAMethod describes an MFA method required for authentication.
+type MFAMethod struct {
+	ID           string `json:"id"`
+	Type         string `json:"type"`
+	UsesPasscode bool   `json:"uses_passcode"`
+}
+
+// LoginResult holds the outcome of an LDAP login attempt.
+type LoginResult struct {
+	Token        string
+	MFARequired  bool
+	MFARequestID string
+	MFAMethods   []MFAMethod
+}
+
+// LoginLDAP authenticates via LDAP and detects if MFA is required.
+func (c *Client) LoginLDAP(ctx context.Context, mount, username, password string) (*LoginResult, error) {
+	data := map[string]interface{}{
+		"password": password,
+	}
+	secret, err := c.raw.Logical().WriteWithContext(ctx,
+		fmt.Sprintf("auth/%s/login/%s", mount, username), data)
+	if err != nil {
+		return nil, fmt.Errorf("LDAP login: %w", err)
+	}
+	if secret == nil || secret.Auth == nil {
+		return nil, fmt.Errorf("no auth data in LDAP response")
+	}
+
+	// If we got a token directly, no MFA needed.
+	if secret.Auth.ClientToken != "" {
+		return &LoginResult{Token: secret.Auth.ClientToken}, nil
+	}
+
+	// MFA required — extract methods from constraints.
+	mfaReq := secret.Auth.MFARequirement
+	if mfaReq == nil {
+		return nil, fmt.Errorf("no token and no MFA requirement in LDAP response")
+	}
+
+	var methods []MFAMethod
+	for _, constraint := range mfaReq.MFAConstraints {
+		for _, m := range constraint.Any {
+			methods = append(methods, MFAMethod{
+				ID:           m.ID,
+				Type:         m.Type,
+				UsesPasscode: m.UsesPasscode,
+			})
+		}
+	}
+
+	return &LoginResult{
+		MFARequired:  true,
+		MFARequestID: mfaReq.MFARequestID,
+		MFAMethods:   methods,
+	}, nil
+}
+
+// ValidateMFA validates an MFA challenge. For push methods (Duo), pass an
+// empty passcode — the call blocks until the user approves or the context
+// is cancelled. For TOTP, pass the user-provided code. Returns the
+// authenticated client token on success.
+func (c *Client) ValidateMFA(ctx context.Context, mfaRequestID, methodID, passcode string) (string, error) {
+	payload := map[string]interface{}{
+		methodID: []string{passcode},
+	}
+	secret, err := c.raw.Sys().MFAValidateWithContext(ctx, mfaRequestID, payload)
+	if err != nil {
+		return "", fmt.Errorf("MFA validate: %w", err)
+	}
+	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
+		return "", fmt.Errorf("no token in MFA validate response")
+	}
+	return secret.Auth.ClientToken, nil
+}
+
 func isNotFound(err error) bool {
 	if respErr, ok := err.(*vaultapi.ResponseError); ok {
 		return respErr.StatusCode == 404

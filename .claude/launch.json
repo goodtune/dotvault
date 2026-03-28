@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vault-dex",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up"],
+      "port": 8200
+    },
+    {
+      "name": "dotvault",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/dotvault", "run", "--config", "config.dev.yaml"],
+      "port": 9000
+    }
+  ]
+}

@@ -19,6 +19,7 @@ services:
       retries: 10
       start_period: 5s
 
+  # NOTE: Add "127.0.0.1 dex" to /etc/hosts for browser-based OIDC flow
   dex:
     image: dexidp/dex:v2.41.1
     container_name: dotvault-dex

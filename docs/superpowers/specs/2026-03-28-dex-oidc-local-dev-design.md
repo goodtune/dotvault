@@ -16,8 +16,8 @@ dotvault web UI (127.0.0.1:8250)
 Vault (127.0.0.1:8200)
   |  generates auth URL pointing to Dex
   v
-Dex (127.0.0.1:5556)
-  |  user authenticates with static credentials
+Dex (dex:5556, mapped to 127.0.0.1:5556)
+  |  mockCallback connector auto-approves login
   |  redirects to 127.0.0.1:8250/auth/callback?code=...&state=...
   v
 dotvault web UI
@@ -31,15 +31,13 @@ Vault exchanges code with Dex, returns Vault token
 ### 1. New file: `dex.yaml`
 
 Dex configuration with:
-- Issuer: `http://localhost:5556/dex`
+- Issuer: `http://dex:5556/dex` (requires `127.0.0.1 dex` in host `/etc/hosts`)
 - Static OIDC client:
   - ID: `dotvault`
   - Secret: `dotvault-dev-secret`
   - Redirect URI: `http://127.0.0.1:8250/auth/callback`
-- Static password connector:
-  - Email: `dev@example.com`
-  - Password: `password` (bcrypt hash)
-- Storage: SQLite3 in-memory
+- Connector: `mockCallback` (auto-approves login, no credentials needed)
+- Storage: SQLite3 file-backed (`/var/dex/dex.db`, persisted via Docker volume)
 
 ### 2. Updated: `docker-compose.yaml`
 
@@ -79,19 +77,19 @@ The code default for `web.listen` remains `127.0.0.1:8200`. The explicit overrid
 
 The existing web-based OIDC flow in `internal/web/auth.go` and `internal/auth/oidc.go` requires no modifications.
 
-## Dev Credentials
+## Prerequisites
 
-| Field    | Value               |
-|----------|---------------------|
-| Email    | dev@example.com     |
-| Password | password            |
+Add to host `/etc/hosts` (one-time):
+```
+127.0.0.1 dex
+```
 
 ## Testing
 
 1. `docker compose up -d` (starts Vault, vault-init, Dex)
 2. Run `dotvault` (or `go run ./cmd/dotvault`)
 3. Browser opens to `http://127.0.0.1:8250/auth/start`
-4. Redirected to Dex login at `http://localhost:5556/dex/auth/...`
-5. Log in with `dev@example.com` / `password`
+4. Redirected to Dex at `http://dex:5556/dex/auth/...`
+5. mockCallback connector auto-approves (click "Grant Access")
 6. Redirected back to dotvault callback
 7. Vault token acquired, daemon starts syncing

@@ -24,6 +24,7 @@ type loginSession struct {
 	mfaMethodID  string
 	totpCh       chan string
 	cancel       context.CancelFunc
+	completedAt  time.Time // set when session reaches a terminal state
 }
 
 // LoginTracker manages async login attempts keyed by session ID.
@@ -35,9 +36,30 @@ type LoginTracker struct {
 
 // NewLoginTracker creates a new LoginTracker.
 func NewLoginTracker(vc *vault.Client) *LoginTracker {
-	return &LoginTracker{
+	lt := &LoginTracker{
 		sessions: make(map[string]*loginSession),
 		vault:    vc,
+	}
+	go lt.gcLoop()
+	return lt
+}
+
+// gcLoop periodically purges sessions that have been in a terminal state
+// for more than 10 minutes, preventing unbounded memory growth from
+// abandoned sessions.
+func (lt *LoginTracker) gcLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		lt.mu.Lock()
+		now := time.Now()
+		for id, s := range lt.sessions {
+			if !s.completedAt.IsZero() && now.Sub(s.completedAt) > 10*time.Minute {
+				s.cancel()
+				delete(lt.sessions, id)
+			}
+		}
+		lt.mu.Unlock()
 	}
 }
 
@@ -68,6 +90,7 @@ func (lt *LoginTracker) runLogin(ctx context.Context, session *loginSession, mou
 		lt.mu.Lock()
 		session.status.State = "failed"
 		session.status.Error = err.Error()
+		session.completedAt = time.Now()
 		lt.mu.Unlock()
 		return
 	}
@@ -77,6 +100,7 @@ func (lt *LoginTracker) runLogin(ctx context.Context, session *loginSession, mou
 		lt.mu.Lock()
 		session.status.Token = result.Token
 		session.status.State = "authenticated"
+		session.completedAt = time.Now()
 		lt.mu.Unlock()
 		return
 	}
@@ -86,6 +110,7 @@ func (lt *LoginTracker) runLogin(ctx context.Context, session *loginSession, mou
 		lt.mu.Lock()
 		session.status.State = "failed"
 		session.status.Error = "MFA required but no methods available"
+		session.completedAt = time.Now()
 		lt.mu.Unlock()
 		return
 	}
@@ -110,12 +135,14 @@ func (lt *LoginTracker) runLogin(ctx context.Context, session *loginSession, mou
 			lt.mu.Lock()
 			session.status.State = "failed"
 			session.status.Error = err.Error()
+			session.completedAt = time.Now()
 			lt.mu.Unlock()
 			return
 		}
 		lt.mu.Lock()
 		session.status.Token = token
 		session.status.State = "authenticated"
+		session.completedAt = time.Now()
 		lt.mu.Unlock()
 	}
 }
@@ -137,12 +164,14 @@ func (lt *LoginTracker) waitForTOTP(ctx context.Context, session *loginSession, 
 			session.status.Token = token
 			session.status.State = "authenticated"
 			session.status.Error = ""
+			session.completedAt = time.Now()
 			lt.mu.Unlock()
 			return
 		case <-ctx.Done():
 			lt.mu.Lock()
 			session.status.State = "failed"
 			session.status.Error = "login timed out"
+			session.completedAt = time.Now()
 			lt.mu.Unlock()
 			return
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	vaultapi "github.com/hashicorp/vault/api"
 )
@@ -240,6 +241,15 @@ func (c *Client) LoginLDAP(ctx context.Context, mount, username, password string
 			})
 		}
 	}
+
+	// Sort methods so passcode-capable (TOTP) come first, then by ID for
+	// determinism. This ensures MFAMethods[0] is the preferred method.
+	sort.Slice(methods, func(i, j int) bool {
+		if methods[i].UsesPasscode != methods[j].UsesPasscode {
+			return methods[i].UsesPasscode
+		}
+		return methods[i].ID < methods[j].ID
+	})
 
 	return &LoginResult{
 		MFARequired:  true,

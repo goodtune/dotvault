@@ -13,12 +13,6 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 )
 
-// AuthStartURL returns the URL to open in a browser to start OIDC auth.
-// It uses the actual bound listener address so it works even with ephemeral ports.
-func (s *Server) AuthStartURL() string {
-	return fmt.Sprintf("http://%s/auth/oidc/start", s.listenAddr)
-}
-
 // WaitForAuth blocks until authentication completes or the context is cancelled.
 func (s *Server) WaitForAuth(ctx context.Context) error {
 	select {

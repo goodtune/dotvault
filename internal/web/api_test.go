@@ -85,5 +85,6 @@ func testServer(t *testing.T) *Server {
 		kvMount:    "secret",
 		userPrefix: "users/",
 		username:   "testuser",
+		authMethod: "oidc",
 	}
 }

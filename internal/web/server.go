@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
@@ -21,12 +22,14 @@ type Server struct {
 	engine        *sync.Engine
 	csrf          *CSRFStore
 	oauth         *OAuthManager
+	login         *auth.LoginTracker
 	mux           *http.ServeMux
 	server        *http.Server
 	rules         []config.Rule
 	kvMount       string
 	userPrefix    string
 	username      string
+	authMethod    string
 	authMount     string
 	authRole      string
 	tokenFilePath string
@@ -58,11 +61,13 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		engine:        sc.Engine,
 		csrf:          NewCSRFStore(),
 		oauth:         NewOAuthManager(),
+		login:         auth.NewLoginTracker(sc.Vault),
 		mux:           http.NewServeMux(),
 		rules:         sc.Rules,
 		kvMount:       sc.VaultCfg.KVMount,
 		userPrefix:    sc.VaultCfg.UserPrefix,
 		username:      sc.Username,
+		authMethod:    sc.VaultCfg.AuthMethod,
 		authMount:     sc.VaultCfg.AuthMount,
 		authRole:      sc.VaultCfg.AuthRole,
 		tokenFilePath: sc.TokenFilePath,
@@ -75,9 +80,17 @@ func NewServer(sc ServerConfig) (*Server, error) {
 }
 
 func (s *Server) registerRoutes() {
-	// Auth routes (OIDC browser-based login)
-	s.mux.HandleFunc("GET /auth/start", s.handleAuthStart)
-	s.mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
+	// Auth routes — OIDC
+	s.mux.HandleFunc("GET /auth/oidc/start", s.handleAuthStart)
+	s.mux.HandleFunc("GET /auth/oidc/callback", s.handleAuthCallback)
+
+	// Auth routes — LDAP
+	s.mux.HandleFunc("POST /auth/ldap/login", s.requireCSRF(s.handleLDAPLogin))
+	s.mux.HandleFunc("GET /auth/ldap/status", s.handleLDAPStatus)
+	s.mux.HandleFunc("POST /auth/ldap/totp", s.requireCSRF(s.handleLDAPTOTP))
+
+	// Auth routes — Token
+	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
 
 	// API routes
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
@@ -157,6 +170,11 @@ func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// URL returns the web UI root URL.
+func (s *Server) URL() string {
+	return fmt.Sprintf("http://%s/", s.listenAddr)
 }
 
 func (s *Server) userKVPrefix() string {

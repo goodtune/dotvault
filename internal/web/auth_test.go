@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -32,7 +33,10 @@ func authTestServer(t *testing.T, vc *vault.Client) *Server {
 	return &Server{
 		cfg:        config.WebConfig{Listen: "127.0.0.1:0"},
 		vault:      vc,
+		csrf:       NewCSRFStore(),
+		login:      auth.NewLoginTracker(vc),
 		authDone:   make(chan struct{}, 1),
+		authMethod: "oidc",
 		authMount:  "oidc",
 		listenAddr: "127.0.0.1:8250",
 	}
@@ -48,7 +52,7 @@ func TestHandleAuthStart_VaultError(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/start", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthStart(w, req)
 
@@ -64,7 +68,7 @@ func TestHandleAuthStart_NilSecret(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/start", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthStart(w, req)
 
@@ -81,7 +85,7 @@ func TestHandleAuthStart_NilSecretData(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/start", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthStart(w, req)
 
@@ -101,7 +105,7 @@ func TestHandleAuthStart_MissingAuthURL(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/start", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthStart(w, req)
 
@@ -121,7 +125,7 @@ func TestHandleAuthStart_Success(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/start", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthStart(w, req)
 
@@ -137,7 +141,7 @@ func TestHandleAuthStart_Success(t *testing.T) {
 
 func TestHandleAuthCallback_MissingCode(t *testing.T) {
 	s := authTestServer(t, nil) // vault not called when code is missing
-	req := httptest.NewRequest("GET", "/auth/callback", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/callback", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
@@ -154,7 +158,7 @@ func TestHandleAuthCallback_VaultError(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/callback?code=test-code&state=test-state", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/callback?code=test-code&state=test-state", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
@@ -171,7 +175,7 @@ func TestHandleAuthCallback_NilAuth(t *testing.T) {
 	})
 
 	s := authTestServer(t, vc)
-	req := httptest.NewRequest("GET", "/auth/callback?code=test-code&state=test-state", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/callback?code=test-code&state=test-state", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
@@ -198,7 +202,7 @@ func TestHandleAuthCallback_Success(t *testing.T) {
 	s := authTestServer(t, vc)
 	s.tokenFilePath = filepath.Join(t.TempDir(), "vault-token")
 
-	req := httptest.NewRequest("GET", "/auth/callback?code=test-code&state=test-state", nil)
+	req := httptest.NewRequest("GET", "/auth/oidc/callback?code=test-code&state=test-state", nil)
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 

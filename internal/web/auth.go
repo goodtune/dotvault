@@ -12,7 +12,7 @@ import (
 // AuthStartURL returns the URL to open in a browser to start OIDC auth.
 // It uses the actual bound listener address so it works even with ephemeral ports.
 func (s *Server) AuthStartURL() string {
-	return fmt.Sprintf("http://%s/auth/start", s.listenAddr)
+	return fmt.Sprintf("http://%s/auth/oidc/start", s.listenAddr)
 }
 
 // WaitForAuth blocks until authentication completes or the context is cancelled.
@@ -31,7 +31,7 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		mount = "oidc"
 	}
 
-	callbackURL := fmt.Sprintf("http://%s/auth/callback", s.listenAddr)
+	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)
 
 	data := map[string]interface{}{
 		"redirect_uri": callbackURL,
@@ -118,4 +118,22 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprint(w, "Authentication successful! You can close this window.")
+}
+
+// --- LDAP and Token stubs (implemented in Task 5) ---
+
+func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
+}
+
+func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
+}
+
+func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
+}
+
+func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "not implemented", http.StatusNotImplemented)
 }

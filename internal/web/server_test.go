@@ -38,7 +38,10 @@ func TestValidateLoopback(t *testing.T) {
 
 func TestServerIntegration(t *testing.T) {
 	s := testServer(t)
-	vc, _ := vault.NewClient(vault.Config{Address: "http://127.0.0.1:8200"})
+	vc, err := vault.NewClient(vault.Config{Address: "http://127.0.0.1:8200"})
+	if err != nil {
+		t.Fatalf("failed to create vault client: %v", err)
+	}
 	s.login = auth.NewLoginTracker(vc)
 	s.mux = http.NewServeMux()
 	s.registerRoutes()

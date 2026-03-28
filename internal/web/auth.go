@@ -164,6 +164,11 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clear failed sessions to prevent unbounded growth.
+	if status.State == "failed" {
+		s.login.Clear(sessionID)
+	}
+
 	// If authenticated, consume the token server-side.
 	if status.State == "authenticated" && status.Token != "" {
 		s.vault.SetToken(status.Token)
@@ -199,6 +204,12 @@ func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	status := s.login.GetStatus(req.SessionID)
+	if status == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+
 	s.login.SubmitTOTP(req.SessionID, req.Passcode)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -218,12 +229,13 @@ func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate the token.
+	// Validate the token, preserving any existing token on failure.
+	prevToken := s.vault.Token()
 	s.vault.SetToken(req.Token)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if _, err := s.vault.LookupSelf(ctx); err != nil {
-		s.vault.SetToken("")
+		s.vault.SetToken(prevToken)
 		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 		return
 	}

@@ -49,7 +49,7 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 			case "pending":
 				continue
 			case "mfa_required":
-				if len(status.MFAMethods) > 0 && status.MFAMethods[0].UsesPasscode && !totpPrompted {
+				if len(status.MFAMethods) > 0 && status.MFAMethods[0].UsesPasscode && (!totpPrompted || status.Error != "") {
 					totpPrompted = true
 					passcode, err := promptPassword("MFA passcode: ")
 					if err != nil {

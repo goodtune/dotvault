@@ -35,6 +35,7 @@ function LDAPLogin({ onAuth }) {
   }, []);
 
   function startPolling(sessionID) {
+    if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
         const status = await getLDAPStatus(sessionID);

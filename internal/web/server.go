@@ -106,7 +106,12 @@ func (s *Server) Start() error {
 		s.readyCh <- err
 		return err
 	}
-	s.listenAddr = ln.Addr().String()
+	// Preserve the configured hostname (e.g. "localhost") and only take
+	// the port from the actual listener, so OIDC redirect URIs match
+	// what users configure in Vault's allowed_redirect_uris.
+	host, _, _ := net.SplitHostPort(s.cfg.Listen)
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	s.listenAddr = net.JoinHostPort(host, port)
 
 	s.server = &http.Server{
 		Handler: s.middleware(s.mux),

@@ -4,7 +4,7 @@
 
 **Goal:** Add Dex as a local OIDC identity provider so the web-based OIDC auth flow can be tested end-to-end via `docker compose up`.
 
-**Architecture:** Dex runs alongside Vault in docker-compose with a static password connector. vault-init configures Vault's OIDC auth method to use Dex. The dotvault web UI handles the browser-based login flow unchanged.
+**Architecture:** Dex runs alongside Vault in docker-compose with a mockCallback connector. vault-init configures Vault's OIDC auth method to use Dex. The dotvault web UI handles the browser-based login flow unchanged.
 
 **Tech Stack:** Dex (dexidp/dex Docker image), HashiCorp Vault OIDC auth method, docker-compose
 

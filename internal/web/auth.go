@@ -74,6 +74,11 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Authentication failed: "+errMsg, http.StatusBadRequest)
 		return
 	}
+	if state == "" {
+		slog.Error("OIDC auth callback missing state parameter")
+		http.Error(w, "Authentication failed: missing state parameter", http.StatusBadRequest)
+		return
+	}
 
 	mount := s.authMount
 	if mount == "" {

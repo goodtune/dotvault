@@ -31,11 +31,13 @@ func newFakeVaultServer(t *testing.T, handler http.HandlerFunc) *vault.Client {
 // the fields needed by the auth handlers.
 func authTestServer(t *testing.T, vc *vault.Client) *Server {
 	t.Helper()
+	lt := auth.NewLoginTracker(vc)
+	t.Cleanup(lt.Close)
 	return &Server{
 		cfg:        config.WebConfig{Listen: "127.0.0.1:0"},
 		vault:      vc,
 		csrf:       NewCSRFStore(),
-		login:      auth.NewLoginTracker(vc),
+		login:      lt,
 		authDone:   make(chan struct{}, 1),
 		authMethod: "oidc",
 		authMount:  "oidc",

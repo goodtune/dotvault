@@ -26,6 +26,7 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 	}
 
 	lt := NewLoginTracker(m.VaultClient)
+	defer lt.Close()
 	const sessionID = "cli"
 	lt.StartLogin(sessionID, mount, m.Username, password)
 

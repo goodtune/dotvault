@@ -144,8 +144,11 @@ func (s *Server) WaitReady() error {
 	return <-s.readyCh
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server and cleans up resources.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.login != nil {
+		s.login.Close()
+	}
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
 	}

@@ -43,6 +43,7 @@ func TestServerIntegration(t *testing.T) {
 		t.Fatalf("failed to create vault client: %v", err)
 	}
 	s.login = auth.NewLoginTracker(vc)
+	t.Cleanup(s.login.Close)
 	s.mux = http.NewServeMux()
 	s.registerRoutes()
 

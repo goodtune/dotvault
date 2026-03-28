@@ -35,6 +35,7 @@ func TestLoginTracker_NoMFA(t *testing.T) {
 	})
 
 	lt := NewLoginTracker(vc)
+	t.Cleanup(lt.Close)
 	lt.StartLogin("sess-1", "ldap", "testuser", "password123")
 
 	deadline := time.After(5 * time.Second)
@@ -102,6 +103,7 @@ func TestLoginTracker_PushMFA(t *testing.T) {
 	})
 
 	lt := NewLoginTracker(vc)
+	t.Cleanup(lt.Close)
 	lt.StartLogin("sess-1", "ldap", "testuser", "password123")
 
 	deadline := time.After(5 * time.Second)
@@ -166,6 +168,7 @@ func TestLoginTracker_TOTPMFA(t *testing.T) {
 	})
 
 	lt := NewLoginTracker(vc)
+	t.Cleanup(lt.Close)
 	lt.StartLogin("sess-1", "ldap", "testuser", "password123")
 
 	deadline := time.After(5 * time.Second)

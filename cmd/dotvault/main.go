@@ -192,7 +192,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					slog.Error("web server error", "error", err)
 				}
 			}()
-			defer webServer.Shutdown(ctx)
+			defer func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				webServer.Shutdown(shutdownCtx)
+			}()
 
 			// Wait for the server to start listening before proceeding.
 			// This ensures WaitForAuth cannot block if the server failed to bind.

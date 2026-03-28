@@ -16,6 +16,7 @@ import (
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
+	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 )
 
@@ -137,35 +138,51 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Authenticate
-	username, vc, err := authenticate(ctx, cfg)
+	username, err := paths.Username()
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve username: %w", err)
 	}
 
-	// Start token lifecycle manager
-	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
-	lifecycleErrCh := lm.Start(ctx)
-	go func() {
-		for err := range lifecycleErrCh {
-			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
-		}
-	}()
+	vc, err := vault.NewClient(vault.Config{
+		Address:       cfg.Vault.Address,
+		CACert:        cfg.Vault.CACert,
+		TLSSkipVerify: cfg.Vault.TLSSkipVerify,
+	})
+	if err != nil {
+		return fmt.Errorf("create vault client: %w", err)
+	}
 
-	// Create and run engine
+	tokenPath := paths.VaultTokenPath()
+
+	// Try to reuse an existing token before starting any auth flow.
+	authenticated := false
+	if token := auth.ResolveToken(tokenPath); token != "" {
+		vc.SetToken(token)
+		if _, err := vc.LookupSelf(ctx); err == nil {
+			slog.Info("reusing existing vault token")
+			authenticated = true
+		} else {
+			slog.Warn("existing token invalid, proceeding to fresh auth", "error", err)
+		}
+	}
+
+	// Create sync engine (safe before authentication — no Vault calls until RunLoop).
 	statePath := filepath.Join(paths.CacheDir(), "state.json")
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
 
-	// Start web UI if enabled
+	// Start web UI if enabled. We start it before authentication so it can
+	// serve the OIDC browser-based login flow.
+	var webServer *web.Server
 	if cfg.Web.Enabled {
-		webServer, err := web.NewServer(web.ServerConfig{
-			WebCfg:   cfg.Web,
-			VaultCfg: cfg.Vault,
-			Rules:    cfg.Rules,
-			Vault:    vc,
-			Engine:   engine,
-			Username: username,
+		webServer, err = web.NewServer(web.ServerConfig{
+			WebCfg:        cfg.Web,
+			VaultCfg:      cfg.Vault,
+			Rules:         cfg.Rules,
+			Vault:         vc,
+			Engine:        engine,
+			Username:      username,
+			TokenFilePath: tokenPath,
 		})
 		if err != nil {
 			slog.Error("failed to create web server", "error", err)
@@ -175,9 +192,72 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					slog.Error("web server error", "error", err)
 				}
 			}()
-			defer webServer.Shutdown(ctx)
+			defer func() {
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				webServer.Shutdown(shutdownCtx)
+			}()
+
+			// Wait for the server to start listening before proceeding.
+			// This ensures WaitForAuth cannot block if the server failed to bind.
+			if err := webServer.WaitReady(); err != nil {
+				return fmt.Errorf("web server failed to start: %w", err)
+			}
 		}
 	}
+
+	// Authenticate if needed.
+	if !authenticated {
+		if webServer != nil && cfg.Vault.AuthMethod == "oidc" {
+			// Web-based OIDC: open the browser to the web server's auth
+			// start page, which redirects through the Vault OIDC flow and
+			// back to the web server's callback to complete authentication.
+			url := webServer.AuthStartURL()
+			slog.Info("opening browser for OIDC authentication", "url", url)
+			if err := browser.OpenURL(url); err != nil {
+				slog.Warn("failed to open browser, please visit URL manually", "url", url, "error", err)
+			}
+			if err := webServer.WaitForAuth(ctx); err != nil {
+				return fmt.Errorf("web-based authentication: %w", err)
+			}
+		} else {
+			// Traditional auth flow (OIDC with ephemeral listener, LDAP
+			// prompt, or token file).
+			mgr := &auth.Manager{
+				VaultClient:   vc,
+				TokenFilePath: tokenPath,
+				AuthMethod:    cfg.Vault.AuthMethod,
+				AuthMount:     cfg.Vault.AuthMount,
+				AuthRole:      cfg.Vault.AuthRole,
+				Username:      username,
+			}
+			if err := mgr.Authenticate(ctx); err != nil {
+				return fmt.Errorf("authenticate: %w", err)
+			}
+		}
+	}
+
+	// Start token lifecycle manager.
+	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
+	lifecycleErrCh := lm.Start(ctx)
+	go func() {
+		const reauthCooldown = 10 * time.Minute
+		var lastReauthOpen time.Time
+
+		for err := range lifecycleErrCh {
+			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
+			if webServer != nil && cfg.Vault.AuthMethod == "oidc" {
+				if lastReauthOpen.IsZero() || time.Since(lastReauthOpen) >= reauthCooldown {
+					lastReauthOpen = time.Now()
+					url := webServer.AuthStartURL()
+					slog.Info("opening browser for re-authentication", "url", url)
+					if err := browser.OpenURL(url); err != nil {
+						slog.Warn("failed to open browser for re-auth", "url", url, "error", err)
+					}
+				}
+			}
+		}
+	}()
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 	return engine.RunLoop(ctx)

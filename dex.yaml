@@ -1,0 +1,21 @@
+issuer: http://dex:5556/dex
+
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: dotvault
+    secret: dotvault-dev-secret
+    name: dotvault
+    redirectURIs:
+      - http://127.0.0.1:8250/auth/callback
+
+connectors:
+  - type: mockCallback
+    id: mock
+    name: Login

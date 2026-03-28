@@ -19,12 +19,31 @@ services:
       retries: 10
       start_period: 5s
 
+  # NOTE: Add "127.0.0.1 dex" to /etc/hosts for browser-based OIDC flow
+  dex:
+    image: dexidp/dex:v2.41.1
+    container_name: dotvault-dex
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex.yaml:/etc/dex/config.yaml:ro
+      - dex-data:/var/dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   vault-init:
     image: hashicorp/vault:1.21
     container_name: dotvault-vault-init
     depends_on:
       vault:
         condition: service_started
+      dex:
+        condition: service_healthy
     environment:
       VAULT_ADDR: http://vault:8200
     entrypoint: /bin/sh
@@ -79,6 +98,23 @@ services:
         vault kv put kv/users/gary/netrc \
           play.stirlo.au='{"login":"gary","password":"s3cret"}'
 
+        echo "==> Enabling OIDC auth method..."
+        vault auth enable oidc 2>/dev/null || true
+
+        echo "==> Configuring OIDC auth with Dex..."
+        vault write auth/oidc/config \
+          oidc_discovery_url="http://dex:5556/dex" \
+          oidc_client_id="dotvault" \
+          oidc_client_secret="dotvault-dev-secret" \
+          default_role="default"
+
+        echo "==> Creating OIDC default role..."
+        vault write auth/oidc/role/default \
+          bound_audiences="dotvault" \
+          allowed_redirect_uris="http://127.0.0.1:8250/auth/callback" \
+          user_claim="email" \
+          token_policies="dotvault"
+
         # Write root token to shared volume for host access
         echo "$$ROOT_TOKEN" > /vault/data/root-token
 
@@ -89,3 +125,4 @@ services:
 
 volumes:
   vault-data:
+  dex-data:

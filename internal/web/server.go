@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -15,27 +16,34 @@ import (
 
 // Server is the web UI HTTP server.
 type Server struct {
-	cfg        config.WebConfig
-	vault      *vault.Client
-	engine     *sync.Engine
-	csrf       *CSRFStore
-	oauth      *OAuthManager
-	mux        *http.ServeMux
-	server     *http.Server
-	rules      []config.Rule
-	kvMount    string
-	userPrefix string
-	username   string
+	cfg           config.WebConfig
+	vault         *vault.Client
+	engine        *sync.Engine
+	csrf          *CSRFStore
+	oauth         *OAuthManager
+	mux           *http.ServeMux
+	server        *http.Server
+	rules         []config.Rule
+	kvMount       string
+	userPrefix    string
+	username      string
+	authMount     string
+	authRole      string
+	tokenFilePath string
+	authDone      chan struct{}
+	readyCh       chan error
+	listenAddr    string
 }
 
 // ServerConfig holds all dependencies for the web server.
 type ServerConfig struct {
-	WebCfg   config.WebConfig
-	VaultCfg config.VaultConfig
-	Rules    []config.Rule
-	Vault    *vault.Client
-	Engine   *sync.Engine
-	Username string
+	WebCfg        config.WebConfig
+	VaultCfg      config.VaultConfig
+	Rules         []config.Rule
+	Vault         *vault.Client
+	Engine        *sync.Engine
+	Username      string
+	TokenFilePath string
 }
 
 // NewServer creates a new web server.
@@ -45,16 +53,21 @@ func NewServer(sc ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:        sc.WebCfg,
-		vault:      sc.Vault,
-		engine:     sc.Engine,
-		csrf:       NewCSRFStore(),
-		oauth:      NewOAuthManager(),
-		mux:        http.NewServeMux(),
-		rules:      sc.Rules,
-		kvMount:    sc.VaultCfg.KVMount,
-		userPrefix: sc.VaultCfg.UserPrefix,
-		username:   sc.Username,
+		cfg:           sc.WebCfg,
+		vault:         sc.Vault,
+		engine:        sc.Engine,
+		csrf:          NewCSRFStore(),
+		oauth:         NewOAuthManager(),
+		mux:           http.NewServeMux(),
+		rules:         sc.Rules,
+		kvMount:       sc.VaultCfg.KVMount,
+		userPrefix:    sc.VaultCfg.UserPrefix,
+		username:      sc.Username,
+		authMount:     sc.VaultCfg.AuthMount,
+		authRole:      sc.VaultCfg.AuthRole,
+		tokenFilePath: sc.TokenFilePath,
+		authDone:      make(chan struct{}, 1),
+		readyCh:       make(chan error, 1),
 	}
 
 	s.registerRoutes()
@@ -62,6 +75,10 @@ func NewServer(sc ServerConfig) (*Server, error) {
 }
 
 func (s *Server) registerRoutes() {
+	// Auth routes (OIDC browser-based login)
+	s.mux.HandleFunc("GET /auth/start", s.handleAuthStart)
+	s.mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
+
 	// API routes
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
@@ -81,19 +98,37 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/", fileServer)
 }
 
-// Start begins serving HTTP.
+// Start begins serving HTTP. It signals WaitReady once the listener is bound,
+// or sends the bind error so the caller can fail fast.
 func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.cfg.Listen)
+	if err != nil {
+		s.readyCh <- err
+		return err
+	}
+	// Preserve the configured hostname (e.g. "localhost") and only take
+	// the port from the actual listener, so OIDC redirect URIs match
+	// what users configure in Vault's allowed_redirect_uris.
+	host, _, _ := net.SplitHostPort(s.cfg.Listen)
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	s.listenAddr = net.JoinHostPort(host, port)
+
 	s.server = &http.Server{
-		Addr:    s.cfg.Listen,
 		Handler: s.middleware(s.mux),
 	}
 
-	slog.Info("starting web UI", "listen", s.cfg.Listen)
-	err := s.server.ListenAndServe()
-	if err == http.ErrServerClosed {
-		return nil
+	slog.Info("starting web UI", "listen", s.listenAddr)
+	s.readyCh <- nil // signal ready
+
+	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
 	}
-	return err
+	return nil
+}
+
+// WaitReady blocks until the web server is listening and returns any startup error.
+func (s *Server) WaitReady() error {
+	return <-s.readyCh
 }
 
 // Shutdown gracefully stops the server.

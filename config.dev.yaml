@@ -1,0 +1,21 @@
+vault:
+  address: "http://127.0.0.1:8200"
+  auth_method: "oidc"
+  tls_skip_verify: true
+
+sync:
+  interval: "15m"
+
+web:
+  enabled: true
+  listen: "127.0.0.1:9000"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      template: |
+        github.com:
+          oauth_token: "{{.token}}"

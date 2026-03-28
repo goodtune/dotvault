@@ -2,6 +2,24 @@
 
 A cross-platform daemon that runs in user context, authenticates to [HashiCorp Vault](https://www.vaultproject.io/), and performs one-way synchronisation of KVv2 secrets into local configuration files. It is intended to run as a long-lived daemon but can also be run interactively for one-off syncs.
 
+## Why `dotvault`?
+
+If you distribute system-level configuration to a fleet of machines — via NixOS, Ansible, Puppet, or similar — you can manage the _structure_ of dotfiles centrally. But when those files need personal secrets (API tokens, OAuth credentials, private keys), there is a gap.
+
+**Template tools own the whole file.** `vault agent` and `consul-template` render a complete file from a template on every pass. If a user adds a genuinely useful entry to their `config.yaml`, the next render obliterates it. Baking every possible user preference into the template as an optional field is laborious and doesn't scale when you typically need to place just a handful of KV pairs — often only one — into any given file.
+
+**`dotvault` takes a surgical approach.** Instead of owning the file, it _merges_ secret values into the coordinates where they're needed, leaving the rest of the file intact. Sysops define the rules; users remain free to customise their own dotfiles without fear of losing changes.
+
+### Designed as a user service
+
+`dotvault` is intended to run as a per-user service. Sysops configure desktops and remote Linux machines to launch it in a user context so that each person has their own daemon, their own Vault identity, and their own secrets.
+
+On desktop environments it runs a local web service. If the current session is unauthenticated, `dotvault` launches a browser at its login page, triggering an OIDC authentication flow against Vault. When this is wired into an SSO provider, users are authenticated more or less transparently — no manual token juggling required.
+
+### Roadmap: OAuth token capture
+
+A planned feature is performing OAuth device-authorisation flows for common services such as GitHub. `dotvault` would complete the flow, capture the resulting OAuth token, persist it into Vault under the user's path, and then synchronise it out to the appropriate config files (e.g. `~/.config/gh/hosts.yml`) on every machine where `dotvault` is running. Log in once, authenticated everywhere.
+
 ## Overview
 
 `dotvault` bridges the gap between centralised secret management and the dotfiles that CLI tools expect on disk. Define rules mapping Vault KV paths to local files, and `dotvault` keeps them in sync — polling for changes, merging safely, and re-syncing if files are modified or deleted externally.

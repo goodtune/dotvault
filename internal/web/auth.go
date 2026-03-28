@@ -10,8 +10,9 @@ import (
 )
 
 // AuthStartURL returns the URL to open in a browser to start OIDC auth.
+// It uses the actual bound listener address so it works even with ephemeral ports.
 func (s *Server) AuthStartURL() string {
-	return fmt.Sprintf("http://%s/auth/start", s.cfg.Listen)
+	return fmt.Sprintf("http://%s/auth/start", s.listenAddr)
 }
 
 // WaitForAuth blocks until authentication completes or the context is cancelled.
@@ -30,7 +31,7 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		mount = "oidc"
 	}
 
-	callbackURL := fmt.Sprintf("http://%s/auth/callback", s.cfg.Listen)
+	callbackURL := fmt.Sprintf("http://%s/auth/callback", s.listenAddr)
 
 	data := map[string]interface{}{
 		"redirect_uri": callbackURL,

@@ -32,6 +32,7 @@ type Server struct {
 	tokenFilePath string
 	authDone      chan struct{}
 	readyCh       chan error
+	listenAddr    string
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -105,12 +106,13 @@ func (s *Server) Start() error {
 		s.readyCh <- err
 		return err
 	}
+	s.listenAddr = ln.Addr().String()
 
 	s.server = &http.Server{
 		Handler: s.middleware(s.mux),
 	}
 
-	slog.Info("starting web UI", "listen", s.cfg.Listen)
+	slog.Info("starting web UI", "listen", s.listenAddr)
 	s.readyCh <- nil // signal ready
 
 	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {

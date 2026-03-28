@@ -237,15 +237,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
 	lifecycleErrCh := lm.Start(ctx)
 	go func() {
-		reauthOpened := false
+		const reauthCooldown = 10 * time.Minute
+		var lastReauthOpen time.Time
+
 		for err := range lifecycleErrCh {
 			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
-			if webServer != nil && cfg.Vault.AuthMethod == "oidc" && !reauthOpened {
-				reauthOpened = true
-				url := webServer.AuthStartURL()
-				slog.Info("opening browser for re-authentication", "url", url)
-				if err := browser.OpenURL(url); err != nil {
-					slog.Warn("failed to open browser for re-auth", "url", url, "error", err)
+			if webServer != nil && cfg.Vault.AuthMethod == "oidc" {
+				if lastReauthOpen.IsZero() || time.Since(lastReauthOpen) >= reauthCooldown {
+					lastReauthOpen = time.Now()
+					url := webServer.AuthStartURL()
+					slog.Info("opening browser for re-authentication", "url", url)
+					if err := browser.OpenURL(url); err != nil {
+						slog.Warn("failed to open browser for re-auth", "url", url, "error", err)
+					}
 				}
 			}
 		}

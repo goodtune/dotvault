@@ -30,10 +30,11 @@ func newFakeVaultServer(t *testing.T, handler http.HandlerFunc) *vault.Client {
 func authTestServer(t *testing.T, vc *vault.Client) *Server {
 	t.Helper()
 	return &Server{
-		cfg:       config.WebConfig{Listen: "127.0.0.1:0"},
-		vault:     vc,
-		authDone:  make(chan struct{}, 1),
-		authMount: "oidc",
+		cfg:        config.WebConfig{Listen: "127.0.0.1:0"},
+		vault:      vc,
+		authDone:   make(chan struct{}, 1),
+		authMount:  "oidc",
+		listenAddr: "127.0.0.1:8250",
 	}
 }
 

@@ -193,6 +193,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				}
 			}()
 			defer webServer.Shutdown(ctx)
+
+			// Wait for the server to start listening before proceeding.
+			// This ensures WaitForAuth cannot block if the server failed to bind.
+			if err := webServer.WaitReady(); err != nil {
+				return fmt.Errorf("web server failed to start: %w", err)
+			}
 		}
 	}
 

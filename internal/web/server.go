@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -30,6 +31,7 @@ type Server struct {
 	authRole      string
 	tokenFilePath string
 	authDone      chan struct{}
+	readyCh       chan error
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -64,6 +66,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authRole:      sc.VaultCfg.AuthRole,
 		tokenFilePath: sc.TokenFilePath,
 		authDone:      make(chan struct{}, 1),
+		readyCh:       make(chan error, 1),
 	}
 
 	s.registerRoutes()
@@ -94,19 +97,31 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/", fileServer)
 }
 
-// Start begins serving HTTP.
+// Start begins serving HTTP. It signals WaitReady once the listener is bound,
+// or sends the bind error so the caller can fail fast.
 func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.cfg.Listen)
+	if err != nil {
+		s.readyCh <- err
+		return err
+	}
+
 	s.server = &http.Server{
-		Addr:    s.cfg.Listen,
 		Handler: s.middleware(s.mux),
 	}
 
 	slog.Info("starting web UI", "listen", s.cfg.Listen)
-	err := s.server.ListenAndServe()
-	if err == http.ErrServerClosed {
-		return nil
+	s.readyCh <- nil // signal ready
+
+	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
 	}
-	return err
+	return nil
+}
+
+// WaitReady blocks until the web server is listening and returns any startup error.
+func (s *Server) WaitReady() error {
+	return <-s.readyCh
 }
 
 // Shutdown gracefully stops the server.

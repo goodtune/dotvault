@@ -43,6 +43,11 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to initiate authentication", http.StatusInternalServerError)
 		return
 	}
+	if secret == nil || secret.Data == nil {
+		slog.Error("nil or empty response getting OIDC auth URL from Vault")
+		http.Error(w, "Failed to get authentication URL", http.StatusInternalServerError)
+		return
+	}
 
 	authURL, ok := secret.Data["auth_url"].(string)
 	if !ok || authURL == "" {
@@ -51,7 +56,7 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("redirecting to OIDC provider", "url", authURL)
+	slog.Info("redirecting to OIDC provider")
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 

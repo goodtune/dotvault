@@ -18,6 +18,13 @@ export function App() {
     loadStatus();
   }, []);
 
+  // Poll for dashboard updates when authenticated.
+  useEffect(() => {
+    if (!status?.authenticated) return;
+    const interval = setInterval(loadData, 30000);
+    return () => clearInterval(interval);
+  }, [status?.authenticated]);
+
   async function loadStatus() {
     try {
       const statusData = await getStatus();
@@ -63,13 +70,6 @@ export function App() {
       ),
     );
   }
-
-  // Start polling for dashboard updates after auth.
-  useEffect(() => {
-    if (!status?.authenticated) return;
-    const interval = setInterval(loadData, 30000);
-    return () => clearInterval(interval);
-  }, [status?.authenticated]);
 
   const oauthRules = rules.filter(r => r.has_oauth);
 

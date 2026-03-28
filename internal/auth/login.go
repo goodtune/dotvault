@@ -136,6 +136,7 @@ func (lt *LoginTracker) waitForTOTP(ctx context.Context, session *loginSession, 
 			lt.mu.Lock()
 			session.status.Token = token
 			session.status.State = "authenticated"
+			session.status.Error = ""
 			lt.mu.Unlock()
 			return
 		case <-ctx.Done():

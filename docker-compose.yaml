@@ -19,6 +19,22 @@ services:
       retries: 10
       start_period: 5s
 
+  dex:
+    image: dexidp/dex:v2.41.1
+    container_name: dotvault-dex
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex.yaml:/etc/dex/config.yaml:ro
+      - dex-data:/var/dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   vault-init:
     image: hashicorp/vault:1.21
     container_name: dotvault-vault-init
@@ -89,3 +105,4 @@ services:
 
 volumes:
   vault-data:
+  dex-data:

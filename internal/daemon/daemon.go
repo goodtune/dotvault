@@ -3,84 +3,72 @@ package daemon
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+
+	godaemon "github.com/sevlyar/go-daemon"
 
 	"github.com/goodtune/dotvault/internal/paths"
 )
 
-const envDaemonized = "_DOTVAULT_DAEMON"
-
-// IsDaemonized returns true if the current process was spawned by Daemonize.
-func IsDaemonized() bool {
-	return os.Getenv(envDaemonized) == "1"
+// Result is returned by Daemonize to describe which side of the fork we are on.
+type Result struct {
+	// PID is the child process ID (only meaningful in the parent).
+	PID int
+	// IsChild is true when we are the daemonized child process.
+	IsChild bool
+	// Release must be deferred by the child to clean up the PID file on exit.
+	// It is nil in the parent.
+	Release func()
 }
 
-// Daemonize re-executes the current binary as a detached background process.
-// It strips the --daemon flag from the arguments to prevent infinite recursion,
-// redirects output to a log file, writes a PID file, and returns the child PID.
-// The caller should exit after a successful call.
-func Daemonize() (int, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return 0, fmt.Errorf("resolve executable: %w", err)
-	}
-
-	args := filterFlag(os.Args[1:], "--daemon")
-
+// Daemonize forks the current process into the background using go-daemon.
+//
+// In the parent, Result.IsChild is false and the caller should print the PID
+// and exit. In the child, Result.IsChild is true and the caller should defer
+// Result.Release() then continue normal execution.
+func Daemonize() (*Result, error) {
 	logDir := paths.LogDir()
 	if err := os.MkdirAll(logDir, 0700); err != nil {
-		return 0, fmt.Errorf("create log directory: %w", err)
+		return nil, fmt.Errorf("create log directory: %w", err)
 	}
 
-	logFile, err := os.OpenFile(
-		filepath.Join(logDir, "daemon.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0600,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("open log file: %w", err)
-	}
-
-	cmd := exec.Command(exe, args...)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.Env = append(os.Environ(), envDaemonized+"=1")
-
-	detach(cmd)
-
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return 0, fmt.Errorf("start daemon: %w", err)
-	}
-
-	pid := cmd.Process.Pid
-
-	// Write PID file for later management.
 	pidDir := paths.CacheDir()
-	if err := os.MkdirAll(pidDir, 0700); err == nil {
-		_ = os.WriteFile(filepath.Join(pidDir, "daemon.pid"), []byte(fmt.Sprintf("%d\n", pid)), 0600)
+	if err := os.MkdirAll(pidDir, 0700); err != nil {
+		return nil, fmt.Errorf("create cache directory: %w", err)
 	}
 
-	// Release the child so it survives our exit.
-	_ = cmd.Process.Release()
-	logFile.Close()
+	ctx := &godaemon.Context{
+		PidFileName: PIDFilePath(),
+		PidFilePerm: 0600,
+		LogFileName: filepath.Join(logDir, "daemon.log"),
+		LogFilePerm: 0600,
+		WorkDir:     "/",
+		Umask:       0o27,
+	}
 
-	return pid, nil
+	child, err := ctx.Reborn()
+	if err != nil {
+		return nil, fmt.Errorf("daemonize: %w", err)
+	}
+
+	if child != nil {
+		// Parent process: child is running in the background.
+		return &Result{PID: child.Pid}, nil
+	}
+
+	// Child process: hand back a release function for PID file cleanup.
+	return &Result{
+		IsChild: true,
+		Release: func() { ctx.Release() },
+	}, nil
+}
+
+// WasReborn returns true if the current process is the daemonized child.
+func WasReborn() bool {
+	return godaemon.WasReborn()
 }
 
 // PIDFilePath returns the path to the daemon PID file.
 func PIDFilePath() string {
 	return filepath.Join(paths.CacheDir(), "daemon.pid")
-}
-
-// filterFlag removes exact matches of flag from args.
-func filterFlag(args []string, flag string) []string {
-	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if a != flag {
-			out = append(out, a)
-		}
-	}
-	return out
 }

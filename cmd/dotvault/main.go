@@ -125,15 +125,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		if !cfg.Web.Enabled {
 			return fmt.Errorf("--daemon requires web.enabled=true in config")
 		}
-		pid, err := daemon.Daemonize()
+		res, err := daemon.Daemonize()
 		if err != nil {
 			return fmt.Errorf("daemonize: %w", err)
 		}
-		logDir := paths.LogDir()
-		fmt.Printf("dotvault daemon started (pid %d)\n", pid)
-		fmt.Printf("  logs: %s/daemon.log\n", logDir)
-		fmt.Printf("  pid:  %s\n", daemon.PIDFilePath())
-		return nil
+		if !res.IsChild {
+			// Parent: print info and exit.
+			logDir := paths.LogDir()
+			fmt.Printf("dotvault daemon started (pid %d)\n", res.PID)
+			fmt.Printf("  logs: %s/daemon.log\n", logDir)
+			fmt.Printf("  pid:  %s\n", daemon.PIDFilePath())
+			return nil
+		}
+		// Child: release PID file on exit, then fall through to run.
+		defer res.Release()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -226,7 +231,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// When running as a daemonized child, start the system tray
 			// icon (Windows task tray / macOS menu bar). Clicking the
 			// icon opens the web UI in the default browser.
-			if daemon.IsDaemonized() {
+			if daemon.WasReborn() {
 				daemon.StartTray(daemon.TrayConfig{
 					URL:    webServer.URL(),
 					Cancel: cancel,

@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -40,7 +38,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
-	rootCmd.Flags().BoolVar(&flagDaemon, "daemon", false, "fork to background as a service (requires web.enabled=true)")
+	rootCmd.Flags().BoolVar(&flagDaemon, "daemon", false, "run as a background service (requires web.enabled=true)")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -120,48 +118,48 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// --daemon: validate web.enabled then fork to background.
+	// --daemon: install and start as an OS-managed background service.
 	if flagDaemon {
 		if !cfg.Web.Enabled {
 			return fmt.Errorf("--daemon requires web.enabled=true in config")
 		}
-		res, err := daemon.Daemonize()
-		if err != nil {
-			return err
+		svcArgs := buildServiceArgs()
+		if err := daemon.Install(svcArgs); err != nil {
+			return fmt.Errorf("daemon: %w", err)
 		}
-		if !res.IsChild {
-			// Parent: print info and exit.
-			logDir := paths.LogDir()
-			fmt.Printf("dotvault daemon started (pid %d)\n", res.PID)
-			fmt.Printf("  logs: %s\n", filepath.Join(logDir, "daemon.log"))
-			fmt.Printf("  pid:  %s\n", daemon.PIDFilePath())
-			return nil
-		}
-		// Child: release PID file on exit, then fall through to run.
-		defer res.Release()
+		fmt.Println("dotvault installed and started as a background service")
+		fmt.Println("  manage with your OS service manager (sc/launchctl/systemctl)")
+		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Run the daemon via kardianos/service. When launched by the OS service
+	// manager (Windows SCM, launchd, systemd) it integrates with the native
+	// lifecycle. When run interactively it shuts down on SIGINT/SIGTERM.
+	return daemon.Run(func(ctx context.Context) error {
+		return runDaemonCore(ctx, cfg)
+	})
+}
 
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	go func() {
-		for sig := range sigCh {
-			switch sig {
-			case syscall.SIGINT, syscall.SIGTERM:
-				slog.Info("received shutdown signal", "signal", sig)
-				cancel()
-			case syscall.SIGHUP:
-				// TODO: Implement config reload on SIGHUP. This is deferred
-				// to a future release. For now, restart the daemon to pick
-				// up config changes.
-				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
-			}
-		}
-	}()
+// buildServiceArgs returns the CLI flags the OS service manager should pass
+// when it starts the dotvault binary (without --daemon to avoid recursion).
+func buildServiceArgs() []string {
+	var args []string
+	if flagConfig != "" {
+		args = append(args, "--config", flagConfig)
+	}
+	if flagLogLevel != "info" {
+		args = append(args, "--log-level", flagLogLevel)
+	}
+	if flagDryRun {
+		args = append(args, "--dry-run")
+	}
+	return args
+}
 
+// runDaemonCore contains the main daemon logic: vault client, web server,
+// authentication, and the sync loop. It is driven by the given context which
+// is cancelled by the service framework on shutdown.
+func runDaemonCore(ctx context.Context, cfg *config.Config) error {
 	username, err := paths.Username()
 	if err != nil {
 		return fmt.Errorf("resolve username: %w", err)
@@ -194,6 +192,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	statePath := filepath.Join(paths.CacheDir(), "state.json")
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
+
+	// Derive a cancel func from the context for the tray "Quit" action.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// Start web UI if enabled. We start it before authentication so it can
 	// serve the OIDC browser-based login flow.
@@ -228,10 +230,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("web server failed to start: %w", err)
 			}
 
-			// When running as a daemonized child, start the system tray
-			// icon (Windows task tray / macOS menu bar). Clicking the
-			// icon opens the web UI in the default browser.
-			if daemon.WasReborn() {
+			// When running as an OS-managed service, start the system tray
+			// icon (Windows task tray / macOS menu bar). Clicking the icon
+			// opens the web UI in the default browser.
+			if daemon.IsManaged() {
 				daemon.StartTray(daemon.TrayConfig{
 					URL:    webServer.URL(),
 					Cancel: cancel,

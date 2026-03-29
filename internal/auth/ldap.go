@@ -32,6 +32,7 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 
 	mfaMessagePrinted := false
 	totpPrompted := false
+	lastTOTPError := ""
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -50,8 +51,10 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 			case "pending":
 				continue
 			case "mfa_required":
-				if len(status.MFAMethods) > 0 && status.MFAMethods[0].UsesPasscode && (!totpPrompted || status.Error != "") {
+				newError := status.Error != "" && status.Error != lastTOTPError
+				if len(status.MFAMethods) > 0 && status.MFAMethods[0].UsesPasscode && (!totpPrompted || newError) {
 					totpPrompted = true
+					lastTOTPError = status.Error
 					passcode, err := promptPassword("MFA passcode: ")
 					if err != nil {
 						lt.Clear(sessionID)

@@ -3,11 +3,14 @@ package vault
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
+
+	vaultapi "github.com/hashicorp/vault/api"
 )
 
 func skipIfNoVault(t *testing.T) {
@@ -243,6 +246,57 @@ func TestValidateMFA(t *testing.T) {
 	if token != "hvs.mfa-validated-token" {
 		t.Errorf("token = %q, want %q", token, "hvs.mfa-validated-token")
 	}
+}
+
+func TestIsForbidden(t *testing.T) {
+	t.Run("direct ResponseError 403", func(t *testing.T) {
+		err := &vaultapi.ResponseError{StatusCode: http.StatusForbidden}
+		if !IsForbidden(err) {
+			t.Error("IsForbidden = false, want true for 403 ResponseError")
+		}
+	})
+
+	t.Run("wrapped ResponseError 403", func(t *testing.T) {
+		inner := &vaultapi.ResponseError{StatusCode: http.StatusForbidden}
+		wrapped := fmt.Errorf("token lookup-self: %w", inner)
+		if !IsForbidden(wrapped) {
+			t.Error("IsForbidden = false, want true for wrapped 403 ResponseError")
+		}
+	})
+
+	t.Run("ResponseError non-403", func(t *testing.T) {
+		err := &vaultapi.ResponseError{StatusCode: http.StatusNotFound}
+		if IsForbidden(err) {
+			t.Error("IsForbidden = true, want false for 404 ResponseError")
+		}
+	})
+
+	t.Run("plain error", func(t *testing.T) {
+		err := fmt.Errorf("connection refused")
+		if IsForbidden(err) {
+			t.Error("IsForbidden = true, want false for non-ResponseError")
+		}
+	})
+
+	t.Run("via LookupSelf mock server", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer ts.Close()
+
+		c, err := NewClient(Config{Address: ts.URL, Token: "bad-token"})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+
+		_, lookupErr := c.LookupSelf(context.Background())
+		if lookupErr == nil {
+			t.Fatal("LookupSelf: expected error, got nil")
+		}
+		if !IsForbidden(lookupErr) {
+			t.Errorf("IsForbidden = false, want true for LookupSelf 403 response; err = %v", lookupErr)
+		}
+	})
 }
 
 func seedTestSecret(t *testing.T, c *Client) {

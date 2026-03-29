@@ -53,11 +53,15 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				return
 			case <-timer.C:
 				if err := lm.checkAndRenew(ctx); err != nil {
-					slog.Warn("token lifecycle check failed", "error", err, "next_retry", lm.currentDelay*2)
-					lm.needsReauth.Store(true)
-					select {
-					case errCh <- err:
-					default:
+					if vault.IsForbidden(err) {
+						slog.Warn("vault token forbidden (403), re-authentication required")
+						lm.needsReauth.Store(true)
+						select {
+						case errCh <- err:
+						default:
+						}
+					} else {
+						slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", lm.currentDelay*2)
 					}
 					// Exponential backoff on failure, capped at maxDelay
 					lm.currentDelay *= 2
@@ -79,10 +83,6 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	secret, err := lm.client.LookupSelf(ctx)
 	if err != nil {
-		if vault.IsForbidden(err) {
-			slog.Warn("token forbidden (403), re-authentication required")
-			lm.needsReauth.Store(true)
-		}
 		return err
 	}
 

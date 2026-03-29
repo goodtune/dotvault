@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -288,7 +289,7 @@ func isNotFound(err error) bool {
 func IsForbidden(err error) bool {
 	var respErr *vaultapi.ResponseError
 	if errors.As(err, &respErr) {
-		return respErr.StatusCode == 403
+		return respErr.StatusCode == http.StatusForbidden
 	}
 	return false
 }

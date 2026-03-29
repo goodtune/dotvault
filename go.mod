@@ -6,6 +6,7 @@ require (
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+	github.com/sevlyar/go-daemon v0.1.6
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.38.0
 	golang.org/x/term v0.37.0
@@ -31,7 +32,6 @@ require (
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
-	github.com/sevlyar/go-daemon v0.1.6 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect

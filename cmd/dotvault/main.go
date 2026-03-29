@@ -40,7 +40,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
-	rootCmd.PersistentFlags().BoolVar(&flagDaemon, "daemon", false, "fork to background as a service (requires web.enabled=true)")
+	rootCmd.Flags().BoolVar(&flagDaemon, "daemon", false, "fork to background as a service (requires web.enabled=true)")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -236,6 +236,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					URL:    webServer.URL(),
 					Cancel: cancel,
 				})
+				defer daemon.StopTray()
 			}
 		}
 	}

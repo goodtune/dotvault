@@ -10,3 +10,6 @@ import "log/slog"
 func StartTray(cfg TrayConfig) {
 	slog.Info("daemon running — menu bar icon not available in this build; open the web UI manually", "url", cfg.URL)
 }
+
+// StopTray is a no-op on macOS builds without native tray support.
+func StopTray() {}

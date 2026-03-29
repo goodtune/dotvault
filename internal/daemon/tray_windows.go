@@ -5,6 +5,7 @@ package daemon
 import (
 	"log/slog"
 	"runtime"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/pkg/browser"
@@ -97,7 +98,7 @@ type msg struct {
 // package-level state for the window procedure callback
 var trayState struct {
 	cfg  TrayConfig
-	hwnd uintptr
+	hwnd atomic.Uintptr
 	nid  notifyIconData
 }
 
@@ -113,10 +114,11 @@ func StartTray(cfg TrayConfig) {
 // icon. It can be called from non-tray shutdown paths (e.g., signal handlers)
 // to avoid leaving a stale notification icon in the system tray.
 func StopTray() {
-	if trayState.hwnd == 0 {
+	hwnd := trayState.hwnd.Load()
+	if hwnd == 0 {
 		return
 	}
-	procPostMessage.Call(trayState.hwnd, uintptr(wmClose), 0, 0)
+	procPostMessage.Call(hwnd, uintptr(wmClose), 0, 0)
 }
 
 func runTrayLoop() {
@@ -150,7 +152,7 @@ func runTrayLoop() {
 		slog.Error("failed to create tray window", "error", err)
 		return
 	}
-	trayState.hwnd = hwnd
+	trayState.hwnd.Store(hwnd)
 
 	// Load default application icon.
 	icon, _, _ := procLoadIcon.Call(0, uintptr(32512)) // IDI_APPLICATION

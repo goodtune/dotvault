@@ -45,3 +45,43 @@ export async function triggerSync() {
     headers: { 'X-CSRF-Token': token },
   });
 }
+
+export async function loginLDAP(username, password) {
+  const token = await getCSRFToken();
+  return fetchJSON('/auth/ldap/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function getLDAPStatus(sessionID) {
+  return fetchJSON(`/auth/ldap/status?session=${encodeURIComponent(sessionID)}`);
+}
+
+export async function submitTOTP(sessionID, passcode) {
+  const token = await getCSRFToken();
+  return fetchJSON('/auth/ldap/totp', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify({ session_id: sessionID, passcode }),
+  });
+}
+
+export async function loginToken(vaultToken) {
+  const token = await getCSRFToken();
+  return fetchJSON('/auth/token/login', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify({ token: vaultToken }),
+  });
+}

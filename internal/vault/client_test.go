@@ -2,6 +2,9 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
@@ -105,6 +108,140 @@ func TestListKVv2(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("ListKVv2 keys = %v, want to contain 'gh'", keys)
+	}
+}
+
+func TestLoginLDAP_NoMFA(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/ldap/login/testuser" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"request_id": "req-1",
+			"auth": map[string]any{
+				"client_token":   "hvs.test-token",
+				"lease_duration": 3600,
+				"renewable":      true,
+				"policies":       []string{"default"},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	result, err := c.LoginLDAP(context.Background(), "ldap", "testuser", "password123")
+	if err != nil {
+		t.Fatalf("LoginLDAP: %v", err)
+	}
+	if result.MFARequired {
+		t.Error("MFARequired = true, want false")
+	}
+	if result.Token != "hvs.test-token" {
+		t.Errorf("Token = %q, want %q", result.Token, "hvs.test-token")
+	}
+}
+
+func TestLoginLDAP_MFARequired(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"request_id": "req-2",
+			"auth": map[string]any{
+				"client_token": "",
+				"mfa_requirement": map[string]any{
+					"mfa_request_id": "mfa-req-123",
+					"mfa_constraints": map[string]any{
+						"duo_constraint": map[string]any{
+							"any": []map[string]any{
+								{
+									"type":          "duo",
+									"id":            "method-456",
+									"uses_passcode": false,
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	result, err := c.LoginLDAP(context.Background(), "ldap", "testuser", "password123")
+	if err != nil {
+		t.Fatalf("LoginLDAP: %v", err)
+	}
+	if !result.MFARequired {
+		t.Fatal("MFARequired = false, want true")
+	}
+	if result.MFARequestID != "mfa-req-123" {
+		t.Errorf("MFARequestID = %q, want %q", result.MFARequestID, "mfa-req-123")
+	}
+	if len(result.MFAMethods) != 1 {
+		t.Fatalf("len(MFAMethods) = %d, want 1", len(result.MFAMethods))
+	}
+	if result.MFAMethods[0].Type != "duo" {
+		t.Errorf("MFAMethods[0].Type = %q, want %q", result.MFAMethods[0].Type, "duo")
+	}
+	if result.MFAMethods[0].ID != "method-456" {
+		t.Errorf("MFAMethods[0].ID = %q, want %q", result.MFAMethods[0].ID, "method-456")
+	}
+	if result.MFAMethods[0].UsesPasscode {
+		t.Error("MFAMethods[0].UsesPasscode = true, want false")
+	}
+}
+
+func TestValidateMFA(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sys/mfa/validate" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+
+		if body["mfa_request_id"] != "mfa-req-123" {
+			t.Errorf("mfa_request_id = %v, want %q", body["mfa_request_id"], "mfa-req-123")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"request_id": "req-3",
+			"auth": map[string]any{
+				"client_token":   "hvs.mfa-validated-token",
+				"lease_duration": 3600,
+				"renewable":      true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	token, err := c.ValidateMFA(context.Background(), "mfa-req-123", "method-456", "")
+	if err != nil {
+		t.Fatalf("ValidateMFA: %v", err)
+	}
+	if token != "hvs.mfa-validated-token" {
+		t.Errorf("token = %q, want %q", token, "hvs.mfa-validated-token")
 	}
 }
 

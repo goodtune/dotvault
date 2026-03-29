@@ -208,12 +208,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if webServer != nil && cfg.Vault.AuthMethod == "oidc" {
-			// Web-based OIDC: open the browser to the web server's auth
-			// start page, which redirects through the Vault OIDC flow and
-			// back to the web server's callback to complete authentication.
-			url := webServer.AuthStartURL()
-			slog.Info("opening browser for OIDC authentication", "url", url)
+		if webServer != nil {
+			// All auth methods go through the web UI when enabled.
+			url := webServer.URL()
+			slog.Info("opening browser for authentication", "url", url)
 			if err := browser.OpenURL(url); err != nil {
 				slog.Warn("failed to open browser, please visit URL manually", "url", url, "error", err)
 			}
@@ -246,10 +244,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 		for err := range lifecycleErrCh {
 			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
-			if webServer != nil && cfg.Vault.AuthMethod == "oidc" {
+			if webServer != nil {
 				if lastReauthOpen.IsZero() || time.Since(lastReauthOpen) >= reauthCooldown {
 					lastReauthOpen = time.Now()
-					url := webServer.AuthStartURL()
+					url := webServer.URL()
 					slog.Info("opening browser for re-authentication", "url", url)
 					if err := browser.OpenURL(url); err != nil {
 						slog.Warn("failed to open browser for re-auth", "url", url, "error", err)

@@ -65,6 +65,25 @@ func TestHandleSyncRequiresCSRF(t *testing.T) {
 	}
 }
 
+func TestHandleStatus_AuthMethod(t *testing.T) {
+	s := testServer(t)
+	s.authMethod = "ldap"
+
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["auth_method"] != "ldap" {
+		t.Errorf("auth_method = %v, want %q", resp["auth_method"], "ldap")
+	}
+}
+
 func testServer(t *testing.T) *Server {
 	t.Helper()
 	return &Server{
@@ -85,5 +104,6 @@ func testServer(t *testing.T) *Server {
 		kvMount:    "secret",
 		userPrefix: "users/",
 		username:   "testuser",
+		authMethod: "oidc",
 	}
 }

@@ -4,6 +4,7 @@ import { StatusBar } from './components/status-bar.jsx';
 import { Sidebar } from './components/sidebar.jsx';
 import { SecretPanel } from './components/secret-panel.jsx';
 import { OAuthBanner } from './components/oauth-banner.jsx';
+import { LoginPage } from './components/login-page.jsx';
 import { getStatus, getRules, listSecrets } from './api.js';
 
 export function App() {
@@ -14,10 +15,27 @@ export function App() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    loadData();
+    loadStatus();
+  }, []);
+
+  // Poll for dashboard updates when authenticated.
+  useEffect(() => {
+    if (!status?.authenticated) return;
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [status?.authenticated]);
+
+  async function loadStatus() {
+    try {
+      const statusData = await getStatus();
+      setStatus(statusData);
+      if (statusData.authenticated) {
+        loadData();
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+  }
 
   async function loadData() {
     try {
@@ -33,6 +51,26 @@ export function App() {
     } catch (err) {
       setError(err.message);
     }
+  }
+
+  // Show login page if not authenticated.
+  if (status && !status.authenticated) {
+    return h(LoginPage, {
+      authMethod: status.auth_method,
+      onAuth: loadData,
+    });
+  }
+
+  // Loading state.
+  if (!status) {
+    return h('div', { class: 'login-container' },
+      h('div', { class: 'login-card' },
+        h('h1', { class: 'login-title' }, 'dotvault'),
+        error
+          ? h('p', { class: 'login-error' }, error)
+          : h('p', null, 'Loading...'),
+      ),
+    );
   }
 
   const oauthRules = rules.filter(r => r.has_oauth);

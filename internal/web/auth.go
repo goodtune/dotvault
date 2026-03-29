@@ -2,18 +2,16 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 )
-
-// AuthStartURL returns the URL to open in a browser to start OIDC auth.
-// It uses the actual bound listener address so it works even with ephemeral ports.
-func (s *Server) AuthStartURL() string {
-	return fmt.Sprintf("http://%s/auth/start", s.listenAddr)
-}
 
 // WaitForAuth blocks until authentication completes or the context is cancelled.
 func (s *Server) WaitForAuth(ctx context.Context) error {
@@ -31,7 +29,7 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 		mount = "oidc"
 	}
 
-	callbackURL := fmt.Sprintf("http://%s/auth/callback", s.listenAddr)
+	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)
 
 	data := map[string]interface{}{
 		"redirect_uri": callbackURL,
@@ -118,4 +116,154 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprint(w, "Authentication successful! You can close this window.")
+}
+
+func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
+		return
+	}
+
+	sessionID, err := generateSessionID()
+	if err != nil {
+		slog.Error("failed to generate session ID", "error", err)
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	mount := s.authMount
+	if mount == "" {
+		mount = "ldap"
+	}
+
+	s.login.StartLogin(sessionID, mount, req.Username, req.Password)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{"session_id": sessionID})
+}
+
+func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session")
+	if sessionID == "" {
+		http.Error(w, `{"error":"session parameter required"}`, http.StatusBadRequest)
+		return
+	}
+
+	status := s.login.GetStatus(sessionID)
+	if status == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Clear failed sessions to prevent unbounded growth.
+	if status.State == "failed" {
+		s.login.Clear(sessionID)
+	}
+
+	// If authenticated, consume the token server-side.
+	if status.State == "authenticated" && status.Token != "" {
+		s.vault.SetToken(status.Token)
+		if err := auth.WriteTokenFile(s.tokenFilePath, status.Token); err != nil {
+			slog.Warn("failed to write token file", "error", err)
+		}
+		s.login.Clear(sessionID)
+
+		slog.Info("LDAP authentication successful via web UI")
+
+		// Signal auth completion.
+		select {
+		case s.authDone <- struct{}{}:
+		default:
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		Passcode  string `json:"passcode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == "" || req.Passcode == "" {
+		http.Error(w, `{"error":"session_id and passcode required"}`, http.StatusBadRequest)
+		return
+	}
+
+	status := s.login.GetStatus(req.SessionID)
+	if status == nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	if status.State != "mfa_required" || len(status.MFAMethods) == 0 || !status.MFAMethods[0].UsesPasscode {
+		http.Error(w, `{"error":"passcode not expected for this session"}`, http.StatusBadRequest)
+		return
+	}
+
+	s.login.SubmitTOTP(req.SessionID, req.Passcode)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "submitted"})
+}
+
+func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Token == "" {
+		http.Error(w, `{"error":"token required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate the token, preserving any existing token on failure.
+	prevToken := s.vault.Token()
+	s.vault.SetToken(req.Token)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := s.vault.LookupSelf(ctx); err != nil {
+		s.vault.SetToken(prevToken)
+		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if err := auth.WriteTokenFile(s.tokenFilePath, req.Token); err != nil {
+		slog.Warn("failed to write token file", "error", err)
+	}
+
+	slog.Info("token authentication successful via web UI")
+
+	// Signal auth completion.
+	select {
+	case s.authDone <- struct{}{}:
+	default:
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"state": "authenticated"})
+}
+
+func generateSessionID() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }

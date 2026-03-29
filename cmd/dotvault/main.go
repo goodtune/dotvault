@@ -145,7 +145,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 func buildServiceArgs() []string {
 	var args []string
 	if flagConfig != "" {
-		args = append(args, "--config", flagConfig)
+		cfgPath := flagConfig
+		if abs, err := filepath.Abs(cfgPath); err == nil {
+			cfgPath = abs
+		}
+		args = append(args, "--config", cfgPath)
 	}
 	if flagLogLevel != "info" {
 		args = append(args, "--log-level", flagLogLevel)

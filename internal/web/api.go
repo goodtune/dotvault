@@ -16,6 +16,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"time":          time.Now().Format(time.RFC3339),
 	}
 
+	if s.loginTextHTML != "" {
+		status["login_text"] = s.loginTextHTML
+	}
+	if s.secretViewTextHTML != "" {
+		status["secret_view_text"] = s.secretViewTextHTML
+	}
+
 	if s.vault != nil && s.vault.Token() != "" {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()

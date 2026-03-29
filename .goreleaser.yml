@@ -2,7 +2,7 @@ version: 2
 
 before:
   hooks:
-    - cd internal/web/frontend && npm ci && npm run build
+    - sh -c "cd internal/web/frontend && npm ci && npm run build"
 
 builds:
   - main: ./cmd/dotvault

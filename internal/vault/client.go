@@ -282,3 +282,13 @@ func isNotFound(err error) bool {
 	}
 	return false
 }
+
+// IsForbidden returns true if the error is a Vault 403 response, indicating
+// the token is invalid, revoked, or lacks permissions.
+func IsForbidden(err error) bool {
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == 403
+	}
+	return false
+}

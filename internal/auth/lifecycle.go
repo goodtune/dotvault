@@ -79,6 +79,10 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	secret, err := lm.client.LookupSelf(ctx)
 	if err != nil {
+		if vault.IsForbidden(err) {
+			slog.Warn("token forbidden (403), re-authentication required")
+			lm.needsReauth.Store(true)
+		}
 		return err
 	}
 

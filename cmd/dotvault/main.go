@@ -133,7 +133,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// Parent: print info and exit.
 			logDir := paths.LogDir()
 			fmt.Printf("dotvault daemon started (pid %d)\n", res.PID)
-			fmt.Printf("  logs: %s/daemon.log\n", logDir)
+			fmt.Printf("  logs: %s\n", filepath.Join(logDir, "daemon.log"))
 			fmt.Printf("  pid:  %s\n", daemon.PIDFilePath())
 			return nil
 		}

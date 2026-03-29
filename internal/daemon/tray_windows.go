@@ -21,6 +21,7 @@ const (
 
 	wmApp        = 0x8000 // WM_APP
 	wmTrayMsg    = wmApp + 1
+	wmNull       = 0x0000
 	wmCommand    = 0x0111
 	wmLButtonUp  = 0x0202
 	wmRButtonUp  = 0x0205
@@ -108,6 +109,16 @@ func StartTray(cfg TrayConfig) {
 	go runTrayLoop()
 }
 
+// StopTray requests that the tray window close and clean up the notification
+// icon. It can be called from non-tray shutdown paths (e.g., signal handlers)
+// to avoid leaving a stale notification icon in the system tray.
+func StopTray() {
+	if trayState.hwnd == 0 {
+		return
+	}
+	procPostMessage.Call(trayState.hwnd, uintptr(wmClose), 0, 0)
+}
+
 func runTrayLoop() {
 	// Windows GUI calls must stay on one OS thread.
 	runtime.LockOSThread()
@@ -121,9 +132,13 @@ func runTrayLoop() {
 	}
 	wc.cbSize = uint32(unsafe.Sizeof(wc))
 
-	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	ret, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	if ret == 0 {
+		slog.Error("failed to register tray window class", "error", err)
+		return
+	}
 
-	hwnd, _, _ := procCreateWindowEx.Call(
+	hwnd, _, err := procCreateWindowEx.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		0, // no title
@@ -131,6 +146,10 @@ func runTrayLoop() {
 		0, 0, 0, 0,
 		0, 0, 0, 0,
 	)
+	if hwnd == 0 {
+		slog.Error("failed to create tray window", "error", err)
+		return
+	}
 	trayState.hwnd = hwnd
 
 	// Load default application icon.
@@ -147,7 +166,11 @@ func runTrayLoop() {
 	copy(nid.szTip[:], windows.StringToUTF16("DotVault — Secret Sync Daemon"))
 	trayState.nid = nid
 
-	procShellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+	ret, _, err = procShellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+	if ret == 0 {
+		slog.Error("failed to add system tray icon", "error", err)
+		return
+	}
 
 	slog.Info("system tray icon added")
 
@@ -156,6 +179,10 @@ func runTrayLoop() {
 	for {
 		ret, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if ret == 0 { // WM_QUIT
+			break
+		}
+		if ret == ^uintptr(0) { // -1: error
+			slog.Error("GetMessageW returned error, exiting tray loop")
 			break
 		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
@@ -216,5 +243,6 @@ func showContextMenu(hwnd uintptr) {
 
 	procSetForegroundWnd.Call(hwnd)
 	procTrackPopupMenu.Call(menu, tpmLeftAlign|tpmBottomAlign, uintptr(pt.x), uintptr(pt.y), 0, hwnd, 0)
+	procPostMessage.Call(hwnd, wmNull, 0, 0)
 	procDestroyMenu.Call(menu)
 }

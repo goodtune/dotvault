@@ -32,6 +32,13 @@ Section "Install"
   File "${BINARY}"
   File "LICENSE"
 
+  ; Install Group Policy ADMX/ADML templates
+  SetOutPath "$SYSDIR\..\PolicyDefinitions"
+  File "dotvault.admx"
+  SetOutPath "$SYSDIR\..\PolicyDefinitions\en-US"
+  File "en-US\dotvault.adml"
+  SetOutPath "$INSTDIR"
+
   ; Add $INSTDIR to system PATH if not already present
   ReadRegStr $0 HKLM "${PATH_KEY}" "Path"
   StrCmp $0 "" 0 +2
@@ -85,6 +92,10 @@ Section "Uninstall"
 
   Delete "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
+
+  ; Remove Group Policy ADMX/ADML templates
+  Delete "$SYSDIR\..\PolicyDefinitions\dotvault.admx"
+  Delete "$SYSDIR\..\PolicyDefinitions\en-US\dotvault.adml"
 
   ; Remove $INSTDIR from system PATH
   ReadRegStr $0 HKLM "${PATH_KEY}" "Path"

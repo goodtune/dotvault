@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  dotvault Group Policy Administrative Template (ADMX)
+
+  Deploy this file to:
+    %SystemRoot%\PolicyDefinitions\dotvault.admx          (local)
+    \\domain\SYSVOL\domain\Policies\PolicyDefinitions\    (central store)
+
+  Deploy the matching ADML file to the en-US subdirectory.
+
+  Registry paths used:
+    Machine: HKLM\SOFTWARE\Policies\dotvault
+    User:    HKCU\SOFTWARE\Policies\dotvault
+
+  Both paths are administrator-controlled. When any policy key is
+  present, dotvault ignores file-based configuration entirely.
+
+  Rules (sync rules) are complex multi-field objects that cannot be
+  fully expressed as ADMX policies. Configure rules via Group Policy
+  Preferences > Registry, targeting:
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\VaultKey      (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetPath    (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetFormat  (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetTemplate (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetMerge   (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\Description   (REG_SZ)
+  Optional OAuth subkey:
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\EnginePath (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Provider   (REG_SZ)
+    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Scopes     (REG_MULTI_SZ)
+-->
+<policyDefinitions
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    revision="1.0"
+    schemaVersion="1.0"
+    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+
+  <policyNamespaces>
+    <target prefix="dotvault" namespace="goodtune.dotvault" />
+  </policyNamespaces>
+
+  <resources minRequiredRevision="1.0" />
+
+  <categories>
+    <category name="Dotvault" displayName="$(string.Cat_Dotvault)" />
+    <category name="Vault" displayName="$(string.Cat_Vault)">
+      <parentCategory ref="Dotvault" />
+    </category>
+    <category name="Sync" displayName="$(string.Cat_Sync)">
+      <parentCategory ref="Dotvault" />
+    </category>
+    <category name="WebUI" displayName="$(string.Cat_WebUI)">
+      <parentCategory ref="Dotvault" />
+    </category>
+  </categories>
+
+  <policies>
+
+    <!-- ============================================================= -->
+    <!-- Vault Settings                                                  -->
+    <!-- ============================================================= -->
+
+    <policy name="VaultAddress"
+            class="Both"
+            displayName="$(string.VaultAddress)"
+            explainText="$(string.VaultAddress_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultAddress)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultAddress_Value" valueName="Address" required="true" />
+      </elements>
+    </policy>
+
+    <policy name="VaultCACert"
+            class="Both"
+            displayName="$(string.VaultCACert)"
+            explainText="$(string.VaultCACert_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultCACert)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultCACert_Value" valueName="CACert" />
+      </elements>
+    </policy>
+
+    <policy name="VaultTLSSkipVerify"
+            class="Both"
+            displayName="$(string.VaultTLSSkipVerify)"
+            explainText="$(string.VaultTLSSkipVerify_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            valueName="TLSSkipVerify">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+
+    <policy name="VaultKVMount"
+            class="Both"
+            displayName="$(string.VaultKVMount)"
+            explainText="$(string.VaultKVMount_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultKVMount)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultKVMount_Value" valueName="KVMount" />
+      </elements>
+    </policy>
+
+    <policy name="VaultUserPrefix"
+            class="Both"
+            displayName="$(string.VaultUserPrefix)"
+            explainText="$(string.VaultUserPrefix_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultUserPrefix)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultUserPrefix_Value" valueName="UserPrefix" />
+      </elements>
+    </policy>
+
+    <policy name="VaultAuthMethod"
+            class="Both"
+            displayName="$(string.VaultAuthMethod)"
+            explainText="$(string.VaultAuthMethod_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultAuthMethod)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <enum id="VaultAuthMethod_Value" valueName="AuthMethod">
+          <item displayName="$(string.AuthMethod_OIDC)"><value><string>oidc</string></value></item>
+          <item displayName="$(string.AuthMethod_LDAP)"><value><string>ldap</string></value></item>
+          <item displayName="$(string.AuthMethod_Token)"><value><string>token</string></value></item>
+        </enum>
+      </elements>
+    </policy>
+
+    <policy name="VaultAuthRole"
+            class="Both"
+            displayName="$(string.VaultAuthRole)"
+            explainText="$(string.VaultAuthRole_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultAuthRole)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultAuthRole_Value" valueName="AuthRole" />
+      </elements>
+    </policy>
+
+    <policy name="VaultAuthMount"
+            class="Both"
+            displayName="$(string.VaultAuthMount)"
+            explainText="$(string.VaultAuthMount_Help)"
+            key="SOFTWARE\Policies\dotvault\Vault"
+            presentation="$(presentation.VaultAuthMount)">
+      <parentCategory ref="Vault" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="VaultAuthMount_Value" valueName="AuthMount" />
+      </elements>
+    </policy>
+
+    <!-- ============================================================= -->
+    <!-- Sync Settings                                                   -->
+    <!-- ============================================================= -->
+
+    <policy name="SyncInterval"
+            class="Both"
+            displayName="$(string.SyncInterval)"
+            explainText="$(string.SyncInterval_Help)"
+            key="SOFTWARE\Policies\dotvault\Sync"
+            presentation="$(presentation.SyncInterval)">
+      <parentCategory ref="Sync" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="SyncInterval_Value" valueName="Interval" />
+      </elements>
+    </policy>
+
+    <!-- ============================================================= -->
+    <!-- Web UI Settings                                                 -->
+    <!-- ============================================================= -->
+
+    <policy name="WebEnabled"
+            class="Both"
+            displayName="$(string.WebEnabled)"
+            explainText="$(string.WebEnabled_Help)"
+            key="SOFTWARE\Policies\dotvault\Web"
+            valueName="Enabled">
+      <parentCategory ref="WebUI" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+
+    <policy name="WebListen"
+            class="Both"
+            displayName="$(string.WebListen)"
+            explainText="$(string.WebListen_Help)"
+            key="SOFTWARE\Policies\dotvault\Web"
+            presentation="$(presentation.WebListen)">
+      <parentCategory ref="WebUI" />
+      <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
+      <elements>
+        <text id="WebListen_Value" valueName="Listen" />
+      </elements>
+    </policy>
+
+  </policies>
+</policyDefinitions>

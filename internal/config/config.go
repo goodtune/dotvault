@@ -39,8 +39,10 @@ type SyncConfig struct {
 
 // WebConfig holds optional web UI settings.
 type WebConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Listen  string `yaml:"listen"`
+	Enabled        bool   `yaml:"enabled"`
+	Listen         string `yaml:"listen"`
+	LoginText      string `yaml:"login_text"`
+	SecretViewText string `yaml:"secret_view_text"`
 }
 
 // Rule defines a single sync rule.

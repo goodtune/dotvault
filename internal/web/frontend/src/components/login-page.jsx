@@ -2,25 +2,26 @@ import { h } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { loginLDAP, getLDAPStatus, submitTOTP, loginToken } from '../api.js';
 
-export function LoginPage({ authMethod, onAuth }) {
-  if (authMethod === 'oidc') return h(OIDCLogin, null);
-  if (authMethod === 'ldap') return h(LDAPLogin, { onAuth });
-  if (authMethod === 'token') return h(TokenLogin, { onAuth });
+export function LoginPage({ authMethod, onAuth, customText }) {
+  if (authMethod === 'oidc') return h(OIDCLogin, { customText });
+  if (authMethod === 'ldap') return h(LDAPLogin, { onAuth, customText });
+  if (authMethod === 'token') return h(TokenLogin, { onAuth, customText });
   return h('div', { class: 'login-container' },
     h('p', { class: 'login-error' }, `Unknown auth method: ${authMethod}`),
   );
 }
 
-function OIDCLogin() {
+function OIDCLogin({ customText }) {
   return h('div', { class: 'login-container' },
     h('div', { class: 'login-card' },
-      h('h1', { class: 'login-title' }, 'dotvault'),
+      h('h1', { class: 'login-title' }, '.vault'),
+      customText && h('div', { class: 'custom-text', dangerouslySetInnerHTML: { __html: customText } }),
       h('a', { class: 'login-btn', href: '/auth/oidc/start' }, 'Login with OIDC'),
     ),
   );
 }
 
-function LDAPLogin({ onAuth }) {
+function LDAPLogin({ onAuth, customText }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState(null);
@@ -89,7 +90,7 @@ function LDAPLogin({ onAuth }) {
   if (phase === 'polling' && (!mfaMethods.length || !mfaMethods.some(m => m.uses_passcode))) {
     return h('div', { class: 'login-container' },
       h('div', { class: 'login-card' },
-        h('h1', { class: 'login-title' }, 'dotvault'),
+        h('h1', { class: 'login-title' }, '.vault'),
         h('p', { class: 'login-mfa-wait' }, 'Waiting for MFA approval...'),
         h('p', { class: 'login-mfa-hint' }, 'Check your device'),
         error && h('p', { class: 'login-error' }, error),
@@ -100,7 +101,7 @@ function LDAPLogin({ onAuth }) {
   if (phase === 'totp') {
     return h('div', { class: 'login-container' },
       h('div', { class: 'login-card' },
-        h('h1', { class: 'login-title' }, 'dotvault'),
+        h('h1', { class: 'login-title' }, '.vault'),
         h('p', { class: 'login-subtitle' }, 'Enter MFA passcode'),
         error && h('p', { class: 'login-error' }, error),
         h('form', { onSubmit: handleTOTP },
@@ -123,7 +124,8 @@ function LDAPLogin({ onAuth }) {
 
   return h('div', { class: 'login-container' },
     h('div', { class: 'login-card' },
-      h('h1', { class: 'login-title' }, 'dotvault'),
+      h('h1', { class: 'login-title' }, '.vault'),
+      customText && h('div', { class: 'custom-text', dangerouslySetInnerHTML: { __html: customText } }),
       error && h('p', { class: 'login-error' }, error),
       h('form', { onSubmit: handleLogin },
         h('input', {
@@ -155,7 +157,7 @@ function LDAPLogin({ onAuth }) {
   );
 }
 
-function TokenLogin({ onAuth }) {
+function TokenLogin({ onAuth, customText }) {
   const [token, setToken] = useState('');
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -176,7 +178,8 @@ function TokenLogin({ onAuth }) {
 
   return h('div', { class: 'login-container' },
     h('div', { class: 'login-card' },
-      h('h1', { class: 'login-title' }, 'dotvault'),
+      h('h1', { class: 'login-title' }, '.vault'),
+      customText && h('div', { class: 'custom-text', dangerouslySetInnerHTML: { __html: customText } }),
       error && h('p', { class: 'login-error' }, error),
       h('form', { onSubmit: handleSubmit },
         h('input', {

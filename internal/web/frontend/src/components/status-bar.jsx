@@ -22,7 +22,7 @@ export function StatusBar({ status, onSync }) {
 
   return h('header', { class: 'status-bar' },
     h('div', { class: 'status-left' },
-      h('span', { class: 'app-title' }, 'dotvault'),
+      h('span', { class: 'app-title' }, '.vault'),
       h('span', { class: `status-indicator ${authClass}` }, authStatus),
     ),
     h('div', { class: 'status-right' },

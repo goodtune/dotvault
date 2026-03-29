@@ -2,9 +2,10 @@ import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { getSecret } from '../api.js';
 
-export function SecretPanel({ secretPath }) {
+export function SecretPanel({ secretPath, customText }) {
   const [secret, setSecret] = useState(null);
   const [revealed, setRevealed] = useState({});
+  const [copied, setCopied] = useState({});
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -44,9 +45,29 @@ export function SecretPanel({ secretPath }) {
     }
   }
 
+  async function copyField(field) {
+    const data = await getSecret(secretPath, true);
+    if (data && data.fields) {
+      const value = typeof data.fields[field] === 'object'
+        ? JSON.stringify(data.fields[field], null, 2)
+        : String(data.fields[field]);
+      await navigator.clipboard.writeText(value);
+      setCopied(prev => ({ ...prev, [field]: true }));
+      setTimeout(() => {
+        setCopied(prev => {
+          const next = { ...prev };
+          delete next[field];
+          return next;
+        });
+      }, 2000);
+    }
+  }
+
   if (!secretPath) {
     return h('main', { class: 'secret-panel' },
-      h('div', { class: 'panel-empty' }, 'Select a secret from the sidebar'),
+      customText
+        ? h('div', { class: 'custom-text', dangerouslySetInnerHTML: { __html: customText } })
+        : h('div', { class: 'panel-empty' }, 'Select a secret from the sidebar'),
     );
   }
 
@@ -88,12 +109,17 @@ export function SecretPanel({ secretPath }) {
                     : String(revealed[field]))
                 : h('span', { class: 'masked' }, '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'),
             ),
-            h('td', null,
+            h('td', { class: 'field-actions' },
               h('button', {
                 class: 'reveal-btn',
                 onClick: () => toggleReveal(field),
                 title: revealed[field] ? 'Hide' : 'Reveal',
               }, revealed[field] ? '\u{1F441}\u{FE0F}' : '\u{1F441}'),
+              h('button', {
+                class: 'copy-btn' + (copied[field] ? ' copied' : ''),
+                onClick: () => copyField(field),
+                title: copied[field] ? 'Copied!' : 'Copy to clipboard',
+              }, copied[field] ? '\u2705' : '\u{1F4CB}'),
             ),
           ),
         ),

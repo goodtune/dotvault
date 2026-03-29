@@ -37,8 +37,10 @@ const (
 )
 
 var (
+	kernel32              = windows.NewLazySystemDLL("kernel32.dll")
 	shell32               = windows.NewLazySystemDLL("shell32.dll")
 	user32                = windows.NewLazySystemDLL("user32.dll")
+	procGetModuleHandle   = kernel32.NewProc("GetModuleHandleW")
 	procShellNotifyIcon   = shell32.NewProc("Shell_NotifyIconW")
 	procLoadIcon          = user32.NewProc("LoadIconW")
 	procRegisterClassEx   = user32.NewProc("RegisterClassExW")
@@ -127,10 +129,12 @@ func runTrayLoop() {
 	defer runtime.UnlockOSThread()
 
 	className, _ := windows.UTF16PtrFromString("DotVaultTray")
+	hInstance, _, _ := procGetModuleHandle.Call(0)
 
 	wc := wndClassEx{
 		lpfnWndProc:   windows.NewCallback(wndProc),
 		lpszClassName: uintptr(unsafe.Pointer(className)),
+		hInstance:     hInstance,
 	}
 	wc.cbSize = uint32(unsafe.Sizeof(wc))
 
@@ -146,7 +150,7 @@ func runTrayLoop() {
 		0, // no title
 		0, // style
 		0, 0, 0, 0,
-		0, 0, 0, 0,
+		0, 0, hInstance, 0,
 	)
 	if hwnd == 0 {
 		slog.Error("failed to create tray window", "error", err)
@@ -191,8 +195,9 @@ func runTrayLoop() {
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
 	}
 
-	// Clean up tray icon on exit.
+	// Clean up tray icon on exit and reset handle so StopTray is safe to call after.
 	procShellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
+	trayState.hwnd.Store(0)
 }
 
 func wndProc(hwnd, msgID, wParam, lParam uintptr) uintptr {

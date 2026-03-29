@@ -127,7 +127,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 		res, err := daemon.Daemonize()
 		if err != nil {
-			return fmt.Errorf("daemonize: %w", err)
+			return err
 		}
 		if !res.IsChild {
 			// Parent: print info and exit.

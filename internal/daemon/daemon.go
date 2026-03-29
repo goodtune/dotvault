@@ -21,6 +21,9 @@ type program struct {
 }
 
 func (p *program) Start(s service.Service) error {
+	if p.runFunc == nil {
+		return fmt.Errorf("daemon: runFunc not set")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.done = make(chan error, 1)
@@ -85,7 +88,10 @@ func IsManaged() bool {
 	return !service.Interactive()
 }
 
-// PIDFilePath returns the path to the daemon PID file.
+// PIDFilePath returns the conventional filesystem path where a daemon PID
+// file may be stored. This package does not create or manage the PID file;
+// it is provided for external tooling or supervisors that want a stable
+// location.
 func PIDFilePath() string {
 	return filepath.Join(paths.CacheDir(), "daemon.pid")
 }

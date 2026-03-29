@@ -222,7 +222,9 @@ func wndProc(hwnd, msgID, wParam, lParam uintptr) uintptr {
 				slog.Warn("failed to open browser from tray", "error", err)
 			}
 		case idQuit:
-			trayState.cfg.Cancel()
+			if trayState.cfg.Cancel != nil {
+				trayState.cfg.Cancel()
+			}
 			procPostMessage.Call(hwnd, wmClose, 0, 0)
 		}
 		return 0

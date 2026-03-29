@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/daemon"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -26,6 +27,7 @@ var (
 	flagConfig   string
 	flagLogLevel string
 	flagDryRun   bool
+	flagDaemon   bool
 )
 
 func main() {
@@ -38,6 +40,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
+	rootCmd.PersistentFlags().BoolVar(&flagDaemon, "daemon", false, "fork to background as a service (requires web.enabled=true)")
 
 	rootCmd.AddCommand(
 		&cobra.Command{
@@ -115,6 +118,22 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	// --daemon: validate web.enabled then fork to background.
+	if flagDaemon {
+		if !cfg.Web.Enabled {
+			return fmt.Errorf("--daemon requires web.enabled=true in config")
+		}
+		pid, err := daemon.Daemonize()
+		if err != nil {
+			return fmt.Errorf("daemonize: %w", err)
+		}
+		logDir := paths.LogDir()
+		fmt.Printf("dotvault daemon started (pid %d)\n", pid)
+		fmt.Printf("  logs: %s/daemon.log\n", logDir)
+		fmt.Printf("  pid:  %s\n", daemon.PIDFilePath())
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,6 +221,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// This ensures WaitForAuth cannot block if the server failed to bind.
 			if err := webServer.WaitReady(); err != nil {
 				return fmt.Errorf("web server failed to start: %w", err)
+			}
+
+			// When running as a daemonized child, start the system tray
+			// icon (Windows task tray / macOS menu bar). Clicking the
+			// icon opens the web UI in the default browser.
+			if daemon.IsDaemonized() {
+				daemon.StartTray(daemon.TrayConfig{
+					URL:    webServer.URL(),
+					Cancel: cancel,
+				})
 			}
 		}
 	}

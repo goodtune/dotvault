@@ -74,6 +74,29 @@ var validFormats = map[string]bool{
 	"netrc": true,
 }
 
+// LoadSystem loads configuration using the platform-appropriate source.
+// On Windows, if Group Policy registry keys exist under
+// HKLM\SOFTWARE\Policies\dotvault or HKCU\SOFTWARE\Policies\dotvault,
+// configuration is loaded from the registry and the file-based config at
+// path is ignored. Machine-level values are read first, then user-level
+// values override them. Both paths are administrator-controlled via GPO.
+// On non-Windows platforms this falls back to Load(path).
+func LoadSystem(path string) (*Config, error) {
+	cfg, managed, err := loadFromRegistry()
+	if err != nil {
+		return nil, fmt.Errorf("read registry config: %w", err)
+	}
+	if managed {
+		slog.Info("configuration loaded from Windows Registry (Group Policy); file-based config is ignored",
+			"path", path)
+		if err := cfg.validate(); err != nil {
+			return nil, fmt.Errorf("validate registry config: %w", err)
+		}
+		return cfg, nil
+	}
+	return Load(path)
+}
+
 // Load reads and validates a config file at the given path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)

@@ -60,10 +60,12 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 					}
 					if vault.IsForbidden(err) {
 						slog.Warn("vault token forbidden (403), re-authentication required", "error", err, "next_retry", nextDelay)
-						lm.needsReauth.Store(true)
-						select {
-						case errCh <- err:
-						default:
+						if !lm.needsReauth.Load() {
+							lm.needsReauth.Store(true)
+							select {
+							case errCh <- err:
+							default:
+							}
 						}
 					} else {
 						slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", nextDelay)

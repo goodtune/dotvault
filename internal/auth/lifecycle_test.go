@@ -51,6 +51,10 @@ func TestLifecycleManager_NeedsReauth(t *testing.T) {
 
 func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/lookup-self" || r.Method != http.MethodGet {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		_ = json.NewEncoder(w).Encode(map[string][]string{
@@ -86,6 +90,10 @@ func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 
 func TestLifecycleManager_TransientErrorNoReauth(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/lookup-self" || r.Method != http.MethodGet {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string][]string{

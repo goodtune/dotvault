@@ -101,7 +101,7 @@ func loadConfig() (*config.Config, error) {
 	if path == "" {
 		path = paths.SystemConfigPath()
 	}
-	return config.Load(path)
+	return config.LoadSystem(path)
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {

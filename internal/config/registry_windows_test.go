@@ -42,17 +42,17 @@ func TestApplyRegistryLayerMerge(t *testing.T) {
 	}
 	applyRegistryLayer(cfg, machine)
 
-	// User layer overrides only AuthMethod.
-	user := registryLayer{
+	// Second layer overrides only AuthMethod.
+	override := registryLayer{
 		VaultAuthMethod: "oidc",
 	}
-	applyRegistryLayer(cfg, user)
+	applyRegistryLayer(cfg, override)
 
 	if cfg.Vault.Address != "https://vault.corp.example.com:8200" {
-		t.Errorf("Address = %q, want machine value", cfg.Vault.Address)
+		t.Errorf("Address = %q, want base value", cfg.Vault.Address)
 	}
 	if cfg.Vault.AuthMethod != "oidc" {
-		t.Errorf("AuthMethod = %q, want user override %q", cfg.Vault.AuthMethod, "oidc")
+		t.Errorf("AuthMethod = %q, want override %q", cfg.Vault.AuthMethod, "oidc")
 	}
 	if cfg.Sync.RawInterval != "15m" {
 		t.Errorf("RawInterval = %q, want machine value %q", cfg.Sync.RawInterval, "15m")

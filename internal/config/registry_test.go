@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"testing"
 )
 
@@ -56,7 +57,7 @@ func TestLoadSystemFileNotFound(t *testing.T) {
 	}
 	// When no registry config exists and the file is missing, LoadSystem
 	// should return an error.
-	_, err := LoadSystem("/nonexistent/path/config.yaml")
+	_, err := LoadSystem(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err == nil {
 		t.Fatal("expected error for missing config file")
 	}

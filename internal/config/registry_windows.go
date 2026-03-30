@@ -245,18 +245,26 @@ func readSingleRule(root registry.Key, name string) (Rule, error) {
 }
 
 // readRegString reads a REG_SZ value, returning ("", false) if not found.
+// Unexpected errors (e.g. type mismatch) are logged to aid GPO debugging.
 func readRegString(key registry.Key, name string) (string, bool) {
 	val, _, err := key.GetStringValue(name)
 	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			slog.Warn("unexpected error reading REG_SZ", "name", name, "error", err)
+		}
 		return "", false
 	}
 	return val, true
 }
 
 // readRegDWORD reads a REG_DWORD value, returning nil if not found.
+// Unexpected errors (e.g. type mismatch) are logged to aid GPO debugging.
 func readRegDWORD(key registry.Key, name string) *uint32 {
 	val, _, err := key.GetIntegerValue(name)
 	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			slog.Warn("unexpected error reading REG_DWORD", "name", name, "error", err)
+		}
 		return nil
 	}
 	v := uint32(val)
@@ -264,9 +272,13 @@ func readRegDWORD(key registry.Key, name string) *uint32 {
 }
 
 // readRegMultiString reads a REG_MULTI_SZ value, returning nil if not found.
+// Unexpected errors (e.g. type mismatch) are logged to aid GPO debugging.
 func readRegMultiString(key registry.Key, name string) []string {
 	val, _, err := key.GetStringsValue(name)
 	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			slog.Warn("unexpected error reading REG_MULTI_SZ", "name", name, "error", err)
+		}
 		return nil
 	}
 	return val

@@ -85,7 +85,11 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	defer key.Close()
 
 	// Read Vault subkey.
-	if vk, err := registry.OpenKey(root, registryPolicyPath+`\Vault`, registry.READ); err == nil {
+	vk, err := registry.OpenKey(root, registryPolicyPath+`\Vault`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Vault policy key: %w", err)
+	}
+	if err == nil {
 		defer vk.Close()
 		layer.VaultAddress, _ = readRegString(vk, "Address")
 		layer.VaultCACert, _ = readRegString(vk, "CACert")
@@ -98,13 +102,21 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read Sync subkey.
-	if sk, err := registry.OpenKey(root, registryPolicyPath+`\Sync`, registry.READ); err == nil {
+	sk, err := registry.OpenKey(root, registryPolicyPath+`\Sync`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Sync policy key: %w", err)
+	}
+	if err == nil {
 		defer sk.Close()
 		layer.SyncInterval, _ = readRegString(sk, "Interval")
 	}
 
 	// Read Web subkey.
-	if wk, err := registry.OpenKey(root, registryPolicyPath+`\Web`, registry.READ); err == nil {
+	wk, err := registry.OpenKey(root, registryPolicyPath+`\Web`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Web policy key: %w", err)
+	}
+	if err == nil {
 		defer wk.Close()
 		layer.WebEnabled = readRegDWORD(wk, "Enabled")
 		layer.WebListen, _ = readRegString(wk, "Listen")
@@ -214,7 +226,11 @@ func readSingleRule(root registry.Key, name string) (Rule, error) {
 
 	// Read optional OAuth settings.
 	oauthPath := path + `\OAuth`
-	if ok, oerr := registry.OpenKey(root, oauthPath, registry.READ); oerr == nil {
+	ok, oerr := registry.OpenKey(root, oauthPath, registry.READ)
+	if oerr != nil && !errors.Is(oerr, registry.ErrNotExist) {
+		return Rule{}, fmt.Errorf("open OAuth key at %s: %w", oauthPath, oerr)
+	}
+	if oerr == nil {
 		defer ok.Close()
 		oauth := &OAuthConfig{}
 		oauth.EnginePath, _ = readRegString(ok, "EnginePath")

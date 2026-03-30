@@ -63,7 +63,7 @@
     <!-- ============================================================= -->
 
     <policy name="VaultAddress"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultAddress)"
             explainText="$(string.VaultAddress_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -76,7 +76,7 @@
     </policy>
 
     <policy name="VaultCACert"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultCACert)"
             explainText="$(string.VaultCACert_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -89,7 +89,7 @@
     </policy>
 
     <policy name="VaultTLSSkipVerify"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultTLSSkipVerify)"
             explainText="$(string.VaultTLSSkipVerify_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -101,7 +101,7 @@
     </policy>
 
     <policy name="VaultKVMount"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultKVMount)"
             explainText="$(string.VaultKVMount_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -114,7 +114,7 @@
     </policy>
 
     <policy name="VaultUserPrefix"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultUserPrefix)"
             explainText="$(string.VaultUserPrefix_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -127,7 +127,7 @@
     </policy>
 
     <policy name="VaultAuthMethod"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultAuthMethod)"
             explainText="$(string.VaultAuthMethod_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -144,7 +144,7 @@
     </policy>
 
     <policy name="VaultAuthRole"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultAuthRole)"
             explainText="$(string.VaultAuthRole_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -157,7 +157,7 @@
     </policy>
 
     <policy name="VaultAuthMount"
-            class="Both"
+            class="Machine"
             displayName="$(string.VaultAuthMount)"
             explainText="$(string.VaultAuthMount_Help)"
             key="SOFTWARE\Policies\dotvault\Vault"
@@ -174,7 +174,7 @@
     <!-- ============================================================= -->
 
     <policy name="SyncInterval"
-            class="Both"
+            class="Machine"
             displayName="$(string.SyncInterval)"
             explainText="$(string.SyncInterval_Help)"
             key="SOFTWARE\Policies\dotvault\Sync"
@@ -191,7 +191,7 @@
     <!-- ============================================================= -->
 
     <policy name="WebEnabled"
-            class="Both"
+            class="Machine"
             displayName="$(string.WebEnabled)"
             explainText="$(string.WebEnabled_Help)"
             key="SOFTWARE\Policies\dotvault\Web"
@@ -203,7 +203,7 @@
     </policy>
 
     <policy name="WebListen"
-            class="Both"
+            class="Machine"
             displayName="$(string.WebListen)"
             explainText="$(string.WebListen_Help)"
             key="SOFTWARE\Policies\dotvault\Web"

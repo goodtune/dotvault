@@ -4,42 +4,7 @@ package config
 
 import (
 	"testing"
-
-	"golang.org/x/sys/windows/registry"
 )
-
-// testRegistryKey creates a temporary registry key under HKCU for testing
-// and returns a cleanup function. Tests use HKCU\SOFTWARE\dotvault-test
-// to avoid interfering with real configuration.
-func testCreatePolicyKey(t *testing.T, subkey string) registry.Key {
-	t.Helper()
-	key, _, err := registry.CreateKey(
-		registry.CURRENT_USER,
-		`SOFTWARE\Policies\dotvault-test\`+subkey,
-		registry.ALL_ACCESS,
-	)
-	if err != nil {
-		t.Fatalf("create test registry key: %v", err)
-	}
-	t.Cleanup(func() {
-		key.Close()
-		// Clean up the subkey tree. Walk bottom-up.
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test\`+subkey)
-	})
-	return key
-}
-
-func testCleanupPolicyRoot(t *testing.T) {
-	t.Helper()
-	t.Cleanup(func() {
-		// Best-effort cleanup of the test root keys.
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test\Rules`)
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test\Vault`)
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test\Sync`)
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test\Web`)
-		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\Policies\dotvault-test`)
-	})
-}
 
 func TestApplyRegistryLayer(t *testing.T) {
 	cfg := &Config{}

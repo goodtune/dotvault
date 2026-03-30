@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -10,44 +11,36 @@ import (
 )
 
 const (
-	// registryPolicyPath is the GPO-managed registry path. Both HKLM and HKCU
-	// keys under SOFTWARE\Policies are administrator-controlled — users cannot
-	// modify HKCU\SOFTWARE\Policies without elevated privileges.
+	// registryPolicyPath is the GPO-managed registry path. Policies are read
+	// from HKLM\SOFTWARE\Policies\dotvault only. HKCU is intentionally not
+	// used as a trusted policy source because it is normally user-writable.
 	registryPolicyPath = `SOFTWARE\Policies\dotvault`
 )
 
 // loadFromRegistry attempts to load configuration from Windows Registry
-// Group Policy keys. It reads machine-level values from HKLM and user-level
-// values from HKCU (both under SOFTWARE\Policies\dotvault), merging them
-// with user values taking precedence over machine values.
+// Group Policy keys. It reads machine-level values from
+// HKLM\SOFTWARE\Policies\dotvault. HKCU is not consulted because it is
+// user-writable and cannot be treated as a trusted policy boundary.
 //
 // Returns (nil, false, nil) if no GPO registry keys are found.
 func loadFromRegistry() (*Config, bool, error) {
-	machine, machineFound := readRegistryLayer(registry.LOCAL_MACHINE)
-	user, userFound := readRegistryLayer(registry.CURRENT_USER)
+	machine, machineFound, err := readRegistryLayer(registry.LOCAL_MACHINE)
+	if err != nil {
+		return nil, false, fmt.Errorf("read HKLM registry layer: %w", err)
+	}
 
-	if !machineFound && !userFound {
+	if !machineFound {
 		return nil, false, nil
 	}
 
 	cfg := &Config{}
 
-	// Apply machine-level values first.
-	if machineFound {
-		slog.Debug("loading machine-level registry configuration",
-			"key", `HKLM\`+registryPolicyPath)
-		applyRegistryLayer(cfg, machine)
-	}
+	slog.Debug("loading machine-level registry configuration",
+		"key", `HKLM\`+registryPolicyPath)
+	applyRegistryLayer(cfg, machine)
 
-	// Apply user-level values on top (user overrides machine).
-	if userFound {
-		slog.Debug("loading user-level registry configuration",
-			"key", `HKCU\`+registryPolicyPath)
-		applyRegistryLayer(cfg, user)
-	}
-
-	// Read rules from both layers, with user rules taking precedence by name.
-	rules, err := readRegistryRules(registry.LOCAL_MACHINE, registry.CURRENT_USER)
+	// Read rules from the machine-level policy key.
+	rules, err := readRegistryRules(registry.LOCAL_MACHINE)
 	if err != nil {
 		return nil, true, fmt.Errorf("read registry rules: %w", err)
 	}
@@ -77,13 +70,17 @@ type registryLayer struct {
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
-// Returns the layer and whether the key exists.
-func readRegistryLayer(root registry.Key) (registryLayer, bool) {
+// Returns the layer, whether the key exists, and any unexpected error.
+// A missing key (ErrNotExist) is not an error — it means no policy is set.
+func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	var layer registryLayer
 
 	key, err := registry.OpenKey(root, registryPolicyPath, registry.READ)
 	if err != nil {
-		return layer, false
+		if errors.Is(err, registry.ErrNotExist) {
+			return layer, false, nil
+		}
+		return layer, false, err
 	}
 	defer key.Close()
 
@@ -113,7 +110,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool) {
 		layer.WebListen, _ = readRegString(wk, "Listen")
 	}
 
-	return layer, true
+	return layer, true, nil
 }
 
 // applyRegistryLayer merges a registry layer into the config. Only non-zero
@@ -154,39 +151,26 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 }
 
-// readRegistryRules reads rules from the Rules subkey under both HKLM and
-// HKCU policy paths. Each rule is a subkey named after the rule, containing
-// values for VaultKey, TargetPath, TargetFormat, etc. User-level rules
-// override machine-level rules with the same name.
-func readRegistryRules(machineRoot, userRoot registry.Key) ([]Rule, error) {
-	ruleMap := make(map[string]Rule)
-	var order []string
-
-	// Read machine-level rules first.
-	if names, err := readRuleNames(machineRoot); err == nil {
-		for _, name := range names {
-			if rule, err := readSingleRule(machineRoot, name); err == nil {
-				ruleMap[name] = rule
-				order = append(order, name)
-			}
+// readRegistryRules reads rules from the Rules subkey under the given root
+// (HKLM). Each rule is a subkey named after the rule, containing values for
+// VaultKey, TargetPath, TargetFormat, etc.
+func readRegistryRules(root registry.Key) ([]Rule, error) {
+	names, err := readRuleNames(root)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			// Rules subkey absent means no rules are configured via registry.
+			return nil, nil
 		}
+		return nil, fmt.Errorf("enumerate rules at HKLM\\%s\\Rules: %w", registryPolicyPath, err)
 	}
 
-	// Read user-level rules, overriding machine-level by name.
-	if names, err := readRuleNames(userRoot); err == nil {
-		for _, name := range names {
-			if rule, err := readSingleRule(userRoot, name); err == nil {
-				if _, exists := ruleMap[name]; !exists {
-					order = append(order, name)
-				}
-				ruleMap[name] = rule
-			}
+	rules := make([]Rule, 0, len(names))
+	for _, name := range names {
+		rule, err := readSingleRule(root, name)
+		if err != nil {
+			return nil, fmt.Errorf("read rule %q from HKLM\\%s\\Rules: %w", name, registryPolicyPath, err)
 		}
-	}
-
-	rules := make([]Rule, 0, len(order))
-	for _, name := range order {
-		rules = append(rules, ruleMap[name])
+		rules = append(rules, rule)
 	}
 	return rules, nil
 }

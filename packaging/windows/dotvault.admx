@@ -10,9 +10,9 @@
 
   Registry paths used:
     Machine: HKLM\SOFTWARE\Policies\dotvault
-    User:    HKCU\SOFTWARE\Policies\dotvault
 
-  Both paths are administrator-controlled. When any policy key is
+  Only machine-level (HKLM) policy is read by dotvault. HKCU is not
+  consulted because it is user-writable. When any HKLM policy key is
   present, dotvault ignores file-based configuration entirely.
 
   Rules (sync rules) are complex multi-field objects that cannot be
@@ -38,6 +38,7 @@
 
   <policyNamespaces>
     <target prefix="dotvault" namespace="goodtune.dotvault" />
+    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
   </policyNamespaces>
 
   <resources minRequiredRevision="1.0" />

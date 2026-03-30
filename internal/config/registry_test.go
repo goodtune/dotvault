@@ -5,6 +5,12 @@ import (
 )
 
 func TestLoadSystemFallsBackToFile(t *testing.T) {
+	// Skip on Windows machines that have GPO registry keys installed,
+	// because LoadSystem will return managed registry config rather than
+	// falling back to the file.
+	if _, managed, _ := loadFromRegistry(); managed {
+		t.Skip("GPO registry keys found on this machine; skipping file-fallback test")
+	}
 	// On non-Windows (or Windows without GPO keys), LoadSystem should
 	// behave identically to Load — reading the YAML file at the given path.
 	yaml := `
@@ -42,6 +48,12 @@ rules:
 }
 
 func TestLoadSystemFileNotFound(t *testing.T) {
+	// Skip on Windows machines that have GPO registry keys installed,
+	// because LoadSystem will return managed registry config rather than
+	// erroring on the missing file.
+	if _, managed, _ := loadFromRegistry(); managed {
+		t.Skip("GPO registry keys found on this machine; skipping file-not-found test")
+	}
 	// When no registry config exists and the file is missing, LoadSystem
 	// should return an error.
 	_, err := LoadSystem("/nonexistent/path/config.yaml")

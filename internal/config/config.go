@@ -78,10 +78,11 @@ var validFormats = map[string]bool{
 
 // LoadSystem loads configuration using the platform-appropriate source.
 // On Windows, if Group Policy registry keys exist under
-// HKLM\SOFTWARE\Policies\dotvault or HKCU\SOFTWARE\Policies\dotvault,
-// configuration is loaded from the registry and the file-based config at
-// path is ignored. Machine-level values are read first, then user-level
-// values override them. Both paths are administrator-controlled via GPO.
+// HKLM\SOFTWARE\Policies\dotvault, configuration is loaded from the
+// registry and the file-based config at path is ignored. Only
+// machine-level (HKLM) policy is read; HKCU is intentionally skipped
+// because it is user-writable and cannot be treated as a trusted policy
+// boundary on unmanaged machines.
 // On non-Windows platforms this falls back to Load(path).
 func LoadSystem(path string) (*Config, error) {
 	cfg, managed, err := loadFromRegistry()

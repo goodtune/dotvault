@@ -32,11 +32,12 @@ Section "Install"
   File "${BINARY}"
   File "LICENSE"
 
-  ; Install Group Policy ADMX/ADML templates
+  ; Install Group Policy ADMX/ADML templates (non-fatal: files may not be
+  ; staged in all build environments)
   SetOutPath "$SYSDIR\..\PolicyDefinitions"
-  File "dotvault.admx"
+  File /nonfatal "dotvault.admx"
   SetOutPath "$SYSDIR\..\PolicyDefinitions\en-US"
-  File "en-US\dotvault.adml"
+  File /nonfatal "en-US\dotvault.adml"
   SetOutPath "$INSTDIR"
 
   ; Add $INSTDIR to system PATH if not already present

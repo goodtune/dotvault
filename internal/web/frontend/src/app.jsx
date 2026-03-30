@@ -58,6 +58,7 @@ export function App() {
     return h(LoginPage, {
       authMethod: status.auth_method,
       onAuth: loadData,
+      customText: status.login_text,
     });
   }
 
@@ -65,7 +66,7 @@ export function App() {
   if (!status) {
     return h('div', { class: 'login-container' },
       h('div', { class: 'login-card' },
-        h('h1', { class: 'login-title' }, 'dotvault'),
+        h('h1', { class: 'login-title' }, '.vault'),
         error
           ? h('p', { class: 'login-error' }, error)
           : h('p', null, 'Loading...'),
@@ -81,7 +82,7 @@ export function App() {
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),
     h('div', { class: 'main-layout' },
       h(Sidebar, { keys, selected: selectedKey, onSelect: setSelectedKey }),
-      h(SecretPanel, { secretPath: selectedKey }),
+      h(SecretPanel, { secretPath: selectedKey, customText: status.secret_view_text }),
     ),
   );
 }

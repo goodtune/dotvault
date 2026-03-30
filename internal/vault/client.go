@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 
 	vaultapi "github.com/hashicorp/vault/api"
@@ -279,6 +280,16 @@ func (c *Client) ValidateMFA(ctx context.Context, mfaRequestID, methodID, passco
 func isNotFound(err error) bool {
 	if respErr, ok := err.(*vaultapi.ResponseError); ok {
 		return respErr.StatusCode == 404
+	}
+	return false
+}
+
+// IsForbidden returns true if the error is a Vault 403 response, indicating
+// the token is invalid, revoked, or lacks permissions.
+func IsForbidden(err error) bool {
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == http.StatusForbidden
 	}
 	return false
 }

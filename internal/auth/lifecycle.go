@@ -53,17 +53,24 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				return
 			case <-timer.C:
 				if err := lm.checkAndRenew(ctx); err != nil {
-					slog.Warn("token lifecycle check failed", "error", err, "next_retry", lm.currentDelay*2)
-					lm.needsReauth.Store(true)
-					select {
-					case errCh <- err:
-					default:
+					// Compute next capped delay before logging so the logged value is accurate
+					nextDelay := lm.currentDelay * 2
+					if nextDelay > lm.maxDelay {
+						nextDelay = lm.maxDelay
 					}
-					// Exponential backoff on failure, capped at maxDelay
-					lm.currentDelay *= 2
-					if lm.currentDelay > lm.maxDelay {
-						lm.currentDelay = lm.maxDelay
+					if vault.IsForbidden(err) {
+						slog.Warn("vault token forbidden (403), re-authentication required", "error", err, "next_retry", nextDelay)
+						if !lm.needsReauth.Load() {
+							lm.needsReauth.Store(true)
+							select {
+							case errCh <- err:
+							default:
+							}
+						}
+					} else {
+						slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", nextDelay)
 					}
+					lm.currentDelay = nextDelay
 				} else {
 					// Reset to base interval on success
 					lm.currentDelay = lm.checkInterval

@@ -33,9 +33,11 @@ type Server struct {
 	authMount     string
 	authRole      string
 	tokenFilePath string
-	authDone      chan struct{}
-	readyCh       chan error
-	listenAddr    string
+	loginTextHTML      string
+	secretViewTextHTML string
+	authDone           chan struct{}
+	readyCh            chan error
+	listenAddr         string
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -70,9 +72,11 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authMethod:    sc.VaultCfg.AuthMethod,
 		authMount:     sc.VaultCfg.AuthMount,
 		authRole:      sc.VaultCfg.AuthRole,
-		tokenFilePath: sc.TokenFilePath,
-		authDone:      make(chan struct{}, 1),
-		readyCh:       make(chan error, 1),
+		loginTextHTML:      renderMarkdown(sc.WebCfg.LoginText),
+		secretViewTextHTML: renderMarkdown(sc.WebCfg.SecretViewText),
+		tokenFilePath:     sc.TokenFilePath,
+		authDone:          make(chan struct{}, 1),
+		readyCh:           make(chan error, 1),
 	}
 
 	s.registerRoutes()

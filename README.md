@@ -1,4 +1,6 @@
-# `dotvault`
+<p align="center">
+  <img src="assets/dotvault.png" alt=".vault logo" width="400">
+</p>
 
 A cross-platform daemon that runs in user context, authenticates to [HashiCorp Vault](https://www.vaultproject.io/), and performs one-way synchronisation of KVv2 secrets into local configuration files. It is intended to run as a long-lived daemon but can also be run interactively for one-off syncs.
 

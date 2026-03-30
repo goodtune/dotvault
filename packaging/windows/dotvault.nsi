@@ -10,6 +10,8 @@
 
 !include "MUI2.nsh"
 
+!define MUI_ICON "dotvault.ico"
+
 Name "${APP_NAME} ${APP_VERSION}"
 OutFile "dotvault_${APP_VERSION}_windows_amd64_setup.exe"
 InstallDir "$PROGRAMFILES\${APP_NAME}"

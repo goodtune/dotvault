@@ -51,6 +51,11 @@ cp "$BINARY" "$STAGING/dotvault.exe"
 cp "$PROJECT_ROOT/LICENSE" "$STAGING/LICENSE"
 cp "$SCRIPT_DIR/dotvault.nsi" "$STAGING/dotvault.nsi"
 
+# Stage Group Policy ADMX/ADML templates
+cp "$SCRIPT_DIR/dotvault.admx" "$STAGING/dotvault.admx"
+mkdir -p "$STAGING/en-US"
+cp "$SCRIPT_DIR/en-US/dotvault.adml" "$STAGING/en-US/dotvault.adml"
+
 # Run NSIS
 makensis \
   -DAPP_VERSION="$VERSION" \

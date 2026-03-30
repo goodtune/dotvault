@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  dotvault Group Policy Administrative Template — English (US)
+
+  Deploy this file to:
+    %SystemRoot%\PolicyDefinitions\en-US\dotvault.adml     (local)
+    \\domain\SYSVOL\domain\Policies\PolicyDefinitions\en-US\ (central store)
+-->
+<policyDefinitionResources
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    revision="1.0"
+    schemaVersion="1.0"
+    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+
+  <displayName>dotvault</displayName>
+  <description>Administrative template for dotvault — Vault-to-file secret synchronisation daemon.</description>
+
+  <resources>
+    <stringTable>
+
+      <!-- Categories -->
+      <string id="Cat_Dotvault">dotvault</string>
+      <string id="Cat_Vault">Vault Connection</string>
+      <string id="Cat_Sync">Sync</string>
+      <string id="Cat_WebUI">Web UI</string>
+
+      <!-- Vault policies -->
+      <string id="VaultAddress">Vault server address</string>
+      <string id="VaultAddress_Help">Specifies the address of the HashiCorp Vault server (e.g. https://vault.example.com:8200).
+
+This setting is required. If not configured, dotvault will not start.</string>
+
+      <string id="VaultCACert">Custom CA certificate path</string>
+      <string id="VaultCACert_Help">Path to a PEM-encoded CA certificate file used to verify the Vault server's TLS certificate.
+
+Leave empty to use the system certificate store.</string>
+
+      <string id="VaultTLSSkipVerify">Skip TLS certificate verification</string>
+      <string id="VaultTLSSkipVerify_Help">When enabled, dotvault will not verify the Vault server's TLS certificate. This is insecure and should only be used for testing.
+
+Enabled = Skip verification (insecure)
+Disabled = Verify certificates (default, recommended)</string>
+
+      <string id="VaultKVMount">KV secrets engine mount path</string>
+      <string id="VaultKVMount_Help">The mount path of the KV v2 secrets engine in Vault.
+
+Default: kv</string>
+
+      <string id="VaultUserPrefix">User secret path prefix</string>
+      <string id="VaultUserPrefix_Help">The path prefix under the KV mount where per-user secrets are stored. The current username is appended to this prefix.
+
+Default: users/
+
+Example: with prefix "users/" and username "alice", secrets are read from kv/data/users/alice/.</string>
+
+      <string id="VaultAuthMethod">Authentication method</string>
+      <string id="VaultAuthMethod_Help">The Vault authentication method to use.
+
+OIDC — Browser-based OpenID Connect (recommended for interactive use)
+LDAP — Username/password via LDAP backend
+Token — Use an existing Vault token file</string>
+
+      <string id="AuthMethod_OIDC">OIDC (OpenID Connect)</string>
+      <string id="AuthMethod_LDAP">LDAP</string>
+      <string id="AuthMethod_Token">Token</string>
+
+      <string id="VaultAuthRole">Authentication role</string>
+      <string id="VaultAuthRole_Help">The Vault auth role to request when authenticating. This is optional and depends on the auth method configuration in Vault.
+
+Leave empty to use the default role.</string>
+
+      <string id="VaultAuthMount">Authentication mount path</string>
+      <string id="VaultAuthMount_Help">Custom mount path for the authentication method in Vault.
+
+Leave empty to use the default mount path for the selected auth method (e.g. "oidc" for OIDC, "ldap" for LDAP).</string>
+
+      <!-- Sync policies -->
+      <string id="SyncInterval">Sync interval</string>
+      <string id="SyncInterval_Help">How often dotvault polls Vault for secret changes. Uses Go duration syntax.
+
+Examples: 5m, 15m, 1h, 30s
+
+Default: 15m
+
+Note: When connected to Vault Enterprise with the events feature, dotvault receives push notifications and this interval serves as a fallback.</string>
+
+      <!-- Web UI policies -->
+      <string id="WebEnabled">Enable web UI</string>
+      <string id="WebEnabled_Help">Controls whether the dotvault web UI is started.
+
+The web UI provides a browser-based interface for authentication (especially OIDC flows) and monitoring sync status.
+
+Enabled = Start the web UI
+Disabled = Run in daemon-only mode (default)</string>
+
+      <string id="WebListen">Web UI listen address</string>
+      <string id="WebListen_Help">The address and port the web UI listens on. Must be a loopback address for security.
+
+Default: 127.0.0.1:8200
+
+Valid examples: 127.0.0.1:8200, [::1]:8200, localhost:9090</string>
+
+    </stringTable>
+
+    <presentationTable>
+
+      <!-- Vault presentations -->
+      <presentation id="VaultAddress">
+        <textBox refId="VaultAddress_Value">
+          <label>Server address:</label>
+          <defaultValue>https://vault.example.com:8200</defaultValue>
+        </textBox>
+      </presentation>
+
+      <presentation id="VaultCACert">
+        <textBox refId="VaultCACert_Value">
+          <label>CA certificate path:</label>
+        </textBox>
+      </presentation>
+
+      <presentation id="VaultKVMount">
+        <textBox refId="VaultKVMount_Value">
+          <label>KV mount path:</label>
+          <defaultValue>kv</defaultValue>
+        </textBox>
+      </presentation>
+
+      <presentation id="VaultUserPrefix">
+        <textBox refId="VaultUserPrefix_Value">
+          <label>User prefix:</label>
+          <defaultValue>users/</defaultValue>
+        </textBox>
+      </presentation>
+
+      <presentation id="VaultAuthMethod">
+        <dropdownList refId="VaultAuthMethod_Value" defaultItem="0">Authentication method:</dropdownList>
+      </presentation>
+
+      <presentation id="VaultAuthRole">
+        <textBox refId="VaultAuthRole_Value">
+          <label>Auth role:</label>
+        </textBox>
+      </presentation>
+
+      <presentation id="VaultAuthMount">
+        <textBox refId="VaultAuthMount_Value">
+          <label>Auth mount path:</label>
+        </textBox>
+      </presentation>
+
+      <!-- Sync presentations -->
+      <presentation id="SyncInterval">
+        <textBox refId="SyncInterval_Value">
+          <label>Interval (Go duration):</label>
+          <defaultValue>15m</defaultValue>
+        </textBox>
+      </presentation>
+
+      <!-- Web UI presentations -->
+      <presentation id="WebListen">
+        <textBox refId="WebListen_Value">
+          <label>Listen address:</label>
+          <defaultValue>127.0.0.1:8200</defaultValue>
+        </textBox>
+      </presentation>
+
+    </presentationTable>
+
+  </resources>
+</policyDefinitionResources>

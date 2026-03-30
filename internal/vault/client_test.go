@@ -280,6 +280,12 @@ func TestIsForbidden(t *testing.T) {
 
 	t.Run("via LookupSelf mock server", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/auth/token/lookup-self" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected method: %s", r.Method)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string][]string{

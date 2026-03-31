@@ -47,9 +47,9 @@ func runWizard(ctx context.Context, pending []pendingEnrolment, io IO) map[strin
 
 		user := creds["user"]
 		if user != "" {
-			fmt.Fprintf(io.Out, "✓ %s (%s) — enrolled as @%s\n\n", p.key, p.engine.Name(), user)
+			fmt.Fprintf(io.Out, "✓ %s (%s) — credentials acquired for @%s\n\n", p.key, p.engine.Name(), user)
 		} else {
-			fmt.Fprintf(io.Out, "✓ %s (%s) — enrolled\n\n", p.key, p.engine.Name())
+			fmt.Fprintf(io.Out, "✓ %s (%s) — credentials acquired\n\n", p.key, p.engine.Name())
 		}
 	}
 

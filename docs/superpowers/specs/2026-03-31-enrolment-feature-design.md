@@ -75,6 +75,7 @@ type BrowserOpener func(url string) error
 // IO provides user interaction capabilities to engines.
 type IO struct {
     Out     io.Writer
+    In      io.Reader     // optional; defaults to os.Stdin if nil
     Browser BrowserOpener
     Log     *slog.Logger
 }
@@ -163,11 +164,11 @@ Enrolment [2/2]: GitLab
 - If no clipboard tool is available, the wizard silently continues (best-effort only).
 - Web UI: click-to-copy button via `navigator.clipboard.writeText()` — future work, not implemented in this PR.
 
-**On success:** writes credentials to Vault immediately, marks as done in progress display.
+**On success:** after the wizard finishes, Manager.CheckAll writes credentials to Vault. The wizard marks the enrolment as done in the progress display once `Engine.Run` returns successfully.
 
 **On failure:** logs error, skips to next enrolment. Failed enrolments retry on the next cycle.
 
-**On context cancellation:** stops the wizard. Already-completed enrolments are preserved in Vault.
+**On context cancellation:** stops the wizard. Credentials from the interrupted run are not written to Vault; previously-written enrolments from earlier cycles are preserved.
 
 ### Web UI Integration (future work, not implemented in this PR)
 
@@ -273,9 +274,9 @@ Config change or startup
 ### Integration Tests
 
 **`test/integration/enrol_test.go`:**
-- Mock OAuth server simulating the device flow protocol (device code endpoint + token endpoint with auto-approve)
 - Full flow: check Vault → engine runs → Vault written → sync triggered
 - Uses real Vault dev server (same as existing e2e tests)
-- Verifies correct client_id and scopes sent to OAuth server
+- Engine interface allows mock injection without real OAuth
+- (Planned) Verify correct client_id and scopes via GitHubEngine against a TLS mock server — deferred to a future PR
 
 The Engine interface makes unit testing straightforward: inject a mock engine that returns canned credentials without hitting any real OAuth provider.

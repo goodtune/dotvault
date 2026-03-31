@@ -180,12 +180,18 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 	}
 
 	// ok key should be in vault
-	secret, _ := vc.ReadKVv2(ctx, "kv", "users/testuser3/keyok")
+	secret, err := vc.ReadKVv2(ctx, "kv", "users/testuser3/keyok")
+	if err != nil {
+		t.Fatalf("ReadKVv2() error for keyok: %v", err)
+	}
 	if secret == nil {
 		t.Error("expected keyok in vault")
 	}
 	// fail key should not be in vault
-	secret, _ = vc.ReadKVv2(ctx, "kv", "users/testuser3/keyfail")
+	secret, err = vc.ReadKVv2(ctx, "kv", "users/testuser3/keyfail")
+	if err != nil {
+		t.Fatalf("ReadKVv2() error for keyfail: %v", err)
+	}
 	if secret != nil {
 		t.Error("keyfail should not be in vault after failure")
 	}

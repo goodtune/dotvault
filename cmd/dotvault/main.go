@@ -294,7 +294,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				reloaded, err := config.Load(configPath)
+				reloaded, err := config.LoadSystem(configPath)
 				if err != nil {
 					slog.Warn("config reload failed", "error", err)
 					continue

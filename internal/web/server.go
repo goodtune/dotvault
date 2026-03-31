@@ -17,21 +17,21 @@ import (
 
 // Server is the web UI HTTP server.
 type Server struct {
-	cfg           config.WebConfig
-	vault         *vault.Client
-	engine        *sync.Engine
-	csrf          *CSRFStore
-	oauth         *OAuthManager
-	login         *auth.LoginTracker
-	mux           *http.ServeMux
-	server        *http.Server
-	rules         []config.Rule
-	kvMount       string
-	userPrefix    string
-	username      string
-	authMethod    string
-	authMount     string
-	authRole      string
+	cfg                config.WebConfig
+	vault              *vault.Client
+	engine             *sync.Engine
+	csrf               *CSRFStore
+	oauth              *OAuthManager
+	login              *auth.LoginTracker
+	mux                *http.ServeMux
+	server             *http.Server
+	rules              []config.Rule
+	kvMount            string
+	userPrefix         string
+	username           string
+	authMethod         string
+	authMount          string
+	authRole           string
 	tokenFilePath      string
 	version            string
 	vaultAddress       string
@@ -61,20 +61,20 @@ func NewServer(sc ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:           sc.WebCfg,
-		vault:         sc.Vault,
-		engine:        sc.Engine,
-		csrf:          NewCSRFStore(),
-		oauth:         NewOAuthManager(),
-		login:         auth.NewLoginTracker(sc.Vault),
-		mux:           http.NewServeMux(),
-		rules:         sc.Rules,
-		kvMount:       sc.VaultCfg.KVMount,
-		userPrefix:    sc.VaultCfg.UserPrefix,
-		username:      sc.Username,
-		authMethod:    sc.VaultCfg.AuthMethod,
-		authMount:     sc.VaultCfg.AuthMount,
-		authRole:      sc.VaultCfg.AuthRole,
+		cfg:                sc.WebCfg,
+		vault:              sc.Vault,
+		engine:             sc.Engine,
+		csrf:               NewCSRFStore(),
+		oauth:              NewOAuthManager(),
+		login:              auth.NewLoginTracker(sc.Vault),
+		mux:                http.NewServeMux(),
+		rules:              sc.Rules,
+		kvMount:            sc.VaultCfg.KVMount,
+		userPrefix:         sc.VaultCfg.UserPrefix,
+		username:           sc.Username,
+		authMethod:         sc.VaultCfg.AuthMethod,
+		authMount:          sc.VaultCfg.AuthMount,
+		authRole:           sc.VaultCfg.AuthRole,
 		tokenFilePath:      sc.TokenFilePath,
 		version:            sc.Version,
 		vaultAddress:       sc.VaultCfg.Address,
@@ -192,4 +192,3 @@ func (s *Server) URL() string {
 func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
 }
-

@@ -4,7 +4,15 @@ import { getSecret } from '../api.js';
 
 function buildVaultSecretURL(status, secretPath) {
   const base = status.vault_address.replace(/\/+$/, '');
-  return `${base}/ui/vault/secrets/${status.kv_mount}/show/${status.user_prefix}${status.username}/${secretPath}`;
+  const action = secretPath && secretPath.endsWith('/') ? 'list' : 'show';
+  const encodedMount = encodeURIComponent(status.kv_mount);
+  const encodePath = (p) => (p || '')
+    .split('/').filter(s => s.length > 0)
+    .map(s => encodeURIComponent(s)).join('/');
+  const userPath = encodePath(`${status.user_prefix || ''}${status.username}`);
+  const secretSegment = encodePath(secretPath);
+  const fullPath = secretSegment ? `${userPath}/${secretSegment}` : userPath;
+  return `${base}/ui/vault/secrets/${encodedMount}/${action}/${fullPath}`;
 }
 
 export function SecretPanel({ secretPath, status, customText }) {
@@ -95,7 +103,7 @@ export function SecretPanel({ secretPath, status, customText }) {
   return h('main', { class: 'secret-panel' },
     h('div', { class: 'secret-heading' },
       h('h2', null, secretPath),
-      status?.vault_address && h('a', {
+      status?.vault_address && status?.kv_mount && status?.username && h('a', {
         class: 'vault-link',
         href: buildVaultSecretURL(status, secretPath),
         target: '_blank',

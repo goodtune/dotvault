@@ -10,15 +10,20 @@ import (
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	authenticated := s.vault != nil && s.vault.Token() != ""
 	status := map[string]any{
-		"authenticated": s.vault != nil && s.vault.Token() != "",
+		"authenticated": authenticated,
 		"auth_method":   s.authMethod,
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
-		"vault_address": s.vaultAddress,
-		"kv_mount":      s.kvMount,
-		"user_prefix":   s.userPrefix,
-		"username":      s.username,
+	}
+
+	// Only expose Vault connection details to authenticated sessions.
+	if authenticated {
+		status["vault_address"] = s.vaultAddress
+		status["kv_mount"] = s.kvMount
+		status["user_prefix"] = s.userPrefix
+		status["username"] = s.username
 	}
 
 	if s.loginTextHTML != "" {

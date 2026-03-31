@@ -37,12 +37,12 @@ Pass the existing `version` variable from `cmd/dotvault/main.go` into `ServerCon
 
 ### StatusBar (top navigation)
 
-Current layout: `[dotvault] [Connected] ... [Updated: HH:MM:SS] [Sync Now]`
+Current layout: `[.vault] [Connected] ... [Updated: HH:MM:SS] [Sync Now]`
 
-New layout: `[dotvault v0.1.0] [Connected] [Vault ↗] ... [Updated: HH:MM:SS] [Sync Now]`
+New layout: `[.vault v0.1.0] [Connected] [Vault ↗] ... [Updated: HH:MM:SS] [Sync Now]`
 
 Specifics:
-- **Version badge**: Render `status.version` as small muted text immediately after "dotvault" in the `.app-title` span (e.g. `dotvault v0.1.0`). Use a `<span class="app-version">` with reduced opacity and smaller font.
+- **Version badge**: Render `status.version` as small muted text immediately after ".vault" in the `.app-title` span (e.g. `.vault v0.1.0`). Use a `<span class="app-version">` with reduced opacity and smaller font.
 - **Vault link**: An anchor element after the status indicator pill. Text: "Vault" with an external link indicator. Links to `status.vault_address` with `target="_blank"` and `rel="noopener noreferrer"`. Styled as a subtle link that fits the dark header. Only rendered when `status.vault_address` is truthy.
 
 ### SecretPanel (secret detail view)

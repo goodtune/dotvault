@@ -95,8 +95,8 @@ func parseTOML(input string) (map[string]any, error) {
 	current := root
 
 	lines := strings.Split(input, "\n")
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
 
 		// Skip empty lines and comments
 		if line == "" || line[0] == '#' {
@@ -159,6 +159,33 @@ func parseTOML(input string) (map[string]any, error) {
 		key := strings.TrimSpace(line[:eqIdx])
 		valStr := strings.TrimSpace(line[eqIdx+1:])
 
+		// Accumulate multi-line strings that span multiple lines.
+		if isMultiLineStringStart(valStr) {
+			delim := valStr[:3] // `"""` or `'''`
+			// Check if it closes on the same line
+			rest := valStr[3:]
+			if idx := strings.Index(rest, delim); idx >= 0 {
+				// Single-line triple-quoted string — handle normally
+			} else {
+				// Accumulate subsequent lines until closing delimiter
+				var buf strings.Builder
+				buf.WriteString(valStr)
+				found := false
+				for i++; i < len(lines); i++ {
+					buf.WriteByte('\n')
+					buf.WriteString(lines[i])
+					if strings.Contains(lines[i], delim) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("line %d: unterminated multi-line string", i+1)
+				}
+				valStr = buf.String()
+			}
+		}
+
 		// Handle dotted keys
 		parts := splitTOMLKey(key)
 		target := current
@@ -194,6 +221,10 @@ func ensureTable(m map[string]any, key string) (map[string]any, error) {
 	tbl := make(map[string]any)
 	m[key] = tbl
 	return tbl, nil
+}
+
+func isMultiLineStringStart(s string) bool {
+	return strings.HasPrefix(s, `"""`) || strings.HasPrefix(s, "'''")
 }
 
 func splitTOMLKey(key string) []string {
@@ -247,22 +278,27 @@ func parseTOMLValue(s string) (any, error) {
 		return s[3 : 3+end], nil
 	}
 
-	// Single-line strings — find the closing quote, then strip comments
-	// from any trailing content after the string.
+	// Single-line strings — scan for closing quote, handling escapes.
 	if s[0] == '"' {
-		end := strings.Index(s[1:], `"`)
+		end := -1
+		for i := 1; i < len(s); i++ {
+			if s[i] == '"' {
+				// Count consecutive backslashes before the quote.
+				backslashes := 0
+				for j := i - 1; j >= 1 && s[j] == '\\'; j-- {
+					backslashes++
+				}
+				// Escaped only if preceded by an odd number of backslashes.
+				if backslashes%2 == 0 {
+					end = i
+					break
+				}
+			}
+		}
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated basic string")
 		}
-		// Skip escaped quotes
-		for end >= 0 && s[end] == '\\' {
-			next := strings.Index(s[end+2:], `"`)
-			if next < 0 {
-				return nil, fmt.Errorf("unterminated basic string")
-			}
-			end = end + 2 + next
-		}
-		return unescapeTOMLString(s[1 : 1+end]), nil
+		return unescapeTOMLString(s[1:end]), nil
 	}
 	if s[0] == '\'' {
 		end := strings.Index(s[1:], "'")
@@ -274,6 +310,10 @@ func parseTOMLValue(s string) (any, error) {
 
 	// Strip inline comment for non-string values
 	s = stripInlineComment(s)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty value")
+	}
 
 	// Boolean
 	if s == "true" {

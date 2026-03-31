@@ -13,10 +13,17 @@ import (
 
 // Config is the top-level system configuration.
 type Config struct {
-	Vault VaultConfig `yaml:"vault"`
-	Sync  SyncConfig  `yaml:"sync"`
-	Web   WebConfig   `yaml:"web"`
-	Rules []Rule      `yaml:"rules"`
+	Vault      VaultConfig          `yaml:"vault"`
+	Sync       SyncConfig           `yaml:"sync"`
+	Web        WebConfig            `yaml:"web"`
+	Rules      []Rule               `yaml:"rules"`
+	Enrolments map[string]Enrolment `yaml:"enrolments"`
+}
+
+// Enrolment declares a credential acquisition flow for a Vault KV key.
+type Enrolment struct {
+	Engine   string         `yaml:"engine"`
+	Settings map[string]any `yaml:"settings"`
 }
 
 // VaultConfig holds Vault connection settings.
@@ -184,6 +191,13 @@ func (c *Config) validate() error {
 		}
 		if !validFormats[r.Target.Format] {
 			return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, or netrc)", i, r.Name, r.Target.Format)
+		}
+	}
+
+	// Enrolments validation
+	for key, e := range c.Enrolments {
+		if e.Engine == "" {
+			return fmt.Errorf("enrolments[%s].engine is required", key)
 		}
 	}
 

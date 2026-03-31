@@ -2,7 +2,12 @@ import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { getSecret } from '../api.js';
 
+function isHTTPURL(url) {
+  return !!url && /^https?:\/\//i.test(url);
+}
+
 function buildVaultSecretURL(status, secretPath) {
+  if (!isHTTPURL(status.vault_address)) return null;
   const base = status.vault_address.replace(/\/+$/, '');
   const action = secretPath && secretPath.endsWith('/') ? 'list' : 'show';
   const encodedMount = encodeURIComponent(status.kv_mount);
@@ -103,12 +108,15 @@ export function SecretPanel({ secretPath, status, customText }) {
   return h('main', { class: 'secret-panel' },
     h('div', { class: 'secret-heading' },
       h('h2', null, secretPath),
-      status?.vault_address && status?.kv_mount && status?.username && h('a', {
-        class: 'vault-link',
-        href: buildVaultSecretURL(status, secretPath),
-        target: '_blank',
-        rel: 'noopener noreferrer',
-      }, 'View in Vault \u2197'),
+      (() => {
+        const url = status?.kv_mount && status?.username && buildVaultSecretURL(status, secretPath);
+        return url && h('a', {
+          class: 'vault-link',
+          href: url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+        }, 'View in Vault \u2197');
+      })(),
     ),
     h('div', { class: 'secret-meta' }, 'Version: ', secret.version),
     h('table', { class: 'field-table' },

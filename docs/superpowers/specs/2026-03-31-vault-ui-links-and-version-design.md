@@ -27,7 +27,7 @@ Add these fields to the `/api/v1/status` JSON response:
 - `"user_prefix"` — `s.userPrefix` (e.g. `"users/"`)
 - `"username"` — `s.username` (e.g. `"gary"`)
 
-These fields are static for the lifetime of the process. They are always included regardless of authentication state, since the SPA only shows post-auth anyway.
+These fields are static for the lifetime of the process. The `"version"` field is always included, but the Vault- and user-related fields (`"vault_address"`, `"kv_mount"`, `"user_prefix"`, `"username"`) are only included when the request is authenticated, to avoid exposing environment details to unauthenticated callers.
 
 ### Wire version through `main.go`
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -288,6 +289,8 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		// For netrc format, convert raw vault data to NetrcVaultData
 		if rule.Target.Format == "netrc" {
 			incomingData = convertToNetrcVaultData(secret.Data)
+		} else if rule.Target.Format == "text" {
+			incomingData = convertToTextData(secret.Data)
 		} else {
 			incomingData = secret.Data
 		}
@@ -318,7 +321,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 	// Determine file permissions
 	perm := os.FileMode(0644)
-	if rule.Target.Format == "netrc" {
+	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
 		perm = 0600
 	}
 
@@ -391,6 +394,27 @@ func parseNetrcJSON(s string, cred *handlers.NetrcCredential) error {
 	cred.Login = jc.Login
 	cred.Password = jc.Password
 	return nil
+}
+
+// convertToTextData extracts the text content from Vault data.
+// It looks for a "data" key first, then "value", then "content". If none
+// are found it concatenates all string values separated by newlines.
+func convertToTextData(data map[string]any) string {
+	for _, key := range []string{"data", "value", "content"} {
+		if v, ok := data[key]; ok {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+	}
+	// Fallback: concatenate all string values
+	var parts []string
+	for _, v := range data {
+		if s, ok := v.(string); ok {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func hasPrefix(s, prefix string) bool {

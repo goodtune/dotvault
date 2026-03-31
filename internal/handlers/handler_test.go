@@ -15,6 +15,8 @@ func TestHandlerFor(t *testing.T) {
 		{"yaml", false},
 		{"json", false},
 		{"ini", false},
+		{"toml", false},
+		{"text", false},
 		{"netrc", false},
 		{"xml", true},
 		{"", true},
@@ -95,5 +97,48 @@ func TestJSONRoundTrip(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("output missing %q:\n%s", want, s)
 		}
+	}
+}
+
+func TestTOMLRoundTrip(t *testing.T) {
+	h, _ := HandlerFor("toml")
+	th := h.(*TOMLHandler)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.toml")
+
+	initial, _ := th.Parse("key1 = \"value1\"\nkey2 = \"value2\"")
+	h.Write(path, initial, 0644)
+
+	data, _ := h.Read(path)
+	incoming, _ := th.Parse("key2 = \"updated\"\nkey3 = \"added\"")
+	merged, _ := h.Merge(data, incoming)
+	h.Write(path, merged, 0644)
+
+	got, _ := os.ReadFile(path)
+	s := string(got)
+	for _, want := range []string{`"value1"`, `"updated"`, `"added"`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("output missing %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestTextRoundTrip(t *testing.T) {
+	h, _ := HandlerFor("text")
+	th := h.(*TextHandler)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "id_rsa")
+
+	initial, _ := th.Parse("initial key content")
+	h.Write(path, initial, 0600)
+
+	data, _ := h.Read(path)
+	incoming, _ := th.Parse("replaced key content")
+	merged, _ := h.Merge(data, incoming)
+	h.Write(path, merged, 0600)
+
+	got, _ := os.ReadFile(path)
+	if string(got) != "replaced key content" {
+		t.Errorf("output = %q, want 'replaced key content'", string(got))
 	}
 }

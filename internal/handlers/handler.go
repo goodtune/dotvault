@@ -34,6 +34,10 @@ func HandlerFor(format string) (FileHandler, error) {
 		return &JSONHandler{}, nil
 	case "ini":
 		return &INIHandler{}, nil
+	case "toml":
+		return &TOMLHandler{}, nil
+	case "text":
+		return &TextHandler{}, nil
 	case "netrc":
 		return &NetrcHandler{}, nil
 	default:

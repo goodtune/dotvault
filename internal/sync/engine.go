@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -397,8 +398,9 @@ func parseNetrcJSON(s string, cred *handlers.NetrcCredential) error {
 }
 
 // convertToTextData extracts the text content from Vault data.
-// It looks for a "data" key first, then "value", then "content". If none
-// are found it concatenates all string values separated by newlines.
+// It looks for a "data" key first, then "value", then "content".
+// If none are found it concatenates all string values in sorted key
+// order for deterministic output.
 func convertToTextData(data map[string]any) string {
 	for _, key := range []string{"data", "value", "content"} {
 		if v, ok := data[key]; ok {
@@ -407,10 +409,15 @@ func convertToTextData(data map[string]any) string {
 			}
 		}
 	}
-	// Fallback: concatenate all string values
+	// Fallback: concatenate all string values in sorted key order
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var parts []string
-	for _, v := range data {
-		if s, ok := v.(string); ok {
+	for _, k := range keys {
+		if s, ok := data[k].(string); ok {
 			parts = append(parts, s)
 		}
 	}

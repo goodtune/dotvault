@@ -1,9 +1,0 @@
-[credentials]
-password = "new-password"
-token = "vault-token-123"
-username = "admin"
-
-[database]
-host = "localhost"
-name = "mydb"
-port = 5432

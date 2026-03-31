@@ -28,7 +28,8 @@ func TestTextHandler_ReadExisting(t *testing.T) {
 
 func TestTextHandler_ReadMissing(t *testing.T) {
 	h := &TextHandler{}
-	data, err := h.Read("/tmp/nonexistent-dotvault-test-file")
+	dir := t.TempDir()
+	data, err := h.Read(filepath.Join(dir, "nonexistent-file"))
 	if err != nil {
 		t.Fatalf("Read() error: %v", err)
 	}

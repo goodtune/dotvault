@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -106,10 +107,10 @@ func parseTOML(input string) (map[string]any, error) {
 		if line[0] == '[' {
 			// Array of tables [[...]]
 			if strings.HasPrefix(line, "[[") {
-				name := strings.TrimSpace(line[2 : len(line)-2])
-				if !strings.HasSuffix(line, "]]") {
+				if len(line) < 4 || !strings.HasSuffix(line, "]]") {
 					return nil, fmt.Errorf("line %d: unterminated array of tables", i+1)
 				}
+				name := strings.TrimSpace(line[2 : len(line)-2])
 				parts := splitTOMLKey(name)
 				parent := root
 				for _, p := range parts[:len(parts)-1] {
@@ -191,7 +192,7 @@ func splitTOMLKey(key string) []string {
 			inQuote = true
 			quoteChar = ch
 		} else if ch == '.' {
-			parts = append(parts, current.String())
+			parts = append(parts, strings.TrimSpace(current.String()))
 			current.Reset()
 		} else {
 			current.WriteByte(ch)
@@ -258,17 +259,42 @@ func parseTOMLValue(s string) (any, error) {
 	}
 
 	// Integer (try before float)
+	cleaned := strings.ReplaceAll(s, "_", "")
 	if isIntegerStr(s) {
-		var n int64
-		fmt.Sscanf(s, "%d", &n)
-		return n, nil
+		// Handle hex, octal, binary prefixes
+		if strings.HasPrefix(cleaned, "0x") || strings.HasPrefix(cleaned, "0X") ||
+			strings.HasPrefix(cleaned, "+0x") || strings.HasPrefix(cleaned, "-0x") {
+			n, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimPrefix(cleaned, "+"), "-"), 0, 64)
+			if err == nil {
+				if strings.HasPrefix(cleaned, "-") {
+					return -n, nil
+				}
+				return n, nil
+			}
+		} else if strings.HasPrefix(cleaned, "0o") || strings.HasPrefix(cleaned, "0O") {
+			n, err := strconv.ParseInt("0"+cleaned[2:], 0, 64)
+			if err == nil {
+				return n, nil
+			}
+		} else if strings.HasPrefix(cleaned, "0b") || strings.HasPrefix(cleaned, "0B") {
+			n, err := strconv.ParseInt(cleaned, 0, 64)
+			if err == nil {
+				return n, nil
+			}
+		} else {
+			n, err := strconv.ParseInt(cleaned, 10, 64)
+			if err == nil {
+				return n, nil
+			}
+		}
 	}
 
 	// Float
 	if isFloatStr(s) {
-		var f float64
-		fmt.Sscanf(s, "%g", &f)
-		return f, nil
+		f, err := strconv.ParseFloat(cleaned, 64)
+		if err == nil {
+			return f, nil
+		}
 	}
 
 	// Bare value — treat as string

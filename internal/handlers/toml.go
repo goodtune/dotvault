@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -105,6 +106,9 @@ func parseTOML(input string) (map[string]any, error) {
 
 		// Table header [section] or [section.subsection]
 		if line[0] == '[' {
+			// Strip trailing comments from headers (e.g., [db] # comment)
+			line = stripInlineComment(line)
+
 			// Array of tables [[...]]
 			if strings.HasPrefix(line, "[[") {
 				if len(line) < 4 || !strings.HasSuffix(line, "]]") {
@@ -162,9 +166,10 @@ func parseTOML(input string) (map[string]any, error) {
 		// Accumulate multi-line strings that span multiple lines.
 		if isMultiLineStringStart(valStr) {
 			delim := valStr[:3] // `"""` or `'''`
+			isBasic := delim == `"""`
 			// Check if it closes on the same line
 			rest := valStr[3:]
-			if idx := strings.Index(rest, delim); idx >= 0 {
+			if findUnescapedDelim(rest, delim, isBasic) >= 0 {
 				// Single-line triple-quoted string — handle normally
 			} else {
 				// Accumulate subsequent lines until closing delimiter
@@ -174,7 +179,7 @@ func parseTOML(input string) (map[string]any, error) {
 				for i++; i < len(lines); i++ {
 					buf.WriteByte('\n')
 					buf.WriteString(lines[i])
-					if strings.Contains(lines[i], delim) {
+					if findUnescapedDelim(lines[i], delim, isBasic) >= 0 {
 						found = true
 						break
 					}
@@ -225,6 +230,29 @@ func ensureTable(m map[string]any, key string) (map[string]any, error) {
 
 func isMultiLineStringStart(s string) bool {
 	return strings.HasPrefix(s, `"""`) || strings.HasPrefix(s, "'''")
+}
+
+// findUnescapedDelim finds the first occurrence of delim in s that is not
+// preceded by an odd number of backslashes (for basic strings). For literal
+// strings (isBasic=false), escapes are not recognised.
+func findUnescapedDelim(s, delim string, isBasic bool) int {
+	dlen := len(delim)
+	for i := 0; i <= len(s)-dlen; i++ {
+		if s[i:i+dlen] == delim {
+			if !isBasic {
+				return i
+			}
+			// Count preceding backslashes
+			backslashes := 0
+			for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+				backslashes++
+			}
+			if backslashes%2 == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func splitTOMLKey(key string) []string {
@@ -308,7 +336,8 @@ func parseTOMLValue(s string) (any, error) {
 		return s[1 : 1+end], nil
 	}
 
-	// Strip inline comment for non-string values
+	// Strip inline comment for non-string values (handles arrays/tables
+	// with trailing comments like [1,2] # comment or {a=1} # comment).
 	s = stripInlineComment(s)
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -669,7 +698,16 @@ func encodeTOMLScalar(buf *bytes.Buffer, v any) {
 	case int:
 		fmt.Fprintf(buf, "%d", val)
 	case float64:
-		fmt.Fprintf(buf, "%g", val)
+		switch {
+		case math.IsInf(val, 1):
+			buf.WriteString("inf")
+		case math.IsInf(val, -1):
+			buf.WriteString("-inf")
+		case math.IsNaN(val):
+			buf.WriteString("nan")
+		default:
+			fmt.Fprintf(buf, "%g", val)
+		}
 	default:
 		fmt.Fprintf(buf, "%v", val)
 	}

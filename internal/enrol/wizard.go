@@ -57,7 +57,7 @@ func runWizard(ctx context.Context, pending []pendingEnrolment, io IO) map[strin
 }
 
 // copyToClipboard attempts to copy the given text to the system clipboard.
-// Best-effort: if no clipboard tool is found, it prints a message and returns.
+// Best-effort: if no clipboard tool is found, it silently continues.
 func copyToClipboard(text string) {
 	// Implemented per-platform in clipboard_*.go
 	tryClipboard(text)

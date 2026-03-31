@@ -20,7 +20,7 @@ type mockEngine struct {
 	called int
 }
 
-func (e *mockEngine) Name() string   { return e.name }
+func (e *mockEngine) Name() string     { return e.name }
 func (e *mockEngine) Fields() []string { return e.fields }
 func (e *mockEngine) Run(_ context.Context, _ map[string]any, _ IO) (map[string]string, error) {
 	e.called++
@@ -56,8 +56,8 @@ func TestCheckAll_AllPresent(t *testing.T) {
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "test", fields: []string{"token"}, creds: map[string]string{"token": "abc"}}
-	engines["test-present"] = eng
-	defer delete(engines, "test-present")
+	RegisterEngine("test-present", eng)
+	t.Cleanup(func() { UnregisterEngine("test-present") })
 
 	// Pre-seed vault with complete credentials
 	vc.EnableKVv2(ctx, "kv")
@@ -89,8 +89,8 @@ func TestCheckAll_Missing(t *testing.T) {
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "test", fields: []string{"token"}, creds: map[string]string{"token": "newtoken"}}
-	engines["test-missing"] = eng
-	defer delete(engines, "test-missing")
+	RegisterEngine("test-missing", eng)
+	t.Cleanup(func() { UnregisterEngine("test-missing") })
 
 	vc.EnableKVv2(ctx, "kv")
 
@@ -133,10 +133,12 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 
 	engOK := &mockEngine{name: "ok", fields: []string{"x"}, creds: map[string]string{"x": "val"}}
 	engFail := &mockEngine{name: "fail", fields: []string{"y"}, err: fmt.Errorf("auth denied")}
-	engines["test-ok"] = engOK
-	engines["test-fail"] = engFail
-	defer delete(engines, "test-ok")
-	defer delete(engines, "test-fail")
+	RegisterEngine("test-ok", engOK)
+	RegisterEngine("test-fail", engFail)
+	t.Cleanup(func() {
+		UnregisterEngine("test-ok")
+		UnregisterEngine("test-fail")
+	})
 
 	vc.EnableKVv2(ctx, "kv")
 

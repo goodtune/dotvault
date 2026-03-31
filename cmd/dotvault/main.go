@@ -278,6 +278,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	// Background goroutine: reload config on each tick and re-check enrolments.
+	// Note: only the enrolments section is acted upon at reload time. Changes to
+	// sync.interval, rules, or other config fields require a daemon restart to
+	// take effect (the sync engine holds its own copy of the config).
 	configPath := flagConfig
 	if configPath == "" {
 		configPath = paths.SystemConfigPath()

@@ -99,11 +99,13 @@ Uses `github.com/cli/oauth` for the OAuth device flow. Reuses the GitHub CLI's O
 - Scopes: `repo`, `read:org`, `gist`
 - Host: `github.com`
 
-**Overridable settings:**
+**Overridable settings (implemented):**
 - `client_id` — OAuth app client ID
-- `client_secret` — OAuth app client secret (if needed for custom apps)
 - `scopes` — list of OAuth scopes
-- `host` — GitHub hostname (for GHES)
+- `host` — GitHub hostname (for GHES); accepts bare hostname or full URL with scheme
+
+**Future work (not in this PR):**
+- `client_secret` — OAuth app client secret (needed for non-device-flow apps)
 
 **Returns:** `{"oauth_token": "<token>", "user": "<username>"}`
 
@@ -158,8 +160,8 @@ Enrolment [2/2]: GitLab
 **Clipboard support:**
 - The device code is auto-copied to the clipboard on display (best-effort).
 - macOS: `pbcopy`, Windows: `clip.exe`, Linux: `xclip`/`xsel`.
-- If no clipboard tool is available, the wizard prints "please copy the code above manually" and continues.
-- Web UI: click-to-copy button via `navigator.clipboard.writeText()`.
+- If no clipboard tool is available, the wizard silently continues (best-effort only).
+- Web UI: click-to-copy button via `navigator.clipboard.writeText()` — future work, not implemented in this PR.
 
 **On success:** writes credentials to Vault immediately, marks as done in progress display.
 
@@ -167,9 +169,9 @@ Enrolment [2/2]: GitLab
 
 **On context cancellation:** stops the wizard. Already-completed enrolments are preserved in Vault.
 
-### Web UI Integration
+### Web UI Integration (future work, not implemented in this PR)
 
-When web mode is active, the wizard pushes enrolment state to the web UI in addition to terminal output. The web UI displays a banner with:
+When web mode is active, the wizard would push enrolment state to the web UI in addition to terminal output. The web UI would display a banner with:
 
 - The current engine name and progress (e.g. "1 of 2")
 - The device code prominently displayed with a click-to-copy button

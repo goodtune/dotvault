@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/cli/oauth"
 )
@@ -34,7 +35,11 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 
 	hostURL := githubDefaultHost
 	if v, ok := settings["host"].(string); ok && v != "" {
-		hostURL = "https://" + v
+		if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+			hostURL = v
+		} else {
+			hostURL = "https://" + v
+		}
 	}
 
 	scopes := githubDefaultScopes
@@ -54,26 +59,34 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		return nil, fmt.Errorf("parse github host: %w", err)
 	}
 
+	in := io.In
+	if in == nil {
+		in = os.Stdin
+	}
+
 	flow := &oauth.Flow{
 		Host:     host,
 		ClientID: clientID,
 		Scopes:   scopes,
 		Stdout:   io.Out,
-		Stdin:    os.Stdin,
+		Stdin:    in,
 		DisplayCode: func(userCode, verificationURI string) error {
 			copyToClipboard(userCode)
 			fmt.Fprintf(io.Out, "! First, copy your one-time code: %s\n", userCode)
 			fmt.Fprintf(io.Out, "- Press Enter to open %s in your browser... ", verificationURI)
-			bufio.NewScanner(os.Stdin).Scan()
+			bufio.NewScanner(in).Scan()
 			return nil
 		},
 		BrowseURL: func(url string) error {
-			fmt.Fprintf(io.Out, "✓ Opened %s in browser\n", url)
-			if io.Browser != nil {
-				if err := io.Browser(url); err != nil {
-					fmt.Fprintf(io.Out, "  (could not open browser automatically: %v)\n", err)
-				}
+			if io.Browser == nil {
+				fmt.Fprintf(io.Out, "- Please open %s in your browser.\n", url)
+				return nil
 			}
+			if err := io.Browser(url); err != nil {
+				fmt.Fprintf(io.Out, "  (could not open browser automatically: %v)\n", err)
+				return nil
+			}
+			fmt.Fprintf(io.Out, "✓ Opened %s in browser\n", url)
 			return nil
 		},
 	}
@@ -113,12 +126,14 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 }
 
 func fetchGitHubUser(ctx context.Context, hostURL, token string) (string, error) {
-	apiURL := hostURL
+	var userURL string
 	if hostURL == githubDefaultHost {
-		apiURL = "https://api.github.com"
+		userURL = "https://api.github.com/user"
+	} else {
+		userURL = strings.TrimRight(hostURL, "/") + "/api/v3/user"
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL+"/user", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
 	if err != nil {
 		return "", err
 	}

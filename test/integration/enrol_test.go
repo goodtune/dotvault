@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -186,37 +185,7 @@ func TestEnrolmentFullFlow(t *testing.T) {
 	}
 }
 
-func TestEnrolmentDefaultClientIDAndScopes(t *testing.T) {
-	// Verifies that the mock OAuth server receives the expected default client_id
-	// and scopes when the GitHub engine runs with no settings overrides.
-	// This test requires a live Vault but mocks the GitHub OAuth endpoints.
-	skipIfNoVault(t)
-
-	mockServer := newMockOAuthServer(t)
-
-	// We build a custom engine that uses the mock server's URLs.
-	// Since we can't easily override the host URL inside GitHubEngine without
-	// going through settings, we verify the logic by inspecting what would be sent.
-	expectedClientID := "178c6fc778ccc68e1d6a"
-	expectedScopes := []string{"repo", "read:org", "gist"}
-
-	// The mock OAuth server captures the client_id and scopes sent to it.
-	// We simulate this by directly calling the device code endpoint.
-	resp, err := http.PostForm(mockServer.server.URL+"/login/device/code", map[string][]string{
-		"client_id": {expectedClientID},
-		"scope":     {fmt.Sprintf("%s,%s,%s", expectedScopes[0], expectedScopes[1], expectedScopes[2])},
-	})
-	if err != nil {
-		t.Fatalf("POST device code: %v", err)
-	}
-	defer resp.Body.Close()
-
-	<-mockServer.deviceCodeCh
-
-	if mockServer.clientID != expectedClientID {
-		t.Errorf("client_id = %q, want %q", mockServer.clientID, expectedClientID)
-	}
-	if len(mockServer.scopes) != 3 {
-		t.Errorf("scopes = %v, want %v", mockServer.scopes, expectedScopes)
-	}
-}
+// TestEnrolmentDefaultClientIDAndScopes was dropped: it posted directly to the
+// mock OAuth server without exercising GitHubEngine, so it gave false confidence.
+// A proper replacement would run GitHubEngine against a TLS mock server and verify
+// the actual HTTP requests it sends — deferred to a future PR.

@@ -3,6 +3,7 @@ package enrol
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -26,6 +27,9 @@ type Manager struct {
 
 // NewManager creates a new Manager.
 func NewManager(cfg ManagerConfig, vc *vault.Client, io IO) *Manager {
+	// Normalize UserPrefix to have exactly one trailing slash so callers
+	// don't need to remember to include it.
+	cfg.UserPrefix = strings.TrimRight(cfg.UserPrefix, "/") + "/"
 	return &Manager{
 		cfg:   cfg,
 		vault: vc,

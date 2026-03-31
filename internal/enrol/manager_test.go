@@ -5,11 +5,30 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
 )
+
+// enableKVv2 enables a KV v2 mount, ignoring "already in use" errors.
+func enableKVv2(t *testing.T, vc *vault.Client, mount string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := vc.EnableKVv2(ctx, mount); err != nil && !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("EnableKVv2(%q): %v", mount, err)
+	}
+}
+
+// seedKVv2 writes a secret, failing the test on error.
+func seedKVv2(t *testing.T, vc *vault.Client, mount, path string, data map[string]any) {
+	t.Helper()
+	ctx := context.Background()
+	if err := vc.WriteKVv2(ctx, mount, path, data); err != nil {
+		t.Fatalf("WriteKVv2(%q, %q): %v", mount, path, err)
+	}
+}
 
 // mockEngine is an Engine for testing.
 type mockEngine struct {
@@ -60,8 +79,8 @@ func TestCheckAll_AllPresent(t *testing.T) {
 	t.Cleanup(func() { UnregisterEngine("test-present") })
 
 	// Pre-seed vault with complete credentials
-	vc.EnableKVv2(ctx, "kv")
-	vc.WriteKVv2(ctx, "kv", "users/testuser/mykey", map[string]any{"token": "existing"})
+	enableKVv2(t, vc, "kv")
+	seedKVv2(t, vc, "kv", "users/testuser/mykey", map[string]any{"token": "existing"})
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -92,7 +111,7 @@ func TestCheckAll_Missing(t *testing.T) {
 	RegisterEngine("test-missing", eng)
 	t.Cleanup(func() { UnregisterEngine("test-missing") })
 
-	vc.EnableKVv2(ctx, "kv")
+	enableKVv2(t, vc, "kv")
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -140,7 +159,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 		UnregisterEngine("test-fail")
 	})
 
-	vc.EnableKVv2(ctx, "kv")
+	enableKVv2(t, vc, "kv")
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -176,7 +195,7 @@ func TestCheckAll_UnknownEngine(t *testing.T) {
 	vc := skipIfNoVault(t)
 	ctx := context.Background()
 
-	vc.EnableKVv2(ctx, "kv")
+	enableKVv2(t, vc, "kv")
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{

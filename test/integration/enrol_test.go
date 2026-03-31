@@ -3,95 +3,14 @@ package integration
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/vault"
 )
-
-// mockOAuthServer simulates the GitHub device flow OAuth endpoints.
-// It auto-approves any device code request and returns a fake access token.
-type mockOAuthServer struct {
-	server       *httptest.Server
-	clientID     string
-	scopes       []string
-	issuedToken  string
-	deviceCodeCh chan struct{}
-}
-
-func newMockOAuthServer(t *testing.T) *mockOAuthServer {
-	t.Helper()
-	m := &mockOAuthServer{
-		issuedToken:  "gho_mock_oauth_token_" + t.Name(),
-		deviceCodeCh: make(chan struct{}, 1),
-	}
-
-	mux := http.NewServeMux()
-
-	// Device code endpoint
-	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		m.clientID = r.FormValue("client_id")
-		m.scopes = splitCSV(r.FormValue("scope"))
-		m.deviceCodeCh <- struct{}{}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"device_code":      "mock_device_code",
-			"user_code":        "MOCK-1234",
-			"verification_uri": m.server.URL + "/login/device",
-			"expires_in":       900,
-			"interval":         0, // poll immediately
-		})
-	})
-
-	// Token endpoint
-	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"access_token": m.issuedToken,
-			"token_type":   "bearer",
-			"scope":        "repo,read:org,gist",
-		})
-	})
-
-	// User API endpoint (GitHub /user)
-	mux.HandleFunc("/api/v3/user", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"login": "mock-octocat",
-		})
-	})
-
-	m.server = httptest.NewServer(mux)
-	t.Cleanup(m.server.Close)
-	return m
-}
-
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	for _, p := range bytes.Split([]byte(s), []byte(",")) {
-		if t := bytes.TrimSpace(p); len(t) > 0 {
-			out = append(out, string(t))
-		}
-	}
-	return out
-}
 
 // testEnrolIO returns an IO that suppresses terminal output and auto-answers Enter.
 func testEnrolIO(t *testing.T) enrol.IO {
@@ -104,11 +23,10 @@ func testEnrolIO(t *testing.T) enrol.IO {
 	}
 }
 
-// mockGitHubEngine wraps GitHubEngine but redirects the OAuth endpoints to the mock server.
+// mockGitHubEngine returns canned credentials without running a real OAuth flow.
 type mockGitHubEngine struct {
-	serverURL string
-	token     string
-	user      string
+	token string
+	user  string
 }
 
 func (e *mockGitHubEngine) Name() string   { return "GitHub" }
@@ -133,7 +51,9 @@ func TestEnrolmentFullFlow(t *testing.T) {
 	ctx := context.Background()
 
 	// Ensure the KV mount exists
-	vc.EnableKVv2(ctx, "secret")
+	if err := vc.EnableKVv2(ctx, "secret"); err != nil && !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("EnableKVv2: %v", err)
+	}
 
 	// Register a mock engine that returns known credentials without running real OAuth
 	mockEng := &mockGitHubEngine{

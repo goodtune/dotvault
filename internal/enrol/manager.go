@@ -67,11 +67,27 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 	results := runWizard(ctx, pending, m.io)
 
 	for key, creds := range results {
-		vaultPath := cfg.UserPrefix + key
+		enrolment := cfg.Enrolments[key]
+		engine, ok := GetEngine(enrolment.Engine)
+		if !ok {
+			m.io.Log.Error("engine not found for result key", "key", key)
+			continue
+		}
+
+		// Validate all required fields are present and non-empty before
+		// writing to Vault. Incomplete credentials are silently discarded;
+		// the enrolment will be retried on the next cycle.
 		data := make(map[string]any, len(creds))
 		for k, v := range creds {
 			data[k] = v
 		}
+		if !hasAllFields(data, engine.Fields()) {
+			m.io.Log.Error("engine returned incomplete credentials, skipping vault write", "key", key, "engine", enrolment.Engine)
+			fmt.Fprintf(m.io.Out, "✗ %s — engine returned incomplete credentials (will retry next cycle)\n", key)
+			continue
+		}
+
+		vaultPath := cfg.UserPrefix + key
 		if writeErr := m.vault.WriteKVv2(ctx, cfg.KVMount, vaultPath, data); writeErr != nil {
 			m.io.Log.Error("failed to write enrolment to vault", "key", key, "error", writeErr)
 			fmt.Fprintf(m.io.Out, "✗ %s — vault write failed (credentials lost, will retry next cycle)\n", key)
@@ -119,10 +135,11 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 func hasAllFields(data map[string]any, fields []string) bool {
 	for _, f := range fields {
 		v, ok := data[f]
-		if !ok {
+		if !ok || v == nil {
 			return false
 		}
-		if s, ok := v.(string); ok && s == "" {
+		s, ok := v.(string)
+		if !ok || strings.TrimSpace(s) == "" {
 			return false
 		}
 	}

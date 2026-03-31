@@ -22,8 +22,17 @@ export function StatusBar({ status, onSync }) {
 
   return h('header', { class: 'status-bar' },
     h('div', { class: 'status-left' },
-      h('span', { class: 'app-title' }, '.vault'),
+      h('span', { class: 'app-title' },
+        '.vault',
+        status?.version && h('span', { class: 'app-version' }, ' v' + status.version),
+      ),
       h('span', { class: `status-indicator ${authClass}` }, authStatus),
+      status?.vault_address && h('a', {
+        class: 'vault-link',
+        href: status.vault_address,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+      }, 'Vault \u2197'),
     ),
     h('div', { class: 'status-right' },
       status?.time && h('span', { class: 'last-sync' },

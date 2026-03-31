@@ -2,7 +2,12 @@ import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { getSecret } from '../api.js';
 
-export function SecretPanel({ secretPath, customText }) {
+function buildVaultSecretURL(status, secretPath) {
+  const base = status.vault_address.replace(/\/+$/, '');
+  return `${base}/ui/vault/secrets/${status.kv_mount}/show/${status.user_prefix}${status.username}/${secretPath}`;
+}
+
+export function SecretPanel({ secretPath, status, customText }) {
   const [secret, setSecret] = useState(null);
   const [revealed, setRevealed] = useState({});
   const [copied, setCopied] = useState({});
@@ -88,7 +93,15 @@ export function SecretPanel({ secretPath, customText }) {
     : Object.keys(secret.fields || {});
 
   return h('main', { class: 'secret-panel' },
-    h('h2', null, secretPath),
+    h('div', { class: 'secret-heading' },
+      h('h2', null, secretPath),
+      status?.vault_address && h('a', {
+        class: 'vault-link',
+        href: buildVaultSecretURL(status, secretPath),
+        target: '_blank',
+        rel: 'noopener noreferrer',
+      }, 'View in Vault \u2197'),
+    ),
     h('div', { class: 'secret-meta' }, 'Version: ', secret.version),
     h('table', { class: 'field-table' },
       h('thead', null,

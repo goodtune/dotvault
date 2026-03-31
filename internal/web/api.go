@@ -14,6 +14,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"authenticated": s.vault != nil && s.vault.Token() != "",
 		"auth_method":   s.authMethod,
 		"time":          time.Now().Format(time.RFC3339),
+		"version":       s.version,
+		"vault_address": s.vaultAddress,
+		"kv_mount":      s.kvMount,
+		"user_prefix":   s.userPrefix,
+		"username":      s.username,
 	}
 
 	if s.loginTextHTML != "" {

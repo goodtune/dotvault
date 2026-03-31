@@ -32,7 +32,9 @@ type Server struct {
 	authMethod    string
 	authMount     string
 	authRole      string
-	tokenFilePath string
+	tokenFilePath      string
+	version            string
+	vaultAddress       string
 	loginTextHTML      string
 	secretViewTextHTML string
 	authDone           chan struct{}
@@ -49,6 +51,7 @@ type ServerConfig struct {
 	Engine        *sync.Engine
 	Username      string
 	TokenFilePath string
+	Version       string
 }
 
 // NewServer creates a new web server.
@@ -72,11 +75,13 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authMethod:    sc.VaultCfg.AuthMethod,
 		authMount:     sc.VaultCfg.AuthMount,
 		authRole:      sc.VaultCfg.AuthRole,
+		tokenFilePath:      sc.TokenFilePath,
+		version:            sc.Version,
+		vaultAddress:       sc.VaultCfg.Address,
 		loginTextHTML:      renderMarkdown(sc.WebCfg.LoginText),
 		secretViewTextHTML: renderMarkdown(sc.WebCfg.SecretViewText),
-		tokenFilePath:     sc.TokenFilePath,
-		authDone:          make(chan struct{}, 1),
-		readyCh:           make(chan error, 1),
+		authDone:           make(chan struct{}, 1),
+		readyCh:            make(chan error, 1),
 	}
 
 	s.registerRoutes()

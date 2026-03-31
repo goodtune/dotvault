@@ -114,7 +114,11 @@ func parseTOML(input string) (map[string]any, error) {
 				parts := splitTOMLKey(name)
 				parent := root
 				for _, p := range parts[:len(parts)-1] {
-					parent = ensureTable(parent, p)
+					var err error
+					parent, err = ensureTable(parent, p)
+					if err != nil {
+						return nil, fmt.Errorf("line %d: %w", i+1, err)
+					}
 				}
 				last := parts[len(parts)-1]
 				arr, _ := parent[last].([]any)
@@ -131,7 +135,11 @@ func parseTOML(input string) (map[string]any, error) {
 			parts := splitTOMLKey(name)
 			current = root
 			for _, p := range parts {
-				current = ensureTable(current, p)
+				var err error
+				current, err = ensureTable(current, p)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: %w", i+1, err)
+				}
 			}
 			continue
 		}
@@ -149,7 +157,11 @@ func parseTOML(input string) (map[string]any, error) {
 		parts := splitTOMLKey(key)
 		target := current
 		for _, p := range parts[:len(parts)-1] {
-			target = ensureTable(target, p)
+			var err error
+			target, err = ensureTable(target, p)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %w", i+1, err)
+			}
 		}
 
 		val, err := parseTOMLValue(valStr)
@@ -162,15 +174,20 @@ func parseTOML(input string) (map[string]any, error) {
 	return root, nil
 }
 
-func ensureTable(m map[string]any, key string) map[string]any {
+// errTableConflict is returned when a key that already holds a non-table value
+// is reused as a table header or dotted key prefix.
+var errTableConflict = fmt.Errorf("key already exists as a non-table value")
+
+func ensureTable(m map[string]any, key string) (map[string]any, error) {
 	if v, ok := m[key]; ok {
 		if tbl, ok := v.(map[string]any); ok {
-			return tbl
+			return tbl, nil
 		}
+		return nil, fmt.Errorf("%w: %q", errTableConflict, key)
 	}
 	tbl := make(map[string]any)
 	m[key] = tbl
-	return tbl
+	return tbl, nil
 }
 
 func splitTOMLKey(key string) []string {
@@ -258,41 +275,19 @@ func parseTOMLValue(s string) (any, error) {
 		return parseTOMLInlineTable(s)
 	}
 
-	// Integer (try before float)
+	// Number parsing — strip underscores, then let strconv detect base/format.
 	cleaned := strings.ReplaceAll(s, "_", "")
+
+	// Integer (try before float)
 	if isIntegerStr(s) {
-		// Handle hex, octal, binary prefixes
-		if strings.HasPrefix(cleaned, "0x") || strings.HasPrefix(cleaned, "0X") ||
-			strings.HasPrefix(cleaned, "+0x") || strings.HasPrefix(cleaned, "-0x") {
-			n, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimPrefix(cleaned, "+"), "-"), 0, 64)
-			if err == nil {
-				if strings.HasPrefix(cleaned, "-") {
-					return -n, nil
-				}
-				return n, nil
-			}
-		} else if strings.HasPrefix(cleaned, "0o") || strings.HasPrefix(cleaned, "0O") {
-			n, err := strconv.ParseInt("0"+cleaned[2:], 0, 64)
-			if err == nil {
-				return n, nil
-			}
-		} else if strings.HasPrefix(cleaned, "0b") || strings.HasPrefix(cleaned, "0B") {
-			n, err := strconv.ParseInt(cleaned, 0, 64)
-			if err == nil {
-				return n, nil
-			}
-		} else {
-			n, err := strconv.ParseInt(cleaned, 10, 64)
-			if err == nil {
-				return n, nil
-			}
+		if n, err := strconv.ParseInt(cleaned, 0, 64); err == nil {
+			return n, nil
 		}
 	}
 
 	// Float
 	if isFloatStr(s) {
-		f, err := strconv.ParseFloat(cleaned, 64)
-		if err == nil {
+		if f, err := strconv.ParseFloat(cleaned, 64); err == nil {
 			return f, nil
 		}
 	}
@@ -425,13 +420,23 @@ func parseTOMLInlineTable(s string) (map[string]any, error) {
 		if eqIdx < 0 {
 			return nil, fmt.Errorf("inline table: expected key = value in %q", elem)
 		}
-		key := strings.TrimSpace(elem[:eqIdx])
+		rawKey := strings.TrimSpace(elem[:eqIdx])
 		valStr := strings.TrimSpace(elem[eqIdx+1:])
 		val, err := parseTOMLValue(valStr)
 		if err != nil {
 			return nil, err
 		}
-		result[key] = val
+		// Unquote the key using the same logic as splitTOMLKey (single part).
+		parts := splitTOMLKey(rawKey)
+		// Store into nested maps for dotted keys.
+		target := result
+		for _, p := range parts[:len(parts)-1] {
+			target, err = ensureTable(target, p)
+			if err != nil {
+				return nil, err
+			}
+		}
+		target[parts[len(parts)-1]] = val
 	}
 	return result, nil
 }
@@ -613,26 +618,34 @@ func encodeTOMLArrayValue(buf *bytes.Buffer, arr []any) {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-		switch val := elem.(type) {
-		case map[string]any:
-			buf.WriteByte('{')
-			keys := make([]string, 0, len(val))
-			for k := range val {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for j, k := range keys {
-				if j > 0 {
-					buf.WriteString(", ")
-				}
-				encodeTOMLKey(buf, k)
-				buf.WriteString(" = ")
-				encodeTOMLScalar(buf, val[k])
-			}
-			buf.WriteByte('}')
-		default:
-			encodeTOMLScalar(buf, elem)
-		}
+		encodeTOMLInlineValue(buf, elem)
 	}
 	buf.WriteByte(']')
+}
+
+// encodeTOMLInlineValue writes any value in inline TOML syntax, handling
+// nested maps (inline tables) and arrays recursively.
+func encodeTOMLInlineValue(buf *bytes.Buffer, v any) {
+	switch val := v.(type) {
+	case map[string]any:
+		buf.WriteByte('{')
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for j, k := range keys {
+			if j > 0 {
+				buf.WriteString(", ")
+			}
+			encodeTOMLKey(buf, k)
+			buf.WriteString(" = ")
+			encodeTOMLInlineValue(buf, val[k])
+		}
+		buf.WriteByte('}')
+	case []any:
+		encodeTOMLArrayValue(buf, val)
+	default:
+		encodeTOMLScalar(buf, v)
+	}
 }

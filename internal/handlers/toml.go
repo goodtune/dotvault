@@ -121,9 +121,15 @@ func parseTOML(input string) (map[string]any, error) {
 					}
 				}
 				last := parts[len(parts)-1]
-				arr, _ := parent[last].([]any)
+				existing, exists := parent[last]
 				newTable := make(map[string]any)
-				parent[last] = append(arr, newTable)
+				if !exists || existing == nil {
+					parent[last] = []any{newTable}
+				} else if arr, ok := existing.([]any); ok {
+					parent[last] = append(arr, newTable)
+				} else {
+					return nil, fmt.Errorf("line %d: cannot redefine key %q as array of tables", i+1, name)
+				}
 				current = newTable
 				continue
 			}
@@ -224,24 +230,14 @@ func parseTOMLValue(s string) (any, error) {
 		return "", nil
 	}
 
-	// Strip inline comment (not inside strings)
-	s = stripInlineComment(s)
-
-	// Boolean
-	if s == "true" {
-		return true, nil
-	}
-	if s == "false" {
-		return false, nil
-	}
-
-	// String (basic or literal)
+	// Parse multi-line strings before stripping comments, since
+	// stripInlineComment does not understand triple-quote delimiters.
 	if strings.HasPrefix(s, `"""`) {
 		end := strings.Index(s[3:], `"""`)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated multi-line basic string")
 		}
-		return s[3 : 3+end], nil
+		return unescapeTOMLString(s[3 : 3+end]), nil
 	}
 	if strings.HasPrefix(s, "'''") {
 		end := strings.Index(s[3:], "'''")
@@ -250,19 +246,41 @@ func parseTOMLValue(s string) (any, error) {
 		}
 		return s[3 : 3+end], nil
 	}
+
+	// Single-line strings — find the closing quote, then strip comments
+	// from any trailing content after the string.
 	if s[0] == '"' {
-		end := strings.LastIndex(s[1:], `"`)
+		end := strings.Index(s[1:], `"`)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated basic string")
+		}
+		// Skip escaped quotes
+		for end >= 0 && s[end] == '\\' {
+			next := strings.Index(s[end+2:], `"`)
+			if next < 0 {
+				return nil, fmt.Errorf("unterminated basic string")
+			}
+			end = end + 2 + next
 		}
 		return unescapeTOMLString(s[1 : 1+end]), nil
 	}
 	if s[0] == '\'' {
-		end := strings.LastIndex(s[1:], "'")
+		end := strings.Index(s[1:], "'")
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated literal string")
 		}
 		return s[1 : 1+end], nil
+	}
+
+	// Strip inline comment for non-string values
+	s = stripInlineComment(s)
+
+	// Boolean
+	if s == "true" {
+		return true, nil
+	}
+	if s == "false" {
+		return false, nil
 	}
 
 	// Inline array
@@ -292,8 +310,7 @@ func parseTOMLValue(s string) (any, error) {
 		}
 	}
 
-	// Bare value — treat as string
-	return s, nil
+	return nil, fmt.Errorf("invalid TOML value: %q", s)
 }
 
 func stripInlineComment(s string) string {
@@ -519,10 +536,7 @@ func encodeTOML(buf *bytes.Buffer, m map[string]any, prefix string) error {
 		v := m[k]
 		switch val := v.(type) {
 		case map[string]any:
-			fullKey := k
-			if prefix != "" {
-				fullKey = prefix + "." + k
-			}
+			fullKey := encodeTOMLHeaderKey(prefix, k)
 			buf.WriteByte('\n')
 			buf.WriteString("[")
 			buf.WriteString(fullKey)
@@ -532,10 +546,7 @@ func encodeTOML(buf *bytes.Buffer, m map[string]any, prefix string) error {
 			}
 		case []any:
 			if isArrayOfTables(val) {
-				fullKey := k
-				if prefix != "" {
-					fullKey = prefix + "." + k
-				}
+				fullKey := encodeTOMLHeaderKey(prefix, k)
 				for _, elem := range val {
 					tbl := elem.(map[string]any)
 					buf.WriteByte('\n')
@@ -581,6 +592,18 @@ func encodeTOMLKey(buf *bytes.Buffer, key string) {
 		buf.WriteString(strings.ReplaceAll(key, `"`, `\"`))
 		buf.WriteByte('"')
 	}
+}
+
+// encodeTOMLHeaderKey builds a dotted key path for table/array-of-tables headers,
+// quoting each segment that contains unsafe characters.
+func encodeTOMLHeaderKey(prefix, key string) string {
+	var buf bytes.Buffer
+	encodeTOMLKey(&buf, key)
+	segment := buf.String()
+	if prefix != "" {
+		return prefix + "." + segment
+	}
+	return segment
 }
 
 func encodeTOMLScalar(buf *bytes.Buffer, v any) {

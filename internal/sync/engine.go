@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -291,7 +290,11 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		if rule.Target.Format == "netrc" {
 			incomingData = convertToNetrcVaultData(secret.Data)
 		} else if rule.Target.Format == "text" {
-			incomingData = convertToTextData(secret.Data)
+			textData, err := convertToTextData(secret.Data)
+			if err != nil {
+				return fmt.Errorf("convert vault data to text: %w", err)
+			}
+			incomingData = textData
 		} else {
 			incomingData = secret.Data
 		}
@@ -399,29 +402,37 @@ func parseNetrcJSON(s string, cred *handlers.NetrcCredential) error {
 
 // convertToTextData extracts the text content from Vault data.
 // It looks for a "data" key first, then "value", then "content".
-// If none are found it concatenates all string values in sorted key
-// order for deterministic output.
-func convertToTextData(data map[string]any) string {
+// Returns an error if a candidate key exists but is not a string,
+// or if no suitable key is found.
+func convertToTextData(data map[string]any) (string, error) {
 	for _, key := range []string{"data", "value", "content"} {
-		if v, ok := data[key]; ok {
-			if s, ok := v.(string); ok {
-				return s
-			}
+		v, ok := data[key]
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			return "", fmt.Errorf("text format: vault key %q is %T, expected string", key, v)
+		}
+		return s, nil
+	}
+
+	// No well-known key found — check if there is exactly one string field.
+	var found string
+	var count int
+	for _, v := range data {
+		if s, ok := v.(string); ok {
+			found = s
+			count++
 		}
 	}
-	// Fallback: concatenate all string values in sorted key order
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
+	if count == 1 {
+		return found, nil
 	}
-	sort.Strings(keys)
-	var parts []string
-	for _, k := range keys {
-		if s, ok := data[k].(string); ok {
-			parts = append(parts, s)
-		}
+	if count == 0 {
+		return "", fmt.Errorf("text format: vault secret contains no string fields; use a \"data\", \"value\", or \"content\" key")
 	}
-	return strings.Join(parts, "\n")
+	return "", fmt.Errorf("text format: vault secret contains %d string fields; use a \"data\", \"value\", or \"content\" key to disambiguate", count)
 }
 
 func hasPrefix(s, prefix string) bool {

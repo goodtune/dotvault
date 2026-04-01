@@ -254,6 +254,17 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {
+			// Even when content is unchanged, enforce permissions for sensitive formats.
+			if !e.DryRun && (rule.Target.Format == "netrc" || rule.Target.Format == "text") {
+				if info, err := os.Stat(targetPath); err == nil {
+					expectedPerm := os.FileMode(0600)
+					if info.Mode().Perm() != expectedPerm {
+						if err := os.Chmod(targetPath, expectedPerm); err != nil {
+							log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", expectedPerm), "error", err)
+						}
+					}
+				}
+			}
 			log.Debug("secret unchanged, skipping")
 			return nil
 		}

@@ -3,6 +3,7 @@ package enrol
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -104,7 +105,14 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pendingEnrolment, error) {
 	var pending []pendingEnrolment
 
-	for key, enrolment := range cfg.Enrolments {
+	keys := make([]string, 0, len(cfg.Enrolments))
+	for key := range cfg.Enrolments {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		enrolment := cfg.Enrolments[key]
 		engine, ok := GetEngine(enrolment.Engine)
 		if !ok {
 			m.io.Log.Error("unknown enrolment engine, skipping", "key", key, "engine", enrolment.Engine)

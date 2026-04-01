@@ -12,7 +12,7 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
-// testEnrolIO returns an IO that suppresses terminal output and auto-answers Enter.
+// testEnrolIO returns an IO that suppresses terminal output.
 func testEnrolIO(t *testing.T) enrol.IO {
 	t.Helper()
 	var buf bytes.Buffer

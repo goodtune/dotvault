@@ -197,7 +197,7 @@ func (c *Config) validate() error {
 	// Enrolments validation
 	for key, e := range c.Enrolments {
 		if e.Engine == "" {
-			return fmt.Errorf("enrolments[%s].engine is required", key)
+			return fmt.Errorf("enrolments[%q].engine is required", key)
 		}
 	}
 

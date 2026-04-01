@@ -45,14 +45,19 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 
 	scopes := githubDefaultScopes
 	if raw, ok := settings["scopes"]; ok {
-		if sl, ok := raw.([]any); ok {
-			scopes = make([]string, 0, len(sl))
-			for _, s := range sl {
-				if str, ok := s.(string); ok {
-					scopes = append(scopes, str)
-				}
-			}
+		sl, ok := raw.([]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid scopes setting: expected list, got %T", raw)
 		}
+		parsed := make([]string, 0, len(sl))
+		for _, s := range sl {
+			str, ok := s.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid scope value: expected string, got %T", s)
+			}
+			parsed = append(parsed, str)
+		}
+		scopes = parsed
 	}
 
 	host, err := oauth.NewGitHubHost(hostURL)

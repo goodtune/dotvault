@@ -200,6 +200,9 @@ func (c *Config) validate() error {
 
 	// Enrolments validation
 	for key, e := range c.Enrolments {
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("enrolment key must not be empty or whitespace")
+		}
 		if e.Engine == "" {
 			return fmt.Errorf("enrolments[%q].engine is required", key)
 		}

@@ -14,7 +14,7 @@ func TestGitHubEngine_Name(t *testing.T) {
 func TestGitHubEngine_Fields(t *testing.T) {
 	e := &GitHubEngine{}
 	fields := e.Fields()
-	want := []string{"oauth_token", "user"}
+	want := []string{"oauth_token"}
 	if len(fields) != len(want) {
 		t.Fatalf("Fields() len = %d, want %d", len(fields), len(want))
 	}

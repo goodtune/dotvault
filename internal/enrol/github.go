@@ -26,7 +26,7 @@ type GitHubEngine struct{}
 
 func (e *GitHubEngine) Name() string { return "GitHub" }
 
-func (e *GitHubEngine) Fields() []string { return []string{"oauth_token", "user"} }
+func (e *GitHubEngine) Fields() []string { return []string{"oauth_token"} }
 
 func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) (map[string]string, error) {
 	clientID := githubDefaultClientID
@@ -127,11 +127,13 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 }
 
 func fetchGitHubUser(ctx context.Context, hostURL, token string) (string, error) {
+	normalizedHostURL := strings.TrimRight(hostURL, "/")
+
 	var userURL string
-	if hostURL == githubDefaultHost {
+	if normalizedHostURL == githubDefaultHost {
 		userURL = "https://api.github.com/user"
 	} else {
-		userURL = strings.TrimRight(hostURL, "/") + "/api/v3/user"
+		userURL = normalizedHostURL + "/api/v3/user"
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)

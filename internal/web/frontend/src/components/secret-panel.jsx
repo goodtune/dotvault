@@ -2,7 +2,25 @@ import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { getSecret } from '../api.js';
 
-export function SecretPanel({ secretPath, customText }) {
+function isHTTPURL(url) {
+  return !!url && /^https?:\/\//i.test(url);
+}
+
+function buildVaultSecretURL(status, secretPath) {
+  if (!isHTTPURL(status.vault_address)) return null;
+  const base = status.vault_address.replace(/\/+$/, '');
+  const action = secretPath && secretPath.endsWith('/') ? 'list' : 'show';
+  const encodedMount = encodeURIComponent(status.kv_mount);
+  const encodePath = (p) => (p || '')
+    .split('/').filter(s => s.length > 0)
+    .map(s => encodeURIComponent(s)).join('/');
+  const userPath = encodePath(`${status.user_prefix || ''}${status.username}`);
+  const secretSegment = encodePath(secretPath);
+  const fullPath = secretSegment ? `${userPath}/${secretSegment}` : userPath;
+  return `${base}/ui/vault/secrets/${encodedMount}/${action}/${fullPath}`;
+}
+
+export function SecretPanel({ secretPath, status, customText }) {
   const [secret, setSecret] = useState(null);
   const [revealed, setRevealed] = useState({});
   const [copied, setCopied] = useState({});
@@ -88,7 +106,18 @@ export function SecretPanel({ secretPath, customText }) {
     : Object.keys(secret.fields || {});
 
   return h('main', { class: 'secret-panel' },
-    h('h2', null, secretPath),
+    h('div', { class: 'secret-heading' },
+      h('h2', null, secretPath),
+      (() => {
+        const url = status?.kv_mount && status?.username && buildVaultSecretURL(status, secretPath);
+        return url && h('a', {
+          class: 'vault-link',
+          href: url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+        }, 'View in Vault \u2197');
+      })(),
+    ),
     h('div', { class: 'secret-meta' }, 'Version: ', secret.version),
     h('table', { class: 'field-table' },
       h('thead', null,

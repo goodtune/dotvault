@@ -82,7 +82,7 @@ export function App() {
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),
     h('div', { class: 'main-layout' },
       h(Sidebar, { keys, selected: selectedKey, onSelect: setSelectedKey }),
-      h(SecretPanel, { secretPath: selectedKey, customText: status.secret_view_text }),
+      h(SecretPanel, { secretPath: selectedKey, status, customText: status.secret_view_text }),
     ),
   );
 }

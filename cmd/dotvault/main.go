@@ -183,6 +183,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Engine:        engine,
 			Username:      username,
 			TokenFilePath: tokenPath,
+			Version:       version,
 		})
 		if err != nil {
 			slog.Error("failed to create web server", "error", err)

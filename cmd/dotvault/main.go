@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -253,6 +255,58 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					if err := browser.OpenURL(url); err != nil {
 						slog.Warn("failed to open browser for re-auth", "url", url, "error", err)
 					}
+				}
+			}
+		}
+	}()
+
+	// Create enrolment manager and run initial check.
+	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+		Enrolments: cfg.Enrolments,
+		KVMount:    cfg.Vault.KVMount,
+		UserPrefix: cfg.Vault.UserPrefix + username + "/",
+	}, vc, enrol.IO{
+		Out:     os.Stderr,
+		Browser: browser.OpenURL,
+		Log:     slog.Default(),
+	})
+	if _, err := enrolMgr.CheckAll(ctx); err != nil {
+		slog.Warn("enrolment check failed", "error", err)
+	}
+	// Note: we don't TriggerSync here because engine.RunLoop performs an
+	// initial sync on startup, which will pick up any newly enrolled credentials.
+
+	// Background goroutine: reload config on each tick and re-check enrolments.
+	// Note: only the enrolments section is acted upon at reload time. Changes to
+	// sync.interval, rules, or other config fields require a daemon restart to
+	// take effect (the sync engine holds its own copy of the config).
+	configPath := flagConfig
+	if configPath == "" {
+		configPath = paths.SystemConfigPath()
+	}
+	go func() {
+		ticker := time.NewTicker(cfg.Sync.Interval)
+		defer ticker.Stop()
+		lastEnrolments := cfg.Enrolments
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reloaded, err := config.LoadSystem(configPath)
+				if err != nil {
+					slog.Warn("config reload failed", "error", err)
+					continue
+				}
+				if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+					slog.Info("enrolments config changed, re-checking")
+					enrolMgr.UpdateConfig(reloaded.Enrolments)
+					lastEnrolments = reloaded.Enrolments
+				}
+				if ok, err := enrolMgr.CheckAll(ctx); err != nil {
+					slog.Warn("enrolment check failed", "error", err)
+				} else if ok {
+					engine.TriggerSync()
 				}
 			}
 		}

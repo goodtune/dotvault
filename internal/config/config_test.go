@@ -94,6 +94,35 @@ rules:
 	}
 }
 
+func TestLoadCustomUserPrefixWithoutTrailingSlash(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+  user_prefix: "team/engineering"
+  auth_method: "oidc"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Vault.UserPrefix != "team/engineering/" {
+		t.Errorf("Vault.UserPrefix = %q, want %q", cfg.Vault.UserPrefix, "team/engineering/")
+	}
+}
+
 func TestLoadWebConfig(t *testing.T) {
 	yaml := `
 vault:
@@ -320,6 +349,115 @@ rules:
 	}
 	if len(r.OAuth.Scopes) != 2 {
 		t.Errorf("len(OAuth.Scopes) = %d, want 2", len(r.OAuth.Scopes))
+	}
+}
+
+func TestLoadEnrolments(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+  auth_method: "oidc"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+
+enrolments:
+  gh:
+    engine: github
+  gitlab:
+    engine: gitlab
+    settings:
+      host: "gitlab.example.com"
+      scopes:
+        - api
+        - read_user
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(cfg.Enrolments) != 2 {
+		t.Fatalf("len(Enrolments) = %d, want 2", len(cfg.Enrolments))
+	}
+	gh, ok := cfg.Enrolments["gh"]
+	if !ok {
+		t.Fatal("missing enrolment 'gh'")
+	}
+	if gh.Engine != "github" {
+		t.Errorf("gh.Engine = %q, want %q", gh.Engine, "github")
+	}
+	gl := cfg.Enrolments["gitlab"]
+	if gl.Engine != "gitlab" {
+		t.Errorf("gitlab.Engine = %q, want %q", gl.Engine, "gitlab")
+	}
+	if gl.Settings["host"] != "gitlab.example.com" {
+		t.Errorf("gitlab.Settings[host] = %v, want %q", gl.Settings["host"], "gitlab.example.com")
+	}
+}
+
+func TestLoadEnrolmentMissingEngine(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+
+enrolments:
+  gh:
+    settings:
+      host: "github.com"
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for missing engine field")
+	}
+}
+
+func TestLoadEmptyEnrolments(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(cfg.Enrolments) != 0 {
+		t.Errorf("len(Enrolments) = %d, want 0", len(cfg.Enrolments))
 	}
 }
 

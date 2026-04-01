@@ -3,6 +3,7 @@ module github.com/goodtune/dotvault
 go 1.25.6
 
 require (
+	github.com/cli/oauth v1.2.2
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
@@ -16,6 +17,8 @@ require (
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
+	github.com/cli/browser v1.0.0 // indirect
+	github.com/cli/safeexec v1.0.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.1 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect

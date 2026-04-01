@@ -81,6 +81,8 @@ var validFormats = map[string]bool{
 	"yaml":  true,
 	"json":  true,
 	"ini":   true,
+	"toml":  true,
+	"text":  true,
 	"netrc": true,
 }
 
@@ -194,7 +196,7 @@ func (c *Config) validate() error {
 			return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
 		}
 		if !validFormats[r.Target.Format] {
-			return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, or netrc)", i, r.Name, r.Target.Format)
+			return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
 		}
 	}
 

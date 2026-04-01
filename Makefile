@@ -7,7 +7,7 @@ test:
 
 .PHONY: build
 build:
-	go build $(LDFLAGS) -o dist/dotvault ./cmd/dotvault
+	CGO_ENABLED=0 go build $(LDFLAGS) -o dist/dotvault ./cmd/dotvault
 
 .PHONY: build-all
 build-all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64

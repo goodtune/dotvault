@@ -1,0 +1,3 @@
+[credentials]
+password = "new-password"
+token = "vault-token-123"

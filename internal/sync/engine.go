@@ -254,6 +254,17 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {
+			// Even when content is unchanged, enforce permissions for sensitive formats.
+			if !e.DryRun && (rule.Target.Format == "netrc" || rule.Target.Format == "text") {
+				if info, err := os.Stat(targetPath); err == nil {
+					expectedPerm := os.FileMode(0600)
+					if info.Mode().Perm() != expectedPerm {
+						if err := os.Chmod(targetPath, expectedPerm); err != nil {
+							log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", expectedPerm), "error", err)
+						}
+					}
+				}
+			}
 			log.Debug("secret unchanged, skipping")
 			return nil
 		}
@@ -288,6 +299,12 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		// For netrc format, convert raw vault data to NetrcVaultData
 		if rule.Target.Format == "netrc" {
 			incomingData = convertToNetrcVaultData(secret.Data)
+		} else if rule.Target.Format == "text" {
+			textData, err := convertToTextData(secret.Data)
+			if err != nil {
+				return fmt.Errorf("convert vault data to text: %w", err)
+			}
+			incomingData = textData
 		} else {
 			incomingData = secret.Data
 		}
@@ -318,7 +335,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 	// Determine file permissions
 	perm := os.FileMode(0644)
-	if rule.Target.Format == "netrc" {
+	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
 		perm = 0600
 	}
 
@@ -330,6 +347,18 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 	if err := handler.Write(targetPath, merged, perm); err != nil {
 		return fmt.Errorf("write file: %w", err)
+	}
+
+	// For formats requiring 0600, ensure existing file permissions are corrected
+	// even if handler.Write decides not to rewrite the content (e.g., content unchanged).
+	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
+		if info, err := os.Stat(targetPath); err == nil {
+			if info.Mode().Perm() != perm {
+				if err := os.Chmod(targetPath, perm); err != nil {
+					log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", perm), "error", err)
+				}
+			}
+		}
 	}
 
 	// Update state
@@ -391,6 +420,43 @@ func parseNetrcJSON(s string, cred *handlers.NetrcCredential) error {
 	cred.Login = jc.Login
 	cred.Password = jc.Password
 	return nil
+}
+
+// convertToTextData extracts the text content from Vault data.
+// It looks for a "data" key first, then "value", then "content".
+// If one of these keys is present it must be a string, otherwise an error is returned.
+// If none of these keys are present (or none hold a string), the function falls back to:
+//   - returning the value when there is exactly one string field in the secret, or
+//   - returning an error if there are zero or multiple string fields (to avoid ambiguity).
+func convertToTextData(data map[string]any) (string, error) {
+	for _, key := range []string{"data", "value", "content"} {
+		v, ok := data[key]
+		if !ok {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			return "", fmt.Errorf("text format: vault key %q is %T, expected string", key, v)
+		}
+		return s, nil
+	}
+
+	// No well-known key found — check if there is exactly one string field.
+	var found string
+	var count int
+	for _, v := range data {
+		if s, ok := v.(string); ok {
+			found = s
+			count++
+		}
+	}
+	if count == 1 {
+		return found, nil
+	}
+	if count == 0 {
+		return "", fmt.Errorf("text format: vault secret contains no string fields; use a \"data\", \"value\", or \"content\" key")
+	}
+	return "", fmt.Errorf("text format: vault secret contains %d string fields; use a \"data\", \"value\", or \"content\" key to disambiguate", count)
 }
 
 func hasPrefix(s, prefix string) bool {

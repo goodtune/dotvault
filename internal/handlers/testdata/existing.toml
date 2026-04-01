@@ -1,0 +1,8 @@
+[database]
+host = "localhost"
+port = 5432
+name = "mydb"
+
+[credentials]
+username = "admin"
+password = "old-password"

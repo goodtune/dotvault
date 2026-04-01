@@ -706,7 +706,13 @@ func encodeTOMLScalar(buf *bytes.Buffer, v any) {
 		case math.IsNaN(val):
 			buf.WriteString("nan")
 		default:
-			fmt.Fprintf(buf, "%g", val)
+			s := strconv.FormatFloat(val, 'g', -1, 64)
+			// Ensure the output contains a decimal point or exponent so it
+			// round-trips as a float, not an integer.
+			if !strings.ContainsAny(s, ".eE") {
+				s += ".0"
+			}
+			buf.WriteString(s)
 		}
 	default:
 		fmt.Fprintf(buf, "%v", val)

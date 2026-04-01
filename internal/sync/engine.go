@@ -338,6 +338,18 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return fmt.Errorf("write file: %w", err)
 	}
 
+	// For formats requiring 0600, ensure existing file permissions are corrected
+	// even if handler.Write decides not to rewrite the content (e.g., content unchanged).
+	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
+		if info, err := os.Stat(targetPath); err == nil {
+			if info.Mode().Perm() != perm {
+				if err := os.Chmod(targetPath, perm); err != nil {
+					log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", perm), "error", err)
+				}
+			}
+		}
+	}
+
 	// Update state
 	newChecksum, _ := FileChecksum(targetPath)
 	e.state.Set(rule.Name, RuleState{

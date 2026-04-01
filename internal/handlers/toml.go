@@ -688,7 +688,9 @@ func encodeTOML(buf *bytes.Buffer, m map[string]any, prefix string) error {
 		switch val := v.(type) {
 		case map[string]any:
 			fullKey := encodeTOMLHeaderKey(prefix, k)
-			buf.WriteByte('\n')
+			if buf.Len() > 0 {
+				buf.WriteByte('\n')
+			}
 			buf.WriteString("[")
 			buf.WriteString(fullKey)
 			buf.WriteString("]\n")
@@ -700,7 +702,9 @@ func encodeTOML(buf *bytes.Buffer, m map[string]any, prefix string) error {
 				fullKey := encodeTOMLHeaderKey(prefix, k)
 				for _, elem := range val {
 					tbl := elem.(map[string]any)
-					buf.WriteByte('\n')
+					if buf.Len() > 0 {
+						buf.WriteByte('\n')
+					}
 					buf.WriteString("[[")
 					buf.WriteString(fullKey)
 					buf.WriteString("]]\n")

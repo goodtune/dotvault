@@ -65,6 +65,39 @@ func TestHandleSyncRequiresCSRF(t *testing.T) {
 	}
 }
 
+func TestHandleStatus_VersionAlwaysPresent(t *testing.T) {
+	s := testServer(t)
+	s.version = "1.2.3"
+
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["version"] != "1.2.3" {
+		t.Errorf("version = %v, want %q", resp["version"], "1.2.3")
+	}
+}
+
+func TestHandleStatus_VaultFieldsHiddenWhenUnauthenticated(t *testing.T) {
+	s := testServer(t)
+	s.vaultAddress = "http://127.0.0.1:8200"
+
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	for _, field := range []string{"vault_address", "kv_mount", "user_prefix", "username"} {
+		if _, ok := resp[field]; ok {
+			t.Errorf("unauthenticated response should not contain %q", field)
+		}
+	}
+}
+
 func TestHandleStatus_AuthMethod(t *testing.T) {
 	s := testServer(t)
 	s.authMethod = "ldap"

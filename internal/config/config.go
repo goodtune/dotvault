@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/paths"
@@ -142,9 +143,12 @@ func (c *Config) validate() error {
 		c.Vault.KVMount = "kv"
 	}
 
-	// Default user prefix
+	// Default user prefix; ensure exactly one trailing slash so all
+	// consumers (sync engine, enrolment manager) build consistent paths.
 	if c.Vault.UserPrefix == "" {
 		c.Vault.UserPrefix = "users/"
+	} else {
+		c.Vault.UserPrefix = strings.TrimRight(c.Vault.UserPrefix, "/") + "/"
 	}
 
 	// Parse sync interval

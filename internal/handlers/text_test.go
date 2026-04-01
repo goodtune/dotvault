@@ -10,7 +10,9 @@ func TestTextHandler_ReadExisting(t *testing.T) {
 	// Create a temp file with known content
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.pem")
-	os.WriteFile(path, []byte("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"), 0600)
+	if err := os.WriteFile(path, []byte("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"), 0600); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
 
 	h := &TextHandler{}
 	data, err := h.Read(path)
@@ -127,12 +129,19 @@ func TestTextHandler_WriteOverwrites(t *testing.T) {
 	path := filepath.Join(dir, "test.txt")
 
 	// Write initial content
-	h.Write(path, "initial", 0600)
+	if err := h.Write(path, "initial", 0600); err != nil {
+		t.Fatalf("Write() initial error: %v", err)
+	}
 
 	// Overwrite
-	h.Write(path, "replaced", 0600)
+	if err := h.Write(path, "replaced", 0600); err != nil {
+		t.Fatalf("Write() overwrite error: %v", err)
+	}
 
-	got, _ := os.ReadFile(path)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
 	if string(got) != "replaced" {
 		t.Errorf("got %q, want 'replaced'", string(got))
 	}

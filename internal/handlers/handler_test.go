@@ -101,20 +101,45 @@ func TestJSONRoundTrip(t *testing.T) {
 }
 
 func TestTOMLRoundTrip(t *testing.T) {
-	h, _ := HandlerFor("toml")
-	th := h.(*TOMLHandler)
+	h, err := HandlerFor("toml")
+	if err != nil {
+		t.Fatalf("HandlerFor(toml): %v", err)
+	}
+	th, ok := h.(*TOMLHandler)
+	if !ok {
+		t.Fatalf("handler is not *TOMLHandler, got %T", h)
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.toml")
 
-	initial, _ := th.Parse("key1 = \"value1\"\nkey2 = \"value2\"")
-	h.Write(path, initial, 0644)
+	initial, err := th.Parse("key1 = \"value1\"\nkey2 = \"value2\"")
+	if err != nil {
+		t.Fatalf("Parse initial TOML: %v", err)
+	}
+	if err := h.Write(path, initial, 0644); err != nil {
+		t.Fatalf("Write initial TOML: %v", err)
+	}
 
-	data, _ := h.Read(path)
-	incoming, _ := th.Parse("key2 = \"updated\"\nkey3 = \"added\"")
-	merged, _ := h.Merge(data, incoming)
-	h.Write(path, merged, 0644)
+	data, err := h.Read(path)
+	if err != nil {
+		t.Fatalf("Read initial TOML: %v", err)
+	}
+	incoming, err := th.Parse("key2 = \"updated\"\nkey3 = \"added\"")
+	if err != nil {
+		t.Fatalf("Parse incoming TOML: %v", err)
+	}
+	merged, err := h.Merge(data, incoming)
+	if err != nil {
+		t.Fatalf("Merge TOML: %v", err)
+	}
+	if err := h.Write(path, merged, 0644); err != nil {
+		t.Fatalf("Write merged TOML: %v", err)
+	}
 
-	got, _ := os.ReadFile(path)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
 	s := string(got)
 	for _, want := range []string{`"value1"`, `"updated"`, `"added"`} {
 		if !strings.Contains(s, want) {
@@ -124,20 +149,45 @@ func TestTOMLRoundTrip(t *testing.T) {
 }
 
 func TestTextRoundTrip(t *testing.T) {
-	h, _ := HandlerFor("text")
-	th := h.(*TextHandler)
+	h, err := HandlerFor("text")
+	if err != nil {
+		t.Fatalf("HandlerFor(text): %v", err)
+	}
+	th, ok := h.(*TextHandler)
+	if !ok {
+		t.Fatalf("handler is not *TextHandler, got %T", h)
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "id_rsa")
 
-	initial, _ := th.Parse("initial key content")
-	h.Write(path, initial, 0600)
+	initial, err := th.Parse("initial key content")
+	if err != nil {
+		t.Fatalf("Parse initial: %v", err)
+	}
+	if err := h.Write(path, initial, 0600); err != nil {
+		t.Fatalf("Write initial: %v", err)
+	}
 
-	data, _ := h.Read(path)
-	incoming, _ := th.Parse("replaced key content")
-	merged, _ := h.Merge(data, incoming)
-	h.Write(path, merged, 0600)
+	data, err := h.Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	incoming, err := th.Parse("replaced key content")
+	if err != nil {
+		t.Fatalf("Parse incoming: %v", err)
+	}
+	merged, err := h.Merge(data, incoming)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if err := h.Write(path, merged, 0600); err != nil {
+		t.Fatalf("Write merged: %v", err)
+	}
 
-	got, _ := os.ReadFile(path)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
 	if string(got) != "replaced key content" {
 		t.Errorf("output = %q, want 'replaced key content'", string(got))
 	}

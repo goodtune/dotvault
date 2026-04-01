@@ -145,13 +145,24 @@ func TestTOMLHandler_MergePreservesExistingKeys(t *testing.T) {
 
 func TestTOMLHandler_WriteTrailingNewline(t *testing.T) {
 	h := &TOMLHandler{}
-	data, _ := h.Parse("key = \"value\"")
+	data, err := h.Parse("key = \"value\"")
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
 
 	dir := t.TempDir()
 	outPath := filepath.Join(dir, "out.toml")
-	h.Write(outPath, data, 0644)
+	if err := h.Write(outPath, data, 0644); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
 
-	got, _ := os.ReadFile(outPath)
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("output is empty")
+	}
 	if got[len(got)-1] != '\n' {
 		t.Error("output missing trailing newline")
 	}
@@ -162,23 +173,36 @@ func TestTOMLHandler_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.toml")
 
-	initial, _ := h.Parse("key1 = \"value1\"\nkey2 = \"value2\"")
-	h.Write(path, initial, 0644)
+	initial, err := h.Parse("key1 = \"value1\"\nkey2 = \"value2\"")
+	if err != nil {
+		t.Fatalf("Parse initial: %v", err)
+	}
+	if err := h.Write(path, initial, 0644); err != nil {
+		t.Fatalf("Write initial: %v", err)
+	}
 
 	data, err := h.Read(path)
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
 
-	incoming, _ := h.Parse("key2 = \"updated\"\nkey3 = \"added\"")
+	incoming, err := h.Parse("key2 = \"updated\"\nkey3 = \"added\"")
+	if err != nil {
+		t.Fatalf("Parse incoming: %v", err)
+	}
 	merged, err := h.Merge(data, incoming)
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
 
-	h.Write(path, merged, 0644)
+	if err := h.Write(path, merged, 0644); err != nil {
+		t.Fatalf("Write merged: %v", err)
+	}
 
-	got, _ := os.ReadFile(path)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
 	s := string(got)
 	for _, want := range []string{`"value1"`, `"updated"`, `"added"`} {
 		if !strings.Contains(s, want) {

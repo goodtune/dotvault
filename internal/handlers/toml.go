@@ -154,8 +154,9 @@ func parseTOML(input string) (map[string]any, error) {
 			continue
 		}
 
-		// Key = Value
-		eqIdx := strings.Index(line, "=")
+		// Key = Value — find the first unquoted '=' to handle quoted keys
+		// containing '=' (e.g. "a=b" = 1).
+		eqIdx := findUnquotedEquals(line)
 		if eqIdx < 0 {
 			return nil, fmt.Errorf("line %d: expected key = value", i+1)
 		}
@@ -284,22 +285,48 @@ func splitTOMLKey(key string) []string {
 	return parts
 }
 
+// findUnquotedEquals finds the first '=' that is not inside a quoted string.
+func findUnquotedEquals(s string) int {
+	inQuote := false
+	quoteChar := byte(0)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote {
+			if ch == '\\' && quoteChar == '"' {
+				i++ // skip escaped char in basic strings
+				continue
+			}
+			if ch == quoteChar {
+				inQuote = false
+			}
+		} else {
+			if ch == '"' || ch == '\'' {
+				inQuote = true
+				quoteChar = ch
+			} else if ch == '=' {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func parseTOMLValue(s string) (any, error) {
-	if s == "" {
-		return "", nil
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("empty TOML value")
 	}
 
 	// Parse multi-line strings before stripping comments, since
 	// stripInlineComment does not understand triple-quote delimiters.
 	if strings.HasPrefix(s, `"""`) {
-		end := strings.Index(s[3:], `"""`)
+		end := findUnescapedDelim(s[3:], `"""`, true)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated multi-line basic string")
 		}
 		return unescapeTOMLString(s[3 : 3+end]), nil
 	}
 	if strings.HasPrefix(s, "'''") {
-		end := strings.Index(s[3:], "'''")
+		end := findUnescapedDelim(s[3:], "'''", false)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated multi-line literal string")
 		}
@@ -326,12 +353,22 @@ func parseTOMLValue(s string) (any, error) {
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated basic string")
 		}
+		// Validate no trailing garbage after the closing quote.
+		remainder := strings.TrimSpace(s[end+1:])
+		if remainder != "" && remainder[0] != '#' {
+			return nil, fmt.Errorf("unexpected content after string: %q", remainder)
+		}
 		return unescapeTOMLString(s[1:end]), nil
 	}
 	if s[0] == '\'' {
 		end := strings.Index(s[1:], "'")
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated literal string")
+		}
+		// Validate no trailing garbage after the closing quote.
+		remainder := strings.TrimSpace(s[1+end+1:])
+		if remainder != "" && remainder[0] != '#' {
+			return nil, fmt.Errorf("unexpected content after string: %q", remainder)
 		}
 		return s[1 : 1+end], nil
 	}
@@ -408,13 +445,48 @@ func stripInlineComment(s string) string {
 }
 
 func unescapeTOMLString(s string) string {
-	s = strings.ReplaceAll(s, `\\`, "\x00BACKSLASH\x00")
-	s = strings.ReplaceAll(s, `\"`, `"`)
-	s = strings.ReplaceAll(s, `\n`, "\n")
-	s = strings.ReplaceAll(s, `\t`, "\t")
-	s = strings.ReplaceAll(s, `\r`, "\r")
-	s = strings.ReplaceAll(s, "\x00BACKSLASH\x00", `\`)
-	return s
+	if s == "" {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); {
+		ch := s[i]
+		if ch != '\\' {
+			b.WriteByte(ch)
+			i++
+			continue
+		}
+
+		// Backslash at end: keep as-is.
+		if i+1 >= len(s) {
+			b.WriteByte('\\')
+			break
+		}
+
+		next := s[i+1]
+		switch next {
+		case '\\':
+			b.WriteByte('\\')
+		case '"':
+			b.WriteByte('"')
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case 'r':
+			b.WriteByte('\r')
+		default:
+			// Unknown escape: preserve the backslash and following character.
+			b.WriteByte('\\')
+			b.WriteByte(next)
+		}
+		i += 2
+	}
+
+	return b.String()
 }
 
 func isIntegerStr(s string) bool {
@@ -502,7 +574,7 @@ func parseTOMLInlineTable(s string) (map[string]any, error) {
 		if elem == "" {
 			continue
 		}
-		eqIdx := strings.Index(elem, "=")
+		eqIdx := findUnquotedEquals(elem)
 		if eqIdx < 0 {
 			return nil, fmt.Errorf("inline table: expected key = value in %q", elem)
 		}

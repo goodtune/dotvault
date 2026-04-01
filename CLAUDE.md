@@ -7,7 +7,7 @@ Cross-platform daemon (Go) that runs in user context, authenticates to HashiCorp
 ```sh
 make test          # run all tests
 make build         # build for current platform
-make build-all     # cross-compile linux/darwin/windows x amd64/arm64
+make build-all     # cross-compile linux/darwin (amd64/arm64) and windows (amd64)
 ```
 
 All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`).

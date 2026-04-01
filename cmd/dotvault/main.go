@@ -270,11 +270,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		Browser: browser.OpenURL,
 		Log:     slog.Default(),
 	})
-	if ok, err := enrolMgr.CheckAll(ctx); err != nil {
+	if _, err := enrolMgr.CheckAll(ctx); err != nil {
 		slog.Warn("enrolment check failed", "error", err)
-	} else if ok {
-		engine.TriggerSync()
 	}
+	// Note: we don't TriggerSync here because engine.RunLoop performs an
+	// initial sync on startup, which will pick up any newly enrolled credentials.
 
 	// Background goroutine: reload config on each tick and re-check enrolments.
 	// Note: only the enrolments section is acted upon at reload time. Changes to

@@ -152,7 +152,7 @@ Enrolment [1/2]: GitHub
 ✓ Opened https://github.com/login/device in browser
 ⠼ Waiting for authentication...
 
-✓ gh (GitHub) — enrolled as @octocat
+✓ gh (GitHub) — credentials acquired for @octocat
 
 Enrolment [2/2]: GitLab
 ...

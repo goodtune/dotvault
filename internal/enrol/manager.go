@@ -3,6 +3,8 @@ package enrol
 import (
 	"context"
 	"fmt"
+	iolib "io"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +33,13 @@ func NewManager(cfg ManagerConfig, vc *vault.Client, io IO) *Manager {
 	// Normalize UserPrefix to have exactly one trailing slash so callers
 	// don't need to remember to include it.
 	cfg.UserPrefix = strings.TrimRight(cfg.UserPrefix, "/") + "/"
+	// Default IO fields to safe no-ops to prevent nil pointer panics.
+	if io.Log == nil {
+		io.Log = slog.Default()
+	}
+	if io.Out == nil {
+		io.Out = iolib.Discard
+	}
 	return &Manager{
 		cfg:   cfg,
 		vault: vc,

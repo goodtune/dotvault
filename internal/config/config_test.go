@@ -94,6 +94,35 @@ rules:
 	}
 }
 
+func TestLoadCustomUserPrefixWithoutTrailingSlash(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+  user_prefix: "team/engineering"
+  auth_method: "oidc"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Vault.UserPrefix != "team/engineering/" {
+		t.Errorf("Vault.UserPrefix = %q, want %q", cfg.Vault.UserPrefix, "team/engineering/")
+	}
+}
+
 func TestLoadWebConfig(t *testing.T) {
 	yaml := `
 vault:

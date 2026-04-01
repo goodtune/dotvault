@@ -29,8 +29,13 @@ type mockGitHubEngine struct {
 	user  string
 }
 
-func (e *mockGitHubEngine) Name() string   { return "GitHub" }
-func (e *mockGitHubEngine) Fields() []string { return []string{"oauth_token"} }
+func (e *mockGitHubEngine) Name() string {
+	return "GitHub"
+}
+
+func (e *mockGitHubEngine) Fields() []string {
+	return []string{"oauth_token"}
+}
 func (e *mockGitHubEngine) Run(_ context.Context, _ map[string]any, _ enrol.IO) (map[string]string, error) {
 	return map[string]string{
 		"oauth_token": e.token,

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -264,7 +265,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
 		Enrolments: cfg.Enrolments,
 		KVMount:    cfg.Vault.KVMount,
-		UserPrefix: cfg.Vault.UserPrefix + username + "/",
+		UserPrefix: strings.TrimRight(cfg.Vault.UserPrefix, "/") + "/" + username + "/",
 	}, vc, enrol.IO{
 		Out:     os.Stderr,
 		Browser: browser.OpenURL,

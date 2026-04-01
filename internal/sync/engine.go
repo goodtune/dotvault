@@ -401,8 +401,10 @@ func parseNetrcJSON(s string, cred *handlers.NetrcCredential) error {
 
 // convertToTextData extracts the text content from Vault data.
 // It looks for a "data" key first, then "value", then "content".
-// Returns an error if a candidate key exists but is not a string,
-// or if no suitable key is found.
+// If one of these keys is present it must be a string, otherwise an error is returned.
+// If none of these keys are present (or none hold a string), the function falls back to:
+//   - returning the value when there is exactly one string field in the secret, or
+//   - returning an error if there are zero or multiple string fields (to avoid ambiguity).
 func convertToTextData(data map[string]any) (string, error) {
 	for _, key := range []string{"data", "value", "content"} {
 		v, ok := data[key]

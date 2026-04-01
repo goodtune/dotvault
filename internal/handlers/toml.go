@@ -323,14 +323,24 @@ func parseTOMLValue(s string) (any, error) {
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated multi-line basic string")
 		}
-		return unescapeTOMLString(s[3 : 3+end]), nil
+		value := unescapeTOMLString(s[3 : 3+end])
+		remainder := strings.TrimSpace(s[3+end+3:])
+		if remainder != "" && remainder[0] != '#' {
+			return nil, fmt.Errorf("unexpected content after string: %q", remainder)
+		}
+		return value, nil
 	}
 	if strings.HasPrefix(s, "'''") {
 		end := findUnescapedDelim(s[3:], "'''", false)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated multi-line literal string")
 		}
-		return s[3 : 3+end], nil
+		value := s[3 : 3+end]
+		remainder := strings.TrimSpace(s[3+end+3:])
+		if remainder != "" && remainder[0] != '#' {
+			return nil, fmt.Errorf("unexpected content after string: %q", remainder)
+		}
+		return value, nil
 	}
 
 	// Single-line strings — scan for closing quote, handling escapes.
@@ -730,7 +740,9 @@ func encodeTOMLKey(buf *bytes.Buffer, key string) {
 		buf.WriteString(key)
 	} else {
 		buf.WriteByte('"')
-		buf.WriteString(strings.ReplaceAll(key, `"`, `\"`))
+		escaped := strings.ReplaceAll(key, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		buf.WriteString(escaped)
 		buf.WriteByte('"')
 	}
 }

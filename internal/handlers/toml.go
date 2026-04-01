@@ -803,7 +803,13 @@ func encodeTOMLScalar(buf *bytes.Buffer, v any) {
 			buf.WriteString(s)
 		}
 	default:
-		fmt.Fprintf(buf, "%v", val)
+		if v == nil {
+			buf.WriteString(`""`)
+			return
+		}
+		// Encode unsupported types as TOML strings to avoid invalid output.
+		s := fmt.Sprint(v)
+		encodeTOMLScalar(buf, s)
 	}
 }
 

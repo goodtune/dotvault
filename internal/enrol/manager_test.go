@@ -12,6 +12,13 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
+// testPrefix returns a per-test unique Vault prefix so tests are
+// idempotent against a long-lived dev server.
+func testPrefix(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("test/%s/", t.Name())
+}
+
 // enableKVv2 enables a KV v2 mount, ignoring "already in use" errors.
 func enableKVv2(t *testing.T, vc *vault.Client, mount string) {
 	t.Helper()
@@ -80,7 +87,8 @@ func TestCheckAll_AllPresent(t *testing.T) {
 
 	// Pre-seed vault with complete credentials
 	enableKVv2(t, vc, "kv")
-	seedKVv2(t, vc, "kv", "users/testuser/mykey", map[string]any{"token": "existing"})
+	prefix := testPrefix(t)
+	seedKVv2(t, vc, "kv", prefix+"mykey", map[string]any{"token": "existing"})
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -88,7 +96,7 @@ func TestCheckAll_AllPresent(t *testing.T) {
 			"mykey": {Engine: "test-present"},
 		},
 		KVMount:    "kv",
-		UserPrefix: "users/testuser/",
+		UserPrefix: prefix,
 	}, vc, testIO(&buf))
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -112,6 +120,7 @@ func TestCheckAll_Missing(t *testing.T) {
 	t.Cleanup(func() { UnregisterEngine("test-missing") })
 
 	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -119,7 +128,7 @@ func TestCheckAll_Missing(t *testing.T) {
 			"newkey": {Engine: "test-missing"},
 		},
 		KVMount:    "kv",
-		UserPrefix: "users/testuser2/",
+		UserPrefix: prefix,
 	}, vc, testIO(&buf))
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -134,7 +143,7 @@ func TestCheckAll_Missing(t *testing.T) {
 	}
 
 	// Verify vault was written
-	secret, err := vc.ReadKVv2(ctx, "kv", "users/testuser2/newkey")
+	secret, err := vc.ReadKVv2(ctx, "kv", prefix+"newkey")
 	if err != nil {
 		t.Fatalf("ReadKVv2 error: %v", err)
 	}
@@ -160,6 +169,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 	})
 
 	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{
@@ -168,7 +178,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 			"keyfail": {Engine: "test-fail"},
 		},
 		KVMount:    "kv",
-		UserPrefix: "users/testuser3/",
+		UserPrefix: prefix,
 	}, vc, testIO(&buf))
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -180,7 +190,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 	}
 
 	// ok key should be in vault
-	secret, err := vc.ReadKVv2(ctx, "kv", "users/testuser3/keyok")
+	secret, err := vc.ReadKVv2(ctx, "kv", prefix+"keyok")
 	if err != nil {
 		t.Fatalf("ReadKVv2() error for keyok: %v", err)
 	}
@@ -188,7 +198,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 		t.Error("expected keyok in vault")
 	}
 	// fail key should not be in vault
-	secret, err = vc.ReadKVv2(ctx, "kv", "users/testuser3/keyfail")
+	secret, err = vc.ReadKVv2(ctx, "kv", prefix+"keyfail")
 	if err != nil {
 		t.Fatalf("ReadKVv2() error for keyfail: %v", err)
 	}
@@ -209,7 +219,7 @@ func TestCheckAll_UnknownEngine(t *testing.T) {
 			"somekey": {Engine: "nonexistent-engine"},
 		},
 		KVMount:    "kv",
-		UserPrefix: "users/testuser4/",
+		UserPrefix: testPrefix(t),
 	}, vc, testIO(&buf))
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -229,7 +239,7 @@ func TestCheckAll_Empty(t *testing.T) {
 	mgr := NewManager(ManagerConfig{
 		Enrolments: nil,
 		KVMount:    "kv",
-		UserPrefix: "users/x/",
+		UserPrefix: testPrefix(t),
 	}, vc, testIO(&buf))
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -248,7 +258,7 @@ func TestUpdateConfig(t *testing.T) {
 	mgr := NewManager(ManagerConfig{
 		Enrolments: nil,
 		KVMount:    "kv",
-		UserPrefix: "users/x/",
+		UserPrefix: testPrefix(t),
 	}, vc, testIO(&buf))
 
 	newMap := map[string]config.Enrolment{

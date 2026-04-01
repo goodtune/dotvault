@@ -76,6 +76,10 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 
 	results := runWizard(ctx, pending, m.io)
 
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
 	for key, creds := range results {
 		enrolment := cfg.Enrolments[key]
 		engine, ok := GetEngine(enrolment.Engine)

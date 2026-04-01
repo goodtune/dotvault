@@ -3,9 +3,11 @@ package integration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
@@ -68,13 +70,16 @@ func TestEnrolmentFullFlow(t *testing.T) {
 	enrol.RegisterEngine("mock-gh", mockEng)
 	defer enrol.UnregisterEngine("mock-gh")
 
+	// Use a per-test prefix so tests are idempotent against a long-lived Vault.
+	prefix := fmt.Sprintf("users/enroltest-%d/", time.Now().UnixNano())
+
 	io := testEnrolIO(t)
 	mgr := enrol.NewManager(enrol.ManagerConfig{
 		Enrolments: map[string]config.Enrolment{
 			"gh": {Engine: "mock-gh"},
 		},
 		KVMount:    "secret",
-		UserPrefix: "users/enroltest/",
+		UserPrefix: prefix,
 	}, vc, io)
 
 	enrolled, err := mgr.CheckAll(ctx)
@@ -86,7 +91,7 @@ func TestEnrolmentFullFlow(t *testing.T) {
 	}
 
 	// Verify the secret was written to Vault
-	secret, err := vc.ReadKVv2(ctx, "secret", "users/enroltest/gh")
+	secret, err := vc.ReadKVv2(ctx, "secret", prefix+"gh")
 	if err != nil {
 		t.Fatalf("ReadKVv2 error: %v", err)
 	}

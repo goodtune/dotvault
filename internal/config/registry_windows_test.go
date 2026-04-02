@@ -173,14 +173,16 @@ func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create key %s: %v", name, err)
 		}
-		defer k.Close()
 		engine := "github"
 		if name == "gitlab" {
 			engine = "gitlab"
 		}
 		if err := k.SetStringValue("Engine", engine); err != nil {
+			k.Close()
 			t.Fatalf("set Engine for %s: %v", name, err)
 		}
+		// Close handle before deferred DeleteKey calls run (LIFO ordering).
+		k.Close()
 	}
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gh`)
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gitlab`)

@@ -365,14 +365,23 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 				// engine setting keys (e.g. "client_id", "host").
 				// Registry value names are case-insensitive on Windows.
 				settingKey := strings.ToLower(vname)
-				if s, ok := readRegString(sk, vname); ok {
-					enrolment.Settings[settingKey] = s
-				} else if ms := readRegMultiString(sk, vname); ms != nil {
-					vals := make([]any, len(ms))
-					for i, v := range ms {
-						vals[i] = v
+				// Read the value type first to dispatch to the correct
+				// reader directly, avoiding spurious type-mismatch
+				// warnings from the probe-and-fallback approach.
+				_, valtype, _ := sk.GetValue(vname, nil)
+				switch valtype {
+				case registry.SZ, registry.EXPAND_SZ:
+					if s, ok := readRegString(sk, vname); ok {
+						enrolment.Settings[settingKey] = s
 					}
-					enrolment.Settings[settingKey] = vals
+				case registry.MULTI_SZ:
+					if ms := readRegMultiString(sk, vname); ms != nil {
+						vals := make([]any, len(ms))
+						for i, v := range ms {
+							vals[i] = v
+						}
+						enrolment.Settings[settingKey] = vals
+					}
 				}
 			}
 		}

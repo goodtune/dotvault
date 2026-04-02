@@ -85,6 +85,15 @@ func TestApplyRegistryLayerBooleans(t *testing.T) {
 }
 
 func TestReadSingleEnrolment(t *testing.T) {
+	// Register cleanup first so stray keys are removed even on early failure.
+	// Deletes children before parents (required on Windows).
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh\Settings`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test`)
+	})
+
 	// Create a temporary registry key tree simulating:
 	//   <testRoot>\Enrolments\gh\Engine = "github"
 	//   <testRoot>\Enrolments\gh\Settings\Host = "github.com"
@@ -97,10 +106,6 @@ func TestReadSingleEnrolment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create test key: %v", err)
 	}
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh\Settings`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test`)
 
 	defer base.Close()
 	if err := base.SetStringValue("Engine", "github"); err != nil {

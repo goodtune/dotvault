@@ -4,6 +4,8 @@ package config
 
 import (
 	"testing"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 func TestApplyRegistryLayer(t *testing.T) {
@@ -79,6 +81,71 @@ func TestApplyRegistryLayerBooleans(t *testing.T) {
 	}
 	if cfg.Web.Listen != "127.0.0.1:9090" {
 		t.Errorf("Web.Listen = %q, want %q", cfg.Web.Listen, "127.0.0.1:9090")
+	}
+}
+
+func TestReadSingleEnrolment(t *testing.T) {
+	// Create a temporary registry key tree simulating:
+	//   <testRoot>\Enrolments\gh\Engine = "github"
+	//   <testRoot>\Enrolments\gh\Settings\Host = "github.com"
+	//   <testRoot>\Enrolments\gh\Settings\Scopes = ["repo", "read:org"]
+	base, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test\Enrolments\gh`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create test key: %v", err)
+	}
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh\Settings`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments\gh`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test`)
+
+	if err := base.SetStringValue("Engine", "github"); err != nil {
+		t.Fatalf("set Engine: %v", err)
+	}
+	base.Close()
+
+	settings, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test\Enrolments\gh\Settings`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Settings key: %v", err)
+	}
+	if err := settings.SetStringValue("Host", "github.com"); err != nil {
+		t.Fatalf("set Host: %v", err)
+	}
+	if err := settings.SetStringsValue("Scopes", []string{"repo", "read:org"}); err != nil {
+		t.Fatalf("set Scopes: %v", err)
+	}
+	settings.Close()
+
+	enrolment, err := readSingleEnrolment(registry.CURRENT_USER, `SOFTWARE\dotvault-test`, "gh")
+	if err != nil {
+		t.Fatalf("readSingleEnrolment() error: %v", err)
+	}
+	if enrolment.Engine != "github" {
+		t.Errorf("Engine = %q, want %q", enrolment.Engine, "github")
+	}
+	if enrolment.Settings == nil {
+		t.Fatal("Settings is nil")
+	}
+	if host, ok := enrolment.Settings["Host"]; !ok || host != "github.com" {
+		t.Errorf("Settings[Host] = %v, want %q", enrolment.Settings["Host"], "github.com")
+	}
+	scopes, ok := enrolment.Settings["Scopes"]
+	if !ok {
+		t.Fatal("Settings[Scopes] missing")
+	}
+	scopeSlice, ok := scopes.([]any)
+	if !ok {
+		t.Fatalf("Settings[Scopes] type = %T, want []any", scopes)
+	}
+	if len(scopeSlice) != 2 || scopeSlice[0] != "repo" || scopeSlice[1] != "read:org" {
+		t.Errorf("Settings[Scopes] = %v, want [repo read:org]", scopeSlice)
 	}
 }
 

@@ -283,3 +283,52 @@ func readRegMultiString(key registry.Key, name string) []string {
 	}
 	return val
 }
+
+// readSingleEnrolment reads a single enrolment from the registry.
+// The basePath parameter is the registry path containing the Enrolments
+// subkey (e.g. registryPolicyPath). The name is the enrolment subkey name.
+func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, error) {
+	path := basePath + `\Enrolments\` + name
+	key, err := registry.OpenKey(root, path, registry.READ)
+	if err != nil {
+		return Enrolment{}, err
+	}
+	defer key.Close()
+
+	enrolment := Enrolment{}
+	enrolment.Engine, _ = readRegString(key, "Engine")
+
+	// Read optional Settings subkey.
+	settingsPath := path + `\Settings`
+	sk, err := registry.OpenKey(root, settingsPath, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return Enrolment{}, fmt.Errorf("open Settings key at %s: %w", settingsPath, err)
+	}
+	if err == nil {
+		defer sk.Close()
+		info, err := sk.Stat()
+		if err != nil {
+			return Enrolment{}, fmt.Errorf("stat Settings key: %w", err)
+		}
+		names, err := sk.ReadValueNames(int(info.ValueCount))
+		if err != nil {
+			return Enrolment{}, fmt.Errorf("read Settings value names: %w", err)
+		}
+		if len(names) > 0 {
+			enrolment.Settings = make(map[string]any, len(names))
+			for _, vname := range names {
+				if s, ok := readRegString(sk, vname); ok {
+					enrolment.Settings[vname] = s
+				} else if ms := readRegMultiString(sk, vname); ms != nil {
+					vals := make([]any, len(ms))
+					for i, v := range ms {
+						vals[i] = v
+					}
+					enrolment.Settings[vname] = vals
+				}
+			}
+		}
+	}
+
+	return enrolment, nil
+}

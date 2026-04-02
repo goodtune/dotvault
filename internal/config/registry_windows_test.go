@@ -102,10 +102,10 @@ func TestReadSingleEnrolment(t *testing.T) {
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test\Enrolments`)
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test`)
 
+	defer base.Close()
 	if err := base.SetStringValue("Engine", "github"); err != nil {
 		t.Fatalf("set Engine: %v", err)
 	}
-	base.Close()
 
 	settings, _, err := registry.CreateKey(
 		registry.CURRENT_USER,
@@ -115,13 +115,13 @@ func TestReadSingleEnrolment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create Settings key: %v", err)
 	}
+	defer settings.Close()
 	if err := settings.SetStringValue("Host", "github.com"); err != nil {
 		t.Fatalf("set Host: %v", err)
 	}
 	if err := settings.SetStringsValue("Scopes", []string{"repo", "read:org"}); err != nil {
 		t.Fatalf("set Scopes: %v", err)
 	}
-	settings.Close()
 
 	enrolment, err := readSingleEnrolment(registry.CURRENT_USER, `SOFTWARE\dotvault-test`, "gh")
 	if err != nil {
@@ -165,7 +165,7 @@ func TestReadRegistryEnrolmentsNotExist(t *testing.T) {
 func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
 	// Create two enrolment subkeys under a temporary registry path.
 	for _, name := range []string{"gh", "gitlab"} {
-		key, _, err := registry.CreateKey(
+		k, _, err := registry.CreateKey(
 			registry.CURRENT_USER,
 			`SOFTWARE\dotvault-test-enrol\Enrolments\`+name,
 			registry.ALL_ACCESS,
@@ -173,14 +173,14 @@ func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create key %s: %v", name, err)
 		}
+		defer k.Close()
 		engine := "github"
 		if name == "gitlab" {
 			engine = "gitlab"
 		}
-		if err := key.SetStringValue("Engine", engine); err != nil {
+		if err := k.SetStringValue("Engine", engine); err != nil {
 			t.Fatalf("set Engine for %s: %v", name, err)
 		}
-		key.Close()
 	}
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gh`)
 	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gitlab`)

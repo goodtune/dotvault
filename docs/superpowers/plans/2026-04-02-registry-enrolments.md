@@ -368,7 +368,7 @@ The existing `readRegistryRules` and helpers hard-code `registryPolicyPath`. For
 
 ---
 
-### Task 4: Update ADMX template
+### Task 5: Update ADMX template
 
 **Files:**
 - Modify: `packaging/windows/dotvault.admx`
@@ -434,7 +434,7 @@ git commit -m "Add Enrolments category and GP Preferences docs to ADMX (#21)"
 
 ---
 
-### Task 5: Final verification
+### Task 6: Final verification
 
 - [ ] **Step 1: Run full test suite**
 

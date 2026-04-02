@@ -364,15 +364,15 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 				// Normalize value names to lowercase so they match
 				// engine setting keys (e.g. "client_id", "host").
 				// Registry value names are case-insensitive on Windows.
-				key := strings.ToLower(vname)
+				settingKey := strings.ToLower(vname)
 				if s, ok := readRegString(sk, vname); ok {
-					enrolment.Settings[key] = s
+					enrolment.Settings[settingKey] = s
 				} else if ms := readRegMultiString(sk, vname); ms != nil {
 					vals := make([]any, len(ms))
 					for i, v := range ms {
 						vals[i] = v
 					}
-					enrolment.Settings[key] = vals
+					enrolment.Settings[settingKey] = vals
 				}
 			}
 		}

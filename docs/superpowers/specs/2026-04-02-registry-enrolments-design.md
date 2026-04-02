@@ -27,22 +27,22 @@ Example for a GitHub enrolment with custom scopes:
 
 ```
 Enrolments\gh\Engine = "github"
-Enrolments\gh\Settings\ClientID = "178c6fc778ccc68e1d6a"
-Enrolments\gh\Settings\Scopes = ["repo", "read:org", "gist"]
-Enrolments\gh\Settings\Host = "github.com"
+Enrolments\gh\Settings\client_id = "178c6fc778ccc68e1d6a"
+Enrolments\gh\Settings\scopes = ["repo", "read:org", "gist"]
+Enrolments\gh\Settings\host = "github.com"
 ```
 
 ## Go Code Changes
 
 ### `internal/config/registry_windows.go`
 
-**`readRegistryEnrolments(root registry.Key) (map[string]Enrolment, error)`**
+**`readRegistryEnrolments(root registry.Key, basePath string) (map[string]Enrolment, error)`**
 
-Opens `registryPolicyPath\Enrolments`, enumerates child subkey names (each is an enrolment name), and calls `readSingleEnrolment` for each. Returns `nil, nil` if the `Enrolments` key does not exist (ErrNotExist).
+Opens `basePath\Enrolments`, enumerates child subkey names (each is an enrolment name), and calls `readSingleEnrolment` for each. Returns `nil, nil` if the `Enrolments` key does not exist (ErrNotExist). The `basePath` parameter enables testability with HKCU temp keys.
 
-**`readSingleEnrolment(root registry.Key, name string) (Enrolment, error)`**
+**`readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, error)`**
 
-Opens the named subkey under `Enrolments\`. Reads `Engine` as REG_SZ. Then attempts to open an optional `Settings\` subkey. If present, enumerates all value names and reads each:
+Opens the named subkey under `basePath\Enrolments\`. Reads `Engine` as REG_SZ. Then attempts to open an optional `Settings\` subkey. If present, enumerates all value names, normalizes them to lowercase via `strings.ToLower`, and reads each:
 - Try REG_SZ first via `readRegString` — store as `string`
 - If not found as string, try REG_MULTI_SZ via `readRegMultiString` — store as `[]any` (each element a `string`) to match YAML unmarshalling behaviour where lists deserialise as `[]any`
 
@@ -53,7 +53,7 @@ Returns the populated `Enrolment` struct.
 After the existing `readRegistryRules` call, add:
 
 ```go
-enrolments, err := readRegistryEnrolments(registry.LOCAL_MACHINE)
+enrolments, err := readRegistryEnrolments(registry.LOCAL_MACHINE, registryPolicyPath)
 if err != nil {
     return nil, true, fmt.Errorf("read registry enrolments: %w", err)
 }

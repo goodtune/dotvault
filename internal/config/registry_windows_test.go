@@ -149,6 +149,57 @@ func TestReadSingleEnrolment(t *testing.T) {
 	}
 }
 
+func TestReadRegistryEnrolmentsNotExist(t *testing.T) {
+	// Use a path that definitely doesn't exist.
+	enrolments, err := readRegistryEnrolments(registry.CURRENT_USER, `SOFTWARE\dotvault-nonexistent`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if enrolments != nil {
+		t.Errorf("expected nil enrolments, got %v", enrolments)
+	}
+}
+
+func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
+	// Create two enrolment subkeys under a temporary registry path.
+	for _, name := range []string{"gh", "gitlab"} {
+		key, _, err := registry.CreateKey(
+			registry.CURRENT_USER,
+			`SOFTWARE\dotvault-test-enrol\Enrolments\`+name,
+			registry.ALL_ACCESS,
+		)
+		if err != nil {
+			t.Fatalf("create key %s: %v", name, err)
+		}
+		engine := "github"
+		if name == "gitlab" {
+			engine = "gitlab"
+		}
+		if err := key.SetStringValue("Engine", engine); err != nil {
+			t.Fatalf("set Engine for %s: %v", name, err)
+		}
+		key.Close()
+	}
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gh`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gitlab`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments`)
+	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol`)
+
+	enrolments, err := readRegistryEnrolments(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol`)
+	if err != nil {
+		t.Fatalf("readRegistryEnrolments() error: %v", err)
+	}
+	if len(enrolments) != 2 {
+		t.Fatalf("len(enrolments) = %d, want 2", len(enrolments))
+	}
+	if enrolments["gh"].Engine != "github" {
+		t.Errorf("gh.Engine = %q, want %q", enrolments["gh"].Engine, "github")
+	}
+	if enrolments["gitlab"].Engine != "gitlab" {
+		t.Errorf("gitlab.Engine = %q, want %q", enrolments["gitlab"].Engine, "gitlab")
+	}
+}
+
 func TestLoadFromRegistryNoKeys(t *testing.T) {
 	// When no GPO keys exist, loadFromRegistry should return false.
 	cfg, managed, err := loadFromRegistry()

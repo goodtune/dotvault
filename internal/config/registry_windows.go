@@ -284,6 +284,42 @@ func readRegMultiString(key registry.Key, name string) []string {
 	return val
 }
 
+// readRegistryEnrolments reads enrolments from the Enrolments subkey under
+// the given basePath. Each enrolment is a named subkey containing an Engine
+// value and optional Settings subkey.
+// Returns (nil, nil) if the Enrolments key does not exist.
+func readRegistryEnrolments(root registry.Key, basePath string) (map[string]Enrolment, error) {
+	enrolPath := basePath + `\Enrolments`
+	key, err := registry.OpenKey(root, enrolPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open Enrolments key at %s: %w", enrolPath, err)
+	}
+	defer key.Close()
+
+	info, err := key.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Enrolments key: %w", err)
+	}
+
+	names, err := key.ReadSubKeyNames(int(info.SubKeyCount))
+	if err != nil {
+		return nil, fmt.Errorf("enumerate enrolment subkeys: %w", err)
+	}
+
+	enrolments := make(map[string]Enrolment, len(names))
+	for _, name := range names {
+		enrolment, err := readSingleEnrolment(root, basePath, name)
+		if err != nil {
+			return nil, fmt.Errorf("read enrolment %q: %w", name, err)
+		}
+		enrolments[name] = enrolment
+	}
+	return enrolments, nil
+}
+
 // readSingleEnrolment reads a single enrolment from the registry.
 // The basePath parameter is the registry path containing the Enrolments
 // subkey (e.g. registryPolicyPath). The name is the enrolment subkey name.

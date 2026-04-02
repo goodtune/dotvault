@@ -133,19 +133,21 @@ func TestReadSingleEnrolment(t *testing.T) {
 	if enrolment.Settings == nil {
 		t.Fatal("Settings is nil")
 	}
-	if host, ok := enrolment.Settings["Host"]; !ok || host != "github.com" {
-		t.Errorf("Settings[Host] = %v, want %q", enrolment.Settings["Host"], "github.com")
+	// Registry value names are TitleCase ("Host", "Scopes") but should be
+	// normalized to lowercase keys to match engine setting lookups.
+	if host, ok := enrolment.Settings["host"]; !ok || host != "github.com" {
+		t.Errorf("Settings[host] = %v, want %q", enrolment.Settings["host"], "github.com")
 	}
-	scopes, ok := enrolment.Settings["Scopes"]
+	scopes, ok := enrolment.Settings["scopes"]
 	if !ok {
-		t.Fatal("Settings[Scopes] missing")
+		t.Fatal("Settings[scopes] missing")
 	}
 	scopeSlice, ok := scopes.([]any)
 	if !ok {
-		t.Fatalf("Settings[Scopes] type = %T, want []any", scopes)
+		t.Fatalf("Settings[scopes] type = %T, want []any", scopes)
 	}
 	if len(scopeSlice) != 2 || scopeSlice[0] != "repo" || scopeSlice[1] != "read:org" {
-		t.Errorf("Settings[Scopes] = %v, want [repo read:org]", scopeSlice)
+		t.Errorf("Settings[scopes] = %v, want [repo read:org]", scopeSlice)
 	}
 }
 

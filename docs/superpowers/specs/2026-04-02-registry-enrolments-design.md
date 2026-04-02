@@ -89,13 +89,13 @@ Registry, targeting:
 
 These tests can only run on Windows (build-tagged `windows`). They exercise the pure logic functions that don't require real registry access where possible, and use the real registry API where necessary.
 
-- **`TestReadSingleEnrolment`** — verifies Engine and Settings (string + multi-string values) are correctly read into an `Enrolment` struct
+- **`TestReadSingleEnrolment`** — verifies Engine and Settings (string + multi-string values) are correctly read into an `Enrolment` struct, including lowercase key normalization
 - **`TestReadRegistryEnrolmentsNotExist`** — verifies that a missing `Enrolments` subkey returns `nil, nil` (no error)
-- **`TestLoadFromRegistryIncludesEnrolments`** — integration-level test verifying `cfg.Enrolments` is populated when registry keys are present
+- **`TestReadRegistryEnrolmentsMultiple`** — verifies enumeration of multiple enrolment subkeys
 
 ## Out of Scope
 
 - No changes to config validation — existing validation (`enrolments[key].engine is required`) already applies to registry-loaded enrolments
-- No ADML file changes (no ADML file exists in the project)
+- ADML changes limited to adding the `Cat_Enrolments` string resource to `packaging/windows/en-US/dotvault.adml`
 - No changes to the enrolment manager, engine interface, or any other package
 - Settings are flat only (no nested maps) — sufficient for all current engines

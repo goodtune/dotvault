@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -360,14 +361,18 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 		if len(names) > 0 {
 			enrolment.Settings = make(map[string]any, len(names))
 			for _, vname := range names {
+				// Normalize value names to lowercase so they match
+				// engine setting keys (e.g. "client_id", "host").
+				// Registry value names are case-insensitive on Windows.
+				key := strings.ToLower(vname)
 				if s, ok := readRegString(sk, vname); ok {
-					enrolment.Settings[vname] = s
+					enrolment.Settings[key] = s
 				} else if ms := readRegMultiString(sk, vname); ms != nil {
 					vals := make([]any, len(ms))
 					for i, v := range ms {
 						vals[i] = v
 					}
-					enrolment.Settings[vname] = vals
+					enrolment.Settings[key] = vals
 				}
 			}
 		}

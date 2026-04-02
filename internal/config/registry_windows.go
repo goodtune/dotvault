@@ -46,6 +46,13 @@ func loadFromRegistry() (*Config, bool, error) {
 	}
 	cfg.Rules = rules
 
+	// Read enrolments from the machine-level policy key.
+	enrolments, err := readRegistryEnrolments(registry.LOCAL_MACHINE, registryPolicyPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("read registry enrolments: %w", err)
+	}
+	cfg.Enrolments = enrolments
+
 	return cfg, true, nil
 }
 

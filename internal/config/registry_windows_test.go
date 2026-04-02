@@ -163,6 +163,15 @@ func TestReadRegistryEnrolmentsNotExist(t *testing.T) {
 }
 
 func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
+	// Register cleanup for the entire tree first so it runs even if
+	// key creation fails partway through the loop.
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gh`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gitlab`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol`)
+	})
+
 	// Create two enrolment subkeys under a temporary registry path.
 	for _, name := range []string{"gh", "gitlab"} {
 		k, _, err := registry.CreateKey(
@@ -181,13 +190,8 @@ func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
 			k.Close()
 			t.Fatalf("set Engine for %s: %v", name, err)
 		}
-		// Close handle before deferred DeleteKey calls run (LIFO ordering).
 		k.Close()
 	}
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gh`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments\gitlab`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol\Enrolments`)
-	defer registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol`)
 
 	enrolments, err := readRegistryEnrolments(registry.CURRENT_USER, `SOFTWARE\dotvault-test-enrol`)
 	if err != nil {

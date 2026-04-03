@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -45,6 +46,13 @@ func loadFromRegistry() (*Config, bool, error) {
 		return nil, true, fmt.Errorf("read registry rules: %w", err)
 	}
 	cfg.Rules = rules
+
+	// Read enrolments from the machine-level policy key.
+	enrolments, err := readRegistryEnrolments(registry.LOCAL_MACHINE, registryPolicyPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("read registry enrolments: %w", err)
+	}
+	cfg.Enrolments = enrolments
 
 	return cfg, true, nil
 }
@@ -282,4 +290,102 @@ func readRegMultiString(key registry.Key, name string) []string {
 		return nil
 	}
 	return val
+}
+
+// readRegistryEnrolments reads enrolments from the Enrolments subkey under
+// the given basePath. Each enrolment is a named subkey containing an Engine
+// value and optional Settings subkey.
+// Returns (nil, nil) if the Enrolments key does not exist.
+func readRegistryEnrolments(root registry.Key, basePath string) (map[string]Enrolment, error) {
+	enrolPath := basePath + `\Enrolments`
+	key, err := registry.OpenKey(root, enrolPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open Enrolments key at %s: %w", enrolPath, err)
+	}
+	defer key.Close()
+
+	info, err := key.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Enrolments key: %w", err)
+	}
+
+	names, err := key.ReadSubKeyNames(int(info.SubKeyCount))
+	if err != nil {
+		return nil, fmt.Errorf("enumerate enrolment subkeys: %w", err)
+	}
+
+	enrolments := make(map[string]Enrolment, len(names))
+	for _, name := range names {
+		enrolment, err := readSingleEnrolment(root, basePath, name)
+		if err != nil {
+			return nil, fmt.Errorf("read enrolment %q: %w", name, err)
+		}
+		enrolments[name] = enrolment
+	}
+	return enrolments, nil
+}
+
+// readSingleEnrolment reads a single enrolment from the registry.
+// The basePath parameter is the registry path containing the Enrolments
+// subkey (e.g. registryPolicyPath). The name is the enrolment subkey name.
+func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, error) {
+	path := basePath + `\Enrolments\` + name
+	key, err := registry.OpenKey(root, path, registry.READ)
+	if err != nil {
+		return Enrolment{}, err
+	}
+	defer key.Close()
+
+	enrolment := Enrolment{}
+	enrolment.Engine, _ = readRegString(key, "Engine")
+
+	// Read optional Settings subkey.
+	settingsPath := path + `\Settings`
+	sk, err := registry.OpenKey(root, settingsPath, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return Enrolment{}, fmt.Errorf("open Settings key at %s: %w", settingsPath, err)
+	}
+	if err == nil {
+		defer sk.Close()
+		info, err := sk.Stat()
+		if err != nil {
+			return Enrolment{}, fmt.Errorf("stat Settings key: %w", err)
+		}
+		names, err := sk.ReadValueNames(int(info.ValueCount))
+		if err != nil {
+			return Enrolment{}, fmt.Errorf("read Settings value names: %w", err)
+		}
+		if len(names) > 0 {
+			enrolment.Settings = make(map[string]any, len(names))
+			for _, vname := range names {
+				// Normalize value names to lowercase so they match
+				// engine setting keys (e.g. "client_id", "host").
+				// Registry value names are case-insensitive on Windows.
+				settingKey := strings.ToLower(vname)
+				// Read the value type first to dispatch to the correct
+				// reader directly, avoiding spurious type-mismatch
+				// warnings from the probe-and-fallback approach.
+				_, valtype, _ := sk.GetValue(vname, nil)
+				switch valtype {
+				case registry.SZ, registry.EXPAND_SZ:
+					if s, ok := readRegString(sk, vname); ok {
+						enrolment.Settings[settingKey] = s
+					}
+				case registry.MULTI_SZ:
+					if ms := readRegMultiString(sk, vname); ms != nil {
+						vals := make([]any, len(ms))
+						for i, v := range ms {
+							vals[i] = v
+						}
+						enrolment.Settings[settingKey] = vals
+					}
+				}
+			}
+		}
+	}
+
+	return enrolment, nil
 }

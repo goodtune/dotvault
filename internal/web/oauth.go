@@ -70,7 +70,7 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 			state, err := s.oauth.CreateState(ruleName)
 			if err != nil {
 				slog.Error("failed to create OAuth state", "error", err)
-				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+				writeError(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
 
@@ -87,7 +87,7 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !found {
-		http.Error(w, `{"error":"rule not found or has no OAuth config"}`, http.StatusNotFound)
+		writeError(w, "rule not found or has no OAuth config", http.StatusNotFound)
 	}
 }
 
@@ -96,14 +96,14 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 
 	if state == "" || code == "" {
-		http.Error(w, `{"error":"missing state or code"}`, http.StatusBadRequest)
+		writeError(w, "missing state or code", http.StatusBadRequest)
 		return
 	}
 
 	ruleName, valid := s.oauth.ValidateState(state)
 	if !valid {
 		slog.Warn("OAuth callback with invalid state", "state", state)
-		http.Error(w, `{"error":"invalid state parameter"}`, http.StatusBadRequest)
+		writeError(w, "invalid state parameter", http.StatusBadRequest)
 		return
 	}
 

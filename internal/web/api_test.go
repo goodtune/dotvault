@@ -63,6 +63,33 @@ func TestHandleSyncRequiresCSRF(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
 	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["error"] != "invalid or missing CSRF token" {
+		t.Errorf("error = %q, want %q", resp["error"], "invalid or missing CSRF token")
+	}
+}
+
+func TestWriteError_ContentTypeAndBody(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeError(w, "something went wrong", http.StatusBadRequest)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if resp["error"] != "something went wrong" {
+		t.Errorf("error = %q, want %q", resp["error"], "something went wrong")
+	}
 }
 
 func TestHandleStatus_VersionAlwaysPresent(t *testing.T) {

@@ -4,6 +4,7 @@ import { StatusBar } from './components/status-bar.jsx';
 import { Sidebar } from './components/sidebar.jsx';
 import { SecretPanel } from './components/secret-panel.jsx';
 import { OAuthBanner } from './components/oauth-banner.jsx';
+import { EnrolmentBanner } from './components/enrolment-banner.jsx';
 import { LoginPage } from './components/login-page.jsx';
 import { getStatus, getRules, listSecrets } from './api.js';
 
@@ -80,6 +81,7 @@ export function App() {
     h(StatusBar, { status, onSync: loadData }),
     error && h('div', { class: 'error-banner' }, error),
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),
+    h(EnrolmentBanner, { onEnrolled: loadData }),
     h('div', { class: 'main-layout' },
       h(Sidebar, { keys, selected: selectedKey, onSelect: setSelectedKey }),
       h(SecretPanel, { secretPath: selectedKey, status, customText: status.secret_view_text }),

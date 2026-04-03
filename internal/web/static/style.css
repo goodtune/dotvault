@@ -81,6 +81,61 @@ body {
 }
 .oauth-btn:hover { background: #d97706; }
 
+.enrolment-banners { padding: 0 20px; }
+.enrolment-banner {
+  background: #eff6ff;
+  color: #1e40af;
+  padding: 12px 16px;
+  margin-top: 10px;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.enrolment-info { margin-bottom: 4px; }
+.enrolment-name { font-weight: 600; }
+.enrolment-key { opacity: 0.7; }
+.enrolment-status { opacity: 0.8; }
+.enrolment-progress { color: #6b7280; font-style: italic; }
+.enrolment-success { color: #059669; font-weight: 500; }
+.enrolment-error { color: #dc2626; font-size: 13px; }
+.enrolment-btn {
+  background: #3b82f6;
+  color: white;
+  border: none;
+  padding: 4px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  margin-top: 6px;
+}
+.enrolment-btn:hover { background: #2563eb; }
+.device-code-panel {
+  background: white;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-top: 8px;
+}
+.device-code-panel p { margin-bottom: 8px; color: #374151; }
+.device-code {
+  display: inline-block;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  background: #f0f4ff;
+  padding: 8px 20px;
+  border-radius: 6px;
+  color: #1e3a8a;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+.device-code-link {
+  display: inline-block;
+  margin-left: 16px;
+  color: #3b82f6;
+  text-decoration: none;
+  font-size: 14px;
+}
+.device-code-link:hover { text-decoration: underline; }
+
 .main-layout {
   display: flex;
   height: calc(100vh - 52px);

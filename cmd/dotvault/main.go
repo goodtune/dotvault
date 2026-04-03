@@ -173,6 +173,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
 
+	// Create enrolment manager early so it can be shared with the web server.
+	// No Vault calls are made until CheckAll/FindPending/RunOne are invoked.
+	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+		Enrolments: cfg.Enrolments,
+		KVMount:    cfg.Vault.KVMount,
+		UserPrefix: cfg.Vault.UserPrefix + username + "/",
+		WebMode:    cfg.Web.Enabled,
+	}, vc, enrol.IO{
+		Out:     os.Stderr,
+		Browser: browser.OpenURL,
+		Log:     slog.Default(),
+	})
+
 	// Start web UI if enabled. We start it before authentication so it can
 	// serve the OIDC browser-based login flow.
 	var webServer *web.Server
@@ -183,6 +196,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
+			EnrolMgr:      enrolMgr,
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
@@ -260,16 +274,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Create enrolment manager and run initial check.
-	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
-		Enrolments: cfg.Enrolments,
-		KVMount:    cfg.Vault.KVMount,
-		UserPrefix: cfg.Vault.UserPrefix + username + "/",
-	}, vc, enrol.IO{
-		Out:     os.Stderr,
-		Browser: browser.OpenURL,
-		Log:     slog.Default(),
-	})
+	// Run initial enrolment check. In web mode this only logs pending
+	// enrolments (the interactive wizard is handled via the web UI).
 	if _, err := enrolMgr.CheckAll(ctx); err != nil {
 		slog.Warn("enrolment check failed", "error", err)
 	}

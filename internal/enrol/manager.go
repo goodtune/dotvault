@@ -18,6 +18,7 @@ type ManagerConfig struct {
 	Enrolments map[string]config.Enrolment
 	KVMount    string // e.g. "kv"
 	UserPrefix string // e.g. "users/jdoe"
+	WebMode    bool   // when true, skip interactive CLI wizard
 }
 
 // Manager orchestrates enrolment checks and the acquisition wizard.
@@ -56,7 +57,8 @@ func (m *Manager) UpdateConfig(enrolments map[string]config.Enrolment) {
 
 // CheckAll checks all configured enrolments and runs the wizard for any that are
 // missing or incomplete. Returns enrolled=true if any new enrolments were written
-// to Vault.
+// to Vault. In web mode, the wizard is skipped — pending enrolments are logged
+// and must be completed via the web UI.
 func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 	m.mu.Lock()
 	cfg := m.cfg
@@ -74,12 +76,29 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		return false, nil
 	}
 
+	// In web mode, never run the interactive CLI wizard. Log pending
+	// enrolments so they can be completed via the web UI.
+	if cfg.WebMode {
+		for _, p := range pending {
+			m.io.Log.Info("enrolment pending — complete via web UI", "key", p.key, "engine", p.engine.Name())
+		}
+		return false, nil
+	}
+
 	results := runWizard(ctx, pending, m.io)
 
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
 
+	enrolled = m.writeResults(ctx, cfg, results)
+	return enrolled, nil
+}
+
+// writeResults validates and writes enrolment credentials to Vault.
+// Returns true if any credentials were written.
+func (m *Manager) writeResults(ctx context.Context, cfg ManagerConfig, results map[string]map[string]string) bool {
+	var enrolled bool
 	for key, creds := range results {
 		enrolment := cfg.Enrolments[key]
 		engine, ok := GetEngine(enrolment.Engine)
@@ -110,8 +129,84 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		enrolled = true
 		m.io.Log.Info("enrolment written to vault", "key", key, "path", vaultPath)
 	}
+	return enrolled
+}
 
-	return enrolled, nil
+// PendingEnrolmentInfo describes a pending enrolment for API consumers.
+type PendingEnrolmentInfo struct {
+	Key        string `json:"key"`
+	EngineName string `json:"engine_name"`
+}
+
+// FindPending returns the list of enrolments that are missing or incomplete in Vault.
+func (m *Manager) FindPending(ctx context.Context) ([]PendingEnrolmentInfo, error) {
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+
+	if len(cfg.Enrolments) == 0 {
+		return nil, nil
+	}
+
+	pending, err := m.findPending(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]PendingEnrolmentInfo, len(pending))
+	for i, p := range pending {
+		result[i] = PendingEnrolmentInfo{
+			Key:        p.key,
+			EngineName: p.engine.Name(),
+		}
+	}
+	return result, nil
+}
+
+// RunOne starts a single enrolment by key. It runs the engine asynchronously and
+// calls onDeviceCode when a device code flow begins. The returned channel receives
+// nil on success or an error on failure.
+func (m *Manager) RunOne(ctx context.Context, key string, onDeviceCode DeviceCodeCallback) <-chan error {
+	ch := make(chan error, 1)
+
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+
+	enrolment, ok := cfg.Enrolments[key]
+	if !ok {
+		ch <- fmt.Errorf("enrolment %q not configured", key)
+		return ch
+	}
+	engine, ok := GetEngine(enrolment.Engine)
+	if !ok {
+		ch <- fmt.Errorf("unknown engine %q for enrolment %q", enrolment.Engine, key)
+		return ch
+	}
+
+	go func() {
+		eio := IO{
+			Out:          m.io.Out,
+			Browser:      m.io.Browser,
+			Log:          m.io.Log,
+			OnDeviceCode: onDeviceCode,
+		}
+
+		creds, err := engine.Run(ctx, enrolment.Settings, eio)
+		if err != nil {
+			ch <- err
+			return
+		}
+
+		results := map[string]map[string]string{key: creds}
+		if !m.writeResults(ctx, cfg, results) {
+			ch <- fmt.Errorf("failed to write credentials for %q", key)
+			return
+		}
+		ch <- nil
+	}()
+
+	return ch
 }
 
 // findPending returns enrolments that are missing or incomplete in Vault.

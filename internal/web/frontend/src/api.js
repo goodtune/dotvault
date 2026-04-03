@@ -85,3 +85,19 @@ export async function loginToken(vaultToken) {
     body: JSON.stringify({ token: vaultToken }),
   });
 }
+
+export async function getEnrolments() {
+  return fetchJSON('/api/v1/enrolments');
+}
+
+export async function startEnrolment(key) {
+  const token = await getCSRFToken();
+  return fetchJSON(`/api/v1/enrolments/${encodeURIComponent(key)}/start`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': token },
+  });
+}
+
+export async function getEnrolmentStatus(key) {
+  return fetchJSON(`/api/v1/enrolments/${encodeURIComponent(key)}/status`);
+}

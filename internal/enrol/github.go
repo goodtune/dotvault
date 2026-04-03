@@ -77,6 +77,16 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		Stdout:   io.Out,
 		Stdin:    in,
 		DisplayCode: func(userCode, verificationURI string) error {
+			if io.OnDeviceCode != nil {
+				// Web mode: notify the web UI and proceed without
+				// waiting for terminal input.
+				io.OnDeviceCode(DeviceCodeInfo{
+					UserCode:        userCode,
+					VerificationURI: verificationURI,
+				})
+				return nil
+			}
+			// CLI mode: prompt on terminal.
 			copyToClipboard(userCode)
 			fmt.Fprintf(io.Out, "! First, copy your one-time code: %s\n", userCode)
 			fmt.Fprintf(io.Out, "- Press Enter to open %s in your browser... ", verificationURI)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -23,6 +24,8 @@ type Server struct {
 	csrf               *CSRFStore
 	oauth              *OAuthManager
 	login              *auth.LoginTracker
+	enrolMgr           *enrol.Manager
+	enrolTracker       *enrol.Tracker
 	mux                *http.ServeMux
 	server             *http.Server
 	rules              []config.Rule
@@ -49,6 +52,7 @@ type ServerConfig struct {
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *sync.Engine
+	EnrolMgr      *enrol.Manager  // optional; nil disables enrolment endpoints
 	Username      string
 	TokenFilePath string
 	Version       string
@@ -60,6 +64,11 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("web.listen: %w", err)
 	}
 
+	var tracker *enrol.Tracker
+	if sc.EnrolMgr != nil {
+		tracker = enrol.NewTracker()
+	}
+
 	s := &Server{
 		cfg:                sc.WebCfg,
 		vault:              sc.Vault,
@@ -67,6 +76,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		csrf:               NewCSRFStore(),
 		oauth:              NewOAuthManager(),
 		login:              auth.NewLoginTracker(sc.Vault),
+		enrolMgr:           sc.EnrolMgr,
+		enrolTracker:       tracker,
 		mux:                http.NewServeMux(),
 		rules:              sc.Rules,
 		kvMount:            sc.VaultCfg.KVMount,
@@ -109,6 +120,13 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
+
+	// Enrolment routes (only when enrolment manager is available)
+	if s.enrolMgr != nil {
+		s.mux.HandleFunc("GET /api/v1/enrolments", s.handleEnrolments)
+		s.mux.HandleFunc("POST /api/v1/enrolments/{key}/start", s.requireCSRF(s.handleEnrolmentStart))
+		s.mux.HandleFunc("GET /api/v1/enrolments/{key}/status", s.handleEnrolmentStatus)
+	}
 
 	// Static SPA files
 	staticSub, err := fs.Sub(staticFS, "static")

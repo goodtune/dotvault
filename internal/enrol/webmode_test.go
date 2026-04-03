@@ -9,7 +9,7 @@ import (
 )
 
 func TestCheckAll_WebMode_SkipsWizard(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "test", fields: []string{"token"}, creds: map[string]string{"token": "abc"}}
@@ -42,7 +42,7 @@ func TestCheckAll_WebMode_SkipsWizard(t *testing.T) {
 }
 
 func TestFindPending_ReturnsPendingInfo(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "TestEngine", fields: []string{"token"}}

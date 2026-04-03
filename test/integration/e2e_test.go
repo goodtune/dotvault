@@ -3,35 +3,32 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
-func skipIfNoVault(t *testing.T) {
-	t.Helper()
-	cmd := exec.Command("curl", "-sf", "http://127.0.0.1:8200/v1/sys/health")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Vault dev server not available")
+var testVC *vault.Client
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	vc, cleanup, err := vaulttest.Start(ctx)
+	if err != nil {
+		log.Fatalf("start vault testcontainer: %v", err)
 	}
+	defer cleanup()
+	testVC = vc
+	os.Exit(m.Run())
 }
 
 func TestEndToEnd(t *testing.T) {
-	skipIfNoVault(t)
-
-	// Skip if Vault not available
-	vc, err := vault.NewClient(vault.Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Skip("Vault not available")
-	}
+	vc := testVC
 	ctx := context.Background()
 
 	// Seed data
@@ -87,7 +84,7 @@ func TestEndToEnd(t *testing.T) {
 	engine := sync.NewEngine(cfg, vc, "e2euser", statePath)
 
 	// Run sync
-	err = engine.RunOnce(ctx)
+	err := engine.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}

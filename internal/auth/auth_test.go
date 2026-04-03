@@ -2,28 +2,45 @@ package auth
 
 import (
 	"context"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
-func skipIfNoVault(t *testing.T) {
-	t.Helper()
-	cmd := exec.Command("curl", "-sf", "http://127.0.0.1:8200/v1/sys/health")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Vault dev server not available")
+var testVC *vault.Client
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	vc, cleanup, err := vaulttest.Start(ctx)
+	if err != nil {
+		log.Fatalf("start vault testcontainer: %v", err)
 	}
+	defer cleanup()
+	testVC = vc
+	os.Exit(m.Run())
+}
+
+func mustVaultClient(t *testing.T) *vault.Client {
+	t.Helper()
+	// Create a fresh client pointing at the same container but without
+	// a pre-set token, matching the original test's expectations.
+	vc, err := vault.NewClient(vault.Config{
+		Address: testVC.Raw().Address(),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return vc
 }
 
 func TestManagerAuthenticate_ExistingToken(t *testing.T) {
-	skipIfNoVault(t)
-
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")
-	os.WriteFile(tokenPath, []byte("dev-root-token"), 0600)
+	os.WriteFile(tokenPath, []byte(vaulttest.DevRootToken), 0600)
 
 	m := &Manager{
 		VaultClient:   mustVaultClient(t),
@@ -36,14 +53,13 @@ func TestManagerAuthenticate_ExistingToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
-	if m.VaultClient.Token() != "dev-root-token" {
-		t.Errorf("token = %q, want %q", m.VaultClient.Token(), "dev-root-token")
+	if m.VaultClient.Token() != vaulttest.DevRootToken {
+		t.Errorf("token = %q, want %q", m.VaultClient.Token(), vaulttest.DevRootToken)
 	}
 }
 
 func TestManagerAuthenticate_EnvToken(t *testing.T) {
-	skipIfNoVault(t)
-	t.Setenv("VAULT_TOKEN", "dev-root-token")
+	t.Setenv("VAULT_TOKEN", vaulttest.DevRootToken)
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")
@@ -62,7 +78,6 @@ func TestManagerAuthenticate_EnvToken(t *testing.T) {
 }
 
 func TestManagerAuthenticate_NoToken(t *testing.T) {
-	skipIfNoVault(t)
 	t.Setenv("VAULT_TOKEN", "")
 
 	dir := t.TempDir()
@@ -79,15 +94,4 @@ func TestManagerAuthenticate_NoToken(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when no token available")
 	}
-}
-
-func mustVaultClient(t *testing.T) *vault.Client {
-	t.Helper()
-	c, err := vault.NewClient(vault.Config{
-		Address: "http://127.0.0.1:8200",
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return c
 }

@@ -4,50 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"testing"
 
+	"github.com/goodtune/dotvault/internal/vaulttest"
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
-func skipIfNoVault(t *testing.T) {
-	t.Helper()
-	addr := os.Getenv("VAULT_ADDR")
-	if addr == "" {
-		addr = "http://127.0.0.1:8200"
+var testVC *Client
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	vc, cleanup, err := vaulttest.Start(ctx)
+	if err != nil {
+		log.Fatalf("start vault testcontainer: %v", err)
 	}
-	// Quick check: try to reach Vault
-	cmd := exec.Command("curl", "-sf", addr+"/v1/sys/health")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Vault dev server not available, skipping integration test")
-	}
+	defer cleanup()
+	testVC = vc
+	os.Exit(m.Run())
 }
 
 func testClient(t *testing.T) *Client {
 	t.Helper()
-	skipIfNoVault(t)
-	c, err := NewClient(Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return c
+	return testVC
 }
 
 func TestNewClient(t *testing.T) {
-	skipIfNoVault(t)
-	c, err := NewClient(Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
+	c := testClient(t)
 	if c == nil {
 		t.Fatal("client is nil")
 	}

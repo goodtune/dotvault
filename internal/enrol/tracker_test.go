@@ -30,7 +30,7 @@ func TestTracker_Clear(t *testing.T) {
 }
 
 func TestTracker_Start_Success(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 
 	eng := &mockEngine{name: "test", fields: []string{"tok"}, creds: map[string]string{"tok": "abc"}}
 	RegisterEngine("test-tracker", eng)
@@ -86,7 +86,7 @@ func TestTracker_Start_AlreadyRunning(t *testing.T) {
 }
 
 func TestTracker_Start_DeviceCode(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 
 	// Engine that calls OnDeviceCode via IO.
 	deviceEng := &deviceCodeEngine{

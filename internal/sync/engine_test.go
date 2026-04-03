@@ -3,8 +3,8 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,26 +12,25 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
-func skipIfNoVault(t *testing.T) {
-	t.Helper()
-	cmd := exec.Command("curl", "-sf", "http://127.0.0.1:8200/v1/sys/health")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Vault dev server not available")
+var testVC *vault.Client
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	vc, cleanup, err := vaulttest.Start(ctx)
+	if err != nil {
+		log.Fatalf("start vault testcontainer: %v", err)
 	}
+	defer cleanup()
+	testVC = vc
+	os.Exit(m.Run())
 }
 
 func testVaultClient(t *testing.T) *vault.Client {
 	t.Helper()
-	c, err := vault.NewClient(vault.Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return c
+	return testVC
 }
 
 func seedVaultData(t *testing.T, c *vault.Client) {
@@ -55,8 +54,6 @@ func seedVaultData(t *testing.T, c *vault.Client) {
 }
 
 func TestEngine_RunOnce(t *testing.T) {
-	skipIfNoVault(t)
-
 	vc := testVaultClient(t)
 	seedVaultData(t, vc)
 
@@ -143,8 +140,6 @@ func TestEngine_RunOnce(t *testing.T) {
 }
 
 func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
-	skipIfNoVault(t)
-
 	vc := testVaultClient(t)
 	seedVaultData(t, vc)
 
@@ -192,8 +187,6 @@ func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
 }
 
 func TestEngine_RunOnceResyncAfterFileDeleted(t *testing.T) {
-	skipIfNoVault(t)
-
 	vc := testVaultClient(t)
 	seedVaultData(t, vc)
 
@@ -244,8 +237,6 @@ func TestEngine_RunOnceResyncAfterFileDeleted(t *testing.T) {
 }
 
 func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
-	skipIfNoVault(t)
-
 	vc := testVaultClient(t)
 	seedVaultData(t, vc)
 

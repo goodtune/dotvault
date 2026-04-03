@@ -4,13 +4,28 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
-	"strings"
+	"os"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
+
+var testVC *vault.Client
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	vc, cleanup, err := vaulttest.Start(ctx)
+	if err != nil {
+		log.Fatalf("start vault testcontainer: %v", err)
+	}
+	defer cleanup()
+	testVC = vc
+	os.Exit(m.Run())
+}
 
 // testPrefix returns a per-test unique Vault prefix so tests are
 // idempotent against a long-lived dev server.
@@ -23,8 +38,10 @@ func testPrefix(t *testing.T) string {
 func enableKVv2(t *testing.T, vc *vault.Client, mount string) {
 	t.Helper()
 	ctx := context.Background()
-	if err := vc.EnableKVv2(ctx, mount); err != nil && !strings.Contains(err.Error(), "already in use") {
-		t.Fatalf("EnableKVv2(%q): %v", mount, err)
+	if err := vc.EnableKVv2(ctx, mount); err != nil {
+		// Ignore "already in use" errors since the mount persists
+		// across tests sharing the same container.
+		t.Logf("EnableKVv2(%q): %v (may already exist)", mount, err)
 	}
 }
 
@@ -61,24 +78,8 @@ func testIO(buf *bytes.Buffer) IO {
 	}
 }
 
-func skipIfNoVault(t *testing.T) *vault.Client {
-	t.Helper()
-	vc, err := vault.NewClient(vault.Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Skip("vault not available")
-	}
-	ctx := context.Background()
-	if _, err := vc.LookupSelf(ctx); err != nil {
-		t.Skip("vault not available")
-	}
-	return vc
-}
-
 func TestCheckAll_AllPresent(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "test", fields: []string{"token"}, creds: map[string]string{"token": "abc"}}
@@ -112,7 +113,7 @@ func TestCheckAll_AllPresent(t *testing.T) {
 }
 
 func TestCheckAll_Missing(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	eng := &mockEngine{name: "test", fields: []string{"token"}, creds: map[string]string{"token": "newtoken"}}
@@ -156,7 +157,7 @@ func TestCheckAll_Missing(t *testing.T) {
 }
 
 func TestCheckAll_PartialFailure(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	engOK := &mockEngine{name: "ok", fields: []string{"x"}, creds: map[string]string{"x": "val"}}
@@ -208,7 +209,7 @@ func TestCheckAll_PartialFailure(t *testing.T) {
 }
 
 func TestCheckAll_UnknownEngine(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	enableKVv2(t, vc, "kv")
@@ -232,7 +233,7 @@ func TestCheckAll_UnknownEngine(t *testing.T) {
 }
 
 func TestCheckAll_Empty(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 	ctx := context.Background()
 
 	var buf bytes.Buffer
@@ -252,7 +253,7 @@ func TestCheckAll_Empty(t *testing.T) {
 }
 
 func TestUpdateConfig(t *testing.T) {
-	vc := skipIfNoVault(t)
+	vc := testVC
 
 	var buf bytes.Buffer
 	mgr := NewManager(ManagerConfig{

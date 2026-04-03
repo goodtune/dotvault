@@ -11,7 +11,6 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
-	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // testEnrolIO returns an IO that suppresses terminal output.
@@ -46,15 +45,7 @@ func (e *mockGitHubEngine) Run(_ context.Context, _ map[string]any, _ enrol.IO) 
 }
 
 func TestEnrolmentFullFlow(t *testing.T) {
-	skipIfNoVault(t)
-
-	vc, err := vault.NewClient(vault.Config{
-		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	vc := testVC
 	ctx := context.Background()
 
 	// Ensure the KV mount exists

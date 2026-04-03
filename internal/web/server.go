@@ -177,7 +177,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.csrf.Validate(r) {
-			http.Error(w, `{"error":"invalid or missing CSRF token"}`, http.StatusForbidden)
+			writeError(w, "invalid or missing CSRF token", http.StatusForbidden)
 			return
 		}
 		next(w, r)

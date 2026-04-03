@@ -124,18 +124,18 @@ func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	if req.Username == "" || req.Password == "" {
-		http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
+		writeError(w, "username and password required", http.StatusBadRequest)
 		return
 	}
 
 	sessionID, err := generateSessionID()
 	if err != nil {
 		slog.Error("failed to generate session ID", "error", err)
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		writeError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -154,13 +154,13 @@ func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
-		http.Error(w, `{"error":"session parameter required"}`, http.StatusBadRequest)
+		writeError(w, "session parameter required", http.StatusBadRequest)
 		return
 	}
 
 	status := s.login.GetStatus(sessionID)
 	if status == nil {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		writeError(w, "session not found", http.StatusNotFound)
 		return
 	}
 
@@ -196,21 +196,21 @@ func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 		Passcode  string `json:"passcode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	if req.SessionID == "" || req.Passcode == "" {
-		http.Error(w, `{"error":"session_id and passcode required"}`, http.StatusBadRequest)
+		writeError(w, "session_id and passcode required", http.StatusBadRequest)
 		return
 	}
 
 	status := s.login.GetStatus(req.SessionID)
 	if status == nil {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		writeError(w, "session not found", http.StatusNotFound)
 		return
 	}
 	if status.State != "mfa_required" || len(status.MFAMethods) == 0 || !status.MFAMethods[0].UsesPasscode {
-		http.Error(w, `{"error":"passcode not expected for this session"}`, http.StatusBadRequest)
+		writeError(w, "passcode not expected for this session", http.StatusBadRequest)
 		return
 	}
 
@@ -225,11 +225,11 @@ func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	if req.Token == "" {
-		http.Error(w, `{"error":"token required"}`, http.StatusBadRequest)
+		writeError(w, "token required", http.StatusBadRequest)
 		return
 	}
 
@@ -240,7 +240,7 @@ func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	if _, err := s.vault.LookupSelf(ctx); err != nil {
 		s.vault.SetToken(prevToken)
-		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+		writeError(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
 

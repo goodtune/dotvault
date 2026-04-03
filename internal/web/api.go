@@ -103,7 +103,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 		keys, err := s.vault.ListKVv2(ctx, s.kvMount, fullPath)
 		if err != nil {
 			slog.Error("list secrets failed", "path", fullPath, "error", err)
-			http.Error(w, `{"error":"failed to list secrets"}`, http.StatusInternalServerError)
+			writeError(w, "failed to list secrets", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, map[string]any{"keys": keys, "path": secretPath})
@@ -114,11 +114,11 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, fullPath)
 	if err != nil {
 		slog.Error("read secret failed", "path", fullPath, "error", err)
-		http.Error(w, `{"error":"failed to read secret"}`, http.StatusInternalServerError)
+		writeError(w, "failed to read secret", http.StatusInternalServerError)
 		return
 	}
 	if secret == nil {
-		http.Error(w, `{"error":"secret not found"}`, http.StatusNotFound)
+		writeError(w, "secret not found", http.StatusNotFound)
 		return
 	}
 
@@ -145,7 +145,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
-		http.Error(w, `{"error":"sync engine not available"}`, http.StatusServiceUnavailable)
+		writeError(w, "sync engine not available", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -157,4 +157,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }

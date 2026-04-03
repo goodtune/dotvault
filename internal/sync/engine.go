@@ -254,8 +254,8 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {
-			// Even when content is unchanged, enforce permissions for sensitive formats.
-			if !e.DryRun && (rule.Target.Format == "netrc" || rule.Target.Format == "text") {
+			// Even when content is unchanged, enforce 0600 permissions.
+			if !e.DryRun {
 				if info, err := os.Stat(targetPath); err == nil {
 					expectedPerm := os.FileMode(0600)
 					if info.Mode().Perm() != expectedPerm {
@@ -333,11 +333,8 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return fmt.Errorf("create parent directory: %w", err)
 	}
 
-	// Determine file permissions
-	perm := os.FileMode(0644)
-	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
-		perm = 0600
-	}
+	// Determine file permissions — all managed files use 0600
+	perm := os.FileMode(0600)
 
 	// Write (or log what would be written in dry-run mode)
 	if e.DryRun {
@@ -349,14 +346,11 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return fmt.Errorf("write file: %w", err)
 	}
 
-	// For formats requiring 0600, ensure existing file permissions are corrected
-	// even if handler.Write decides not to rewrite the content (e.g., content unchanged).
-	if rule.Target.Format == "netrc" || rule.Target.Format == "text" {
-		if info, err := os.Stat(targetPath); err == nil {
-			if info.Mode().Perm() != perm {
-				if err := os.Chmod(targetPath, perm); err != nil {
-					log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", perm), "error", err)
-				}
+	// Ensure the written file has 0600 permissions (it may have pre-existed with looser perms).
+	if info, err := os.Stat(targetPath); err == nil {
+		if info.Mode().Perm() != perm {
+			if err := os.Chmod(targetPath, perm); err != nil {
+				log.Warn("failed to enforce file permissions", "path", targetPath, "expected", fmt.Sprintf("%04o", perm), "error", err)
 			}
 		}
 	}

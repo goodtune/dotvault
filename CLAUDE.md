@@ -158,7 +158,7 @@ All handlers implement the `FileHandler` interface (Read, Merge, Write). Handler
 
 The `merge` field exists in rule config but is not dispatched on. Each handler always uses its native merge strategy, which is the only sensible strategy for that format.
 
-All writes are atomic (temp file with target permissions + rename). Permissions: netrc and text use 0600; other formats currently use 0644.
+All writes are atomic (temp file with target permissions + rename). Permissions: all managed files use 0600.
 
 ## Template Processing
 
@@ -226,6 +226,7 @@ ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for V
 
 ## File Permissions & Security
 
+- Managed files (all sync rule targets): written at 0600
 - Token file (`~/.vault-token`): written at 0600, warns if permissions differ
 - Config file: warns if group or world writable
 - Secret values are never logged, even at DEBUG level

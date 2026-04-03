@@ -24,6 +24,7 @@
       <string id="Cat_Vault">Vault Connection</string>
       <string id="Cat_Sync">Sync</string>
       <string id="Cat_WebUI">Web UI</string>
+      <string id="Cat_Enrolments">Enrolments</string>
 
       <!-- Vault policies -->
       <string id="VaultAddress">Vault server address</string>

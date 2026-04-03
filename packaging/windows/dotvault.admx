@@ -28,6 +28,13 @@
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\EnginePath (REG_SZ)
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Provider   (REG_SZ)
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Scopes     (REG_MULTI_SZ)
+
+  Enrolments (credential acquisition flows) are also configured via
+  Group Policy Preferences > Registry, targeting:
+    SOFTWARE\Policies\dotvault\Enrolments\<name>\Engine            (REG_SZ)
+  Optional Settings subkey:
+    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_SZ)
+    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_MULTI_SZ)
 -->
 <policyDefinitions
     xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -52,6 +59,9 @@
       <parentCategory ref="Dotvault" />
     </category>
     <category name="WebUI" displayName="$(string.Cat_WebUI)">
+      <parentCategory ref="Dotvault" />
+    </category>
+    <category name="Enrolments" displayName="$(string.Cat_Enrolments)">
       <parentCategory ref="Dotvault" />
     </category>
   </categories>

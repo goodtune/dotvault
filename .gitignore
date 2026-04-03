@@ -2,3 +2,4 @@ dist/
 dotvault
 internal/web/frontend/node_modules/
 site/
+.worktrees/

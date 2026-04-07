@@ -31,6 +31,7 @@ func (m *Manager) Authenticate(ctx context.Context) error {
 			return nil
 		}
 		slog.Warn("existing token invalid, proceeding to fresh auth", "error", err)
+		m.VaultClient.SetToken("")
 	}
 
 	// Step 2: Authenticate with configured method

@@ -165,6 +165,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			authenticated = true
 		} else {
 			slog.Warn("existing token invalid, proceeding to fresh auth", "error", err)
+			vc.SetToken("")
 		}
 	}
 

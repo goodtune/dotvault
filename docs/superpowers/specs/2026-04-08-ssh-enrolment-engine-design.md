@@ -56,13 +56,13 @@ A helper function `promptPassphrase(io IO, mode string) (string, error)` in `ssh
 6. If entries don't match: return error `"passphrases do not match"`.
 7. Return the passphrase.
 
-No retry loop on mismatch — the wizard logs the failure and continues. Re-run via config reload or daemon restart.
+No retry loop on mismatch — the wizard logs the failure and continues. Enrolment is retried automatically on the next periodic `CheckAll` cycle.
 
 ## IO Struct Changes
 
 Two additions to the `IO` struct in `internal/enrol/engine.go`:
 
-- **`Username string`** — the authenticated Vault username. Set by the manager when constructing `IO`. The SSH engine uses it for the key comment (`username@dotvault`).
+- **`Username string`** — the authenticated Vault username. Set by the caller when constructing `IO` and passed through to the manager/engine. The SSH engine uses it for the key comment (`username@dotvault`).
 - **`PromptSecret func(label string) (string, error)`** — requests masked input from the user. Returns the entered string, or error on cancellation/IO failure.
 
 ### CLI Implementation

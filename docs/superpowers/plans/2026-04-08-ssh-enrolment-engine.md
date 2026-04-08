@@ -4,7 +4,7 @@
 
 **Goal:** Add an SSH enrolment engine that generates Ed25519 key pairs in OpenSSH format and stores them in Vault KVv2, with configurable passphrase protection prompted via CLI or web UI.
 
-**Architecture:** New `SSHEngine` in `internal/enrol/ssh.go` implements the existing `Engine` interface. The `IO` struct gains `Username` and `PromptSecret` fields to support identity-aware engines and masked user input. The manager wires a CLI-based `PromptSecret` (using `golang.org/x/term`), and the web server adds two endpoints for browser-based secret prompting. Passphrase policy is a three-tier setting: `required` (default), `recommended`, `unsafe`.
+**Architecture:** New `SSHEngine` in `internal/enrol/ssh.go` implements the existing `Engine` interface. The `IO` struct gains `Username` and `PromptSecret` fields to support identity-aware engines and masked user input. The CLI entrypoint (`cmd/dotvault/main.go`) wires a terminal-based `PromptSecret` (using `golang.org/x/term`) into `enrol.IO`, which the manager receives and passes to engines, and the web server adds two endpoints for browser-based secret prompting. Passphrase policy is a three-tier setting: `required` (default), `recommended`, `unsafe`.
 
 **Tech Stack:** `crypto/ed25519`, `crypto/rand`, `encoding/pem`, `golang.org/x/crypto/ssh` (marshalling), `golang.org/x/term` (CLI hidden input)
 
@@ -543,7 +543,7 @@ Replace the IO struct literal at lines 269-273:
 	})
 ```
 
-Add `"golang.org/x/term"` to the import block. `golang.org/x/term` is already an indirect dependency in `go.mod`.
+Add `"golang.org/x/term"` to the import block. `golang.org/x/term` is already a direct dependency in `go.mod`.
 
 - [ ] **Step 2: Build to verify compilation**
 
@@ -754,7 +754,7 @@ git commit -m "Wire web-based PromptSecret when web UI is active"
 
 Run: `go mod tidy`
 
-This will promote `golang.org/x/crypto` from indirect to direct (since `ssh.go` imports `golang.org/x/crypto/ssh`) and promote `golang.org/x/term` from indirect to direct (since `main.go` imports it).
+This will promote `golang.org/x/crypto` from indirect to direct (since `ssh.go` imports `golang.org/x/crypto/ssh`). `golang.org/x/term` is already a direct dependency.
 
 - [ ] **Step 2: Verify the build**
 

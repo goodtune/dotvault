@@ -177,17 +177,20 @@ func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
 
 	s.enrolPromptMu.Lock()
 	ch := s.enrolPromptCh
-	s.enrolPromptMu.Unlock()
-
 	if ch == nil {
+		s.enrolPromptMu.Unlock()
 		writeError(w, "no pending prompt", http.StatusConflict)
 		return
 	}
 
 	select {
 	case ch <- req.Value:
+		s.enrolPromptCh = nil
+		s.enrolPromptLabel = ""
+		s.enrolPromptMu.Unlock()
 		writeJSON(w, map[string]any{"status": "accepted"})
 	default:
+		s.enrolPromptMu.Unlock()
 		writeError(w, "prompt already answered", http.StatusConflict)
 	}
 }

@@ -269,8 +269,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		Log:     slog.Default(),
 		Username: username,
 		PromptSecret: func(label string) (string, error) {
+			fd := int(os.Stdin.Fd())
+			if !term.IsTerminal(fd) {
+				return "", fmt.Errorf("cannot prompt for passphrase: stdin is not a terminal (use web UI or set passphrase to unsafe)")
+			}
 			fmt.Fprintf(os.Stderr, "%s ", label)
-			pass, err := term.ReadPassword(int(os.Stdin.Fd()))
+			pass, err := term.ReadPassword(fd)
 			fmt.Fprintln(os.Stderr) // newline after hidden input
 			if err != nil {
 				return "", err

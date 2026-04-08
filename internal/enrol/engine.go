@@ -27,10 +27,12 @@ type BrowserOpener func(url string) error
 
 // IO provides user interaction capabilities to engines.
 type IO struct {
-	Out     io.Writer
-	In      io.Reader // optional; defaults to os.Stdin if nil
-	Browser BrowserOpener
-	Log     *slog.Logger
+	Out          io.Writer
+	In           io.Reader // optional; defaults to os.Stdin if nil
+	Browser      BrowserOpener
+	Log          *slog.Logger
+	Username     string                              // authenticated Vault username
+	PromptSecret func(label string) (string, error) // masked user input
 }
 
 var (

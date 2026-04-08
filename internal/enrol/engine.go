@@ -39,6 +39,7 @@ var (
 	enginesMu sync.RWMutex
 	engines   = map[string]Engine{
 		"github": &GitHubEngine{},
+		"ssh":    &SSHEngine{},
 	}
 )
 

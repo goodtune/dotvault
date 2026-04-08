@@ -7,11 +7,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
-	"github.com/goodtune/dotvault/internal/sync"
+	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -19,7 +20,7 @@ import (
 type Server struct {
 	cfg                config.WebConfig
 	vault              *vault.Client
-	engine             *sync.Engine
+	engine             *internalsync.Engine
 	csrf               *CSRFStore
 	oauth              *OAuthManager
 	login              *auth.LoginTracker
@@ -40,6 +41,9 @@ type Server struct {
 	authDone           chan struct{}
 	readyCh            chan error
 	listenAddr         string
+	enrolPromptMu      sync.Mutex
+	enrolPromptLabel   string
+	enrolPromptCh      chan string
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -48,7 +52,7 @@ type ServerConfig struct {
 	VaultCfg      config.VaultConfig
 	Rules         []config.Rule
 	Vault         *vault.Client
-	Engine        *sync.Engine
+	Engine        *internalsync.Engine
 	Username      string
 	TokenFilePath string
 	Version       string
@@ -109,6 +113,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
+
+	// Enrolment prompt routes
+	s.mux.HandleFunc("GET /api/v1/enrol/prompt", s.handleEnrolPrompt)
+	s.mux.HandleFunc("POST /api/v1/enrol/secret", s.requireCSRF(s.handleEnrolSecret))
 
 	// Static SPA files
 	staticSub, err := fs.Sub(staticFS, "static")
@@ -191,4 +199,30 @@ func (s *Server) URL() string {
 
 func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
+}
+
+// EnrolPromptSecret implements a web-based PromptSecret. It sets the pending
+// prompt state and blocks until the frontend submits a value via the
+// /api/v1/enrol/secret endpoint, or the context is cancelled.
+func (s *Server) EnrolPromptSecret(ctx context.Context, label string) (string, error) {
+	ch := make(chan string, 1)
+
+	s.enrolPromptMu.Lock()
+	s.enrolPromptLabel = label
+	s.enrolPromptCh = ch
+	s.enrolPromptMu.Unlock()
+
+	defer func() {
+		s.enrolPromptMu.Lock()
+		s.enrolPromptLabel = ""
+		s.enrolPromptCh = nil
+		s.enrolPromptMu.Unlock()
+	}()
+
+	select {
+	case val := <-ch:
+		return val, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }

@@ -131,3 +131,85 @@ func TestSSHEngine_Required_WithPassphrase(t *testing.T) {
 	}
 }
 
+func TestSSHEngine_Required_EmptyPassphrase(t *testing.T) {
+	e := &SSHEngine{}
+	io := sshTestIO("", "") // empty entries
+	settings := map[string]any{"passphrase": "required"}
+
+	_, err := e.Run(context.Background(), settings, io)
+	if err == nil {
+		t.Fatal("expected error for empty passphrase in required mode")
+	}
+	if !strings.Contains(err.Error(), "passphrase is required") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "passphrase is required")
+	}
+}
+
+func TestSSHEngine_Recommended_EmptyPassphrase(t *testing.T) {
+	e := &SSHEngine{}
+	io := sshTestIO("", "") // empty entries
+	settings := map[string]any{"passphrase": "recommended"}
+
+	creds, err := e.Run(context.Background(), settings, io)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	// Should produce a valid unencrypted key
+	privPEM := creds["private_key"]
+	_, err = ssh.ParseRawPrivateKey([]byte(privPEM))
+	if err != nil {
+		t.Fatalf("key should be unencrypted but ParseRawPrivateKey() failed: %v", err)
+	}
+}
+
+func TestSSHEngine_Mismatch(t *testing.T) {
+	e := &SSHEngine{}
+	io := sshTestIO("hunter2", "hunter3") // mismatched entries
+	settings := map[string]any{"passphrase": "required"}
+
+	_, err := e.Run(context.Background(), settings, io)
+	if err == nil {
+		t.Fatal("expected error for mismatched passphrases")
+	}
+	if !strings.Contains(err.Error(), "passphrases do not match") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "passphrases do not match")
+	}
+}
+
+func TestSSHEngine_InvalidMode(t *testing.T) {
+	e := &SSHEngine{}
+	io := sshTestIO()
+	settings := map[string]any{"passphrase": "bogus"}
+
+	_, err := e.Run(context.Background(), settings, io)
+	if err == nil {
+		t.Fatal("expected error for invalid passphrase mode")
+	}
+	if !strings.Contains(err.Error(), "invalid passphrase mode") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "invalid passphrase mode")
+	}
+}
+
+func TestSSHEngine_DefaultMode(t *testing.T) {
+	e := &SSHEngine{}
+	// No passphrase in settings — defaults to "required"
+	io := sshTestIO("mypass", "mypass")
+	settings := map[string]any{}
+
+	creds, err := e.Run(context.Background(), settings, io)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	// Key should be encrypted
+	_, err = ssh.ParseRawPrivateKey([]byte(creds["private_key"]))
+	if err == nil {
+		t.Fatal("expected error parsing encrypted key without passphrase")
+	}
+	_, err = ssh.ParseRawPrivateKeyWithPassphrase([]byte(creds["private_key"]), []byte("mypass"))
+	if err != nil {
+		t.Fatalf("ParseRawPrivateKeyWithPassphrase() error: %v", err)
+	}
+}
+

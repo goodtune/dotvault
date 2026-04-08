@@ -20,6 +20,7 @@ import (
 	"github.com/goodtune/dotvault/internal/web"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -270,6 +271,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		Out:     os.Stderr,
 		Browser: browser.OpenURL,
 		Log:     slog.Default(),
+		Username: username,
+		PromptSecret: func(label string) (string, error) {
+			fmt.Fprintf(os.Stderr, "%s ", label)
+			pass, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Fprintln(os.Stderr) // newline after hidden input
+			if err != nil {
+				return "", err
+			}
+			return string(pass), nil
+		},
 	})
 	if _, err := enrolMgr.CheckAll(ctx); err != nil {
 		slog.Warn("enrolment check failed", "error", err)

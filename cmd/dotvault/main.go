@@ -20,6 +20,7 @@ import (
 	"github.com/goodtune/dotvault/internal/web"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -262,15 +263,35 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Create enrolment manager and run initial check.
+	enrolIO := enrol.IO{
+		Out:     os.Stderr,
+		Browser: browser.OpenURL,
+		Log:     slog.Default(),
+		Username: username,
+		PromptSecret: func(label string) (string, error) {
+			fd := int(os.Stdin.Fd())
+			if !term.IsTerminal(fd) {
+				return "", fmt.Errorf("cannot prompt for passphrase: stdin is not a terminal (use web UI or set passphrase to unsafe)")
+			}
+			fmt.Fprintf(os.Stderr, "%s ", label)
+			pass, err := term.ReadPassword(fd)
+			fmt.Fprintln(os.Stderr) // newline after hidden input
+			if err != nil {
+				return "", err
+			}
+			return string(pass), nil
+		},
+	}
+	if webServer != nil {
+		enrolIO.PromptSecret = func(label string) (string, error) {
+			return webServer.EnrolPromptSecret(ctx, label)
+		}
+	}
 	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
 		Enrolments: cfg.Enrolments,
 		KVMount:    cfg.Vault.KVMount,
 		UserPrefix: cfg.Vault.UserPrefix + username + "/",
-	}, vc, enrol.IO{
-		Out:     os.Stderr,
-		Browser: browser.OpenURL,
-		Log:     slog.Default(),
-	})
+	}, vc, enrolIO)
 	if _, err := enrolMgr.CheckAll(ctx); err != nil {
 		slog.Warn("enrolment check failed", "error", err)
 	}

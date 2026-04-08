@@ -55,9 +55,10 @@ func (e *mockEngine) Run(_ context.Context, _ map[string]any, _ IO) (map[string]
 
 func testIO(buf *bytes.Buffer) IO {
 	return IO{
-		Out:     buf,
-		Browser: func(url string) error { return nil },
-		Log:     slog.New(slog.NewTextHandler(buf, nil)),
+		Out:      buf,
+		Browser:  func(url string) error { return nil },
+		Log:      slog.New(slog.NewTextHandler(buf, nil)),
+		Username: "testuser",
 	}
 }
 

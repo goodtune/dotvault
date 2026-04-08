@@ -154,6 +154,47 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"status": "sync triggered"})
 }
 
+func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
+	s.enrolPromptMu.RLock()
+	label := s.enrolPromptLabel
+	pending := s.enrolPromptCh != nil
+	s.enrolPromptMu.RUnlock()
+
+	writeJSON(w, map[string]any{
+		"pending": pending,
+		"label":   label,
+	})
+}
+
+func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.enrolPromptMu.Lock()
+	ch := s.enrolPromptCh
+	if ch == nil {
+		s.enrolPromptMu.Unlock()
+		writeError(w, "no pending prompt", http.StatusConflict)
+		return
+	}
+
+	select {
+	case ch <- req.Value:
+		s.enrolPromptCh = nil
+		s.enrolPromptLabel = ""
+		s.enrolPromptMu.Unlock()
+		writeJSON(w, map[string]any{"status": "accepted"})
+	default:
+		s.enrolPromptMu.Unlock()
+		writeError(w, "prompt already answered", http.StatusConflict)
+	}
+}
+
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)

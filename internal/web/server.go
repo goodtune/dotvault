@@ -208,14 +208,20 @@ func (s *Server) EnrolPromptSecret(ctx context.Context, label string) (string, e
 	ch := make(chan string, 1)
 
 	s.enrolPromptMu.Lock()
+	if s.enrolPromptCh != nil {
+		s.enrolPromptMu.Unlock()
+		return "", fmt.Errorf("enrol prompt already pending")
+	}
 	s.enrolPromptLabel = label
 	s.enrolPromptCh = ch
 	s.enrolPromptMu.Unlock()
 
 	defer func() {
 		s.enrolPromptMu.Lock()
-		s.enrolPromptLabel = ""
-		s.enrolPromptCh = nil
+		if s.enrolPromptCh == ch {
+			s.enrolPromptLabel = ""
+			s.enrolPromptCh = nil
+		}
 		s.enrolPromptMu.Unlock()
 	}()
 

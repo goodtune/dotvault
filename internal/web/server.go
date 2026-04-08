@@ -41,7 +41,7 @@ type Server struct {
 	authDone           chan struct{}
 	readyCh            chan error
 	listenAddr         string
-	enrolPromptMu      sync.Mutex
+	enrolPromptMu      sync.RWMutex
 	enrolPromptLabel   string
 	enrolPromptCh      chan string
 }

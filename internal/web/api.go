@@ -155,10 +155,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
-	s.enrolPromptMu.Lock()
+	s.enrolPromptMu.RLock()
 	label := s.enrolPromptLabel
 	pending := s.enrolPromptCh != nil
-	s.enrolPromptMu.Unlock()
+	s.enrolPromptMu.RUnlock()
 
 	writeJSON(w, map[string]any{
 		"pending": pending,

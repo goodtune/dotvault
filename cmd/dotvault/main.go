@@ -263,11 +263,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Create enrolment manager and run initial check.
-	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
-		Enrolments: cfg.Enrolments,
-		KVMount:    cfg.Vault.KVMount,
-		UserPrefix: cfg.Vault.UserPrefix + username + "/",
-	}, vc, enrol.IO{
+	enrolIO := enrol.IO{
 		Out:     os.Stderr,
 		Browser: browser.OpenURL,
 		Log:     slog.Default(),
@@ -281,7 +277,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			}
 			return string(pass), nil
 		},
-	})
+	}
+	if webServer != nil {
+		enrolIO.PromptSecret = func(label string) (string, error) {
+			return webServer.EnrolPromptSecret(ctx, label)
+		}
+	}
+	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+		Enrolments: cfg.Enrolments,
+		KVMount:    cfg.Vault.KVMount,
+		UserPrefix: cfg.Vault.UserPrefix + username + "/",
+	}, vc, enrolIO)
 	if _, err := enrolMgr.CheckAll(ctx); err != nil {
 		slog.Warn("enrolment check failed", "error", err)
 	}

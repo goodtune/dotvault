@@ -102,3 +102,32 @@ func TestSSHEngine_Unsafe_NoPassphrase(t *testing.T) {
 		t.Errorf("comment = %q, want %q", comment, "testuser@dotvault")
 	}
 }
+
+func TestSSHEngine_Required_WithPassphrase(t *testing.T) {
+	e := &SSHEngine{}
+	io := sshTestIO("hunter2", "hunter2") // two matching entries
+	settings := map[string]any{"passphrase": "required"}
+
+	creds, err := e.Run(context.Background(), settings, io)
+	if err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	privPEM := creds["private_key"]
+
+	// Verify the key cannot be parsed without passphrase
+	_, err = ssh.ParseRawPrivateKey([]byte(privPEM))
+	if err == nil {
+		t.Fatal("expected error parsing encrypted key without passphrase")
+	}
+
+	// Verify the key can be parsed with the correct passphrase
+	rawKey, err := ssh.ParseRawPrivateKeyWithPassphrase([]byte(privPEM), []byte("hunter2"))
+	if err != nil {
+		t.Fatalf("ParseRawPrivateKeyWithPassphrase() error: %v", err)
+	}
+	if _, ok := rawKey.(*ed25519.PrivateKey); !ok {
+		t.Errorf("parsed key type = %T, want *ed25519.PrivateKey", rawKey)
+	}
+}
+

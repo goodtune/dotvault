@@ -164,8 +164,10 @@ func TestHandleEnrolPrompt_NoPending(t *testing.T) {
 
 func TestHandleEnrolPrompt_Pending(t *testing.T) {
 	s := testServer(t)
+	s.enrolPromptMu.Lock()
 	s.enrolPromptCh = make(chan string, 1)
 	s.enrolPromptLabel = "Enter passphrase:"
+	s.enrolPromptMu.Unlock()
 
 	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)
 	w := httptest.NewRecorder()
@@ -198,8 +200,10 @@ func TestHandleEnrolSecret_NoPending(t *testing.T) {
 func TestHandleEnrolSecret_Accepted(t *testing.T) {
 	s := testServer(t)
 	ch := make(chan string, 1)
+	s.enrolPromptMu.Lock()
 	s.enrolPromptCh = ch
 	s.enrolPromptLabel = "Enter passphrase:"
+	s.enrolPromptMu.Unlock()
 
 	body := strings.NewReader(`{"value":"hunter2"}`)
 	req := httptest.NewRequest("POST", "/api/v1/enrol/secret", body)
@@ -216,11 +220,15 @@ func TestHandleEnrolSecret_Accepted(t *testing.T) {
 		t.Errorf("channel value = %q, want %q", val, "hunter2")
 	}
 	// Verify state was cleared atomically
-	if s.enrolPromptCh != nil {
+	s.enrolPromptMu.RLock()
+	promptCh := s.enrolPromptCh
+	promptLabel := s.enrolPromptLabel
+	s.enrolPromptMu.RUnlock()
+	if promptCh != nil {
 		t.Error("enrolPromptCh should be nil after accepted submission")
 	}
-	if s.enrolPromptLabel != "" {
-		t.Errorf("enrolPromptLabel = %q, want empty", s.enrolPromptLabel)
+	if promptLabel != "" {
+		t.Errorf("enrolPromptLabel = %q, want empty", promptLabel)
 	}
 }
 

@@ -40,6 +40,10 @@ Browse and inspect secrets synced by dotvault. Secrets are hidden by default and
 
 Trigger an immediate sync cycle from the dashboard without waiting for the next poll interval.
 
+### Copy Vault token
+
+A clipboard icon in the header bar allows you to copy the current active Vault token to the clipboard. This lets you authenticate directly to the Vault web UI using your existing token, avoiding a repeated multi-factor authentication flow.
+
 ## Customisable content
 
 You can display markdown text on the login page and secret view page:
@@ -71,6 +75,7 @@ The web UI communicates with the dotvault daemon via a REST API:
 |--------|------|-------------|
 | `GET` | `/api/v1/status` | Server status, auth state, token TTL, sync state |
 | `GET` | `/api/v1/rules` | Configured sync rules |
+| `GET` | `/api/v1/token` | Current Vault token (authenticated sessions only) |
 | `GET` | `/api/v1/secrets/{path}` | List or reveal a secret |
 | `POST` | `/api/v1/sync` | Trigger immediate sync (CSRF-protected) |
 | `GET` | `/api/v1/csrf` | Obtain a one-time CSRF token |

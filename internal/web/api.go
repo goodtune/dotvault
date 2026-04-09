@@ -34,7 +34,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.vault != nil && s.vault.Token() != "" {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
 		secret, err := s.vault.LookupSelf(ctx)
@@ -93,7 +93,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	secretPath := strings.TrimPrefix(r.URL.Path, "/api/v1/secrets/")
 	reveal := r.URL.Query().Get("reveal") == "true"
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	fullPath := s.userKVPrefix() + secretPath

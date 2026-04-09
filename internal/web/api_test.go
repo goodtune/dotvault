@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/vault"
 )
 
 func TestHandleStatus(t *testing.T) {
@@ -266,5 +268,119 @@ func testServer(t *testing.T) *Server {
 		userPrefix: "users/",
 		username:   "testuser",
 		authMethod: "oidc",
+	}
+}
+
+func testServerWithVault(t *testing.T, handler http.Handler) *Server {
+	t.Helper()
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	vc, err := vault.NewClient(vault.Config{
+		Address: ts.URL,
+		Token:   "test-token",
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	s := testServer(t)
+	s.vault = vc
+	return s
+}
+
+func TestHandleSecrets_ListKeys(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list") != "true" {
+			t.Errorf("expected list=true query param, got %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"keys": []string{"gh", "ssh"},
+			},
+		})
+	})
+
+	s := testServerWithVault(t, handler)
+	req := httptest.NewRequest("GET", "/api/v1/secrets/", nil)
+	w := httptest.NewRecorder()
+
+	s.handleSecrets(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	keys, ok := resp["keys"].([]any)
+	if !ok {
+		t.Fatalf("keys is %T, want []any", resp["keys"])
+	}
+	if len(keys) != 2 {
+		t.Errorf("len(keys) = %d, want 2", len(keys))
+	}
+}
+
+func TestHandleSecrets_ReadSecret(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"data": map[string]any{
+					"token": "ghp_secret",
+					"user":  "testuser",
+				},
+				"metadata": map[string]any{
+					"version": 3,
+				},
+			},
+		})
+	})
+
+	s := testServerWithVault(t, handler)
+	req := httptest.NewRequest("GET", "/api/v1/secrets/gh", nil)
+	w := httptest.NewRecorder()
+
+	s.handleSecrets(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["path"] != "gh" {
+		t.Errorf("path = %v, want %q", resp["path"], "gh")
+	}
+	// Without reveal=true, fields should be a list of names
+	fields, ok := resp["fields"].([]any)
+	if !ok {
+		t.Fatalf("fields is %T, want []any", resp["fields"])
+	}
+	if len(fields) != 2 {
+		t.Errorf("len(fields) = %d, want 2", len(fields))
+	}
+}
+
+func TestHandleSecrets_SlowVaultReturnsWithinTimeout(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a slow Vault server that still responds within the 30s timeout.
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"keys": []string{"gh"},
+			},
+		})
+	})
+
+	s := testServerWithVault(t, handler)
+	req := httptest.NewRequest("GET", "/api/v1/secrets/", nil)
+	w := httptest.NewRecorder()
+
+	s.handleSecrets(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
 	}
 }

@@ -311,7 +311,9 @@ func TestHandleSecrets_ListKeys(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
 	keys, ok := resp["keys"].([]any)
 	if !ok {
 		t.Fatalf("keys is %T, want []any", resp["keys"])
@@ -348,7 +350,9 @@ func TestHandleSecrets_ReadSecret(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
 	if resp["path"] != "gh" {
 		t.Errorf("path = %v, want %q", resp["path"], "gh")
 	}

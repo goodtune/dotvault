@@ -148,7 +148,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	slog.Info("vault token retrieved via web UI")
+	slog.Info("vault token retrieved via web UI", "username", s.username)
 	writeJSON(w, map[string]any{"token": s.vault.Token()})
 }
 

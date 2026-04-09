@@ -143,6 +143,15 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+	slog.Info("vault token retrieved via web UI", "username", s.username)
+	writeJSON(w, map[string]any{"token": s.vault.Token()})
+}
+
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		writeError(w, "sync engine not available", http.StatusServiceUnavailable)

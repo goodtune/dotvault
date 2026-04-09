@@ -1,9 +1,10 @@
 import { h } from 'preact';
 import { useState } from 'preact/hooks';
-import { triggerSync } from '../api.js';
+import { triggerSync, getVaultToken } from '../api.js';
 
 export function StatusBar({ status, onSync }) {
   const [syncing, setSyncing] = useState(false);
+  const [tokenCopied, setTokenCopied] = useState(false);
 
   async function handleSync() {
     setSyncing(true);
@@ -14,6 +15,17 @@ export function StatusBar({ status, onSync }) {
       console.error('sync failed:', err);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handleCopyToken() {
+    try {
+      const data = await getVaultToken();
+      await navigator.clipboard.writeText(data.token);
+      setTokenCopied(true);
+      setTimeout(() => setTokenCopied(false), 2000);
+    } catch (err) {
+      console.error('copy token failed:', err);
     }
   }
 
@@ -41,6 +53,11 @@ export function StatusBar({ status, onSync }) {
       status?.time && h('span', { class: 'last-sync' },
         'Updated: ', new Date(status.time).toLocaleTimeString(),
       ),
+      status?.authenticated && h('button', {
+        class: 'copy-token-btn' + (tokenCopied ? ' copied' : ''),
+        onClick: handleCopyToken,
+        title: tokenCopied ? 'Token copied!' : 'Copy Vault token to clipboard',
+      }, tokenCopied ? '\u2705' : '\u{1F4CB}'),
       h('button', {
         class: 'sync-btn',
         onClick: handleSync,

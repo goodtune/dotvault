@@ -52,6 +52,19 @@ body {
 .sync-btn:hover { background: #2667cc; }
 .sync-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.copy-token-btn {
+  background: none;
+  color: #eee;
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 6px;
+  cursor: pointer;
+  padding: 4px 10px;
+  font-size: 16px;
+  line-height: 1;
+}
+.copy-token-btn:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.5); }
+.copy-token-btn.copied { border-color: #b7e4c7; }
+
 .error-banner {
   background: #fee2e2;
   color: #991b1b;

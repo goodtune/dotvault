@@ -85,3 +85,7 @@ export async function loginToken(vaultToken) {
     body: JSON.stringify({ token: vaultToken }),
   });
 }
+
+export async function getVaultToken() {
+  return fetchJSON('/api/v1/token');
+}

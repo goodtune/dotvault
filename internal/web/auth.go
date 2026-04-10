@@ -116,7 +116,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	default:
 	}
 
-	fmt.Fprint(w, "Authentication successful! You can close this window.")
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {

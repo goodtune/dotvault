@@ -209,8 +209,11 @@ func TestHandleAuthCallback_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", w.Code)
+	if w.Code != http.StatusFound {
+		t.Errorf("status = %d, want 302", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "/" {
+		t.Errorf("Location = %q, want %q", loc, "/")
 	}
 
 	// authDone must be signaled.

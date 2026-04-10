@@ -57,8 +57,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only expose enrolment state to authenticated sessions.
-	if authenticated && s.enrolRunner != nil {
-		status["enrolments"] = s.enrolRunner.States()
+	if authenticated {
+		if runner := s.getEnrolRunner(); runner != nil {
+			status["enrolments"] = runner.States()
+		}
 	}
 
 	writeJSON(w, status)

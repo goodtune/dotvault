@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -46,6 +45,7 @@ type Server struct {
 	enrolPromptMu      sync.RWMutex
 	enrolPromptLabel   string
 	enrolPromptCh      chan string
+	enrolRunnerMu      sync.RWMutex
 	enrolRunner        *EnrolmentRunner
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
@@ -215,6 +215,13 @@ func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
 }
 
+// getEnrolRunner returns the enrolment runner, safe for concurrent access.
+func (s *Server) getEnrolRunner() *EnrolmentRunner {
+	s.enrolRunnerMu.RLock()
+	defer s.enrolRunnerMu.RUnlock()
+	return s.enrolRunner
+}
+
 // InitEnrolments sets up the enrolment runner for web-driven enrolment.
 // It checks Vault for already-completed enrolments and marks them as such.
 func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
@@ -222,10 +229,10 @@ func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]confi
 		return
 	}
 
-	s.enrolRunner = NewEnrolmentRunner(enrolments)
+	runner := NewEnrolmentRunner(enrolments)
 
 	// Check Vault for already-complete enrolments.
-	for _, info := range s.enrolRunner.States() {
+	for _, info := range runner.States() {
 		engine, ok := enrol.GetEngine(info.Engine)
 		if !ok {
 			continue
@@ -236,34 +243,24 @@ func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]confi
 			slog.Warn("failed to check enrolment in vault", "key", info.Key, "error", err)
 			continue
 		}
-		if secret != nil {
-			allPresent := true
-			for _, f := range engine.Fields() {
-				v, ok := secret.Data[f]
-				if !ok || v == nil {
-					allPresent = false
-					break
-				}
-				str, ok := v.(string)
-				if !ok || strings.TrimSpace(str) == "" {
-					allPresent = false
-					break
-				}
-			}
-			if allPresent {
-				s.enrolRunner.MarkComplete(info.Key)
-			}
+		if secret != nil && enrol.HasAllFields(secret.Data, engine.Fields()) {
+			runner.MarkComplete(info.Key)
 		}
 	}
+
+	s.enrolRunnerMu.Lock()
+	s.enrolRunner = runner
+	s.enrolRunnerMu.Unlock()
 }
 
 // WaitForEnrolments blocks until the user completes the enrolment page.
 // Returns immediately if there are no pending enrolments or no runner.
 func (s *Server) WaitForEnrolments() {
-	if s.enrolRunner == nil {
+	r := s.getEnrolRunner()
+	if r == nil {
 		return
 	}
-	s.enrolRunner.Wait()
+	r.Wait()
 }
 
 // EnrolPromptSecret implements a web-based PromptSecret. It sets the pending

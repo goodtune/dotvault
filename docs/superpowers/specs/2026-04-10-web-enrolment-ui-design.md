@@ -227,7 +227,7 @@ The device code detection uses a simple regex on the output lines. This keeps th
 - **Daemon restart** — all in-memory state reset. `findPending()` re-checks Vault, so completed enrolments (already in Vault) show as complete. Skipped state is lost — user can skip again.
 - **No enrolments configured** — status API returns empty list, SPA shows dashboard directly.
 - **All already complete** — same as above. `findPending()` returns nothing.
-- **Config adds new enrolments** — the daemon's existing periodic re-check detects new enrolments. The header indicator appears on the dashboard, prompting the user to visit the enrolment page.
+- **Config adds new enrolments** — in web mode, newly added enrolments are not detected automatically; a daemon restart is required before new enrolments appear in the UI. In CLI mode, the existing periodic re-check detects them on the next polling interval.
 
 ## CLI Mode
 

@@ -19,12 +19,13 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 
-	if s.enrolRunner == nil {
+	runner := s.getEnrolRunner()
+	if runner == nil {
 		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	err := s.enrolRunner.Start(
+	err := runner.Start(
 		s.shutdownCtx, key, s.vault,
 		s.kvMount, s.userKVPrefix(), s.username,
 		s.EnrolPromptSecret,
@@ -59,12 +60,13 @@ func (s *Server) handleEnrolSkip(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 
-	if s.enrolRunner == nil {
+	runner := s.getEnrolRunner()
+	if runner == nil {
 		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	err := s.enrolRunner.Skip(key)
+	err := runner.Skip(key)
 	if err != nil {
 		if errors.Is(err, ErrEnrolNotFound) {
 			writeError(w, "enrolment not found", http.StatusNotFound)
@@ -83,12 +85,13 @@ func (s *Server) handleEnrolStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 
-	if s.enrolRunner == nil {
+	runner := s.getEnrolRunner()
+	if runner == nil {
 		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	info, err := s.enrolRunner.GetState(key)
+	info, err := runner.GetState(key)
 	if err != nil {
 		writeError(w, "enrolment not found", http.StatusNotFound)
 		return
@@ -101,11 +104,12 @@ func (s *Server) handleEnrolComplete(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return
 	}
-	if s.enrolRunner == nil {
+	runner := s.getEnrolRunner()
+	if runner == nil {
 		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	s.enrolRunner.Complete()
+	runner.Complete()
 	writeJSON(w, map[string]any{"status": "ok"})
 }

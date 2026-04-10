@@ -34,10 +34,12 @@ Enrolment configuration changes are detected on each polling tick without requir
 | Engine | Service | Flow type |
 |--------|---------|-----------|
 | `github` | GitHub / GitHub Enterprise | OAuth device flow |
+| `ssh` | SSH key generation | Ed25519 key pair |
 
-More engines will be added in future releases. See the individual engine pages for details:
+See the individual engine pages for details:
 
 - [GitHub CLI](github.md)
+- [SSH Keys](ssh.md)
 
 ## Engine interface
 

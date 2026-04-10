@@ -125,6 +125,50 @@ func TestHandleEnrolComplete(t *testing.T) {
 	}
 }
 
+func TestHandleEnrolStartRequiresCSRF(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/start", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.requireCSRF(s.handleEnrolStart)(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
+	}
+}
+
+func TestHandleEnrolSkipRequiresCSRF(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/skip", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.requireCSRF(s.handleEnrolSkip)(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
+	}
+}
+
+func TestHandleEnrolCompleteRequiresCSRF(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/complete", nil)
+	w := httptest.NewRecorder()
+
+	s.requireCSRF(s.handleEnrolComplete)(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
+	}
+}
+
 func TestHandleStatus_IncludesEnrolments(t *testing.T) {
 	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
 	defer enrol.UnregisterEngine("mock")

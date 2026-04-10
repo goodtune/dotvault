@@ -37,6 +37,13 @@ type enrolState struct {
 	mu         sync.Mutex
 }
 
+// Sentinel errors for enrolment operations.
+var (
+	ErrEnrolNotFound      = fmt.Errorf("enrolment not found")
+	ErrEnrolAlreadyRunning = fmt.Errorf("enrolment already running")
+	ErrEnrolBusy          = fmt.Errorf("another enrolment is running")
+)
+
 // EnrolmentRunner manages per-enrolment lifecycle for web mode.
 type EnrolmentRunner struct {
 	states map[string]*enrolState
@@ -125,13 +132,13 @@ func (r *EnrolmentRunner) Skip(key string) error {
 	s, ok := r.states[key]
 	r.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("enrolment %q not found", key)
+		return ErrEnrolNotFound
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.status == "running" {
-		return fmt.Errorf("enrolment %q is currently running", key)
+		return ErrEnrolAlreadyRunning
 	}
 	s.status = "skipped"
 	return nil
@@ -143,7 +150,7 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 	s, ok := r.states[key]
 	r.mu.RUnlock()
 	if !ok {
-		return EnrolStateInfo{}, fmt.Errorf("enrolment %q not found", key)
+		return EnrolStateInfo{}, ErrEnrolNotFound
 	}
 
 	s.mu.Lock()
@@ -230,25 +237,44 @@ func (lc *lineCapture) flush() {
 type PromptSecretFunc func(ctx context.Context, label string) (string, error)
 
 // Start launches an enrolment engine in a background goroutine.
-// Returns error if the key is unknown or the enrolment is already running.
+// Returns error if the key is unknown, the enrolment is already running,
+// or another enrolment is currently running (only one may run at a time
+// because the secret prompt mechanism is global).
 func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Client, kvMount, userPrefix, username string, promptSecret PromptSecretFunc) error {
-	r.mu.RLock()
+	r.mu.Lock()
 	s, ok := r.states[key]
-	r.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("enrolment %q not found", key)
+		r.mu.Unlock()
+		return ErrEnrolNotFound
+	}
+
+	// Enforce single-running: the prompt mechanism is global, so only
+	// one enrolment engine can run at a time.
+	for otherKey, other := range r.states {
+		if otherKey == key {
+			continue
+		}
+		other.mu.Lock()
+		running := other.status == "running"
+		other.mu.Unlock()
+		if running {
+			r.mu.Unlock()
+			return ErrEnrolBusy
+		}
 	}
 
 	s.mu.Lock()
 	if s.status == "running" {
 		s.mu.Unlock()
-		return fmt.Errorf("enrolment %q is already running", key)
+		r.mu.Unlock()
+		return ErrEnrolAlreadyRunning
 	}
 	s.status = "running"
 	s.output = nil
 	s.errMsg = ""
 	s.doneCh = make(chan struct{})
 	s.mu.Unlock()
+	r.mu.Unlock()
 
 	capture := &lineCapture{state: s}
 
@@ -316,6 +342,7 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 }
 
 // WaitForKey blocks until the given enrolment is no longer "running".
+// Returns immediately if the enrolment is not found or not running.
 func (r *EnrolmentRunner) WaitForKey(key string) {
 	r.mu.RLock()
 	s, ok := r.states[key]
@@ -324,7 +351,11 @@ func (r *EnrolmentRunner) WaitForKey(key string) {
 		return
 	}
 	s.mu.Lock()
+	status := s.status
 	ch := s.doneCh
 	s.mu.Unlock()
+	if status != "running" {
+		return
+	}
 	<-ch
 }

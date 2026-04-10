@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -249,6 +250,8 @@ func TestHandleEnrolSecretRequiresCSRF(t *testing.T) {
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	return &Server{
 		csrf:  NewCSRFStore(),
 		oauth: NewOAuthManager(),
@@ -264,10 +267,12 @@ func testServer(t *testing.T) *Server {
 				},
 			},
 		},
-		kvMount:    "secret",
-		userPrefix: "users/",
-		username:   "testuser",
-		authMethod: "oidc",
+		kvMount:        "secret",
+		userPrefix:     "users/",
+		username:       "testuser",
+		authMethod:     "oidc",
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 

@@ -47,6 +47,8 @@ type Server struct {
 	enrolPromptLabel   string
 	enrolPromptCh      chan string
 	enrolRunner        *EnrolmentRunner
+	shutdownCtx        context.Context
+	shutdownCancel     context.CancelFunc
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -90,6 +92,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
 	}
+	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
 	s.registerRoutes()
 	return s, nil
@@ -173,6 +176,7 @@ func (s *Server) WaitReady() error {
 
 // Shutdown gracefully stops the server and cleans up resources.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutdownCancel()
 	if s.login != nil {
 		s.login.Close()
 	}

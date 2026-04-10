@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -75,8 +76,8 @@ func TestEnrolmentRunner_Skip(t *testing.T) {
 func TestEnrolmentRunner_SkipUnknownKey(t *testing.T) {
 	runner := NewEnrolmentRunner(nil)
 	err := runner.Skip("nonexistent")
-	if err == nil {
-		t.Error("expected error for unknown key")
+	if !errors.Is(err, ErrEnrolNotFound) {
+		t.Errorf("Skip() error = %v, want %v", err, ErrEnrolNotFound)
 	}
 }
 
@@ -97,8 +98,8 @@ func TestEnrolmentRunner_GetState(t *testing.T) {
 	}
 
 	_, err = runner.GetState("nonexistent")
-	if err == nil {
-		t.Error("expected error for unknown key")
+	if !errors.Is(err, ErrEnrolNotFound) {
+		t.Errorf("GetState() error = %v, want %v", err, ErrEnrolNotFound)
 	}
 }
 
@@ -222,8 +223,8 @@ func TestEnrolmentRunner_Start_AlreadyRunning(t *testing.T) {
 	s.mu.Unlock()
 
 	err := runner.Start(context.Background(), "svc", nil, "", "", "", nil)
-	if err == nil {
-		t.Error("expected error for already running enrolment")
+	if !errors.Is(err, ErrEnrolAlreadyRunning) {
+		t.Errorf("Start() error = %v, want %v", err, ErrEnrolAlreadyRunning)
 	}
 }
 

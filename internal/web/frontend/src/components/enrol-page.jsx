@@ -6,6 +6,7 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
   const allAddressed = enrolments.every(
     e => e.status === 'complete' || e.status === 'skipped'
   );
+  const anyRunning = enrolments.some(e => e.status === 'running');
 
   async function handleContinue() {
     try {
@@ -24,7 +25,7 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
       ),
       h('div', { class: 'enrol-list' },
         enrolments.map(e =>
-          h(EnrolCard, { key: e.key, enrolment: e, onUpdate })
+          h(EnrolCard, { key: e.key, enrolment: e, onUpdate, anyRunning })
         ),
       ),
       h('div', { class: 'enrol-footer' },

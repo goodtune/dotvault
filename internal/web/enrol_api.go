@@ -1,7 +1,7 @@
 package web
 
 import (
-	"context"
+	"errors"
 	"net/http"
 )
 
@@ -14,17 +14,17 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := s.enrolRunner.Start(
-		context.Background(), key, s.vault,
+		s.shutdownCtx, key, s.vault,
 		s.kvMount, s.userKVPrefix(), s.username,
 		s.EnrolPromptSecret,
 	)
 	if err != nil {
-		if err.Error() == "enrolment \""+key+"\" not found" {
+		if errors.Is(err, ErrEnrolNotFound) {
 			writeError(w, "enrolment not found", http.StatusNotFound)
 			return
 		}
-		if err.Error() == "enrolment \""+key+"\" is already running" {
-			writeError(w, "enrolment already running", http.StatusConflict)
+		if errors.Is(err, ErrEnrolAlreadyRunning) || errors.Is(err, ErrEnrolBusy) {
+			writeError(w, err.Error(), http.StatusConflict)
 			return
 		}
 		writeError(w, err.Error(), http.StatusInternalServerError)
@@ -44,7 +44,7 @@ func (s *Server) handleEnrolSkip(w http.ResponseWriter, r *http.Request) {
 
 	err := s.enrolRunner.Skip(key)
 	if err != nil {
-		if err.Error() == "enrolment \""+key+"\" not found" {
+		if errors.Is(err, ErrEnrolNotFound) {
 			writeError(w, "enrolment not found", http.StatusNotFound)
 			return
 		}

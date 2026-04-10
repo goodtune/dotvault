@@ -2,7 +2,7 @@ import { h } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
 
-export function EnrolCard({ enrolment, onUpdate }) {
+export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [localStatus, setLocalStatus] = useState(enrolment.status);
   const [output, setOutput] = useState([]);
   const [error, setError] = useState(enrolment.error || null);
@@ -89,6 +89,7 @@ export function EnrolCard({ enrolment, onUpdate }) {
   }, null);
 
   const isGitHub = enrolment.engine === 'github';
+  const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
     return h('div', { class: 'enrol-card enrol-complete' },
@@ -129,7 +130,16 @@ export function EnrolCard({ enrolment, onUpdate }) {
         h('div', { class: 'enrol-device-actions' },
           h('button', {
             class: 'enrol-btn-secondary',
-            onClick: () => navigator.clipboard.writeText(deviceCode),
+            onClick: () => {
+              const el = document.createElement('textarea');
+              el.value = deviceCode;
+              el.style.position = 'fixed';
+              el.style.opacity = '0';
+              document.body.appendChild(el);
+              el.select();
+              document.execCommand('copy');
+              document.body.removeChild(el);
+            },
           }, 'Copy Code'),
           h('a', {
             class: 'enrol-btn-secondary',
@@ -170,8 +180,8 @@ export function EnrolCard({ enrolment, onUpdate }) {
           h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
         ),
         h('div', { class: 'enrol-card-actions' },
-          h('button', { class: 'enrol-btn-primary', onClick: handleStart }, 'Retry'),
-          h('button', { class: 'enrol-btn-secondary', onClick: handleSkip }, 'Skip'),
+          h('button', { class: 'enrol-btn-primary', onClick: handleStart, disabled: startDisabled }, 'Retry'),
+          h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
         ),
       ),
       h('p', { class: 'enrol-error-text' }, error),
@@ -186,8 +196,8 @@ export function EnrolCard({ enrolment, onUpdate }) {
         h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
       ),
       h('div', { class: 'enrol-card-actions' },
-        h('button', { class: 'enrol-btn-primary', onClick: handleStart }, 'Start'),
-        h('button', { class: 'enrol-btn-secondary', onClick: handleSkip }, 'Skip'),
+        h('button', { class: 'enrol-btn-primary', onClick: handleStart, disabled: startDisabled }, 'Start'),
+        h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
       ),
     ),
     error && h('p', { class: 'enrol-error-text' }, error),

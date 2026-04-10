@@ -32,6 +32,7 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
         h('button', {
           class: 'enrol-continue-btn',
           onClick: handleContinue,
+          disabled: anyRunning,
         }, allAddressed ? 'Continue to Dashboard \u2192' : 'Skip remaining and continue \u2192'),
       ),
     ),

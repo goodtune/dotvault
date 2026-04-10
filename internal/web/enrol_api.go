@@ -38,6 +38,10 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if errors.Is(err, ErrEnrolNotStartable) {
+			writeError(w, err.Error(), http.StatusConflict)
+			return
+		}
 		if errors.Is(err, ErrEnrolAlreadyRunning) || errors.Is(err, ErrEnrolBusy) {
 			writeError(w, err.Error(), http.StatusConflict)
 			return

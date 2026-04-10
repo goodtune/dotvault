@@ -43,6 +43,7 @@ var (
 	ErrEnrolAlreadyRunning = fmt.Errorf("enrolment already running")
 	ErrEnrolBusy           = fmt.Errorf("another enrolment is running")
 	ErrEnrolInvalidEngine  = fmt.Errorf("enrolment has no valid engine")
+	ErrEnrolNotStartable   = fmt.Errorf("enrolment is not in a startable state")
 )
 
 // EnrolmentRunner manages per-enrolment lifecycle for web mode.
@@ -285,6 +286,11 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 		s.mu.Unlock()
 		r.mu.Unlock()
 		return ErrEnrolAlreadyRunning
+	}
+	if s.status != "pending" && s.status != "failed" {
+		s.mu.Unlock()
+		r.mu.Unlock()
+		return ErrEnrolNotStartable
 	}
 	if s.engine == nil {
 		s.mu.Unlock()

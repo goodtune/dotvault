@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -207,6 +209,57 @@ func (s *Server) URL() string {
 
 func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
+}
+
+// InitEnrolments sets up the enrolment runner for web-driven enrolment.
+// It checks Vault for already-completed enrolments and marks them as such.
+func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
+	if len(enrolments) == 0 {
+		return
+	}
+
+	s.enrolRunner = NewEnrolmentRunner(enrolments)
+
+	// Check Vault for already-complete enrolments.
+	for _, info := range s.enrolRunner.States() {
+		engine, ok := enrol.GetEngine(info.Engine)
+		if !ok {
+			continue
+		}
+		vaultPath := s.userKVPrefix() + info.Key
+		secret, err := s.vault.ReadKVv2(ctx, s.kvMount, vaultPath)
+		if err != nil {
+			slog.Warn("failed to check enrolment in vault", "key", info.Key, "error", err)
+			continue
+		}
+		if secret != nil {
+			allPresent := true
+			for _, f := range engine.Fields() {
+				v, ok := secret.Data[f]
+				if !ok || v == nil {
+					allPresent = false
+					break
+				}
+				str, ok := v.(string)
+				if !ok || strings.TrimSpace(str) == "" {
+					allPresent = false
+					break
+				}
+			}
+			if allPresent {
+				s.enrolRunner.MarkComplete(info.Key)
+			}
+		}
+	}
+}
+
+// WaitForEnrolments blocks until the user completes the enrolment page.
+// Returns immediately if there are no pending enrolments or no runner.
+func (s *Server) WaitForEnrolments() {
+	if s.enrolRunner == nil {
+		return
+	}
+	s.enrolRunner.Wait()
 }
 
 // EnrolPromptSecret implements a web-based PromptSecret. It sets the pending

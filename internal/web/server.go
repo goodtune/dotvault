@@ -44,6 +44,7 @@ type Server struct {
 	enrolPromptMu      sync.RWMutex
 	enrolPromptLabel   string
 	enrolPromptCh      chan string
+	enrolRunner        *EnrolmentRunner
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -118,6 +119,12 @@ func (s *Server) registerRoutes() {
 	// Enrolment prompt routes
 	s.mux.HandleFunc("GET /api/v1/enrol/prompt", s.handleEnrolPrompt)
 	s.mux.HandleFunc("POST /api/v1/enrol/secret", s.requireCSRF(s.handleEnrolSecret))
+
+	// Enrolment runner routes
+	s.mux.HandleFunc("POST /api/v1/enrol/{key}/start", s.requireCSRF(s.handleEnrolStart))
+	s.mux.HandleFunc("POST /api/v1/enrol/{key}/skip", s.requireCSRF(s.handleEnrolSkip))
+	s.mux.HandleFunc("GET /api/v1/enrol/{key}/status", s.handleEnrolStatus)
+	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
 
 	// Static SPA files
 	staticSub, err := fs.Sub(staticFS, "static")

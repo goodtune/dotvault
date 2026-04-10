@@ -56,6 +56,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["rules"] = ruleStatuses
 	}
 
+	if s.enrolRunner != nil {
+		status["enrolments"] = s.enrolRunner.States()
+	}
+
 	writeJSON(w, status)
 }
 

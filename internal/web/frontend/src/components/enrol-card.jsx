@@ -95,9 +95,14 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     }
   }
 
-  // Parse device code from GitHub engine output.
+  // Parse device code and verification URL from GitHub engine output.
   const deviceCode = output.reduce((found, line) => {
     const match = line.match(/one-time code: (\S+)/);
+    return match ? match[1] : found;
+  }, null);
+
+  const verificationURL = output.reduce((found, line) => {
+    const match = line.match(/open (https?:\/\/\S+)/);
     return match ? match[1] : found;
   }, null);
 
@@ -154,9 +159,9 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
               document.body.removeChild(el);
             },
           }, 'Copy Code'),
-          h('a', {
+          verificationURL && h('a', {
             class: 'enrol-btn-secondary',
-            href: 'https://github.com/login/device',
+            href: verificationURL,
             target: '_blank',
             rel: 'noopener',
           }, 'Open GitHub \u2192'),

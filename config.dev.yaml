@@ -19,3 +19,11 @@ rules:
       template: |
         github.com:
           oauth_token: "{{.token}}"
+
+enrolments:
+  gh:
+    engine: github
+  ssh:
+    engine: ssh
+    settings:
+      passphrase: "recommended"

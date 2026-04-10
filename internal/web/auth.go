@@ -83,12 +83,13 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		mount = "oidc"
 	}
 
-	loginData := map[string]interface{}{
-		"code":  code,
-		"state": state,
+	callbackPath := fmt.Sprintf("auth/%s/oidc/callback", mount)
+	loginData := map[string][]string{
+		"code":  {code},
+		"state": {state},
 	}
-	loginSecret, err := s.vault.Raw().Logical().WriteWithContext(r.Context(),
-		fmt.Sprintf("auth/%s/oidc/callback", mount), loginData)
+	loginSecret, err := s.vault.Raw().Logical().ReadWithDataWithContext(r.Context(),
+		callbackPath, loginData)
 	if err != nil {
 		slog.Error("OIDC token exchange failed", "error", err)
 		http.Error(w, "Authentication failed during token exchange", http.StatusInternalServerError)

@@ -13,7 +13,7 @@ staticClients:
     secret: dotvault-dev-secret
     name: dotvault
     redirectURIs:
-      - http://127.0.0.1:8250/auth/callback
+      - http://127.0.0.1:9000/auth/oidc/callback
 
 connectors:
   - type: mockCallback

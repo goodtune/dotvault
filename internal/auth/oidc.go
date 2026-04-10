@@ -83,12 +83,13 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 		}
 
 		// Exchange code for token via Vault
-		loginData := map[string]interface{}{
-			"code":  result.code,
-			"state": result.state,
+		callbackPath := fmt.Sprintf("auth/%s/oidc/callback", mount)
+		loginData := map[string][]string{
+			"code":  {result.code},
+			"state": {result.state},
 		}
-		loginSecret, err := m.VaultClient.Raw().Logical().WriteWithContext(ctx,
-			fmt.Sprintf("auth/%s/oidc/callback", mount), loginData)
+		loginSecret, err := m.VaultClient.Raw().Logical().ReadWithDataWithContext(ctx,
+			callbackPath, loginData)
 		if err != nil {
 			return fmt.Errorf("OIDC token exchange: %w", err)
 		}

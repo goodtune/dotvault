@@ -177,7 +177,7 @@ Automated credential acquisition from external services (`internal/enrol/`). Enr
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow via `github.com/cli/oauth`).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), SSH (Ed25519 key generation).
 
 ### GitHub Engine Defaults
 
@@ -186,6 +186,17 @@ Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered
 - Host: `github.com`
 
 Overridable via settings: `client_id`, `scopes`, `host`. Returns `{"oauth_token": "<token>", "user": "<username>"}`.
+
+### SSH Engine
+
+Generates Ed25519 key pairs in OpenSSH format. Returns `{"public_key": "<ssh-ed25519 ...>", "private_key": "<PEM>"}`. The public key comment is `{username}@dotvault`.
+
+Passphrase mode controlled via settings `passphrase` field:
+- `"required"` (default) — user must provide a passphrase; fails if empty
+- `"recommended"` — user prompted but can skip
+- `"unsafe"` — no passphrase (unencrypted private key)
+
+No external dependencies beyond `golang.org/x/crypto/ssh`.
 
 ### Manager & Wizard
 

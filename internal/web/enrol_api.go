@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"net/http"
 )
 
@@ -13,7 +14,7 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := s.enrolRunner.Start(
-		r.Context(), key, s.vault,
+		context.Background(), key, s.vault,
 		s.kvMount, s.userKVPrefix(), s.username,
 		s.EnrolPromptSecret,
 	)

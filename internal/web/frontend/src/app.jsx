@@ -100,7 +100,7 @@ export function App() {
     h(StatusBar, {
       status,
       onSync: loadData,
-      pendingEnrolments: enrolDismissed ? 0 : pendingEnrolments.length,
+      pendingEnrolments: pendingEnrolments.length,
       onEnrolClick: () => setEnrolDismissed(false),
     }),
     error && h('div', { class: 'error-banner' }, error),

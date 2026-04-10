@@ -129,7 +129,7 @@ func TestHandleStatus_IncludesEnrolments(t *testing.T) {
 	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
 	defer enrol.UnregisterEngine("mock")
 
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
 		"svc": {Engine: "mock"},
 	})

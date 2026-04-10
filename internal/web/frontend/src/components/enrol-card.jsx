@@ -55,6 +55,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       setLocalStatus('running');
       setOutput([]);
       setError(null);
+      if (onUpdate) onUpdate();
       startPolling();
     } catch (err) {
       setError(err.message);

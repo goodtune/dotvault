@@ -265,7 +265,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if webServer != nil {
 		// Web mode: let the frontend drive enrolments.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
-		webServer.WaitForEnrolments()
+
+		waitDone := make(chan struct{})
+		go func() {
+			webServer.WaitForEnrolments()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+		case <-ctx.Done():
+			slog.Info("stopping enrolment wait due to shutdown")
+		}
 	} else {
 		// CLI mode: terminal-based wizard (unchanged).
 		enrolIO := enrol.IO{

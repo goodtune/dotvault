@@ -67,6 +67,17 @@ func NewEnrolmentRunner(enrolments map[string]config.Enrolment) *EnrolmentRunner
 		e := enrolments[key]
 		engine, ok := enrol.GetEngine(e.Engine)
 		if !ok {
+			slog.Warn("unknown enrolment engine", "key", key, "engine", e.Engine)
+			s := &enrolState{
+				key:        key,
+				engineName: e.Engine,
+				settings:   e.Settings,
+				status:     "failed",
+				errMsg:     fmt.Sprintf("unknown engine %q", e.Engine),
+				doneCh:     make(chan struct{}),
+			}
+			close(s.doneCh)
+			states[key] = s
 			continue
 		}
 		states[key] = &enrolState{
@@ -112,13 +123,15 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 		}
 		s.mu.Lock()
 		info := EnrolStateInfo{
-			Key:        s.key,
-			Engine:     s.engineName,
-			EngineName: s.engine.Name(),
-			Status:     s.status,
-			Fields:     s.engine.Fields(),
-			Output:     append([]string{}, s.output...),
-			Error:      s.errMsg,
+			Key:    s.key,
+			Engine: s.engineName,
+			Status: s.status,
+			Output: append([]string{}, s.output...),
+			Error:  s.errMsg,
+		}
+		if s.engine != nil {
+			info.EngineName = s.engine.Name()
+			info.Fields = s.engine.Fields()
 		}
 		s.mu.Unlock()
 		result = append(result, info)
@@ -155,15 +168,18 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return EnrolStateInfo{
-		Key:        s.key,
-		Engine:     s.engineName,
-		EngineName: s.engine.Name(),
-		Status:     s.status,
-		Fields:     s.engine.Fields(),
-		Output:     append([]string{}, s.output...),
-		Error:      s.errMsg,
-	}, nil
+	info := EnrolStateInfo{
+		Key:    s.key,
+		Engine: s.engineName,
+		Status: s.status,
+		Output: append([]string{}, s.output...),
+		Error:  s.errMsg,
+	}
+	if s.engine != nil {
+		info.EngineName = s.engine.Name()
+		info.Fields = s.engine.Fields()
+	}
+	return info, nil
 }
 
 // HasPending returns true if any enrolment is pending, running, or failed.

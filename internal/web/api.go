@@ -56,7 +56,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["rules"] = ruleStatuses
 	}
 
-	if s.enrolRunner != nil {
+	// Only expose enrolment state to authenticated sessions.
+	if authenticated && s.enrolRunner != nil {
 		status["enrolments"] = s.enrolRunner.States()
 	}
 

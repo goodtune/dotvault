@@ -40,7 +40,7 @@ func TestHandleEnrolStart(t *testing.T) {
 }
 
 func TestHandleEnrolStart_NotFound(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(nil)
 
 	req := httptest.NewRequest("POST", "/api/v1/enrol/bogus/start", nil)
@@ -58,7 +58,7 @@ func TestHandleEnrolSkip(t *testing.T) {
 	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
 	defer enrol.UnregisterEngine("mock")
 
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
 		"svc": {Engine: "mock"},
 	})
@@ -83,7 +83,7 @@ func TestHandleEnrolStatus(t *testing.T) {
 	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
 	defer enrol.UnregisterEngine("mock")
 
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
 		"svc": {Engine: "mock"},
 	})
@@ -105,7 +105,7 @@ func TestHandleEnrolStatus(t *testing.T) {
 }
 
 func TestHandleEnrolComplete(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(nil)
 
 	req := httptest.NewRequest("POST", "/api/v1/enrol/complete", nil)

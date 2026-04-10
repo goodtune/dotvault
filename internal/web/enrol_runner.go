@@ -39,9 +39,10 @@ type enrolState struct {
 
 // Sentinel errors for enrolment operations.
 var (
-	ErrEnrolNotFound      = fmt.Errorf("enrolment not found")
+	ErrEnrolNotFound       = fmt.Errorf("enrolment not found")
 	ErrEnrolAlreadyRunning = fmt.Errorf("enrolment already running")
-	ErrEnrolBusy          = fmt.Errorf("another enrolment is running")
+	ErrEnrolBusy           = fmt.Errorf("another enrolment is running")
+	ErrEnrolInvalidEngine  = fmt.Errorf("enrolment has no valid engine")
 )
 
 // EnrolmentRunner manages per-enrolment lifecycle for web mode.
@@ -284,6 +285,11 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 		s.mu.Unlock()
 		r.mu.Unlock()
 		return ErrEnrolAlreadyRunning
+	}
+	if s.engine == nil {
+		s.mu.Unlock()
+		r.mu.Unlock()
+		return ErrEnrolInvalidEngine
 	}
 	s.status = "running"
 	s.output = nil

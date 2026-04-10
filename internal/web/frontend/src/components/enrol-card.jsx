@@ -20,11 +20,19 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     if (localStatus === 'running' && !pollRef.current) {
       startPolling();
     }
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
   }, [localStatus]);
 
   function startPolling() {
-    if (pollRef.current) clearInterval(pollRef.current);
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
     pollRef.current = setInterval(async () => {
       try {
         const [statusData, promptData] = await Promise.all([

@@ -5,7 +5,18 @@ import (
 	"net/http"
 )
 
+func (s *Server) requireEnrolAuth(w http.ResponseWriter) bool {
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	key := r.PathValue("key")
 
 	if s.enrolRunner == nil {
@@ -23,6 +34,10 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 			writeError(w, "enrolment not found", http.StatusNotFound)
 			return
 		}
+		if errors.Is(err, ErrEnrolInvalidEngine) {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if errors.Is(err, ErrEnrolAlreadyRunning) || errors.Is(err, ErrEnrolBusy) {
 			writeError(w, err.Error(), http.StatusConflict)
 			return
@@ -35,6 +50,9 @@ func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolSkip(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	key := r.PathValue("key")
 
 	if s.enrolRunner == nil {
@@ -56,6 +74,9 @@ func (s *Server) handleEnrolSkip(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	key := r.PathValue("key")
 
 	if s.enrolRunner == nil {
@@ -73,6 +94,9 @@ func (s *Server) handleEnrolStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolComplete(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	if s.enrolRunner == nil {
 		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
 		return

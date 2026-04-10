@@ -18,7 +18,22 @@ rules:
       format: yaml
       template: |
         github.com:
-          oauth_token: "{{.token}}"
+          user: "{{.user}}"
+          oauth_token: "{{.oauth_token}}"
+
+  - name: ssh-private-key
+    vault_key: "ssh"
+    target:
+      path: "~/tmp/.ssh/id_ed25519"
+      format: text
+      template: "{{ .private_key }}"
+
+  - name: ssh-public-key
+    vault_key: "ssh"
+    target:
+      path: "~/tmp/.ssh/id_ed25519.pub"
+      format: text
+      template: "{{ .public_key }}"
 
 enrolments:
   gh:

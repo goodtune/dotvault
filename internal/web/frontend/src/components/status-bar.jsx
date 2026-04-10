@@ -1,10 +1,19 @@
 import { h } from 'preact';
-import { useState } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
 
 export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
   const [syncing, setSyncing] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
+  const cachedToken = useRef(null);
+
+  useEffect(() => {
+    if (status?.authenticated) {
+      getVaultToken()
+        .then(data => { cachedToken.current = data.token; })
+        .catch(() => {});
+    }
+  }, [status?.authenticated]);
 
   async function handleSync() {
     setSyncing(true);
@@ -18,15 +27,19 @@ export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
     }
   }
 
-  async function handleCopyToken() {
-    try {
-      const data = await getVaultToken();
-      await navigator.clipboard.writeText(data.token);
-      setTokenCopied(true);
-      setTimeout(() => setTokenCopied(false), 2000);
-    } catch (err) {
-      console.error('copy token failed:', err);
-    }
+  function handleCopyToken() {
+    const token = cachedToken.current;
+    if (!token) return;
+    const el = document.createElement('textarea');
+    el.value = token;
+    el.style.position = 'fixed';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    setTokenCopied(true);
+    setTimeout(() => setTokenCopied(false), 2000);
   }
 
   const authStatus = status?.authenticated ? 'Connected' : 'Disconnected';

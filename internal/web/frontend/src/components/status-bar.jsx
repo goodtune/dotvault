@@ -2,7 +2,7 @@ import { h } from 'preact';
 import { useState } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
 
-export function StatusBar({ status, onSync }) {
+export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
   const [syncing, setSyncing] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
 
@@ -48,6 +48,10 @@ export function StatusBar({ status, onSync }) {
         target: '_blank',
         rel: 'noopener noreferrer',
       }, 'Vault \u2197'),
+      pendingEnrolments > 0 && h('button', {
+        class: 'enrol-indicator',
+        onClick: onEnrolClick,
+      }, pendingEnrolments + ' pending'),
     ),
     h('div', { class: 'status-right' },
       status?.time && h('span', { class: 'last-sync' },

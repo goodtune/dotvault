@@ -89,3 +89,47 @@ export async function loginToken(vaultToken) {
 export async function getVaultToken() {
   return fetchJSON('/api/v1/token');
 }
+
+export async function startEnrolment(key) {
+  const token = await getCSRFToken();
+  return fetchJSON(`/api/v1/enrol/${encodeURIComponent(key)}/start`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': token },
+  });
+}
+
+export async function skipEnrolment(key) {
+  const token = await getCSRFToken();
+  return fetchJSON(`/api/v1/enrol/${encodeURIComponent(key)}/skip`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': token },
+  });
+}
+
+export async function getEnrolmentStatus(key) {
+  return fetchJSON(`/api/v1/enrol/${encodeURIComponent(key)}/status`);
+}
+
+export async function completeEnrolments() {
+  const token = await getCSRFToken();
+  return fetchJSON('/api/v1/enrol/complete', {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': token },
+  });
+}
+
+export async function getEnrolPrompt() {
+  return fetchJSON('/api/v1/enrol/prompt');
+}
+
+export async function submitEnrolSecret(value) {
+  const token = await getCSRFToken();
+  return fetchJSON('/api/v1/enrol/secret', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': token,
+    },
+    body: JSON.stringify({ value }),
+  });
+}

@@ -1,0 +1,203 @@
+import { h } from 'preact';
+import { useState, useEffect, useRef } from 'preact/hooks';
+import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
+
+export function EnrolCard({ enrolment, onUpdate }) {
+  const [localStatus, setLocalStatus] = useState(enrolment.status);
+  const [output, setOutput] = useState([]);
+  const [error, setError] = useState(enrolment.error || null);
+  const [promptLabel, setPromptLabel] = useState(null);
+  const [secretValue, setSecretValue] = useState('');
+  const pollRef = useRef(null);
+
+  useEffect(() => {
+    setLocalStatus(enrolment.status);
+    setError(enrolment.error || null);
+  }, [enrolment.status, enrolment.error]);
+
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  function startPolling() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const [statusData, promptData] = await Promise.all([
+          getEnrolmentStatus(enrolment.key),
+          getEnrolPrompt(),
+        ]);
+        setOutput(statusData.output || []);
+
+        if (promptData.pending) {
+          setPromptLabel(promptData.label);
+        } else {
+          setPromptLabel(null);
+        }
+
+        if (statusData.status !== 'running') {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setLocalStatus(statusData.status);
+          setError(statusData.error || null);
+          setPromptLabel(null);
+          if (onUpdate) onUpdate();
+        }
+      } catch (err) {
+        console.error('poll error:', err);
+      }
+    }, 2000);
+  }
+
+  async function handleStart() {
+    try {
+      await startEnrolment(enrolment.key);
+      setLocalStatus('running');
+      setOutput([]);
+      setError(null);
+      startPolling();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleSkip() {
+    try {
+      await skipEnrolment(enrolment.key);
+      setLocalStatus('skipped');
+      if (onUpdate) onUpdate();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleSecretSubmit(e) {
+    e.preventDefault();
+    try {
+      await submitEnrolSecret(secretValue);
+      setSecretValue('');
+      setPromptLabel(null);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  // Parse device code from GitHub engine output.
+  const deviceCode = output.reduce((found, line) => {
+    const match = line.match(/one-time code: (\S+)/);
+    return match ? match[1] : found;
+  }, null);
+
+  const isGitHub = enrolment.engine === 'github';
+
+  if (localStatus === 'complete') {
+    return h('div', { class: 'enrol-card enrol-complete' },
+      h('div', { class: 'enrol-card-header' },
+        h('div', null,
+          h('span', { class: 'enrol-check' }, '\u2713'),
+          h('strong', null, enrolment.name),
+        ),
+        h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
+      ),
+    );
+  }
+
+  if (localStatus === 'skipped') {
+    return h('div', { class: 'enrol-card enrol-skipped' },
+      h('div', { class: 'enrol-card-header' },
+        h('div', null,
+          h('strong', null, enrolment.name),
+          h('span', { class: 'enrol-badge' }, 'SKIPPED'),
+        ),
+        h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
+      ),
+    );
+  }
+
+  if (localStatus === 'running') {
+    return h('div', { class: 'enrol-card enrol-running' },
+      h('div', { class: 'enrol-card-header' },
+        h('div', null,
+          h('strong', null, enrolment.name),
+          h('span', { class: 'enrol-badge enrol-badge-running' }, 'RUNNING'),
+        ),
+      ),
+      // GitHub device flow UI
+      isGitHub && deviceCode && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, 'Enter this code on GitHub:'),
+        h('div', { class: 'enrol-device-code' }, deviceCode),
+        h('div', { class: 'enrol-device-actions' },
+          h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: () => navigator.clipboard.writeText(deviceCode),
+          }, 'Copy Code'),
+          h('a', {
+            class: 'enrol-btn-secondary',
+            href: 'https://github.com/login/device',
+            target: '_blank',
+            rel: 'noopener',
+          }, 'Open GitHub \u2192'),
+        ),
+        h('p', { class: 'enrol-device-waiting' }, 'Waiting for approval...'),
+      ),
+      // Passphrase prompt UI
+      promptLabel && !isGitHub && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
+        h('label', { class: 'enrol-prompt-label' }, promptLabel),
+        h('input', {
+          type: 'password',
+          class: 'enrol-prompt-input',
+          value: secretValue,
+          onInput: e => setSecretValue(e.target.value),
+          placeholder: 'Enter passphrase',
+          autofocus: true,
+        }),
+        h('div', { class: 'enrol-prompt-actions' },
+          h('button', { type: 'submit', class: 'enrol-btn-primary' }, 'Submit'),
+        ),
+      ),
+      // Generic output fallback
+      !isGitHub && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
+        output.map((line, i) => h('div', { key: i }, line)),
+      ),
+    );
+  }
+
+  if (localStatus === 'failed') {
+    return h('div', { class: 'enrol-card enrol-failed' },
+      h('div', { class: 'enrol-card-header' },
+        h('div', null,
+          h('strong', null, enrolment.name),
+          h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
+        ),
+        h('div', { class: 'enrol-card-actions' },
+          h('button', { class: 'enrol-btn-primary', onClick: handleStart }, 'Retry'),
+          h('button', { class: 'enrol-btn-secondary', onClick: handleSkip }, 'Skip'),
+        ),
+      ),
+      h('p', { class: 'enrol-error-text' }, error),
+    );
+  }
+
+  // Pending
+  return h('div', { class: 'enrol-card' },
+    h('div', { class: 'enrol-card-header' },
+      h('div', null,
+        h('strong', null, enrolment.name),
+        h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
+      ),
+      h('div', { class: 'enrol-card-actions' },
+        h('button', { class: 'enrol-btn-primary', onClick: handleStart }, 'Start'),
+        h('button', { class: 'enrol-btn-secondary', onClick: handleSkip }, 'Skip'),
+      ),
+    ),
+    error && h('p', { class: 'enrol-error-text' }, error),
+  );
+}
+
+function engineDescription(engine) {
+  switch (engine) {
+    case 'github': return 'OAuth token via device flow';
+    case 'ssh': return 'Ed25519 key generation';
+    default: return engine;
+  }
+}

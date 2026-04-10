@@ -14,7 +14,7 @@ rules:
   - name: gh
     vault_key: "gh"
     target:
-      path: "~/.config/gh/hosts.yml"
+      path: "~/tmp/.config/gh/hosts.yml"
       format: yaml
       template: |
         github.com:

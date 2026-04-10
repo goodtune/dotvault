@@ -4,7 +4,7 @@ import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, subm
 
 export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [localStatus, setLocalStatus] = useState(enrolment.status);
-  const [output, setOutput] = useState([]);
+  const [output, setOutput] = useState(enrolment.output || []);
   const [error, setError] = useState(enrolment.error || null);
   const [promptLabel, setPromptLabel] = useState(null);
   const [secretValue, setSecretValue] = useState('');
@@ -13,7 +13,8 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   useEffect(() => {
     setLocalStatus(enrolment.status);
     setError(enrolment.error || null);
-  }, [enrolment.status, enrolment.error]);
+    if (enrolment.output) setOutput(enrolment.output);
+  }, [enrolment.status, enrolment.error, enrolment.output]);
 
   // Start polling if the enrolment is already running (e.g. page reload).
   useEffect(() => {
@@ -33,18 +34,19 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
+    const needsPrompt = enrolment.engine !== 'github';
     pollRef.current = setInterval(async () => {
       try {
-        const [statusData, promptData] = await Promise.all([
-          getEnrolmentStatus(enrolment.key),
-          getEnrolPrompt(),
-        ]);
+        const statusData = await getEnrolmentStatus(enrolment.key);
         setOutput(statusData.output || []);
 
-        if (promptData.pending) {
-          setPromptLabel(promptData.label);
-        } else {
-          setPromptLabel(null);
+        if (needsPrompt) {
+          const promptData = await getEnrolPrompt();
+          if (promptData.pending) {
+            setPromptLabel(promptData.label);
+          } else {
+            setPromptLabel(null);
+          }
         }
 
         if (statusData.status !== 'running') {
@@ -163,7 +165,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
             class: 'enrol-btn-secondary',
             href: verificationURL,
             target: '_blank',
-            rel: 'noopener',
+            rel: 'noopener noreferrer',
           }, 'Open GitHub \u2192'),
         ),
         h('p', { class: 'enrol-device-waiting' }, 'Waiting for approval...'),

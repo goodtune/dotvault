@@ -134,6 +134,8 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 		if s.engine != nil {
 			info.EngineName = s.engine.Name()
 			info.Fields = s.engine.Fields()
+		} else {
+			info.EngineName = s.engineName
 		}
 		s.mu.Unlock()
 		result = append(result, info)
@@ -152,11 +154,20 @@ func (r *EnrolmentRunner) Skip(key string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.status == "running" {
+	switch s.status {
+	case "pending":
+		s.status = "skipped"
+		return nil
+	case "failed":
+		s.status = "skipped"
+		s.output = nil
+		s.errMsg = ""
+		return nil
+	case "running":
 		return ErrEnrolAlreadyRunning
+	default:
+		return ErrEnrolNotStartable
 	}
-	s.status = "skipped"
-	return nil
 }
 
 // GetState returns the state of a single enrolment.
@@ -180,6 +191,8 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 	if s.engine != nil {
 		info.EngineName = s.engine.Name()
 		info.Fields = s.engine.Fields()
+	} else {
+		info.EngineName = s.engineName
 	}
 	return info, nil
 }

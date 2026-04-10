@@ -18,8 +18,8 @@ rules:
       format: yaml
       template: |
         github.com:
-          user: "{{.user}}"
-          oauth_token: "{{.oauth_token}}"
+          user: "{{ .user | default "" }}"
+          oauth_token: "{{ .oauth_token | default "" }}"
 
   - name: ssh-private-key
     vault_key: "ssh"

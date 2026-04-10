@@ -15,9 +15,13 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     setError(enrolment.error || null);
   }, [enrolment.status, enrolment.error]);
 
+  // Start polling if the enrolment is already running (e.g. page reload).
   useEffect(() => {
+    if (localStatus === 'running' && !pollRef.current) {
+      startPolling();
+    }
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, []);
+  }, [localStatus]);
 
   function startPolling() {
     if (pollRef.current) clearInterval(pollRef.current);

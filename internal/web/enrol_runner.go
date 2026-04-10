@@ -297,7 +297,6 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 	io := enrol.IO{
 		Out:      capture,
 		In:       strings.NewReader("\n"), // auto-proceed for engines that wait for Enter
-		Browser:  func(url string) error { return nil },
 		Log:      slog.Default(),
 		Username: username,
 	}

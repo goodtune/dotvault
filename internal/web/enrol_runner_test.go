@@ -2,6 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -134,5 +137,130 @@ func TestEnrolmentRunner_Complete(t *testing.T) {
 		// expected
 	default:
 		t.Error("done channel not signalled")
+	}
+}
+
+func fakeVaultHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"data": map[string]any{
+			"data":     map[string]any{},
+			"metadata": map[string]any{"version": 1},
+		},
+	})
+}
+
+func TestEnrolmentRunner_Start_Success(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{
+		name:   "Mock",
+		fields: []string{"token"},
+		creds:  map[string]string{"token": "abc123"},
+	})
+	defer enrol.UnregisterEngine("mock")
+
+	vc := newFakeVaultServer(t, fakeVaultHandler)
+
+	runner := NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "mock"},
+	})
+
+	err := runner.Start(context.Background(), "svc", vc, "kv", "users/gary/", "gary", nil)
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	runner.WaitForKey("svc")
+
+	info, _ := runner.GetState("svc")
+	if info.Status != "complete" {
+		t.Errorf("status = %q, want %q", info.Status, "complete")
+	}
+}
+
+func TestEnrolmentRunner_Start_Failure(t *testing.T) {
+	enrol.RegisterEngine("failmock", &mockEngine{
+		name:   "FailMock",
+		fields: []string{"token"},
+		err:    fmt.Errorf("device flow timeout"),
+	})
+	defer enrol.UnregisterEngine("failmock")
+
+	runner := NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "failmock"},
+	})
+
+	err := runner.Start(context.Background(), "svc", nil, "", "", "", nil)
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+
+	runner.WaitForKey("svc")
+
+	info, _ := runner.GetState("svc")
+	if info.Status != "failed" {
+		t.Errorf("status = %q, want %q", info.Status, "failed")
+	}
+	if info.Error != "device flow timeout" {
+		t.Errorf("error = %q, want %q", info.Error, "device flow timeout")
+	}
+}
+
+func TestEnrolmentRunner_Start_AlreadyRunning(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	runner := NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "mock"},
+	})
+
+	// Manually set running state.
+	runner.mu.RLock()
+	s := runner.states["svc"]
+	runner.mu.RUnlock()
+	s.mu.Lock()
+	s.status = "running"
+	s.mu.Unlock()
+
+	err := runner.Start(context.Background(), "svc", nil, "", "", "", nil)
+	if err == nil {
+		t.Error("expected error for already running enrolment")
+	}
+}
+
+func TestEnrolmentRunner_Start_Retry(t *testing.T) {
+	retryEngine := &mockEngine{
+		name:   "Retry",
+		fields: []string{"token"},
+		creds:  map[string]string{"token": "retry-token"},
+	}
+	enrol.RegisterEngine("retry", retryEngine)
+	defer enrol.UnregisterEngine("retry")
+
+	runner := NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "retry"},
+	})
+
+	// Manually set to failed.
+	runner.mu.RLock()
+	s := runner.states["svc"]
+	runner.mu.RUnlock()
+	s.mu.Lock()
+	s.status = "failed"
+	s.errMsg = "previous failure"
+	s.doneCh = make(chan struct{})
+	s.mu.Unlock()
+
+	vc := newFakeVaultServer(t, fakeVaultHandler)
+
+	err := runner.Start(context.Background(), "svc", vc, "kv", "users/gary/", "gary", nil)
+	if err != nil {
+		t.Fatalf("Start() error on retry: %v", err)
+	}
+
+	runner.WaitForKey("svc")
+
+	info, _ := runner.GetState("svc")
+	if info.Status != "complete" {
+		t.Errorf("status = %q, want %q", info.Status, "complete")
 	}
 }

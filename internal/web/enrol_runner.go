@@ -1,12 +1,17 @@
 package web
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // EnrolStateInfo is the JSON-serializable view of an enrolment's state.
@@ -184,4 +189,142 @@ func (r *EnrolmentRunner) Wait() {
 		return
 	}
 	<-r.done
+}
+
+// lineCapture is an io.Writer that captures lines for the status endpoint.
+type lineCapture struct {
+	state *enrolState
+	buf   bytes.Buffer
+}
+
+func (lc *lineCapture) Write(p []byte) (int, error) {
+	lc.buf.Write(p)
+	for {
+		line, err := lc.buf.ReadString('\n')
+		if err != nil {
+			// Incomplete line — put it back.
+			lc.buf.WriteString(line)
+			break
+		}
+		trimmed := strings.TrimRight(line, "\n\r")
+		if trimmed != "" {
+			lc.state.mu.Lock()
+			lc.state.output = append(lc.state.output, trimmed)
+			lc.state.mu.Unlock()
+		}
+	}
+	return len(p), nil
+}
+
+// flush captures any remaining partial line.
+func (lc *lineCapture) flush() {
+	remaining := strings.TrimSpace(lc.buf.String())
+	if remaining != "" {
+		lc.state.mu.Lock()
+		lc.state.output = append(lc.state.output, remaining)
+		lc.state.mu.Unlock()
+	}
+}
+
+// PromptSecretFunc is the function signature for web-based secret prompting.
+type PromptSecretFunc func(ctx context.Context, label string) (string, error)
+
+// Start launches an enrolment engine in a background goroutine.
+// Returns error if the key is unknown or the enrolment is already running.
+func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Client, kvMount, userPrefix, username string, promptSecret PromptSecretFunc) error {
+	r.mu.RLock()
+	s, ok := r.states[key]
+	r.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("enrolment %q not found", key)
+	}
+
+	s.mu.Lock()
+	if s.status == "running" {
+		s.mu.Unlock()
+		return fmt.Errorf("enrolment %q is already running", key)
+	}
+	s.status = "running"
+	s.output = nil
+	s.errMsg = ""
+	s.doneCh = make(chan struct{})
+	s.mu.Unlock()
+
+	capture := &lineCapture{state: s}
+
+	io := enrol.IO{
+		Out:      capture,
+		In:       strings.NewReader("\n"), // auto-proceed for engines that wait for Enter
+		Browser:  func(url string) error { return nil },
+		Log:      slog.Default(),
+		Username: username,
+	}
+	if promptSecret != nil {
+		io.PromptSecret = func(label string) (string, error) {
+			return promptSecret(ctx, label)
+		}
+	}
+
+	go func() {
+		creds, err := s.engine.Run(ctx, s.settings, io)
+		capture.flush()
+
+		if err != nil {
+			s.mu.Lock()
+			s.status = "failed"
+			s.errMsg = err.Error()
+			s.mu.Unlock()
+			close(s.doneCh)
+			return
+		}
+
+		// Validate all fields present.
+		data := make(map[string]any, len(creds))
+		for k, v := range creds {
+			data[k] = v
+		}
+		for _, f := range s.engine.Fields() {
+			v, ok := data[f]
+			if !ok || v == nil || strings.TrimSpace(v.(string)) == "" {
+				s.mu.Lock()
+				s.status = "failed"
+				s.errMsg = "engine returned incomplete credentials"
+				s.mu.Unlock()
+				close(s.doneCh)
+				return
+			}
+		}
+
+		// Write to Vault.
+		vaultPath := userPrefix + key
+		if err := vc.WriteKVv2(ctx, kvMount, vaultPath, data); err != nil {
+			s.mu.Lock()
+			s.status = "failed"
+			s.errMsg = fmt.Sprintf("vault write failed: %v", err)
+			s.mu.Unlock()
+			close(s.doneCh)
+			return
+		}
+
+		s.mu.Lock()
+		s.status = "complete"
+		s.mu.Unlock()
+		close(s.doneCh)
+	}()
+
+	return nil
+}
+
+// WaitForKey blocks until the given enrolment is no longer "running".
+func (r *EnrolmentRunner) WaitForKey(key string) {
+	r.mu.RLock()
+	s, ok := r.states[key]
+	r.mu.RUnlock()
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	ch := s.doneCh
+	s.mu.Unlock()
+	<-ch
 }

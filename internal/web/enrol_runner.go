@@ -136,6 +136,7 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 			info.Fields = s.engine.Fields()
 		} else {
 			info.EngineName = s.engineName
+			info.Fields = []string{}
 		}
 		s.mu.Unlock()
 		result = append(result, info)
@@ -193,6 +194,7 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 		info.Fields = s.engine.Fields()
 	} else {
 		info.EngineName = s.engineName
+		info.Fields = []string{}
 	}
 	return info, nil
 }

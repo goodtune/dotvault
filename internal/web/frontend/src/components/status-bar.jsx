@@ -1,17 +1,7 @@
 import { h } from 'preact';
 import { useState, useRef } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
-
-function copyText(text) {
-  const el = document.createElement('textarea');
-  el.value = text;
-  el.style.position = 'fixed';
-  el.style.opacity = '0';
-  document.body.appendChild(el);
-  el.select();
-  document.execCommand('copy');
-  document.body.removeChild(el);
-}
+import { copyText } from '../clipboard.js';
 
 export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
   const [syncing, setSyncing] = useState(false);

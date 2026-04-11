@@ -1,6 +1,7 @@
 import { h } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
+import { copyText } from '../clipboard.js';
 
 export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [localStatus, setLocalStatus] = useState(enrolment.status);
@@ -150,16 +151,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
         h('div', { class: 'enrol-device-actions' },
           h('button', {
             class: 'enrol-btn-secondary',
-            onClick: () => {
-              const el = document.createElement('textarea');
-              el.value = deviceCode;
-              el.style.position = 'fixed';
-              el.style.opacity = '0';
-              document.body.appendChild(el);
-              el.select();
-              document.execCommand('copy');
-              document.body.removeChild(el);
-            },
+            onClick: () => copyText(deviceCode),
           }, 'Copy Code'),
           verificationURL && h('a', {
             class: 'enrol-btn-secondary',

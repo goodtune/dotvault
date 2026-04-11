@@ -10,7 +10,10 @@ The current flow authenticates in the browser, then silently runs the enrolment 
 
 ## Auth Callback Change
 
-All auth success handlers (`handleAuthCallback`, `handleLDAPStatus`, `handleTokenLogin`) currently respond with "Authentication successful! You can close this window." or redirect to `/`. Change these to redirect to `/` with an HTTP 302. The SPA at `/` will decide what to render based on the status API response.
+Auth success responses reflect the handler behavior:
+
+- `handleAuthCallback` redirects to `/` with an HTTP 302 so the SPA can load and decide what to render based on the status API response.
+- `handleLDAPStatus` and `handleTokenLogin` return JSON success responses for the SPA to poll or consume; they do not perform browser redirects.
 
 ## SPA Routing
 
@@ -68,9 +71,9 @@ Response: `{"status": "running"}`
 
 The engine runs in a background goroutine. The `IO` struct is wired with:
 - `Out` → writes captured into an in-memory string slice
-- `Browser` → no-op (frontend handles opening tabs)
+- `Browser` → left unset (`nil`); the frontend handles browser interaction
 - `PromptSecret` → blocks on channel, same as existing `EnrolPromptSecret`
-- `Username` → from the authenticated Vault identity
+- `Username` → from the daemon/OS username passed into the server config
 - `Log` → the server's slog logger
 
 On completion, the runner writes credentials to Vault KVv2 (same as the current manager) and updates the enrolment status to `complete`. On error, status becomes `failed` with the error message stored.
@@ -174,10 +177,10 @@ After auth completes, the daemon calls `runner.Init(cfg.Enrolments, vaultClient,
 
 The `IO` struct for web mode:
 - `Out` → `io.Writer` that appends lines to `enrolState.Output` (thread-safe via mutex)
-- `In` → nil (not used in web mode)
-- `Browser` → no-op function (frontend opens tabs itself)
+- `In` → `strings.NewReader("\n")` (auto-proceed for engines that wait for Enter)
+- `Browser` → left unset (`nil`); the frontend handles browser interaction
 - `Log` → server's slog logger
-- `Username` → from Vault auth identity
+- `Username` → from the daemon/OS username passed into the server config
 - `PromptSecret` → `server.EnrolPromptSecret(ctx, label)` (existing implementation)
 
 ### Daemon Integration

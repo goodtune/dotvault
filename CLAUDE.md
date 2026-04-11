@@ -22,13 +22,25 @@ The built assets are embedded into the binary via `embed.FS`.
 
 ## Local Development
 
+Two-step workflow — start the infrastructure, then run the daemon with the dev config:
+
 ```sh
 docker compose up -d   # starts Vault + Dex OIDC provider
+go run ./cmd/dotvault run --config config.dev.yaml
 ```
 
-Requires `127.0.0.1 dex` in `/etc/hosts`. Dex uses a mockCallback connector that auto-approves login. The dev Vault listens on `127.0.0.1:8200`; the dotvault web UI should be configured on a different port (e.g. `127.0.0.1:8250`) to avoid conflict.
+Requires `127.0.0.1 dex` in `/etc/hosts`. Dex uses a mockCallback connector that auto-approves login. The dev Vault listens on `127.0.0.1:8200`; the dotvault web UI is configured on port 9000 (`127.0.0.1:9000`) in `config.dev.yaml` to avoid conflict.
 
 The vault-init container seeds sample secrets, enables OIDC auth via Dex, and exports the root token to `/vault/data/root-token`.
+
+`config.dev.yaml` points at the local Vault (`http://127.0.0.1:8200`), enables the web UI on port 9000, and configures all available enrolment engines. When adding a new enrolment engine, add a corresponding entry to `config.dev.yaml` under the `enrolments` section so the dev config exercises all available engines.
+
+### Claude Code Desktop
+
+`.claude/launch.json` defines both services as Preview configurations so Claude Code Desktop can start them automatically, connect to the running web UI, and auto-verify changes. The two configurations mirror the manual steps above:
+
+- **`vault-dex`** — `docker compose up` (port 8200)
+- **`dotvault`** — `go run ./cmd/dotvault run --config config.dev.yaml` (port 9000)
 
 ## Architecture
 

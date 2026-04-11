@@ -95,7 +95,7 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		for k, v := range creds {
 			data[k] = v
 		}
-		if !hasAllFields(data, engine.Fields()) {
+		if !HasAllFields(data, engine.Fields()) {
 			m.io.Log.Error("engine returned incomplete credentials, skipping vault write", "key", key, "engine", enrolment.Engine)
 			fmt.Fprintf(m.io.Out, "✗ %s — engine returned incomplete credentials (will retry next cycle)\n", key)
 			continue
@@ -138,7 +138,7 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 			return nil, fmt.Errorf("check vault for enrolment %q: %w", key, err)
 		}
 
-		if secret != nil && hasAllFields(secret.Data, engine.Fields()) {
+		if secret != nil && HasAllFields(secret.Data, engine.Fields()) {
 			m.io.Log.Debug("enrolment already complete", "key", key)
 			continue
 		}
@@ -153,7 +153,7 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 	return pending, nil
 }
 
-func hasAllFields(data map[string]any, fields []string) bool {
+func HasAllFields(data map[string]any, fields []string) bool {
 	for _, f := range fields {
 		v, ok := data[f]
 		if !ok || v == nil {

@@ -1,10 +1,12 @@
 import { h } from 'preact';
-import { useState } from 'preact/hooks';
+import { useState, useRef } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
+import { copyText } from '../clipboard.js';
 
-export function StatusBar({ status, onSync }) {
+export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
   const [syncing, setSyncing] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
+  const cachedToken = useRef(null);
 
   async function handleSync() {
     setSyncing(true);
@@ -20,8 +22,11 @@ export function StatusBar({ status, onSync }) {
 
   async function handleCopyToken() {
     try {
-      const data = await getVaultToken();
-      await navigator.clipboard.writeText(data.token);
+      if (!cachedToken.current) {
+        const data = await getVaultToken();
+        cachedToken.current = data.token;
+      }
+      copyText(cachedToken.current);
       setTokenCopied(true);
       setTimeout(() => setTokenCopied(false), 2000);
     } catch (err) {
@@ -48,6 +53,10 @@ export function StatusBar({ status, onSync }) {
         target: '_blank',
         rel: 'noopener noreferrer',
       }, 'Vault \u2197'),
+      pendingEnrolments > 0 && h('button', {
+        class: 'enrol-indicator',
+        onClick: onEnrolClick,
+      }, pendingEnrolments + ' pending'),
     ),
     h('div', { class: 'status-right' },
       status?.time && h('span', { class: 'last-sync' },

@@ -111,8 +111,9 @@ services:
         echo "==> Creating OIDC default role..."
         vault write auth/oidc/role/default \
           bound_audiences="dotvault" \
-          allowed_redirect_uris="http://127.0.0.1:8250/auth/callback" \
+          allowed_redirect_uris="http://127.0.0.1:9000/auth/oidc/callback" \
           user_claim="email" \
+          oidc_scopes="openid,email" \
           token_policies="dotvault"
 
         # Write root token to shared volume for host access

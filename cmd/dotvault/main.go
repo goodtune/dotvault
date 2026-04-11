@@ -262,77 +262,84 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Create enrolment manager and run initial check.
-	enrolIO := enrol.IO{
-		Out:     os.Stderr,
-		Browser: browser.OpenURL,
-		Log:     slog.Default(),
-		Username: username,
-		PromptSecret: func(label string) (string, error) {
-			fd := int(os.Stdin.Fd())
-			if !term.IsTerminal(fd) {
-				return "", fmt.Errorf("cannot prompt for passphrase: stdin is not a terminal (use web UI or set passphrase to unsafe)")
-			}
-			fmt.Fprintf(os.Stderr, "%s ", label)
-			pass, err := term.ReadPassword(fd)
-			fmt.Fprintln(os.Stderr) // newline after hidden input
-			if err != nil {
-				return "", err
-			}
-			return string(pass), nil
-		},
-	}
 	if webServer != nil {
-		enrolIO.PromptSecret = func(label string) (string, error) {
-			return webServer.EnrolPromptSecret(ctx, label)
-		}
-	}
-	enrolMgr := enrol.NewManager(enrol.ManagerConfig{
-		Enrolments: cfg.Enrolments,
-		KVMount:    cfg.Vault.KVMount,
-		UserPrefix: cfg.Vault.UserPrefix + username + "/",
-	}, vc, enrolIO)
-	if _, err := enrolMgr.CheckAll(ctx); err != nil {
-		slog.Warn("enrolment check failed", "error", err)
-	}
-	// Note: we don't TriggerSync here because engine.RunLoop performs an
-	// initial sync on startup, which will pick up any newly enrolled credentials.
+		// Web mode: let the frontend drive enrolments.
+		webServer.InitEnrolments(ctx, cfg.Enrolments)
 
-	// Background goroutine: reload config on each tick and re-check enrolments.
-	// Note: only the enrolments section is acted upon at reload time. Changes to
-	// sync.interval, rules, or other config fields require a daemon restart to
-	// take effect (the sync engine holds its own copy of the config).
-	configPath := flagConfig
-	if configPath == "" {
-		configPath = paths.SystemConfigPath()
-	}
-	go func() {
-		ticker := time.NewTicker(cfg.Sync.Interval)
-		defer ticker.Stop()
-		lastEnrolments := cfg.Enrolments
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				reloaded, err := config.LoadSystem(configPath)
+		waitDone := make(chan struct{})
+		go func() {
+			webServer.WaitForEnrolments()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+		case <-ctx.Done():
+			slog.Info("stopping enrolment wait due to shutdown")
+		}
+	} else {
+		// CLI mode: terminal-based wizard (unchanged).
+		enrolIO := enrol.IO{
+			Out:     os.Stderr,
+			Browser: browser.OpenURL,
+			Log:     slog.Default(),
+			Username: username,
+			PromptSecret: func(label string) (string, error) {
+				fd := int(os.Stdin.Fd())
+				if !term.IsTerminal(fd) {
+					return "", fmt.Errorf("cannot prompt for passphrase: stdin is not a terminal (use web UI or set passphrase to unsafe)")
+				}
+				fmt.Fprintf(os.Stderr, "%s ", label)
+				pass, err := term.ReadPassword(fd)
+				fmt.Fprintln(os.Stderr) // newline after hidden input
 				if err != nil {
-					slog.Warn("config reload failed", "error", err)
-					continue
+					return "", err
 				}
-				if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-					slog.Info("enrolments config changed, re-checking")
-					enrolMgr.UpdateConfig(reloaded.Enrolments)
-					lastEnrolments = reloaded.Enrolments
-				}
-				if ok, err := enrolMgr.CheckAll(ctx); err != nil {
-					slog.Warn("enrolment check failed", "error", err)
-				} else if ok {
-					engine.TriggerSync()
+				return string(pass), nil
+			},
+		}
+		enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+			Enrolments: cfg.Enrolments,
+			KVMount:    cfg.Vault.KVMount,
+			UserPrefix: cfg.Vault.UserPrefix + username + "/",
+		}, vc, enrolIO)
+		if _, err := enrolMgr.CheckAll(ctx); err != nil {
+			slog.Warn("enrolment check failed", "error", err)
+		}
+
+		// Background goroutine: reload config on each tick and re-check enrolments.
+		configPath := flagConfig
+		if configPath == "" {
+			configPath = paths.SystemConfigPath()
+		}
+		go func() {
+			ticker := time.NewTicker(cfg.Sync.Interval)
+			defer ticker.Stop()
+			lastEnrolments := cfg.Enrolments
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					reloaded, err := config.LoadSystem(configPath)
+					if err != nil {
+						slog.Warn("config reload failed", "error", err)
+						continue
+					}
+					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+						slog.Info("enrolments config changed, re-checking")
+						enrolMgr.UpdateConfig(reloaded.Enrolments)
+						lastEnrolments = reloaded.Enrolments
+					}
+					if ok, err := enrolMgr.CheckAll(ctx); err != nil {
+						slog.Warn("enrolment check failed", "error", err)
+					} else if ok {
+						engine.TriggerSync()
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 	return engine.RunLoop(ctx)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -44,6 +45,10 @@ type Server struct {
 	enrolPromptMu      sync.RWMutex
 	enrolPromptLabel   string
 	enrolPromptCh      chan string
+	enrolRunnerMu      sync.RWMutex
+	enrolRunner        *EnrolmentRunner
+	shutdownCtx        context.Context
+	shutdownCancel     context.CancelFunc
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -87,6 +92,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
 	}
+	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
 	s.registerRoutes()
 	return s, nil
@@ -118,6 +124,12 @@ func (s *Server) registerRoutes() {
 	// Enrolment prompt routes
 	s.mux.HandleFunc("GET /api/v1/enrol/prompt", s.handleEnrolPrompt)
 	s.mux.HandleFunc("POST /api/v1/enrol/secret", s.requireCSRF(s.handleEnrolSecret))
+
+	// Enrolment runner routes
+	s.mux.HandleFunc("POST /api/v1/enrol/{key}/start", s.requireCSRF(s.handleEnrolStart))
+	s.mux.HandleFunc("POST /api/v1/enrol/{key}/skip", s.requireCSRF(s.handleEnrolSkip))
+	s.mux.HandleFunc("GET /api/v1/enrol/{key}/status", s.handleEnrolStatus)
+	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
 
 	// Static SPA files
 	staticSub, err := fs.Sub(staticFS, "static")
@@ -164,6 +176,7 @@ func (s *Server) WaitReady() error {
 
 // Shutdown gracefully stops the server and cleans up resources.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutdownCancel()
 	if s.login != nil {
 		s.login.Close()
 	}
@@ -200,6 +213,54 @@ func (s *Server) URL() string {
 
 func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
+}
+
+// getEnrolRunner returns the enrolment runner, safe for concurrent access.
+func (s *Server) getEnrolRunner() *EnrolmentRunner {
+	s.enrolRunnerMu.RLock()
+	defer s.enrolRunnerMu.RUnlock()
+	return s.enrolRunner
+}
+
+// InitEnrolments sets up the enrolment runner for web-driven enrolment.
+// It checks Vault for already-completed enrolments and marks them as such.
+func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
+	if len(enrolments) == 0 {
+		return
+	}
+
+	runner := NewEnrolmentRunner(enrolments)
+
+	// Check Vault for already-complete enrolments.
+	for _, info := range runner.States() {
+		engine, ok := enrol.GetEngine(info.Engine)
+		if !ok {
+			continue
+		}
+		vaultPath := s.userKVPrefix() + info.Key
+		secret, err := s.vault.ReadKVv2(ctx, s.kvMount, vaultPath)
+		if err != nil {
+			slog.Warn("failed to check enrolment in vault", "key", info.Key, "error", err)
+			continue
+		}
+		if secret != nil && enrol.HasAllFields(secret.Data, engine.Fields()) {
+			runner.MarkComplete(info.Key)
+		}
+	}
+
+	s.enrolRunnerMu.Lock()
+	s.enrolRunner = runner
+	s.enrolRunnerMu.Unlock()
+}
+
+// WaitForEnrolments blocks until the user completes the enrolment page.
+// Returns immediately if there are no pending enrolments or no runner.
+func (s *Server) WaitForEnrolments() {
+	r := s.getEnrolRunner()
+	if r == nil {
+		return
+	}
+	r.Wait()
 }
 
 // EnrolPromptSecret implements a web-based PromptSecret. It sets the pending

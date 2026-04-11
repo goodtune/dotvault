@@ -14,8 +14,37 @@ rules:
   - name: gh
     vault_key: "gh"
     target:
-      path: "~/.config/gh/hosts.yml"
+      path: "~/tmp/.config/gh/hosts.yml"
       format: yaml
       template: |
         github.com:
-          oauth_token: "{{.token}}"
+          user: "{{ .user | default "" }}"
+          oauth_token: "{{ .oauth_token | default "" }}"
+
+  - name: ssh-private-key
+    vault_key: "ssh"
+    target:
+      path: "~/tmp/.ssh/id_ed25519"
+      format: text
+      template: "{{ .private_key }}"
+
+  - name: ssh-public-key
+    vault_key: "ssh"
+    target:
+      path: "~/tmp/.ssh/id_ed25519.pub"
+      format: text
+      template: "{{ .public_key }}"
+
+  - name: netrc
+    vault_key: "netrc"
+    target:
+      path: "~/tmp/.netrc"
+      format: netrc
+
+enrolments:
+  gh:
+    engine: github
+  ssh:
+    engine: ssh
+    settings:
+      passphrase: "recommended"

@@ -56,6 +56,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["rules"] = ruleStatuses
 	}
 
+	// Only expose enrolment state to authenticated sessions.
+	if authenticated {
+		if runner := s.getEnrolRunner(); runner != nil {
+			status["enrolments"] = runner.States()
+		}
+	}
+
 	writeJSON(w, status)
 }
 
@@ -164,6 +171,9 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	s.enrolPromptMu.RLock()
 	label := s.enrolPromptLabel
 	pending := s.enrolPromptCh != nil
@@ -176,6 +186,9 @@ func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
 	var req struct {
 		Value string `json:"value"`
 	}

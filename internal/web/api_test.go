@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -148,7 +149,7 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 }
 
 func TestHandleEnrolPrompt_NoPending(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)
 	w := httptest.NewRecorder()
 
@@ -165,7 +166,7 @@ func TestHandleEnrolPrompt_NoPending(t *testing.T) {
 }
 
 func TestHandleEnrolPrompt_Pending(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolPromptMu.Lock()
 	s.enrolPromptCh = make(chan string, 1)
 	s.enrolPromptLabel = "Enter passphrase:"
@@ -187,7 +188,7 @@ func TestHandleEnrolPrompt_Pending(t *testing.T) {
 }
 
 func TestHandleEnrolSecret_NoPending(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	body := strings.NewReader(`{"value":"secret"}`)
 	req := httptest.NewRequest("POST", "/api/v1/enrol/secret", body)
 	w := httptest.NewRecorder()
@@ -200,7 +201,7 @@ func TestHandleEnrolSecret_NoPending(t *testing.T) {
 }
 
 func TestHandleEnrolSecret_Accepted(t *testing.T) {
-	s := testServer(t)
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	ch := make(chan string, 1)
 	s.enrolPromptMu.Lock()
 	s.enrolPromptCh = ch
@@ -249,6 +250,8 @@ func TestHandleEnrolSecretRequiresCSRF(t *testing.T) {
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	return &Server{
 		csrf:  NewCSRFStore(),
 		oauth: NewOAuthManager(),
@@ -264,10 +267,12 @@ func testServer(t *testing.T) *Server {
 				},
 			},
 		},
-		kvMount:    "secret",
-		userPrefix: "users/",
-		username:   "testuser",
-		authMethod: "oidc",
+		kvMount:        "secret",
+		userPrefix:     "users/",
+		username:       "testuser",
+		authMethod:     "oidc",
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 

@@ -5,6 +5,7 @@ import { Sidebar } from './components/sidebar.jsx';
 import { SecretPanel } from './components/secret-panel.jsx';
 import { OAuthBanner } from './components/oauth-banner.jsx';
 import { LoginPage } from './components/login-page.jsx';
+import { EnrolPage } from './components/enrol-page.jsx';
 import { getStatus, getRules, listSecrets } from './api.js';
 
 export function App() {
@@ -13,6 +14,7 @@ export function App() {
   const [keys, setKeys] = useState([]);
   const [selectedKey, setSelectedKey] = useState(null);
   const [error, setError] = useState(null);
+  const [enrolDismissed, setEnrolDismissed] = useState(false);
 
   useEffect(() => {
     loadStatus();
@@ -74,10 +76,33 @@ export function App() {
     );
   }
 
+  // Check for pending enrolments.
+  const enrolments = status.enrolments || [];
+  const pendingEnrolments = enrolments.filter(
+    e => e.status === 'pending' || e.status === 'running' || e.status === 'failed'
+  );
+
+  // Show enrolment page if there are pending enrolments and user hasn't dismissed.
+  if (pendingEnrolments.length > 0 && !enrolDismissed) {
+    return h(EnrolPage, {
+      enrolments,
+      onComplete: () => {
+        setEnrolDismissed(true);
+        loadData();
+      },
+      onUpdate: loadStatus,
+    });
+  }
+
   const oauthRules = rules.filter(r => r.has_oauth);
 
   return h(Fragment, null,
-    h(StatusBar, { status, onSync: loadData }),
+    h(StatusBar, {
+      status,
+      onSync: loadData,
+      pendingEnrolments: pendingEnrolments.length,
+      onEnrolClick: () => setEnrolDismissed(false),
+    }),
     error && h('div', { class: 'error-banner' }, error),
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),
     h('div', { class: 'main-layout' },

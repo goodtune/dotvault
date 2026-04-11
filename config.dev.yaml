@@ -35,6 +35,12 @@ rules:
       format: text
       template: "{{ .public_key }}"
 
+  - name: netrc
+    vault_key: "netrc"
+    target:
+      path: "~/tmp/.netrc"
+      format: netrc
+
 enrolments:
   gh:
     engine: github

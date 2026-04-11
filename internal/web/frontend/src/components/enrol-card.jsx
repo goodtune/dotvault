@@ -164,9 +164,10 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       ),
       // Passphrase prompt UI
       promptLabel && !isGitHub && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
-        h('label', { class: 'enrol-prompt-label' }, promptLabel),
+        h('label', { class: 'enrol-prompt-label', htmlFor: 'enrol-secret' }, promptLabel),
         h('input', {
           type: 'password',
+          id: 'enrol-secret',
           class: 'enrol-prompt-input',
           value: secretValue,
           onInput: e => setSecretValue(e.target.value),

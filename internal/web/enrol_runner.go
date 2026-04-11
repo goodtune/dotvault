@@ -349,16 +349,13 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 		for k, v := range creds {
 			data[k] = v
 		}
-		for _, f := range s.engine.Fields() {
-			v, ok := data[f]
-			if !ok || v == nil || strings.TrimSpace(v.(string)) == "" {
-				s.mu.Lock()
-				s.status = "failed"
-				s.errMsg = "engine returned incomplete credentials"
-				s.mu.Unlock()
-				close(s.doneCh)
-				return
-			}
+		if !enrol.HasAllFields(data, s.engine.Fields()) {
+			s.mu.Lock()
+			s.status = "failed"
+			s.errMsg = "engine returned incomplete credentials"
+			s.mu.Unlock()
+			close(s.doneCh)
+			return
 		}
 
 		// Write to Vault.

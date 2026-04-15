@@ -41,6 +41,33 @@ rules:
       path: "~/tmp/.netrc"
       format: netrc
 
+  - name: jfrog
+    vault_key: "jfrog"
+    target:
+      path: "~/tmp/.jfrog/jfrog-cli.conf.v6"
+      format: json
+      template: |
+        {
+          "servers": [
+            {
+              "serverId": "{{ .server_id }}",
+              "url": "{{ .url }}/",
+              "artifactoryUrl": "{{ .url }}/artifactory/",
+              "distributionUrl": "{{ .url }}/distribution/",
+              "xrayUrl": "{{ .url }}/xray/",
+              "missionControlUrl": "{{ .url }}/mc/",
+              "pipelinesUrl": "{{ .url }}/pipelines/",
+              "accessUrl": "{{ .url }}/access/",
+              "user": "{{ .user | default "" }}",
+              "accessToken": "{{ .access_token }}",
+              "refreshToken": "{{ .refresh_token | default "" }}",
+              "webLogin": true,
+              "isDefault": true
+            }
+          ],
+          "version": "6"
+        }
+
 enrolments:
   gh:
     engine: github
@@ -48,3 +75,8 @@ enrolments:
     engine: ssh
     settings:
       passphrase: "recommended"
+  jfrog:
+    engine: jfrog
+    settings:
+      # Point at your JFrog Platform. Required — no sensible default exists.
+      url: "https://mycompany.jfrog.io"

@@ -189,7 +189,7 @@ Automated credential acquisition from external services (`internal/enrol/`). Enr
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), SSH (Ed25519 key generation).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation).
 
 ### GitHub Engine Defaults
 
@@ -198,6 +198,24 @@ Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered
 - Host: `github.com`
 
 Overridable via settings: `client_id`, `scopes`, `host`. Returns `{"oauth_token": "<token>", "user": "<username>"}`.
+
+### JFrog Engine
+
+Mirrors the `jf login` web login flow from `jfrog-cli`. No public OAuth app exists — JFrog Platform hosts its own browser login endpoint, so the engine just requires the platform URL.
+
+Required settings:
+- `url` — JFrog Platform URL (e.g. `https://mycompany.jfrog.io`)
+
+Defaults (from the upstream `jfrog-cli-core` source, overridable via settings):
+- `client_name`: `JFrog-CLI` (sent as `jfClientName` query parameter)
+- `client_code`: `1` (sent as `jfClientCode` query parameter)
+
+Flow:
+1. POST `{url}/access/api/v2/authentication/jfrog_client_login/request` with a random UUID
+2. Open `{url}/ui/login?jfClientSession=<uuid>&jfClientName=JFrog-CLI&jfClientCode=1` — user confirms the last 4 chars of the UUID after sign-in
+3. Poll GET `{url}/access/api/v2/authentication/jfrog_client_login/token/<uuid>` until 200
+
+Returns the full identity needed to render a `jfrog-cli.conf.v6` server entry: `{"access_token", "refresh_token", "token_type", "expires_in", "scope", "url", "server_id", "user"}`. `server_id` is deduced from the platform hostname (e.g. `mycompany.jfrog.io` → `mycompany`, IP addresses → `default-server`); `user` is extracted from the access-token JWT subject. Requires JFrog Artifactory 7.64.0 or newer on the remote side.
 
 ### SSH Engine
 

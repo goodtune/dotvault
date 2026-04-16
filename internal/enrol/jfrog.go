@@ -198,8 +198,8 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 		return nil, fmt.Errorf("mint jfrog access token: %w", err)
 	}
 	if minted.AccessToken == "" || minted.RefreshToken == "" {
-		return nil, fmt.Errorf("jfrog mint returned incomplete token pair (access=%q refresh present=%t)",
-			minted.AccessToken, minted.RefreshToken != "")
+		return nil, fmt.Errorf("jfrog mint returned incomplete token pair (access_token present=%t, refresh_token present=%t)",
+			minted.AccessToken != "", minted.RefreshToken != "")
 	}
 
 	user := extractUsernameFromJWT(minted.AccessToken)

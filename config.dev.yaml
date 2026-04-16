@@ -78,5 +78,5 @@ enrolments:
   jfrog:
     engine: jfrog
     settings:
-      # Point at your JFrog Platform. Required — no sensible default exists.
-      url: "https://mycompany.jfrog.io"
+      # Local Artifactory JCR from `docker compose --profile jfrog`.
+      url: "http://127.0.0.1:8082"

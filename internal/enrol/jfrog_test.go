@@ -71,9 +71,11 @@ func TestDeduceJFrogServerID(t *testing.T) {
 
 func TestEnsureScheme(t *testing.T) {
 	cases := map[string]string{
-		"mycompany.jfrog.io":          "https://mycompany.jfrog.io",
-		"https://mycompany.jfrog.io":  "https://mycompany.jfrog.io",
-		"http://localhost:8082":       "http://localhost:8082",
+		"mycompany.jfrog.io":           "https://mycompany.jfrog.io",
+		"https://mycompany.jfrog.io":   "https://mycompany.jfrog.io",
+		"http://localhost:8082":        "http://localhost:8082",
+		"HTTPS://mycompany.jfrog.io":   "HTTPS://mycompany.jfrog.io",
+		"HTTP://localhost:8082":        "HTTP://localhost:8082",
 	}
 	for in, want := range cases {
 		if got := ensureScheme(in); got != want {
@@ -94,6 +96,10 @@ func TestNormalizeJFrogPlatformURL(t *testing.T) {
 		{"https://mycompany.jfrog.io/", "https://mycompany.jfrog.io", false},
 		{"http://127.0.0.1:8082", "http://127.0.0.1:8082", false},
 		{"http://127.0.0.1:8082/", "http://127.0.0.1:8082", false},
+
+		// Uppercase scheme — normalizer should lower-case it.
+		{"HTTPS://mycompany.jfrog.io", "https://mycompany.jfrog.io", false},
+		{"HTTP://127.0.0.1:8082", "http://127.0.0.1:8082", false},
 
 		// Rejected: paths, queries, fragments, empty.
 		{"https://mycompany.jfrog.io/artifactory", "", true},

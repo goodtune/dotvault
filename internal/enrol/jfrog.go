@@ -289,8 +289,11 @@ func (e *JFrogEngine) Refresh(ctx context.Context, settings map[string]any, exis
 }
 
 // ensureScheme prepends https:// if the URL has no scheme.
+// The check is case-insensitive so that inputs like "HTTPS://host" are
+// recognized as having a scheme rather than getting https:// prepended.
 func ensureScheme(u string) string {
-	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+	lower := strings.ToLower(u)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		return u
 	}
 	return "https://" + u

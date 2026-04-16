@@ -209,18 +209,24 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	}
 	issuedAtStr := existing["issued_at"]
 	if issuedAtStr == "" {
+		// Bump backoff so a malformed secret doesn't re-log this ERROR
+		// every tick — the state is only fixable by re-enrolment or a
+		// manual Vault edit, and in both cases polling harder doesn't help.
 		slog.Error("refresh: secret has expires_at but no issued_at, skipping", "key", key)
+		m.bumpBackoff(key)
 		return
 	}
 
 	expiresAt, err := time.Parse(time.RFC3339, expiresAtStr)
 	if err != nil {
 		slog.Error("refresh: invalid expires_at, skipping", "key", key, "value", expiresAtStr, "error", err)
+		m.bumpBackoff(key)
 		return
 	}
 	issuedAt, err := time.Parse(time.RFC3339, issuedAtStr)
 	if err != nil {
 		slog.Error("refresh: invalid issued_at, skipping", "key", key, "value", issuedAtStr, "error", err)
+		m.bumpBackoff(key)
 		return
 	}
 

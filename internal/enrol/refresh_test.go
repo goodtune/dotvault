@@ -391,6 +391,72 @@ func TestRefreshManager_ErrRevokedWipesSecret(t *testing.T) {
 	}
 }
 
+func TestRefreshManager_MalformedSecretBumpsBackoff(t *testing.T) {
+	// A secret that has expires_at but is otherwise malformed (missing
+	// issued_at, unparseable RFC3339, etc.) must bump backoff so the ERROR
+	// doesn't re-log every tick.
+	cases := []struct {
+		name string
+		data map[string]string
+	}{
+		{
+			name: "MissingIssuedAt",
+			data: map[string]string{
+				"access_token":  "a",
+				"refresh_token": "r",
+				"expires_at":    "2026-04-17T12:00:00Z",
+				// issued_at absent
+			},
+		},
+		{
+			name: "BadExpiresAt",
+			data: map[string]string{
+				"access_token":  "a",
+				"refresh_token": "r",
+				"issued_at":     "2026-04-17T00:00:00Z",
+				"expires_at":    "not-an-rfc3339-timestamp",
+			},
+		},
+		{
+			name: "BadIssuedAt",
+			data: map[string]string{
+				"access_token":  "a",
+				"refresh_token": "r",
+				"issued_at":     "not-an-rfc3339-timestamp",
+				"expires_at":    "2026-04-17T12:00:00Z",
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fv := newFakeVault("kv")
+			vc := fv.serve(t)
+			fv.seed("users/alice/jfrog", tc.data)
+
+			fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+			fake.response = func(fakeRefresherCall) (map[string]string, error) {
+				return nil, errors.New("should not be called for malformed secret")
+			}
+			registerFake(t, "jfrog-fake", fake)
+
+			m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+				"jfrog": {Engine: "jfrog-fake"},
+			}, 10*time.Second,
+				WithClock(&fixedClock{now: time.Date(2026, 4, 17, 10, 0, 0, 0, time.UTC)}),
+			)
+			m.tick(context.Background())
+
+			m.mu.Lock()
+			b := m.backoffs["jfrog"]
+			m.mu.Unlock()
+			if b.delay == 0 {
+				t.Errorf("backoff delay should be set after malformed-secret skip, got %v", b)
+			}
+		})
+	}
+}
+
 func TestRefreshManager_ErrRevokedDeleteFailureBumpsBackoff(t *testing.T) {
 	// If the Vault cleanup for a revoked credential fails, the manager
 	// must NOT clear backoff — otherwise the next tick re-calls Refresh

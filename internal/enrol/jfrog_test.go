@@ -102,6 +102,11 @@ func TestNormalizeJFrogPlatformURL(t *testing.T) {
 		{"https://mycompany.jfrog.io#frag", "", true},
 		{"", "", true},
 		{"   ", "", true},
+		// Rejected: non-http schemes would later fail at http.Client.Do with
+		// a vague "unsupported protocol scheme" — easier to catch up front.
+		{"ftp://mycompany.jfrog.io", "", true},
+		{"file:///etc/passwd", "", true},
+		{"ssh://mycompany.jfrog.io", "", true},
 	}
 	for _, tc := range cases {
 		got, err := normalizeJFrogPlatformURL(tc.in)

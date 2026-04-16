@@ -303,7 +303,11 @@ func normalizeJFrogPlatformURL(raw string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse jfrog url: %w", err)
 	}
-	if u.Scheme == "" || u.Host == "" {
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("jfrog url must use http or https, got %q", raw)
+	}
+	if u.Host == "" {
 		return "", fmt.Errorf("jfrog url must include a host: %q", raw)
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
@@ -312,7 +316,7 @@ func normalizeJFrogPlatformURL(raw string) (string, error) {
 	if u.Path != "" && u.Path != "/" {
 		return "", fmt.Errorf("jfrog url must be the platform base URL without a path (got %q)", raw)
 	}
-	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), nil
+	return (&url.URL{Scheme: scheme, Host: u.Host}).String(), nil
 }
 
 // deduceJFrogServerID extracts a short server identifier from the platform
@@ -384,7 +388,10 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 		if err != nil {
 			return jfrogCommonTokenParams{}, err
 		}
-		body, _ := readAndClose(resp)
+		body, err := readAndClose(resp)
+		if err != nil {
+			return jfrogCommonTokenParams{}, fmt.Errorf("read jfrog token poll response: %w", err)
+		}
 
 		switch resp.StatusCode {
 		case http.StatusOK:
@@ -448,7 +455,10 @@ func jfrogMintRefreshableToken(ctx context.Context, client *http.Client, platfor
 	if err != nil {
 		return jfrogCommonTokenParams{}, err
 	}
-	respBody, _ := readAndClose(resp)
+	respBody, err := readAndClose(resp)
+	if err != nil {
+		return jfrogCommonTokenParams{}, fmt.Errorf("read jfrog mint response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return jfrogCommonTokenParams{}, fmt.Errorf("jfrog mint returned status %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
@@ -488,7 +498,10 @@ func jfrogExchangeRefreshToken(ctx context.Context, client *http.Client, platfor
 	if err != nil {
 		return jfrogCommonTokenParams{}, err
 	}
-	respBody, _ := readAndClose(resp)
+	respBody, err := readAndClose(resp)
+	if err != nil {
+		return jfrogCommonTokenParams{}, fmt.Errorf("read jfrog refresh response: %w", err)
+	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:

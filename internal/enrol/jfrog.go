@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -549,11 +550,23 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "…"
 }
 
+// readAndClose reads the response body (capped at 1 MB to limit exposure
+// to unexpectedly large payloads from a user-configured URL) and closes
+// the body. 1 MB is generous for any JFrog API response; legitimate
+// token responses are a few KB at most.
 func readAndClose(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
+	const maxBody = 1 << 20 // 1 MB
+	limited := io.LimitReader(resp.Body, maxBody+1)
 	buf := new(bytes.Buffer)
-	_, err := buf.ReadFrom(resp.Body)
-	return buf.Bytes(), err
+	n, err := buf.ReadFrom(limited)
+	if err != nil {
+		return nil, err
+	}
+	if n > maxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBody)
+	}
+	return buf.Bytes(), nil
 }
 
 // extractUsernameFromJWT parses a JFrog access token JWT and returns the

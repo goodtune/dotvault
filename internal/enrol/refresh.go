@@ -195,6 +195,9 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	}
 	if secret == nil {
 		// No enrolment yet — not our problem; the enrolment wizard handles it.
+		// Clear any stale backoff from a previous attempt (e.g. the secret
+		// was deleted externally while we were in a backoff window).
+		m.resetBackoff(key)
 		return
 	}
 
@@ -226,6 +229,12 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	issuedAt, err := time.Parse(time.RFC3339, issuedAtStr)
 	if err != nil {
 		slog.Error("refresh: invalid issued_at, skipping", "key", key, "value", issuedAtStr, "error", err)
+		m.bumpBackoff(key)
+		return
+	}
+
+	if !expiresAt.After(issuedAt) {
+		slog.Error("refresh: expires_at is not after issued_at, skipping", "key", key, "issued_at", issuedAtStr, "expires_at", expiresAtStr)
 		m.bumpBackoff(key)
 		return
 	}

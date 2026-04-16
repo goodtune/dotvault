@@ -482,6 +482,9 @@ func TestParseDuration(t *testing.T) {
 		// Overflow guard: time.Duration is int64 ns ≈ 292 years max, so
 		// anything above ~106,751 days wraps. 200,000d comfortably overflows.
 		{"200000d", 0, true},
+		// Very large day count that overflows int64 at ParseInt — must
+		// surface a dedicated "exceeds range" error, not "unknown unit d".
+		{"99999999999999999999d", 0, true},
 	}
 	for _, tc := range cases {
 		got, err := ParseDuration(tc.in)

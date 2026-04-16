@@ -40,13 +40,23 @@ func ParseDuration(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty duration")
 	}
-	// Bare Nd: digits followed by 'd' with nothing after. A minus sign is
-	// allowed through strconv.Atoi but rejected explicitly below so the
-	// error is clearer than stdlib's "unknown unit" for the common mistake.
+	// Bare Nd: digits followed by 'd' with nothing after. Use ParseInt
+	// rather than Atoi so that very-large-day values that overflow int are
+	// caught here (Atoi returns "value out of range", which would otherwise
+	// fall through to time.ParseDuration and produce a confusing "unknown
+	// unit d" error). A minus sign is allowed through ParseInt but rejected
+	// explicitly below so the error message is clear.
 	if strings.HasSuffix(s, "d") {
 		num := s[:len(s)-1]
-		days, err := strconv.Atoi(num)
+		days, err := strconv.ParseInt(num, 10, 64)
 		if err != nil {
+			// Is the parse failure because the numeral is out of int64 range?
+			// That's a clear "too big" case — surface it directly instead of
+			// handing the string to time.ParseDuration where "d" is an
+			// unknown unit and the error would be confusing.
+			if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+				return 0, fmt.Errorf("duration %q exceeds representable range", s)
+			}
 			// Not a bare Nd (e.g. "1.5d", "1dd", "1d12h") — fall through to
 			// stdlib, which will produce the standard "unknown unit" error.
 			return time.ParseDuration(s)
@@ -54,10 +64,10 @@ func ParseDuration(s string) (time.Duration, error) {
 		if days < 0 {
 			return 0, fmt.Errorf("negative duration: %q", s)
 		}
-		// Guard against int64 overflow. time.Duration is nanoseconds in an
-		// int64, so max representable days ≈ MaxInt64 / (24*time.Hour in ns).
-		// Anything above that silently wraps to a negative/garbage value.
-		const maxDays = int(int64(math.MaxInt64) / int64(24*time.Hour))
+		// Guard against int64 overflow when converting to nanoseconds.
+		// time.Duration is nanoseconds in an int64 so max representable
+		// days ≈ MaxInt64 / (24 * time.Hour in ns).
+		const maxDays = int64(math.MaxInt64 / int64(24*time.Hour))
 		if days > maxDays {
 			return 0, fmt.Errorf("duration %q exceeds time.Duration range (max %dd)", s, maxDays)
 		}

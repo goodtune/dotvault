@@ -385,7 +385,28 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 	endpoint := fmt.Sprintf("%s/access/api/v2/authentication/jfrog_client_login/token/%s", platformURL, url.PathEscape(session))
 	deadline := time.Now().Add(max)
 
+	// Reusable timer avoids leaking a new timer on every loop iteration
+	// (each `time.After(interval)` allocates one that lives until it fires,
+	// even if we return early on ctx cancellation or a hard error).
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C // drain the initial fire so the first iteration goes straight to the HTTP call
+	}
+	defer timer.Stop()
+
+	first := true
 	for {
+		// On the first iteration, skip the wait and poll immediately.
+		if !first {
+			timer.Reset(interval)
+			select {
+			case <-ctx.Done():
+				return jfrogCommonTokenParams{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
+		first = false
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return jfrogCommonTokenParams{}, err
@@ -414,12 +435,6 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 
 		if time.Now().After(deadline) {
 			return jfrogCommonTokenParams{}, fmt.Errorf("timed out waiting for jfrog web login after %s", max)
-		}
-
-		select {
-		case <-ctx.Done():
-			return jfrogCommonTokenParams{}, ctx.Err()
-		case <-time.After(interval):
 		}
 	}
 }

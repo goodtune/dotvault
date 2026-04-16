@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/config"
 )
 
 const (
@@ -26,24 +28,71 @@ const (
 const (
 	jfrogDefaultPollInterval = 3 * time.Second
 	jfrogDefaultMaxWait      = 5 * time.Minute
+	// jfrogDefaultTokenTTL is the default dotvault-minted access token
+	// lifetime. 60d is considerably shorter than JFrog's own 1-year default
+	// and reflects the assumption that dotvault users are more often admins
+	// who should see tighter rotation windows.
+	jfrogDefaultTokenTTL = 60 * 24 * time.Hour
 )
 
 // JFrogEngine performs a JFrog Platform browser-based web login exchange,
-// mirroring the flow used by `jf login` in jfrog-cli.
+// mirroring the flow used by `jf login` in jfrog-cli. After the web login
+// completes, the engine mints a second, dotvault-owned refreshable token
+// with a shorter TTL; the bootstrap token from the web login is discarded.
 type JFrogEngine struct {
 	// overridable for tests
 	httpClient   *http.Client
 	pollInterval time.Duration
 	maxWait      time.Duration
+	// now is injected for deterministic issued_at/expires_at timestamps.
+	now func() time.Time
 }
 
 func (e *JFrogEngine) Name() string { return "JFrog" }
 
-// Fields lists the Vault KV fields this engine writes. access_token is the
-// only strictly-required credential; the other fields are identity metadata
-// needed to render a jfrog-cli config file.
+// Fields lists the Vault KV fields this engine writes. All fields are
+// required for a complete enrolment: access_token drives the CLI config,
+// refresh_token powers the rotation cycle, url+server_id+user render the
+// jfrog-cli.conf.v6 template, and issued_at+expires_at drive the
+// half-life refresh decision.
 func (e *JFrogEngine) Fields() []string {
-	return []string{"access_token", "url", "server_id"}
+	return []string{
+		"access_token",
+		"refresh_token",
+		"url",
+		"server_id",
+		"user",
+		"issued_at",
+		"expires_at",
+	}
+}
+
+// clock returns the current time via the engine's injected clock (or
+// time.Now if none is set).
+func (e *JFrogEngine) clock() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return time.Now().UTC()
+}
+
+// resolveTokenTTL resolves the configured token_ttl setting against the
+// engine default. Returns an error for non-string or unparseable values.
+// The 10-minute floor is enforced at config-load time; here we just parse.
+func resolveTokenTTL(settings map[string]any) (time.Duration, error) {
+	raw, ok := settings["token_ttl"]
+	if !ok {
+		return jfrogDefaultTokenTTL, nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return 0, fmt.Errorf("jfrog token_ttl must be a string, got %T", raw)
+	}
+	d, err := config.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("parse jfrog token_ttl %q: %w", s, err)
+	}
+	return d, nil
 }
 
 func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (map[string]string, error) {
@@ -61,6 +110,11 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 	clientCode := jfrogDefaultClientCode
 	if v, ok := settings["client_code"].(string); ok && v != "" {
 		clientCode = v
+	}
+
+	ttl, err := resolveTokenTTL(settings)
+	if err != nil {
+		return nil, err
 	}
 
 	serverID, err := deduceJFrogServerID(platformURL)
@@ -106,7 +160,7 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 		fmt.Fprintf(io.Out, "✓ Opened %s in browser\n", loginURL)
 	}
 
-	// Step 3: poll for the token.
+	// Step 3: poll for the bootstrap token.
 	pollInterval := e.pollInterval
 	if pollInterval == 0 {
 		pollInterval = jfrogDefaultPollInterval
@@ -117,38 +171,108 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 	}
 
 	fmt.Fprintf(io.Out, "⠼ Waiting for authentication...\n")
-	token, err := jfrogPollForToken(ctx, client, platformURL, session, pollInterval, maxWait)
+	bootstrap, err := jfrogPollForToken(ctx, client, platformURL, session, pollInterval, maxWait)
 	if err != nil {
 		return nil, err
 	}
-	if token.AccessToken == "" {
+	if bootstrap.AccessToken == "" {
 		return nil, fmt.Errorf("jfrog returned empty access token after web login")
 	}
 
-	user := extractUsernameFromJWT(token.AccessToken)
+	// Step 4: exchange the bootstrap token for a dotvault-owned,
+	// refreshable token with the configured TTL. The bootstrap token is
+	// discarded — it is never stored or reused.
+	fmt.Fprintf(io.Out, "⠼ Minting dotvault-owned access token (ttl=%s)...\n", ttl)
+	minted, err := jfrogMintRefreshableToken(ctx, client, platformURL, bootstrap.AccessToken, ttl)
+	if err != nil {
+		return nil, fmt.Errorf("mint jfrog access token: %w", err)
+	}
+	if minted.AccessToken == "" || minted.RefreshToken == "" {
+		return nil, fmt.Errorf("jfrog mint returned incomplete token pair (access=%q refresh present=%t)",
+			minted.AccessToken, minted.RefreshToken != "")
+	}
 
+	user := extractUsernameFromJWT(minted.AccessToken)
+	if user == "" {
+		// Fall back to the bootstrap token's subject if the minted JWT
+		// doesn't carry a parseable username. This keeps compatibility
+		// with odd JFrog deployments while still preferring the minted
+		// identity when available.
+		user = extractUsernameFromJWT(bootstrap.AccessToken)
+	}
+
+	now := e.clock()
 	result := map[string]string{
-		"access_token": token.AccessToken,
-		"url":          platformURL,
-		"server_id":    serverID,
+		"access_token":  minted.AccessToken,
+		"refresh_token": minted.RefreshToken,
+		"url":           platformURL,
+		"server_id":     serverID,
+		"user":          user,
+		"issued_at":     now.UTC().Format(time.RFC3339),
+		"expires_at":    now.Add(ttl).UTC().Format(time.RFC3339),
 	}
-	if token.RefreshToken != "" {
-		result["refresh_token"] = token.RefreshToken
+	return result, nil
+}
+
+// Refresh rotates a dotvault-owned JFrog token pair. Returns the same 7
+// fields that Run returns so the caller can atomically replace the Vault
+// secret. A 401/403 from the access service means the refresh token itself
+// has been revoked upstream — callers should treat that as permanent and
+// force a fresh enrolment.
+func (e *JFrogEngine) Refresh(ctx context.Context, settings map[string]any, existing map[string]string) (map[string]string, error) {
+	platformURL, ok := settings["url"].(string)
+	if !ok || strings.TrimSpace(platformURL) == "" {
+		return nil, fmt.Errorf("jfrog refresh requires a non-empty 'url' setting")
 	}
-	if token.TokenType != "" {
-		result["token_type"] = token.TokenType
-	}
-	if token.Scope != "" {
-		result["scope"] = token.Scope
-	}
-	if token.ExpiresIn != nil {
-		result["expires_in"] = fmt.Sprintf("%d", *token.ExpiresIn)
-	}
-	if user != "" {
-		result["user"] = user
+	platformURL = ensureScheme(strings.TrimRight(platformURL, "/"))
+
+	access := existing["access_token"]
+	refresh := existing["refresh_token"]
+	if access == "" || refresh == "" {
+		return nil, fmt.Errorf("jfrog refresh requires both access_token and refresh_token in the existing secret")
 	}
 
-	return result, nil
+	ttl, err := resolveTokenTTL(settings)
+	if err != nil {
+		return nil, err
+	}
+
+	serverID, err := deduceJFrogServerID(platformURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse jfrog url: %w", err)
+	}
+
+	client := e.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	rotated, err := jfrogExchangeRefreshToken(ctx, client, platformURL, access, refresh)
+	if err != nil {
+		return nil, err
+	}
+	if rotated.AccessToken == "" || rotated.RefreshToken == "" {
+		return nil, fmt.Errorf("jfrog refresh returned incomplete token pair")
+	}
+
+	user := extractUsernameFromJWT(rotated.AccessToken)
+	if user == "" {
+		// The refresh endpoint may return a reference (non-JWT) token;
+		// fall back to the username we already had on file rather than
+		// losing it on every rotation.
+		user = existing["user"]
+	}
+
+	now := e.clock()
+	return map[string]string{
+		"access_token":  rotated.AccessToken,
+		"refresh_token": rotated.RefreshToken,
+		"url":           platformURL,
+		"server_id":     serverID,
+		"user":          user,
+		"issued_at":     now.UTC().Format(time.RFC3339),
+		"expires_at":    now.Add(ttl).UTC().Format(time.RFC3339),
+	}, nil
 }
 
 // ensureScheme prepends https:// if the URL has no scheme.
@@ -253,6 +377,107 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 		case <-time.After(interval):
 		}
 	}
+}
+
+// jfrogMintRefreshableToken exchanges the bootstrap access token produced
+// by the web-login flow for a dotvault-owned, refreshable token pair with
+// the caller-specified TTL. Called once at enrolment time; the bootstrap
+// token is discarded after this call returns.
+//
+// Endpoint: POST {platform}/access/api/v2/tokens with a bearer auth header.
+// Body: {"expires_in": <seconds>, "refreshable": true, "scope": "applied-permissions/user"}.
+//
+// Non-admin users can successfully mint refreshable tokens for themselves
+// with any non-zero TTL; the admin-only restriction in JFrog only applies
+// to expires_in=0 (never-expiring tokens), which we intentionally do not use.
+func jfrogMintRefreshableToken(ctx context.Context, client *http.Client, platformURL, bootstrapToken string, ttl time.Duration) (jfrogCommonTokenParams, error) {
+	endpoint := platformURL + "/access/api/v2/tokens"
+	body, err := json.Marshal(struct {
+		ExpiresIn   int64  `json:"expires_in"`
+		Refreshable bool   `json:"refreshable"`
+		Scope       string `json:"scope"`
+	}{
+		ExpiresIn:   int64(ttl.Seconds()),
+		Refreshable: true,
+		Scope:       "applied-permissions/user",
+	})
+	if err != nil {
+		return jfrogCommonTokenParams{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return jfrogCommonTokenParams{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+bootstrapToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return jfrogCommonTokenParams{}, err
+	}
+	respBody, _ := readAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		return jfrogCommonTokenParams{}, fmt.Errorf("jfrog mint returned status %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+	}
+	var token jfrogCommonTokenParams
+	if err := json.Unmarshal(respBody, &token); err != nil {
+		return jfrogCommonTokenParams{}, fmt.Errorf("decode jfrog mint response: %w", err)
+	}
+	return token, nil
+}
+
+// jfrogExchangeRefreshToken rotates an existing token pair. JFrog's
+// refresh endpoint ROTATES the refresh token on every successful call —
+// the old refresh_token is invalidated immediately, so callers must
+// persist the returned pair atomically before acknowledging success.
+//
+// Endpoint: POST {platform}/access/api/v1/tokens with form-urlencoded body
+// grant_type=refresh_token&access_token=<old>&refresh_token=<old>.
+//
+// 401/403 → ErrRevoked (token has been revoked upstream; caller should
+// discard the secret and force a fresh enrolment). Any other error is
+// transient and the caller should keep the existing secret for retry.
+func jfrogExchangeRefreshToken(ctx context.Context, client *http.Client, platformURL, accessToken, refreshToken string) (jfrogCommonTokenParams, error) {
+	endpoint := platformURL + "/access/api/v1/tokens"
+	form := url.Values{
+		"grant_type":    []string{"refresh_token"},
+		"access_token":  []string{accessToken},
+		"refresh_token": []string{refreshToken},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return jfrogCommonTokenParams{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return jfrogCommonTokenParams{}, err
+	}
+	respBody, _ := readAndClose(resp)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var token jfrogCommonTokenParams
+		if err := json.Unmarshal(respBody, &token); err != nil {
+			return jfrogCommonTokenParams{}, fmt.Errorf("decode jfrog refresh response: %w", err)
+		}
+		return token, nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return jfrogCommonTokenParams{}, fmt.Errorf("jfrog refresh rejected (status %d): %w", resp.StatusCode, ErrRevoked)
+	default:
+		return jfrogCommonTokenParams{}, fmt.Errorf("jfrog refresh returned status %d: %s", resp.StatusCode, truncate(string(respBody), 200))
+	}
+}
+
+// truncate trims s to maxLen runes with an ellipsis, for error logs.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }
 
 func readAndClose(resp *http.Response) ([]byte, error) {

@@ -243,6 +243,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Start token lifecycle manager.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
 	lifecycleErrCh := lm.Start(ctx)
+
+	// Start refresh manager for any enrolment whose engine rotates its own
+	// credentials (currently JFrog). Failures are logged and retried on the
+	// next tick — never fatal to the daemon.
+	rm := enrol.NewRefreshManager(
+		vc,
+		cfg.Vault.KVMount,
+		cfg.Vault.UserPrefix+username+"/",
+		cfg.Enrolments,
+		5*time.Minute,
+	)
+	rm.Start(ctx)
 	go func() {
 		const reauthCooldown = 10 * time.Minute
 		var lastReauthOpen time.Time
@@ -329,6 +341,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
 						slog.Info("enrolments config changed, re-checking")
 						enrolMgr.UpdateConfig(reloaded.Enrolments)
+						rm.UpdateConfig(reloaded.Enrolments)
 						lastEnrolments = reloaded.Enrolments
 					}
 					if ok, err := enrolMgr.CheckAll(ctx); err != nil {

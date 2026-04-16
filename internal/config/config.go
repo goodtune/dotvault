@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,35 @@ import (
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
 )
+
+// ParseDuration extends time.ParseDuration with a "Nd" suffix representing
+// whole days (24 * N hours). Everything else is delegated to the stdlib
+// parser, so "6h", "30m", "1h30m" etc. continue to work as expected.
+//
+// Accepts: "60d" (=1440h), "6h", "10m", "45s", combined forms.
+// Rejects: "1.5d" (non-integer days), "w", "y" suffixes, empty string,
+// negative values (consistent with a duration setting).
+func ParseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	// Detect a trailing Nd: digits followed by 'd' with nothing after.
+	if strings.HasSuffix(s, "d") {
+		num := s[:len(s)-1]
+		days, err := strconv.Atoi(num)
+		if err != nil {
+			// Not a bare Nd (e.g. "1.5d", "1dd") — fall through to stdlib,
+			// which will produce the standard "unknown unit" error.
+			return time.ParseDuration(s)
+		}
+		if days < 0 {
+			return 0, fmt.Errorf("negative duration: %q", s)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
 
 // Config is the top-level system configuration.
 type Config struct {
@@ -207,6 +237,23 @@ func (c *Config) validate() error {
 		}
 		if e.Engine == "" {
 			return fmt.Errorf("enrolments[%q].engine is required", key)
+		}
+
+		// Engine-agnostic validation of token_ttl if present: must parse
+		// as a duration and be no smaller than the 10-minute floor so
+		// engines that refresh don't thrash the upstream API.
+		if raw, ok := e.Settings["token_ttl"]; ok {
+			s, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl must be a string, got %T", key, raw)
+			}
+			d, err := ParseDuration(s)
+			if err != nil {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl %q: %w", key, s, err)
+			}
+			if d < 10*time.Minute {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
+			}
 		}
 	}
 

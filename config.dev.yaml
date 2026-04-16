@@ -60,8 +60,6 @@ rules:
               "accessUrl": "{{ .url }}/access/",
               "user": "{{ .user | default "" }}",
               "accessToken": "{{ .access_token }}",
-              "refreshToken": "{{ .refresh_token | default "" }}",
-              "webLogin": true,
               "isDefault": true
             }
           ],
@@ -80,3 +78,6 @@ enrolments:
     settings:
       # Local Artifactory JCR from `docker compose --profile jfrog`.
       url: "http://127.0.0.1:8082"
+      # Shorter-than-production TTL so the refresh cycle gets exercised
+      # during normal dev-loop sessions (halfway point = 3 h).
+      token_ttl: "6h"

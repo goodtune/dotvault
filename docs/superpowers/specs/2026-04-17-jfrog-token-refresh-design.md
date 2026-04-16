@@ -56,13 +56,16 @@ Modeled on `internal/auth/lifecycle.go`. Constructor:
 ```go
 func NewRefreshManager(
     client *vault.Client,
-    cfg *config.Config,
-    userPrefix, username string,
+    kvMount, userPrefix string, // userPrefix already includes username + trailing slash
+    enrolments map[string]config.Enrolment,
     checkInterval time.Duration,
+    opts ...RefreshManagerOption, // WithClock, WithMaxBackoff — test hooks
 ) *RefreshManager
 ```
 
-Default `checkInterval` is 5 minutes (caller-supplied so tests can inject shorter values).
+Design note: decoupling from `*config.Config` means the manager only depends on the slice of configuration it actually uses. `userPrefix` is pre-built by the caller (`cfg.Vault.UserPrefix + username + "/"`), matching the convention used by the enrolment manager.
+
+`checkInterval` is caller-supplied (5 minutes in the daemon, shorter values in tests). Non-positive values are coerced to a safe fallback with a WARN log so `time.NewTicker` cannot panic.
 
 `Start(ctx)` spawns a goroutine that ticks every `checkInterval`. Per tick:
 
@@ -80,9 +83,17 @@ Default `checkInterval` is 5 minutes (caller-supplied so tests can inject shorte
 After `auth.LifecycleManager.Start(ctx)`, also start the refresh manager:
 
 ```go
-rm := enrol.NewRefreshManager(vaultClient, cfg, cfg.Vault.UserPrefix, username, 5*time.Minute)
+rm := enrol.NewRefreshManager(
+    vaultClient,
+    cfg.Vault.KVMount,
+    cfg.Vault.UserPrefix+username+"/",
+    cfg.Enrolments,
+    5*time.Minute,
+)
 rm.Start(ctx)
 ```
+
+The daemon's existing config-reload loop calls `rm.UpdateConfig(reloaded.Enrolments)` alongside `enrolMgr.UpdateConfig` so the refresh manager notices when enrolments are added or removed.
 
 Failures from the refresh goroutine are logged, not bubbled up. Refresh is best-effort — the sync engine continues rendering whatever's in Vault, which degrades gracefully even if refresh is broken.
 

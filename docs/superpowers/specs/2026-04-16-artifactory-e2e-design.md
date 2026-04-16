@@ -18,34 +18,30 @@ One-shot verification only. No committed E2E test, no CI wiring.
 
 ## Architecture
 
-Three new services in `docker-compose.yaml`, all tagged `profiles: ["jfrog"]` so they are skipped by default and activated only by `docker compose --profile jfrog up -d`.
+Two new services in `docker-compose.yaml`, both tagged `profiles: ["jfrog"]` so they are skipped by default and activated only by `docker compose --profile jfrog up -d`.
 
 ### `artifactory`
 
 - Image: `releases-docker.jfrog.io/jfrog/artifactory-jcr:7.98.9`
 - Rationale for JCR over OSS: JCR ships the full JFrog Platform UI chrome, including the `jfClientSession` confirmation screen that the web-login flow routes through. The Access service is bundled in both, but the OSS UI is thinner and has shown inconsistencies in the `/ui/login?jfClientSession=...` handoff. Multi-arch (`linux/amd64` + `linux/arm64`), so Apple Silicon runs native.
-- Port: `8082:8082` (JFrog router entrypoint — serves both `/ui/...` and `/access/api/...`).
+- Port: `127.0.0.1:8082:8082` (JFrog router entrypoint — serves both `/ui/...` and `/access/api/...`; bound to loopback so dev-only credentials aren't reachable from the LAN).
 - Memory limit: 4 GB (`mem_limit: 4g`).
 - Volume: named volume `artifactory-data` mounted at `/var/opt/jfrog/artifactory`.
+- Env: `JF_SHARED_SECURITY_MASTERKEY` and `JF_SHARED_SECURITY_JOINKEY` are pinned to deterministic 64-char hex dev fixtures because Artifactory refuses to start without them and its auto-generation on first boot is unreliable on Docker Desktop volumes.
 - Healthcheck: `GET /artifactory/api/system/ping` every 5 s, `start_period: 120s`, `retries: 30`.
+- Admin credentials: the default `admin` / `password` are kept as-is. Artifactory forces a password change on first UI login, which happens implicitly as part of the Playwright verification flow; no dedicated init container is needed.
 
-### `artifactory-init`
+### `artifactory-db`
 
-Mirrors the `vault-init` pattern. Runs once, exits 0.
+Postgres 16 sidecar (`postgres:16-alpine`). Artifactory 7.78+ dropped support for the embedded Derby database, so even a single-node dev instance requires an external database.
 
-Depends on `artifactory` with `condition: service_healthy`.
-
-Responsibilities:
-
-1. Resolve `admin/password` (default) into a known dev password `dotvault-dev` by `POST /artifactory/api/security/users/admin` with `Authorization: Basic YWRtaW46cGFzc3dvcmQ=`.
-2. Idempotency: if the initial basic-auth login returns 401, treat as "already initialised" and exit 0. If the reset itself returns 200, exit 0. Any other status is a hard failure with the response body logged.
-3. No secrets are logged. The new password is inline in the script because it is a dev-only fixture.
-
-Why REST rather than the file-based `bootstrap.creds` approach: `bootstrap.creds` only takes effect on a **pristine** volume. A REST-based init container survives `docker compose down && up` without needing the volume wiped, matching the ergonomic of `vault-init`.
+- Credentials: `artifactory` / `dotvault-dev` / database `artifactory`. Loopback-only via internal Docker networking (no published ports).
+- Healthcheck: `pg_isready -U artifactory -d artifactory` every 5 s.
+- `artifactory` depends on `artifactory-db` with `condition: service_healthy` so the database is ready before Artifactory tries to connect on startup.
 
 ### Shared profile tag
 
-All three existing services (`vault`, `dex`, `vault-init`) remain profile-less and are brought up by a plain `docker compose up -d`. Only the new `artifactory` + `artifactory-init` carry the `jfrog` profile. Existing devs see zero change in the default workflow.
+All existing services (`vault`, `dex`, `vault-init`) remain profile-less and are brought up by a plain `docker compose up -d`. Only the new `artifactory` + `artifactory-db` carry the `jfrog` profile. Existing devs see zero change in the default workflow.
 
 ## dotvault Configuration
 
@@ -65,7 +61,7 @@ No changes to sync rules, handlers, or engine code — the engine already accept
 
 `CLAUDE.md` — one sentence added to the **Local Development** section:
 
-> JFrog enrolment testing is opt-in: `docker compose --profile jfrog up -d` additionally starts a local Artifactory JCR on port 8082 (admin password `dotvault-dev`). The default `docker compose up -d` does not include it.
+> JFrog enrolment testing is opt-in: `docker compose --profile jfrog up -d` additionally starts a local Artifactory JCR on port 8082 alongside a Postgres sidecar (required by Artifactory 7.78+). The default `docker compose up -d` does not include them. The admin account keeps the out-of-the-box `admin`/`password` credentials; Artifactory forces a password change on first UI login.
 
 ## Playwright Verification Flow
 
@@ -73,7 +69,7 @@ Run once, interactively from this session. Not committed.
 
 ### Preconditions
 
-- `docker compose --profile jfrog up -d` — all five services (vault, dex, vault-init, artifactory, artifactory-init) healthy.
+- `docker compose --profile jfrog up -d` — all five services (vault, dex, vault-init, artifactory-db, artifactory) healthy.
 - `go run ./cmd/dotvault run --config config.dev.yaml` — daemon running on `127.0.0.1:9000`.
 - `/etc/hosts` entry for `dex` already exists (prerequisite of the existing dev setup).
 
@@ -81,7 +77,7 @@ Run once, interactively from this session. Not committed.
 
 1. **Dotvault login.** Playwright MCP navigates to `http://127.0.0.1:9000`, clicks "Sign in with OIDC", which redirects to Dex. Dex's mockCallback connector auto-approves. Returns to dotvault, lands on the enrolment page.
 2. **Start JFrog enrolment.** Playwright clicks `Start` on the JFrog card. The web UI displays the last-4-chars confirmation code and the Artifactory login URL `http://127.0.0.1:8082/ui/login?jfClientSession=<uuid>&jfClientName=JFrog-CLI&jfClientCode=1`. Both captured from the DOM.
-3. **Artifactory login** (same browser context). Playwright navigates to the captured URL, signs in as `admin` / `dotvault-dev`. The Artifactory UI surfaces the "Confirm you're authorizing JFrog-CLI" screen showing the expected last-4 chars. Playwright clicks `Accept`.
+3. **Artifactory login** (same browser context). Playwright navigates to the captured URL, signs in as `admin` / `password` (the out-of-the-box default), and handles the mandatory first-login password change in the same session. The Artifactory UI then surfaces the "Confirm you're authorizing JFrog-CLI" screen showing the expected last-4 chars. Playwright clicks `Accept`.
 4. **Token poll.** dotvault's background poll against `GET /access/api/v2/authentication/jfrog_client_login/token/<uuid>` flips from 400 to 200. The enrolment page transitions to `complete`.
 5. **Verify.** Three independent checks:
    - `docker exec dotvault-vault vault kv get kv/users/gary/jfrog` — contains `access_token`, `refresh_token`, `token_type=Bearer`, `expires_in`, `url=http://127.0.0.1:8082`, `server_id=default-server`, `user=admin`.
@@ -90,8 +86,8 @@ Run once, interactively from this session. Not committed.
 
 ## Error Handling
 
-- **Artifactory fails to boot within 180 s:** abort, surface `docker compose logs artifactory`, do not proceed.
-- **`artifactory-init` fails the admin-reset:** hard failure (any status other than 200 or initial 401). Log the response body.
+- **Artifactory fails to boot within ~3 minutes cold start:** abort, surface `docker compose logs artifactory` and `docker compose logs artifactory-db`, do not proceed.
+- **Postgres refuses Artifactory's connection:** usually a volume-state mismatch from a previous run. `docker compose down -v --profile jfrog` + retry.
 - **Playwright selector drift** (Artifactory UI version differences on the confirmation screen): screenshot the DOM, report, and ask the user rather than guessing. Do not auto-retry with different selectors.
 - **Token poll timeout (5 min default in the engine):** the engine already returns a timeout error with the elapsed duration; the web UI shows the failure and the enrolment stays `pending`.
 
@@ -99,7 +95,7 @@ Run once, interactively from this session. Not committed.
 
 | File | Change |
 |------|--------|
-| `docker-compose.yaml` | Add `artifactory` + `artifactory-init` services under `profiles: ["jfrog"]`; add `artifactory-data` named volume |
+| `docker-compose.yaml` | Add `artifactory` + `artifactory-db` services under `profiles: ["jfrog"]`; add `artifactory-data` and `artifactory-db-data` named volumes; bind Artifactory to `127.0.0.1:8082:8082` |
 | `config.dev.yaml` | Point `enrolments.jfrog.settings.url` at `http://127.0.0.1:8082` |
 | `CLAUDE.md` | One-sentence note in Local Development about the `--profile jfrog` variant |
 

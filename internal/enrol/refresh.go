@@ -27,6 +27,10 @@ func (realClock) Now() time.Time { return time.Now().UTC() }
 // auth.LifecycleManager — one goroutine, stateless between ticks, with
 // per-enrolment exponential backoff so a single flaky provider does not
 // stall the others.
+// defaultRefreshInterval is the fallback cadence if a caller supplies a
+// non-positive checkInterval (which would otherwise panic time.NewTicker).
+const defaultRefreshInterval = time.Minute
+
 type RefreshManager struct {
 	client        *vault.Client
 	kvMount       string
@@ -37,7 +41,16 @@ type RefreshManager struct {
 
 	mu         sync.Mutex
 	enrolments map[string]config.Enrolment
-	backoffs   map[string]time.Duration // per-enrolment backoff state; cleared on success
+	// backoff state per-enrolment. `delay` is the current wait interval
+	// (doubled on each failure, capped at maxBackoff, cleared on success).
+	// `nextAttempt` is the clock time before which tick() skips this
+	// enrolment — this is what actually makes the backoff observable.
+	backoffs map[string]backoffState
+}
+
+type backoffState struct {
+	delay       time.Duration
+	nextAttempt time.Time
 }
 
 // RefreshManagerOption configures a RefreshManager at construction time.
@@ -55,7 +68,9 @@ func WithMaxBackoff(d time.Duration) RefreshManagerOption {
 
 // NewRefreshManager constructs a RefreshManager. userPrefix must already
 // include the username and a trailing slash (e.g. "users/alice/"), matching
-// the convention used by the rest of the daemon.
+// the convention used by the rest of the daemon. A non-positive
+// checkInterval is coerced to defaultRefreshInterval with a WARN log so
+// the ticker cannot panic.
 func NewRefreshManager(
 	client *vault.Client,
 	kvMount, userPrefix string,
@@ -63,6 +78,11 @@ func NewRefreshManager(
 	checkInterval time.Duration,
 	opts ...RefreshManagerOption,
 ) *RefreshManager {
+	if checkInterval <= 0 {
+		slog.Warn("refresh: invalid check_interval, using fallback",
+			"check_interval", checkInterval, "fallback", defaultRefreshInterval)
+		checkInterval = defaultRefreshInterval
+	}
 	m := &RefreshManager{
 		client:        client,
 		kvMount:       kvMount,
@@ -71,7 +91,7 @@ func NewRefreshManager(
 		maxBackoff:    5 * time.Minute,
 		clock:         realClock{},
 		enrolments:    enrolments,
-		backoffs:      make(map[string]time.Duration),
+		backoffs:      make(map[string]backoffState),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -118,7 +138,8 @@ func (m *RefreshManager) run(ctx context.Context) {
 
 // tick iterates all enrolments and triggers a refresh for each Refresher
 // whose token is past half-life. Each enrolment is handled independently;
-// one failure does not block others.
+// one failure does not block others. Enrolments whose previous attempt
+// failed are skipped until their backoff deadline has elapsed.
 func (m *RefreshManager) tick(ctx context.Context) {
 	m.mu.Lock()
 	snapshot := make(map[string]config.Enrolment, len(m.enrolments))
@@ -127,6 +148,7 @@ func (m *RefreshManager) tick(ctx context.Context) {
 	}
 	m.mu.Unlock()
 
+	now := m.clock.Now()
 	for key, enrolment := range snapshot {
 		if ctx.Err() != nil {
 			return
@@ -139,9 +161,25 @@ func (m *RefreshManager) tick(ctx context.Context) {
 		if !ok {
 			continue // engine doesn't rotate; nothing to do
 		}
+		if m.inBackoff(key, now) {
+			// Previous attempt failed; not yet time to retry.
+			continue
+		}
 
 		m.refreshOne(ctx, key, enrolment, refresher)
 	}
+}
+
+// inBackoff reports whether this enrolment is still inside its retry
+// cooldown window as of `now`.
+func (m *RefreshManager) inBackoff(key string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.backoffs[key]
+	if !ok {
+		return false
+	}
+	return now.Before(s.nextAttempt)
 }
 
 // refreshOne handles a single enrolment: read Vault, check half-life, call
@@ -224,24 +262,25 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	m.resetBackoff(key)
 }
 
-// bumpBackoff doubles this enrolment's pending retry delay, capped at
-// maxBackoff. Because tick() runs on a fixed ticker rather than rescheduling
-// against the backoff value, backoff in practice just means "don't retry
-// sooner than the next tick" — the data structure is in place so that
-// longer check intervals (or a future per-enrolment scheduler) can use it.
+// bumpBackoff records a failure for this enrolment and sets the next
+// allowed attempt time. Delay doubles on each consecutive failure,
+// capped at maxBackoff, and starts at checkInterval (so a transient
+// failure costs at least one tick before the next attempt). The
+// nextAttempt timestamp is the actual gate consulted by tick().
 func (m *RefreshManager) bumpBackoff(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current := m.backoffs[key]
-	if current == 0 {
-		current = m.checkInterval
+	s := m.backoffs[key]
+	if s.delay == 0 {
+		s.delay = m.checkInterval
 	} else {
-		current *= 2
+		s.delay *= 2
 	}
-	if current > m.maxBackoff {
-		current = m.maxBackoff
+	if s.delay > m.maxBackoff {
+		s.delay = m.maxBackoff
 	}
-	m.backoffs[key] = current
+	s.nextAttempt = m.clock.Now().Add(s.delay)
+	m.backoffs[key] = s
 }
 
 func (m *RefreshManager) resetBackoff(key string) {

@@ -472,12 +472,15 @@ func jfrogExchangeRefreshToken(ctx context.Context, client *http.Client, platfor
 	}
 }
 
-// truncate trims s to maxLen runes with an ellipsis, for error logs.
+// truncate trims s to maxLen runes with an ellipsis, for error logs. Rune-
+// aware rather than byte-aware so a truncated UTF-8 multi-byte sequence
+// doesn't emit mojibake in the log line.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "…"
+	return string(runes[:maxLen]) + "…"
 }
 
 func readAndClose(resp *http.Response) ([]byte, error) {

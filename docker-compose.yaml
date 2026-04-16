@@ -152,8 +152,11 @@ services:
     depends_on:
       artifactory-db:
         condition: service_healthy
+    # Bind explicitly to loopback so the dev-only admin password + pinned
+    # master/join keys aren't reachable from the LAN. The plain "8082:8082"
+    # form binds on all interfaces on Docker Desktop.
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
     environment:
       # Dev-only deterministic master/join keys. Artifactory refuses to start
       # without these and its auto-generation on first boot is unreliable on

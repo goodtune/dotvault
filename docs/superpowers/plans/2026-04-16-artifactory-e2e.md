@@ -2,6 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-04-17):** Historical planning artifact — preserved for
+> audit trail. **What actually shipped differs from this plan**:
+>
+> - The `artifactory-init` sidecar was dropped mid-execution because
+>   rotating the admin password via REST was unreliable across Artifactory
+>   UI versions. The default `admin` / `password` credentials are kept
+>   as-is; Artifactory forces a first-login change that happens naturally
+>   during the Playwright verification flow.
+> - A `artifactory-db` Postgres sidecar was added (not in the original
+>   plan) because Artifactory 7.78+ dropped the embedded Derby database
+>   and fails to start without an external database.
+> - `JF_SHARED_SECURITY_MASTERKEY` and `JF_SHARED_SECURITY_JOINKEY` are
+>   pinned to deterministic hex fixtures; auto-generation is unreliable
+>   on Docker Desktop volumes.
+> - The `8082:8082` port mapping was tightened to `127.0.0.1:8082:8082`
+>   after a Copilot review noted the dev-only credentials + fixed keys
+>   would otherwise be reachable from the LAN.
+>
+> Refer to the current `docker-compose.yaml` and the companion spec
+> (`docs/superpowers/specs/2026-04-16-artifactory-e2e-design.md`, which
+> has been updated to match what shipped) for the authoritative setup.
+> The step-by-step below is left intact so the decision history is not
+> lost.
+
 **Goal:** Add an opt-in local Artifactory JCR to `docker-compose.yaml` so the `JFrogEngine` can be exercised end-to-end, then verify the full browser-based enrolment flow once via the Playwright MCP.
 
 **Architecture:** Two new services (`artifactory`, `artifactory-init`) gated by `profiles: ["jfrog"]` so plain `docker compose up -d` stays lean. `artifactory-init` mirrors the existing `vault-init` pattern: waits for the healthcheck, then uses the default `admin/password` credentials to reset the admin password to `dotvault-dev` via REST, idempotently. No Go code changes.

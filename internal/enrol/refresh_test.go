@@ -401,10 +401,11 @@ func TestRefreshManager_TransientErrorKeepsSecret(t *testing.T) {
 
 	// Use a small checkInterval relative to maxBackoff so we can verify
 	// both the initial seed and the doubling step before saturation.
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
 	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
 		"jfrog": {Engine: "jfrog-fake"},
 	}, 10*time.Second,
-		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+		WithClock(clk),
 		WithMaxBackoff(10*time.Minute),
 	)
 	m.tick(context.Background())
@@ -418,17 +419,30 @@ func TestRefreshManager_TransientErrorKeepsSecret(t *testing.T) {
 	m.mu.Lock()
 	b := m.backoffs["jfrog"]
 	m.mu.Unlock()
-	if b != 10*time.Second {
-		t.Errorf("backoff after first failure = %v, want %v (checkInterval)", b, 10*time.Second)
+	if b.delay != 10*time.Second {
+		t.Errorf("backoff delay after first failure = %v, want %v (checkInterval)", b.delay, 10*time.Second)
+	}
+	wantDeadline := clk.Now().Add(10 * time.Second)
+	if !b.nextAttempt.Equal(wantDeadline) {
+		t.Errorf("nextAttempt after first failure = %v, want %v", b.nextAttempt, wantDeadline)
 	}
 
-	// A second failure should double it.
+	// A tick *inside* the backoff window must not call Refresh again.
+	callsBefore := len(fake.Calls())
+	m.tick(context.Background())
+	if len(fake.Calls()) != callsBefore {
+		t.Errorf("Refresh called %d times within backoff window, want 0 additional calls",
+			len(fake.Calls())-callsBefore)
+	}
+
+	// Advance past the deadline; next tick should bump delay from 10s to 20s.
+	clk.Advance(11 * time.Second)
 	m.tick(context.Background())
 	m.mu.Lock()
 	b2 := m.backoffs["jfrog"]
 	m.mu.Unlock()
-	if b2 != 20*time.Second {
-		t.Errorf("backoff after second failure = %v, want 20s (doubled)", b2)
+	if b2.delay != 20*time.Second {
+		t.Errorf("backoff delay after second failure = %v, want 20s (doubled)", b2.delay)
 	}
 }
 
@@ -451,22 +465,27 @@ func TestRefreshManager_BackoffCappedAtMax(t *testing.T) {
 	}
 	registerFake(t, "jfrog-fake", fake)
 
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
 	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
 		"jfrog": {Engine: "jfrog-fake"},
 	}, 30*time.Second,
-		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+		WithClock(clk),
 		WithMaxBackoff(2*time.Minute),
 	)
 
-	// Hammer it; backoff should saturate at 2m.
+	// Advance time past the current backoff window each iteration so the
+	// rotation actually runs; otherwise the backoff gate would skip it.
+	// Delay sequence: 30s → 60s → 120s (cap). A big enough jump forces
+	// saturation regardless of the exact doubling count.
 	for i := 0; i < 10; i++ {
 		m.tick(context.Background())
+		clk.Advance(5 * time.Minute)
 	}
 	m.mu.Lock()
 	b := m.backoffs["jfrog"]
 	m.mu.Unlock()
-	if b != 2*time.Minute {
-		t.Errorf("saturated backoff = %v, want 2m", b)
+	if b.delay != 2*time.Minute {
+		t.Errorf("saturated backoff delay = %v, want 2m", b.delay)
 	}
 }
 
@@ -504,24 +523,42 @@ func TestRefreshManager_SuccessResetsBackoff(t *testing.T) {
 	}
 	registerFake(t, "jfrog-fake", fake)
 
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
 	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
 		"jfrog": {Engine: "jfrog-fake"},
-	}, time.Hour,
-		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+	}, 10*time.Second,
+		WithClock(clk),
 	)
 	m.tick(context.Background())
 	m.mu.Lock()
 	first := m.backoffs["jfrog"]
 	m.mu.Unlock()
-	if first == 0 {
-		t.Fatal("backoff should be non-zero after failure")
+	if first.delay == 0 {
+		t.Fatal("backoff delay should be non-zero after failure")
 	}
+	// Advance past the backoff deadline so the next tick actually runs.
+	clk.Advance(11 * time.Second)
 	m.tick(context.Background())
 	m.mu.Lock()
 	_, stillInBackoffs := m.backoffs["jfrog"]
 	m.mu.Unlock()
 	if stillInBackoffs {
 		t.Error("backoff entry should be cleared after a successful rotation")
+	}
+}
+
+func TestNewRefreshManager_InvalidCheckInterval(t *testing.T) {
+	// A non-positive checkInterval must be coerced to the fallback so
+	// Start's time.NewTicker doesn't panic. Construct with zero and with
+	// a negative duration; both should yield a usable manager.
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	for _, d := range []time.Duration{0, -time.Second} {
+		m := NewRefreshManager(vc, "kv", "users/alice/", nil, d)
+		if m.checkInterval != defaultRefreshInterval {
+			t.Errorf("NewRefreshManager(checkInterval=%v) kept it as-is; want coerced to %v",
+				d, defaultRefreshInterval)
+		}
 	}
 }
 

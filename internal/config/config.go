@@ -13,25 +13,41 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ParseDuration extends time.ParseDuration with a "Nd" suffix representing
-// whole days (24 * N hours). Everything else is delegated to the stdlib
-// parser, so "6h", "30m", "1h30m" etc. continue to work as expected.
+// ParseDuration extends time.ParseDuration with a standalone "Nd" suffix
+// representing whole days (N × 24h). It is a thin wrapper: anything other
+// than a bare Nd is delegated to the stdlib parser, so "6h", "30m",
+// "1h30m" etc. continue to work as normal.
 //
-// Accepts: "60d" (=1440h), "6h", "10m", "45s", combined forms.
-// Rejects: "1.5d" (non-integer days), "w", "y" suffixes, empty string,
-// negative values (consistent with a duration setting).
+// Accepts:
+//   - bare "Nd" where N is a non-negative integer ("60d" → 1440h, "1d" → 24h)
+//   - anything time.ParseDuration accepts ("6h", "30m", "1h30m", "45s")
+//
+// Rejects:
+//   - empty string
+//   - negative bare "Nd" (e.g. "-5d"): kept out as a guard-rail for
+//     settings like token_ttl where negative values never make sense.
+//     Note that stdlib forms like "-5m" are still parseable by
+//     time.ParseDuration and pass through unchanged — callers that need a
+//     "must be positive" invariant should enforce it at the validation
+//     site (e.g. the 10-min floor check for token_ttl)
+//   - mixed forms combining days with other units ("1d12h" is rejected
+//     because "d" is not understood by time.ParseDuration; if this ever
+//     becomes load-bearing we can extend the parser)
+//   - non-integer days ("1.5d") and unsupported suffixes ("w", "y")
 func ParseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty duration")
 	}
-	// Detect a trailing Nd: digits followed by 'd' with nothing after.
+	// Bare Nd: digits followed by 'd' with nothing after. A minus sign is
+	// allowed through strconv.Atoi but rejected explicitly below so the
+	// error is clearer than stdlib's "unknown unit" for the common mistake.
 	if strings.HasSuffix(s, "d") {
 		num := s[:len(s)-1]
 		days, err := strconv.Atoi(num)
 		if err != nil {
-			// Not a bare Nd (e.g. "1.5d", "1dd") — fall through to stdlib,
-			// which will produce the standard "unknown unit" error.
+			// Not a bare Nd (e.g. "1.5d", "1dd", "1d12h") — fall through to
+			// stdlib, which will produce the standard "unknown unit" error.
 			return time.ParseDuration(s)
 		}
 		if days < 0 {

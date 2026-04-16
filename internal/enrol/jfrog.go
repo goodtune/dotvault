@@ -96,11 +96,14 @@ func resolveTokenTTL(settings map[string]any) (time.Duration, error) {
 }
 
 func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (map[string]string, error) {
-	platformURL, ok := settings["url"].(string)
-	if !ok || strings.TrimSpace(platformURL) == "" {
+	rawPlatformURL, ok := settings["url"].(string)
+	if !ok {
 		return nil, fmt.Errorf("jfrog enrolment requires a non-empty 'url' setting (your JFrog Platform URL, e.g. https://mycompany.jfrog.io)")
 	}
-	platformURL = ensureScheme(strings.TrimRight(platformURL, "/"))
+	platformURL, err := normalizeJFrogPlatformURL(rawPlatformURL)
+	if err != nil {
+		return nil, err
+	}
 
 	clientName := jfrogDefaultClientName
 	if v, ok := settings["client_name"].(string); ok && v != "" {
@@ -220,11 +223,14 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 // has been revoked upstream — callers should treat that as permanent and
 // force a fresh enrolment.
 func (e *JFrogEngine) Refresh(ctx context.Context, settings map[string]any, existing map[string]string) (map[string]string, error) {
-	platformURL, ok := settings["url"].(string)
-	if !ok || strings.TrimSpace(platformURL) == "" {
+	rawPlatformURL, ok := settings["url"].(string)
+	if !ok {
 		return nil, fmt.Errorf("jfrog refresh requires a non-empty 'url' setting")
 	}
-	platformURL = ensureScheme(strings.TrimRight(platformURL, "/"))
+	platformURL, err := normalizeJFrogPlatformURL(rawPlatformURL)
+	if err != nil {
+		return nil, err
+	}
 
 	access := existing["access_token"]
 	refresh := existing["refresh_token"]
@@ -281,6 +287,32 @@ func ensureScheme(u string) string {
 		return u
 	}
 	return "https://" + u
+}
+
+// normalizeJFrogPlatformURL parses `raw`, enforces that it is a
+// scheme+host-only URL (no path, query, or fragment), and returns the
+// canonical string form. JFrog API paths are concatenated directly onto
+// this value, so any embedded path would route requests incorrectly and
+// a query/fragment would appear verbatim in the stored template.
+func normalizeJFrogPlatformURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("jfrog enrolment requires a non-empty 'url' setting (your JFrog Platform URL, e.g. https://mycompany.jfrog.io)")
+	}
+	u, err := url.Parse(ensureScheme(raw))
+	if err != nil {
+		return "", fmt.Errorf("parse jfrog url: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("jfrog url must include a host: %q", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("jfrog url must not include a query or fragment: %q", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("jfrog url must be the platform base URL without a path (got %q)", raw)
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), nil
 }
 
 // deduceJFrogServerID extracts a short server identifier from the platform

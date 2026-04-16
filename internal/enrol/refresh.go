@@ -237,9 +237,16 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 		if errors.Is(err, ErrRevoked) {
 			slog.Warn("refresh: upstream credential revoked, wiping vault secret so user can re-enrol", "key", key, "error", err)
 			if delErr := m.client.DeleteKVv2(ctx, m.kvMount, path); delErr != nil {
-				slog.Error("refresh: failed to delete revoked secret", "key", key, "error", delErr)
+				// Treat Vault cleanup failure as transient: keep backoff
+				// so we retry the delete on a later tick instead of
+				// re-calling Refresh against a known-revoked credential
+				// every cycle.
+				slog.Error("refresh: failed to delete revoked secret, will retry", "key", key, "error", delErr)
+				m.bumpBackoff(key)
+				return
 			}
-			// No backoff on revocation — the state is terminal until re-enrol.
+			// No backoff once the revoked secret has been wiped — the
+			// state is terminal until the user re-enrols.
 			m.resetBackoff(key)
 			return
 		}

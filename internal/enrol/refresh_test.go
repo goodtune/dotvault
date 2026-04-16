@@ -71,10 +71,14 @@ func copyMap(in map[string]string) map[string]string {
 // exercises.
 type fakeVault struct {
 	mu      sync.Mutex
-	mount   string                          // e.g. "kv"
-	secrets map[string]map[string]string    // path -> data
+	mount   string                       // e.g. "kv"
+	secrets map[string]map[string]string // path -> data
 	writes  []fakeVaultWrite
 	deletes []string
+	// When non-zero, DELETE on the metadata endpoint returns this status
+	// code and leaves the secret in place. Used to exercise the
+	// refresh-manager's revocation-cleanup-failure path.
+	deleteStatus int
 }
 
 type fakeVaultWrite struct {
@@ -152,6 +156,13 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, metaPrefix)
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		fv.mu.Lock()
+		status := fv.deleteStatus
+		fv.mu.Unlock()
+		if status != 0 {
+			http.Error(w, "delete refused by fake", status)
 			return
 		}
 		fv.mu.Lock()
@@ -377,6 +388,54 @@ func TestRefreshManager_ErrRevokedWipesSecret(t *testing.T) {
 	deleted := fv.deleted()
 	if len(deleted) != 1 || deleted[0] != "users/alice/jfrog" {
 		t.Errorf("deleted = %v, want [users/alice/jfrog]", deleted)
+	}
+}
+
+func TestRefreshManager_ErrRevokedDeleteFailureBumpsBackoff(t *testing.T) {
+	// If the Vault cleanup for a revoked credential fails, the manager
+	// must NOT clear backoff — otherwise the next tick re-calls Refresh
+	// against a known-revoked token every cycle.
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	fv.deleteStatus = http.StatusInternalServerError
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	expires := issued.Add(6 * time.Hour)
+	fv.seed("users/alice/jfrog", map[string]string{
+		"access_token":  "a",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    expires.Format(time.RFC3339),
+	})
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) { return nil, ErrRevoked }
+	registerFake(t, "jfrog-fake", fake)
+
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, 10*time.Second,
+		WithClock(clk),
+	)
+	m.tick(context.Background())
+
+	// Secret must still be present (delete failed).
+	if got := fv.secret("users/alice/jfrog"); got == nil {
+		t.Fatal("secret unexpectedly gone after failed delete")
+	}
+	// Backoff must be set so the next tick within the window skips Refresh.
+	m.mu.Lock()
+	b := m.backoffs["jfrog"]
+	m.mu.Unlock()
+	if b.delay == 0 {
+		t.Errorf("backoff delay should be set after failed delete, got %v", b)
+	}
+	callsBefore := len(fake.Calls())
+	m.tick(context.Background())
+	if len(fake.Calls()) != callsBefore {
+		t.Errorf("Refresh called %d additional times within backoff window, want 0",
+			len(fake.Calls())-callsBefore)
 	}
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -52,6 +53,13 @@ func ParseDuration(s string) (time.Duration, error) {
 		}
 		if days < 0 {
 			return 0, fmt.Errorf("negative duration: %q", s)
+		}
+		// Guard against int64 overflow. time.Duration is nanoseconds in an
+		// int64, so max representable days ≈ MaxInt64 / (24*time.Hour in ns).
+		// Anything above that silently wraps to a negative/garbage value.
+		const maxDays = int(int64(math.MaxInt64) / int64(24*time.Hour))
+		if days > maxDays {
+			return 0, fmt.Errorf("duration %q exceeds time.Duration range (max %dd)", s, maxDays)
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}

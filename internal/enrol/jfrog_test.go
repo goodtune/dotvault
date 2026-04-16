@@ -82,6 +82,45 @@ func TestEnsureScheme(t *testing.T) {
 	}
 }
 
+func TestNormalizeJFrogPlatformURL(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		// Accepted shapes — bare host, trailing slash, explicit scheme.
+		{"mycompany.jfrog.io", "https://mycompany.jfrog.io", false},
+		{"https://mycompany.jfrog.io", "https://mycompany.jfrog.io", false},
+		{"https://mycompany.jfrog.io/", "https://mycompany.jfrog.io", false},
+		{"http://127.0.0.1:8082", "http://127.0.0.1:8082", false},
+		{"http://127.0.0.1:8082/", "http://127.0.0.1:8082", false},
+
+		// Rejected: paths, queries, fragments, empty.
+		{"https://mycompany.jfrog.io/artifactory", "", true},
+		{"https://mycompany.jfrog.io/artifactory/", "", true},
+		{"https://mycompany.jfrog.io?foo=bar", "", true},
+		{"https://mycompany.jfrog.io#frag", "", true},
+		{"", "", true},
+		{"   ", "", true},
+	}
+	for _, tc := range cases {
+		got, err := normalizeJFrogPlatformURL(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("normalizeJFrogPlatformURL(%q) = %q, want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("normalizeJFrogPlatformURL(%q) unexpected error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("normalizeJFrogPlatformURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestNewUUIDv4_Format(t *testing.T) {
 	u, err := newUUIDv4()
 	if err != nil {

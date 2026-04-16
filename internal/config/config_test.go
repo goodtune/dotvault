@@ -479,6 +479,9 @@ func TestParseDuration(t *testing.T) {
 		{"bogus", 0, true},
 		{"", 0, true},
 		{"1w", 0, true}, // not supported
+		// Overflow guard: time.Duration is int64 ns ≈ 292 years max, so
+		// anything above ~106,751 days wraps. 200,000d comfortably overflows.
+		{"200000d", 0, true},
 	}
 	for _, tc := range cases {
 		got, err := ParseDuration(tc.in)

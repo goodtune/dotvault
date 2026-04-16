@@ -124,6 +124,65 @@ services:
     volumes:
       - vault-data:/vault/data
 
+  # Opt-in Artifactory JCR + Postgres for exercising the JFrog enrolment
+  # engine. Activated by `docker compose --profile jfrog up -d`. Plain `up`
+  # skips both. Artifactory 7.78+ no longer supports the embedded Derby DB,
+  # so Postgres is required even for single-node dev use.
+  artifactory-db:
+    image: postgres:16-alpine
+    container_name: dotvault-artifactory-db
+    profiles: ["jfrog"]
+    environment:
+      POSTGRES_USER: artifactory
+      POSTGRES_PASSWORD: dotvault-dev
+      POSTGRES_DB: artifactory
+    volumes:
+      - artifactory-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artifactory -d artifactory"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  artifactory:
+    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.98.9
+    container_name: dotvault-artifactory
+    profiles: ["jfrog"]
+    depends_on:
+      artifactory-db:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    environment:
+      # Dev-only deterministic master/join keys. Artifactory refuses to start
+      # without these and its auto-generation on first boot is unreliable on
+      # Docker Desktop volumes; pinning them sidesteps that. NOT SECRETS —
+      # this stack binds only to loopback and is for enrolment testing.
+      JF_SHARED_SECURITY_MASTERKEY: "deadbeefcafebabe0123456789abcdeffedcba98765432100123456789abcdef"
+      JF_SHARED_SECURITY_JOINKEY: "cafebabedeadbeef00112233445566778899aabbccddeeff0011223344556677"
+      JF_SHARED_DATABASE_TYPE: "postgresql"
+      JF_SHARED_DATABASE_DRIVER: "org.postgresql.Driver"
+      JF_SHARED_DATABASE_URL: "jdbc:postgresql://artifactory-db:5432/artifactory"
+      JF_SHARED_DATABASE_USERNAME: "artifactory"
+      JF_SHARED_DATABASE_PASSWORD: "dotvault-dev"
+    volumes:
+      - artifactory-data:/var/opt/jfrog/artifactory
+    mem_limit: 4g
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 32000
+        hard: 40000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8082/artifactory/api/system/ping >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 120s
+
 volumes:
   vault-data:
   dex-data:
+  artifactory-data:
+  artifactory-db-data:

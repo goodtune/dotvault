@@ -50,18 +50,24 @@ type JFrogEngine struct {
 
 func (e *JFrogEngine) Name() string { return "JFrog" }
 
-// Fields lists the Vault KV fields this engine writes. All fields are
-// required for a complete enrolment: access_token drives the CLI config,
-// refresh_token powers the rotation cycle, url+server_id+user render the
-// jfrog-cli.conf.v6 template, and issued_at+expires_at drive the
-// half-life refresh decision.
+// Fields lists the Vault KV fields this engine requires for a complete
+// enrolment: access_token drives the CLI config, refresh_token powers
+// the rotation cycle, url+server_id render the jfrog-cli.conf.v6 template,
+// and issued_at+expires_at drive the half-life refresh decision.
+//
+// `user` is intentionally NOT listed: the engine writes it when it can be
+// extracted from the access-token JWT subject, but JFrog reference
+// (non-JWT) tokens don't expose a parseable subject. Making user
+// mandatory would have `enrol.Manager.HasAllFields` reject otherwise-good
+// enrolments with reference-token deployments. GitHub's engine takes the
+// same approach — its `user` value is written when available but isn't
+// required for `HasAllFields`.
 func (e *JFrogEngine) Fields() []string {
 	return []string{
 		"access_token",
 		"refresh_token",
 		"url",
 		"server_id",
-		"user",
 		"issued_at",
 		"expires_at",
 	}

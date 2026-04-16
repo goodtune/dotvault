@@ -25,7 +25,7 @@ func TestJFrogEngine_Name(t *testing.T) {
 func TestJFrogEngine_Fields(t *testing.T) {
 	e := &JFrogEngine{}
 	got := e.Fields()
-	want := []string{"access_token", "refresh_token", "url", "server_id", "user", "issued_at", "expires_at"}
+	want := []string{"access_token", "refresh_token", "url", "server_id", "issued_at", "expires_at"}
 	if len(got) != len(want) {
 		t.Fatalf("Fields() = %v, want %v", got, want)
 	}

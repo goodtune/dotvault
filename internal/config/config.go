@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +13,68 @@ import (
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
 )
+
+// ParseDuration extends time.ParseDuration with a standalone "Nd" suffix
+// representing whole days (N × 24h). It is a thin wrapper: anything other
+// than a bare Nd is delegated to the stdlib parser, so "6h", "30m",
+// "1h30m" etc. continue to work as normal.
+//
+// Accepts:
+//   - bare "Nd" where N is a non-negative integer ("60d" → 1440h, "1d" → 24h)
+//   - anything time.ParseDuration accepts ("6h", "30m", "1h30m", "45s")
+//
+// Rejects:
+//   - empty string
+//   - negative bare "Nd" (e.g. "-5d"): kept out as a guard-rail for
+//     settings like token_ttl where negative values never make sense.
+//     Note that stdlib forms like "-5m" are still parseable by
+//     time.ParseDuration and pass through unchanged — callers that need a
+//     "must be positive" invariant should enforce it at the validation
+//     site (e.g. the 10-min floor check for token_ttl)
+//   - mixed forms combining days with other units ("1d12h" is rejected
+//     because "d" is not understood by time.ParseDuration; if this ever
+//     becomes load-bearing we can extend the parser)
+//   - non-integer days ("1.5d") and unsupported suffixes ("w", "y")
+func ParseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	// Bare Nd: digits followed by 'd' with nothing after. Use ParseInt
+	// rather than Atoi so that very-large-day values that overflow int are
+	// caught here (Atoi returns "value out of range", which would otherwise
+	// fall through to time.ParseDuration and produce a confusing "unknown
+	// unit d" error). A minus sign is allowed through ParseInt but rejected
+	// explicitly below so the error message is clear.
+	if strings.HasSuffix(s, "d") {
+		num := s[:len(s)-1]
+		days, err := strconv.ParseInt(num, 10, 64)
+		if err != nil {
+			// Is the parse failure because the numeral is out of int64 range?
+			// That's a clear "too big" case — surface it directly instead of
+			// handing the string to time.ParseDuration where "d" is an
+			// unknown unit and the error would be confusing.
+			if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+				return 0, fmt.Errorf("duration %q exceeds representable range", s)
+			}
+			// Not a bare Nd (e.g. "1.5d", "1dd", "1d12h") — fall through to
+			// stdlib, which will produce the standard "unknown unit" error.
+			return time.ParseDuration(s)
+		}
+		if days < 0 {
+			return 0, fmt.Errorf("negative duration: %q", s)
+		}
+		// Guard against int64 overflow when converting to nanoseconds.
+		// time.Duration is nanoseconds in an int64 so max representable
+		// days ≈ MaxInt64 / (24 * time.Hour in ns).
+		const maxDays = int64(math.MaxInt64 / int64(24*time.Hour))
+		if days > maxDays {
+			return 0, fmt.Errorf("duration %q exceeds time.Duration range (max %dd)", s, maxDays)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
 
 // Config is the top-level system configuration.
 type Config struct {
@@ -207,6 +271,23 @@ func (c *Config) validate() error {
 		}
 		if e.Engine == "" {
 			return fmt.Errorf("enrolments[%q].engine is required", key)
+		}
+
+		// Engine-agnostic validation of token_ttl if present: must parse
+		// as a duration and be no smaller than the 10-minute floor so
+		// engines that refresh don't thrash the upstream API.
+		if raw, ok := e.Settings["token_ttl"]; ok {
+			s, ok := raw.(string)
+			if !ok {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl must be a string, got %T", key, raw)
+			}
+			d, err := ParseDuration(s)
+			if err != nil {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl %q: %w", key, s, err)
+			}
+			if d < 10*time.Minute {
+				return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
+			}
 		}
 	}
 

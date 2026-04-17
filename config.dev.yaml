@@ -41,6 +41,31 @@ rules:
       path: "~/tmp/.netrc"
       format: netrc
 
+  - name: jfrog
+    vault_key: "jfrog"
+    target:
+      path: "~/tmp/.jfrog/jfrog-cli.conf.v6"
+      format: json
+      template: |
+        {
+          "servers": [
+            {
+              "serverId": "{{ .server_id }}",
+              "url": "{{ .url }}/",
+              "artifactoryUrl": "{{ .url }}/artifactory/",
+              "distributionUrl": "{{ .url }}/distribution/",
+              "xrayUrl": "{{ .url }}/xray/",
+              "missionControlUrl": "{{ .url }}/mc/",
+              "pipelinesUrl": "{{ .url }}/pipelines/",
+              "accessUrl": "{{ .url }}/access/",
+              "user": "{{ .user | default "" }}",
+              "accessToken": "{{ .access_token }}",
+              "isDefault": true
+            }
+          ],
+          "version": "6"
+        }
+
 enrolments:
   gh:
     engine: github
@@ -48,3 +73,11 @@ enrolments:
     engine: ssh
     settings:
       passphrase: "recommended"
+  jfrog:
+    engine: jfrog
+    settings:
+      # Local Artifactory JCR from `docker compose --profile jfrog`.
+      url: "http://127.0.0.1:8082"
+      # Shorter-than-production TTL so the refresh cycle gets exercised
+      # during normal dev-loop sessions (halfway point = 3 h).
+      token_ttl: "6h"

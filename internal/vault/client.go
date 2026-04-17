@@ -154,6 +154,21 @@ func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[str
 	return nil
 }
 
+// DeleteKVv2 deletes all versions of a KVv2 secret (the full metadata
+// record, not just a soft-delete of the latest version). Used by the
+// refresh manager when the upstream credential has been permanently
+// revoked and the local state needs to be wiped so the user can re-enrol.
+func (c *Client) DeleteKVv2(ctx context.Context, mount, path string) error {
+	if err := c.raw.KVv2(mount).DeleteMetadata(ctx, path); err != nil {
+		// A not-found metadata entry is fine (race with another cleanup).
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete kv %s/%s: %w", mount, path, err)
+	}
+	return nil
+}
+
 // LookupSelf returns the current token's metadata, or an error if invalid.
 func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().LookupSelfWithContext(ctx)

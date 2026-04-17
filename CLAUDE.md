@@ -31,6 +31,8 @@ go run ./cmd/dotvault run --config config.dev.yaml
 
 Requires `127.0.0.1 dex` in `/etc/hosts`. Dex uses a mockCallback connector that auto-approves login. The dev Vault listens on `127.0.0.1:8200`; the dotvault web UI is configured on port 9000 (`127.0.0.1:9000`) in `config.dev.yaml` to avoid conflict.
 
+JFrog enrolment testing is opt-in: `docker compose --profile jfrog up -d` additionally starts a local Artifactory JCR on port 8082 alongside a Postgres sidecar (required by Artifactory 7.78+). Plain `docker compose up -d` does not include them. Allow ~3 minutes on the first cold start for JFrog to finish its cluster-join. The admin account keeps the out-of-the-box `admin`/`password` credentials; Artifactory forces a password change on first UI login.
+
 The vault-init container seeds sample secrets, enables OIDC auth via Dex, and exports the root token to `/vault/data/root-token`.
 
 `config.dev.yaml` points at the local Vault (`http://127.0.0.1:8200`), enables the web UI on port 9000, and configures all available enrolment engines. When adding a new enrolment engine, add a corresponding entry to `config.dev.yaml` under the `enrolments` section so the dev config exercises all available engines.
@@ -189,7 +191,7 @@ Automated credential acquisition from external services (`internal/enrol/`). Enr
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), SSH (Ed25519 key generation).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation).
 
 ### GitHub Engine Defaults
 
@@ -198,6 +200,35 @@ Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered
 - Host: `github.com`
 
 Overridable via settings: `client_id`, `scopes`, `host`. Returns `{"oauth_token": "<token>", "user": "<username>"}`.
+
+### JFrog Engine
+
+Mirrors the `jf login` web login flow from `jfrog-cli`, then mints a dotvault-owned refreshable token with a configurable TTL. No public OAuth app exists — JFrog Platform hosts its own browser login endpoint, so the engine just requires the platform URL.
+
+Required settings:
+- `url` — JFrog Platform URL (e.g. `https://mycompany.jfrog.io`)
+
+Optional settings:
+- `token_ttl` — lifetime of the dotvault-minted access token. Accepts `time.ParseDuration` syntax plus `Nd` for whole days (e.g. `60d`, `6h`, `10m`). Default `60d`. Floor `10m` — validated at config-load time. Non-admin users can mint refreshable tokens at any non-zero TTL; only the never-expire case (`expires_in=0`) requires admin.
+- `client_name`: `JFrog-CLI` (sent as `jfClientName` query parameter)
+- `client_code`: `1` (sent as `jfClientCode` query parameter)
+
+Flow (enrolment — runs once per user):
+1. POST `{url}/access/api/v2/authentication/jfrog_client_login/request` with a random UUID
+2. Open `{url}/ui/login?jfClientSession=<uuid>&jfClientName=JFrog-CLI&jfClientCode=1` — user confirms the last 4 chars of the UUID after sign-in
+3. Poll GET `{url}/access/api/v2/authentication/jfrog_client_login/token/<uuid>` until 200 — returns a bootstrap token with the JFrog server default TTL (typically 1 year)
+4. POST `{url}/access/api/v2/tokens` with `Authorization: Bearer <bootstrap>` and `{"expires_in":<token_ttl_seconds>,"refreshable":true,"scope":"applied-permissions/user"}` — mints the dotvault-owned pair; the bootstrap token is discarded
+
+Flow (refresh — periodic, driven by `RefreshManager`):
+1. Every `check_interval` (daemon-wired at 5 min), iterate all enrolments whose engine implements `Refresher`
+2. For each, read the secret and skip unless `now >= issued_at + (expires_at - issued_at) / 2`
+3. POST `{url}/access/api/v1/tokens` with `grant_type=refresh_token&access_token=<current>&refresh_token=<current>` — **JFrog rotates both tokens on every successful refresh**, so the old refresh_token is invalid immediately
+4. Stamp new `issued_at: now`, `expires_at: now + token_ttl` (dotvault's configured TTL, not whatever JFrog returns), write the replacement map atomically
+5. `401`/`403` from the refresh endpoint is treated as permanent revocation — the secret is deleted from Vault and the user is prompted to re-enrol. Other errors are transient; the existing secret is kept and retried with exponential backoff
+
+Vault schema (7 fields): `access_token`, `refresh_token`, `url`, `server_id`, `user`, `issued_at` (RFC3339), `expires_at` (RFC3339). The rendered `jfrog-cli.conf.v6` only contains `accessToken` — `refreshToken` and `webLogin: true` are deliberately omitted so `jf` never attempts its own refresh (which would race the sync-engine clobber).
+
+`server_id` is deduced from the platform hostname (e.g. `mycompany.jfrog.io` → `mycompany`, IP addresses → `default-server`); `user` is extracted from the access-token JWT subject. Requires JFrog Artifactory 7.64.0 or newer on the remote side.
 
 ### SSH Engine
 

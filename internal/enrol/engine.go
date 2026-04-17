@@ -2,6 +2,7 @@ package enrol
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -22,6 +23,26 @@ type Engine interface {
 	Fields() []string
 }
 
+// Refresher is implemented by engines whose credentials expire and can be
+// rotated without user interaction. Today only JFrog implements it.
+type Refresher interface {
+	Engine
+
+	// Refresh takes the current Vault secret body and returns a replacement.
+	// The returned map overwrites the whole Vault secret (it must contain
+	// every field the engine still cares about, including a new expires_at).
+	//
+	// Returns ErrRevoked to signal the upstream credential is permanently
+	// gone (401/403) — caller wipes the Vault secret and flags for re-enrol.
+	// Any other error is transient; caller keeps the existing secret and
+	// retries with backoff.
+	Refresh(ctx context.Context, settings map[string]any, existing map[string]string) (map[string]string, error)
+}
+
+// ErrRevoked indicates the upstream credential is no longer valid and
+// cannot be recovered by refresh.
+var ErrRevoked = errors.New("credential revoked upstream")
+
 // BrowserOpener opens a URL in the user's default browser.
 type BrowserOpener func(url string) error
 
@@ -39,6 +60,7 @@ var (
 	enginesMu sync.RWMutex
 	engines   = map[string]Engine{
 		"github": &GitHubEngine{},
+		"jfrog":  &JFrogEngine{},
 		"ssh":    &SSHEngine{},
 	}
 )

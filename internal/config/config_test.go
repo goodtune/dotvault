@@ -461,6 +461,143 @@ rules:
 	}
 }
 
+func TestParseDuration(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"60d", 60 * 24 * time.Hour, false},
+		{"1d", 24 * time.Hour, false},
+		{"6h", 6 * time.Hour, false},
+		{"10m", 10 * time.Minute, false},
+		{"1h30m", 90 * time.Minute, false},
+		{"45s", 45 * time.Second, false},
+		{"0d", 0, false},
+		{"-5d", 0, true},     // negative not allowed for Nd
+		{"1.5d", 0, true},     // stdlib rejects .5d as unknown unit
+		{"bogus", 0, true},
+		{"", 0, true},
+		{"1w", 0, true}, // not supported
+		// Overflow guard: time.Duration is int64 ns ≈ 292 years max, so
+		// anything above ~106,751 days wraps. 200,000d comfortably overflows.
+		{"200000d", 0, true},
+		// Very large day count that overflows int64 at ParseInt — must
+		// surface a dedicated "exceeds range" error, not "unknown unit d".
+		{"99999999999999999999d", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := ParseDuration(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("ParseDuration(%q) = %v, want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseDuration(%q) error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParseDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestLoadTokenTTLFloor(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+
+enrolments:
+  jfrog:
+    engine: jfrog
+    settings:
+      url: "https://mycompany.jfrog.io"
+      token_ttl: "5m"
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for token_ttl below 10m floor")
+	}
+}
+
+func TestLoadTokenTTLValid(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+
+enrolments:
+  jfrog:
+    engine: jfrog
+    settings:
+      url: "https://mycompany.jfrog.io"
+      token_ttl: "6h"
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	got := cfg.Enrolments["jfrog"].Settings["token_ttl"]
+	if got != "6h" {
+		t.Errorf("token_ttl = %v, want %q", got, "6h")
+	}
+}
+
+func TestLoadTokenTTLInvalid(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+
+enrolments:
+  jfrog:
+    engine: jfrog
+    settings:
+      url: "https://mycompany.jfrog.io"
+      token_ttl: "bogus"
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unparseable token_ttl")
+	}
+}
+
 func writeTemp(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

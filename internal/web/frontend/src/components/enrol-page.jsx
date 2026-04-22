@@ -6,7 +6,11 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
   const allAddressed = enrolments.every(
     e => e.status === 'complete' || e.status === 'skipped'
   );
+  const anyPending = enrolments.some(
+    e => e.status === 'pending' || e.status === 'failed'
+  );
   const anyRunning = enrolments.some(e => e.status === 'running');
+  const isReEnrolMode = allAddressed && !anyPending;
 
   async function handleContinue() {
     try {
@@ -19,9 +23,13 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
 
   return h('div', { class: 'enrol-page' },
     h('div', { class: 'enrol-container' },
-      h('h2', { class: 'enrol-heading' }, 'Complete your setup'),
+      h('h2', { class: 'enrol-heading' },
+        isReEnrolMode ? 'Manage credentials' : 'Complete your setup',
+      ),
       h('p', { class: 'enrol-subheading' },
-        'The following credentials need to be configured before syncing can begin.',
+        isReEnrolMode
+          ? 'Re-enrol to replace existing credentials for any service.'
+          : 'The following credentials need to be configured before syncing can begin.',
       ),
       h('div', { class: 'enrol-list' },
         enrolments.map(e =>
@@ -33,7 +41,10 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
           class: 'enrol-continue-btn',
           onClick: handleContinue,
           disabled: anyRunning,
-        }, allAddressed ? 'Continue to Dashboard \u2192' : 'Skip remaining and continue \u2192'),
+        }, isReEnrolMode
+          ? '\u2190 Back to Dashboard'
+          : allAddressed ? 'Continue to Dashboard \u2192' : 'Skip remaining and continue \u2192',
+        ),
       ),
     ),
   );

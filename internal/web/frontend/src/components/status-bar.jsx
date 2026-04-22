@@ -3,7 +3,7 @@ import { useState, useRef } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
 import { copyText } from '../clipboard.js';
 
-export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
+export function StatusBar({ status, onSync, pendingEnrolments, hasEnrolments, onEnrolClick }) {
   const [syncing, setSyncing] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
   const cachedToken = useRef(null);
@@ -53,10 +53,10 @@ export function StatusBar({ status, onSync, pendingEnrolments, onEnrolClick }) {
         target: '_blank',
         rel: 'noopener noreferrer',
       }, 'Vault \u2197'),
-      pendingEnrolments > 0 && h('button', {
-        class: 'enrol-indicator',
+      hasEnrolments && h('button', {
+        class: pendingEnrolments > 0 ? 'enrol-indicator' : 'enrol-indicator-idle',
         onClick: onEnrolClick,
-      }, pendingEnrolments + ' pending'),
+      }, pendingEnrolments > 0 ? pendingEnrolments + ' pending' : 'Enrolments'),
     ),
     h('div', { class: 'status-right' },
       status?.time && h('span', { class: 'last-sync' },

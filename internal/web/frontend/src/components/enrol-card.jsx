@@ -1,6 +1,6 @@
 import { h } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
+import { startEnrolment, skipEnrolment, resetEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
 import { copyText } from '../clipboard.js';
 
 export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
@@ -9,6 +9,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [error, setError] = useState(enrolment.error || null);
   const [promptLabel, setPromptLabel] = useState(null);
   const [secretValue, setSecretValue] = useState('');
+  const [confirmReset, setConfirmReset] = useState(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -87,6 +88,19 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     }
   }
 
+  async function handleResetConfirm() {
+    try {
+      setConfirmReset(false);
+      await resetEnrolment(enrolment.key);
+      setLocalStatus('pending');
+      setOutput([]);
+      setError(null);
+      if (onUpdate) onUpdate();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   async function handleSecretSubmit(e) {
     e.preventDefault();
     try {
@@ -119,7 +133,23 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           h('span', { class: 'enrol-check' }, '\u2713'),
           h('strong', null, enrolment.name),
         ),
-        h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
+        h('div', { class: 'enrol-card-actions' },
+          h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
+          !confirmReset && h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: () => setConfirmReset(true),
+            disabled: anyRunning,
+          }, 'Re-enrol'),
+        ),
+      ),
+      confirmReset && h('div', { class: 'enrol-warn' },
+        h('p', { class: 'enrol-warn-text' },
+          'This will overwrite your existing credentials. Are you sure?',
+        ),
+        h('div', { class: 'enrol-warn-actions' },
+          h('button', { class: 'enrol-btn-danger', onClick: handleResetConfirm }, 'Overwrite credentials'),
+          h('button', { class: 'enrol-btn-secondary', onClick: () => setConfirmReset(false) }, 'Cancel'),
+        ),
       ),
     );
   }

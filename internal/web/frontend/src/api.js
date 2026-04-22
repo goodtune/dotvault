@@ -106,6 +106,14 @@ export async function skipEnrolment(key) {
   });
 }
 
+export async function resetEnrolment(key) {
+  const token = await getCSRFToken();
+  return fetchJSON(`/api/v1/enrol/${encodeURIComponent(key)}/reset`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': token },
+  });
+}
+
 export async function getEnrolmentStatus(key) {
   return fetchJSON(`/api/v1/enrol/${encodeURIComponent(key)}/status`);
 }

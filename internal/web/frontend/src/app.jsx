@@ -15,6 +15,7 @@ export function App() {
   const [selectedKey, setSelectedKey] = useState(null);
   const [error, setError] = useState(null);
   const [enrolDismissed, setEnrolDismissed] = useState(false);
+  const [enrolPageOpen, setEnrolPageOpen] = useState(false);
 
   useEffect(() => {
     loadStatus();
@@ -82,12 +83,14 @@ export function App() {
     e => e.status === 'pending' || e.status === 'running' || e.status === 'failed'
   );
 
-  // Show enrolment page if there are pending enrolments and user hasn't dismissed.
-  if (pendingEnrolments.length > 0 && !enrolDismissed) {
+  // Show enrolment page if there are pending enrolments (and not dismissed),
+  // or if the user explicitly navigated to it via the header button.
+  if ((pendingEnrolments.length > 0 && !enrolDismissed) || enrolPageOpen) {
     return h(EnrolPage, {
       enrolments,
       onComplete: () => {
         setEnrolDismissed(true);
+        setEnrolPageOpen(false);
         loadData();
       },
       onUpdate: loadStatus,
@@ -101,7 +104,11 @@ export function App() {
       status,
       onSync: loadData,
       pendingEnrolments: pendingEnrolments.length,
-      onEnrolClick: () => setEnrolDismissed(false),
+      hasEnrolments: enrolments.length > 0,
+      onEnrolClick: () => {
+        setEnrolDismissed(false);
+        setEnrolPageOpen(true);
+      },
     }),
     error && h('div', { class: 'error-banner' }, error),
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),

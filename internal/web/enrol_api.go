@@ -100,6 +100,31 @@ func (s *Server) handleEnrolStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, info)
 }
 
+func (s *Server) handleEnrolReset(w http.ResponseWriter, r *http.Request) {
+	if !s.requireEnrolAuth(w) {
+		return
+	}
+	key := r.PathValue("key")
+
+	runner := s.getEnrolRunner()
+	if runner == nil {
+		writeError(w, "enrolments not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	err := runner.Reset(key)
+	if err != nil {
+		if errors.Is(err, ErrEnrolNotFound) {
+			writeError(w, "enrolment not found", http.StatusNotFound)
+			return
+		}
+		writeError(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	writeJSON(w, map[string]any{"status": "pending"})
+}
+
 func (s *Server) handleEnrolComplete(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return

@@ -12,22 +12,26 @@ import (
 
 // LifecycleManager manages token TTL checks and renewal.
 type LifecycleManager struct {
-	client        *vault.Client
-	checkInterval time.Duration
-	needsReauth   atomic.Bool
+	client         *vault.Client
+	checkInterval  time.Duration
+	disableRenewal bool
+	needsReauth    atomic.Bool
 
 	// Exponential backoff state for check failures.
 	currentDelay time.Duration
 	maxDelay     time.Duration
 }
 
-// NewLifecycleManager creates a new token lifecycle manager.
-func NewLifecycleManager(client *vault.Client, checkInterval time.Duration) *LifecycleManager {
+// NewLifecycleManager creates a new token lifecycle manager. When
+// disableRenewal is true the manager still monitors TTL and signals re-auth
+// when the token expires, but never calls RenewSelf.
+func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disableRenewal bool) *LifecycleManager {
 	return &LifecycleManager{
-		client:        client,
-		checkInterval: checkInterval,
-		currentDelay:  checkInterval,
-		maxDelay:      5 * time.Minute,
+		client:         client,
+		checkInterval:  checkInterval,
+		disableRenewal: disableRenewal,
+		currentDelay:   checkInterval,
+		maxDelay:       5 * time.Minute,
 	}
 }
 
@@ -121,9 +125,9 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	renewableRaw, _ := secret.Data["renewable"]
 	renewable, _ := renewableRaw.(bool)
 
-	// Renew at 75% of TTL (i.e., when only 25% remains)
+	// Renew at 75% of TTL (i.e., when only 25% remains), unless renewal is disabled.
 	renewThreshold := ttl / 4
-	if ttl <= renewThreshold && renewable {
+	if ttl <= renewThreshold && renewable && !lm.disableRenewal {
 		slog.Info("renewing token", "ttl_remaining", ttl)
 		_, err := lm.client.RenewSelf(ctx, 0)
 		if err != nil {

@@ -241,7 +241,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start token lifecycle manager.
-	lm := auth.NewLifecycleManager(vc, 5*time.Minute)
+	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
 	lifecycleErrCh := lm.Start(ctx)
 
 	// Start refresh manager for any enrolment whose engine rotates its own

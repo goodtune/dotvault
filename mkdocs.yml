@@ -60,6 +60,8 @@ nav:
   - Service Onboarding:
       - Overview: services/overview.md
       - GitHub CLI: services/github.md
+      - JFrog Platform: services/jfrog.md
+      - SSH Keys: services/ssh.md
   - Web UI: web-ui.md
   - Admin Guide:
       - Deployment: admin/deployment.md

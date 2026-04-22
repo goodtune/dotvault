@@ -75,7 +75,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\dotva
 
 ### Config Sections
 
-- **`vault`** — address (required), auth_method, auth_mount, auth_role, kv_mount (default `"kv"`), user_prefix (default `"users/"`, trailing slash enforced), ca_cert, tls_skip_verify
+- **`vault`** — address (required), auth_method, auth_mount, auth_role, kv_mount (default `"kv"`), user_prefix (default `"users/"`, trailing slash enforced), ca_cert, tls_skip_verify, disable_token_renewal (default false — set true to prevent the daemon from calling RenewSelf; TTL expiry still triggers re-auth)
 - **`sync`** — interval as Go duration string (default `15m`)
 - **`web`** — enabled (default false), listen (loopback only, hard invariant), login_text (markdown), secret_view_text (markdown)
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)

@@ -17,7 +17,7 @@ func TestLifecycleManager_Start(t *testing.T) {
 	vc := mustVaultClient(t)
 	vc.SetToken("dev-root-token")
 
-	lm := NewLifecycleManager(vc, 1*time.Second)
+	lm := NewLifecycleManager(vc, 1*time.Second, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -41,7 +41,7 @@ func TestLifecycleManager_NeedsReauth(t *testing.T) {
 	vc := mustVaultClient(t)
 	vc.SetToken("dev-root-token")
 
-	lm := NewLifecycleManager(vc, 1*time.Second)
+	lm := NewLifecycleManager(vc, 1*time.Second, false)
 
 	// With a valid root token, should not need reauth
 	if lm.NeedsReauth() {
@@ -68,7 +68,7 @@ func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	lm := NewLifecycleManager(vc, 50*time.Millisecond)
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -85,6 +85,45 @@ func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 
 	if !lm.NeedsReauth() {
 		t.Error("NeedsReauth() = false, want true after 403")
+	}
+}
+
+func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
+	renewCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":       json.Number("30"), // well within renewal threshold
+					"renewable": true,
+					"expire_time": "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renewCalled = true
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if renewCalled {
+		t.Error("RenewSelf was called despite disable_token_renewal=true")
 	}
 }
 
@@ -107,7 +146,7 @@ func TestLifecycleManager_TransientErrorNoReauth(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	lm := NewLifecycleManager(vc, 50*time.Millisecond)
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

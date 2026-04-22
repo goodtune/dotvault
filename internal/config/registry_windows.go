@@ -60,14 +60,15 @@ func loadFromRegistry() (*Config, bool, error) {
 // registryLayer holds the flat values read from a single registry hive.
 type registryLayer struct {
 	// Vault
-	VaultAddress       string
-	VaultCACert        string
-	VaultTLSSkipVerify *uint32
-	VaultKVMount       string
-	VaultUserPrefix    string
-	VaultAuthMethod    string
-	VaultAuthRole      string
-	VaultAuthMount     string
+	VaultAddress            string
+	VaultCACert             string
+	VaultTLSSkipVerify      *uint32
+	VaultKVMount            string
+	VaultUserPrefix         string
+	VaultAuthMethod         string
+	VaultAuthRole           string
+	VaultAuthMount          string
+	VaultDisableTokenRenewal *uint32
 
 	// Sync
 	SyncInterval string
@@ -107,6 +108,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultAuthMethod, _ = readRegString(vk, "AuthMethod")
 		layer.VaultAuthRole, _ = readRegString(vk, "AuthRole")
 		layer.VaultAuthMount, _ = readRegString(vk, "AuthMount")
+		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
 	}
 
 	// Read Sync subkey.
@@ -159,6 +161,9 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.VaultAuthMount != "" {
 		cfg.Vault.AuthMount = layer.VaultAuthMount
+	}
+	if layer.VaultDisableTokenRenewal != nil {
+		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
 	}
 	if layer.SyncInterval != "" {
 		cfg.Sync.RawInterval = layer.SyncInterval

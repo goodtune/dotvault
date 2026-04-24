@@ -6,11 +6,8 @@ export function EnrolPage({ enrolments, onComplete, onUpdate }) {
   const allAddressed = enrolments.every(
     e => e.status === 'complete' || e.status === 'skipped'
   );
-  const anyPending = enrolments.some(
-    e => e.status === 'pending' || e.status === 'failed'
-  );
   const anyRunning = enrolments.some(e => e.status === 'running');
-  const isReEnrolMode = allAddressed && !anyPending;
+  const isReEnrolMode = allAddressed;
 
   async function handleContinue() {
     try {

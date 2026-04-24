@@ -466,3 +466,34 @@ body {
   font-family: inherit;
 }
 .enrol-indicator:hover { background: #fde68a; }
+.enrol-indicator-idle {
+  background: transparent;
+  color: #888;
+  border: 1px solid #ddd;
+  padding: 2px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+}
+.enrol-indicator-idle:hover { background: #f5f5f5; color: #333; }
+.enrol-warn {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 6px;
+}
+.enrol-warn-text { font-size: 13px; color: #92400e; margin: 0 0 10px; }
+.enrol-warn-actions { display: flex; gap: 8px; }
+.enrol-btn-danger {
+  background: #dc2626;
+  color: #fff;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+}
+.enrol-btn-danger:hover { background: #b91c1c; }

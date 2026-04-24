@@ -228,6 +228,95 @@ func TestEnrolmentRunner_Start_AlreadyRunning(t *testing.T) {
 	}
 }
 
+func TestEnrolmentRunner_Reset(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	tests := []struct {
+		name      string
+		fromState string
+		wantErr   error
+		wantState string
+	}{
+		{name: "from complete", fromState: "complete", wantErr: nil, wantState: "pending"},
+		{name: "from skipped", fromState: "skipped", wantErr: nil, wantState: "pending"},
+		{name: "from pending", fromState: "pending", wantErr: ErrEnrolNotResettable, wantState: "pending"},
+		{name: "from failed", fromState: "failed", wantErr: ErrEnrolNotResettable, wantState: "failed"},
+		{name: "from running", fromState: "running", wantErr: ErrEnrolAlreadyRunning, wantState: "running"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := NewEnrolmentRunner(map[string]config.Enrolment{
+				"svc": {Engine: "mock"},
+			})
+			runner.mu.RLock()
+			s := runner.states["svc"]
+			runner.mu.RUnlock()
+			s.mu.Lock()
+			s.status = tc.fromState
+			s.output = []string{"prior line"}
+			s.errMsg = "prior error"
+			s.mu.Unlock()
+
+			err := runner.Reset("svc")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Reset() error = %v, want %v", err, tc.wantErr)
+			}
+
+			info, _ := runner.GetState("svc")
+			if info.Status != tc.wantState {
+				t.Errorf("status = %q, want %q", info.Status, tc.wantState)
+			}
+			if tc.wantErr == nil {
+				if info.Error != "" {
+					t.Errorf("error = %q, want empty after successful reset", info.Error)
+				}
+				if len(info.Output) != 0 {
+					t.Errorf("output = %v, want empty after successful reset", info.Output)
+				}
+			}
+		})
+	}
+}
+
+func TestEnrolmentRunner_ResetUnknownKey(t *testing.T) {
+	runner := NewEnrolmentRunner(nil)
+	err := runner.Reset("nonexistent")
+	if !errors.Is(err, ErrEnrolNotFound) {
+		t.Errorf("Reset() error = %v, want %v", err, ErrEnrolNotFound)
+	}
+}
+
+func TestEnrolmentRunner_ResetThenStart(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{
+		name:   "Mock",
+		fields: []string{"token"},
+		creds:  map[string]string{"token": "second-token"},
+	})
+	defer enrol.UnregisterEngine("mock")
+
+	runner := NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "mock"},
+	})
+	runner.MarkComplete("svc")
+
+	if err := runner.Reset("svc"); err != nil {
+		t.Fatalf("Reset() error: %v", err)
+	}
+
+	vc := newFakeVaultServer(t, fakeVaultHandler)
+	if err := runner.Start(context.Background(), "svc", vc, "kv", "users/gary/", "gary", nil); err != nil {
+		t.Fatalf("Start() after Reset() error: %v", err)
+	}
+	runner.WaitForKey("svc")
+
+	info, _ := runner.GetState("svc")
+	if info.Status != "complete" {
+		t.Errorf("status after re-run = %q, want %q", info.Status, "complete")
+	}
+}
+
 func TestEnrolmentRunner_Start_Retry(t *testing.T) {
 	retryEngine := &mockEngine{
 		name:   "Retry",

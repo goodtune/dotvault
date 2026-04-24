@@ -128,6 +128,7 @@ func (s *Server) registerRoutes() {
 	// Enrolment runner routes
 	s.mux.HandleFunc("POST /api/v1/enrol/{key}/start", s.requireCSRF(s.handleEnrolStart))
 	s.mux.HandleFunc("POST /api/v1/enrol/{key}/skip", s.requireCSRF(s.handleEnrolSkip))
+	s.mux.HandleFunc("POST /api/v1/enrol/{key}/reset", s.requireCSRF(s.handleEnrolReset))
 	s.mux.HandleFunc("GET /api/v1/enrol/{key}/status", s.handleEnrolStatus)
 	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
 

@@ -104,6 +104,103 @@ func TestHandleEnrolStatus(t *testing.T) {
 	}
 }
 
+func TestHandleEnrolReset(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "mock"},
+	})
+	s.enrolRunner.MarkComplete("svc")
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/reset", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.handleEnrolReset(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["status"] != "pending" {
+		t.Errorf("status = %v, want %q", resp["status"], "pending")
+	}
+
+	info, _ := s.enrolRunner.GetState("svc")
+	if info.Status != "pending" {
+		t.Errorf("runner state = %q, want %q", info.Status, "pending")
+	}
+}
+
+func TestHandleEnrolReset_NotFound(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/bogus/reset", nil)
+	req.SetPathValue("key", "bogus")
+	w := httptest.NewRecorder()
+
+	s.handleEnrolReset(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleEnrolReset_Conflict(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
+		"svc": {Engine: "mock"},
+	})
+	// Pending is not resettable.
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/reset", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.handleEnrolReset(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", w.Code)
+	}
+}
+
+func TestHandleEnrolReset_NoRunner(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	// Intentionally leave s.enrolRunner nil.
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/reset", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.handleEnrolReset(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+func TestHandleEnrolResetRequiresCSRF(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(nil)
+
+	req := httptest.NewRequest("POST", "/api/v1/enrol/svc/reset", nil)
+	req.SetPathValue("key", "svc")
+	w := httptest.NewRecorder()
+
+	s.requireCSRF(s.handleEnrolReset)(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
+	}
+}
+
 func TestHandleEnrolComplete(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(nil)

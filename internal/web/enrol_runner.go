@@ -44,6 +44,7 @@ var (
 	ErrEnrolBusy           = fmt.Errorf("another enrolment is running")
 	ErrEnrolInvalidEngine  = fmt.Errorf("enrolment has no valid engine")
 	ErrEnrolNotStartable   = fmt.Errorf("enrolment is not in a startable state")
+	ErrEnrolNotResettable  = fmt.Errorf("enrolment is not in a resettable state")
 )
 
 // EnrolmentRunner manages per-enrolment lifecycle for web mode.
@@ -142,6 +143,33 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 		result = append(result, info)
 	}
 	return result
+}
+
+// Reset returns a complete or skipped enrolment to pending so it can be re-run.
+// Returns an error if the key is not found, the enrolment is running, or it
+// is in a state that cannot be reset (e.g. pending or failed).
+func (r *EnrolmentRunner) Reset(key string) error {
+	r.mu.RLock()
+	s, ok := r.states[key]
+	r.mu.RUnlock()
+	if !ok {
+		return ErrEnrolNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.status {
+	case "complete", "skipped":
+		s.status = "pending"
+		s.output = nil
+		s.errMsg = ""
+		s.doneCh = make(chan struct{})
+		return nil
+	case "running":
+		return ErrEnrolAlreadyRunning
+	default:
+		return ErrEnrolNotResettable
+	}
 }
 
 // Skip marks an enrolment as skipped. Returns error if key not found or running.

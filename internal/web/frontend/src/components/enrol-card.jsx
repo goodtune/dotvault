@@ -1,6 +1,6 @@
 import { h } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { startEnrolment, skipEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
+import { startEnrolment, skipEnrolment, resetEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
 import { copyText } from '../clipboard.js';
 
 export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
@@ -9,6 +9,8 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [error, setError] = useState(enrolment.error || null);
   const [promptLabel, setPromptLabel] = useState(null);
   const [secretValue, setSecretValue] = useState('');
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -56,6 +58,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           setLocalStatus(statusData.status);
           setError(statusData.error || null);
           setPromptLabel(null);
+          setSecretValue('');
           if (onUpdate) onUpdate();
         }
       } catch (err) {
@@ -70,6 +73,8 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       setLocalStatus('running');
       setOutput([]);
       setError(null);
+      setSecretValue('');
+      setPromptLabel(null);
       if (onUpdate) onUpdate();
       startPolling();
     } catch (err) {
@@ -83,6 +88,24 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       setLocalStatus('skipped');
       if (onUpdate) onUpdate();
     } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleResetConfirm() {
+    setResetting(true);
+    setError(null);
+    try {
+      await resetEnrolment(enrolment.key);
+      setConfirmReset(false);
+      setResetting(false);
+      setLocalStatus('pending');
+      setOutput([]);
+      setSecretValue('');
+      setPromptLabel(null);
+      if (onUpdate) onUpdate();
+    } catch (err) {
+      setResetting(false);
       setError(err.message);
     }
   }
@@ -113,13 +136,39 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
+    const overwriteDisabled = anyRunning || resetting;
     return h('div', { class: 'enrol-card enrol-complete' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
           h('span', { class: 'enrol-check' }, '\u2713'),
           h('strong', null, enrolment.name),
         ),
-        h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
+        h('div', { class: 'enrol-card-actions' },
+          h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
+          !confirmReset && h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: () => setConfirmReset(true),
+            disabled: anyRunning,
+          }, 'Re-enrol'),
+        ),
+      ),
+      confirmReset && h('div', { class: 'enrol-warn' },
+        h('p', { class: 'enrol-warn-text' },
+          'This will overwrite your existing credentials. Are you sure?',
+        ),
+        h('div', { class: 'enrol-warn-actions' },
+          h('button', {
+            class: 'enrol-btn-danger',
+            onClick: handleResetConfirm,
+            disabled: overwriteDisabled,
+          }, resetting ? 'Overwriting\u2026' : 'Overwrite credentials'),
+          h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: () => setConfirmReset(false),
+            disabled: resetting,
+          }, 'Cancel'),
+        ),
+        error && h('p', { class: 'enrol-error-text' }, error),
       ),
     );
   }

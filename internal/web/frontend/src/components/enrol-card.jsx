@@ -10,6 +10,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const [promptLabel, setPromptLabel] = useState(null);
   const [secretValue, setSecretValue] = useState('');
   const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -89,14 +90,17 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   }
 
   async function handleResetConfirm() {
+    setResetting(true);
+    setError(null);
     try {
-      setConfirmReset(false);
       await resetEnrolment(enrolment.key);
+      setConfirmReset(false);
+      setResetting(false);
       setLocalStatus('pending');
       setOutput([]);
-      setError(null);
       if (onUpdate) onUpdate();
     } catch (err) {
+      setResetting(false);
       setError(err.message);
     }
   }
@@ -127,6 +131,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
+    const overwriteDisabled = anyRunning || resetting;
     return h('div', { class: 'enrol-card enrol-complete' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
@@ -147,9 +152,18 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           'This will overwrite your existing credentials. Are you sure?',
         ),
         h('div', { class: 'enrol-warn-actions' },
-          h('button', { class: 'enrol-btn-danger', onClick: handleResetConfirm }, 'Overwrite credentials'),
-          h('button', { class: 'enrol-btn-secondary', onClick: () => setConfirmReset(false) }, 'Cancel'),
+          h('button', {
+            class: 'enrol-btn-danger',
+            onClick: handleResetConfirm,
+            disabled: overwriteDisabled,
+          }, resetting ? 'Overwriting\u2026' : 'Overwrite credentials'),
+          h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: () => setConfirmReset(false),
+            disabled: resetting,
+          }, 'Cancel'),
         ),
+        error && h('p', { class: 'enrol-error-text' }, error),
       ),
     );
   }

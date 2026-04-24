@@ -58,6 +58,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           setLocalStatus(statusData.status);
           setError(statusData.error || null);
           setPromptLabel(null);
+          setSecretValue('');
           if (onUpdate) onUpdate();
         }
       } catch (err) {
@@ -72,6 +73,8 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       setLocalStatus('running');
       setOutput([]);
       setError(null);
+      setSecretValue('');
+      setPromptLabel(null);
       if (onUpdate) onUpdate();
       startPolling();
     } catch (err) {
@@ -98,6 +101,8 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       setResetting(false);
       setLocalStatus('pending');
       setOutput([]);
+      setSecretValue('');
+      setPromptLabel(null);
       if (onUpdate) onUpdate();
     } catch (err) {
       setResetting(false);

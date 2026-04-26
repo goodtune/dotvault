@@ -37,7 +37,9 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-    const needsPrompt = enrolment.engine !== 'github';
+    // Only engines that block on interactive terminal input (ssh's passphrase)
+    // need the /enrol/prompt poll. github and jfrog are fully browser-driven.
+    const needsPrompt = enrolment.engine === 'ssh';
     pollRef.current = setInterval(async () => {
       try {
         const statusData = await getEnrolmentStatus(enrolment.key);
@@ -121,18 +123,40 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     }
   }
 
-  // Parse device code and verification URL from GitHub engine output.
+  // Parse device code and verification URL from the engine's line-oriented
+  // output. Both github and jfrog emit a "! First, copy your one-time code: X"
+  // line; jfrog then emits "✓ Opened https://... in browser", github emits
+  // "- Press Enter to open https://... in your browser...". Either shape
+  // contains an https URL we can link to.
   const deviceCode = output.reduce((found, line) => {
-    const match = line.match(/one-time code: (\S+)/);
+    const match = line.match(/one-time code:\s*(\S+)/);
     return match ? match[1] : found;
   }, null);
 
   const verificationURL = output.reduce((found, line) => {
-    const match = line.match(/open (https?:\/\/\S+)/);
-    return match ? match[1] : found;
+    const match = line.match(/(https?:\/\/\S+)/);
+    // Strip trailing punctuation that terminates a prose sentence but isn't
+    // part of the URL (e.g. "...browser." or "manually." in our own copy).
+    return match ? match[1].replace(/[.,;:]+$/, '') : found;
   }, null);
 
-  const isGitHub = enrolment.engine === 'github';
+  // Latest spinner/progress line ("⠼ Waiting for authentication...",
+  // "⠼ Minting dotvault-owned access token...") gives the user a live hint
+  // about which step the engine is on.
+  let progressLine = null;
+  for (let i = output.length - 1; i >= 0; i--) {
+    const trimmed = output[i].trim();
+    if (trimmed.startsWith('⠼')) {
+      progressLine = trimmed.replace(/^⠼\s*/, '');
+      break;
+    }
+  }
+
+  const hasDeviceFlow = Boolean(deviceCode && verificationURL);
+  // Once the engine has moved past "waiting for authentication" into a
+  // server-to-server exchange (e.g. jfrog's mint step), the code is no
+  // longer actionable — collapse the code UI and show just the progress.
+  const codeNoLongerActionable = Boolean(progressLine && /minting/i.test(progressLine));
   const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
@@ -193,26 +217,31 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           h('span', { class: 'enrol-badge enrol-badge-running' }, 'RUNNING'),
         ),
       ),
-      // GitHub device flow UI
-      isGitHub && deviceCode && h('div', { class: 'enrol-device-flow' },
-        h('p', { class: 'enrol-device-label' }, 'Enter this code on GitHub:'),
+      // Active device-code step — show the code + a link to the service.
+      hasDeviceFlow && !codeNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `Enter this code on ${enrolment.name}:`),
         h('div', { class: 'enrol-device-code' }, deviceCode),
         h('div', { class: 'enrol-device-actions' },
           h('button', {
             class: 'enrol-btn-secondary',
             onClick: () => copyText(deviceCode),
           }, 'Copy Code'),
-          verificationURL && h('a', {
+          h('a', {
             class: 'enrol-btn-secondary',
             href: verificationURL,
             target: '_blank',
             rel: 'noopener noreferrer',
-          }, 'Open GitHub \u2192'),
+          }, `Open ${enrolment.name} \u2192`),
         ),
-        h('p', { class: 'enrol-device-waiting' }, 'Waiting for approval...'),
+        h('p', { class: 'enrol-device-waiting' }, progressLine || 'Waiting for approval\u2026'),
       ),
-      // Passphrase prompt UI
-      promptLabel && !isGitHub && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
+      // Post-authentication server-to-server step (e.g. jfrog's token mint).
+      hasDeviceFlow && codeNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `\u2713 Signed in to ${enrolment.name}`),
+        h('p', { class: 'enrol-device-waiting' }, progressLine),
+      ),
+      // Passphrase prompt (ssh).
+      promptLabel && !hasDeviceFlow && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
         h('label', { class: 'enrol-prompt-label', htmlFor: 'enrol-secret' }, promptLabel),
         h('input', {
           type: 'password',
@@ -227,8 +256,10 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           h('button', { type: 'submit', class: 'enrol-btn-primary' }, 'Submit'),
         ),
       ),
-      // Generic output fallback
-      !isGitHub && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
+      // Fallback for engines that don't match the device-flow or prompt
+      // shapes — show whatever the engine has emitted so the user isn't
+      // left staring at a silent spinner.
+      !hasDeviceFlow && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
         output.map((line, i) => h('div', { key: i }, line)),
       ),
     );
@@ -269,6 +300,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
 function engineDescription(engine) {
   switch (engine) {
     case 'github': return 'OAuth token via device flow';
+    case 'jfrog': return 'Refreshable access token via web login';
     case 'ssh': return 'Ed25519 key generation';
     default: return engine;
   }

@@ -238,7 +238,7 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 				ExpiresIn:    &exp,
 				Scope:        "applied-permissions/user",
 			})
-		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v2/tokens":
+		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v1/tokens":
 			mintHits++
 			gotBearer = r.Header.Get("Authorization")
 			if err := json.NewDecoder(r.Body).Decode(&gotMintBody); err != nil {
@@ -345,6 +345,71 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 	}
 }
 
+// TestJFrogEngine_Run_MintUsesV1Endpoint proves the engine mints its
+// dotvault-owned token via POST /access/api/v1/tokens, not /v2/tokens.
+//
+// Regression: real-world JFrog deployments (e.g. customer SaaS hosts on
+// older Artifactory versions, or non-admin callers on instances where the
+// v2 endpoint is admin-only) respond with HTTP 404 to the v2 path. The
+// v1 endpoint is what `jfrog-client-go` has always used for self-token
+// creation and is supported back to Artifactory 7.21.1 — well below our
+// floor of 7.64.0 for the web-login flow itself.
+//
+// The test server below refuses v2 (like the real failing deployment) and
+// only serves v1. If the engine still uses v2, Run fails with "mint jfrog
+// access token: jfrog mint returned status 404".
+func TestJFrogEngine_Run_MintUsesV1Endpoint(t *testing.T) {
+	bootstrap := "bootstrap.token.sig"
+	minted := "minted.token.sig"
+
+	var v1Hits, v2Hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v2/authentication/jfrog_client_login/request":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/access/api/v2/authentication/jfrog_client_login/token/"):
+			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{AccessToken: bootstrap})
+		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v1/tokens":
+			v1Hits++
+			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{
+				AccessToken:  minted,
+				RefreshToken: "dotvault-refresh-1",
+				TokenType:    "Bearer",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v2/tokens":
+			v2Hits++
+			// Mirror the upstream deployment's behaviour: reject v2 with 404.
+			http.Error(w, `{"errors":[{"code":"NOT_FOUND","message":"HTTP 404 Not Found"}]}`, http.StatusNotFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	e := &JFrogEngine{
+		httpClient:   srv.Client(),
+		pollInterval: time.Millisecond,
+		maxWait:      time.Second,
+		now:          func() time.Time { return time.Unix(0, 0).UTC() },
+	}
+	creds, err := e.Run(context.Background(), map[string]any{
+		"url":       srv.URL,
+		"token_ttl": "1h",
+	}, newTestIO())
+	if err != nil {
+		t.Fatalf("Run error (expected v1 mint to succeed): %v", err)
+	}
+	if creds["access_token"] != minted {
+		t.Errorf("access_token = %q, want minted %q", creds["access_token"], minted)
+	}
+	if v1Hits != 1 {
+		t.Errorf("v1 /tokens hits = %d, want 1", v1Hits)
+	}
+	if v2Hits != 0 {
+		t.Errorf("v2 /tokens hits = %d, want 0 (v2 is admin-only and not all deployments expose it)", v2Hits)
+	}
+}
+
 func TestJFrogEngine_Run_RequestEndpointFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotFound)
@@ -391,7 +456,7 @@ func TestJFrogEngine_Run_Timeout(t *testing.T) {
 
 func TestJFrogEngine_Run_DefaultTTL(t *testing.T) {
 	// When token_ttl is omitted, the engine should fall back to the 60d
-	// default and pass that value to POST /access/api/v2/tokens.
+	// default and pass that value to POST /access/api/v1/tokens.
 	bootstrap := "bootstrap.token.sig"
 	minted := "minted.token.sig"
 
@@ -405,7 +470,7 @@ func TestJFrogEngine_Run_DefaultTTL(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/access/api/v2/authentication/jfrog_client_login/token/"):
 			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{AccessToken: bootstrap})
-		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v2/tokens":
+		case r.Method == http.MethodPost && r.URL.Path == "/access/api/v1/tokens":
 			_ = json.NewDecoder(r.Body).Decode(&gotMintBody)
 			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{AccessToken: minted, RefreshToken: "r1"})
 		default:

@@ -148,7 +148,7 @@ Used for `token_ttl` today; may replace `sync.interval`'s parsing later if we wa
 
 1. Web-login flow runs as today through the `jfrog_client_login/token/<uuid>` poll.
 2. The token returned is a **short-lived bootstrap token** (JFrog server default TTL, typically 1 year).
-3. The engine immediately calls `POST /access/api/v2/tokens` with `Authorization: Bearer <bootstrap>` and body:
+3. The engine immediately calls `POST /access/api/v1/tokens` with `Authorization: Bearer <bootstrap>` and body:
    ```json
    {"expires_in": <token_ttl_seconds>, "refreshable": true, "scope": "applied-permissions/user"}
    ```
@@ -156,7 +156,7 @@ Used for `token_ttl` today; may replace `sync.interval`'s parsing later if we wa
 5. Engine stamps `issued_at: now`, `expires_at: now + token_ttl`, returns the 7 fields.
 6. Bootstrap token is discarded — it is never used or stored again.
 
-Non-admin users can successfully mint refreshable tokens for themselves with a non-zero TTL. The admin-only restriction is specifically on `expires_in: 0`, which we deliberately don't use.
+v1 rather than v2: the v2 endpoint is admin-only across every JFrog deployment we've tested, so non-admin callers (and older Artifactory versions) see it as a 404. v1 has been the self-token creation endpoint since Artifactory 7.21.1 — well below our floor of 7.64.0 for the web-login flow itself — and is what `jfrog-client-go` uses for the same operation. Non-admin users can still mint refreshable tokens for themselves via v1 with any non-zero TTL.
 
 ### Refresh (periodic — every 5 min)
 
@@ -214,7 +214,7 @@ Per-enrolment backoff means one flaky JFrog doesn't stall refresh of a (future) 
 1. **`JFrogEngine.Refresh` unit tests.** `httptest.Server` serving `POST /access/api/v1/tokens`. Cases: happy path (new pair returned); 401 → `ErrRevoked`; 403 → `ErrRevoked`; 500 → wrapped error; malformed JSON → wrapped error.
 2. **`RefreshManager` unit tests.** Fake clock (new internal `Clock` interface, default `realClock`), fake `vault.Client` (reuse existing test double if present), `Refresher` test double recording calls. Cases: no `expires_at` → skipped; before half-life → skipped; past half-life → `Refresh` called; returned map written back; `ErrRevoked` → `vault.Delete`; transient error → secret intact, backoff doubled.
 3. **Config parsing.** `ParseDuration("60d") == 1440h`; `ParseDuration("6h") == 6h`; `ParseDuration("5m")` rejected by `token_ttl` validator (floor check); `ParseDuration("bogus")` returns error.
-4. **Engine mint-on-enrol.** Extend `TestJFrogEngine_Run_FullFlow` to also serve `POST /access/api/v2/tokens`, assert the bootstrap token is discarded, the stored TTL matches `settings["token_ttl"]`, and `issued_at`/`expires_at` are present.
+4. **Engine mint-on-enrol.** Extend `TestJFrogEngine_Run_FullFlow` to also serve `POST /access/api/v1/tokens`, assert the bootstrap token is discarded, the stored TTL matches `settings["token_ttl"]`, and `issued_at`/`expires_at` are present.
 5. **Manual verification** against the local Artifactory with `token_ttl: "6h"`: daemon logs should show a refresh at ~3 h, and the Vault version number increments. For a tighter loop, cranking `token_ttl: "10m"` + a test-only `check_interval_seconds: 30` demonstrates full rotation within minutes. Not committed as an automated test.
 
 ## Files Touched
@@ -224,7 +224,7 @@ Per-enrolment backoff means one flaky JFrog doesn't stall refresh of a (future) 
 | `internal/enrol/engine.go` | Add `Refresher` interface and `ErrRevoked` sentinel |
 | `internal/enrol/refresh.go` | New file: `RefreshManager` + `Clock` interface |
 | `internal/enrol/refresh_test.go` | New file: manager unit tests |
-| `internal/enrol/jfrog.go` | Add post-web-login `POST /access/api/v2/tokens`; add `Refresh` method; new schema (issued_at/expires_at; drop token_type/expires_in/scope) |
+| `internal/enrol/jfrog.go` | Add post-web-login `POST /access/api/v1/tokens`; add `Refresh` method; new schema (issued_at/expires_at; drop token_type/expires_in/scope) |
 | `internal/enrol/jfrog_test.go` | Extend for mint-on-enrol; add `Refresh` tests |
 | `internal/config/config.go` | Add `ParseDuration` helper; validate `token_ttl` at load |
 | `internal/config/config_test.go` | Duration parsing + validation tests |

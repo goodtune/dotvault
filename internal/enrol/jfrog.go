@@ -448,14 +448,16 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 // the caller-specified TTL. Called once at enrolment time; the bootstrap
 // token is discarded after this call returns.
 //
-// Endpoint: POST {platform}/access/api/v2/tokens with a bearer auth header.
+// Endpoint: POST {platform}/access/api/v1/tokens with a bearer auth header.
 // Body: {"expires_in": <seconds>, "refreshable": true, "scope": "applied-permissions/user"}.
 //
-// Non-admin users can successfully mint refreshable tokens for themselves
-// with any non-zero TTL; the admin-only restriction in JFrog only applies
-// to expires_in=0 (never-expiring tokens), which we intentionally do not use.
+// v1 — not v2 — because the v2 endpoint is admin-only in every JFrog
+// deployment the community currently reports on, so non-admin callers
+// (and older Artifactory versions) see it as a 404. v1 has been the
+// self-token creation endpoint since Artifactory 7.21.1 and matches what
+// `jfrog-client-go` uses for the same flow.
 func jfrogMintRefreshableToken(ctx context.Context, client *http.Client, platformURL, bootstrapToken string, ttl time.Duration) (jfrogCommonTokenParams, error) {
-	endpoint := platformURL + "/access/api/v2/tokens"
+	endpoint := platformURL + "/access/api/v1/tokens"
 	body, err := json.Marshal(struct {
 		ExpiresIn   int64  `json:"expires_in"`
 		Refreshable bool   `json:"refreshable"`

@@ -217,7 +217,7 @@ Flow (enrolment — runs once per user):
 1. POST `{url}/access/api/v2/authentication/jfrog_client_login/request` with a random UUID
 2. Open `{url}/ui/login?jfClientSession=<uuid>&jfClientName=JFrog-CLI&jfClientCode=1` — user confirms the last 4 chars of the UUID after sign-in
 3. Poll GET `{url}/access/api/v2/authentication/jfrog_client_login/token/<uuid>` until 200 — returns a bootstrap token with the JFrog server default TTL (typically 1 year)
-4. POST `{url}/access/api/v2/tokens` with `Authorization: Bearer <bootstrap>` and `{"expires_in":<token_ttl_seconds>,"refreshable":true,"scope":"applied-permissions/user"}` — mints the dotvault-owned pair; the bootstrap token is discarded
+4. POST `{url}/access/api/v1/tokens` with `Authorization: Bearer <bootstrap>` and `{"expires_in":<token_ttl_seconds>,"refreshable":true,"scope":"applied-permissions/user"}` — mints the dotvault-owned pair; the bootstrap token is discarded. v1 rather than v2 because v2 is admin-only on most JFrog deployments (non-admins and older Artifactory versions see it as a 404); v1 has been the self-token endpoint since Artifactory 7.21.1 and is what `jfrog-client-go` uses.
 
 Flow (refresh — periodic, driven by `RefreshManager`):
 1. Every `check_interval` (daemon-wired at 5 min), iterate all enrolments whose engine implements `Refresher`

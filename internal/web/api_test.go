@@ -373,6 +373,10 @@ func TestIsSensitiveSettingKey(t *testing.T) {
 		{"privateKey", true},
 		{"access-token", true},
 		{"oauth-token", true},
+		// Acronym-style keys: must still be caught.
+		{"JWTToken", true},
+		{"XMLToken", true},
+		{"APIKey", true},
 	} {
 		if got := isSensitiveSettingKey(tc.key); got != tc.sensitive {
 			t.Errorf("isSensitiveSettingKey(%q) = %v, want %v", tc.key, got, tc.sensitive)

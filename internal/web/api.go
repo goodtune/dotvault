@@ -293,25 +293,32 @@ func isSensitiveSettingKey(k string) bool {
 // normalizeKey lower-cases a key and converts camelCase / kebab-case into
 // snake_case so the redaction matcher can treat all naming conventions
 // uniformly. Examples: `clientSecret` → `client_secret`,
-// `access-token` → `access_token`, `OAuthToken` → `oauth_token`.
-// Note: runs of consecutive upper-case letters are not split (e.g.
-// `XMLToken` → `xmltoken`), but no real credential field name uses that
-// style so the matcher is unaffected in practice.
+// `access-token` → `access_token`, `OAuthToken` → `oauth_token`,
+// `XMLToken` → `xml_token`. Acronym boundaries (an upper-case run
+// followed by a capitalized word) are split so that defensive matching
+// still catches keys like `JWTToken` or `APIKey`.
 func normalizeKey(k string) string {
 	var b strings.Builder
 	b.Grow(len(k) + 4)
-	var prev rune
-	for i, r := range k {
+	runes := []rune(k)
+	for i, r := range runes {
 		switch {
 		case r == '-':
 			b.WriteByte('_')
-		case i > 0 && unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)):
-			b.WriteByte('_')
+		case unicode.IsUpper(r):
+			if i > 0 {
+				prev := runes[i-1]
+				nextIsLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+				prevPrevIsUpper := i > 1 && unicode.IsUpper(runes[i-2])
+				if unicode.IsLower(prev) || unicode.IsDigit(prev) ||
+					(unicode.IsUpper(prev) && nextIsLower && prevPrevIsUpper) {
+					b.WriteByte('_')
+				}
+			}
 			b.WriteRune(unicode.ToLower(r))
 		default:
 			b.WriteRune(unicode.ToLower(r))
 		}
-		prev = r
 	}
 	return b.String()
 }

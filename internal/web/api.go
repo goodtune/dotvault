@@ -293,7 +293,10 @@ func isSensitiveSettingKey(k string) bool {
 // normalizeKey lower-cases a key and converts camelCase / kebab-case into
 // snake_case so the redaction matcher can treat all naming conventions
 // uniformly. Examples: `clientSecret` → `client_secret`,
-// `access-token` → `access_token`, `OAuthToken` → `o_auth_token`.
+// `access-token` → `access_token`, `OAuthToken` → `oauth_token`.
+// Note: runs of consecutive upper-case letters are not split (e.g.
+// `XMLToken` → `xmltoken`), but no real credential field name uses that
+// style so the matcher is unaffected in practice.
 func normalizeKey(k string) string {
 	var b strings.Builder
 	b.Grow(len(k) + 4)

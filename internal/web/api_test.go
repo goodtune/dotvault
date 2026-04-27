@@ -351,6 +351,7 @@ func TestIsSensitiveSettingKey(t *testing.T) {
 		// camelCase / kebab-case variants must also match.
 		{"clientSecret", true},
 		{"refreshToken", true},
+		{"OAuthToken", true},
 		{"privateKey", true},
 		{"access-token", true},
 		{"oauth-token", true},

@@ -114,6 +114,7 @@ export function App() {
         },
         onConfigClick: () => setConfigPageOpen(true),
       }),
+      error && h('div', { class: 'error-banner' }, error),
       h(ConfigPage, { onClose: () => setConfigPageOpen(false) }),
     );
   }

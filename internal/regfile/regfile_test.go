@@ -352,6 +352,63 @@ func TestRejectsNonASCIIValueName(t *testing.T) {
 	}
 }
 
+func TestHexValueLongHeadStillEmitsByteOnFirstLine(t *testing.T) {
+	// Build a setting name long enough that head + first byte sits well
+	// past 50 chars but still fits within the wrap budget. The first
+	// emitted line must contain at least one hex byte rather than a bare
+	// `head\` with no payload.
+	longName := strings.Repeat("a", 50) // legal printable ASCII
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					longName: "value\nwith newline", // forces hex(1)
+				},
+			},
+		},
+	}
+	got := mustGenerate(t, cfg)
+	// Find the first hex line for this setting and confirm it contains
+	// at least one byte token before any backslash continuation.
+	prefix := `"` + longName + `"=hex(1):`
+	idx := strings.Index(got, prefix)
+	if idx == -1 {
+		t.Fatalf("hex value not present in output:\n%s", got)
+	}
+	firstLineEnd := strings.Index(got[idx:], "\r\n")
+	if firstLineEnd == -1 {
+		t.Fatalf("no CRLF after hex value start")
+	}
+	firstLine := got[idx : idx+firstLineEnd]
+	// The body after `hex(1):` must contain at least one two-hex-digit byte.
+	body := strings.TrimSuffix(strings.TrimPrefix(firstLine, prefix), `\`)
+	if len(body) < 2 {
+		t.Errorf("first hex line has no payload byte: %q", firstLine)
+	}
+}
+
+func TestHexValueRejectsImpossiblyLongName(t *testing.T) {
+	// A name so long that head + first byte cannot fit within maxLineLen
+	// must error rather than produce malformed output.
+	tooLong := strings.Repeat("a", 200)
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					tooLong: "value\nwith newline",
+				},
+			},
+		},
+	}
+	if _, err := GenerateText(cfg); err == nil {
+		t.Fatalf("expected error for impossibly long value name")
+	}
+}
+
 func TestQuoteREGSZ(t *testing.T) {
 	tests := []struct {
 		in, want string

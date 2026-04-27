@@ -493,6 +493,8 @@ on any problem the daemon would normally reject at load time.`,
 }
 
 func runRegExport(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
 	cfg, err := config.Load(args[0])
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)

@@ -271,22 +271,34 @@ func (e *emitter) writeMultiString(name string, values []string) {
 // using the standard backslash continuation that regedit.exe produces.
 // Continuation lines are prefixed with two spaces; that indent is included
 // in the running length so emitted lines do not exceed maxLineLen.
+//
+// The first byte is always emitted on the same line as the head so we never
+// produce a degenerate first line of just `<head>\` with no payload byte.
+// If the head plus first byte cannot fit (excluding any later wrap budget),
+// generation fails with an explicit error rather than emitting malformed
+// output.
 func (e *emitter) writeHexValue(name string, kind int, data []byte) {
 	head := fmt.Sprintf("%s=hex(%d):", quoteREGName(name), kind)
-	cur := head
-	for i, by := range data {
+	if len(data) == 0 {
+		e.b.WriteString(head + "\r\n")
+		return
+	}
+	firstToken := fmt.Sprintf("%02x", data[0])
+	// Reserve two columns for the trailing ",\\" if a continuation is needed.
+	if len(head)+len(firstToken) > maxLineLen-2 {
+		e.fail("registry value name %q is too long to encode as hex(%d) within %d columns", name, kind, maxLineLen)
+		return
+	}
+	cur := head + firstToken
+	for _, by := range data[1:] {
 		token := fmt.Sprintf("%02x", by)
-		sep := ","
-		if i == 0 {
-			sep = ""
-		}
 		// Reserve two columns for the trailing ",\\" on a continuation line.
-		if len(cur)+len(sep)+len(token) > maxLineLen-2 {
-			e.b.WriteString(cur + sep + "\\\r\n")
+		if len(cur)+1+len(token) > maxLineLen-2 {
+			e.b.WriteString(cur + ",\\\r\n")
 			cur = "  " + token
 			continue
 		}
-		cur += sep + token
+		cur += "," + token
 	}
 	e.b.WriteString(cur + "\r\n")
 }

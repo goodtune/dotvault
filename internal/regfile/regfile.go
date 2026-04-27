@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/goodtune/dotvault/internal/config"
 )
@@ -292,28 +293,37 @@ func (e *emitter) writeMultiString(name string, values []string) {
 // If the head plus first byte cannot fit (excluding any later wrap budget),
 // generation fails with an explicit error rather than emitting malformed
 // output.
+//
+// Lengths are measured in runes rather than bytes so Unicode value names
+// don't trigger spurious wraps or false "too long" errors. Hex tokens
+// (`,XX`) and the indent are pure ASCII, so rune count matches column
+// count for everything we append.
 func (e *emitter) writeHexValue(name string, kind int, data []byte) {
 	head := fmt.Sprintf("%s=hex(%d):", quoteREGName(name), kind)
+	headLen := utf8.RuneCountInString(head)
 	if len(data) == 0 {
 		e.b.WriteString(head + "\r\n")
 		return
 	}
 	firstToken := fmt.Sprintf("%02x", data[0])
 	// Reserve two columns for the trailing ",\\" if a continuation is needed.
-	if len(head)+len(firstToken) > maxLineLen-2 {
+	if headLen+len(firstToken) > maxLineLen-2 {
 		e.fail("registry value name %q is too long to encode as hex(%d) within %d columns", name, kind, maxLineLen)
 		return
 	}
 	cur := head + firstToken
+	curLen := headLen + len(firstToken)
 	for _, by := range data[1:] {
 		token := fmt.Sprintf("%02x", by)
 		// Reserve two columns for the trailing ",\\" on a continuation line.
-		if len(cur)+1+len(token) > maxLineLen-2 {
+		if curLen+1+len(token) > maxLineLen-2 {
 			e.b.WriteString(cur + ",\\\r\n")
 			cur = "  " + token
+			curLen = 2 + len(token)
 			continue
 		}
 		cur += "," + token
+		curLen += 1 + len(token)
 	}
 	e.b.WriteString(cur + "\r\n")
 }

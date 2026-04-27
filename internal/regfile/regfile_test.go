@@ -2,6 +2,7 @@ package regfile
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -17,11 +18,33 @@ func mustGenerate(t *testing.T, cfg *config.Config) string {
 	return got
 }
 
-func TestGenerateMinimal(t *testing.T) {
-	cfg := &config.Config{
+// validBaseConfig returns a minimally valid Config — one that
+// `config.(*Config).validate()` would accept — for tests that only
+// exercise renderer-level behavior and don't otherwise care about rule
+// content. This keeps tests aligned with the real-world inputs the CLI
+// passes to Generate*, since callers always come through config.Load.
+func validBaseConfig() *config.Config {
+	return &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
-		Sync:  config.SyncConfig{RawInterval: "15m"},
+		Rules: []config.Rule{
+			{
+				Name:     "minimal",
+				VaultKey: "minimal",
+				Target: config.Target{
+					Path:   "~/.dotvault/minimal",
+					Format: "text",
+				},
+			},
+		},
 	}
+}
+
+func TestGenerateMinimal(t *testing.T) {
+	// Use a config that would actually pass config.(*Config).validate().
+	// The CLI always feeds Generate* a validated config, so tests should
+	// mirror that.
+	cfg := validBaseConfig()
+	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
 
 	got := mustGenerate(t, cfg)
 
@@ -602,6 +625,75 @@ func TestGenerateProducesUTF16LEWithBOM(t *testing.T) {
 	// First payload character is 'W' from "Windows Registry...".
 	if len(got) < 4 || got[2] != 'W' || got[3] != 0x00 {
 		t.Errorf("Generate output not UTF-16LE encoded; bytes 2-3 = % x", got[2:4])
+	}
+}
+
+func TestGenerateOnLoadedConfig(t *testing.T) {
+	// Round-trip: load a YAML through config.Load (which runs validate)
+	// and confirm Generate accepts the result. This exercises the actual
+	// path the CLI uses.
+	yamlBody := `vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+sync:
+  interval: "15m"
+rules:
+  - name: gh
+    vault_key: gh
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      template: |
+        github.com:
+          oauth_token: "{{ .oauth_token }}"
+enrolments:
+  gh:
+    engine: github
+`
+	dir := t.TempDir()
+	yamlPath := dir + "/config.yaml"
+	if err := os.WriteFile(yamlPath, []byte(yamlBody), 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	for _, want := range []string{
+		"Windows Registry Editor Version 5.00",
+		`\Rules\gh]`,
+		`"VaultKey"="gh"`,
+		`\Enrolments\gh]`,
+		`"Engine"="github"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("loaded-config output missing %q\n%s", want, got)
+		}
+	}
+}
+
+func TestHexValueAcceptsLongUnicodeName(t *testing.T) {
+	// A name made entirely of multi-byte runes that exceeds maxLineLen
+	// when measured in bytes but fits when measured in runes. Without
+	// rune-aware length tracking, writeHexValue would (incorrectly)
+	// reject this as "too long to encode within 76 columns".
+	longUnicode := strings.Repeat("é", 40) // 40 runes, 80 UTF-8 bytes
+	cfg := validBaseConfig()
+	cfg.Enrolments = map[string]config.Enrolment{
+		"gh": {
+			Engine: "github",
+			Settings: map[string]any{
+				longUnicode: "value\nforces hex(1)",
+			},
+		},
+	}
+	if _, err := GenerateText(cfg); err != nil {
+		t.Errorf("Unicode name should be accepted with rune-length tracking: %v", err)
 	}
 }
 

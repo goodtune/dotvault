@@ -182,6 +182,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		webServer, err = web.NewServer(web.ServerConfig{
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
+			SyncCfg:       cfg.Sync,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
@@ -292,9 +293,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	} else {
 		// CLI mode: terminal-based wizard (unchanged).
 		enrolIO := enrol.IO{
-			Out:     os.Stderr,
-			Browser: browser.OpenURL,
-			Log:     slog.Default(),
+			Out:      os.Stderr,
+			Browser:  browser.OpenURL,
+			Log:      slog.Default(),
 			Username: username,
 			PromptSecret: func(label string) (string, error) {
 				fd := int(os.Stdin.Fd())

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -93,6 +94,153 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{"rules": rules})
+}
+
+// handleConfig returns the effective service configuration: managed files
+// (sync rules) and active enrolments. It is a view-only endpoint and never
+// includes secret values such as the Vault CA certificate or stored
+// credentials. Available only to authenticated sessions.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	type targetView struct {
+		Path        string `json:"path"`
+		Format      string `json:"format"`
+		Merge       string `json:"merge,omitempty"`
+		HasTemplate bool   `json:"has_template"`
+	}
+	type oauthView struct {
+		Provider   string   `json:"provider"`
+		EnginePath string   `json:"engine_path,omitempty"`
+		Scopes     []string `json:"scopes,omitempty"`
+	}
+	type ruleView struct {
+		Name        string     `json:"name"`
+		Description string     `json:"description,omitempty"`
+		VaultKey    string     `json:"vault_key"`
+		Target      targetView `json:"target"`
+		OAuth       *oauthView `json:"oauth,omitempty"`
+	}
+	type enrolmentView struct {
+		Key        string         `json:"key"`
+		Engine     string         `json:"engine"`
+		EngineName string         `json:"engine_name,omitempty"`
+		Fields     []string       `json:"fields,omitempty"`
+		Settings   map[string]any `json:"settings,omitempty"`
+		Status     string         `json:"status,omitempty"`
+	}
+
+	rules := make([]ruleView, len(s.rules))
+	for i, r := range s.rules {
+		rules[i] = ruleView{
+			Name:        r.Name,
+			Description: r.Description,
+			VaultKey:    r.VaultKey,
+			Target: targetView{
+				Path:        r.Target.Path,
+				Format:      r.Target.Format,
+				Merge:       r.Target.Merge,
+				HasTemplate: r.Target.Template != "",
+			},
+		}
+		if r.OAuth != nil {
+			rules[i].OAuth = &oauthView{
+				Provider:   r.OAuth.Provider,
+				EnginePath: r.OAuth.EnginePath,
+				Scopes:     r.OAuth.Scopes,
+			}
+		}
+	}
+
+	statuses := map[string]EnrolStateInfo{}
+	if runner := s.getEnrolRunner(); runner != nil {
+		for _, st := range runner.States() {
+			statuses[st.Key] = st
+		}
+	}
+
+	keys := make([]string, 0, len(s.enrolments))
+	for k := range s.enrolments {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	enrolments := make([]enrolmentView, 0, len(keys))
+	for _, k := range keys {
+		e := s.enrolments[k]
+		ev := enrolmentView{
+			Key:      k,
+			Engine:   e.Engine,
+			Settings: redactEnrolmentSettings(e.Settings),
+		}
+		if st, ok := statuses[k]; ok {
+			ev.EngineName = st.EngineName
+			ev.Fields = st.Fields
+			ev.Status = st.Status
+		}
+		enrolments = append(enrolments, ev)
+	}
+
+	syncInterval := s.syncCfg.RawInterval
+	if syncInterval == "" && s.syncCfg.Interval > 0 {
+		syncInterval = s.syncCfg.Interval.String()
+	}
+
+	resp := map[string]any{
+		"vault": map[string]any{
+			"address":               s.vaultCfg.Address,
+			"kv_mount":              s.kvMount,
+			"user_prefix":           s.userPrefix,
+			"auth_method":           s.authMethod,
+			"auth_mount":            s.authMount,
+			"auth_role":             s.authRole,
+			"tls_skip_verify":       s.vaultCfg.TLSSkipVerify,
+			"has_ca_cert":           s.vaultCfg.CACert != "",
+			"disable_token_renewal": s.vaultCfg.DisableTokenRenewal,
+		},
+		"sync": map[string]any{
+			"interval": syncInterval,
+		},
+		"web": map[string]any{
+			"enabled": s.cfg.Enabled,
+			"listen":  s.cfg.Listen,
+		},
+		"rules":      rules,
+		"enrolments": enrolments,
+	}
+	writeJSON(w, resp)
+}
+
+// redactEnrolmentSettings returns a copy of settings with values masked for
+// keys that look credential-bearing. Engine settings should only ever hold
+// configuration (URLs, scopes, IDs) — this is a defensive belt-and-braces
+// pass so a misconfigured YAML can't leak through the read-only UI.
+func redactEnrolmentSettings(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if isSensitiveSettingKey(k) {
+			out[k] = "***"
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func isSensitiveSettingKey(k string) bool {
+	lk := strings.ToLower(k)
+	for _, needle := range []string{"password", "secret", "token", "credential", "api_key", "apikey", "private"} {
+		if strings.Contains(lk, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

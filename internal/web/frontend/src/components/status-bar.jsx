@@ -3,7 +3,7 @@ import { useState, useRef } from 'preact/hooks';
 import { triggerSync, getVaultToken } from '../api.js';
 import { copyText } from '../clipboard.js';
 
-export function StatusBar({ status, onSync, pendingEnrolments, hasEnrolments, onEnrolClick }) {
+export function StatusBar({ status, onSync, pendingEnrolments, hasEnrolments, onEnrolClick, onConfigClick }) {
   const [syncing, setSyncing] = useState(false);
   const [tokenCopied, setTokenCopied] = useState(false);
   const cachedToken = useRef(null);
@@ -62,6 +62,11 @@ export function StatusBar({ status, onSync, pendingEnrolments, hasEnrolments, on
       status?.time && h('span', { class: 'last-sync' },
         'Updated: ', new Date(status.time).toLocaleTimeString(),
       ),
+      status?.authenticated && onConfigClick && h('button', {
+        class: 'config-btn',
+        onClick: onConfigClick,
+        title: 'View effective configuration',
+      }, 'Config'),
       status?.authenticated && h('button', {
         class: 'copy-token-btn' + (tokenCopied ? ' copied' : ''),
         onClick: handleCopyToken,

@@ -20,6 +20,8 @@ import (
 // Server is the web UI HTTP server.
 type Server struct {
 	cfg                config.WebConfig
+	vaultCfg           config.VaultConfig
+	syncCfg            config.SyncConfig
 	vault              *vault.Client
 	engine             *internalsync.Engine
 	csrf               *CSRFStore
@@ -28,6 +30,7 @@ type Server struct {
 	mux                *http.ServeMux
 	server             *http.Server
 	rules              []config.Rule
+	enrolments         map[string]config.Enrolment
 	kvMount            string
 	userPrefix         string
 	username           string
@@ -55,6 +58,7 @@ type Server struct {
 type ServerConfig struct {
 	WebCfg        config.WebConfig
 	VaultCfg      config.VaultConfig
+	SyncCfg       config.SyncConfig
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *internalsync.Engine
@@ -71,6 +75,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 
 	s := &Server{
 		cfg:                sc.WebCfg,
+		vaultCfg:           sc.VaultCfg,
+		syncCfg:            sc.SyncCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		csrf:               NewCSRFStore(),
@@ -115,6 +121,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	s.mux.HandleFunc("GET /api/v1/rules", s.handleRules)
+	s.mux.HandleFunc("GET /api/v1/config", s.handleConfig)
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
@@ -226,6 +233,7 @@ func (s *Server) getEnrolRunner() *EnrolmentRunner {
 // InitEnrolments sets up the enrolment runner for web-driven enrolment.
 // It checks Vault for already-completed enrolments and marks them as such.
 func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
+	s.enrolments = enrolments
 	if len(enrolments) == 0 {
 		return
 	}

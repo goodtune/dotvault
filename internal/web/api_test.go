@@ -148,6 +148,162 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 	}
 }
 
+func TestHandleConfig_Unauthenticated(t *testing.T) {
+	s := testServer(t)
+	req := httptest.NewRequest("GET", "/api/v1/config", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfig(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestHandleConfig_Authenticated(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{
+		Address:       "http://127.0.0.1:8200",
+		CACert:        "-----BEGIN CERTIFICATE-----\nsecret\n-----END CERTIFICATE-----",
+		TLSSkipVerify: true,
+	}
+	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
+	s.cfg = config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"}
+	s.rules = []config.Rule{
+		{
+			Name:        "gh",
+			Description: "GitHub host config",
+			VaultKey:    "gh",
+			Target: config.Target{
+				Path:     "~/.config/gh/hosts.yml",
+				Format:   "yaml",
+				Merge:    "deep",
+				Template: "{{ . }}",
+			},
+			OAuth: &config.OAuthConfig{
+				Provider:   "github",
+				EnginePath: "github",
+				Scopes:     []string{"repo"},
+			},
+		},
+	}
+	s.enrolments = map[string]config.Enrolment{
+		"gh": {
+			Engine: "github",
+			Settings: map[string]any{
+				"client_id": "abc123",
+				"scopes":    []any{"repo"},
+				// A defensively-redacted key — engines never do this in
+				// practice, but a malformed YAML must not leak through.
+				"oauth_token": "ghp_should_not_appear",
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfig(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+
+	vault, ok := resp["vault"].(map[string]any)
+	if !ok {
+		t.Fatalf("vault is %T, want map", resp["vault"])
+	}
+	if vault["address"] != "http://127.0.0.1:8200" {
+		t.Errorf("vault.address = %v, want %q", vault["address"], "http://127.0.0.1:8200")
+	}
+	if vault["has_ca_cert"] != true {
+		t.Errorf("vault.has_ca_cert = %v, want true", vault["has_ca_cert"])
+	}
+	if vault["tls_skip_verify"] != true {
+		t.Errorf("vault.tls_skip_verify = %v, want true", vault["tls_skip_verify"])
+	}
+	if _, leaked := vault["ca_cert"]; leaked {
+		t.Error("vault.ca_cert must not be exposed")
+	}
+	if body := w.Body.String(); strings.Contains(body, "BEGIN CERTIFICATE") {
+		t.Error("response body must not contain CA certificate contents")
+	}
+
+	syncCfg, ok := resp["sync"].(map[string]any)
+	if !ok {
+		t.Fatalf("sync is %T, want map", resp["sync"])
+	}
+	if syncCfg["interval"] != "15m" {
+		t.Errorf("sync.interval = %v, want %q", syncCfg["interval"], "15m")
+	}
+
+	rules, ok := resp["rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("rules = %v, want one rule", resp["rules"])
+	}
+	rule := rules[0].(map[string]any)
+	if rule["name"] != "gh" {
+		t.Errorf("rule.name = %v, want %q", rule["name"], "gh")
+	}
+	target := rule["target"].(map[string]any)
+	if target["has_template"] != true {
+		t.Errorf("rule.target.has_template = %v, want true", target["has_template"])
+	}
+	if _, leaked := target["template"]; leaked {
+		t.Error("rule.target.template body must not be exposed")
+	}
+	if oauth, ok := rule["oauth"].(map[string]any); !ok || oauth["provider"] != "github" {
+		t.Errorf("rule.oauth = %v, want provider=github", rule["oauth"])
+	}
+
+	enrolments, ok := resp["enrolments"].([]any)
+	if !ok || len(enrolments) != 1 {
+		t.Fatalf("enrolments = %v, want one entry", resp["enrolments"])
+	}
+	enrol := enrolments[0].(map[string]any)
+	if enrol["key"] != "gh" || enrol["engine"] != "github" {
+		t.Errorf("enrolment = %v, want key=gh engine=github", enrol)
+	}
+	settings, ok := enrol["settings"].(map[string]any)
+	if !ok {
+		t.Fatalf("enrolment.settings is %T, want map", enrol["settings"])
+	}
+	if settings["client_id"] != "abc123" {
+		t.Errorf("settings.client_id = %v, want %q", settings["client_id"], "abc123")
+	}
+	if settings["oauth_token"] != "***" {
+		t.Errorf("settings.oauth_token = %v, want redacted", settings["oauth_token"])
+	}
+	if strings.Contains(w.Body.String(), "ghp_should_not_appear") {
+		t.Error("redacted token leaked into response body")
+	}
+}
+
+func TestRedactEnrolmentSettings(t *testing.T) {
+	in := map[string]any{
+		"url":           "https://example.jfrog.io",
+		"client_id":     "abc",
+		"oauth_token":   "ghp_xxx",
+		"api_key":       "k",
+		"refresh_TOKEN": "r",
+		"private_key":   "-----BEGIN-----",
+	}
+	out := redactEnrolmentSettings(in)
+	if out["url"] != "https://example.jfrog.io" || out["client_id"] != "abc" {
+		t.Errorf("non-sensitive keys altered: %v", out)
+	}
+	for _, k := range []string{"oauth_token", "api_key", "refresh_TOKEN", "private_key"} {
+		if out[k] != "***" {
+			t.Errorf("settings[%q] = %v, want redacted", k, out[k])
+		}
+	}
+}
+
 func TestHandleEnrolPrompt_NoPending(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)

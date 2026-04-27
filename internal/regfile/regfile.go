@@ -123,6 +123,10 @@ func (e *emitter) writeRules(rules []config.Rule) {
 }
 
 func (e *emitter) writeRule(r config.Rule) {
+	if err := validateKeyName(r.Name); err != nil {
+		e.fail("rule %q: %w", r.Name, err)
+		return
+	}
 	rulePath := rootKey + `\Rules\` + r.Name
 	e.writeKey(rulePath)
 	e.writeString("Description", r.Description)
@@ -139,7 +143,10 @@ func (e *emitter) writeRule(r config.Rule) {
 	e.writeKey(rulePath + `\OAuth`)
 	e.writeString("EnginePath", r.OAuth.EnginePath)
 	e.writeString("Provider", r.OAuth.Provider)
-	if len(r.OAuth.Scopes) > 0 {
+	// Emit Scopes whenever the slice is non-nil so an explicit empty list
+	// (`scopes: []` in YAML) round-trips as an empty REG_MULTI_SZ rather
+	// than being silently dropped.
+	if r.OAuth.Scopes != nil {
 		e.writeMultiString("Scopes", r.OAuth.Scopes)
 	}
 	e.WriteString("\r\n")
@@ -163,6 +170,10 @@ func (e *emitter) writeEnrolments(enrolments map[string]config.Enrolment) {
 }
 
 func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
+	if err := validateKeyName(name); err != nil {
+		e.fail("enrolment %q: %w", name, err)
+		return
+	}
 	enrolPath := rootKey + `\Enrolments\` + name
 	e.writeKey(enrolPath)
 	e.writeString("Engine", en.Engine)
@@ -189,12 +200,17 @@ func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 // how to deserialise these two kinds, so any other value type is treated
 // as an error rather than silently dropped: a partial export that
 // disagrees with the source YAML is worse than a hard failure.
+//
+// Empty lists are preserved as empty REG_MULTI_SZ rather than dropped:
+// in YAML an explicit `[]` differs from an absent key, and engines that
+// override defaults from the presence of a list (e.g. GitHub's `scopes`)
+// rely on that distinction.
 func (e *emitter) writeSetting(enrolment, name string, value any) {
 	switch v := value.(type) {
 	case string:
 		e.writeString(name, v)
 	case []string:
-		if len(v) > 0 {
+		if v != nil {
 			e.writeMultiString(name, v)
 		}
 	case []any:
@@ -207,9 +223,7 @@ func (e *emitter) writeSetting(enrolment, name string, value any) {
 			}
 			strs = append(strs, s)
 		}
-		if len(strs) > 0 {
-			e.writeMultiString(name, strs)
-		}
+		e.writeMultiString(name, strs)
 	default:
 		e.fail("enrolments[%q].settings[%q]: cannot represent %T in registry; only strings and string lists are supported", enrolment, name, value)
 	}
@@ -329,24 +343,48 @@ func escapeREGString(s string) string {
 }
 
 // validateValueName rejects names containing characters that cannot be
-// safely represented inside a quoted .reg value name. The .reg format
-// has no escape mechanism for control characters or NUL inside quoted
-// strings, so we error out rather than silently corrupt the output.
+// safely represented inside a quoted .reg value name. We require printable
+// ASCII so the same renderer output is valid in both UTF-16LE and ASCII
+// modes; the .reg format has no escape mechanism for control characters
+// inside quoted strings.
 func validateValueName(name string) error {
 	if name == "" {
 		return fmt.Errorf("registry value name must not be empty")
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7F {
-			return fmt.Errorf("registry value name %q contains control character U+%04X", name, r)
+		if r < 0x20 || r > 0x7E {
+			return fmt.Errorf("registry value name %q contains non-printable-ASCII character U+%04X", name, r)
 		}
 	}
 	return nil
 }
 
-// needsHex reports whether s contains characters that cannot appear in a
-// quoted REG_SZ value. The .reg quoted form only supports printable ASCII;
-// anything else (newlines, tabs, non-ASCII) must use hex(1).
+// validateKeyName rejects names that cannot appear as a single registry
+// key path segment. In addition to the printable-ASCII rule used for
+// value names, key segments must not contain `\` (segment separator),
+// `[` or `]` (key-line delimiters), so they cannot break out of the
+// path or invalidate the surrounding `.reg` syntax.
+func validateKeyName(name string) error {
+	if name == "" {
+		return fmt.Errorf("registry key name must not be empty")
+	}
+	for _, r := range name {
+		if r < 0x20 || r > 0x7E {
+			return fmt.Errorf("registry key name %q contains non-printable-ASCII character U+%04X", name, r)
+		}
+		switch r {
+		case '\\', '[', ']':
+			return fmt.Errorf("registry key name %q contains reserved character %q", name, r)
+		}
+	}
+	return nil
+}
+
+// needsHex reports whether this renderer should emit s as hex(1) instead
+// of a quoted REG_SZ value. Although .reg v5 files can represent Unicode
+// in quoted strings when encoded as UTF-16LE, this renderer keeps quoted
+// output to printable ASCII so text-oriented output stays plain text;
+// anything else (newlines, tabs, non-ASCII) is emitted as hex(1).
 func needsHex(s string) bool {
 	for _, r := range s {
 		if r < 0x20 || r > 0x7E {

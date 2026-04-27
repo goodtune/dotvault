@@ -242,6 +242,116 @@ func TestGenerateEscapesQuoteAndBackslashInName(t *testing.T) {
 	}
 }
 
+func TestEmptyOAuthScopesEmitsEmptyMultiSZ(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target:   config.Target{Path: "~/x", Format: "yaml"},
+				OAuth: &config.OAuthConfig{
+					Provider: "github",
+					Scopes:   []string{}, // explicit empty list
+				},
+			},
+		},
+	}
+	got := mustGenerate(t, cfg)
+	// Empty REG_MULTI_SZ is just the trailing NUL pair: 00,00.
+	if !strings.Contains(got, `"Scopes"=hex(7):00,00`) {
+		t.Errorf("expected empty REG_MULTI_SZ for empty scopes; got:\n%s", got)
+	}
+}
+
+func TestNilOAuthScopesOmitted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target:   config.Target{Path: "~/x", Format: "yaml"},
+				OAuth: &config.OAuthConfig{
+					Provider: "github",
+					// Scopes is nil — key absent in YAML, omit from output
+				},
+			},
+		},
+	}
+	got := mustGenerate(t, cfg)
+	if strings.Contains(got, `"Scopes"=`) {
+		t.Errorf("nil scopes should be omitted from output; got:\n%s", got)
+	}
+}
+
+func TestEmptyEnrolmentListSettingEmitsEmptyMultiSZ(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"scopes": []any{}, // explicit empty list from YAML
+				},
+			},
+		},
+	}
+	got := mustGenerate(t, cfg)
+	if !strings.Contains(got, `"scopes"=hex(7):00,00`) {
+		t.Errorf("expected empty REG_MULTI_SZ for empty scopes setting; got:\n%s", got)
+	}
+}
+
+func TestRejectsBadRuleName(t *testing.T) {
+	for _, bad := range []string{`with\backslash`, `with]bracket`, `with[bracket`, "with\nnewline", "with é"} {
+		cfg := &config.Config{
+			Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+			Rules: []config.Rule{
+				{
+					Name:     bad,
+					VaultKey: "k",
+					Target:   config.Target{Path: "/tmp/x", Format: "text"},
+				},
+			},
+		}
+		if _, err := GenerateText(cfg); err == nil {
+			t.Errorf("expected error for rule name %q", bad)
+		}
+	}
+}
+
+func TestRejectsBadEnrolmentName(t *testing.T) {
+	for _, bad := range []string{`with\backslash`, `with]bracket`, "with\tcontrol"} {
+		cfg := &config.Config{
+			Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+			Enrolments: map[string]config.Enrolment{
+				bad: {Engine: "github"},
+			},
+		}
+		if _, err := GenerateText(cfg); err == nil {
+			t.Errorf("expected error for enrolment name %q", bad)
+		}
+	}
+}
+
+func TestRejectsNonASCIIValueName(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"naïve": "value",
+				},
+			},
+		},
+	}
+	if _, err := GenerateText(cfg); err == nil {
+		t.Fatalf("expected error for non-ASCII setting name")
+	}
+}
+
 func TestQuoteREGSZ(t *testing.T) {
 	tests := []struct {
 		in, want string

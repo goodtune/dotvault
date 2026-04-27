@@ -304,7 +304,10 @@ func TestEmptyEnrolmentListSettingEmitsEmptyMultiSZ(t *testing.T) {
 }
 
 func TestRejectsBadRuleName(t *testing.T) {
-	for _, bad := range []string{`with\backslash`, `with]bracket`, `with[bracket`, "with\nnewline", "with é"} {
+	// Names containing path/structural delimiters or control chars must be
+	// rejected. Unicode names are NOT in this list because they're allowed
+	// (UTF-16LE output represents them faithfully).
+	for _, bad := range []string{`with\backslash`, `with]bracket`, `with[bracket`, "with\nnewline"} {
 		cfg := &config.Config{
 			Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 			Rules: []config.Rule{
@@ -318,6 +321,26 @@ func TestRejectsBadRuleName(t *testing.T) {
 		if _, err := GenerateText(cfg); err == nil {
 			t.Errorf("expected error for rule name %q", bad)
 		}
+	}
+}
+
+func TestAcceptsUnicodeRuleName(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "café",
+				VaultKey: "k",
+				Target:   config.Target{Path: "/tmp/x", Format: "text"},
+			},
+		},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("Unicode rule name should be accepted: %v", err)
+	}
+	if !strings.Contains(got, `\Rules\café]`) {
+		t.Errorf("Unicode rule name not present in key path:\n%s", got)
 	}
 }
 
@@ -335,7 +358,10 @@ func TestRejectsBadEnrolmentName(t *testing.T) {
 	}
 }
 
-func TestRejectsNonASCIIValueName(t *testing.T) {
+func TestAcceptsUnicodeValueName(t *testing.T) {
+	// Unicode characters in value names are allowed: the default UTF-16LE
+	// output represents them faithfully and the --ascii output stays
+	// valid UTF-8.
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Enrolments: map[string]config.Enrolment{
@@ -347,8 +373,37 @@ func TestRejectsNonASCIIValueName(t *testing.T) {
 			},
 		},
 	}
-	if _, err := GenerateText(cfg); err == nil {
-		t.Fatalf("expected error for non-ASCII setting name")
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("Unicode value name should be accepted: %v", err)
+	}
+	if !strings.Contains(got, `"naïve"="value"`) {
+		t.Errorf("Unicode value name not present:\n%s", got)
+	}
+}
+
+func TestEmptyStringEmittedExplicitly(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			Address: "https://vault.example.com:8200",
+			// CACert/AuthMethod/etc. are empty — should be emitted as ""
+			// so re-import clears any previously-set value.
+		},
+		Sync: config.SyncConfig{RawInterval: "15m"},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	for _, want := range []string{
+		`"AuthMethod"=""`,
+		`"AuthMount"=""`,
+		`"AuthRole"=""`,
+		`"CACert"=""`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in output (clearing semantics):\n%s", want, got)
+		}
 	}
 }
 

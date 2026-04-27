@@ -488,7 +488,7 @@ on any problem the daemon would normally reject at load time.`,
 		RunE: runRegExport,
 	}
 	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
-	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "emit ASCII text instead of UTF-16LE")
+	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "emit unencoded plain text instead of UTF-16LE")
 	return cmd
 }
 
@@ -519,7 +519,10 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 		_, err := os.Stdout.Write(data)
 		return err
 	}
-	return os.WriteFile(flagRegOutput, data, 0644)
+	// Match the 0600 convention used by other dotvault-managed files: the
+	// rendered .reg can include enrolment settings or other potentially
+	// sensitive material that should not be world-readable.
+	return os.WriteFile(flagRegOutput, data, 0600)
 }
 
 func isTerminal() bool {

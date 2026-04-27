@@ -232,10 +232,13 @@ func (e *emitter) writeSetting(enrolment, name string, value any) {
 // writeString emits a REG_SZ value. Plain ASCII without control characters
 // is emitted in quoted form; anything else falls through to hex(1) so that
 // templates with embedded newlines round-trip correctly.
+//
+// Empty strings are emitted explicitly as `""=""` rather than omitted, so
+// that re-importing an exported .reg clears any value previously configured
+// for the same name. Without this, removing an optional field from YAML
+// would leave stale registry data on machines where the policy was
+// previously applied.
 func (e *emitter) writeString(name, value string) {
-	if value == "" {
-		return
-	}
 	if err := validateValueName(name); err != nil {
 		e.fail("%w", err)
 		return
@@ -354,35 +357,37 @@ func escapeREGString(s string) string {
 	return s
 }
 
-// validateValueName rejects names containing characters that cannot be
-// safely represented inside a quoted .reg value name. We require printable
-// ASCII so the same renderer output is valid in both UTF-16LE and ASCII
-// modes; the .reg format has no escape mechanism for control characters
-// inside quoted strings.
+// validateValueName rejects names that cannot be safely represented inside
+// a quoted .reg value name. The .reg format has no escape mechanism for
+// control characters or NUL inside quoted strings, so we error out rather
+// than silently corrupt the output. Unicode characters are allowed: the
+// default UTF-16LE output encodes them faithfully, and the --ascii output
+// stays valid UTF-8.
 func validateValueName(name string) error {
 	if name == "" {
 		return fmt.Errorf("registry value name must not be empty")
 	}
 	for _, r := range name {
-		if r < 0x20 || r > 0x7E {
-			return fmt.Errorf("registry value name %q contains non-printable-ASCII character U+%04X", name, r)
+		if r < 0x20 || r == 0x7F {
+			return fmt.Errorf("registry value name %q contains control character U+%04X", name, r)
 		}
 	}
 	return nil
 }
 
 // validateKeyName rejects names that cannot appear as a single registry
-// key path segment. In addition to the printable-ASCII rule used for
-// value names, key segments must not contain `\` (segment separator),
-// `[` or `]` (key-line delimiters), so they cannot break out of the
-// path or invalidate the surrounding `.reg` syntax.
+// key path segment. Key segments may contain Unicode because the default
+// .reg output is UTF-16LE and can represent it; however they must not
+// contain control characters, `\` (segment separator), or `[`/`]`
+// (key-line delimiters) so they cannot break out of the path or
+// invalidate the surrounding `.reg` syntax.
 func validateKeyName(name string) error {
 	if name == "" {
 		return fmt.Errorf("registry key name must not be empty")
 	}
 	for _, r := range name {
-		if r < 0x20 || r > 0x7E {
-			return fmt.Errorf("registry key name %q contains non-printable-ASCII character U+%04X", name, r)
+		if r < 0x20 || r == 0x7F {
+			return fmt.Errorf("registry key name %q contains control character U+%04X", name, r)
 		}
 		switch r {
 		case '\\', '[', ']':

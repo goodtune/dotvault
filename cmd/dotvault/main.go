@@ -91,7 +91,7 @@ func setupLogging() {
 	opts := &slog.HandlerOptions{Level: level}
 
 	var handler slog.Handler
-	if isTerminal() {
+	if isStderrTerminal() {
 		handler = slog.NewTextHandler(os.Stderr, opts)
 	} else {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
@@ -484,7 +484,9 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	return username, vc, nil
 }
 
-func isTerminal() bool {
+// isStderrTerminal reports whether stderr is a character device, used to
+// pick the slog text vs JSON handler at startup.
+func isStderrTerminal() bool {
 	fi, err := os.Stderr.Stat()
 	if err != nil {
 		return false

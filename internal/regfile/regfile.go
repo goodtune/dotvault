@@ -98,15 +98,13 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 }
 
 func (e *emitter) writeSync(s config.SyncConfig) {
-	interval := s.RawInterval
-	if interval == "" && s.Interval > 0 {
-		interval = s.Interval.String()
-	}
-	if interval == "" {
-		return
-	}
+	// Emit RawInterval as the user wrote it (or empty if they relied on
+	// the daemon's 15m default). Avoid s.Interval.String() because Go's
+	// time.Duration formatter produces verbose forms like "15m0s" for
+	// what the YAML expressed as "15m"; that round-trip is technically
+	// valid but pollutes diffs of exported .reg files.
 	e.writeKey(rootKey + `\Sync`)
-	e.writeString("Interval", interval)
+	e.writeString("Interval", s.RawInterval)
 	e.WriteString("\r\n")
 }
 

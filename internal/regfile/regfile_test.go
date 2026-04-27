@@ -19,10 +19,13 @@ func mustGenerate(t *testing.T, cfg *config.Config) string {
 }
 
 // validBaseConfig returns a minimally valid Config — one that
-// `config.(*Config).validate()` would accept — for tests that only
-// exercise renderer-level behavior and don't otherwise care about rule
-// content. This keeps tests aligned with the real-world inputs the CLI
-// passes to Generate*, since callers always come through config.Load.
+// `config.(*Config).validate()` would accept — for tests that want a
+// realistic baseline matching what the CLI passes to Generate*.
+//
+// regfile.Generate* itself does not require validation; many tests in
+// this file deliberately construct partial configs to exercise specific
+// renderer paths in isolation. End-to-end coverage for the
+// load-and-render path lives in TestGenerateOnLoadedConfig.
 func validBaseConfig() *config.Config {
 	return &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
@@ -262,6 +265,44 @@ func TestGenerateEscapesQuoteAndBackslashInName(t *testing.T) {
 	// Both " and \ in the name must be backslash-escaped on the wire.
 	if !strings.Contains(got, `"weird\"name\\path"="value"`) {
 		t.Errorf("setting name not escaped correctly; got:\n%s", got)
+	}
+}
+
+func TestSyncIntervalDefaultedYAMLEmitsEmpty(t *testing.T) {
+	// When the YAML omits sync.interval, config.Load fills Interval with
+	// the 15m default but leaves RawInterval empty. Exporting must NOT
+	// fall back to time.Duration.String() ("15m0s"), which would pollute
+	// diffs and round-trip through registry/validate to the same default
+	// anyway. The export emits an empty REG_SZ; the registry-side load
+	// then re-applies the default during validate.
+	yaml := `vault:
+  address: "https://vault.example.com:8200"
+rules:
+  - name: r
+    vault_key: r
+    target:
+      path: /tmp/r
+      format: text
+`
+	dir := t.TempDir()
+	yamlPath := dir + "/config.yaml"
+	if err := os.WriteFile(yamlPath, []byte(yaml), 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	cfg, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if strings.Contains(got, "15m0s") {
+		t.Errorf("output should not contain Go-format duration \"15m0s\":\n%s", got)
+	}
+	if !strings.Contains(got, `"Interval"=""`) {
+		t.Errorf("expected empty REG_SZ for unset interval; got:\n%s", got)
 	}
 }
 

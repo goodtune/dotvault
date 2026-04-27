@@ -323,6 +323,24 @@ func TestRedactEnrolmentSettings(t *testing.T) {
 	}
 }
 
+func TestFormatDuration(t *testing.T) {
+	for _, tc := range []struct {
+		in   time.Duration
+		want string
+	}{
+		{15 * time.Minute, "15m"},
+		{time.Hour, "1h"},
+		{time.Hour + 30*time.Minute, "1h30m"},
+		{45 * time.Second, "45s"},
+		{2*time.Hour + 5*time.Second, "2h0m5s"},
+		{0, "0s"},
+	} {
+		if got := formatDuration(tc.in); got != tc.want {
+			t.Errorf("formatDuration(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsSensitiveSettingKey(t *testing.T) {
 	for _, tc := range []struct {
 		key       string

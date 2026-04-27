@@ -61,7 +61,10 @@ function ConfigBody({ config }) {
         rows: [
           ['Enabled', formatBool(web?.enabled)],
           ['Listen address', web?.listen || '—'],
-        ],
+          web?.listen_effective && web.listen_effective !== web.listen
+            ? ['Listen address (effective)', web.listen_effective]
+            : null,
+        ].filter(Boolean),
       }),
     ),
     h(Section, {

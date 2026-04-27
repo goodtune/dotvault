@@ -188,7 +188,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	syncInterval := s.syncCfg.RawInterval
 	if syncInterval == "" && s.syncCfg.Interval > 0 {
-		syncInterval = s.syncCfg.Interval.String()
+		syncInterval = formatDuration(s.syncCfg.Interval)
 	}
 
 	web := map[string]any{
@@ -314,6 +314,41 @@ func normalizeKey(k string) string {
 		prev = r
 	}
 	return b.String()
+}
+
+// formatDuration is a tidier alternative to time.Duration.String() that
+// trims trailing zero-valued units (so 15m renders as "15m" instead of
+// "15m0s", 1h as "1h" instead of "1h0m0s"). Used for the effective sync
+// interval when the configured raw form was empty (i.e. fell back to the
+// 15m default).
+//
+// The trim is unit-aware: a "0m" or "0s" tail is only stripped when the
+// preceding character is itself a unit letter (h/m/s), so multi-digit
+// values like "30m" or "1h30m0s" are not mangled.
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "0s"
+	}
+	s := d.String()
+	s = stripZeroUnit(s, 's')
+	s = stripZeroUnit(s, 'm')
+	return s
+}
+
+func stripZeroUnit(s string, unit byte) string {
+	needle := "0" + string(unit)
+	if !strings.HasSuffix(s, needle) {
+		return s
+	}
+	pre := s[:len(s)-2]
+	if pre == "" {
+		return s
+	}
+	switch pre[len(pre)-1] {
+	case 'h', 'm', 's':
+		return pre
+	}
+	return s
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

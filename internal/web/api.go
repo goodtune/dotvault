@@ -162,15 +162,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	keys := make([]string, 0, len(s.enrolments))
-	for k := range s.enrolments {
+	enrolmentMap := s.getEnrolments()
+	keys := make([]string, 0, len(enrolmentMap))
+	for k := range enrolmentMap {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
 	enrolments := make([]enrolmentView, 0, len(keys))
 	for _, k := range keys {
-		e := s.enrolments[k]
+		e := enrolmentMap[k]
 		ev := enrolmentView{
 			Key:      k,
 			Engine:   e.Engine,

@@ -15,6 +15,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
@@ -26,9 +27,11 @@ import (
 var version = "dev"
 
 var (
-	flagConfig   string
-	flagLogLevel string
-	flagDryRun   bool
+	flagConfig    string
+	flagLogLevel  string
+	flagDryRun    bool
+	flagRegOutput string
+	flagRegASCII  bool
 )
 
 func main() {
@@ -65,6 +68,7 @@ func main() {
 				fmt.Println(version)
 			},
 		},
+		newRegExportCmd(),
 	)
 
 	// --once as alias for sync
@@ -292,9 +296,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	} else {
 		// CLI mode: terminal-based wizard (unchanged).
 		enrolIO := enrol.IO{
-			Out:     os.Stderr,
-			Browser: browser.OpenURL,
-			Log:     slog.Default(),
+			Out:      os.Stderr,
+			Browser:  browser.OpenURL,
+			Log:      slog.Default(),
 			Username: username,
 			PromptSecret: func(label string) (string, error) {
 				fd := int(os.Stdin.Fd())
@@ -463,6 +467,49 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	}
 
 	return username, vc, nil
+}
+
+func newRegExportCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reg-export <config.yaml>",
+		Short: "Convert a YAML config to a Windows .reg file",
+		Long: `Convert a dotvault YAML configuration file into a Windows Registry
+.reg file targeting HKLM\SOFTWARE\Policies\dotvault.
+
+The resulting file can be applied with regedit.exe /s, deployed via Group
+Policy Preferences, or imported manually. By default the output is encoded
+as UTF-16LE with BOM, matching the canonical format produced by regedit.exe.
+Pass --ascii for a plain-text REGEDIT4-compatible variant suitable for
+diffing or piping through other tools.
+
+The YAML file is fully validated before conversion; conversion errors out
+on any problem the daemon would normally reject at load time.`,
+		Args: cobra.ExactArgs(1),
+		RunE: runRegExport,
+	}
+	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
+	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "emit ASCII text instead of UTF-16LE")
+	return cmd
+}
+
+func runRegExport(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load(args[0])
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	var data []byte
+	if flagRegASCII {
+		data = []byte(regfile.GenerateText(cfg))
+	} else {
+		data = regfile.Generate(cfg)
+	}
+
+	if flagRegOutput == "" || flagRegOutput == "-" {
+		_, err := os.Stdout.Write(data)
+		return err
+	}
+	return os.WriteFile(flagRegOutput, data, 0644)
 }
 
 func isTerminal() bool {

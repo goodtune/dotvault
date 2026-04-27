@@ -16,8 +16,9 @@
   present, dotvault ignores file-based configuration entirely.
 
   Rules (sync rules) are complex multi-field objects that cannot be
-  fully expressed as ADMX policies. Configure rules via Group Policy
-  Preferences > Registry, targeting:
+  fully expressed as ADMX policies. Author them as a YAML config and
+  convert with `dotvault reg-export config.yaml -o dotvault.reg`, or
+  configure them by hand via Group Policy Preferences > Registry, targeting:
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\VaultKey      (REG_SZ)
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetPath    (REG_SZ)
     SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetFormat  (REG_SZ)

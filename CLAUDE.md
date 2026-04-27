@@ -93,12 +93,22 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\dotva
 ## CLI
 
 ```
-dotvault          Run daemon (default command)
-dotvault run      Explicit daemon mode (same as bare invocation)
-dotvault sync     One-shot sync cycle, then exit
-dotvault status   Display auth state, token TTL, per-rule sync state
-dotvault version  Print build version
+dotvault            Run daemon (default command)
+dotvault run        Explicit daemon mode (same as bare invocation)
+dotvault sync       One-shot sync cycle, then exit
+dotvault status     Display auth state, token TTL, per-rule sync state
+dotvault version    Print build version
+dotvault reg-export Convert a YAML config to a Windows .reg file
 ```
+
+`reg-export` reads and validates the YAML config, then emits a `Windows
+Registry Editor Version 5.00` file targeting `HKLM\SOFTWARE\Policies\dotvault`
+to stdout (or `--output <path>`, written with 0600 permissions). Default
+encoding is UTF-16LE with BOM; `--ascii` produces an unencoded plain-text
+variant of the same v5 format. Multi-line values such as Go templates
+round-trip via `hex(1):` (UTF-16LE bytes). Optional string fields are
+emitted as `""` even when empty so re-importing clears stale registry
+values. Rendering is in `internal/regfile/`.
 
 Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`, `--once` (redirects to sync from within runDaemon).
 

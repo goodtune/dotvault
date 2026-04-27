@@ -27,6 +27,10 @@ export async function getRules() {
   return fetchJSON('/api/v1/rules');
 }
 
+export async function getConfig() {
+  return fetchJSON('/api/v1/config');
+}
+
 export async function listSecrets(path = '') {
   return fetchJSON(`/api/v1/secrets/${path}`);
 }

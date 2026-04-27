@@ -186,6 +186,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		webServer, err = web.NewServer(web.ServerConfig{
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
+			SyncCfg:       cfg.Sync,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,

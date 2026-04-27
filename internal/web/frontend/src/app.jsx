@@ -6,6 +6,7 @@ import { SecretPanel } from './components/secret-panel.jsx';
 import { OAuthBanner } from './components/oauth-banner.jsx';
 import { LoginPage } from './components/login-page.jsx';
 import { EnrolPage } from './components/enrol-page.jsx';
+import { ConfigPage } from './components/config-page.jsx';
 import { getStatus, getRules, listSecrets } from './api.js';
 
 export function App() {
@@ -16,6 +17,7 @@ export function App() {
   const [error, setError] = useState(null);
   const [enrolDismissed, setEnrolDismissed] = useState(false);
   const [enrolPageOpen, setEnrolPageOpen] = useState(false);
+  const [configPageOpen, setConfigPageOpen] = useState(false);
 
   useEffect(() => {
     loadStatus();
@@ -91,10 +93,30 @@ export function App() {
       onComplete: () => {
         setEnrolDismissed(true);
         setEnrolPageOpen(false);
+        setConfigPageOpen(false);
         loadData();
       },
       onUpdate: loadStatus,
     });
+  }
+
+  if (configPageOpen) {
+    return h(Fragment, null,
+      h(StatusBar, {
+        status,
+        onSync: loadData,
+        pendingEnrolments: pendingEnrolments.length,
+        hasEnrolments: enrolments.length > 0,
+        onEnrolClick: () => {
+          setEnrolDismissed(false);
+          setEnrolPageOpen(true);
+          setConfigPageOpen(false);
+        },
+        onConfigClick: () => setConfigPageOpen(true),
+      }),
+      error && h('div', { class: 'error-banner' }, error),
+      h(ConfigPage, { onClose: () => setConfigPageOpen(false) }),
+    );
   }
 
   const oauthRules = rules.filter(r => r.has_oauth);
@@ -109,6 +131,7 @@ export function App() {
         setEnrolDismissed(false);
         setEnrolPageOpen(true);
       },
+      onConfigClick: () => setConfigPageOpen(true),
     }),
     error && h('div', { class: 'error-banner' }, error),
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),

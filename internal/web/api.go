@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +95,267 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{"rules": rules})
+}
+
+// handleConfig returns the effective service configuration: managed files
+// (sync rules) and active enrolments. It is a view-only endpoint and never
+// includes secret values such as the Vault CA certificate or stored
+// credentials. Available only to authenticated sessions.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	type targetView struct {
+		Path        string `json:"path"`
+		Format      string `json:"format"`
+		Merge       string `json:"merge,omitempty"`
+		HasTemplate bool   `json:"has_template"`
+	}
+	type oauthView struct {
+		Provider   string   `json:"provider"`
+		EnginePath string   `json:"engine_path,omitempty"`
+		Scopes     []string `json:"scopes,omitempty"`
+	}
+	type ruleView struct {
+		Name        string     `json:"name"`
+		Description string     `json:"description,omitempty"`
+		VaultKey    string     `json:"vault_key"`
+		Target      targetView `json:"target"`
+		OAuth       *oauthView `json:"oauth,omitempty"`
+	}
+	type enrolmentView struct {
+		Key        string         `json:"key"`
+		Engine     string         `json:"engine"`
+		EngineName string         `json:"engine_name,omitempty"`
+		Fields     []string       `json:"fields,omitempty"`
+		Settings   map[string]any `json:"settings,omitempty"`
+		Status     string         `json:"status,omitempty"`
+	}
+
+	rules := make([]ruleView, len(s.rules))
+	for i, rule := range s.rules {
+		rules[i] = ruleView{
+			Name:        rule.Name,
+			Description: rule.Description,
+			VaultKey:    rule.VaultKey,
+			Target: targetView{
+				Path:        rule.Target.Path,
+				Format:      rule.Target.Format,
+				Merge:       rule.Target.Merge,
+				HasTemplate: rule.Target.Template != "",
+			},
+		}
+		if rule.OAuth != nil {
+			rules[i].OAuth = &oauthView{
+				Provider:   rule.OAuth.Provider,
+				EnginePath: rule.OAuth.EnginePath,
+				Scopes:     rule.OAuth.Scopes,
+			}
+		}
+	}
+
+	statuses := map[string]EnrolStateInfo{}
+	if runner := s.getEnrolRunner(); runner != nil {
+		for _, st := range runner.States() {
+			statuses[st.Key] = st
+		}
+	}
+
+	enrolmentMap := s.getEnrolments()
+	keys := make([]string, 0, len(enrolmentMap))
+	for k := range enrolmentMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	enrolments := make([]enrolmentView, 0, len(keys))
+	for _, k := range keys {
+		e := enrolmentMap[k]
+		ev := enrolmentView{
+			Key:      k,
+			Engine:   e.Engine,
+			Settings: redactEnrolmentSettings(e.Settings),
+		}
+		if st, ok := statuses[k]; ok {
+			ev.EngineName = st.EngineName
+			ev.Fields = st.Fields
+			ev.Status = st.Status
+		}
+		enrolments = append(enrolments, ev)
+	}
+
+	syncInterval := s.syncCfg.RawInterval
+	if syncInterval == "" && s.syncCfg.Interval > 0 {
+		syncInterval = formatDuration(s.syncCfg.Interval)
+	}
+
+	web := map[string]any{
+		"enabled": s.cfg.Enabled,
+		"listen":  s.cfg.Listen,
+	}
+	// listen_effective surfaces the actually-bound address, which differs
+	// from the configured value when the user gave a port like ":0".
+	if s.listenAddr != "" {
+		web["listen_effective"] = s.listenAddr
+	}
+
+	resp := map[string]any{
+		"vault": map[string]any{
+			"address":               s.vaultCfg.Address,
+			"kv_mount":              s.kvMount,
+			"user_prefix":           s.userPrefix,
+			"auth_method":           s.authMethod,
+			"auth_mount":            s.authMount,
+			"auth_role":             s.authRole,
+			"tls_skip_verify":       s.vaultCfg.TLSSkipVerify,
+			"has_ca_cert":           s.vaultCfg.CACert != "",
+			"disable_token_renewal": s.vaultCfg.DisableTokenRenewal,
+		},
+		"sync": map[string]any{
+			"interval": syncInterval,
+		},
+		"web":        web,
+		"rules":      rules,
+		"enrolments": enrolments,
+	}
+	writeJSON(w, resp)
+}
+
+// redactEnrolmentSettings returns a copy of settings with values masked for
+// keys that look credential-bearing. Engine settings should only ever hold
+// configuration (URLs, scopes, IDs) — this is a defensive belt-and-braces
+// pass so a misconfigured YAML can't leak through the read-only UI.
+// Recursion handles nested maps and slices so a sensitive key buried deep
+// in the tree is still redacted.
+func redactEnrolmentSettings(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out, _ := redactEnrolmentValue(in).(map[string]any)
+	return out
+}
+
+func redactEnrolmentValue(v any) any {
+	switch vv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(vv))
+		for k, nested := range vv {
+			if isSensitiveSettingKey(k) {
+				out[k] = "***"
+				continue
+			}
+			out[k] = redactEnrolmentValue(nested)
+		}
+		return out
+	case []any:
+		out := make([]any, len(vv))
+		for i, nested := range vv {
+			out[i] = redactEnrolmentValue(nested)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// isSensitiveSettingKey reports whether a settings key looks like it carries
+// a credential. The key is first normalized so that camelCase, kebab-case
+// and snake_case variants all collapse to the same form (`accessToken`,
+// `access-token`, `access_token` → `access_token`). Matching then uses an
+// exact-name list and a suffix list rather than a loose substring match so
+// that legitimate configuration knobs are not false-positive redacted —
+// e.g. `token_ttl` must remain visible, only `token`, `*_token`,
+// `oauth_token`, `access_token`, `clientSecret`, `privateKey` etc are
+// masked.
+func isSensitiveSettingKey(k string) bool {
+	nk := normalizeKey(k)
+	switch nk {
+	case "password", "passphrase", "secret", "credential", "credentials",
+		"api_key", "apikey", "private_key", "privatekey",
+		"token", "oauth_token", "access_token", "refresh_token",
+		"bearer_token", "auth_token":
+		return true
+	}
+	for _, suffix := range []string{
+		"_token", "_secret", "_password", "_passphrase",
+		"_credential", "_credentials", "_apikey", "_api_key",
+		"_private_key",
+	} {
+		if strings.HasSuffix(nk, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeKey lower-cases a key and converts camelCase / kebab-case into
+// snake_case so the redaction matcher can treat all naming conventions
+// uniformly. Examples: `clientSecret` → `client_secret`,
+// `access-token` → `access_token`, `OAuthToken` → `oauth_token`,
+// `XMLToken` → `xml_token`. Acronym boundaries (an upper-case run
+// followed by a capitalized word) are split so that defensive matching
+// still catches keys like `JWTToken` or `APIKey`.
+func normalizeKey(k string) string {
+	var b strings.Builder
+	b.Grow(len(k) + 4)
+	runes := []rune(k)
+	for i, r := range runes {
+		switch {
+		case r == '-':
+			b.WriteByte('_')
+		case unicode.IsUpper(r):
+			if i > 0 {
+				prev := runes[i-1]
+				nextIsLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+				prevPrevIsUpper := i > 1 && unicode.IsUpper(runes[i-2])
+				if unicode.IsLower(prev) || unicode.IsDigit(prev) ||
+					(unicode.IsUpper(prev) && nextIsLower && prevPrevIsUpper) {
+					b.WriteByte('_')
+				}
+			}
+			b.WriteRune(unicode.ToLower(r))
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// formatDuration is a tidier alternative to time.Duration.String() that
+// trims trailing zero-valued units (so 15m renders as "15m" instead of
+// "15m0s", 1h as "1h" instead of "1h0m0s"). Used for the effective sync
+// interval when the configured raw form was empty (i.e. fell back to the
+// 15m default).
+//
+// The trim is unit-aware: a "0m" or "0s" tail is only stripped when the
+// preceding character is itself a unit letter (h/m/s), so multi-digit
+// values like "30m" or "1h30m0s" are not mangled.
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "0s"
+	}
+	s := d.String()
+	s = stripZeroUnit(s, 's')
+	s = stripZeroUnit(s, 'm')
+	return s
+}
+
+func stripZeroUnit(s string, unit byte) string {
+	needle := "0" + string(unit)
+	if !strings.HasSuffix(s, needle) {
+		return s
+	}
+	pre := s[:len(s)-2]
+	if pre == "" {
+		return s
+	}
+	switch pre[len(pre)-1] {
+	case 'h', 'm', 's':
+		return pre
+	}
+	return s
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

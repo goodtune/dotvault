@@ -20,6 +20,8 @@ import (
 // Server is the web UI HTTP server.
 type Server struct {
 	cfg                config.WebConfig
+	vaultCfg           config.VaultConfig
+	syncCfg            config.SyncConfig
 	vault              *vault.Client
 	engine             *internalsync.Engine
 	csrf               *CSRFStore
@@ -28,6 +30,7 @@ type Server struct {
 	mux                *http.ServeMux
 	server             *http.Server
 	rules              []config.Rule
+	enrolments         map[string]config.Enrolment
 	kvMount            string
 	userPrefix         string
 	username           string
@@ -55,6 +58,7 @@ type Server struct {
 type ServerConfig struct {
 	WebCfg        config.WebConfig
 	VaultCfg      config.VaultConfig
+	SyncCfg       config.SyncConfig
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *internalsync.Engine
@@ -71,6 +75,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 
 	s := &Server{
 		cfg:                sc.WebCfg,
+		vaultCfg:           sc.VaultCfg,
+		syncCfg:            sc.SyncCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		csrf:               NewCSRFStore(),
@@ -115,6 +121,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	s.mux.HandleFunc("GET /api/v1/rules", s.handleRules)
+	s.mux.HandleFunc("GET /api/v1/config", s.handleConfig)
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
@@ -223,10 +230,29 @@ func (s *Server) getEnrolRunner() *EnrolmentRunner {
 	return s.enrolRunner
 }
 
+// getEnrolments returns a shallow copy of the configured enrolments map,
+// safe for concurrent access and for the caller to iterate or mutate
+// without affecting server state.
+func (s *Server) getEnrolments() map[string]config.Enrolment {
+	s.enrolRunnerMu.RLock()
+	defer s.enrolRunnerMu.RUnlock()
+	if s.enrolments == nil {
+		return nil
+	}
+	out := make(map[string]config.Enrolment, len(s.enrolments))
+	for k, v := range s.enrolments {
+		out[k] = v
+	}
+	return out
+}
+
 // InitEnrolments sets up the enrolment runner for web-driven enrolment.
 // It checks Vault for already-completed enrolments and marks them as such.
 func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
 	if len(enrolments) == 0 {
+		s.enrolRunnerMu.Lock()
+		s.enrolments = enrolments
+		s.enrolRunnerMu.Unlock()
 		return
 	}
 
@@ -251,6 +277,7 @@ func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]confi
 
 	s.enrolRunnerMu.Lock()
 	s.enrolRunner = runner
+	s.enrolments = enrolments
 	s.enrolRunnerMu.Unlock()
 }
 

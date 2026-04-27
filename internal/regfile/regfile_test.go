@@ -265,6 +265,56 @@ func TestGenerateEscapesQuoteAndBackslashInName(t *testing.T) {
 	}
 }
 
+func TestRulesAndEnrolmentsAreDeletedBeforeRecreate(t *testing.T) {
+	// Re-importing an exported .reg should be idempotent: rules or
+	// enrolments removed from YAML must also disappear from the registry,
+	// so the export emits a deletion stanza for each dynamic subtree
+	// before the recreation block.
+	cfg := validBaseConfig()
+	cfg.Enrolments = map[string]config.Enrolment{
+		"gh": {Engine: "github"},
+	}
+	got := mustGenerate(t, cfg)
+
+	rulesDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`
+	rulesKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`
+	enrolDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Enrolments]`
+	enrolKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Enrolments]`
+
+	for _, want := range []string{rulesDel, rulesKey, enrolDel, enrolKey} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in output:\n%s", want, got)
+		}
+	}
+	// Deletion must come before recreation so the .reg processor wipes
+	// the subtree first.
+	if strings.Index(got, rulesDel) > strings.Index(got, rulesKey) {
+		t.Errorf("Rules deletion stanza must precede recreation")
+	}
+	if strings.Index(got, enrolDel) > strings.Index(got, enrolKey) {
+		t.Errorf("Enrolments deletion stanza must precede recreation")
+	}
+}
+
+func TestEmptyRulesEmitsOnlyDeletion(t *testing.T) {
+	// A config with no rules should still emit `[-...\Rules]` so an
+	// import wipes any previously-defined rules.
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(got, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`) {
+		t.Errorf("expected Rules deletion stanza even with no rules:\n%s", got)
+	}
+	// And no recreation key for Rules (no rules to put under it).
+	if strings.Contains(got, `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`+"\r\n") {
+		t.Errorf("did not expect Rules recreation when no rules present:\n%s", got)
+	}
+}
+
 func TestEmptyOAuthScopesEmitsEmptyMultiSZ(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},

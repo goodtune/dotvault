@@ -497,7 +497,8 @@ func newRegExportCmd() *cobra.Command {
 
 The input config path may be supplied as a positional argument or via the
 inherited --config flag; the positional argument takes precedence when
-both are given.
+both are given. If neither is supplied the platform-specific system
+config path is used, matching the other dotvault subcommands.
 
 The resulting file can be applied with regedit.exe /s, deployed via Group
 Policy Preferences, or imported manually. By default the output is encoded
@@ -523,9 +524,12 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 		path = args[0]
 	}
 	if path == "" {
-		return fmt.Errorf("provide a YAML config path as a positional argument or via --config")
+		path = paths.SystemConfigPath()
 	}
 
+	// reg-export deliberately reads the YAML file, not the registry, so we
+	// use config.Load rather than config.LoadSystem (the latter would
+	// short-circuit to the registry on Windows when GPO keys are present).
 	cfg, err := config.Load(path)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)

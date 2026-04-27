@@ -75,6 +75,14 @@ func (e *emitter) writeKey(path string) {
 	fmt.Fprintf(&e.b, "[%s]\r\n", path)
 }
 
+// writeKeyDeletion emits a `[-PATH]` stanza which instructs registry
+// import to delete the given key (and all subkeys/values). Used to make
+// the export idempotent for sections where the set of subkeys is
+// determined dynamically by the YAML.
+func (e *emitter) writeKeyDeletion(path string) {
+	fmt.Fprintf(&e.b, "[-%s]\r\n\r\n", path)
+}
+
 func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeKey(rootKey + `\Vault`)
 	e.writeString("Address", v.Address)
@@ -110,7 +118,15 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 }
 
 func (e *emitter) writeRules(rules []config.Rule) {
+	// Delete the whole Rules subtree before re-creating it. Because the
+	// registry loader enumerates every subkey under Rules, an additive
+	// export would let rules removed from YAML keep syncing secrets on
+	// machines where they were previously imported. Pre-deleting makes
+	// the .reg file an idempotent statement of intent rather than a
+	// merge against existing state.
+	e.writeKeyDeletion(rootKey + `\Rules`)
 	if len(rules) == 0 {
+		// No rules to re-create; the deletion stanza alone wipes the subtree.
 		return
 	}
 	e.writeKey(rootKey + `\Rules`)
@@ -154,6 +170,10 @@ func (e *emitter) writeRule(r config.Rule) {
 }
 
 func (e *emitter) writeEnrolments(enrolments map[string]config.Enrolment) {
+	// Same idempotency story as writeRules: wipe the Enrolments subtree
+	// first so enrolments (and their Settings) removed from YAML are also
+	// removed from the registry on re-import.
+	e.writeKeyDeletion(rootKey + `\Enrolments`)
 	if len(enrolments) == 0 {
 		return
 	}

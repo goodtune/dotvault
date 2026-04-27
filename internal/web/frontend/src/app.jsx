@@ -93,6 +93,7 @@ export function App() {
       onComplete: () => {
         setEnrolDismissed(true);
         setEnrolPageOpen(false);
+        setConfigPageOpen(false);
         loadData();
       },
       onUpdate: loadStatus,
@@ -109,6 +110,7 @@ export function App() {
         onEnrolClick: () => {
           setEnrolDismissed(false);
           setEnrolPageOpen(true);
+          setConfigPageOpen(false);
         },
         onConfigClick: () => setConfigPageOpen(true),
       }),

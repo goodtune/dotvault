@@ -134,23 +134,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rules := make([]ruleView, len(s.rules))
-	for i, r := range s.rules {
+	for i, rule := range s.rules {
 		rules[i] = ruleView{
-			Name:        r.Name,
-			Description: r.Description,
-			VaultKey:    r.VaultKey,
+			Name:        rule.Name,
+			Description: rule.Description,
+			VaultKey:    rule.VaultKey,
 			Target: targetView{
-				Path:        r.Target.Path,
-				Format:      r.Target.Format,
-				Merge:       r.Target.Merge,
-				HasTemplate: r.Target.Template != "",
+				Path:        rule.Target.Path,
+				Format:      rule.Target.Format,
+				Merge:       rule.Target.Merge,
+				HasTemplate: rule.Target.Template != "",
 			},
 		}
-		if r.OAuth != nil {
+		if rule.OAuth != nil {
 			rules[i].OAuth = &oauthView{
-				Provider:   r.OAuth.Provider,
-				EnginePath: r.OAuth.EnginePath,
-				Scopes:     r.OAuth.Scopes,
+				Provider:   rule.OAuth.Provider,
+				EnginePath: rule.OAuth.EnginePath,
+				Scopes:     rule.OAuth.Scopes,
 			}
 		}
 	}
@@ -218,19 +218,37 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 // keys that look credential-bearing. Engine settings should only ever hold
 // configuration (URLs, scopes, IDs) — this is a defensive belt-and-braces
 // pass so a misconfigured YAML can't leak through the read-only UI.
+// Recursion handles nested maps and slices so a sensitive key buried deep
+// in the tree is still redacted.
 func redactEnrolmentSettings(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		if isSensitiveSettingKey(k) {
-			out[k] = "***"
-			continue
-		}
-		out[k] = v
-	}
+	out, _ := redactEnrolmentValue(in).(map[string]any)
 	return out
+}
+
+func redactEnrolmentValue(v any) any {
+	switch vv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(vv))
+		for k, nested := range vv {
+			if isSensitiveSettingKey(k) {
+				out[k] = "***"
+				continue
+			}
+			out[k] = redactEnrolmentValue(nested)
+		}
+		return out
+	case []any:
+		out := make([]any, len(vv))
+		for i, nested := range vv {
+			out[i] = redactEnrolmentValue(nested)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func isSensitiveSettingKey(k string) bool {

@@ -304,6 +304,48 @@ func TestRedactEnrolmentSettings(t *testing.T) {
 	}
 }
 
+func TestRedactEnrolmentSettings_Nested(t *testing.T) {
+	in := map[string]any{
+		"oauth": map[string]any{
+			"client_id":   "public",
+			"oauth_token": "ghp_should_not_appear",
+			"deep": map[string]any{
+				"password": "p",
+				"label":    "fine",
+			},
+		},
+		"hosts": []any{
+			map[string]any{"url": "https://a", "secret": "leak"},
+			map[string]any{"url": "https://b"},
+		},
+	}
+	out := redactEnrolmentSettings(in)
+
+	oauth := out["oauth"].(map[string]any)
+	if oauth["client_id"] != "public" {
+		t.Errorf("nested non-sensitive key altered: %v", oauth["client_id"])
+	}
+	if oauth["oauth_token"] != "***" {
+		t.Errorf("nested oauth_token = %v, want redacted", oauth["oauth_token"])
+	}
+	deep := oauth["deep"].(map[string]any)
+	if deep["password"] != "***" {
+		t.Errorf("doubly-nested password = %v, want redacted", deep["password"])
+	}
+	if deep["label"] != "fine" {
+		t.Errorf("doubly-nested label altered: %v", deep["label"])
+	}
+
+	hosts := out["hosts"].([]any)
+	first := hosts[0].(map[string]any)
+	if first["url"] != "https://a" {
+		t.Errorf("slice element url altered: %v", first["url"])
+	}
+	if first["secret"] != "***" {
+		t.Errorf("slice element secret = %v, want redacted", first["secret"])
+	}
+}
+
 func TestHandleEnrolPrompt_NoPending(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)

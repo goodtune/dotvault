@@ -484,14 +484,10 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	return username, vc, nil
 }
 
-// isStderrTerminal reports whether stderr is a character device, used to
+// isStderrTerminal reports whether stderr is connected to a TTY, used to
 // pick the slog text vs JSON handler at startup.
 func isStderrTerminal() bool {
-	fi, err := os.Stderr.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether

@@ -136,7 +136,9 @@ function RuleCard({ rule }) {
 function EnrolmentCard({ enrolment }) {
   const { key, engine, engine_name, fields = [], settings, status } = enrolment;
   const settingsRows = settings
-    ? Object.entries(settings).map(([k, v]) => [k, formatSetting(v)])
+    ? Object.entries(settings)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => [k, formatSetting(v)])
     : [];
   return h('div', { class: 'config-card' },
     h('div', { class: 'config-card-title' },

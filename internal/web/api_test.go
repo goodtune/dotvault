@@ -327,6 +327,7 @@ func TestIsSensitiveSettingKey(t *testing.T) {
 		// Real credential keys.
 		{"password", true},
 		{"passphrase", true},
+		{"token", true},
 		{"oauth_token", true},
 		{"access_token", true},
 		{"refresh_token", true},

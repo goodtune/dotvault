@@ -256,14 +256,14 @@ func redactEnrolmentValue(v any) any {
 // a credential. It uses an exact-name list and a suffix list rather than a
 // loose substring match so that legitimate configuration knobs are not
 // false-positive redacted — e.g. `token_ttl` (JFrog engine duration knob)
-// must remain visible, only `*_token` / `oauth_token` / `access_token` etc
-// are masked.
+// must remain visible, only `token`, `*_token`, `oauth_token`,
+// `access_token` etc are masked.
 func isSensitiveSettingKey(k string) bool {
 	lk := strings.ToLower(k)
 	switch lk {
 	case "password", "passphrase", "secret", "credential", "credentials",
 		"api_key", "apikey", "private_key", "privatekey",
-		"oauth_token", "access_token", "refresh_token",
+		"token", "oauth_token", "access_token", "refresh_token",
 		"bearer_token", "auth_token":
 		return true
 	}

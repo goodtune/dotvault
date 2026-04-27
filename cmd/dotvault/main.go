@@ -223,6 +223,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			if err := webServer.WaitForAuth(ctx); err != nil {
 				return fmt.Errorf("web-based authentication: %w", err)
 			}
+		} else if !isInteractive() {
+			// Headless: no web UI to drive auth and no terminal to prompt
+			// on. Don't crash and don't spam the logs trying to read from
+			// a closed stdin — stay up so an external interactive facility
+			// (e.g. a login profile that runs `dotvault sync`) can write
+			// the token, and a daemon restart will pick it up.
+			slog.Warn("no vault token available and no interactive facility (web UI disabled, stdin is not a terminal); daemon will idle until shutdown")
+			<-ctx.Done()
+			return nil
 		} else {
 			// Traditional auth flow (OIDC with ephemeral listener, LDAP
 			// prompt, or token file).
@@ -289,12 +298,22 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 			slog.Info("stopping enrolment wait due to shutdown")
 		}
+	} else if !isInteractive() {
+		// Headless CLI mode: no web UI, no terminal. Skip the enrolment
+		// wizard entirely — engines that prompt would either fail or hang
+		// without a TTY. The RefreshManager started above continues to
+		// rotate already-enrolled credentials, and config reloads still
+		// pick up changes once an interactive session completes the
+		// enrolment.
+		if len(cfg.Enrolments) > 0 {
+			slog.Info("skipping enrolment wizard: stdin is not a terminal and web UI is disabled")
+		}
 	} else {
-		// CLI mode: terminal-based wizard (unchanged).
+		// CLI mode: terminal-based wizard.
 		enrolIO := enrol.IO{
-			Out:     os.Stderr,
-			Browser: browser.OpenURL,
-			Log:     slog.Default(),
+			Out:      os.Stderr,
+			Browser:  browser.OpenURL,
+			Log:      slog.Default(),
 			Username: username,
 			PromptSecret: func(label string) (string, error) {
 				fd := int(os.Stdin.Fd())
@@ -471,4 +490,10 @@ func isTerminal() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// isInteractive reports whether stdin is connected to a TTY, i.e. whether
+// the daemon can prompt the user for credentials, MFA passcodes, etc.
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
 }

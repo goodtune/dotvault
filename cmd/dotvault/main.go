@@ -15,6 +15,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
@@ -26,9 +27,11 @@ import (
 var version = "dev"
 
 var (
-	flagConfig   string
-	flagLogLevel string
-	flagDryRun   bool
+	flagConfig    string
+	flagLogLevel  string
+	flagDryRun    bool
+	flagRegOutput string
+	flagRegASCII  bool
 )
 
 func main() {
@@ -65,6 +68,7 @@ func main() {
 				fmt.Println(version)
 			},
 		},
+		newRegExportCmd(),
 	)
 
 	// --once as alias for sync
@@ -482,6 +486,78 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	}
 
 	return username, vc, nil
+}
+
+func newRegExportCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reg-export [config.yaml]",
+		Short: "Convert a YAML config to a Windows .reg file",
+		Long: `Convert a dotvault YAML configuration file into a Windows Registry
+.reg file targeting HKLM\SOFTWARE\Policies\dotvault.
+
+The input config path may be supplied as a positional argument or via the
+inherited --config flag; the positional argument takes precedence when
+both are given. If neither is supplied the platform-specific system
+config path is used, matching the other dotvault subcommands.
+
+The resulting file can be applied with regedit.exe /s, deployed via Group
+Policy Preferences, or imported manually. By default the output is encoded
+as UTF-16LE with BOM, matching the canonical format produced by regedit.exe.
+Pass --ascii for a plain-text variant suitable for diffing or piping
+through other tools.
+
+The YAML file is fully validated before conversion; conversion errors out
+on any problem the daemon would normally reject at load time.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runRegExport,
+	}
+	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
+	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "emit unencoded plain text instead of UTF-16LE")
+	return cmd
+}
+
+func runRegExport(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
+	path := flagConfig
+	if len(args) == 1 {
+		path = args[0]
+	}
+	if path == "" {
+		path = paths.SystemConfigPath()
+	}
+
+	// reg-export deliberately reads the YAML file, not the registry, so we
+	// use config.Load rather than config.LoadSystem (the latter would
+	// short-circuit to the registry on Windows when GPO keys are present).
+	cfg, err := config.Load(path)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	var data []byte
+	if flagRegASCII {
+		text, err := regfile.GenerateText(cfg)
+		if err != nil {
+			return fmt.Errorf("render reg file: %w", err)
+		}
+		data = []byte(text)
+	} else {
+		out, err := regfile.Generate(cfg)
+		if err != nil {
+			return fmt.Errorf("render reg file: %w", err)
+		}
+		data = out
+	}
+
+	if flagRegOutput == "" || flagRegOutput == "-" {
+		_, err := os.Stdout.Write(data)
+		return err
+	}
+	// Match the 0600 convention used by other dotvault-managed files: the
+	// rendered .reg can include enrolment settings or other potentially
+	// sensitive material that should not be world-readable.
+	return os.WriteFile(flagRegOutput, data, 0600)
 }
 
 // isStderrTerminal reports whether stderr is connected to a TTY, used to

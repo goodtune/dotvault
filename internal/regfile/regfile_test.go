@@ -382,6 +382,48 @@ func TestAcceptsUnicodeValueName(t *testing.T) {
 	}
 }
 
+func TestRejectsNULInStringValue(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"key": "before\x00after",
+				},
+			},
+		},
+	}
+	_, err := GenerateText(cfg)
+	if err == nil {
+		t.Fatal("expected error for embedded NUL in string value")
+	}
+	if !strings.Contains(err.Error(), "NUL") {
+		t.Errorf("error should mention NUL; got: %v", err)
+	}
+}
+
+func TestRejectsNULInMultiStringElement(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "k",
+				Target:   config.Target{Path: "/tmp/x", Format: "text"},
+				OAuth: &config.OAuthConfig{
+					Provider: "github",
+					Scopes:   []string{"ok", "bad\x00scope"},
+				},
+			},
+		},
+	}
+	_, err := GenerateText(cfg)
+	if err == nil {
+		t.Fatal("expected error for embedded NUL in multi-string element")
+	}
+}
+
 func TestEmptyStringEmittedExplicitly(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{

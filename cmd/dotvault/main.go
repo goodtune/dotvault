@@ -471,10 +471,14 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 
 func newRegExportCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "reg-export <config.yaml>",
+		Use:   "reg-export [config.yaml]",
 		Short: "Convert a YAML config to a Windows .reg file",
 		Long: `Convert a dotvault YAML configuration file into a Windows Registry
 .reg file targeting HKLM\SOFTWARE\Policies\dotvault.
+
+The input config path may be supplied as a positional argument or via the
+inherited --config flag; the positional argument takes precedence when
+both are given.
 
 The resulting file can be applied with regedit.exe /s, deployed via Group
 Policy Preferences, or imported manually. By default the output is encoded
@@ -484,7 +488,7 @@ through other tools.
 
 The YAML file is fully validated before conversion; conversion errors out
 on any problem the daemon would normally reject at load time.`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: runRegExport,
 	}
 	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
@@ -495,7 +499,15 @@ on any problem the daemon would normally reject at load time.`,
 func runRegExport(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, err := config.Load(args[0])
+	path := flagConfig
+	if len(args) == 1 {
+		path = args[0]
+	}
+	if path == "" {
+		return fmt.Errorf("provide a YAML config path as a positional argument or via --config")
+	}
+
+	cfg, err := config.Load(path)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

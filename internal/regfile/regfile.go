@@ -233,13 +233,17 @@ func (e *emitter) writeSetting(enrolment, name string, value any) {
 // is emitted in quoted form; anything else falls through to hex(1) so that
 // templates with embedded newlines round-trip correctly.
 //
-// Empty strings are emitted explicitly as `""=""` rather than omitted, so
-// that re-importing an exported .reg clears any value previously configured
-// for the same name. Without this, removing an optional field from YAML
-// would leave stale registry data on machines where the policy was
-// previously applied.
+// Empty strings are emitted explicitly as `"<Name>"=""` rather than
+// omitted, so that re-importing an exported .reg clears any value
+// previously configured for the same name. Without this, removing an
+// optional field from YAML would leave stale registry data on machines
+// where the policy was previously applied.
 func (e *emitter) writeString(name, value string) {
 	if err := validateValueName(name); err != nil {
+		e.fail("%w", err)
+		return
+	}
+	if err := rejectEmbeddedNUL(name, value); err != nil {
 		e.fail("%w", err)
 		return
 	}
@@ -266,6 +270,14 @@ func (e *emitter) writeMultiString(name string, values []string) {
 	if err := validateValueName(name); err != nil {
 		e.fail("%w", err)
 		return
+	}
+	// Embedded NUL in a list element would split or truncate the entry on
+	// import because REG_MULTI_SZ uses NUL as the element delimiter.
+	for i, v := range values {
+		if strings.IndexByte(v, 0) >= 0 {
+			e.fail("registry value %q list element [%d] contains an embedded NUL byte; REG_MULTI_SZ uses NUL as a delimiter and cannot represent it", name, i)
+			return
+		}
 	}
 	e.writeHexValue(name, 7, utf16MultiStringBytes(values))
 }
@@ -355,6 +367,18 @@ func escapeREGString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return s
+}
+
+// rejectEmbeddedNUL returns an error if value contains a NUL byte (\x00).
+// REG_SZ and REG_MULTI_SZ both use NUL as a terminator, so an embedded NUL
+// would be truncated or split when the value is read back on import,
+// breaking round-trip. We surface this as a clear error rather than
+// silently corrupt the export.
+func rejectEmbeddedNUL(name, value string) error {
+	if strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("registry value %q contains an embedded NUL byte; REG_SZ cannot represent it", name)
+	}
+	return nil
 }
 
 // validateValueName rejects names that cannot be safely represented inside

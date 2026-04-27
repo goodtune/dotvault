@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -190,6 +191,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		syncInterval = s.syncCfg.Interval.String()
 	}
 
+	web := map[string]any{
+		"enabled": s.cfg.Enabled,
+		"listen":  s.cfg.Listen,
+	}
+	// listen_effective surfaces the actually-bound address, which differs
+	// from the configured value when the user gave a port like ":0".
+	if s.listenAddr != "" {
+		web["listen_effective"] = s.listenAddr
+	}
+
 	resp := map[string]any{
 		"vault": map[string]any{
 			"address":               s.vaultCfg.Address,
@@ -205,10 +216,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"sync": map[string]any{
 			"interval": syncInterval,
 		},
-		"web": map[string]any{
-			"enabled": s.cfg.Enabled,
-			"listen":  s.cfg.Listen,
-		},
+		"web":        web,
 		"rules":      rules,
 		"enrolments": enrolments,
 	}
@@ -253,14 +261,17 @@ func redactEnrolmentValue(v any) any {
 }
 
 // isSensitiveSettingKey reports whether a settings key looks like it carries
-// a credential. It uses an exact-name list and a suffix list rather than a
-// loose substring match so that legitimate configuration knobs are not
-// false-positive redacted — e.g. `token_ttl` (JFrog engine duration knob)
-// must remain visible, only `token`, `*_token`, `oauth_token`,
-// `access_token` etc are masked.
+// a credential. The key is first normalized so that camelCase, kebab-case
+// and snake_case variants all collapse to the same form (`accessToken`,
+// `access-token`, `access_token` → `access_token`). Matching then uses an
+// exact-name list and a suffix list rather than a loose substring match so
+// that legitimate configuration knobs are not false-positive redacted —
+// e.g. `token_ttl` must remain visible, only `token`, `*_token`,
+// `oauth_token`, `access_token`, `clientSecret`, `privateKey` etc are
+// masked.
 func isSensitiveSettingKey(k string) bool {
-	lk := strings.ToLower(k)
-	switch lk {
+	nk := normalizeKey(k)
+	switch nk {
 	case "password", "passphrase", "secret", "credential", "credentials",
 		"api_key", "apikey", "private_key", "privatekey",
 		"token", "oauth_token", "access_token", "refresh_token",
@@ -272,11 +283,34 @@ func isSensitiveSettingKey(k string) bool {
 		"_credential", "_credentials", "_apikey", "_api_key",
 		"_private_key",
 	} {
-		if strings.HasSuffix(lk, suffix) {
+		if strings.HasSuffix(nk, suffix) {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeKey lower-cases a key and converts camelCase / kebab-case into
+// snake_case so the redaction matcher can treat all naming conventions
+// uniformly. Examples: `clientSecret` → `client_secret`,
+// `access-token` → `access_token`, `OAuthToken` → `o_auth_token`.
+func normalizeKey(k string) string {
+	var b strings.Builder
+	b.Grow(len(k) + 4)
+	var prev rune
+	for i, r := range k {
+		switch {
+		case r == '-':
+			b.WriteByte('_')
+		case i > 0 && unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)):
+			b.WriteByte('_')
+			b.WriteRune(unicode.ToLower(r))
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+		prev = r
+	}
+	return b.String()
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

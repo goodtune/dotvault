@@ -168,7 +168,8 @@ func TestHandleConfig_Authenticated(t *testing.T) {
 		TLSSkipVerify: true,
 	}
 	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
-	s.cfg = config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"}
+	s.cfg = config.WebConfig{Enabled: true, Listen: "127.0.0.1:0"}
+	s.listenAddr = "127.0.0.1:43217"
 	s.rules = []config.Rule{
 		{
 			Name:        "gh",
@@ -240,6 +241,17 @@ func TestHandleConfig_Authenticated(t *testing.T) {
 	}
 	if syncCfg["interval"] != "15m" {
 		t.Errorf("sync.interval = %v, want %q", syncCfg["interval"], "15m")
+	}
+
+	web, ok := resp["web"].(map[string]any)
+	if !ok {
+		t.Fatalf("web is %T, want map", resp["web"])
+	}
+	if web["listen"] != "127.0.0.1:0" {
+		t.Errorf("web.listen = %v, want configured value", web["listen"])
+	}
+	if web["listen_effective"] != "127.0.0.1:43217" {
+		t.Errorf("web.listen_effective = %v, want bound address", web["listen_effective"])
 	}
 
 	rules, ok := resp["rules"].([]any)
@@ -336,6 +348,12 @@ func TestIsSensitiveSettingKey(t *testing.T) {
 		{"private_key", true},
 		{"some_password", true},
 		{"vault_secret", true},
+		// camelCase / kebab-case variants must also match.
+		{"clientSecret", true},
+		{"refreshToken", true},
+		{"privateKey", true},
+		{"access-token", true},
+		{"oauth-token", true},
 	} {
 		if got := isSensitiveSettingKey(tc.key); got != tc.sensitive {
 			t.Errorf("isSensitiveSettingKey(%q) = %v, want %v", tc.key, got, tc.sensitive)

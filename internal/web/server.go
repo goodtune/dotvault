@@ -230,13 +230,20 @@ func (s *Server) getEnrolRunner() *EnrolmentRunner {
 	return s.enrolRunner
 }
 
-// getEnrolments returns the configured enrolments map, safe for concurrent
-// access. The map itself is treated as immutable once set by InitEnrolments,
-// so callers may iterate without further locking.
+// getEnrolments returns a shallow copy of the configured enrolments map,
+// safe for concurrent access and for the caller to iterate or mutate
+// without affecting server state.
 func (s *Server) getEnrolments() map[string]config.Enrolment {
 	s.enrolRunnerMu.RLock()
 	defer s.enrolRunnerMu.RUnlock()
-	return s.enrolments
+	if s.enrolments == nil {
+		return nil
+	}
+	out := make(map[string]config.Enrolment, len(s.enrolments))
+	for k, v := range s.enrolments {
+		out[k] = v
+	}
+	return out
 }
 
 // InitEnrolments sets up the enrolment runner for web-driven enrolment.

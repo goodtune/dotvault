@@ -168,8 +168,14 @@ function formatBool(v) {
 
 function formatSetting(v) {
   if (v === null || v === undefined) return '—';
-  if (Array.isArray(v)) return v.join(', ');
-  if (typeof v === 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) {
+    const hasObjects = v.some(item => item !== null && typeof item === 'object');
+    if (!hasObjects) return v.join(', ');
+    return h('pre', { class: 'config-json' }, JSON.stringify(v, null, 2));
+  }
+  if (typeof v === 'object') {
+    return h('pre', { class: 'config-json' }, JSON.stringify(v, null, 2));
+  }
   return h('code', null, String(v));
 }
 

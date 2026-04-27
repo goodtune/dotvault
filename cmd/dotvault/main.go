@@ -479,8 +479,8 @@ func newRegExportCmd() *cobra.Command {
 The resulting file can be applied with regedit.exe /s, deployed via Group
 Policy Preferences, or imported manually. By default the output is encoded
 as UTF-16LE with BOM, matching the canonical format produced by regedit.exe.
-Pass --ascii for a plain-text REGEDIT4-compatible variant suitable for
-diffing or piping through other tools.
+Pass --ascii for a plain-text variant suitable for diffing or piping
+through other tools.
 
 The YAML file is fully validated before conversion; conversion errors out
 on any problem the daemon would normally reject at load time.`,
@@ -500,9 +500,17 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 
 	var data []byte
 	if flagRegASCII {
-		data = []byte(regfile.GenerateText(cfg))
+		text, err := regfile.GenerateText(cfg)
+		if err != nil {
+			return fmt.Errorf("render reg file: %w", err)
+		}
+		data = []byte(text)
 	} else {
-		data = regfile.Generate(cfg)
+		out, err := regfile.Generate(cfg)
+		if err != nil {
+			return fmt.Errorf("render reg file: %w", err)
+		}
+		data = out
 	}
 
 	if flagRegOutput == "" || flagRegOutput == "-" {

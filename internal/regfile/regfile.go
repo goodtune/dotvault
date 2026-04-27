@@ -23,44 +23,72 @@ const (
 )
 
 // Generate produces .reg file content for cfg encoded as UTF-16LE with BOM.
-func Generate(cfg *config.Config) []byte {
-	return encodeUTF16LE(GenerateText(cfg))
+func Generate(cfg *config.Config) ([]byte, error) {
+	text, err := GenerateText(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return encodeUTF16LE(text), nil
 }
 
-// GenerateText produces .reg file content for cfg as plain ASCII text.
-// Useful for tests and for callers that want to emit a REGEDIT4-compatible
-// file without UTF-16 encoding.
-func GenerateText(cfg *config.Config) string {
-	var b strings.Builder
-	b.WriteString(header)
+// GenerateText produces .reg file content for cfg as plain text using the
+// same Windows Registry Editor Version 5.00 format as Generate, but without
+// UTF-16LE encoding. Useful for tests and for callers that want to inspect
+// or post-process the output.
+func GenerateText(cfg *config.Config) (string, error) {
+	e := &emitter{}
+	e.WriteString(header)
 
-	writeKey(&b, rootKey)
-	b.WriteString("\r\n")
+	e.writeKey(rootKey)
+	e.WriteString("\r\n")
 
-	writeVault(&b, cfg.Vault)
-	writeSync(&b, cfg.Sync)
-	writeWeb(&b, cfg.Web)
-	writeRules(&b, cfg.Rules)
-	writeEnrolments(&b, cfg.Enrolments)
+	e.writeVault(cfg.Vault)
+	e.writeSync(cfg.Sync)
+	e.writeWeb(cfg.Web)
+	e.writeRules(cfg.Rules)
+	e.writeEnrolments(cfg.Enrolments)
 
-	return b.String()
+	if e.err != nil {
+		return "", e.err
+	}
+	return e.b.String(), nil
 }
 
-func writeVault(b *strings.Builder, v config.VaultConfig) {
-	writeKey(b, rootKey+`\Vault`)
-	writeString(b, "Address", v.Address)
-	writeString(b, "AuthMethod", v.AuthMethod)
-	writeString(b, "AuthMount", v.AuthMount)
-	writeString(b, "AuthRole", v.AuthRole)
-	writeString(b, "CACert", v.CACert)
-	writeString(b, "KVMount", v.KVMount)
-	writeString(b, "UserPrefix", v.UserPrefix)
-	writeBool(b, "DisableTokenRenewal", v.DisableTokenRenewal)
-	writeBool(b, "TLSSkipVerify", v.TLSSkipVerify)
-	b.WriteString("\r\n")
+// emitter is a strings.Builder wrapper that captures the first error
+// encountered so the rendering walk can carry on without if/return
+// noise at every call site.
+type emitter struct {
+	b   strings.Builder
+	err error
 }
 
-func writeSync(b *strings.Builder, s config.SyncConfig) {
+func (e *emitter) WriteString(s string) { e.b.WriteString(s) }
+
+func (e *emitter) fail(format string, args ...any) {
+	if e.err == nil {
+		e.err = fmt.Errorf(format, args...)
+	}
+}
+
+func (e *emitter) writeKey(path string) {
+	fmt.Fprintf(&e.b, "[%s]\r\n", path)
+}
+
+func (e *emitter) writeVault(v config.VaultConfig) {
+	e.writeKey(rootKey + `\Vault`)
+	e.writeString("Address", v.Address)
+	e.writeString("AuthMethod", v.AuthMethod)
+	e.writeString("AuthMount", v.AuthMount)
+	e.writeString("AuthRole", v.AuthRole)
+	e.writeString("CACert", v.CACert)
+	e.writeString("KVMount", v.KVMount)
+	e.writeString("UserPrefix", v.UserPrefix)
+	e.writeBool("DisableTokenRenewal", v.DisableTokenRenewal)
+	e.writeBool("TLSSkipVerify", v.TLSSkipVerify)
+	e.WriteString("\r\n")
+}
+
+func (e *emitter) writeSync(s config.SyncConfig) {
 	interval := s.RawInterval
 	if interval == "" && s.Interval > 0 {
 		interval = s.Interval.String()
@@ -68,61 +96,61 @@ func writeSync(b *strings.Builder, s config.SyncConfig) {
 	if interval == "" {
 		return
 	}
-	writeKey(b, rootKey+`\Sync`)
-	writeString(b, "Interval", interval)
-	b.WriteString("\r\n")
+	e.writeKey(rootKey + `\Sync`)
+	e.writeString("Interval", interval)
+	e.WriteString("\r\n")
 }
 
-func writeWeb(b *strings.Builder, w config.WebConfig) {
-	writeKey(b, rootKey+`\Web`)
-	writeBool(b, "Enabled", w.Enabled)
-	writeString(b, "Listen", w.Listen)
-	b.WriteString("\r\n")
+func (e *emitter) writeWeb(w config.WebConfig) {
+	e.writeKey(rootKey + `\Web`)
+	e.writeBool("Enabled", w.Enabled)
+	e.writeString("Listen", w.Listen)
+	e.WriteString("\r\n")
 }
 
-func writeRules(b *strings.Builder, rules []config.Rule) {
+func (e *emitter) writeRules(rules []config.Rule) {
 	if len(rules) == 0 {
 		return
 	}
-	writeKey(b, rootKey+`\Rules`)
-	b.WriteString("\r\n")
+	e.writeKey(rootKey + `\Rules`)
+	e.WriteString("\r\n")
 
 	sorted := append([]config.Rule(nil), rules...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
 	for _, r := range sorted {
-		writeRule(b, r)
+		e.writeRule(r)
 	}
 }
 
-func writeRule(b *strings.Builder, r config.Rule) {
+func (e *emitter) writeRule(r config.Rule) {
 	rulePath := rootKey + `\Rules\` + r.Name
-	writeKey(b, rulePath)
-	writeString(b, "Description", r.Description)
-	writeString(b, "TargetFormat", r.Target.Format)
-	writeString(b, "TargetMerge", r.Target.Merge)
-	writeString(b, "TargetPath", r.Target.Path)
-	writeString(b, "TargetTemplate", r.Target.Template)
-	writeString(b, "VaultKey", r.VaultKey)
-	b.WriteString("\r\n")
+	e.writeKey(rulePath)
+	e.writeString("Description", r.Description)
+	e.writeString("TargetFormat", r.Target.Format)
+	e.writeString("TargetMerge", r.Target.Merge)
+	e.writeString("TargetPath", r.Target.Path)
+	e.writeString("TargetTemplate", r.Target.Template)
+	e.writeString("VaultKey", r.VaultKey)
+	e.WriteString("\r\n")
 
 	if r.OAuth == nil {
 		return
 	}
-	writeKey(b, rulePath+`\OAuth`)
-	writeString(b, "EnginePath", r.OAuth.EnginePath)
-	writeString(b, "Provider", r.OAuth.Provider)
+	e.writeKey(rulePath + `\OAuth`)
+	e.writeString("EnginePath", r.OAuth.EnginePath)
+	e.writeString("Provider", r.OAuth.Provider)
 	if len(r.OAuth.Scopes) > 0 {
-		writeMultiString(b, "Scopes", r.OAuth.Scopes)
+		e.writeMultiString("Scopes", r.OAuth.Scopes)
 	}
-	b.WriteString("\r\n")
+	e.WriteString("\r\n")
 }
 
-func writeEnrolments(b *strings.Builder, enrolments map[string]config.Enrolment) {
+func (e *emitter) writeEnrolments(enrolments map[string]config.Enrolment) {
 	if len(enrolments) == 0 {
 		return
 	}
-	writeKey(b, rootKey+`\Enrolments`)
-	b.WriteString("\r\n")
+	e.writeKey(rootKey + `\Enrolments`)
+	e.WriteString("\r\n")
 
 	names := make([]string, 0, len(enrolments))
 	for n := range enrolments {
@@ -130,114 +158,107 @@ func writeEnrolments(b *strings.Builder, enrolments map[string]config.Enrolment)
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		writeEnrolment(b, n, enrolments[n])
+		e.writeEnrolment(n, enrolments[n])
 	}
 }
 
-func writeEnrolment(b *strings.Builder, name string, e config.Enrolment) {
+func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 	enrolPath := rootKey + `\Enrolments\` + name
-	writeKey(b, enrolPath)
-	writeString(b, "Engine", e.Engine)
-	b.WriteString("\r\n")
+	e.writeKey(enrolPath)
+	e.writeString("Engine", en.Engine)
+	e.WriteString("\r\n")
 
-	if len(e.Settings) == 0 {
+	if len(en.Settings) == 0 {
 		return
 	}
-	writeKey(b, enrolPath+`\Settings`)
+	e.writeKey(enrolPath + `\Settings`)
 
-	keys := make([]string, 0, len(e.Settings))
-	for k := range e.Settings {
+	keys := make([]string, 0, len(en.Settings))
+	for k := range en.Settings {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		writeSetting(b, k, e.Settings[k])
+		e.writeSetting(name, k, en.Settings[k])
 	}
-	b.WriteString("\r\n")
+	e.WriteString("\r\n")
 }
 
 // writeSetting emits a single enrolment setting. Strings become REG_SZ;
-// slices of strings become REG_MULTI_SZ. Other types are skipped because
-// the registry reader only knows how to deserialise these two kinds.
-func writeSetting(b *strings.Builder, name string, value any) {
+// slices of strings become REG_MULTI_SZ. The registry reader only knows
+// how to deserialise these two kinds, so any other value type is treated
+// as an error rather than silently dropped: a partial export that
+// disagrees with the source YAML is worse than a hard failure.
+func (e *emitter) writeSetting(enrolment, name string, value any) {
 	switch v := value.(type) {
 	case string:
-		writeString(b, name, v)
+		e.writeString(name, v)
 	case []string:
 		if len(v) > 0 {
-			writeMultiString(b, name, v)
+			e.writeMultiString(name, v)
 		}
 	case []any:
 		strs := make([]string, 0, len(v))
-		for _, item := range v {
+		for i, item := range v {
 			s, ok := item.(string)
 			if !ok {
+				e.fail("enrolments[%q].settings[%q][%d]: cannot represent %T in registry; only strings are supported", enrolment, name, i, item)
 				return
 			}
 			strs = append(strs, s)
 		}
 		if len(strs) > 0 {
-			writeMultiString(b, name, strs)
+			e.writeMultiString(name, strs)
 		}
+	default:
+		e.fail("enrolments[%q].settings[%q]: cannot represent %T in registry; only strings and string lists are supported", enrolment, name, value)
 	}
-}
-
-func writeKey(b *strings.Builder, path string) {
-	fmt.Fprintf(b, "[%s]\r\n", path)
 }
 
 // writeString emits a REG_SZ value. Plain ASCII without control characters
 // is emitted in quoted form; anything else falls through to hex(1) so that
 // templates with embedded newlines round-trip correctly.
-func writeString(b *strings.Builder, name, value string) {
+func (e *emitter) writeString(name, value string) {
 	if value == "" {
 		return
 	}
-	if needsHex(value) {
-		writeHexValue(b, name, 1, utf16Bytes([]string{value}))
+	if err := validateValueName(name); err != nil {
+		e.fail("%w", err)
 		return
 	}
-	fmt.Fprintf(b, "\"%s\"=%s\r\n", name, quoteREGSZ(value))
+	if needsHex(value) {
+		e.writeHexValue(name, 1, utf16StringBytes(value))
+		return
+	}
+	fmt.Fprintf(&e.b, "%s=%s\r\n", quoteREGName(name), quoteREGSZ(value))
 }
 
-func writeBool(b *strings.Builder, name string, value bool) {
+func (e *emitter) writeBool(name string, value bool) {
+	if err := validateValueName(name); err != nil {
+		e.fail("%w", err)
+		return
+	}
 	v := uint32(0)
 	if value {
 		v = 1
 	}
-	fmt.Fprintf(b, "\"%s\"=dword:%08x\r\n", name, v)
+	fmt.Fprintf(&e.b, "%s=dword:%08x\r\n", quoteREGName(name), v)
 }
 
-func writeMultiString(b *strings.Builder, name string, values []string) {
-	writeHexValue(b, name, 7, utf16Bytes(values))
-}
-
-// utf16Bytes encodes one or more strings as a contiguous UTF-16LE byte
-// sequence terminated as expected by the corresponding registry type:
-//
-//   - REG_SZ (single string): trailing NUL.
-//   - REG_MULTI_SZ (slice of strings): each string NUL-terminated, plus
-//     a final NUL terminator on the empty trailing string.
-func utf16Bytes(values []string) []byte {
-	var runes []uint16
-	for _, s := range values {
-		runes = append(runes, utf16.Encode([]rune(s))...)
-		runes = append(runes, 0)
+func (e *emitter) writeMultiString(name string, values []string) {
+	if err := validateValueName(name); err != nil {
+		e.fail("%w", err)
+		return
 	}
-	if len(values) > 1 {
-		runes = append(runes, 0)
-	}
-	out := make([]byte, 2*len(runes))
-	for i, r := range runes {
-		binary.LittleEndian.PutUint16(out[2*i:], r)
-	}
-	return out
+	e.writeHexValue(name, 7, utf16MultiStringBytes(values))
 }
 
 // writeHexValue emits a hex(<kind>):... value, wrapping at maxLineLen
 // using the standard backslash continuation that regedit.exe produces.
-func writeHexValue(b *strings.Builder, name string, kind int, data []byte) {
-	head := fmt.Sprintf("\"%s\"=hex(%d):", name, kind)
+// Continuation lines are prefixed with two spaces; that indent is included
+// in the running length so emitted lines do not exceed maxLineLen.
+func (e *emitter) writeHexValue(name string, kind int, data []byte) {
+	head := fmt.Sprintf("%s=hex(%d):", quoteREGName(name), kind)
 	cur := head
 	for i, by := range data {
 		token := fmt.Sprintf("%02x", by)
@@ -245,23 +266,82 @@ func writeHexValue(b *strings.Builder, name string, kind int, data []byte) {
 		if i == 0 {
 			sep = ""
 		}
-		// Reserve one column for the trailing backslash on continuation.
-		if len(cur)+len(sep)+len(token) > maxLineLen-1 {
-			b.WriteString(cur + sep + "\\\r\n  ")
-			cur = token
+		// Reserve two columns for the trailing ",\\" on a continuation line.
+		if len(cur)+len(sep)+len(token) > maxLineLen-2 {
+			e.b.WriteString(cur + sep + "\\\r\n")
+			cur = "  " + token
 			continue
 		}
 		cur += sep + token
 	}
-	b.WriteString(cur + "\r\n")
+	e.b.WriteString(cur + "\r\n")
+}
+
+// utf16StringBytes encodes a single string as UTF-16LE bytes terminated
+// by a single NUL (0x00 0x00).
+func utf16StringBytes(s string) []byte {
+	runes := utf16.Encode([]rune(s))
+	runes = append(runes, 0)
+	return runesToLE(runes)
+}
+
+// utf16MultiStringBytes encodes a REG_MULTI_SZ as a contiguous UTF-16LE
+// byte sequence: each string NUL-terminated, plus a final NUL terminator
+// (the empty trailing string) when the slice is non-empty. An empty slice
+// produces a single NUL pair, matching how regedit.exe emits an empty
+// REG_MULTI_SZ.
+func utf16MultiStringBytes(values []string) []byte {
+	var runes []uint16
+	for _, s := range values {
+		runes = append(runes, utf16.Encode([]rune(s))...)
+		runes = append(runes, 0)
+	}
+	runes = append(runes, 0)
+	return runesToLE(runes)
+}
+
+func runesToLE(runes []uint16) []byte {
+	out := make([]byte, 2*len(runes))
+	for i, r := range runes {
+		binary.LittleEndian.PutUint16(out[2*i:], r)
+	}
+	return out
 }
 
 // quoteREGSZ wraps s in double quotes and escapes the only two characters
 // that have special meaning inside a quoted REG_SZ value.
 func quoteREGSZ(s string) string {
+	return `"` + escapeREGString(s) + `"`
+}
+
+// quoteREGName quotes a value name with the same escape rules as REG_SZ
+// values. Value names accepted by Windows are very permissive; the rest
+// of the renderer guards against unrepresentable cases via
+// validateValueName before calling here.
+func quoteREGName(name string) string {
+	return `"` + escapeREGString(name) + `"`
+}
+
+func escapeREGString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
+	return s
+}
+
+// validateValueName rejects names containing characters that cannot be
+// safely represented inside a quoted .reg value name. The .reg format
+// has no escape mechanism for control characters or NUL inside quoted
+// strings, so we error out rather than silently corrupt the output.
+func validateValueName(name string) error {
+	if name == "" {
+		return fmt.Errorf("registry value name must not be empty")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7F {
+			return fmt.Errorf("registry value name %q contains control character U+%04X", name, r)
+		}
+	}
+	return nil
 }
 
 // needsHex reports whether s contains characters that cannot appear in a

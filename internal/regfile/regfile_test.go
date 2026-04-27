@@ -8,13 +8,22 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 )
 
+func mustGenerate(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	return got
+}
+
 func TestGenerateMinimal(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Sync:  config.SyncConfig{RawInterval: "15m"},
 	}
 
-	got := GenerateText(cfg)
+	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
 		"Windows Registry Editor Version 5.00\r\n",
@@ -55,7 +64,7 @@ func TestGenerateRulesAndOAuth(t *testing.T) {
 		},
 	}
 
-	got := GenerateText(cfg)
+	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
 		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules]\r\n",
@@ -94,7 +103,7 @@ func TestGenerateMultilineTemplate(t *testing.T) {
 		},
 	}
 
-	got := GenerateText(cfg)
+	got := mustGenerate(t, cfg)
 
 	if !strings.Contains(got, "\"TargetTemplate\"=hex(1):") {
 		t.Errorf("multi-line template should be emitted as hex(1):\n%s", got)
@@ -130,7 +139,7 @@ func TestGenerateEnrolments(t *testing.T) {
 		},
 	}
 
-	got := GenerateText(cfg)
+	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
 		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments]\r\n",
@@ -154,6 +163,82 @@ func TestGenerateEnrolments(t *testing.T) {
 	sshIdx := strings.Index(got, `\Enrolments\ssh]`)
 	if ghIdx == -1 || sshIdx == -1 || ghIdx > sshIdx {
 		t.Errorf("expected gh before ssh in sorted output; gh=%d ssh=%d", ghIdx, sshIdx)
+	}
+}
+
+func TestGenerateUnsupportedSettingTypeErrors(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"port": 22, // ints are not representable
+				},
+			},
+		},
+	}
+	_, err := GenerateText(cfg)
+	if err == nil {
+		t.Fatalf("expected error for unsupported setting type")
+	}
+	if !strings.Contains(err.Error(), "port") || !strings.Contains(err.Error(), "int") {
+		t.Errorf("error should mention the offending setting and type; got: %v", err)
+	}
+}
+
+func TestGenerateMixedListErrors(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"scopes": []any{"repo", 42}, // mixed list
+				},
+			},
+		},
+	}
+	_, err := GenerateText(cfg)
+	if err == nil {
+		t.Fatalf("expected error for mixed-type list")
+	}
+}
+
+func TestGenerateRejectsControlCharsInName(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					"bad\nname": "value",
+				},
+			},
+		},
+	}
+	_, err := GenerateText(cfg)
+	if err == nil {
+		t.Fatalf("expected error for control char in setting name")
+	}
+}
+
+func TestGenerateEscapesQuoteAndBackslashInName(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {
+				Engine: "github",
+				Settings: map[string]any{
+					`weird"name\path`: "value",
+				},
+			},
+		},
+	}
+	got := mustGenerate(t, cfg)
+	// Both " and \ in the name must be backslash-escaped on the wire.
+	if !strings.Contains(got, `"weird\"name\\path"="value"`) {
+		t.Errorf("setting name not escaped correctly; got:\n%s", got)
 	}
 }
 
@@ -193,21 +278,40 @@ func TestNeedsHex(t *testing.T) {
 	}
 }
 
-func TestUTF16BytesSingle(t *testing.T) {
-	// "A" -> 41,00 plus NUL terminator 00,00
-	got := utf16Bytes([]string{"A"})
+func TestUTF16StringBytes(t *testing.T) {
+	// "A" -> 41,00 plus NUL terminator 00,00.
+	got := utf16StringBytes("A")
 	want := []byte{0x41, 0x00, 0x00, 0x00}
 	if !bytes.Equal(got, want) {
-		t.Errorf("utf16Bytes([\"A\"]) = % x, want % x", got, want)
+		t.Errorf("utf16StringBytes(\"A\") = % x, want % x", got, want)
 	}
 }
 
-func TestUTF16BytesMulti(t *testing.T) {
-	// ["A", "B"] -> 41,00,00,00,42,00,00,00 plus final terminator 00,00
-	got := utf16Bytes([]string{"A", "B"})
+func TestUTF16MultiStringBytesSingle(t *testing.T) {
+	// REG_MULTI_SZ for ["A"]: "A"\0\0
+	// As UTF-16LE bytes: 41,00,00,00,00,00 (single string + double-NUL terminator)
+	got := utf16MultiStringBytes([]string{"A"})
+	want := []byte{0x41, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if !bytes.Equal(got, want) {
+		t.Errorf("utf16MultiStringBytes([\"A\"]) = % x, want % x", got, want)
+	}
+}
+
+func TestUTF16MultiStringBytesMulti(t *testing.T) {
+	// ["A", "B"] -> 41,00,00,00,42,00,00,00,00,00
+	got := utf16MultiStringBytes([]string{"A", "B"})
 	want := []byte{0x41, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00}
 	if !bytes.Equal(got, want) {
-		t.Errorf("utf16Bytes = % x, want % x", got, want)
+		t.Errorf("utf16MultiStringBytes = % x, want % x", got, want)
+	}
+}
+
+func TestUTF16MultiStringBytesEmpty(t *testing.T) {
+	// Empty MULTI_SZ is just the trailing NUL pair.
+	got := utf16MultiStringBytes(nil)
+	want := []byte{0x00, 0x00}
+	if !bytes.Equal(got, want) {
+		t.Errorf("utf16MultiStringBytes(nil) = % x, want % x", got, want)
 	}
 }
 
@@ -224,7 +328,10 @@ func TestGenerateProducesUTF16LEWithBOM(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 	}
-	got := Generate(cfg)
+	got, err := Generate(cfg)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
 	if len(got) < 2 || got[0] != 0xFF || got[1] != 0xFE {
 		t.Errorf("Generate output missing UTF-16LE BOM; first bytes = % x", got[:min(8, len(got))])
 	}
@@ -235,7 +342,7 @@ func TestGenerateProducesUTF16LEWithBOM(t *testing.T) {
 }
 
 func TestHexLineWrapping(t *testing.T) {
-	// Build a value long enough to force at least one continuation.
+	// Build a value long enough to force multiple continuations.
 	value := strings.Repeat("a", 200)
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
@@ -251,15 +358,16 @@ func TestHexLineWrapping(t *testing.T) {
 			},
 		},
 	}
-	got := GenerateText(cfg)
+	got := mustGenerate(t, cfg)
 
 	if !strings.Contains(got, ",\\\r\n  ") {
 		t.Errorf("expected backslash continuation in wrapped hex value; got:\n%s", got)
 	}
-	// Each non-last continuation line should end with ",\".
+	// Now that wrapping accounts for the two-space continuation indent,
+	// no emitted line should exceed maxLineLen characters.
 	for _, line := range strings.Split(got, "\r\n") {
-		if len(line) > maxLineLen+5 { // small slack for the leading "  "
-			t.Errorf("line exceeds wrap limit (%d): %q", len(line), line)
+		if len(line) > maxLineLen {
+			t.Errorf("line exceeds wrap limit (%d > %d): %q", len(line), maxLineLen, line)
 		}
 	}
 }

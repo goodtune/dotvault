@@ -229,7 +229,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// a closed stdin — stay up so an external interactive facility
 			// (e.g. a login profile that runs `dotvault sync`) can write
 			// the token, and a daemon restart will pick it up.
-			slog.Warn("no vault token available and no interactive facility (web UI disabled, stdin is not a terminal); daemon will idle until shutdown")
+			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); daemon will idle until shutdown")
 			<-ctx.Done()
 			return nil
 		} else {
@@ -302,11 +302,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// Headless CLI mode: no web UI, no terminal. Skip the enrolment
 		// wizard entirely — engines that prompt would either fail or hang
 		// without a TTY. The RefreshManager started above continues to
-		// rotate already-enrolled credentials, and config reloads still
-		// pick up changes once an interactive session completes the
-		// enrolment.
+		// rotate already-enrolled credentials, but enrolment/config
+		// changes are not reloaded in this path and require a daemon
+		// restart to take effect.
 		if len(cfg.Enrolments) > 0 {
-			slog.Info("skipping enrolment wizard: stdin is not a terminal and web UI is disabled")
+			slog.Info("skipping enrolment wizard: stdin is not a terminal and web UI is not running")
 		}
 	} else {
 		// CLI mode: terminal-based wizard.

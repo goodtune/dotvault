@@ -288,18 +288,56 @@ func TestRedactEnrolmentSettings(t *testing.T) {
 	in := map[string]any{
 		"url":           "https://example.jfrog.io",
 		"client_id":     "abc",
+		"token_ttl":     "60d",
 		"oauth_token":   "ghp_xxx",
 		"api_key":       "k",
 		"refresh_TOKEN": "r",
 		"private_key":   "-----BEGIN-----",
 	}
 	out := redactEnrolmentSettings(in)
-	if out["url"] != "https://example.jfrog.io" || out["client_id"] != "abc" {
-		t.Errorf("non-sensitive keys altered: %v", out)
+	for k, want := range map[string]any{
+		"url":       "https://example.jfrog.io",
+		"client_id": "abc",
+		"token_ttl": "60d",
+	} {
+		if out[k] != want {
+			t.Errorf("settings[%q] = %v, want %v", k, out[k], want)
+		}
 	}
 	for _, k := range []string{"oauth_token", "api_key", "refresh_TOKEN", "private_key"} {
 		if out[k] != "***" {
 			t.Errorf("settings[%q] = %v, want redacted", k, out[k])
+		}
+	}
+}
+
+func TestIsSensitiveSettingKey(t *testing.T) {
+	for _, tc := range []struct {
+		key       string
+		sensitive bool
+	}{
+		// Configuration knobs that look credential-y but aren't.
+		{"token_ttl", false},
+		{"client_id", false},
+		{"client_code", false},
+		{"client_name", false},
+		{"url", false},
+		{"scopes", false},
+		{"host", false},
+		// Real credential keys.
+		{"password", true},
+		{"passphrase", true},
+		{"oauth_token", true},
+		{"access_token", true},
+		{"refresh_token", true},
+		{"REFRESH_TOKEN", true},
+		{"api_key", true},
+		{"private_key", true},
+		{"some_password", true},
+		{"vault_secret", true},
+	} {
+		if got := isSensitiveSettingKey(tc.key); got != tc.sensitive {
+			t.Errorf("isSensitiveSettingKey(%q) = %v, want %v", tc.key, got, tc.sensitive)
 		}
 	}
 }

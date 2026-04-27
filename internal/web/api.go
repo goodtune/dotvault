@@ -252,10 +252,27 @@ func redactEnrolmentValue(v any) any {
 	}
 }
 
+// isSensitiveSettingKey reports whether a settings key looks like it carries
+// a credential. It uses an exact-name list and a suffix list rather than a
+// loose substring match so that legitimate configuration knobs are not
+// false-positive redacted — e.g. `token_ttl` (JFrog engine duration knob)
+// must remain visible, only `*_token` / `oauth_token` / `access_token` etc
+// are masked.
 func isSensitiveSettingKey(k string) bool {
 	lk := strings.ToLower(k)
-	for _, needle := range []string{"password", "secret", "token", "credential", "api_key", "apikey", "private"} {
-		if strings.Contains(lk, needle) {
+	switch lk {
+	case "password", "passphrase", "secret", "credential", "credentials",
+		"api_key", "apikey", "private_key", "privatekey",
+		"oauth_token", "access_token", "refresh_token",
+		"bearer_token", "auth_token":
+		return true
+	}
+	for _, suffix := range []string{
+		"_token", "_secret", "_password", "_passphrase",
+		"_credential", "_credentials", "_apikey", "_api_key",
+		"_private_key",
+	} {
+		if strings.HasSuffix(lk, suffix) {
 			return true
 		}
 	}

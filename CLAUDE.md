@@ -10,7 +10,7 @@ make build         # build for current platform
 make build-all     # cross-compile linux/darwin (amd64/arm64) and windows (amd64)
 ```
 
-All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`).
+All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`). The Windows build additionally passes `-H=windowsgui` so a double-clicked binary does not flash a console window; CLI subcommands re-attach to the parent console at startup (`cmd/dotvault/console_windows.go`).
 
 The web frontend lives in `internal/web/frontend/` (Preact + esbuild). After changing frontend code:
 
@@ -59,6 +59,7 @@ internal/
   enrol/                 Credential acquisition via OAuth device flow
   web/                   Web UI server (Preact SPA), auth endpoints, REST API
   perms/                 File permission checks (Unix mode bits, Windows DACL)
+  tray/                  Windows system-tray icon (no-op on other platforms)
 test/integration/        Integration tests against real Vault
 packaging/windows/       ADMX Group Policy template
 ```
@@ -124,6 +125,7 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 6. Run enrolment check (wizard if any credentials missing in Vault)
 7. Start sync engine: initial sync, then hybrid event+poll loop
 8. Background goroutine reloads config on each tick for enrolment changes only
+9. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
 
 Config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
 

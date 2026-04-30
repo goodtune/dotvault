@@ -17,6 +17,7 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sync"
+	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
 	"github.com/pkg/browser"
@@ -35,6 +36,12 @@ var (
 )
 
 func main() {
+	// On Windows the binary is linked with -H=windowsgui so a double-click
+	// doesn't flash a console window. When the user runs the binary from
+	// cmd.exe / PowerShell instead, attach to the parent console so CLI
+	// subcommands still produce visible output. No-op on other platforms.
+	attachParentConsole()
+
 	rootCmd := &cobra.Command{
 		Use:   "dotvault",
 		Short: "Vault-to-file secret synchronisation daemon",
@@ -379,7 +386,39 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
-	return engine.RunLoop(ctx)
+
+	// Run the sync engine on a goroutine and the tray (Windows) or a
+	// blocking ctx-wait (everything else) on the main goroutine. The tray
+	// must own the main goroutine because the Win32 message pump requires
+	// runtime.LockOSThread on the same OS thread that creates the window.
+	// If the sync loop exits unexpectedly we cancel the context to wake
+	// tray.Run up and let the daemon shut down cleanly.
+	loopErrCh := make(chan error, 1)
+	go func() {
+		loopErrCh <- engine.RunLoop(ctx)
+		cancel()
+	}()
+
+	trayCfg := tray.Config{
+		Tooltip: fmt.Sprintf("dotvault %s", version),
+		OnExit: func() {
+			slog.Info("exit requested from tray")
+			cancel()
+		},
+	}
+	if webServer != nil {
+		trayCfg.WebURL = webServer.URL()
+	}
+	if err := tray.Run(ctx, trayCfg); err != nil {
+		slog.Warn("tray exited with error", "error", err)
+	}
+
+	// Tray returned because either the user picked Exit, ctx was cancelled
+	// elsewhere (signal handler, lifecycle manager), or no tray is supported
+	// on this platform and tray.Run blocked on ctx. Either way, stop the
+	// sync loop and propagate its result.
+	cancel()
+	return <-loopErrCh
 }
 
 func runSync(cmd *cobra.Command, args []string) error {

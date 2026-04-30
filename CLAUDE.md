@@ -99,6 +99,7 @@ dotvault sync       One-shot sync cycle, then exit
 dotvault status     Display auth state, token TTL, per-rule sync state
 dotvault version    Print build version
 dotvault reg-export Convert a YAML config to a Windows .reg file
+dotvault reg-import Convert a Windows .reg file back to YAML
 ```
 
 `reg-export` reads and validates the YAML config, then emits a `Windows
@@ -109,6 +110,22 @@ variant of the same v5 format. Multi-line values such as Go templates
 round-trip via `hex(1):` (UTF-16LE bytes). Optional string fields are
 emitted as `""` even when empty so re-importing clears stale registry
 values. Rendering is in `internal/regfile/`.
+
+`reg-import` is the inverse: it parses a `.reg` file (positional path or
+stdin when omitted/`-`) and emits the equivalent YAML configuration to
+stdout (or `--output <path>`, 0600). Both UTF-16LE-with-BOM and plain
+ASCII variants are accepted — the encoding is detected from the leading
+BOM. The reconstructed config is run through `config.Load` validation
+before being printed, so malformed inputs surface as clear errors rather
+than producing partial YAML. Parsing lives in `internal/regfile/parse.go`
+and the canonical YAML emitter in `internal/regfile/yaml.go`.
+
+The web UI's Effective Configuration screen exposes the same conversion
+in-browser via download buttons backed by `GET
+/api/v1/config/download?format=yaml|reg`. The endpoint reassembles the
+in-memory `*config.Config` and routes through the same regfile renderers,
+so a daemon that loaded its config from a Windows GPO can be exported
+back as YAML (or vice versa) without restart.
 
 Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`, `--once` (redirects to sync from within runDaemon).
 
@@ -275,6 +292,8 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 - `GET /api/v1/csrf` — issue CSRF token (one-time use, max 1000 in memory)
 - `GET /api/v1/status` — server status (auth, vault version, token TTL, sync state, vault address, kv_mount, user_prefix, username)
 - `GET /api/v1/rules` — configured sync rules
+- `GET /api/v1/config` — redacted view of the running config for the UI
+- `GET /api/v1/config/download?format=yaml|reg` — full config download for the Effective Configuration screen
 - `GET /api/v1/secrets/{path}` — list or reveal secret (reveal requires `?reveal=true`)
 - `POST /api/v1/sync` — trigger immediate sync (CSRF-protected)
 

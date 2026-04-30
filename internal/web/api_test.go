@@ -160,6 +160,114 @@ func TestHandleConfig_Unauthenticated(t *testing.T) {
 	}
 }
 
+func TestHandleConfigDownload_Unauthenticated(t *testing.T) {
+	s := testServer(t)
+	req := httptest.NewRequest("GET", "/api/v1/config/download", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfigDownload(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestHandleConfigDownload_YAML(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
+	s.cfg = config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"}
+	s.rules = []config.Rule{
+		{
+			Name:     "gh",
+			VaultKey: "gh",
+			Target: config.Target{
+				Path:   "~/.config/gh/hosts.yml",
+				Format: "yaml",
+			},
+		},
+	}
+	s.enrolments = map[string]config.Enrolment{
+		"gh": {Engine: "github"},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=yaml", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfigDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Disposition"); !strings.Contains(got, "dotvault-config.yaml") {
+		t.Errorf("Content-Disposition = %q, want filename=dotvault-config.yaml", got)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/x-yaml") {
+		t.Errorf("Content-Type = %q, want application/x-yaml", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "address: https://vault.example.com:8200") {
+		t.Errorf("body missing vault address:\n%s", body)
+	}
+	if !strings.Contains(body, "interval: 15m") {
+		t.Errorf("body missing sync interval:\n%s", body)
+	}
+}
+
+func TestHandleConfigDownload_REG(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
+	s.rules = []config.Rule{
+		{
+			Name:     "gh",
+			VaultKey: "gh",
+			Target: config.Target{
+				Path:   "~/.config/gh/hosts.yml",
+				Format: "yaml",
+			},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=reg", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfigDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body length = %d", w.Code, w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Disposition"); !strings.Contains(got, "dotvault-config.reg") {
+		t.Errorf("Content-Disposition = %q, want filename=dotvault-config.reg", got)
+	}
+	body := w.Body.Bytes()
+	// UTF-16LE BOM at the start of the canonical reg output.
+	if len(body) < 2 || body[0] != 0xFF || body[1] != 0xFE {
+		t.Errorf("REG download missing UTF-16LE BOM; first bytes: %x", body[:min(8, len(body))])
+	}
+}
+
+func TestHandleConfigDownload_BadFormat(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.rules = []config.Rule{
+		{
+			Name:     "r",
+			VaultKey: "r",
+			Target:   config.Target{Path: "/tmp/r", Format: "text"},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=xml", nil)
+	w := httptest.NewRecorder()
+
+	s.handleConfigDownload(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for unknown format", w.Code)
+	}
+}
+
 func TestHandleConfig_Authenticated(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.vaultCfg = config.VaultConfig{

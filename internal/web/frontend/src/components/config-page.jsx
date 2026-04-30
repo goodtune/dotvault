@@ -16,10 +16,24 @@ export function ConfigPage({ onClose }) {
     h('div', { class: 'config-container' },
       h('div', { class: 'config-header' },
         h('h2', { class: 'config-heading' }, 'Effective Configuration'),
-        h('button', {
-          class: 'enrol-btn-secondary',
-          onClick: onClose,
-        }, '← Back to Dashboard'),
+        h('div', { class: 'config-header-actions' },
+          h('a', {
+            class: 'enrol-btn-secondary',
+            href: '/api/v1/config/download?format=yaml',
+            download: 'dotvault-config.yaml',
+            title: 'Download the effective config as YAML',
+          }, 'Download YAML'),
+          h('a', {
+            class: 'enrol-btn-secondary',
+            href: '/api/v1/config/download?format=reg',
+            download: 'dotvault-config.reg',
+            title: 'Download the effective config as a Windows .reg file',
+          }, 'Download REG'),
+          h('button', {
+            class: 'enrol-btn-secondary',
+            onClick: onClose,
+          }, '← Back to Dashboard'),
+        ),
       ),
       h('p', { class: 'config-subheading' },
         'Read-only view of the running daemon’s configuration. To change anything, edit the config file and restart the service.',

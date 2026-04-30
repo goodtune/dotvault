@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -27,11 +28,12 @@ import (
 var version = "dev"
 
 var (
-	flagConfig    string
-	flagLogLevel  string
-	flagDryRun    bool
-	flagRegOutput string
-	flagRegASCII  bool
+	flagConfig       string
+	flagLogLevel     string
+	flagDryRun       bool
+	flagRegOutput    string
+	flagRegASCII     bool
+	flagImportOutput string
 )
 
 func main() {
@@ -69,6 +71,7 @@ func main() {
 			},
 		},
 		newRegExportCmd(),
+		newRegImportCmd(),
 	)
 
 	// --once as alias for sync
@@ -559,6 +562,107 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 	// rendered .reg can include enrolment settings or other potentially
 	// sensitive material that should not be world-readable.
 	return os.WriteFile(flagRegOutput, data, 0600)
+}
+
+func newRegImportCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reg-import [config.reg]",
+		Short: "Convert a Windows .reg file to dotvault YAML",
+		Long: `Convert a Windows Registry .reg file into a dotvault YAML config file.
+
+This is the inverse of reg-export: it reads values under
+HKLM\SOFTWARE\Policies\dotvault from the input .reg and reconstructs
+the equivalent YAML representation. Useful for translating a Group
+Policy export back into a hand-editable config, and for verifying
+round-trip fidelity of reg-export output.
+
+The input .reg may be either UTF-16LE with BOM (the canonical
+regedit.exe format produced by reg-export's default mode) or plain
+text/UTF-8 (the variant produced by --ascii); the encoding is detected
+automatically.
+
+The input may be supplied as a positional argument or via stdin (when
+the argument is "-" or omitted). The reconstructed YAML is written to
+stdout by default, or to the path given by --output. Output is fully
+validated through the standard config loader before being returned, so
+malformed registry exports surface as clear errors rather than silently
+producing partial configs.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runRegImport,
+	}
+	cmd.Flags().StringVarP(&flagImportOutput, "output", "o", "", "write YAML to file instead of stdout")
+	return cmd
+}
+
+func runRegImport(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
+	var input []byte
+	var err error
+	switch {
+	case len(args) == 0 || args[0] == "-":
+		input, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("read stdin: %w", err)
+		}
+	default:
+		input, err = os.ReadFile(args[0])
+		if err != nil {
+			return fmt.Errorf("read input: %w", err)
+		}
+	}
+
+	cfg, err := regfile.Parse(input)
+	if err != nil {
+		return fmt.Errorf("parse reg file: %w", err)
+	}
+
+	yamlData, err := regfile.MarshalYAML(cfg)
+	if err != nil {
+		return fmt.Errorf("render yaml: %w", err)
+	}
+
+	// Validate the result through the same loader path that reg-export
+	// uses on its YAML input, so reg-import surfaces config-level errors
+	// (e.g. a rule with an invalid format string) rather than emitting
+	// YAML the daemon would later reject. We round-trip through the
+	// loader by writing to a temp file, since config.Load is the path's
+	// single source of truth.
+	if err := validateYAML(yamlData); err != nil {
+		return fmt.Errorf("imported config is not valid: %w", err)
+	}
+
+	if flagImportOutput == "" || flagImportOutput == "-" {
+		_, err := os.Stdout.Write(yamlData)
+		return err
+	}
+	return os.WriteFile(flagImportOutput, yamlData, 0600)
+}
+
+// validateYAML feeds the rendered YAML through config.Load so that
+// reg-import surfaces validation failures (missing rules, bad formats,
+// non-loopback web.listen, etc.) before writing or printing the output.
+// A temp file is used because config.Load is the single entry point that
+// runs (*Config).validate; the indirection avoids duplicating validation
+// logic here.
+func validateYAML(data []byte) error {
+	tmp, err := os.CreateTemp("", "dotvault-import-*.yaml")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if _, err := config.Load(tmpPath); err != nil {
+		return err
+	}
+	return nil
 }
 
 // isStderrTerminal reports whether stderr is connected to a TTY, used to

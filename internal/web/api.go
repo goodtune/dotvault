@@ -3,12 +3,16 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/regfile"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -356,6 +360,77 @@ func stripZeroUnit(s string, unit byte) string {
 		return pre
 	}
 	return s
+}
+
+// handleConfigDownload returns the daemon's in-memory configuration as a
+// downloadable file in either YAML or Windows .reg form. Available only
+// to authenticated sessions; the response is the unredacted configuration
+// because the same caller already holds the Vault token and can read the
+// file from disk directly. The format is selected via ?format=yaml|reg
+// (default yaml).
+func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = "yaml"
+	}
+
+	cfg := s.buildEffectiveConfig()
+
+	switch format {
+	case "yaml", "yml":
+		data, err := regfile.MarshalYAML(cfg)
+		if err != nil {
+			slog.Error("marshal yaml for download", "error", err)
+			writeError(w, "failed to render YAML", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.yaml"`)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
+	case "reg":
+		data, err := regfile.Generate(cfg)
+		if err != nil {
+			slog.Error("generate reg for download", "error", err)
+			writeError(w, "failed to render REG", http.StatusInternalServerError)
+			return
+		}
+		// application/octet-stream: .reg is UTF-16LE binary, not text/plain.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.reg"`)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
+	default:
+		writeError(w, "unsupported format (use yaml or reg)", http.StatusBadRequest)
+	}
+}
+
+// buildEffectiveConfig reassembles the *config.Config the daemon is running
+// from the per-section copies the web server holds. The result is suitable
+// for round-trip through regfile.MarshalYAML or regfile.Generate.
+//
+// We rebuild rather than retain a single *config.Config because the server
+// already has each section in a typed field for direct API use; pulling
+// them back together for download keeps the in-memory representation
+// authoritative.
+func (s *Server) buildEffectiveConfig() *config.Config {
+	rules := make([]config.Rule, len(s.rules))
+	copy(rules, s.rules)
+
+	enrolments := s.getEnrolments()
+
+	return &config.Config{
+		Vault:      s.vaultCfg,
+		Sync:       s.syncCfg,
+		Web:        s.cfg,
+		Rules:      rules,
+		Enrolments: enrolments,
+	}
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

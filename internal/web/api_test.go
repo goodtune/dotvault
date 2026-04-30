@@ -205,6 +205,15 @@ func TestHandleConfigDownload_YAML(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/x-yaml") {
 		t.Errorf("Content-Type = %q, want application/x-yaml", ct)
 	}
+	// Sensitive content must not be cached by browsers/proxies. We assert
+	// both Cache-Control: no-store and the legacy Pragma header so an HTTP/1.0
+	// intermediate cannot persist the body.
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if p := w.Header().Get("Pragma"); p != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache", p)
+	}
 	body := w.Body.String()
 	if !strings.Contains(body, "address: https://vault.example.com:8200") {
 		t.Errorf("body missing vault address:\n%s", body)

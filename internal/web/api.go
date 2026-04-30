@@ -365,10 +365,22 @@ func stripZeroUnit(s string, unit byte) string {
 // handleConfigDownload returns the daemon's in-memory configuration as a
 // downloadable file in either YAML or Windows .reg form. The endpoint is
 // gated on the daemon itself being authenticated to Vault — the same
-// global state the rest of the API checks — and the response is the
-// unredacted configuration. The web UI binds to loopback only, so any
-// caller able to reach the endpoint can already read the YAML file from
-// disk; surfacing the same content as a download adds no new exposure.
+// global state the rest of the API checks — and serves the unredacted
+// config so a downloaded YAML is a usable replacement for the source
+// file (and a .reg can be re-applied to a Windows registry without
+// fields silently disappearing).
+//
+// Unlike /api/v1/config (which redacts CA certs, CA bundles, and
+// credential-shaped settings for UI viewing) this endpoint exists
+// specifically to round-trip the running config back to disk, so
+// redaction would defeat its purpose. The compensating boundaries are:
+//   - the web UI binds to loopback only (a hard invariant in
+//     paths.ValidateLoopback) so the response cannot reach the network
+//   - the daemon must be authenticated to Vault, gating the endpoint
+//     behind the same proof-of-trust used for /api/v1/token
+//   - the response is marked Cache-Control: no-store to keep proxies
+//     and browser disk caches from persisting the body
+//
 // The format is selected via ?format=yaml|reg (default yaml).
 func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 	if s.vault == nil || s.vault.Token() == "" {
@@ -382,6 +394,12 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.buildEffectiveConfig()
+
+	// no-store on every response path: the body may include CA certs,
+	// templates, and enrolment settings that should not survive in any
+	// intermediate cache or browser disk cache.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 
 	switch format {
 	case "yaml", "yml":

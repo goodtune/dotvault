@@ -410,13 +410,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		trayCfg.WebURL = webServer.URL()
 	}
 	if err := tray.Run(ctx, trayCfg); err != nil {
-		slog.Warn("tray exited with error", "error", err)
+		// A failed tray (e.g. RegisterClassEx, CreateWindow, or
+		// Shell_NotifyIcon refused on a session that has no shell) must
+		// not take the daemon down with it. Log and fall back to a plain
+		// ctx wait so the sync engine keeps running headlessly until
+		// signal/lifecycle cancels it.
+		slog.Warn("tray exited with error; daemon continues running headlessly", "error", err)
+		if ctx.Err() == nil {
+			<-ctx.Done()
+		}
 	}
 
-	// Tray returned because either the user picked Exit, ctx was cancelled
-	// elsewhere (signal handler, lifecycle manager), or no tray is supported
-	// on this platform and tray.Run blocked on ctx. Either way, stop the
-	// sync loop and propagate its result.
+	// Tray returned because the user picked Exit or ctx was cancelled
+	// elsewhere (signal handler, lifecycle manager, headless fallback).
+	// Stop the sync loop and propagate its result.
 	cancel()
 	return <-loopErrCh
 }

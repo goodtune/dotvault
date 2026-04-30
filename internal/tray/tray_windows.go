@@ -19,6 +19,7 @@ import (
 // from the Windows SDK headers (winuser.h, shellapi.h).
 const (
 	wmDestroy     = 0x0002
+	wmNull        = 0x0000
 	wmCommand     = 0x0111
 	wmRButtonUp   = 0x0205
 	wmLButtonDbl  = 0x0203
@@ -172,11 +173,16 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("RegisterClassEx: %w", callErr)
 	}
 
+	// Hidden top-level window — no WS_VISIBLE, no taskbar entry. We
+	// deliberately do not pass HWND_MESSAGE: TrackPopupMenu requires a
+	// foreground-able owner to dismiss on click-away (see showMenu's
+	// SetForegroundWindow workaround), and message-only windows cannot
+	// become foreground.
 	hwnd, _, callErr := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
-		0, // no WS_VISIBLE — we're a message-only host
+		0,
 		0, 0, 0, 0,
 		0, 0,
 		hInstance,
@@ -218,30 +224,41 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	// Standard Win32 message pump. GetMessageW returns 0 on WM_QUIT
-	// and -1 on error.
+	// and -1 on error — the latter is a real failure (invalid hwnd or
+	// bad message-queue state), surface it instead of treating it as a
+	// clean shutdown.
+	var loopErr error
 	var m msg
 	for {
-		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if int32(ret) <= 0 {
-			break
+		ret, _, callErr := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		switch int32(ret) {
+		case -1:
+			loopErr = fmt.Errorf("GetMessage: %w", callErr)
+		case 0:
+			// WM_QUIT — clean exit.
+		default:
+			procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+			procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+			continue
 		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+		break
 	}
 
 	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
-	return nil
+	return loopErr
 }
 
-// wndProc handles messages for the tray's hidden window. It must not call
-// blocking Go code that re-enters Win32 or holds locks across a syscall.
+// wndProc handles messages for the tray's hidden window. It must not block
+// or re-enter Win32 in ways that stall the pump, so user-supplied callbacks
+// (browser open, daemon shutdown) are dispatched to goroutines and return
+// control immediately.
 func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintptr {
 	switch message {
 	case wmTrayCB:
 		// lParam carries the inner mouse event for the tray icon.
 		switch uint32(lParam) {
 		case wmLButtonDbl:
-			triggerView()
+			go triggerView()
 		case wmRButtonUp:
 			showMenu(hwnd)
 		}
@@ -249,9 +266,9 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 	case wmCommand:
 		switch uint32(wParam & 0xFFFF) {
 		case menuIDView:
-			triggerView()
+			go triggerView()
 		case menuIDExit:
-			triggerExit(hwnd)
+			go triggerExit(hwnd)
 		}
 		return 0
 	case wmTrayQuit:
@@ -288,8 +305,11 @@ func showMenu(hwnd windows.Handle) {
 	var pt point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 
-	// Required quirk: the foreground window must be us before TrackPopupMenu
-	// is called, otherwise the menu won't dismiss when the user clicks away.
+	// Required quirks (documented in the Shell_NotifyIcon MSDN reference):
+	// 1. Bring our window to the foreground before TrackPopupMenu so the
+	//    menu actually dismisses when the user clicks away.
+	// 2. Post a no-op WM_NULL afterwards to flush the menu's input state;
+	//    without this the menu can stay "stuck" on second invocation.
 	procSetForegroundWindow.Call(uintptr(hwnd))
 	procTrackPopupMenu.Call(
 		hMenu,
@@ -299,6 +319,7 @@ func showMenu(hwnd windows.Handle) {
 		uintptr(hwnd),
 		0,
 	)
+	procPostMessageW.Call(uintptr(hwnd), wmNull, 0, 0)
 }
 
 func triggerView() {
@@ -313,14 +334,17 @@ func triggerView() {
 	}
 }
 
-func triggerExit(hwnd windows.Handle) {
+// triggerExit runs the user-supplied OnExit (typically a context cancel)
+// off-thread so wndProc never blocks. We do not call DestroyWindow here:
+// the ctx-cancel watcher inside Run will see the cancelled context and
+// post wmTrayQuit, which wndProc handles on the correct thread.
+func triggerExit(_ windows.Handle) {
 	trayState.mu.Lock()
 	onExit := trayState.cfg.OnExit
 	trayState.mu.Unlock()
 	if onExit != nil {
 		onExit()
 	}
-	procDestroyWindow.Call(uintptr(hwnd))
 }
 
 // copyUTF16 fills a fixed-size UTF-16 buffer from s, leaving room for a

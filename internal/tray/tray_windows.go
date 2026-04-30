@@ -143,9 +143,9 @@ func Run(ctx context.Context, cfg Config) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	hInstance, _, _ := procGetModuleHandleW.Call(0)
+	hInstance, _, callErr := procGetModuleHandleW.Call(0)
 	if hInstance == 0 {
-		return fmt.Errorf("GetModuleHandle failed")
+		return fmt.Errorf("GetModuleHandle: %w", callErr)
 	}
 
 	hIcon, _, _ := procLoadIconW.Call(0, uintptr(idiApplication))

@@ -31,14 +31,20 @@ func attachParentConsole() {
 		return
 	}
 	// Re-bind the Go runtime's stdio to the now-attached console so
-	// fmt.Println and slog land where the user expects.
-	if h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE); err == nil && h != 0 {
+	// fmt.Println and slog land where the user expects. GetStdHandle
+	// returns 0 if no handle is set and INVALID_HANDLE_VALUE on error;
+	// reject both before wrapping with os.NewFile.
+	if h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE); err == nil && validHandle(h) {
 		os.Stdout = os.NewFile(uintptr(h), "stdout")
 	}
-	if h, err := windows.GetStdHandle(windows.STD_ERROR_HANDLE); err == nil && h != 0 {
+	if h, err := windows.GetStdHandle(windows.STD_ERROR_HANDLE); err == nil && validHandle(h) {
 		os.Stderr = os.NewFile(uintptr(h), "stderr")
 	}
-	if h, err := windows.GetStdHandle(windows.STD_INPUT_HANDLE); err == nil && h != 0 {
+	if h, err := windows.GetStdHandle(windows.STD_INPUT_HANDLE); err == nil && validHandle(h) {
 		os.Stdin = os.NewFile(uintptr(h), "stdin")
 	}
+}
+
+func validHandle(h windows.Handle) bool {
+	return h != 0 && h != windows.InvalidHandle
 }

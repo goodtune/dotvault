@@ -18,7 +18,7 @@ import (
 // .reg file or registry-loaded config where the empty-string distinction
 // matters: re-importing a YAML config that omits a field would leave any
 // previously-set value in place, whereas an explicit empty string clears
-// it. This matches the clearing semantics already used by reg-export.
+// it. This matches the clearing semantics already used by reg-import.
 func MarshalYAML(cfg *config.Config) ([]byte, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("cannot marshal nil config")

@@ -363,11 +363,13 @@ func stripZeroUnit(s string, unit byte) string {
 }
 
 // handleConfigDownload returns the daemon's in-memory configuration as a
-// downloadable file in either YAML or Windows .reg form. Available only
-// to authenticated sessions; the response is the unredacted configuration
-// because the same caller already holds the Vault token and can read the
-// file from disk directly. The format is selected via ?format=yaml|reg
-// (default yaml).
+// downloadable file in either YAML or Windows .reg form. The endpoint is
+// gated on the daemon itself being authenticated to Vault — the same
+// global state the rest of the API checks — and the response is the
+// unredacted configuration. The web UI binds to loopback only, so any
+// caller able to reach the endpoint can already read the YAML file from
+// disk; surfacing the same content as a download adds no new exposure.
+// The format is selected via ?format=yaml|reg (default yaml).
 func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 	if s.vault == nil || s.vault.Token() == "" {
 		writeError(w, "not authenticated", http.StatusUnauthorized)

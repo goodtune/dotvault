@@ -98,26 +98,35 @@ dotvault run        Explicit daemon mode (same as bare invocation)
 dotvault sync       One-shot sync cycle, then exit
 dotvault status     Display auth state, token TTL, per-rule sync state
 dotvault version    Print build version
-dotvault reg-export Convert a YAML config to a Windows .reg file
-dotvault reg-import Convert a Windows .reg file back to YAML
+dotvault reg-export Convert a Windows .reg file to YAML (or canonical .reg)
+dotvault reg-import Convert a YAML config to a Windows .reg file
 ```
 
-`reg-export` reads and validates the YAML config, then emits a `Windows
-Registry Editor Version 5.00` file targeting `HKLM\SOFTWARE\Policies\dotvault`
-to stdout (or `--output <path>`, written with 0600 permissions). Default
-encoding is UTF-16LE with BOM; `--ascii` produces an unencoded plain-text
-variant of the same v5 format. Multi-line values such as Go templates
-round-trip via `hex(1):` (UTF-16LE bytes). Optional string fields are
-emitted as `""` even when empty so re-importing clears stale registry
-values. Rendering is in `internal/regfile/`.
+The naming follows regedit's `/e` (export) and `/s` (import) directional
+convention: `reg-export` pulls policy out of the registry world into a
+user-facing form, `reg-import` casts a YAML config into the .reg form a
+Windows admin would push back into the registry.
 
-`reg-import` is the inverse: it parses a `.reg` file (positional path or
-stdin when omitted/`-`) and emits the equivalent YAML configuration to
-stdout (or `--output <path>`, 0600). Both UTF-16LE-with-BOM and plain
-ASCII variants are accepted — the encoding is detected from the leading
-BOM. The reconstructed config is run through `config.Load` validation
-before being printed, so malformed inputs surface as clear errors rather
-than producing partial YAML. Parsing lives in `internal/regfile/parse.go`
+`reg-export` parses a `.reg` file (positional path or stdin when
+omitted/`-`) under `HKLM\SOFTWARE\Policies\dotvault` and emits the
+equivalent dotvault YAML configuration to stdout (or `--output <path>`,
+0600). Both UTF-16LE-with-BOM and plain ASCII inputs are accepted — the
+encoding is detected from the leading BOM. The reconstructed YAML is
+run through `config.Load` validation before being printed, so malformed
+inputs surface as clear errors rather than producing partial YAML. Pass
+`--regedit` to re-emit the canonicalised .reg form instead of YAML;
+combine with `--ascii` for the plain-text variant of the v5 format.
+
+`reg-import` is the inverse: it reads and validates a YAML config, then
+emits a `Windows Registry Editor Version 5.00` file targeting
+`HKLM\SOFTWARE\Policies\dotvault` to stdout (or `--output <path>`,
+written with 0600 permissions). Default encoding is UTF-16LE with BOM,
+matching the canonical format produced by regedit.exe; `--ascii`
+produces an unencoded plain-text variant of the same v5 format.
+Multi-line values such as Go templates round-trip via `hex(1):`
+(UTF-16LE bytes). Optional string fields are emitted as `""` even when
+empty so re-importing clears stale registry values. Rendering lives in
+`internal/regfile/regfile.go`, parsing in `internal/regfile/parse.go`,
 and the canonical YAML emitter in `internal/regfile/yaml.go`.
 
 The web UI's Effective Configuration screen exposes the same conversion

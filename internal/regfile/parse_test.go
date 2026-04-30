@@ -209,8 +209,8 @@ func TestParseDeletionStanzaIgnored(t *testing.T) {
 }
 
 // TestParseValidatesAfterLoad confirms a parsed Config is acceptable to
-// config.(*Config).validate, simulating how the CLI's reg-import path
-// will hand off to the loader.
+// config.(*Config).validate, simulating how the CLI's reg-export path
+// will hand off to the loader before printing YAML.
 func TestParseValidatesAfterLoad(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
@@ -334,6 +334,39 @@ func TestMarshalYAMLLoadsBack(t *testing.T) {
 	}
 	if len(loaded.Rules) != 1 || loaded.Rules[0].Name != "netrc" {
 		t.Errorf("rules not preserved: %+v", loaded.Rules)
+	}
+}
+
+// TestParseLowercasesEnrolmentSettingNames mirrors the registry-side
+// loader's case-insensitive handling: a hand-edited .reg that capitalises
+// settings names like "Host" or "ClientID" must still surface as the
+// lowercase keys engines consume (e.g. `host`, `client_id`).
+func TestParseLowercasesEnrolmentSettingNames(t *testing.T) {
+	reg := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh]\r\n" +
+		"\"Engine\"=\"github\"\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
+		"\"Host\"=\"github.com\"\r\n" +
+		"\"Client_ID\"=\"abc123\"\r\n"
+
+	got, err := Parse([]byte(reg))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	en, ok := got.Enrolments["gh"]
+	if !ok {
+		t.Fatalf("missing gh enrolment")
+	}
+	if _, present := en.Settings["host"]; !present {
+		t.Errorf("expected lowercase 'host' key in settings; got %v", en.Settings)
+	}
+	if _, present := en.Settings["client_id"]; !present {
+		t.Errorf("expected lowercase 'client_id' key in settings; got %v", en.Settings)
+	}
+	for k := range en.Settings {
+		if k != strings.ToLower(k) {
+			t.Errorf("setting key %q is not lowercase", k)
+		}
 	}
 }
 

@@ -510,13 +510,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			hasOAuth = true
 		}
 		if v, ok := get(oauthKey, "Scopes"); ok {
-			// Treat an explicit empty REG_MULTI_SZ as []string{}, matching
-			// `scopes: []` in YAML so the round-trip preserves intent.
-			if v.multi == nil {
-				oauth.Scopes = []string{}
-			} else {
-				oauth.Scopes = v.multi
-			}
+			// utf16BytesToMultiString always returns a non-nil slice on
+			// success — the empty REG_MULTI_SZ case is normalised to
+			// []string{} there — so the assignment is safe to do directly
+			// and preserves the `scopes: []` round-trip intent.
+			oauth.Scopes = v.multi
 			hasOAuth = true
 		}
 		if hasOAuth {
@@ -545,9 +543,15 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			if vk.key != settingsKey {
 				continue
 			}
+			// Normalize to lowercase: Windows registry value names are
+			// case-insensitive and the registry-side loader in
+			// internal/config/registry_windows.go applies the same lowering
+			// so engine setting keys (`client_id`, `host`, ...) match
+			// regardless of how the .reg file capitalises them.
+			settingKey := strings.ToLower(vk.name)
 			switch v.kind {
 			case rvSZ:
-				settings[vk.name] = v.str
+				settings[settingKey] = v.str
 			case rvMultiSZ:
 				// Convert []string to []any so that the YAML round-trip
 				// produces the same type as a freshly-loaded YAML config
@@ -556,7 +560,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 				for i, s := range v.multi {
 					out[i] = s
 				}
-				settings[vk.name] = out
+				settings[settingKey] = out
 			}
 		}
 		if len(settings) > 0 {

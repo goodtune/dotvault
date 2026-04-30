@@ -216,11 +216,30 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("Shell_NotifyIcon(NIM_ADD): %w", callErr)
 	}
 
-	// Watcher: when the daemon context is cancelled, tell the message
-	// pump to break out by posting a custom message to our window.
+	// Tear-down: always remove the tray icon and destroy the window when
+	// Run returns, regardless of whether we exited cleanly via WM_QUIT or
+	// bailed out on a GetMessageW failure. close(done) first so the
+	// ctx-cancel watcher goroutine exits before we touch the window —
+	// otherwise it could PostMessage to a destroyed handle. DestroyWindow
+	// must run on this (locked) thread because it owns the window.
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
+		procDestroyWindow.Call(hwnd)
+		trayState.mu.Lock()
+		trayState.hwnd = 0
+		trayState.mu.Unlock()
+	}()
+
+	// Watcher: wake the pump on ctx-cancel by posting a custom message,
+	// or exit cleanly when Run returns and closes done.
 	go func() {
-		<-ctx.Done()
-		procPostMessageW.Call(hwnd, wmTrayQuit, 0, 0)
+		select {
+		case <-ctx.Done():
+			procPostMessageW.Call(hwnd, wmTrayQuit, 0, 0)
+		case <-done:
+		}
 	}()
 
 	// Standard Win32 message pump. GetMessageW returns 0 on WM_QUIT
@@ -244,7 +263,6 @@ func Run(ctx context.Context, cfg Config) error {
 		break
 	}
 
-	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
 	return loopErr
 }
 
@@ -335,16 +353,18 @@ func triggerView() {
 }
 
 // triggerExit runs the user-supplied OnExit (typically a context cancel)
-// off-thread so wndProc never blocks. We do not call DestroyWindow here:
-// the ctx-cancel watcher inside Run will see the cancelled context and
-// post wmTrayQuit, which wndProc handles on the correct thread.
-func triggerExit(_ windows.Handle) {
+// off-thread so wndProc never blocks, then posts wmTrayQuit so the tray
+// reliably closes even if OnExit is nil or doesn't actually cancel ctx.
+// DestroyWindow stays on the pump thread (handled by wndProc), and a
+// duplicate wmTrayQuit from the ctx-cancel watcher is harmless.
+func triggerExit(hwnd windows.Handle) {
 	trayState.mu.Lock()
 	onExit := trayState.cfg.OnExit
 	trayState.mu.Unlock()
 	if onExit != nil {
 		onExit()
 	}
+	procPostMessageW.Call(uintptr(hwnd), wmTrayQuit, 0, 0)
 }
 
 // copyUTF16 fills a fixed-size UTF-16 buffer from s, leaving room for a

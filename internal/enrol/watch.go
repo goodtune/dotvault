@@ -149,9 +149,23 @@ func (m *WatchManager) run(ctx context.Context) {
 // runEventLoop subscribes to kv-v2/data-write events and pushes a
 // trigger onto triggerCh whenever an event matches one of the
 // configured Watcher source paths. Reconnects with exponential backoff
-// on transient failures; gives up silently if the Events API isn't
-// available (community Vault), in which case polling is the only path.
+// on transient failures. Gives up only when the Vault deployment is
+// known not to expose the Events API (community edition); transient
+// startup or reconnect failures keep retrying so the daemon recovers
+// when Vault comes back without needing a process restart.
 func (m *WatchManager) runEventLoop(ctx context.Context) {
+	// Probe the Vault edition once: the Events API is Enterprise-only.
+	// If we can't determine the edition (e.g. health endpoint blocked
+	// by ACLs), assume Enterprise and let the subscribe-retry loop
+	// figure it out — falsely retrying against community Vault costs
+	// occasional log lines, but bailing out early on a transient
+	// health-check error would silently disable events for the rest of
+	// the process.
+	if health, err := m.client.ServerHealth(ctx); err == nil && !health.Enterprise {
+		slog.Info("watch: event subscription requires Vault Enterprise, using poll-only")
+		return
+	}
+
 	delay := time.Second
 	const maxDelay = 5 * time.Minute
 	for {
@@ -160,9 +174,22 @@ func (m *WatchManager) runEventLoop(ctx context.Context) {
 		}
 		eventCh, errCh, err := m.client.SubscribeEvents(ctx, "kv-v2/data-write")
 		if err != nil {
-			slog.Info("watch: event subscription not available, using poll-only",
-				"error", err)
-			return
+			// Treat as transient. The reviewer's concern: a temporary
+			// startup blip (DNS, Vault restart, network) shouldn't
+			// permanently disable events for the lifetime of the
+			// daemon. ServerHealth above already handles the one
+			// known-permanent case (community edition).
+			slog.Warn("watch: event subscribe failed, will retry", "error", err, "delay", delay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			delay *= 2
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			continue
 		}
 		slog.Info("watch: subscribed to vault events")
 		delay = time.Second // reset on a successful connect
@@ -255,13 +282,9 @@ func (m *WatchManager) tickAll(ctx context.Context) {
 	}
 	m.mu.Unlock()
 
-	now := m.clock.Now()
 	for key, enrolment := range snapshot {
 		if ctx.Err() != nil {
 			return
-		}
-		if m.inBackoff(key, now) {
-			continue
 		}
 		m.tickOneWithEnrolment(ctx, key, enrolment)
 	}
@@ -284,6 +307,14 @@ func (m *WatchManager) tickOneWithEnrolment(ctx context.Context, key string, enr
 		return
 	}
 	if _, ok := engine.(Watcher); !ok {
+		return
+	}
+
+	// Honour the per-enrolment backoff for both periodic polls and
+	// event-driven triggers — otherwise a misbehaving upstream can
+	// cause every matching kv-v2/data-write event to fire an
+	// immediate retry, hammering Vault and the upstream service.
+	if m.inBackoff(key, m.clock.Now()) {
 		return
 	}
 

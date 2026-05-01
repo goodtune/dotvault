@@ -247,6 +247,40 @@ func TestWatchManager_BackoffOnEngineFailure(t *testing.T) {
 	}
 }
 
+func TestWatchManager_TickOne_RespectsBackoff(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	w := &fakeWatcher{
+		name:    "fake",
+		fields:  []string{"token"},
+		sources: []WatchSource{{Mount: "kv", Path: "apps/x/keys/alice"}},
+		respond: func(int) (map[string]string, error) {
+			return nil, errIntentional
+		},
+	}
+	RegisterEngine("test-watch-tickone-backoff", w)
+	t.Cleanup(func() { UnregisterEngine("test-watch-tickone-backoff") })
+
+	m, _ := newWatchManagerForTest(vc, map[string]config.Enrolment{
+		"someapp": {Engine: "test-watch-tickone-backoff"},
+	})
+
+	ctx := context.Background()
+	// First call fails and arms the backoff.
+	m.tickOne(ctx, "someapp")
+	if w.Calls() != 1 {
+		t.Fatalf("after first tickOne, calls = %d, want 1", w.Calls())
+	}
+	// Event-driven triggers must observe the backoff window. Without
+	// the inBackoff guard a flapping upstream could fire engine.Run on
+	// every kv-v2/data-write event.
+	m.tickOne(ctx, "someapp")
+	if w.Calls() != 1 {
+		t.Errorf("tickOne ignored backoff: calls = %d, want 1", w.Calls())
+	}
+}
+
 func TestWatchManager_NonWatcherEngineSkipped(t *testing.T) {
 	fv := newFakeVault("kv")
 	vc := fv.serve(t)

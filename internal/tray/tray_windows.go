@@ -218,26 +218,32 @@ func Run(ctx context.Context, cfg Config) error {
 
 	// Tear-down: always remove the tray icon and destroy the window when
 	// Run returns, regardless of whether we exited cleanly via WM_QUIT or
-	// bailed out on a GetMessageW failure. close(done) first so the
-	// ctx-cancel watcher goroutine exits before we touch the window —
-	// otherwise it could PostMessage to a destroyed handle. DestroyWindow
-	// must run on this (locked) thread because it owns the window.
+	// bailed out on a GetMessageW failure. Order matters:
+	//   1. close(done) — releases the ctx-cancel watcher goroutine.
+	//   2. Take the state lock and zero trayState.hwnd before destroying
+	//      the window. Any concurrent postTrayQuit caller will then
+	//      observe hwnd=0 and skip, avoiding a PostMessage targeting a
+	//      destroyed (or recycled) handle. Callers already holding the
+	//      lock complete their PostMessage first; that message simply
+	//      stays queued forever after the pump exits, which is harmless.
+	// DestroyWindow runs on this (locked) OS thread because the window
+	// belongs to it.
 	done := make(chan struct{})
 	defer func() {
 		close(done)
-		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
-		procDestroyWindow.Call(hwnd)
 		trayState.mu.Lock()
 		trayState.hwnd = 0
 		trayState.mu.Unlock()
+		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&trayState.nid)))
+		procDestroyWindow.Call(hwnd)
 	}()
 
-	// Watcher: wake the pump on ctx-cancel by posting a custom message,
-	// or exit cleanly when Run returns and closes done.
+	// Watcher: wake the pump on ctx-cancel via postTrayQuit, or exit
+	// cleanly when Run returns and closes done.
 	go func() {
 		select {
 		case <-ctx.Done():
-			procPostMessageW.Call(hwnd, wmTrayQuit, 0, 0)
+			postTrayQuit()
 		case <-done:
 		}
 	}()
@@ -286,7 +292,7 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 		case menuIDView:
 			go triggerView()
 		case menuIDExit:
-			go triggerExit(hwnd)
+			go triggerExit()
 		}
 		return 0
 	case wmTrayQuit:
@@ -353,18 +359,33 @@ func triggerView() {
 }
 
 // triggerExit runs the user-supplied OnExit (typically a context cancel)
-// off-thread so wndProc never blocks, then posts wmTrayQuit so the tray
-// reliably closes even if OnExit is nil or doesn't actually cancel ctx.
-// DestroyWindow stays on the pump thread (handled by wndProc), and a
-// duplicate wmTrayQuit from the ctx-cancel watcher is harmless.
-func triggerExit(hwnd windows.Handle) {
+// off-thread so wndProc never blocks, then signals the tray to close so
+// it reliably exits even if OnExit is nil or doesn't actually cancel
+// ctx. DestroyWindow stays on the pump thread (handled by wndProc), and
+// a duplicate wmTrayQuit from the ctx-cancel watcher is harmless.
+func triggerExit() {
 	trayState.mu.Lock()
 	onExit := trayState.cfg.OnExit
 	trayState.mu.Unlock()
 	if onExit != nil {
 		onExit()
 	}
-	procPostMessageW.Call(uintptr(hwnd), wmTrayQuit, 0, 0)
+	postTrayQuit()
+}
+
+// postTrayQuit posts wmTrayQuit to the tray window so the pump can tear
+// itself down, but only if the window is still alive. Reading
+// trayState.hwnd under the state mutex serialises against Run's
+// deferred cleanup, which clears the field before destroying the window;
+// this prevents goroutines from posting to a destroyed (and potentially
+// recycled) HWND.
+func postTrayQuit() {
+	trayState.mu.Lock()
+	defer trayState.mu.Unlock()
+	if trayState.hwnd == 0 {
+		return
+	}
+	procPostMessageW.Call(uintptr(trayState.hwnd), wmTrayQuit, 0, 0)
 }
 
 // copyUTF16 fills a fixed-size UTF-16 buffer from s, leaving room for a

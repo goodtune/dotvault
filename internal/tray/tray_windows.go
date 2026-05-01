@@ -27,7 +27,6 @@ const (
 	wmTrayCB      = wmUser + 1 // notification callback from Shell_NotifyIcon
 	wmTrayQuit    = wmUser + 2 // posted by Run when ctx is cancelled
 	nimAdd        = 0x00000000
-	nimModify     = 0x00000001
 	nimDelete     = 0x00000002
 	nifMessage    = 0x00000001
 	nifIcon       = 0x00000002
@@ -35,7 +34,6 @@ const (
 	idiApplication = 32512
 	idcArrow       = 32512
 	tpmRightButton = 0x0002
-	tpmReturnCmd   = 0x0100
 	mfString       = 0x00000000
 	mfSeparator    = 0x00000800
 

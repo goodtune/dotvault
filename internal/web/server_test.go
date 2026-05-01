@@ -100,13 +100,19 @@ func TestHostAllowed(t *testing.T) {
 		{"attacker.test", false},
 		{"some-other-name:9000", false},
 		{"", false},
-		// Malformed bracket pairs must NOT be normalised into a
-		// matching alias. unwrapIPv6 only strips brackets when both
-		// are present; lone brackets stay attached and fail the
-		// allowlist comparison.
+		// Malformed/lone-bracket pairs that are NOT in the
+		// `[host]:port` form must stay bracketed. unwrapIPv6 only
+		// strips brackets when the inner content parses as a real
+		// IPv6 literal, so a tampered Host like "[localhost]" without
+		// a port can't be silently normalised into the "localhost"
+		// alias. (When the form IS [host]:port, net.SplitHostPort
+		// itself unbrackets the host before we ever see it; that is
+		// the standard URL syntax for an IPv6 literal in a URL and
+		// reflects the underlying hostname rather than disguising it.)
 		{"[localhost", false},
 		{"localhost]", false},
-		{"[localhost]:9000", true}, // properly bracketed alias is fine after port strip + unwrap
+		{"[localhost]", false},
+		{"[127.0.0.1]", false},
 	}
 
 	for _, tc := range cases {
@@ -137,5 +143,14 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 403 for forbidden host", w.Code)
+	}
+	// Security headers must apply to error responses too — without
+	// nosniff a 403 error page could be MIME-sniffed, and without CSP
+	// it could be framed by an attacker.
+	if csp := w.Header().Get("Content-Security-Policy"); csp != "default-src 'self'" {
+		t.Errorf("Content-Security-Policy on 403 = %q, want default-src 'self'", csp)
+	}
+	if xcto := w.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
+		t.Errorf("X-Content-Type-Options on 403 = %q, want nosniff", xcto)
 	}
 }

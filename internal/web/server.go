@@ -198,6 +198,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set security headers up front so they apply to every response,
+		// including the 403 we may write below for a forbidden Host.
+		// Browsers honour these headers on error responses too — without
+		// them a 403 page could be MIME-sniffed or framed by an attacker.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
 		// DNS-rebinding defence. The listener is loopback-only by hard
 		// invariant (paths.ValidateLoopback), but a hostile origin can
 		// still resolve a name like rebound.attacker.test to 127.0.0.1
@@ -212,10 +219,6 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}
-		// Content-Security-Policy
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
-		// Prevent MIME type sniffing
-		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -249,16 +252,20 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 	return false
 }
 
-// unwrapIPv6 removes a single matched pair of bracket characters from an
-// IPv6-literal hostname (e.g. "[::1]" -> "::1"). It deliberately does
-// NOT strip a stray opening or closing bracket on its own: the
-// host-allowlist check is part of the DNS-rebinding defence, and
-// silently normalising malformed Host headers like "[localhost" or
-// "localhost]" into "localhost" would let a tampered request slip
-// past the allowlist.
+// unwrapIPv6 removes the surrounding brackets from a properly-bracketed
+// IPv6-literal hostname (e.g. "[::1]" -> "::1") and returns the input
+// unchanged otherwise. The unwrap only fires when the inner content
+// actually parses as an IPv6 address — bracket-wrapped non-IPv6 strings
+// like "[localhost]" stay bracketed so they fail the allowlist
+// comparison rather than slipping through as "localhost". This keeps
+// the DNS-rebinding defence strict even against tampered Host headers.
 func unwrapIPv6(host string) string {
-	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
-		return host[1 : len(host)-1]
+	if len(host) < 2 || host[0] != '[' || host[len(host)-1] != ']' {
+		return host
+	}
+	inner := host[1 : len(host)-1]
+	if ip := net.ParseIP(inner); ip != nil && ip.To4() == nil {
+		return inner
 	}
 	return host
 }

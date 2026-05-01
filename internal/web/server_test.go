@@ -74,7 +74,10 @@ func TestServerIntegration(t *testing.T) {
 // is not enough — the Host string itself must be loopback.
 func TestHostAllowed(t *testing.T) {
 	s := testServer(t)
-	s.cfg.Listen = "localhost:9000"
+	// Use a non-alias hostname so the "configured listen hostname"
+	// branch is genuinely exercised; pinning to "localhost" (which is
+	// a hard-coded alias) would mask any regression in that branch.
+	s.cfg.Listen = "my-loopback-alias:9000"
 
 	cases := []struct {
 		host string
@@ -85,14 +88,25 @@ func TestHostAllowed(t *testing.T) {
 		{"[::1]:9000", true},
 		{"localhost:9000", true},
 		{"localhost", true},
-		// Configured listen hostname survives even if it isn't one of the
-		// hard-coded aliases.
-		{"localhost:1234", true},
-		// DNS-rebound names that resolve to 127.0.0.1 in the wild but
-		// don't match the configured listener — must be rejected.
+		// Configured listen hostname (not one of the hard-coded
+		// aliases) is accepted on any port — the check is on the
+		// hostname, not the port pairing.
+		{"my-loopback-alias:9000", true},
+		{"my-loopback-alias:1234", true},
+		{"my-loopback-alias", true},
+		// Other arbitrary names — including rebound DNS that resolves
+		// to 127.0.0.1 in the wild — must be rejected.
 		{"rebound.example.com:9000", false},
 		{"attacker.test", false},
+		{"some-other-name:9000", false},
 		{"", false},
+		// Malformed bracket pairs must NOT be normalised into a
+		// matching alias. unwrapIPv6 only strips brackets when both
+		// are present; lone brackets stay attached and fail the
+		// allowlist comparison.
+		{"[localhost", false},
+		{"localhost]", false},
+		{"[localhost]:9000", true}, // properly bracketed alias is fine after port strip + unwrap
 	}
 
 	for _, tc := range cases {

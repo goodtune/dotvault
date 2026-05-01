@@ -149,21 +149,26 @@ func decodeRegBytes(data []byte) (string, error) {
 	return string(data), nil
 }
 
-// splitLogicalLines splits by line and re-joins continuations, where a
-// trailing `\` (after stripping CRLF) means the next line is a continuation
-// of the current value. Continuation lines are appended verbatim with their
-// leading whitespace stripped, matching the way regedit.exe wraps hex
-// output with a two-space indent.
+// splitLogicalLines splits by line and re-joins continuations. The only
+// continuation form this parser recognises is the `,\` tail produced by
+// regedit's hex wrapping (e.g. `...,67,00,69,\` followed by indented
+// `00,...`), which is the only place a real continuation can appear in
+// .reg v5 files emitted by us or regedit.exe. Backslashes inside quoted
+// REG_SZ values are escaped as `\\` so they can't form a tail
+// continuation; treating any trailing `\` as a continuation would
+// misjoin lines like `"path"="C:\\"` followed by another value.
+//
+// Continuation lines are appended with their leading whitespace stripped,
+// matching the way regedit.exe wraps hex output with a two-space indent.
 func splitLogicalLines(text string) ([]string, error) {
 	rawLines := strings.Split(text, "\n")
 	var out []string
 	var pending strings.Builder
 	for _, raw := range rawLines {
 		line := strings.TrimRight(raw, "\r")
-		// A line is a continuation if its trailing non-whitespace ends in `\`.
-		// Note: backslash inside a quoted REG_SZ is escaped as `\\`, so a
-		// real continuation only ever appears in hex(...) lines whose tail
-		// is `,\`.
+		// A line is a continuation only if it ends in `,\` (the regedit
+		// hex-wrap form). See the function comment for why we deliberately
+		// do not generalise to "any trailing `\`".
 		stripped := strings.TrimRight(line, " \t")
 		if strings.HasSuffix(stripped, ",\\") {
 			body := strings.TrimSuffix(stripped, ",\\")

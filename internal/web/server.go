@@ -205,7 +205,9 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// daemon. Without a Host check the response (which can include
 		// Vault tokens, secrets, and the unredacted config download) is
 		// readable by the attacker's page. Reject any Host whose
-		// hostname is not a recognised loopback alias.
+		// hostname is not a recognised loopback alias (127.0.0.1, ::1,
+		// localhost) or the hostname the daemon was configured to
+		// listen on via web.listen.
 		if !s.hostAllowed(r) {
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
@@ -221,9 +223,10 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 // hostAllowed reports whether r.Host names a loopback identity. It strips
 // the port and matches against the standard set (127.0.0.1, ::1,
 // localhost) plus the hostname the daemon was configured to listen on
-// (e.g. "localhost" when web.listen is "localhost:9000"). Anything else
-// — including arbitrary names that happen to resolve to a loopback IP —
-// is rejected to defeat DNS-rebinding attacks against the API.
+// (e.g. "my-loopback-alias" when web.listen is "my-loopback-alias:9000").
+// Anything else — including arbitrary names that happen to resolve to a
+// loopback IP — is rejected to defeat DNS-rebinding attacks against the
+// API.
 func (s *Server) hostAllowed(r *http.Request) bool {
 	if r.Host == "" {
 		return false
@@ -232,18 +235,32 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	host = unwrapIPv6(host)
 	switch strings.ToLower(host) {
 	case "127.0.0.1", "::1", "localhost":
 		return true
 	}
 	if listenHost, _, err := net.SplitHostPort(s.cfg.Listen); err == nil {
-		listenHost = strings.TrimPrefix(strings.TrimSuffix(listenHost, "]"), "[")
+		listenHost = unwrapIPv6(listenHost)
 		if strings.EqualFold(host, listenHost) {
 			return true
 		}
 	}
 	return false
+}
+
+// unwrapIPv6 removes a single matched pair of bracket characters from an
+// IPv6-literal hostname (e.g. "[::1]" -> "::1"). It deliberately does
+// NOT strip a stray opening or closing bracket on its own: the
+// host-allowlist check is part of the DNS-rebinding defence, and
+// silently normalising malformed Host headers like "[localhost" or
+// "localhost]" into "localhost" would let a tampered request slip
+// past the allowlist.
+func unwrapIPv6(host string) string {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		return host[1 : len(host)-1]
+	}
+	return host
 }
 
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {

@@ -575,6 +575,45 @@ func TestParseRejectsUnsupportedSettingType(t *testing.T) {
 	}
 }
 
+// TestParseMultiSZPreservesMiddleEmptyElements confirms the parser
+// surfaces every element of a REG_MULTI_SZ list, even when one of the
+// middle entries is an empty string. The previous "stop at the first
+// consecutive NUL" logic truncated `["a", "", "b"]` to `["a"]`, which
+// disagreed with both the writer (utf16MultiStringBytes appends each
+// element followed by a NUL plus a final list-terminator NUL) and
+// Windows MultiSZ semantics (drop only the trailing empty terminator).
+func TestParseMultiSZPreservesMiddleEmptyElements(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target:   config.Target{Path: "~/x", Format: "yaml"},
+				OAuth: &config.OAuthConfig{
+					Provider: "github",
+					Scopes:   []string{"a", "", "b"},
+				},
+			},
+		},
+	}
+	text, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	got, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Rules[0].OAuth == nil {
+		t.Fatalf("OAuth lost in round-trip")
+	}
+	want := []string{"a", "", "b"}
+	if !reflect.DeepEqual(got.Rules[0].OAuth.Scopes, want) {
+		t.Errorf("Scopes round-trip mismatch:\ngot:  %#v\nwant: %#v", got.Rules[0].OAuth.Scopes, want)
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

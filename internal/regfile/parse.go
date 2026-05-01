@@ -353,6 +353,14 @@ func utf16BytesToString(b []byte) (string, error) {
 // NUL-terminated UTF-16LE strings followed by a final NUL terminator
 // representing the empty trailing string. The empty-list encoding is a
 // single NUL pair (i.e. 2 bytes of zero).
+//
+// Splitting strategy: walk every NUL as a string boundary (matching
+// what golang.org/x/sys/windows/registry does), then drop the trailing
+// empty element which is the list terminator. Treating the FIRST
+// consecutive NUL as the terminator would lose middle empty elements
+// — `["a", "", "b"]` round-trips through utf16MultiStringBytes as
+// `a\0\0b\0\0`, and a Windows-faithful reader must surface all three
+// strings rather than truncating at "a".
 func utf16BytesToMultiString(b []byte) ([]string, error) {
 	if len(b)%2 != 0 {
 		return nil, fmt.Errorf("REG_MULTI_SZ byte sequence has odd length")
@@ -364,24 +372,24 @@ func utf16BytesToMultiString(b []byte) ([]string, error) {
 	if len(runes) == 0 {
 		return []string{}, nil
 	}
-	// The trailing element is always the empty terminator. If the only
-	// element is that empty terminator, the list is empty.
+	// Split on every NUL — middle empties are real list elements.
 	var out []string
 	start := 0
 	for i, r := range runes {
 		if r == 0 {
-			if i == start {
-				// terminator
-				break
-			}
 			out = append(out, string(utf16.Decode(runes[start:i])))
 			start = i + 1
 		}
 	}
+	// The final empty string is the list terminator, not a real element.
+	// If the only element collected is that terminator, the list is empty
+	// (matching the empty-MULTI_SZ encoding of a single NUL pair).
+	if n := len(out); n > 0 && out[n-1] == "" {
+		out = out[:n-1]
+	}
 	if out == nil {
-		// Differentiate "explicit empty" from "absent": the parser caller
-		// uses non-nil-empty to mean an explicit `[]` so the behaviour
-		// matches yaml.Unmarshal of `scopes: []`.
+		// Non-nil empty so callers can distinguish "explicit empty"
+		// from "absent" (matches yaml.Unmarshal of `scopes: []`).
 		return []string{}, nil
 	}
 	return out, nil

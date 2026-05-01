@@ -143,7 +143,11 @@ func (e *CopyEngine) Run(ctx context.Context, settings map[string]any, io IO) (m
 
 	var incoming map[string]any
 	if err := json.Unmarshal([]byte(rendered), &incoming); err != nil {
-		return nil, fmt.Errorf("copy: parse rendered JSON: %w\nrendered: %s", err, rendered)
+		// Deliberately omit the rendered payload — it contains the
+		// source secret's data and could leak credential material into
+		// logs or the web UI. The byte offset in the json error is
+		// usually enough to localise the problem in the template.
+		return nil, fmt.Errorf("copy: parse rendered JSON: %w", err)
 	}
 
 	// Merge into existing target so unrelated keys at the path are

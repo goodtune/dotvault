@@ -348,12 +348,11 @@ func (m *WatchManager) tickOneWithEnrolment(ctx context.Context, key string, enr
 
 // targetMatches reports whether the existing Vault data already
 // contains every key from desired with the same string value. Extra
-// keys in existing are ignored — the merge in CopyEngine.Run already
-// preserves them, so a perfect match means no write is needed.
+// keys in existing are ignored — the engine's merge already preserves
+// them, and another writer may have added unrelated fields concurrently
+// that we shouldn't clobber. We only need every desired key present
+// with the right value to declare a no-op.
 func targetMatches(existing, desired map[string]any) bool {
-	if len(existing) != len(desired) {
-		return false
-	}
 	for k, v := range desired {
 		ev, ok := existing[k]
 		if !ok {

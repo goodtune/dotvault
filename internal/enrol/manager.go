@@ -163,7 +163,18 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 	return pending, nil
 }
 
+// HasAllFields reports whether every name in fields is present in data
+// as a non-empty string. A nil or empty fields list is treated as
+// incomplete rather than vacuously satisfied: callers use this to
+// answer "is the enrolment complete?" and an empty field list means
+// "we don't know what fields are required" — typically because a
+// SettingsFielder engine couldn't infer them from a malformed config.
+// Treating that as complete would silently skip the misconfigured
+// enrolment forever.
 func HasAllFields(data map[string]any, fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
 	for _, f := range fields {
 		v, ok := data[f]
 		if !ok || v == nil {

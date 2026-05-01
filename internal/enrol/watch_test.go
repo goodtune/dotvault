@@ -330,6 +330,75 @@ func TestWatchManager_DispatchEvent_IgnoresNonMatching(t *testing.T) {
 	}
 }
 
+func TestTargetMatches(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing map[string]any
+		desired  map[string]any
+		want     bool
+	}{
+		{
+			name:     "exact match",
+			existing: map[string]any{"a": "1"},
+			desired:  map[string]any{"a": "1"},
+			want:     true,
+		},
+		{
+			name:     "extra keys in existing are ignored",
+			existing: map[string]any{"a": "1", "extra": "preserved"},
+			desired:  map[string]any{"a": "1"},
+			want:     true,
+		},
+		{
+			name:     "missing desired key",
+			existing: map[string]any{"b": "1"},
+			desired:  map[string]any{"a": "1"},
+			want:     false,
+		},
+		{
+			name:     "value mismatch",
+			existing: map[string]any{"a": "1"},
+			desired:  map[string]any{"a": "2"},
+			want:     false,
+		},
+		{
+			name:     "empty desired matches anything",
+			existing: map[string]any{"a": "1"},
+			desired:  map[string]any{},
+			want:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := targetMatches(tt.existing, tt.desired); got != tt.want {
+				t.Errorf("targetMatches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasAllFields(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   map[string]any
+		fields []string
+		want   bool
+	}{
+		{"all present", map[string]any{"a": "1", "b": "2"}, []string{"a", "b"}, true},
+		{"missing field", map[string]any{"a": "1"}, []string{"a", "b"}, false},
+		{"empty value", map[string]any{"a": "1", "b": ""}, []string{"a", "b"}, false},
+		{"nil fields treated as incomplete", map[string]any{"a": "1"}, nil, false},
+		{"empty fields treated as incomplete", map[string]any{"a": "1"}, []string{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HasAllFields(tt.data, tt.fields); got != tt.want {
+				t.Errorf("HasAllFields() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEventMatchesSource(t *testing.T) {
 	tests := []struct {
 		name string

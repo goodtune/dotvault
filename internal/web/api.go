@@ -386,10 +386,14 @@ func stripZeroUnit(s string, unit byte) string {
 //
 // The format is selected via ?format=yaml|reg (default yaml).
 func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
-	// no-store on every response path including 401/403/400: even error
-	// pages from this endpoint should not be cached, both because they
-	// may reveal whether the daemon is currently authenticated and
-	// because we want the cache invariant to hold uniformly.
+	// no-store applies to every response this handler emits — the
+	// success body, the 401 from the auth gate, the 400 on bad
+	// format, and the 500 on render failures. (A request that fails
+	// the middleware-level Host allowlist is rejected before this
+	// handler runs and gets its own no-store via writeError's JSON
+	// envelope on /api/ routes.) Even the error pages should not be
+	// cached because they can reveal whether the daemon is currently
+	// authenticated.
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 

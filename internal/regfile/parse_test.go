@@ -614,12 +614,12 @@ func TestParseMultiSZPreservesMiddleEmptyElements(t *testing.T) {
 	}
 }
 
-// TestParseRejectsUntermiantedMultiSZ guards against a corrupted
+// TestParseRejectsUnterminatedMultiSZ guards against a corrupted
 // REG_MULTI_SZ blob whose payload doesn't end in a NUL terminator.
 // Without the explicit check the function would silently emit an
 // empty list and drop the truncated final segment without surfacing
 // any error, which would make data loss invisible.
-func TestParseRejectsUntermiantedMultiSZ(t *testing.T) {
+func TestParseRejectsUnterminatedMultiSZ(t *testing.T) {
 	// hex(7) for "ab" without the trailing NUL terminator pair.
 	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
 		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +

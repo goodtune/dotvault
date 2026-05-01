@@ -87,6 +87,15 @@ func TestHostAllowed(t *testing.T) {
 	}{
 		{"127.0.0.1:9000", true},
 		{"127.0.0.1", true},
+		// Other loopback IP forms — accepted via net.IP.IsLoopback so
+		// equivalent textual representations don't trip the allowlist.
+		{"127.0.0.5", true},                           // anywhere in 127.0.0.0/8
+		{"[0:0:0:0:0:0:0:1]:9000", true},              // long-form IPv6 loopback
+		{"0:0:0:0:0:0:0:1", true},                     // same, no port/brackets
+		{"[::ffff:127.0.0.1]:9000", true},             // IPv4-mapped IPv6 loopback
+		// Non-loopback IPs must still be rejected.
+		{"8.8.8.8:9000", false},
+		{"[2001:db8::1]:9000", false},
 		{"[::1]:9000", true},
 		{"localhost:9000", true},
 		{"localhost", true},
@@ -160,6 +169,12 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	// http.Error would give text/plain and a generic StatusText body.
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type on /api/ 403 = %q, want application/json", ct)
+	}
+	// Cache invariant: the API's no-store policy from
+	// handleConfigDownload should apply uniformly to the middleware
+	// rejection too.
+	if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control on /api/ 403 = %q, want no-store", cc)
 	}
 	var body map[string]string
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {

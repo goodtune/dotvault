@@ -219,8 +219,12 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			// API consumers (the SPA fetch wrapper, scripts, tests)
 			// rely on JSON error envelopes — fall back to plain text
 			// only for non-API routes (e.g. a browser hitting `/`
-			// directly).
+			// directly). Mark the 403 no-store so the API invariant
+			// holds for both the handler-level errors and the
+			// middleware-level rejection.
 			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("Pragma", "no-cache")
 				writeError(w, "forbidden host", http.StatusForbidden)
 			} else {
 				http.Error(w, "forbidden host", http.StatusForbidden)
@@ -232,12 +236,16 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 }
 
 // hostAllowed reports whether r.Host names a loopback identity. It strips
-// the port and matches against the standard set (127.0.0.1, ::1,
-// localhost) plus the hostname the daemon was configured to listen on
-// (e.g. "my-loopback-alias" when web.listen is "my-loopback-alias:9000").
-// Anything else — including arbitrary names that happen to resolve to a
-// loopback IP — is rejected to defeat DNS-rebinding attacks against the
-// API.
+// the port and then applies two rules:
+//   - IP literals: accepted iff net.IP.IsLoopback() (covers 127.0.0.1,
+//     ::1, the long-form 0:0:0:0:0:0:0:1, ::ffff:127.0.0.1, and the
+//     entire 127.0.0.0/8 range).
+//   - Hostnames: a strict allowlist of "localhost" plus whatever
+//     hostname the daemon was configured to listen on (e.g.
+//     "my-loopback-alias" when web.listen is "my-loopback-alias:9000").
+//
+// Hostnames that happen to resolve to a loopback IP elsewhere on the
+// network are still rejected — that's the DNS-rebinding defence.
 func (s *Server) hostAllowed(r *http.Request) bool {
 	if r.Host == "" {
 		return false
@@ -247,8 +255,20 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 		host = h
 	}
 	host = unwrapIPv6(host)
-	switch strings.ToLower(host) {
-	case "127.0.0.1", "::1", "localhost":
+
+	// IP literals: accept any form that resolves to a loopback address.
+	// This covers "127.0.0.1", "::1", the long-form "0:0:0:0:0:0:0:1",
+	// "::ffff:127.0.0.1", and the entire 127.0.0.0/8 loopback range —
+	// all of which reach a loopback-bound listener and would already
+	// have made it past the kernel's address check. ParseIP returns
+	// nil for hostnames so this branch is IP-only; arbitrary names
+	// still fall through to the strict allowlist below.
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	// Non-IP hostnames: strict allowlist (DNS-rebinding defence).
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	if listenHost, _, err := net.SplitHostPort(s.cfg.Listen); err == nil {

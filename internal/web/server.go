@@ -260,8 +260,7 @@ func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]confi
 
 	// Check Vault for already-complete enrolments.
 	for _, info := range runner.States() {
-		engine, ok := enrol.GetEngine(info.Engine)
-		if !ok {
+		if _, ok := enrol.GetEngine(info.Engine); !ok {
 			continue
 		}
 		vaultPath := s.userKVPrefix() + info.Key
@@ -270,7 +269,7 @@ func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]confi
 			slog.Warn("failed to check enrolment in vault", "key", info.Key, "error", err)
 			continue
 		}
-		if secret != nil && enrol.HasAllFields(secret.Data, engine.Fields()) {
+		if secret != nil && enrol.HasAllFields(secret.Data, info.Fields) {
 			runner.MarkComplete(info.Key)
 		}
 	}

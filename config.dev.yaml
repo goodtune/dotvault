@@ -81,3 +81,18 @@ enrolments:
       # Shorter-than-production TTL so the refresh cycle gets exercised
       # during normal dev-loop sessions (halfway point = 3 h).
       token_ttl: "6h"
+  # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the
+  # user's enrolment path under a different field name. Re-evaluated on
+  # every poll cycle by the WatchManager and, on Enterprise Vault, on
+  # source-write events.
+  sample:
+    engine: copy
+    settings:
+      from:
+        mount: kv
+        path: apps/sample/keys/{{.user}}
+      format: json
+      template: |
+        {
+          "token": "{{ .data.key }}"
+        }

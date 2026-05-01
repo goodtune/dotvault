@@ -134,7 +134,7 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 		}
 		if s.engine != nil {
 			info.EngineName = s.engine.Name()
-			info.Fields = s.engine.Fields()
+			info.Fields = enrol.EngineFields(s.engine, s.settings)
 		} else {
 			info.EngineName = s.engineName
 			info.Fields = []string{}
@@ -219,7 +219,7 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 	}
 	if s.engine != nil {
 		info.EngineName = s.engine.Name()
-		info.Fields = s.engine.Fields()
+		info.Fields = enrol.EngineFields(s.engine, s.settings)
 	} else {
 		info.EngineName = s.engineName
 		info.Fields = []string{}
@@ -349,11 +349,15 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 
 	capture := &lineCapture{state: s}
 
+	vaultPath := userPrefix + key
 	io := enrol.IO{
-		Out:      capture,
-		In:       strings.NewReader("\n"), // auto-proceed for engines that wait for Enter
-		Log:      slog.Default(),
-		Username: username,
+		Out:        capture,
+		In:         strings.NewReader("\n"), // auto-proceed for engines that wait for Enter
+		Log:        slog.Default(),
+		Username:   username,
+		Vault:      vc,
+		KVMount:    kvMount,
+		TargetPath: vaultPath,
 	}
 	if promptSecret != nil {
 		io.PromptSecret = func(label string) (string, error) {
@@ -379,7 +383,7 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 		for k, v := range creds {
 			data[k] = v
 		}
-		if !enrol.HasAllFields(data, s.engine.Fields()) {
+		if !enrol.HasAllFields(data, enrol.EngineFields(s.engine, s.settings)) {
 			s.mu.Lock()
 			s.status = "failed"
 			s.errMsg = "engine returned incomplete credentials"
@@ -389,7 +393,6 @@ func (r *EnrolmentRunner) Start(ctx context.Context, key string, vc *vault.Clien
 		}
 
 		// Write to Vault.
-		vaultPath := userPrefix + key
 		if err := vc.WriteKVv2(ctx, kvMount, vaultPath, data); err != nil {
 			s.mu.Lock()
 			s.status = "failed"

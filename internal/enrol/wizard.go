@@ -9,9 +9,10 @@ import (
 
 // pendingEnrolment is an enrolment that needs to run.
 type pendingEnrolment struct {
-	key       string
-	enrolment config.Enrolment
-	engine    Engine
+	key        string
+	enrolment  config.Enrolment
+	engine     Engine
+	targetPath string
 }
 
 // runWizard runs pending enrolments sequentially and returns the credentials
@@ -33,7 +34,9 @@ func runWizard(ctx context.Context, pending []pendingEnrolment, io IO) map[strin
 
 		fmt.Fprintf(io.Out, "Enrolment [%d/%d]: %s\n", i+1, total, p.engine.Name())
 
-		creds, err := p.engine.Run(ctx, p.enrolment.Settings, io)
+		engineIO := io
+		engineIO.TargetPath = p.targetPath
+		creds, err := p.engine.Run(ctx, p.enrolment.Settings, engineIO)
 		if err != nil {
 			if ctx.Err() != nil {
 				return results

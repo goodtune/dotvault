@@ -347,50 +347,83 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 	enrolment := Enrolment{}
 	enrolment.Engine, _ = readRegString(key, "Engine")
 
-	// Read optional Settings subkey.
+	// Read optional Settings subkey, recursing into any nested subkeys
+	// so engines like "copy" with structured settings (e.g. settings.from
+	// → mount/path) round-trip cleanly through reg-export → reg-import.
 	settingsPath := path + `\Settings`
-	sk, err := registry.OpenKey(root, settingsPath, registry.READ)
-	if err != nil && !errors.Is(err, registry.ErrNotExist) {
-		return Enrolment{}, fmt.Errorf("open Settings key at %s: %w", settingsPath, err)
+	settings, err := readRegistrySettingsBlock(root, settingsPath)
+	if err != nil {
+		return Enrolment{}, err
 	}
-	if err == nil {
-		defer sk.Close()
-		info, err := sk.Stat()
-		if err != nil {
-			return Enrolment{}, fmt.Errorf("stat Settings key: %w", err)
+	if len(settings) > 0 {
+		enrolment.Settings = settings
+	}
+
+	return enrolment, nil
+}
+
+// readRegistrySettingsBlock reads scalar values directly under keyPath
+// and recursively reads any subkeys as nested map[string]any entries.
+// Returns nil (no error) when the key does not exist; returns an empty
+// map when the key exists but contains no values or subkeys.
+func readRegistrySettingsBlock(root registry.Key, keyPath string) (map[string]any, error) {
+	sk, err := registry.OpenKey(root, keyPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
 		}
+		return nil, fmt.Errorf("open settings key at %s: %w", keyPath, err)
+	}
+	defer sk.Close()
+
+	info, err := sk.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat settings key: %w", err)
+	}
+
+	out := make(map[string]any)
+
+	if info.ValueCount > 0 {
 		names, err := sk.ReadValueNames(int(info.ValueCount))
 		if err != nil {
-			return Enrolment{}, fmt.Errorf("read Settings value names: %w", err)
+			return nil, fmt.Errorf("read settings value names: %w", err)
 		}
-		if len(names) > 0 {
-			enrolment.Settings = make(map[string]any, len(names))
-			for _, vname := range names {
-				// Normalize value names to lowercase so they match
-				// engine setting keys (e.g. "client_id", "host").
-				// Registry value names are case-insensitive on Windows.
-				settingKey := strings.ToLower(vname)
-				// Read the value type first to dispatch to the correct
-				// reader directly, avoiding spurious type-mismatch
-				// warnings from the probe-and-fallback approach.
-				_, valtype, _ := sk.GetValue(vname, nil)
-				switch valtype {
-				case registry.SZ, registry.EXPAND_SZ:
-					if s, ok := readRegString(sk, vname); ok {
-						enrolment.Settings[settingKey] = s
+		for _, vname := range names {
+			// Registry value names are case-insensitive on Windows;
+			// engines compare keys lowercase (e.g. "client_id"), so
+			// normalize before storing.
+			settingKey := strings.ToLower(vname)
+			_, valtype, _ := sk.GetValue(vname, nil)
+			switch valtype {
+			case registry.SZ, registry.EXPAND_SZ:
+				if s, ok := readRegString(sk, vname); ok {
+					out[settingKey] = s
+				}
+			case registry.MULTI_SZ:
+				if ms := readRegMultiString(sk, vname); ms != nil {
+					vals := make([]any, len(ms))
+					for i, v := range ms {
+						vals[i] = v
 					}
-				case registry.MULTI_SZ:
-					if ms := readRegMultiString(sk, vname); ms != nil {
-						vals := make([]any, len(ms))
-						for i, v := range ms {
-							vals[i] = v
-						}
-						enrolment.Settings[settingKey] = vals
-					}
+					out[settingKey] = vals
 				}
 			}
 		}
 	}
 
-	return enrolment, nil
+	if info.SubKeyCount > 0 {
+		subnames, err := sk.ReadSubKeyNames(int(info.SubKeyCount))
+		if err != nil {
+			return nil, fmt.Errorf("read settings subkey names: %w", err)
+		}
+		for _, sub := range subnames {
+			nested, err := readRegistrySettingsBlock(root, keyPath+`\`+sub)
+			if err != nil {
+				return nil, err
+			}
+			out[strings.ToLower(sub)] = nested
+		}
+	}
+
+	return out, nil
 }

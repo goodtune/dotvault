@@ -88,6 +88,11 @@ services:
         path "kv/metadata/users/*" {
           capabilities = ["read", "list", "delete"]
         }
+        # Read-only access to per-user app secrets so the "copy" enrolment
+        # engine can mirror them into the user's enrolment path.
+        path "kv/data/apps/+/keys/*" {
+          capabilities = ["read"]
+        }
         path "sys/events/subscribe/*" {
           capabilities = ["read"]
         }
@@ -97,6 +102,9 @@ services:
         vault kv put kv/users/gary/gh token=ghp_example_token_1234
         vault kv put kv/users/gary/netrc \
           play.stirlo.au='{"login":"gary","password":"s3cret"}'
+        # Seed a per-user app secret for exercising the "copy" enrolment
+        # engine, which mirrors a value from one Vault path to another.
+        vault kv put kv/apps/sample/keys/gary key=copied-from-upstream
 
         echo "==> Enabling OIDC auth method..."
         vault auth enable oidc 2>/dev/null || true

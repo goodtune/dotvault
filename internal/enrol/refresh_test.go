@@ -118,7 +118,11 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			data, ok := fv.secrets[path]
 			fv.mu.Unlock()
 			if !ok {
-				http.NotFound(w, r)
+				// Mimic Vault's 404 body so the SDK parses it as a
+				// proper not-found rather than a JSON error.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"errors":[]}`))
 				return
 			}
 			body, _ := json.Marshal(map[string]any{

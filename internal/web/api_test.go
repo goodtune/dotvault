@@ -170,6 +170,46 @@ func TestHandleConfigDownload_Unauthenticated(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", w.Code)
 	}
+	// Cache headers must apply even to the unauthenticated response so
+	// a 401 doesn't get persisted in any intermediate cache. The
+	// handler comment claims this is invariant on every path.
+	if cc := w.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Errorf("Cache-Control on 401 = %q, want no-store", cc)
+	}
+	if p := w.Header().Get("Pragma"); p != "no-cache" {
+		t.Errorf("Pragma on 401 = %q, want no-cache", p)
+	}
+}
+
+func TestHandleConfigDownload_DefaultIntervalMaterialised(t *testing.T) {
+	// When the source YAML omitted sync.interval, validate() sets
+	// Interval to 15m but leaves RawInterval empty. The download must
+	// reflect the effective interval, not the empty raw value.
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.syncCfg = config.SyncConfig{Interval: 15 * time.Minute}
+	s.rules = []config.Rule{
+		{
+			Name:     "r",
+			VaultKey: "r",
+			Target:   config.Target{Path: "/tmp/r", Format: "text"},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=yaml", nil)
+	w := httptest.NewRecorder()
+	s.handleConfigDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "interval: 15m") {
+		t.Errorf("expected materialised interval `15m`; got:\n%s", body)
+	}
+	if strings.Contains(body, `interval: ""`) {
+		t.Errorf("download emitted empty interval; should have materialised the default:\n%s", body)
+	}
 }
 
 func TestHandleConfigDownload_YAML(t *testing.T) {

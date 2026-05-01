@@ -386,6 +386,13 @@ func stripZeroUnit(s string, unit byte) string {
 //
 // The format is selected via ?format=yaml|reg (default yaml).
 func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
+	// no-store on every response path including 401/403/400: even error
+	// pages from this endpoint should not be cached, both because they
+	// may reveal whether the daemon is currently authenticated and
+	// because we want the cache invariant to hold uniformly.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
 	if s.vault == nil || s.vault.Token() == "" {
 		writeError(w, "not authenticated", http.StatusUnauthorized)
 		return
@@ -397,12 +404,6 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := s.buildEffectiveConfig()
-
-	// no-store on every response path: the body may include CA certs,
-	// templates, and enrolment settings that should not survive in any
-	// intermediate cache or browser disk cache.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
 
 	switch format {
 	case "yaml":
@@ -441,15 +442,28 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 // already has each section in a typed field for direct API use; pulling
 // them back together for download keeps the in-memory representation
 // authoritative.
+//
+// One subtle fix-up: when the source YAML omitted `sync.interval`,
+// (*Config).validate populates Sync.Interval with the 15m default but
+// leaves Sync.RawInterval empty. The renderers serialise RawInterval
+// (so the .reg form stays diff-stable when the user actually wrote
+// "15m"), so we'd otherwise emit `interval: ""` here even though the
+// daemon is using 15m. Materialise RawInterval from Interval whenever
+// it's empty so the download reflects the effective configuration.
 func (s *Server) buildEffectiveConfig() *config.Config {
 	rules := make([]config.Rule, len(s.rules))
 	copy(rules, s.rules)
 
 	enrolments := s.getEnrolments()
 
+	syncCfg := s.syncCfg
+	if syncCfg.RawInterval == "" && syncCfg.Interval > 0 {
+		syncCfg.RawInterval = formatDuration(syncCfg.Interval)
+	}
+
 	return &config.Config{
 		Vault:      s.vaultCfg,
-		Sync:       s.syncCfg,
+		Sync:       syncCfg,
 		Web:        s.cfg,
 		Rules:      rules,
 		Enrolments: enrolments,

@@ -614,6 +614,31 @@ func TestParseMultiSZPreservesMiddleEmptyElements(t *testing.T) {
 	}
 }
 
+// TestParseRejectsUntermiantedMultiSZ guards against a corrupted
+// REG_MULTI_SZ blob whose payload doesn't end in a NUL terminator.
+// Without the explicit check the function would silently emit an
+// empty list and drop the truncated final segment without surfacing
+// any error, which would make data loss invisible.
+func TestParseRejectsUntermiantedMultiSZ(t *testing.T) {
+	// hex(7) for "ab" without the trailing NUL terminator pair.
+	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"\"VaultKey\"=\"r\"\r\n" +
+		"\"TargetPath\"=\"/tmp/r\"\r\n" +
+		"\"TargetFormat\"=\"text\"\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r\\OAuth]\r\n" +
+		"\"Provider\"=\"github\"\r\n" +
+		// 61,00,62,00 = "ab" UTF-16LE, missing the trailing 00,00 pair.
+		"\"Scopes\"=hex(7):61,00,62,00\r\n"
+	_, err := Parse([]byte(bad))
+	if err == nil {
+		t.Fatalf("expected error for unterminated REG_MULTI_SZ")
+	}
+	if !strings.Contains(err.Error(), "REG_MULTI_SZ") || !strings.Contains(err.Error(), "terminator") {
+		t.Errorf("error should describe the missing terminator; got %v", err)
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

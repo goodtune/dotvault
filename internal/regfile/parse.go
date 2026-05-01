@@ -372,6 +372,14 @@ func utf16BytesToMultiString(b []byte) ([]string, error) {
 	if len(runes) == 0 {
 		return []string{}, nil
 	}
+	// REG_MULTI_SZ must end with a NUL terminator. A blob with no
+	// trailing NUL (or a non-empty blob with no NUL anywhere) means
+	// the data was truncated or corrupted; silently dropping the
+	// trailing segment would convert that into an empty list and lose
+	// real configuration without warning.
+	if runes[len(runes)-1] != 0 {
+		return nil, fmt.Errorf("REG_MULTI_SZ byte sequence is missing the trailing NUL terminator")
+	}
 	// Split on every NUL — middle empties are real list elements.
 	var out []string
 	start := 0

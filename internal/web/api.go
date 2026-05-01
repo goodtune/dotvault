@@ -376,6 +376,9 @@ func stripZeroUnit(s string, unit byte) string {
 // redaction would defeat its purpose. The compensating boundaries are:
 //   - the web UI binds to loopback only (a hard invariant in
 //     paths.ValidateLoopback) so the response cannot reach the network
+//   - the middleware rejects requests whose Host header is not a
+//     loopback alias, defeating DNS-rebinding attacks that would
+//     otherwise let a hostile origin read the response
 //   - the daemon must be authenticated to Vault, gating the endpoint
 //     behind the same proof-of-trust used for /api/v1/token
 //   - the response is marked Cache-Control: no-store to keep proxies
@@ -402,7 +405,7 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 
 	switch format {
-	case "yaml", "yml":
+	case "yaml":
 		data, err := regfile.MarshalYAML(cfg)
 		if err != nil {
 			slog.Error("marshal yaml for download", "error", err)

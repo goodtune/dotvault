@@ -370,6 +370,59 @@ func TestParseLowercasesEnrolmentSettingNames(t *testing.T) {
 	}
 }
 
+// TestMarshalYAMLMapKeysSorted pins the implicit map-key sort that
+// yaml.v3 currently performs. The doc comment on MarshalYAML calls this
+// out as a non-spec guarantee; if a future yaml.v3 release stops
+// sorting we want this test to fail loudly so we can switch to an
+// explicit yaml.Node walk before downstream diffs go noisy.
+func TestMarshalYAMLMapKeysSorted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "r",
+				VaultKey: "r",
+				Target:   config.Target{Path: "/tmp/r", Format: "text"},
+			},
+		},
+		// Insert keys in non-alphabetical order so a stable iteration
+		// would still betray missing sort logic.
+		Enrolments: map[string]config.Enrolment{
+			"zulu":    {Engine: "ssh"},
+			"alpha":   {Engine: "github"},
+			"mike":    {Engine: "jfrog"},
+			"charlie": {Engine: "github", Settings: map[string]any{"zoo": "z", "ant": "a", "moose": "m"}},
+		},
+	}
+	out, err := MarshalYAML(cfg)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	body := string(out)
+
+	// Top-level enrolment keys must appear alphabetically.
+	wantOrder := []string{"alpha", "charlie", "mike", "zulu"}
+	prev := 0
+	for _, name := range wantOrder {
+		idx := strings.Index(body[prev:], "\n  "+name+":")
+		if idx < 0 {
+			t.Fatalf("enrolment %q missing from output:\n%s", name, body)
+		}
+		prev += idx + 1
+	}
+
+	// Settings map under "charlie" must also be alphabetised.
+	settingsOrder := []string{"ant:", "moose:", "zoo:"}
+	prev = strings.Index(body, "charlie:")
+	for _, key := range settingsOrder {
+		idx := strings.Index(body[prev:], key)
+		if idx < 0 {
+			t.Fatalf("settings key %q missing from output:\n%s", key, body)
+		}
+		prev += idx + 1
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

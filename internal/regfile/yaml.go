@@ -9,9 +9,15 @@ import (
 )
 
 // MarshalYAML renders cfg as the canonical YAML form accepted by config.Load.
-// The output is sorted (yaml.v3 sorts map keys alphabetically) and uses
-// 2-space indentation, matching the project's existing config.dev.yaml
-// style. A trailing newline is included.
+// Output uses 2-space indentation, matching the project's existing
+// config.dev.yaml style, and includes a trailing newline.
+//
+// In current yaml.v3 versions map keys are emitted in sorted order, which
+// keeps Enrolments and per-engine Settings stable across runs. That
+// behaviour is not formally guaranteed by the YAML spec, so the test
+// suite includes a regression test that pins it; if a future yaml.v3
+// release drops the implicit sort the test will fail loudly and prompt
+// us to switch to an explicit yaml.Node walk.
 //
 // Empty optional fields are emitted explicitly (e.g. `auth_method: ""`)
 // rather than omitted, because the source of this call is typically a

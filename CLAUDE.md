@@ -308,6 +308,8 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 
 **Security headers:** `Content-Security-Policy: default-src 'self'`, `X-Content-Type-Options: nosniff`.
 
+**DNS-rebinding defence:** the middleware rejects any request whose `Host` header is not a loopback alias (`127.0.0.1`, `::1`, `localhost`) or the configured `web.listen` hostname. Loopback binding alone doesn't stop a hostile origin from resolving its own DNS name to `127.0.0.1` and using a victim's browser as a relay; the Host check ensures the daemon refuses such requests before any handler runs.
+
 Configurable markdown content via `web.login_text` and `web.secret_view_text` fields rendered by `internal/web/markdown.go`.
 
 ## Windows Registry / Group Policy

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -197,12 +198,52 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// DNS-rebinding defence. The listener is loopback-only by hard
+		// invariant (paths.ValidateLoopback), but a hostile origin can
+		// still resolve a name like rebound.attacker.test to 127.0.0.1
+		// and have the user's browser send a request that reaches the
+		// daemon. Without a Host check the response (which can include
+		// Vault tokens, secrets, and the unredacted config download) is
+		// readable by the attacker's page. Reject any Host whose
+		// hostname is not a recognised loopback alias.
+		if !s.hostAllowed(r) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
 		// Content-Security-Policy
 		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		// Prevent MIME type sniffing
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// hostAllowed reports whether r.Host names a loopback identity. It strips
+// the port and matches against the standard set (127.0.0.1, ::1,
+// localhost) plus the hostname the daemon was configured to listen on
+// (e.g. "localhost" when web.listen is "localhost:9000"). Anything else
+// — including arbitrary names that happen to resolve to a loopback IP —
+// is rejected to defeat DNS-rebinding attacks against the API.
+func (s *Server) hostAllowed(r *http.Request) bool {
+	if r.Host == "" {
+		return false
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	switch strings.ToLower(host) {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	if listenHost, _, err := net.SplitHostPort(s.cfg.Listen); err == nil {
+		listenHost = strings.TrimPrefix(strings.TrimSuffix(listenHost, "]"), "[")
+		if strings.EqualFold(host, listenHost) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {

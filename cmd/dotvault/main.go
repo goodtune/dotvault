@@ -676,7 +676,7 @@ func runRegImport(cmd *cobra.Command, args []string) error {
 // (*Config).validate; the indirection avoids duplicating validation
 // logic here.
 func validateYAML(data []byte) error {
-	tmp, err := os.CreateTemp("", "dotvault-import-*.yaml")
+	tmp, err := os.CreateTemp("", "dotvault-validate-*.yaml")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}

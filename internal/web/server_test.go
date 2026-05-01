@@ -67,3 +67,61 @@ func TestServerIntegration(t *testing.T) {
 		t.Errorf("X-Content-Type-Options = %q, want 'nosniff'", xcto)
 	}
 }
+
+// TestHostAllowed pins the DNS-rebinding defence in the middleware: only
+// loopback aliases (and the configured listen hostname) are accepted as
+// the Host header. A name that resolves to 127.0.0.1 in the wider DNS
+// is not enough — the Host string itself must be loopback.
+func TestHostAllowed(t *testing.T) {
+	s := testServer(t)
+	s.cfg.Listen = "localhost:9000"
+
+	cases := []struct {
+		host string
+		ok   bool
+	}{
+		{"127.0.0.1:9000", true},
+		{"127.0.0.1", true},
+		{"[::1]:9000", true},
+		{"localhost:9000", true},
+		{"localhost", true},
+		// Configured listen hostname survives even if it isn't one of the
+		// hard-coded aliases.
+		{"localhost:1234", true},
+		// DNS-rebound names that resolve to 127.0.0.1 in the wild but
+		// don't match the configured listener — must be rejected.
+		{"rebound.example.com:9000", false},
+		{"attacker.test", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/", nil)
+			r.Host = tc.host
+			if got := s.hostAllowed(r); got != tc.ok {
+				t.Errorf("hostAllowed(%q) = %v, want %v", tc.host, got, tc.ok)
+			}
+		})
+	}
+}
+
+// TestMiddlewareRejectsBadHost confirms the host check actually rejects
+// requests at the HTTP layer rather than just informing later handlers.
+func TestMiddlewareRejectsBadHost(t *testing.T) {
+	s := testServer(t)
+	s.cfg.Listen = "127.0.0.1:0"
+
+	handler := s.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("inner handler should not run for forbidden host")
+	}))
+
+	r := httptest.NewRequest("GET", "/api/v1/status", nil)
+	r.Host = "rebound.attacker.test"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for forbidden host", w.Code)
+	}
+}

@@ -294,10 +294,20 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 		}
 		return 0
 	case wmTrayQuit:
-		// Ctx-cancel watcher tapping us on the shoulder.
-		procDestroyWindow.Call(uintptr(hwnd))
+		// Ctx-cancel watcher (or menu Exit) signalling shutdown. Just
+		// break out of the pump — Run's deferred cleanup runs
+		// Shell_NotifyIcon(NIM_DELETE) before DestroyWindow so the tray
+		// icon is removed cleanly. Calling DestroyWindow here would
+		// invalidate the HWND before NIM_DELETE could reference it,
+		// leaving Explorer with a "dead" icon until the next mouse
+		// hover.
+		procPostQuitMessage.Call(0)
 		return 0
 	case wmDestroy:
+		// Fired by DestroyWindow in the defer. PostQuitMessage here is
+		// a no-op (pump already exited) but harmless and keeps the
+		// window proc consistent if DestroyWindow is ever invoked from
+		// another path.
 		procPostQuitMessage.Call(0)
 		return 0
 	}

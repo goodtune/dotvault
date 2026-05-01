@@ -523,11 +523,35 @@ producing partial configs.`,
 	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
 	cmd.Flags().BoolVar(&flagRegRegedit, "regedit", false, "emit canonical .reg instead of YAML")
 	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "with --regedit, emit unencoded plain text instead of UTF-16LE")
+
+	// Hide the inherited --config flag from this subcommand's help.
+	// reg-export takes a .reg input via positional path or stdin and
+	// has no use for --config (which selects a YAML file for the other
+	// subcommands). Showing it would be a UX footgun. We restore the
+	// original Hidden state after rendering so other subcommands' help
+	// continues to advertise --config normally.
+	defaultHelp := cmd.HelpFunc()
+	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
+		if cfg := c.InheritedFlags().Lookup("config"); cfg != nil {
+			wasHidden := cfg.Hidden
+			cfg.Hidden = true
+			defer func() { cfg.Hidden = wasHidden }()
+		}
+		defaultHelp(c, args)
+	})
 	return cmd
 }
 
 func runRegExport(cmd *cobra.Command, args []string) error {
 	setupLogging()
+
+	// reg-export reads a .reg file (positional path or stdin) — the
+	// inherited --config flag does not apply here. Reject the
+	// combination explicitly rather than silently ignoring it, so a
+	// user expecting --config to select the input gets clear feedback.
+	if flagConfig != "" {
+		return fmt.Errorf("--config does not apply to reg-export; pass the .reg path as a positional argument or stdin")
+	}
 
 	// --ascii is only meaningful in the .reg pass-through path; YAML
 	// output has no UTF-16LE encoding to opt out of. Reject the

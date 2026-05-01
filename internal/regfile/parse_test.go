@@ -520,6 +520,40 @@ func TestParseKindMismatchErrors(t *testing.T) {
 	}
 }
 
+// TestParseCaseInsensitivePaths confirms registry key paths are
+// compared case-insensitively. Windows registry treats key paths as
+// case-insensitive, so a hand-written .reg using non-canonical case
+// (e.g. "Software" instead of "SOFTWARE", or "vault" instead of
+// "Vault") must still produce a complete config rather than silently
+// dropping the values.
+func TestParseCaseInsensitivePaths(t *testing.T) {
+	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		// Lower-case Software, mixed-case dotvault, lowercase vault
+		"[HKEY_LOCAL_MACHINE\\Software\\Policies\\DotVault\\vault]\r\n" +
+		"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
+		// Lowercase rules + oauth under it.
+		"[hkey_local_machine\\SOFTWARE\\Policies\\dotvault\\RULES\\gh]\r\n" +
+		"\"VaultKey\"=\"gh\"\r\n" +
+		"\"TargetPath\"=\"/tmp/gh\"\r\n" +
+		"\"TargetFormat\"=\"text\"\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\gh\\oauth]\r\n" +
+		"\"Provider\"=\"github\"\r\n"
+
+	got, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse should accept case-folded paths: %v", err)
+	}
+	if got.Vault.Address != "https://vault.example.com:8200" {
+		t.Errorf("Vault.Address lost across case-folded prefix; got %q", got.Vault.Address)
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Name != "gh" {
+		t.Fatalf("expected rule 'gh', got %+v", got.Rules)
+	}
+	if got.Rules[0].OAuth == nil || got.Rules[0].OAuth.Provider != "github" {
+		t.Errorf("OAuth child key lost across case-folded segment; got %+v", got.Rules[0].OAuth)
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

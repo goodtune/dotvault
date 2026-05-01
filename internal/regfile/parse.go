@@ -62,15 +62,15 @@ func Parse(data []byte) (*config.Config, error) {
 				currentKey = ""
 				continue
 			}
-			currentKey = path
+			currentKey = canonicalizeKeyPath(path)
 			// Track rule / enrolment subkey names so we can emit them even
 			// when they have no values of their own (e.g. a rule whose
 			// fields are all empty strings would still produce its parent
 			// key line).
-			if name, ok := childUnder(path, rootKey+`\Rules`); ok && name != "" {
+			if name, ok := childUnder(currentKey, rootKey+`\Rules`); ok && name != "" {
 				rules[name] = true
 			}
-			if name, ok := childUnder(path, rootKey+`\Enrolments`); ok && name != "" {
+			if name, ok := childUnder(currentKey, rootKey+`\Enrolments`); ok && name != "" {
 				enrolments[name] = true
 			}
 			continue
@@ -420,6 +420,61 @@ func unescapeREGString(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
+}
+
+// canonicalSegments maps lower-cased fixed key segments under the
+// dotvault policy root to the case the renderer emits. Windows registry
+// paths are case-insensitive, so a hand-written .reg file might
+// reasonably use any case for these segments; canonicalizeKeyPath
+// folds them to the canonical form so downstream lookups in
+// applyValues can do exact-string comparisons.
+//
+// Only segments at known structural positions are normalised — we do
+// NOT touch user-defined names (rule names, enrolment names, or value
+// names). A rule named "OAuth" would still survive the round-trip
+// because canonicalizeKeyPath only canonicalises positions it expects
+// to be a fixed segment.
+var canonicalSegments = map[string]string{
+	"vault":      "Vault",
+	"sync":       "Sync",
+	"web":        "Web",
+	"rules":      "Rules",
+	"enrolments": "Enrolments",
+	"oauth":      "OAuth",
+	"settings":   "Settings",
+}
+
+// canonicalizeKeyPath normalises path so that comparisons against
+// rootKey (and known fixed sub-segments like Vault, Sync, Rules,
+// OAuth, Settings) are case-insensitive even though the rest of the
+// parser does exact-string comparison. Paths outside the dotvault
+// policy root are returned unchanged so the caller's pathInScope
+// check still rejects them.
+func canonicalizeKeyPath(path string) string {
+	if !(len(path) >= len(rootKey) && strings.EqualFold(path[:len(rootKey)], rootKey)) {
+		return path
+	}
+	// Replace the prefix with canonical case.
+	path = rootKey + path[len(rootKey):]
+
+	rootDepth := strings.Count(rootKey, `\`) + 1 // number of segments in rootKey
+	parts := strings.Split(path, `\`)
+
+	// Position rootDepth: Vault | Sync | Web | Rules | Enrolments
+	if len(parts) > rootDepth {
+		if c, ok := canonicalSegments[strings.ToLower(parts[rootDepth])]; ok {
+			parts[rootDepth] = c
+		}
+	}
+	// Position rootDepth+2: OAuth (under Rules\<name>) or Settings
+	// (under Enrolments\<name>). We deliberately don't touch
+	// rootDepth+1 because that's a user-defined name.
+	if len(parts) > rootDepth+2 {
+		if c, ok := canonicalSegments[strings.ToLower(parts[rootDepth+2])]; ok {
+			parts[rootDepth+2] = c
+		}
+	}
+	return strings.Join(parts, `\`)
 }
 
 // pathInScope reports whether path lives under HKLM\SOFTWARE\Policies\dotvault.

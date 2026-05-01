@@ -180,6 +180,14 @@ func splitLogicalLines(text string) ([]string, error) {
 			continue
 		}
 		if pending.Len() > 0 {
+			// An empty/whitespace-only line after a `,\` tail isn't a
+			// valid continuation completion — regedit's hex wrap always
+			// continues with `<indent>byte,byte,...`. Treat it the same
+			// as EOF and fail loudly so a truncated hex blob doesn't
+			// silently parse as a too-short value.
+			if strings.TrimSpace(line) == "" {
+				return nil, fmt.Errorf("unterminated hex continuation followed by blank line")
+			}
 			pending.WriteString(strings.TrimLeft(line, " \t"))
 			out = append(out, pending.String())
 			pending.Reset()
@@ -187,8 +195,10 @@ func splitLogicalLines(text string) ([]string, error) {
 		}
 		out = append(out, line)
 	}
+	// Unterminated `,\` tail at end of input means the file was
+	// truncated mid-value. Same rationale as the blank-line case above.
 	if pending.Len() > 0 {
-		out = append(out, pending.String())
+		return nil, fmt.Errorf("unterminated hex continuation at end of input")
 	}
 	return out, nil
 }

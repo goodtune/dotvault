@@ -529,6 +529,14 @@ producing partial configs.`,
 func runRegExport(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
+	// --ascii is only meaningful in the .reg pass-through path; YAML
+	// output has no UTF-16LE encoding to opt out of. Reject the
+	// combination explicitly so a user who expected ASCII .reg doesn't
+	// silently get YAML instead.
+	if flagRegASCII && !flagRegRegedit {
+		return fmt.Errorf("--ascii is only valid with --regedit")
+	}
+
 	var input []byte
 	var err error
 	switch {

@@ -423,6 +423,24 @@ func TestMarshalYAMLMapKeysSorted(t *testing.T) {
 	}
 }
 
+// TestParseRejectsUnterminatedContinuation guards against a silent
+// truncation of hex(1)/hex(7) values when the input ends mid-continuation.
+// Without an explicit error the partial hex blob parses as a shorter
+// value (e.g. a template clipped halfway through), so the parser must
+// fail loudly instead.
+func TestParseRejectsUnterminatedContinuation(t *testing.T) {
+	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"\"TargetTemplate\"=hex(1):67,00,69,00,\\\r\n" // dangling continuation
+	_, err := Parse([]byte(bad))
+	if err == nil {
+		t.Fatalf("expected error for unterminated continuation")
+	}
+	if !strings.Contains(err.Error(), "unterminated") {
+		t.Errorf("error should mention 'unterminated'; got: %v", err)
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

@@ -441,6 +441,85 @@ func TestParseRejectsUnterminatedContinuation(t *testing.T) {
 	}
 }
 
+// TestParseSkipsValueDeletions accepts the regedit `"name"=-` syntax that
+// removes a previously-set value. Real-world GPO exports routinely
+// include these alongside [-KEY] stanzas; failing hard on them would
+// stop reg-export from converting otherwise valid input.
+func TestParseSkipsValueDeletions(t *testing.T) {
+	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+		"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
+		"\"DeprecatedSetting\"=-\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"\"VaultKey\"=\"r\"\r\n" +
+		"\"TargetPath\"=\"/tmp/r\"\r\n" +
+		"\"TargetFormat\"=\"text\"\r\n" +
+		"\"OldField\"=-\r\n"
+
+	got, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("Parse should accept value-deletion lines: %v", err)
+	}
+	if got.Vault.Address != "https://vault.example.com:8200" {
+		t.Errorf("Vault.Address = %q, want %q", got.Vault.Address, "https://vault.example.com:8200")
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Name != "r" {
+		t.Errorf("expected 1 rule named 'r', got %+v", got.Rules)
+	}
+}
+
+// TestParseKindMismatchErrors confirms that a known config field with
+// the wrong .reg type is a hard parse error rather than silently
+// decoding to the zero value. The first failure reported wins, so the
+// test asserts on substring rather than exact key.
+func TestParseKindMismatchErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantSubstr string
+	}{
+		{
+			name: "string where dword expected",
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+				"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
+				"\"TLSSkipVerify\"=\"yes\"\r\n",
+			wantSubstr: "TLSSkipVerify",
+		},
+		{
+			name: "dword where string expected",
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+				"\"Address\"=dword:00000001\r\n",
+			wantSubstr: "Address",
+		},
+		{
+			name: "string where multi-string expected",
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+				"\"VaultKey\"=\"r\"\r\n" +
+				"\"TargetPath\"=\"/tmp/r\"\r\n" +
+				"\"TargetFormat\"=\"text\"\r\n" +
+				"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r\\OAuth]\r\n" +
+				"\"Provider\"=\"github\"\r\n" +
+				"\"Scopes\"=\"repo\"\r\n",
+			wantSubstr: "Scopes",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			full := "Windows Registry Editor Version 5.00\r\n\r\n" + tc.body
+			_, err := Parse([]byte(full))
+			if err == nil {
+				t.Fatalf("expected kind-mismatch error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q should mention %q", err.Error(), tc.wantSubstr)
+			}
+			if !strings.Contains(err.Error(), "unexpected type") {
+				t.Errorf("error should describe a kind mismatch; got %q", err.Error())
+			}
+		})
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

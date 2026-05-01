@@ -230,6 +230,15 @@ func parseValueLine(line string) (string, regValue, bool, error) {
 		return "", regValue{}, false, nil
 	}
 
+	// Value-deletion syntax: `"name"=-` is regedit's way of removing a
+	// previously-set value. We're rebuilding the config from scratch, so
+	// a deletion is a no-op for us — drop the line silently rather than
+	// failing parseRHS on an "unrecognized value form". Real-world GPO
+	// .reg files routinely include these alongside [-KEY] stanzas.
+	if strings.TrimSpace(rest) == "-" {
+		return "", regValue{}, false, nil
+	}
+
 	val, err := parseRHS(rest)
 	if err != nil {
 		return "", regValue{}, false, err
@@ -440,96 +449,137 @@ func childUnder(path, prefix string) (string, bool) {
 // during parsing. Unknown values are ignored — the renderer is the source
 // of truth for the schema, so anything outside it is treated as opaque.
 func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[string]bool, enrolments map[string]bool) error {
-	get := func(keyPath, name string) (regValue, bool) {
+	// Typed accessors so a known field with the wrong .reg type is a
+	// hard parse error instead of silently decoding to the zero value.
+	// We read against the schema produced by regfile.Generate*: every
+	// known string is REG_SZ, every bool is REG_DWORD, and the only
+	// REG_MULTI_SZ is OAuth Scopes. A value of an unexpected type
+	// almost certainly means hand-edited corruption — fail loudly so
+	// the daemon doesn't quietly run with misconfigured policy.
+	getString := func(keyPath, name string) (string, bool, error) {
 		v, ok := values[valueKey{key: keyPath, name: name}]
-		return v, ok
+		if !ok {
+			return "", false, nil
+		}
+		if v.kind != rvSZ {
+			return "", false, kindMismatchErr(keyPath, name, "REG_SZ", v.kind)
+		}
+		return v.str, true, nil
+	}
+	getDWORD := func(keyPath, name string) (uint32, bool, error) {
+		v, ok := values[valueKey{key: keyPath, name: name}]
+		if !ok {
+			return 0, false, nil
+		}
+		if v.kind != rvDWORD {
+			return 0, false, kindMismatchErr(keyPath, name, "REG_DWORD", v.kind)
+		}
+		return v.dword, true, nil
+	}
+	getMultiString := func(keyPath, name string) ([]string, bool, error) {
+		v, ok := values[valueKey{key: keyPath, name: name}]
+		if !ok {
+			return nil, false, nil
+		}
+		if v.kind != rvMultiSZ {
+			return nil, false, kindMismatchErr(keyPath, name, "REG_MULTI_SZ", v.kind)
+		}
+		return v.multi, true, nil
+	}
+
+	apply := func(target *string, keyPath, name string) error {
+		v, ok, err := getString(keyPath, name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			*target = v
+		}
+		return nil
+	}
+	applyBool := func(target *bool, keyPath, name string) error {
+		v, ok, err := getDWORD(keyPath, name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			*target = v != 0
+		}
+		return nil
 	}
 
 	// Vault.
 	vaultKey := rootKey + `\Vault`
-	if v, ok := get(vaultKey, "Address"); ok {
-		cfg.Vault.Address = v.str
-	}
-	if v, ok := get(vaultKey, "AuthMethod"); ok {
-		cfg.Vault.AuthMethod = v.str
-	}
-	if v, ok := get(vaultKey, "AuthMount"); ok {
-		cfg.Vault.AuthMount = v.str
-	}
-	if v, ok := get(vaultKey, "AuthRole"); ok {
-		cfg.Vault.AuthRole = v.str
-	}
-	if v, ok := get(vaultKey, "CACert"); ok {
-		cfg.Vault.CACert = v.str
-	}
-	if v, ok := get(vaultKey, "KVMount"); ok {
-		cfg.Vault.KVMount = v.str
-	}
-	if v, ok := get(vaultKey, "UserPrefix"); ok {
-		cfg.Vault.UserPrefix = v.str
-	}
-	if v, ok := get(vaultKey, "DisableTokenRenewal"); ok {
-		cfg.Vault.DisableTokenRenewal = v.dword != 0
-	}
-	if v, ok := get(vaultKey, "TLSSkipVerify"); ok {
-		cfg.Vault.TLSSkipVerify = v.dword != 0
+	for _, fn := range []func() error{
+		func() error { return apply(&cfg.Vault.Address, vaultKey, "Address") },
+		func() error { return apply(&cfg.Vault.AuthMethod, vaultKey, "AuthMethod") },
+		func() error { return apply(&cfg.Vault.AuthMount, vaultKey, "AuthMount") },
+		func() error { return apply(&cfg.Vault.AuthRole, vaultKey, "AuthRole") },
+		func() error { return apply(&cfg.Vault.CACert, vaultKey, "CACert") },
+		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
+		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
+		func() error { return applyBool(&cfg.Vault.DisableTokenRenewal, vaultKey, "DisableTokenRenewal") },
+		func() error { return applyBool(&cfg.Vault.TLSSkipVerify, vaultKey, "TLSSkipVerify") },
+	} {
+		if err := fn(); err != nil {
+			return err
+		}
 	}
 
 	// Sync.
-	syncKey := rootKey + `\Sync`
-	if v, ok := get(syncKey, "Interval"); ok {
-		cfg.Sync.RawInterval = v.str
+	if err := apply(&cfg.Sync.RawInterval, rootKey+`\Sync`, "Interval"); err != nil {
+		return err
 	}
 
 	// Web.
 	webKey := rootKey + `\Web`
-	if v, ok := get(webKey, "Enabled"); ok {
-		cfg.Web.Enabled = v.dword != 0
+	if err := applyBool(&cfg.Web.Enabled, webKey, "Enabled"); err != nil {
+		return err
 	}
-	if v, ok := get(webKey, "Listen"); ok {
-		cfg.Web.Listen = v.str
+	if err := apply(&cfg.Web.Listen, webKey, "Listen"); err != nil {
+		return err
 	}
 
 	// Rules.
 	for name := range rules {
 		rule := config.Rule{Name: name}
 		base := rootKey + `\Rules\` + name
-		if v, ok := get(base, "Description"); ok {
-			rule.Description = v.str
-		}
-		if v, ok := get(base, "VaultKey"); ok {
-			rule.VaultKey = v.str
-		}
-		if v, ok := get(base, "TargetPath"); ok {
-			rule.Target.Path = v.str
-		}
-		if v, ok := get(base, "TargetFormat"); ok {
-			rule.Target.Format = v.str
-		}
-		if v, ok := get(base, "TargetTemplate"); ok {
-			rule.Target.Template = v.str
-		}
-		if v, ok := get(base, "TargetMerge"); ok {
-			rule.Target.Merge = v.str
+		for _, fn := range []func() error{
+			func() error { return apply(&rule.Description, base, "Description") },
+			func() error { return apply(&rule.VaultKey, base, "VaultKey") },
+			func() error { return apply(&rule.Target.Path, base, "TargetPath") },
+			func() error { return apply(&rule.Target.Format, base, "TargetFormat") },
+			func() error { return apply(&rule.Target.Template, base, "TargetTemplate") },
+			func() error { return apply(&rule.Target.Merge, base, "TargetMerge") },
+		} {
+			if err := fn(); err != nil {
+				return err
+			}
 		}
 		// OAuth subkey.
 		oauthKey := base + `\OAuth`
 		hasOAuth := false
 		oauth := &config.OAuthConfig{}
-		if v, ok := get(oauthKey, "EnginePath"); ok {
-			oauth.EnginePath = v.str
+		if v, ok, err := getString(oauthKey, "EnginePath"); err != nil {
+			return err
+		} else if ok {
+			oauth.EnginePath = v
 			hasOAuth = true
 		}
-		if v, ok := get(oauthKey, "Provider"); ok {
-			oauth.Provider = v.str
+		if v, ok, err := getString(oauthKey, "Provider"); err != nil {
+			return err
+		} else if ok {
+			oauth.Provider = v
 			hasOAuth = true
 		}
-		if v, ok := get(oauthKey, "Scopes"); ok {
+		if v, ok, err := getMultiString(oauthKey, "Scopes"); err != nil {
+			return err
+		} else if ok {
 			// utf16BytesToMultiString always returns a non-nil slice on
 			// success — the empty REG_MULTI_SZ case is normalised to
 			// []string{} there — so the assignment is safe to do directly
 			// and preserves the `scopes: []` round-trip intent.
-			oauth.Scopes = v.multi
+			oauth.Scopes = v
 			hasOAuth = true
 		}
 		if hasOAuth {
@@ -547,8 +597,10 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	for name := range enrolments {
 		base := rootKey + `\Enrolments\` + name
 		en := config.Enrolment{}
-		if v, ok := get(base, "Engine"); ok {
-			en.Engine = v.str
+		if v, ok, err := getString(base, "Engine"); err != nil {
+			return err
+		} else if ok {
+			en.Engine = v
 		}
 		// Settings subkey: collect all values whose key path is exactly
 		// base\Settings.
@@ -585,6 +637,29 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 
 	return nil
+}
+
+// kindMismatchErr renders a clear "wrong .reg type" error mentioning the
+// full key path, value name, expected kind, and actual kind. The path
+// is included so a user staring at a 1000-line .reg dump can find the
+// offending value with a single grep.
+func kindMismatchErr(keyPath, name, want string, got regValueKind) error {
+	return fmt.Errorf("registry value %s\\%s has unexpected type (want %s, got %s)", keyPath, name, want, kindName(got))
+}
+
+func kindName(k regValueKind) string {
+	switch k {
+	case rvSZ:
+		return "REG_SZ"
+	case rvDWORD:
+		return "REG_DWORD"
+	case rvMultiSZ:
+		return "REG_MULTI_SZ"
+	case rvBinary:
+		return "REG_BINARY"
+	default:
+		return fmt.Sprintf("kind=%d", k)
+	}
 }
 
 func sortRulesByName(rules []config.Rule) {

@@ -1,8 +1,10 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -152,5 +154,42 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	}
 	if xcto := w.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
 		t.Errorf("X-Content-Type-Options on 403 = %q, want nosniff", xcto)
+	}
+	// Forbidden Host on /api/ must use the JSON error envelope so the
+	// SPA fetch wrapper and tests get a structured response. Plain
+	// http.Error would give text/plain and a generic StatusText body.
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type on /api/ 403 = %q, want application/json", ct)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("403 body is not JSON: %v", err)
+	}
+	if body["error"] != "forbidden host" {
+		t.Errorf("error field = %q, want %q", body["error"], "forbidden host")
+	}
+}
+
+// TestMiddlewareForbiddenHostNonAPIPlainText pins that requests outside
+// /api/ and /auth/ still get the human-readable text/plain 403 — useful
+// when a misconfigured browser hits `/` directly.
+func TestMiddlewareForbiddenHostNonAPIPlainText(t *testing.T) {
+	s := testServer(t)
+	s.cfg.Listen = "127.0.0.1:0"
+
+	handler := s.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("inner handler should not run for forbidden host")
+	}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Host = "rebound.attacker.test"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type on / 403 = %q, want text/plain", ct)
 	}
 }

@@ -554,6 +554,27 @@ func TestParseCaseInsensitivePaths(t *testing.T) {
 	}
 }
 
+// TestParseRejectsUnsupportedSettingType refuses to silently drop an
+// enrolment Settings value whose .reg type isn't REG_SZ or
+// REG_MULTI_SZ. regfile.Generate refuses to emit those types in the
+// first place, so encountering one on read indicates either a
+// hand-edited file or an export from a different tool — losing the
+// value would silently degrade the config without warning.
+func TestParseRejectsUnsupportedSettingType(t *testing.T) {
+	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh]\r\n" +
+		"\"Engine\"=\"github\"\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
+		"\"port\"=dword:00000016\r\n"
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatalf("expected error for REG_DWORD enrolment setting")
+	}
+	if !strings.Contains(err.Error(), "port") || !strings.Contains(err.Error(), "REG_DWORD") {
+		t.Errorf("error should mention name and observed kind; got %v", err)
+	}
+}
+
 // TestParseRejectsMalformedHex catches user-edited hex blobs that become
 // unparseable, so a corrupt .reg surfaces a clear error rather than
 // silently producing partial config.

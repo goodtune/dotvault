@@ -216,7 +216,15 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// localhost) or the hostname the daemon was configured to
 		// listen on via web.listen.
 		if !s.hostAllowed(r) {
-			http.Error(w, "forbidden host", http.StatusForbidden)
+			// API consumers (the SPA fetch wrapper, scripts, tests)
+			// rely on JSON error envelopes — fall back to plain text
+			// only for non-API routes (e.g. a browser hitting `/`
+			// directly).
+			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
+				writeError(w, "forbidden host", http.StatusForbidden)
+			} else {
+				http.Error(w, "forbidden host", http.StatusForbidden)
+			}
 			return
 		}
 		next.ServeHTTP(w, r)

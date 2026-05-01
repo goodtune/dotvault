@@ -683,6 +683,15 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 					out[i] = s
 				}
 				settings[settingKey] = out
+			default:
+				// regfile.Generate refuses to emit any other kind for
+				// Settings values, so encountering one here means the
+				// .reg was hand-edited (or produced by a different
+				// tool) and silently dropping it would lose
+				// configuration without warning. Fail with the full
+				// path and observed kind so the offending line is
+				// easy to find.
+				return fmt.Errorf("registry value %s\\%s has unsupported type %s for an enrolment setting (only REG_SZ and REG_MULTI_SZ are supported)", settingsKey, vk.name, kindName(v.kind))
 			}
 		}
 		if len(settings) > 0 {

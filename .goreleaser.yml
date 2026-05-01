@@ -11,6 +11,9 @@ builds:
       - CGO_ENABLED=0
     ldflags:
       - -s -w -X main.version={{.Version}}
+      # Windows: build as GUI subsystem so double-click does not flash a
+      # console. CLI subcommands re-attach to the parent console at runtime.
+      - "{{ if eq .Os \"windows\" }}-H=windowsgui{{ end }}"
     targets:
       - linux_amd64
       - linux_arm64

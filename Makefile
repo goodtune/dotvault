@@ -1,6 +1,11 @@
 VERSION := $(shell git describe --tags --always --dirty)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
+# Windows builds use the GUI subsystem so the binary can be double-clicked
+# without opening a console window. It still functions as a CLI when invoked
+# from cmd.exe / PowerShell — see console_windows.go for AttachConsole logic.
+WINDOWS_LDFLAGS := -ldflags "-s -w -H=windowsgui -X main.version=$(VERSION)"
+
 .PHONY: test
 test:
 	go test ./...
@@ -25,7 +30,7 @@ build-darwin-arm64:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o dist/dotvault-darwin-arm64 ./cmd/dotvault
 
 build-windows-amd64:
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/dotvault-windows-amd64.exe ./cmd/dotvault
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(WINDOWS_LDFLAGS) -o dist/dotvault-windows-amd64.exe ./cmd/dotvault
 
 .PHONY: clean
 clean:

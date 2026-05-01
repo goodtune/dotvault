@@ -282,20 +282,27 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 
 // unwrapIPv6 removes the surrounding brackets from a properly-bracketed
 // IPv6-literal hostname (e.g. "[::1]" -> "::1") and returns the input
-// unchanged otherwise. The unwrap only fires when the inner content
-// actually parses as an IPv6 address — bracket-wrapped non-IPv6 strings
-// like "[localhost]" stay bracketed so they fail the allowlist
-// comparison rather than slipping through as "localhost". This keeps
-// the DNS-rebinding defence strict even against tampered Host headers.
+// unchanged otherwise. The unwrap fires only when the inner content
+// looks like real IPv6 syntax — i.e. contains a colon AND parses as an
+// IP. That distinguishes legitimate IPv6 forms (including IPv4-mapped
+// "::ffff:127.0.0.1", which net.IP.To4 normalises and so wouldn't pass
+// a "non-IPv4-mapped" filter) from bracketed non-IP strings like
+// "[localhost]" that should stay bracketed and fail the allowlist
+// comparison. Bracketed bare IPv4 literals like "[127.0.0.1]" also
+// stay bracketed because brackets aren't standard URL syntax for IPv4
+// — they're a tampered form and the strict path is to leave them.
 func unwrapIPv6(host string) string {
 	if len(host) < 2 || host[0] != '[' || host[len(host)-1] != ']' {
 		return host
 	}
 	inner := host[1 : len(host)-1]
-	if ip := net.ParseIP(inner); ip != nil && ip.To4() == nil {
-		return inner
+	if !strings.Contains(inner, ":") {
+		return host
 	}
-	return host
+	if net.ParseIP(inner) == nil {
+		return host
+	}
+	return inner
 }
 
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {

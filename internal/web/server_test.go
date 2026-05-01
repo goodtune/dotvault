@@ -93,6 +93,7 @@ func TestHostAllowed(t *testing.T) {
 		{"[0:0:0:0:0:0:0:1]:9000", true},              // long-form IPv6 loopback
 		{"0:0:0:0:0:0:0:1", true},                     // same, no port/brackets
 		{"[::ffff:127.0.0.1]:9000", true},             // IPv4-mapped IPv6 loopback
+		{"[::ffff:127.0.0.1]", true},                  // same, no port (regression: To4-aware unwrap)
 		// Non-loopback IPs must still be rejected.
 		{"8.8.8.8:9000", false},
 		{"[2001:db8::1]:9000", false},

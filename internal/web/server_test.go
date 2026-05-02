@@ -128,7 +128,15 @@ func TestHostAllowed(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.host, func(t *testing.T) {
+		// Empty Host renders as Go's auto-generated "#00" subtest
+		// name, which is unhelpful when scanning failures. Substitute
+		// a readable label only for that case so other rows continue
+		// to show the actual Host string.
+		name := tc.host
+		if name == "" {
+			name = "<empty>"
+		}
+		t.Run(name, func(t *testing.T) {
 			r := httptest.NewRequest("GET", "/", nil)
 			r.Host = tc.host
 			if got := s.hostAllowed(r); got != tc.ok {

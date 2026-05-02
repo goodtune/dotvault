@@ -271,11 +271,14 @@ func (m *WatchManager) dispatchEvent(evt vault.Event) {
 	}
 }
 
-// enqueueTrigger pushes a key onto triggerCh, deduping per-key so that
-// repeated events for the same enrolment collapse into a single
-// re-evaluation. This guarantees that an event for any given key is
-// never silently dropped just because the buffer happens to be full
-// of triggers for *other* keys.
+// enqueueTrigger pushes a key onto triggerCh, deduping per-key so a
+// burst of repeated events for the same enrolment collapses into a
+// single re-evaluation rather than swamping the buffer. The send is
+// non-blocking — when the buffer is full of triggers for *other*
+// keys, this trigger is dropped and the enrolment falls back to the
+// next polling tick. We accept that latency cap rather than blocking
+// the event-dispatch goroutine, which would back-pressure the Vault
+// Events websocket reader.
 func (m *WatchManager) enqueueTrigger(key string) {
 	m.mu.Lock()
 	if m.pending[key] {
@@ -288,9 +291,8 @@ func (m *WatchManager) enqueueTrigger(key string) {
 	select {
 	case m.triggerCh <- key:
 	default:
-		// Buffer full of distinct keys (rare) — back out the dedup
-		// marker so this key still gets picked up on the next poll
-		// rather than being lost forever.
+		// Buffer full of distinct keys — back out the dedup marker
+		// so the next poll still re-evaluates this enrolment.
 		m.mu.Lock()
 		delete(m.pending, key)
 		m.mu.Unlock()

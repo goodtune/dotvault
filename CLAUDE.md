@@ -284,7 +284,7 @@ Behaviour:
 Periodic refresh:
 
 - The Copy engine implements `Watcher`, so the daemon's `WatchManager` re-evaluates each copy enrolment on every poll cycle (defaults to the sync interval) and writes back only when the merged result differs from the current target — avoiding spurious KVv2 versions.
-- On Vault Enterprise, the WatchManager also subscribes to `kv-v2/data-write` events filtered by the configured source paths, triggering an immediate refresh when the source secret is updated. Failures degrade gracefully to poll-only, mirroring the sync engine's reconnection behaviour.
+- On Vault Enterprise, the WatchManager also subscribes to the `kv-v2/data-write` event type and filters incoming events client-side against the configured source paths, triggering an immediate refresh when a matching source secret is updated. Failures degrade gracefully to poll-only, mirroring the sync engine's reconnection behaviour.
 
 ### Manager & Wizard
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -122,6 +123,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	s.mux.HandleFunc("GET /api/v1/rules", s.handleRules)
 	s.mux.HandleFunc("GET /api/v1/config", s.handleConfig)
+	s.mux.HandleFunc("GET /api/v1/config/download", s.handleConfigDownload)
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
@@ -196,12 +198,111 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Content-Security-Policy
+		// Set security headers up front so they apply to every response,
+		// including the 403 we may write below for a forbidden Host.
+		// Browsers honour these headers on error responses too — without
+		// them a 403 page could be MIME-sniffed or framed by an attacker.
 		w.Header().Set("Content-Security-Policy", "default-src 'self'")
-		// Prevent MIME type sniffing
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// DNS-rebinding defence. The listener is loopback-only by hard
+		// invariant (paths.ValidateLoopback), but a hostile origin can
+		// still resolve a name like rebound.attacker.test to 127.0.0.1
+		// and have the user's browser send a request that reaches the
+		// daemon. Without a Host check the response (which can include
+		// Vault tokens, secrets, and the unredacted config download) is
+		// readable by the attacker's page. Reject any Host whose
+		// hostname is not a recognised loopback alias (127.0.0.1, ::1,
+		// localhost) or the hostname the daemon was configured to
+		// listen on via web.listen.
+		if !s.hostAllowed(r) {
+			// API consumers (the SPA fetch wrapper, scripts, tests)
+			// rely on JSON error envelopes — fall back to plain text
+			// only for non-API routes (e.g. a browser hitting `/`
+			// directly). Mark the 403 no-store so the API invariant
+			// holds for both the handler-level errors and the
+			// middleware-level rejection.
+			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("Pragma", "no-cache")
+				writeError(w, "forbidden host", http.StatusForbidden)
+			} else {
+				http.Error(w, "forbidden host", http.StatusForbidden)
+			}
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// hostAllowed reports whether r.Host names a loopback identity. It strips
+// the port and then applies two rules:
+//   - IP literals: accepted iff net.IP.IsLoopback() (covers 127.0.0.1,
+//     ::1, the long-form 0:0:0:0:0:0:0:1, ::ffff:127.0.0.1, and the
+//     entire 127.0.0.0/8 range).
+//   - Hostnames: a strict allowlist of "localhost" plus whatever
+//     hostname the daemon was configured to listen on (e.g.
+//     "my-loopback-alias" when web.listen is "my-loopback-alias:9000").
+//
+// Hostnames that happen to resolve to a loopback IP elsewhere on the
+// network are still rejected — that's the DNS-rebinding defence.
+func (s *Server) hostAllowed(r *http.Request) bool {
+	if r.Host == "" {
+		return false
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = unwrapIPv6(host)
+
+	// IP literals: accept any form that resolves to a loopback address.
+	// This covers "127.0.0.1", "::1", the long-form "0:0:0:0:0:0:0:1",
+	// "::ffff:127.0.0.1", and the entire 127.0.0.0/8 loopback range —
+	// all of which reach a loopback-bound listener and would already
+	// have made it past the kernel's address check. ParseIP returns
+	// nil for hostnames so this branch is IP-only; arbitrary names
+	// still fall through to the strict allowlist below.
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+
+	// Non-IP hostnames: strict allowlist (DNS-rebinding defence).
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if listenHost, _, err := net.SplitHostPort(s.cfg.Listen); err == nil {
+		listenHost = unwrapIPv6(listenHost)
+		if strings.EqualFold(host, listenHost) {
+			return true
+		}
+	}
+	return false
+}
+
+// unwrapIPv6 removes the surrounding brackets from a properly-bracketed
+// IPv6-literal hostname (e.g. "[::1]" -> "::1") and returns the input
+// unchanged otherwise. The unwrap fires only when the inner content
+// looks like real IPv6 syntax — i.e. contains a colon AND parses as an
+// IP. That distinguishes legitimate IPv6 forms (including IPv4-mapped
+// "::ffff:127.0.0.1", which net.IP.To4 normalises and so wouldn't pass
+// a "non-IPv4-mapped" filter) from bracketed non-IP strings like
+// "[localhost]" that should stay bracketed and fail the allowlist
+// comparison. Bracketed bare IPv4 literals like "[127.0.0.1]" also
+// stay bracketed because brackets aren't standard URL syntax for IPv4
+// — they're a tampered form and the strict path is to leave them.
+func unwrapIPv6(host string) string {
+	if len(host) < 2 || host[0] != '[' || host[len(host)-1] != ']' {
+		return host
+	}
+	inner := host[1 : len(host)-1]
+	if !strings.Contains(inner, ":") {
+		return host
+	}
+	if net.ParseIP(inner) == nil {
+		return host
+	}
+	return inner
 }
 
 func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {

@@ -100,8 +100,18 @@ func (e *CopyEngine) WatchSources(settings map[string]any, username string) []Wa
 }
 
 func (e *CopyEngine) Run(ctx context.Context, settings map[string]any, io IO) (map[string]string, error) {
+	// Fail fast on missing IO so callers don't end up reading a path
+	// like "apps/sample/keys/" (empty username) or merging against an
+	// empty mount — those would surface as opaque "not found" errors
+	// from Vault rather than pointing at the misconfiguration.
 	if io.Vault == nil {
 		return nil, fmt.Errorf("copy engine requires a Vault client")
+	}
+	if io.Username == "" {
+		return nil, fmt.Errorf("copy engine requires a non-empty IO.Username for {{.user}} substitution")
+	}
+	if io.TargetPath != "" && io.KVMount == "" {
+		return nil, fmt.Errorf("copy engine requires IO.KVMount when IO.TargetPath is set")
 	}
 
 	format, _ := settings["format"].(string)

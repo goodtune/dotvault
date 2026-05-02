@@ -121,6 +121,45 @@ func TestCopyEngine_Run_RequiresVault(t *testing.T) {
 	}
 }
 
+func TestCopyEngine_Run_RequiresUsername(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	e := &CopyEngine{}
+	_, err := e.Run(context.Background(), map[string]any{
+		"from": map[string]any{
+			"mount": "kv",
+			"path":  "apps/x/keys/{{.user}}",
+		},
+		"format":   "json",
+		"template": `{"token": "x"}`,
+	}, IO{Vault: vc})
+	if err == nil {
+		t.Fatal("expected error when Username is empty")
+	}
+}
+
+func TestCopyEngine_Run_RequiresKVMountWhenTargetPathSet(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	e := &CopyEngine{}
+	_, err := e.Run(context.Background(), map[string]any{
+		"from": map[string]any{
+			"mount": "kv",
+			"path":  "apps/x/keys/{{.user}}",
+		},
+		"format":   "json",
+		"template": `{"token": "x"}`,
+	}, IO{
+		Vault:      vc,
+		Username:   "alice",
+		TargetPath: "users/alice/x",
+		// KVMount intentionally empty.
+	})
+	if err == nil {
+		t.Fatal("expected error when TargetPath is set but KVMount is empty")
+	}
+}
+
 func TestCopyEngine_Run_HappyPath(t *testing.T) {
 	fv := newFakeVault("kv")
 	vc := fv.serve(t)

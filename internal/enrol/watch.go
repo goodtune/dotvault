@@ -118,9 +118,20 @@ func (m *WatchManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.enrolments = enrolments
+	// Drop bookkeeping for enrolments that have been removed. A stale
+	// pending entry would otherwise block future re-add of the same
+	// key — `enqueueTrigger` skips when pending[key] is already true,
+	// so leaving the bit set across a removal+re-add cycle would
+	// suppress event-driven refreshes for that enrolment until the
+	// next poll.
 	for key := range m.backoffs {
 		if _, ok := enrolments[key]; !ok {
 			delete(m.backoffs, key)
+		}
+	}
+	for key := range m.pending {
+		if _, ok := enrolments[key]; !ok {
+			delete(m.pending, key)
 		}
 	}
 }

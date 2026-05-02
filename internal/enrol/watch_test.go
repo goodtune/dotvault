@@ -433,6 +433,46 @@ func TestHasAllFields(t *testing.T) {
 	}
 }
 
+func TestWatchManager_UpdateConfig_DropsStalePendingAndBackoff(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	w := &fakeWatcher{
+		name:    "fake",
+		fields:  []string{"token"},
+		sources: []WatchSource{{Mount: "kv", Path: "apps/x/keys/alice"}},
+	}
+	RegisterEngine("test-watch-updateconfig-cleanup", w)
+	t.Cleanup(func() { UnregisterEngine("test-watch-updateconfig-cleanup") })
+
+	m, _ := newWatchManagerForTest(vc, map[string]config.Enrolment{
+		"someapp": {Engine: "test-watch-updateconfig-cleanup"},
+	})
+
+	// Simulate state for an enrolment that's about to be removed.
+	m.mu.Lock()
+	m.pending["someapp"] = true
+	m.backoffs["someapp"] = backoffState{}
+	m.mu.Unlock()
+
+	// Drop the enrolment from config — both per-key bookkeeping
+	// entries should be cleaned up so a future re-add isn't blocked
+	// by the stale dedup marker.
+	m.UpdateConfig(map[string]config.Enrolment{})
+
+	m.mu.Lock()
+	_, pendingRemains := m.pending["someapp"]
+	_, backoffRemains := m.backoffs["someapp"]
+	m.mu.Unlock()
+
+	if pendingRemains {
+		t.Errorf("UpdateConfig left stale pending entry for removed enrolment")
+	}
+	if backoffRemains {
+		t.Errorf("UpdateConfig left stale backoff entry for removed enrolment")
+	}
+}
+
 func TestWatchManager_DispatchEvent_DedupesPerKey(t *testing.T) {
 	fv := newFakeVault("kv")
 	vc := fv.serve(t)

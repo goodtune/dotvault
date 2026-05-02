@@ -201,30 +201,71 @@ func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 	if len(en.Settings) == 0 {
 		return
 	}
-	e.writeKey(enrolPath + `\Settings`)
+	e.writeSettingsBlock(name, enrolPath+`\Settings`, "", en.Settings)
+}
 
-	keys := make([]string, 0, len(en.Settings))
-	for k := range en.Settings {
+// writeSettingsBlock emits a Settings (or nested settings) block as a
+// registry key plus its scalar values, then recursively emits any
+// nested-map values as further subkeys. settingPath is the dotted-key
+// breadcrumb used in error messages so users can locate problematic
+// entries in their YAML; the empty string means "top-level".
+func (e *emitter) writeSettingsBlock(enrolment, keyPath, settingPath string, m map[string]any) {
+	e.writeKey(keyPath)
+
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+
+	// Emit scalar (and string-list) values first so the resulting .reg
+	// file has a predictable shape: subkeys live at the bottom of each
+	// section, matching how the Windows registry editor displays them.
+	var nested []string
 	for _, k := range keys {
-		e.writeSetting(name, k, en.Settings[k])
+		full := joinSettingPath(settingPath, k)
+		switch v := m[k].(type) {
+		case map[string]any:
+			nested = append(nested, k)
+		default:
+			e.writeSetting(enrolment, full, k, v)
+		}
 	}
 	e.WriteString("\r\n")
+
+	for _, k := range nested {
+		full := joinSettingPath(settingPath, k)
+		sub := m[k].(map[string]any)
+		if err := validateKeyName(k); err != nil {
+			e.fail("enrolments[%q].settings[%q]: %w", enrolment, full, err)
+			return
+		}
+		e.writeSettingsBlock(enrolment, keyPath+`\`+k, full, sub)
+	}
 }
 
-// writeSetting emits a single enrolment setting. Strings become REG_SZ;
-// slices of strings become REG_MULTI_SZ. The registry reader only knows
-// how to deserialise these two kinds, so any other value type is treated
-// as an error rather than silently dropped: a partial export that
-// disagrees with the source YAML is worse than a hard failure.
+func joinSettingPath(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + "." + key
+}
+
+// writeSetting emits a single scalar (or string-list) enrolment setting.
+// Strings become REG_SZ; slices of strings become REG_MULTI_SZ. Nested
+// maps are handled by writeSettingsBlock (subkey recursion), so they
+// never reach this function.
+//
+// The registry reader only knows how to deserialise REG_SZ / REG_MULTI_SZ
+// at any one level, so any other value type is treated as an error
+// rather than silently dropped: a partial export that disagrees with
+// the source YAML is worse than a hard failure.
 //
 // Empty lists are preserved as empty REG_MULTI_SZ rather than dropped:
 // in YAML an explicit `[]` differs from an absent key, and engines that
 // override defaults from the presence of a list (e.g. GitHub's `scopes`)
 // rely on that distinction.
-func (e *emitter) writeSetting(enrolment, name string, value any) {
+func (e *emitter) writeSetting(enrolment, settingPath, name string, value any) {
 	switch v := value.(type) {
 	case string:
 		e.writeString(name, v)
@@ -237,14 +278,14 @@ func (e *emitter) writeSetting(enrolment, name string, value any) {
 		for i, item := range v {
 			s, ok := item.(string)
 			if !ok {
-				e.fail("enrolments[%q].settings[%q][%d]: cannot represent %T in registry; only strings are supported", enrolment, name, i, item)
+				e.fail("enrolments[%q].settings[%q][%d]: cannot represent %T in registry; only strings are supported", enrolment, settingPath, i, item)
 				return
 			}
 			strs = append(strs, s)
 		}
 		e.writeMultiString(name, strs)
 	default:
-		e.fail("enrolments[%q].settings[%q]: cannot represent %T in registry; only strings and string lists are supported", enrolment, name, value)
+		e.fail("enrolments[%q].settings[%q]: cannot represent %T in registry; only strings, string lists, and nested maps are supported", enrolment, settingPath, value)
 	}
 }
 

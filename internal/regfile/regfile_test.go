@@ -192,6 +192,41 @@ func TestGenerateEnrolments(t *testing.T) {
 	}
 }
 
+func TestGenerateNestedMapSetting(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"format": "json",
+					"from": map[string]any{
+						"mount": "kv",
+						"path":  "apps/sample/keys/{{.user}}",
+					},
+				},
+			},
+		},
+	}
+
+	got := mustGenerate(t, cfg)
+
+	wantContains := []string{
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample]\r\n",
+		"\"Engine\"=\"copy\"\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample\\Settings]\r\n",
+		"\"format\"=\"json\"\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample\\Settings\\from]\r\n",
+		"\"mount\"=\"kv\"\r\n",
+		"\"path\"=\"apps/sample/keys/{{.user}}\"\r\n",
+	}
+	for _, want := range wantContains {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q\n--- output ---\n%s", want, got)
+		}
+	}
+}
+
 func TestGenerateUnsupportedSettingTypeErrors(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},

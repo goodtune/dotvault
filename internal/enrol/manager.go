@@ -40,6 +40,15 @@ func NewManager(cfg ManagerConfig, vc *vault.Client, io IO) *Manager {
 	if io.Out == nil {
 		io.Out = iolib.Discard
 	}
+	// Populate Vault-related IO fields so engines that need to read or
+	// merge against existing Vault data (e.g. the copy engine) have
+	// access without each call site having to wire them up.
+	if io.Vault == nil {
+		io.Vault = vc
+	}
+	if io.KVMount == "" {
+		io.KVMount = cfg.KVMount
+	}
 	return &Manager{
 		cfg:   cfg,
 		vault: vc,
@@ -95,7 +104,7 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		for k, v := range creds {
 			data[k] = v
 		}
-		if !HasAllFields(data, engine.Fields()) {
+		if !HasAllFields(data, EngineFields(engine, enrolment.Settings)) {
 			m.io.Log.Error("engine returned incomplete credentials, skipping vault write", "key", key, "engine", enrolment.Engine)
 			fmt.Fprintf(m.io.Out, "✗ %s — engine returned incomplete credentials (will retry next cycle)\n", key)
 			continue
@@ -138,22 +147,34 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 			return nil, fmt.Errorf("check vault for enrolment %q: %w", key, err)
 		}
 
-		if secret != nil && HasAllFields(secret.Data, engine.Fields()) {
+		if secret != nil && HasAllFields(secret.Data, EngineFields(engine, enrolment.Settings)) {
 			m.io.Log.Debug("enrolment already complete", "key", key)
 			continue
 		}
 
 		pending = append(pending, pendingEnrolment{
-			key:       key,
-			enrolment: enrolment,
-			engine:    engine,
+			key:        key,
+			enrolment:  enrolment,
+			engine:     engine,
+			targetPath: vaultPath,
 		})
 	}
 
 	return pending, nil
 }
 
+// HasAllFields reports whether every name in fields is present in data
+// as a non-empty string. A nil or empty fields list is treated as
+// incomplete rather than vacuously satisfied: callers use this to
+// answer "is the enrolment complete?" and an empty field list means
+// "we don't know what fields are required" — typically because a
+// SettingsFielder engine couldn't infer them from a malformed config.
+// Treating that as complete would silently skip the misconfigured
+// enrolment forever.
 func HasAllFields(data map[string]any, fields []string) bool {
+	if len(fields) == 0 {
+		return false
+	}
 	for _, f := range fields {
 		v, ok := data[f]
 		if !ok || v == nil {

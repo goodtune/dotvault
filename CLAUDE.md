@@ -148,10 +148,11 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 3. Start web UI if enabled (before auth, so it can serve browser-based login)
 4. Authenticate if needed: web mode routes all auth through the SPA; CLI mode uses method-specific flows (OIDC browser, LDAP terminal prompt, token file)
 5. Start token lifecycle manager (renews at 75% TTL, exponential backoff 1s-5m on failure)
-6. Run enrolment check (wizard if any credentials missing in Vault)
-7. Start sync engine: initial sync, then hybrid event+poll loop
-8. Background goroutine reloads config on each tick for enrolment changes only
-9. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
+6. Start RefreshManager (rotates expiring credentials for `Refresher` engines, e.g. JFrog) and WatchManager (re-mirrors upstream sources for `Watcher` engines, e.g. Copy)
+7. Run enrolment check (wizard if any credentials missing in Vault)
+8. Start sync engine: initial sync, then hybrid event+poll loop
+9. Background goroutine reloads config on each tick for enrolment changes only
+10. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
 
 Config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
 
@@ -229,7 +230,13 @@ Automated credential acquisition from external services (`internal/enrol/`). Enr
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
+
+Optional interfaces extend the contract for engines that need them:
+
+- `SettingsFielder.FieldsFromSettings(settings)` — engines whose written-field set depends on per-enrolment settings (currently the Copy engine, where the JSON template determines the keys). The manager and web runner use `EngineFields(engine, settings)` which falls back to `Fields()` when not implemented.
+- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog). Driven by `RefreshManager`.
+- `Watcher.WatchSources(settings, username) []WatchSource` — engines whose output is derived from upstream Vault data and must track source changes (currently Copy). Driven by `WatchManager`, which polls every sync interval and (on Enterprise Vault) reacts to source-write events within seconds.
 
 ### GitHub Engine Defaults
 
@@ -278,6 +285,33 @@ Passphrase mode controlled via settings `passphrase` field:
 - `"unsafe"` — no passphrase (unencrypted private key)
 
 No external dependencies beyond `golang.org/x/crypto/ssh`.
+
+### Copy Engine
+
+Mirrors an existing KVv2 secret into the user's enrolment path, optionally
+transforming its shape via a JSON template. Useful when other tooling (or a
+separate operator workflow) populates a per-user secret under a shared prefix
+(e.g. `apps/<app>/keys/<user>`) and dotvault needs to expose that value to
+the user under their own path with potentially different field names.
+
+Required settings (nested map):
+
+- `from.mount` — source KV mount (e.g. `kv`)
+- `from.path` — source path; supports a `{{.user}}` substitution that resolves to the authenticated Vault username (`token_meta_username`)
+- `format` — must be `json` (only supported format)
+- `template` — Go template producing JSON; receives `{ "data": <source secret data>, "user": <username> }` as dot context. Top-level keys of the rendered JSON become the fields written to the target.
+
+Behaviour:
+
+- Only `json` format is supported; the rendered output must parse as a JSON object whose values are strings (or are coerced to strings).
+- The target secret is **merged**, not replaced — keys produced by the template are written, but pre-existing keys at the target that the template does not name are preserved. This makes it safe for multiple operators / processes to maintain different fields under the same user path.
+- The set of fields the engine writes is derived dynamically from the template's top-level JSON keys (via the `SettingsFielder` interface). The manager treats the enrolment as complete when those fields are present in the target, just as for static-field engines.
+- Preserved values are **stringified**, not type-preserved: the engine flattens the returned data to `map[string]string`, so any pre-existing object/number/bool field at the target is JSON-marshalled to its textual form before being written back. This is intentional (the engine contract is `map[string]string` and dropping non-strings would lose data) but means the copy engine should not be co-tenanted with workflows that depend on KVv2 fields keeping their original JSON type.
+
+Periodic refresh:
+
+- The Copy engine implements `Watcher`, so the daemon's `WatchManager` re-evaluates each copy enrolment on every poll cycle (defaults to the sync interval) and writes back only when the merged result differs from the current target — avoiding spurious KVv2 versions.
+- On Vault Enterprise, the WatchManager also subscribes to the `kv-v2/data-write` event type and filters incoming events client-side against the configured source paths, triggering an immediate refresh when a matching source secret is updated. Failures degrade gracefully to poll-only, mirroring the sync engine's reconnection behaviour.
 
 ### Manager & Wizard
 

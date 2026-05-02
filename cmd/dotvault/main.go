@@ -280,6 +280,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		5*time.Minute,
 	)
 	rm.Start(ctx)
+
+	// Start watch manager for enrolments that mirror an upstream Vault
+	// secret (currently the copy engine). Polls at the sync interval and,
+	// where Vault Enterprise events are available, reacts to source-write
+	// events within seconds. Distinct from RefreshManager because the two
+	// concerns (token rotation vs. data mirroring) are orthogonal.
+	wm := enrol.NewWatchManager(
+		vc,
+		cfg.Vault.KVMount,
+		cfg.Vault.UserPrefix+username+"/",
+		username,
+		cfg.Enrolments,
+		cfg.Sync.Interval,
+	)
+	wm.Start(ctx)
 	go func() {
 		const reauthCooldown = 10 * time.Minute
 		var lastReauthOpen time.Time
@@ -377,6 +392,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 						slog.Info("enrolments config changed, re-checking")
 						enrolMgr.UpdateConfig(reloaded.Enrolments)
 						rm.UpdateConfig(reloaded.Enrolments)
+						wm.UpdateConfig(reloaded.Enrolments)
 						lastEnrolments = reloaded.Enrolments
 					}
 					if ok, err := enrolMgr.CheckAll(ctx); err != nil {

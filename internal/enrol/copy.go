@@ -201,10 +201,14 @@ func (e *CopyEngine) Run(ctx context.Context, settings map[string]any, io IO) (m
 // would otherwise produce invalid JSON when rendered against an empty
 // context.
 //
-// The replacement is a single-pass scan over s rather than a regex so
-// it correctly handles nested action delimiters like `{{"}}"}}`. Stray
-// or unmatched `{{` are passed through verbatim — json.Unmarshal will
-// then surface the malformed template to the caller as a parse error.
+// Limitation: the closing `}}` is found by a simple scan, so an action
+// that itself contains the literal `}}` inside a quoted string argument
+// (e.g. `{{ printf "}}" }}`) terminates early and the trailing
+// fragment falls through verbatim. Such templates are pathological for
+// the copy engine's "JSON-with-string-substitutions" shape and would
+// fail json.Unmarshal anyway; in that case FieldsFromSettings returns
+// nil and the manager treats the enrolment as incomplete so the
+// misconfiguration is surfaced rather than silently skipped.
 func stripTemplateActions(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

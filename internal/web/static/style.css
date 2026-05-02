@@ -524,6 +524,19 @@ body {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 4px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.config-header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.config-header-actions a.enrol-btn-secondary {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
 }
 .config-heading { font-size: 22px; font-weight: 700; color: #1a1a2e; }
 .config-subheading { font-size: 13px; color: #888; margin-bottom: 24px; }

@@ -3,12 +3,16 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/regfile"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -356,6 +360,118 @@ func stripZeroUnit(s string, unit byte) string {
 		return pre
 	}
 	return s
+}
+
+// handleConfigDownload returns the daemon's in-memory configuration as a
+// downloadable file in either YAML or Windows .reg form. The endpoint is
+// gated on the daemon itself being authenticated to Vault — the same
+// global state the rest of the API checks — and serves the unredacted
+// config so a downloaded YAML is a usable replacement for the source
+// file (and a .reg can be re-applied to a Windows registry without
+// fields silently disappearing).
+//
+// Unlike /api/v1/config (which redacts CA certs, CA bundles, and
+// credential-shaped settings for UI viewing) this endpoint exists
+// specifically to round-trip the running config back to disk, so
+// redaction would defeat its purpose. The compensating boundaries are:
+//   - the web UI binds to loopback only (a hard invariant in
+//     paths.ValidateLoopback) so the response cannot reach the network
+//   - the middleware rejects requests whose Host header is not a
+//     loopback alias, defeating DNS-rebinding attacks that would
+//     otherwise let a hostile origin read the response
+//   - the daemon must be authenticated to Vault, gating the endpoint
+//     behind the same proof-of-trust used for /api/v1/token
+//   - the response is marked Cache-Control: no-store to keep proxies
+//     and browser disk caches from persisting the body
+//
+// The format is selected via ?format=yaml|reg (default yaml).
+func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
+	// no-store applies to every response this handler emits — the
+	// success body, the 401 from the auth gate, the 400 on bad
+	// format, and the 500 on render failures. (A request that fails
+	// the middleware-level Host allowlist is rejected before this
+	// handler runs and gets its own no-store via writeError's JSON
+	// envelope on /api/ routes.) Even the error pages should not be
+	// cached because they can reveal whether the daemon is currently
+	// authenticated.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
+	if s.vault == nil || s.vault.Token() == "" {
+		writeError(w, "not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = "yaml"
+	}
+
+	cfg := s.buildEffectiveConfig()
+
+	switch format {
+	case "yaml":
+		data, err := regfile.MarshalYAML(cfg)
+		if err != nil {
+			slog.Error("marshal yaml for download", "error", err)
+			writeError(w, "failed to render YAML", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.yaml"`)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
+	case "reg":
+		data, err := regfile.Generate(cfg)
+		if err != nil {
+			slog.Error("generate reg for download", "error", err)
+			writeError(w, "failed to render REG", http.StatusInternalServerError)
+			return
+		}
+		// application/octet-stream: .reg is UTF-16LE binary, not text/plain.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.reg"`)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
+	default:
+		writeError(w, "unsupported format (use yaml or reg)", http.StatusBadRequest)
+	}
+}
+
+// buildEffectiveConfig reassembles the *config.Config the daemon is running
+// from the per-section copies the web server holds. The result is suitable
+// for round-trip through regfile.MarshalYAML or regfile.Generate.
+//
+// We rebuild rather than retain a single *config.Config because the server
+// already has each section in a typed field for direct API use; pulling
+// them back together for download keeps the in-memory representation
+// authoritative.
+//
+// One subtle fix-up: when the source YAML omitted `sync.interval`,
+// (*Config).validate populates Sync.Interval with the 15m default but
+// leaves Sync.RawInterval empty. The renderers serialise RawInterval
+// (so the .reg form stays diff-stable when the user actually wrote
+// "15m"), so we'd otherwise emit `interval: ""` here even though the
+// daemon is using 15m. Materialise RawInterval from Interval whenever
+// it's empty so the download reflects the effective configuration.
+func (s *Server) buildEffectiveConfig() *config.Config {
+	rules := make([]config.Rule, len(s.rules))
+	copy(rules, s.rules)
+
+	enrolments := s.getEnrolments()
+
+	syncCfg := s.syncCfg
+	if syncCfg.RawInterval == "" && syncCfg.Interval > 0 {
+		syncCfg.RawInterval = formatDuration(syncCfg.Interval)
+	}
+
+	return &config.Config{
+		Vault:      s.vaultCfg,
+		Sync:       syncCfg,
+		Web:        s.cfg,
+		Rules:      rules,
+		Enrolments: enrolments,
+	}
 }
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {

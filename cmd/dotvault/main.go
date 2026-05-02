@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -28,11 +29,13 @@ import (
 var version = "dev"
 
 var (
-	flagConfig    string
-	flagLogLevel  string
-	flagDryRun    bool
-	flagRegOutput string
-	flagRegASCII  bool
+	flagConfig       string
+	flagLogLevel     string
+	flagDryRun       bool
+	flagRegOutput    string
+	flagRegASCII     bool
+	flagRegRegedit   bool
+	flagImportOutput string
 )
 
 func main() {
@@ -76,6 +79,7 @@ func main() {
 			},
 		},
 		newRegExportCmd(),
+		newRegImportCmd(),
 	)
 
 	// --once as alias for sync
@@ -535,10 +539,146 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	return username, vc, nil
 }
 
+// newRegExportCmd defines the `reg-export` subcommand which mirrors
+// regedit's `/e` direction: pull a .reg representation of the dotvault
+// policy out of the registry world and into a user-facing form. The
+// default form is YAML; --regedit re-emits the canonicalised .reg.
 func newRegExportCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "reg-export [config.yaml]",
-		Short: "Convert a YAML config to a Windows .reg file",
+		Use:   "reg-export [config.reg]",
+		Short: "Export a Windows .reg file as YAML (default) or canonical .reg",
+		Long: `Read a Windows Registry .reg file representing dotvault policy under
+HKLM\SOFTWARE\Policies\dotvault and emit its contents in the requested
+form. The default output is the equivalent dotvault YAML configuration;
+pass --regedit to re-emit the .reg in its canonical Windows Registry
+Editor v5 form (--ascii alongside --regedit selects the plain-text
+variant).
+
+The input .reg may be either UTF-16LE with BOM (the canonical
+regedit.exe format) or plain text/UTF-8; the encoding is detected
+automatically.
+
+The input may be supplied as a positional argument or via stdin (when
+the argument is "-" or omitted). YAML output is fully validated
+through the standard config loader before being returned, so malformed
+registry exports surface as clear errors rather than silently
+producing partial configs.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runRegExport,
+	}
+	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
+	cmd.Flags().BoolVar(&flagRegRegedit, "regedit", false, "emit canonical .reg instead of YAML")
+	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "with --regedit, emit unencoded plain text instead of UTF-16LE")
+
+	// Hide the inherited --config flag from this subcommand's help.
+	// reg-export takes a .reg input via positional path or stdin and
+	// has no use for --config (which selects a YAML file for the other
+	// subcommands). Showing it would be a UX footgun. We restore the
+	// original Hidden state after rendering so other subcommands' help
+	// continues to advertise --config normally.
+	defaultHelp := cmd.HelpFunc()
+	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
+		if cfg := c.InheritedFlags().Lookup("config"); cfg != nil {
+			wasHidden := cfg.Hidden
+			cfg.Hidden = true
+			defer func() { cfg.Hidden = wasHidden }()
+		}
+		defaultHelp(c, args)
+	})
+	return cmd
+}
+
+func runRegExport(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
+	// reg-export reads a .reg file (positional path or stdin) — the
+	// inherited --config flag does not apply here. Reject the
+	// combination explicitly rather than silently ignoring it, so a
+	// user expecting --config to select the input gets clear feedback.
+	if flagConfig != "" {
+		return fmt.Errorf("--config does not apply to reg-export; pass the .reg path as a positional argument or stdin")
+	}
+
+	// --ascii is only meaningful in the .reg pass-through path; YAML
+	// output has no UTF-16LE encoding to opt out of. Reject the
+	// combination explicitly so a user who expected ASCII .reg doesn't
+	// silently get YAML instead.
+	if flagRegASCII && !flagRegRegedit {
+		return fmt.Errorf("--ascii is only valid with --regedit")
+	}
+
+	var input []byte
+	var err error
+	switch {
+	case len(args) == 0 || args[0] == "-":
+		input, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("read stdin: %w", err)
+		}
+	default:
+		input, err = os.ReadFile(args[0])
+		if err != nil {
+			return fmt.Errorf("read input: %w", err)
+		}
+	}
+
+	cfg, err := regfile.Parse(input)
+	if err != nil {
+		return fmt.Errorf("parse reg file: %w", err)
+	}
+
+	var data []byte
+	if flagRegRegedit {
+		// Pass-through .reg: parse then re-render. Round-tripping through
+		// the parser catches malformed input and normalises wrapping.
+		if flagRegASCII {
+			text, err := regfile.GenerateText(cfg)
+			if err != nil {
+				return fmt.Errorf("render reg file: %w", err)
+			}
+			data = []byte(text)
+		} else {
+			out, err := regfile.Generate(cfg)
+			if err != nil {
+				return fmt.Errorf("render reg file: %w", err)
+			}
+			data = out
+		}
+	} else {
+		yamlData, err := regfile.MarshalYAML(cfg)
+		if err != nil {
+			return fmt.Errorf("render yaml: %w", err)
+		}
+		// Validate the YAML through the same loader path the daemon uses
+		// at startup, so reg-export surfaces config-level errors (missing
+		// rules, bad formats, non-loopback web.listen) rather than emitting
+		// YAML the daemon would later reject. We round-trip through the
+		// loader by writing to a temp file, since config.Load is the
+		// single entry point that runs (*Config).validate.
+		if err := validateYAML(yamlData); err != nil {
+			return fmt.Errorf("exported config is not valid: %w", err)
+		}
+		data = yamlData
+	}
+
+	if flagRegOutput == "" || flagRegOutput == "-" {
+		_, err := os.Stdout.Write(data)
+		return err
+	}
+	// Match the 0600 convention used by other dotvault-managed files: the
+	// output can include enrolment settings or other potentially sensitive
+	// material that should not be world-readable.
+	return os.WriteFile(flagRegOutput, data, 0600)
+}
+
+// newRegImportCmd defines the `reg-import` subcommand which mirrors
+// regedit's `/s` direction: take a hand-edited YAML config and cast it
+// into the .reg form a Windows admin would import into the registry
+// (e.g. via Group Policy Preferences or `regedit.exe /s`).
+func newRegImportCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reg-import [config.yaml]",
+		Short: "Convert a YAML config into a Windows .reg file",
 		Long: `Convert a dotvault YAML configuration file into a Windows Registry
 .reg file targeting HKLM\SOFTWARE\Policies\dotvault.
 
@@ -556,14 +696,14 @@ through other tools.
 The YAML file is fully validated before conversion; conversion errors out
 on any problem the daemon would normally reject at load time.`,
 		Args: cobra.MaximumNArgs(1),
-		RunE: runRegExport,
+		RunE: runRegImport,
 	}
-	cmd.Flags().StringVarP(&flagRegOutput, "output", "o", "", "write to file instead of stdout")
+	cmd.Flags().StringVarP(&flagImportOutput, "output", "o", "", "write to file instead of stdout")
 	cmd.Flags().BoolVar(&flagRegASCII, "ascii", false, "emit unencoded plain text instead of UTF-16LE")
 	return cmd
 }
 
-func runRegExport(cmd *cobra.Command, args []string) error {
+func runRegImport(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
 	path := flagConfig
@@ -574,7 +714,7 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 		path = paths.SystemConfigPath()
 	}
 
-	// reg-export deliberately reads the YAML file, not the registry, so we
+	// reg-import deliberately reads the YAML file, not the registry, so we
 	// use config.Load rather than config.LoadSystem (the latter would
 	// short-circuit to the registry on Windows when GPO keys are present).
 	cfg, err := config.Load(path)
@@ -597,14 +737,40 @@ func runRegExport(cmd *cobra.Command, args []string) error {
 		data = out
 	}
 
-	if flagRegOutput == "" || flagRegOutput == "-" {
+	if flagImportOutput == "" || flagImportOutput == "-" {
 		_, err := os.Stdout.Write(data)
 		return err
 	}
 	// Match the 0600 convention used by other dotvault-managed files: the
 	// rendered .reg can include enrolment settings or other potentially
 	// sensitive material that should not be world-readable.
-	return os.WriteFile(flagRegOutput, data, 0600)
+	return os.WriteFile(flagImportOutput, data, 0600)
+}
+
+// validateYAML feeds rendered YAML through config.Load so that reg-export
+// surfaces validation failures (missing rules, bad formats, non-loopback
+// web.listen, etc.) before writing or printing the output. A temp file
+// is used because config.Load is the single entry point that runs
+// (*Config).validate; the indirection avoids duplicating validation
+// logic here.
+func validateYAML(data []byte) error {
+	tmp, err := os.CreateTemp("", "dotvault-validate-*.yaml")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if _, err := config.Load(tmpPath); err != nil {
+		return err
+	}
+	return nil
 }
 
 // isStderrTerminal reports whether stderr is connected to a TTY, used to

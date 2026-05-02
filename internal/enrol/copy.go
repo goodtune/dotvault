@@ -33,23 +33,23 @@ func (e *CopyEngine) Name() string { return "Copy" }
 // FieldsFromSettings to discover them when the settings are known.
 func (e *CopyEngine) Fields() []string { return nil }
 
-// FieldsFromSettings parses the configured JSON template and returns its
-// top-level keys. The template is rendered against an empty context so
-// the field names — which must be JSON object keys, not template
-// expressions — are extracted independently of any source data. Returns
-// nil when the template is missing or unparseable; the manager will
-// then treat the enrolment as never-satisfied and re-run it.
+// FieldsFromSettings extracts the top-level keys of the configured JSON
+// template without executing it. Top-level keys are the fields the
+// engine writes to Vault, and they must be inferable from the template
+// source alone — running the Go template engine would substitute
+// `<no value>` for any data reference under an empty context, breaking
+// any template that emits unquoted JSON values like
+// `{"port": {{ .data.port }}}`. Returns nil when the template is
+// missing or unparseable; the manager treats nil-fields as
+// "incomplete" so the enrolment is re-run rather than silently skipped.
 func (e *CopyEngine) FieldsFromSettings(settings map[string]any) []string {
 	template, _ := settings["template"].(string)
 	if template == "" {
 		return nil
 	}
-	rendered, err := tmpl.Render("copy-fields", template, map[string]any{})
-	if err != nil {
-		return nil
-	}
+	stripped := stripTemplateActions(template)
 	var m map[string]any
-	if err := json.Unmarshal([]byte(rendered), &m); err != nil {
+	if err := json.Unmarshal([]byte(stripped), &m); err != nil {
 		return nil
 	}
 	keys := make([]string, 0, len(m))
@@ -189,4 +189,37 @@ func (e *CopyEngine) Run(ctx context.Context, settings map[string]any, io IO) (m
 	}
 
 	return merged, nil
+}
+
+// stripTemplateActions replaces every `{{ ... }}` action in s with the
+// JSON literal `null`. The result is suitable for json.Unmarshal when
+// the surrounding text is JSON: an action inside a string ("{{x}}")
+// becomes the string "null"; a bare action ({{x}}) becomes the literal
+// null — both valid JSON. This is how FieldsFromSettings extracts
+// top-level keys without executing the template against real data,
+// where unquoted dynamic values (e.g. {"port": {{ .data.port }}})
+// would otherwise produce invalid JSON when rendered against an empty
+// context.
+//
+// The replacement is a single-pass scan over s rather than a regex so
+// it correctly handles nested action delimiters like `{{"}}"}}`. Stray
+// or unmatched `{{` are passed through verbatim — json.Unmarshal will
+// then surface the malformed template to the caller as a parse error.
+func stripTemplateActions(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if i+1 < len(s) && s[i] == '{' && s[i+1] == '{' {
+			end := strings.Index(s[i+2:], "}}")
+			if end >= 0 {
+				b.WriteString("null")
+				i += 2 + end + 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }

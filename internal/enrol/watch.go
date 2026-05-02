@@ -45,8 +45,16 @@ type WatchManager struct {
 	mu         sync.Mutex
 	enrolments map[string]config.Enrolment
 	backoffs   map[string]backoffState
-	// triggerCh is buffered so an event can request an immediate tick
-	// without blocking the event-dispatch goroutine.
+	// pending tracks which enrolment keys already have a trigger queued
+	// on triggerCh so dispatchEvent can dedupe per-key without growing
+	// the channel buffer. Cleared by the run loop when it consumes a
+	// trigger for that key.
+	pending map[string]bool
+	// triggerCh is buffered to absorb bursts of events without blocking
+	// the dispatch goroutine. Per-key dedup via the `pending` set
+	// guarantees one buffered slot per enrolment is enough — buffer
+	// pressure means many distinct keys are queued simultaneously,
+	// which is rare in practice.
 	triggerCh chan string // enrolment key, or "" for all
 }
 
@@ -88,6 +96,7 @@ func NewWatchManager(
 		clock:        realClock{},
 		enrolments:   enrolments,
 		backoffs:     make(map[string]backoffState),
+		pending:      make(map[string]bool),
 		triggerCh:    make(chan string, 16),
 	}
 	for _, opt := range opts {
@@ -137,6 +146,13 @@ func (m *WatchManager) run(ctx context.Context) {
 		case <-ticker.C:
 			m.tickAll(ctx)
 		case key := <-m.triggerCh:
+			// Clear the dedup marker before running the engine, not
+			// after: an event arriving during the engine run should
+			// re-queue the key so the next iteration picks it up
+			// (the source may have changed again).
+			m.mu.Lock()
+			delete(m.pending, key)
+			m.mu.Unlock()
 			if key == "" {
 				m.tickAll(ctx)
 			} else {
@@ -248,16 +264,36 @@ func (m *WatchManager) dispatchEvent(evt vault.Event) {
 		}
 		for _, src := range watcher.WatchSources(enrolment.Settings, m.username) {
 			if eventMatchesSource(evt, src) {
-				select {
-				case m.triggerCh <- key:
-				default:
-					// A trigger for this enrolment is already pending; the
-					// next tick will consume it and re-evaluate, so dropping
-					// a duplicate is safe.
-				}
+				m.enqueueTrigger(key)
 				break
 			}
 		}
+	}
+}
+
+// enqueueTrigger pushes a key onto triggerCh, deduping per-key so that
+// repeated events for the same enrolment collapse into a single
+// re-evaluation. This guarantees that an event for any given key is
+// never silently dropped just because the buffer happens to be full
+// of triggers for *other* keys.
+func (m *WatchManager) enqueueTrigger(key string) {
+	m.mu.Lock()
+	if m.pending[key] {
+		m.mu.Unlock()
+		return
+	}
+	m.pending[key] = true
+	m.mu.Unlock()
+
+	select {
+	case m.triggerCh <- key:
+	default:
+		// Buffer full of distinct keys (rare) — back out the dedup
+		// marker so this key still gets picked up on the next poll
+		// rather than being lost forever.
+		m.mu.Lock()
+		delete(m.pending, key)
+		m.mu.Unlock()
 	}
 }
 

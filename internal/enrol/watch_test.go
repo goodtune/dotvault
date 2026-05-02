@@ -433,6 +433,50 @@ func TestHasAllFields(t *testing.T) {
 	}
 }
 
+func TestWatchManager_DispatchEvent_DedupesPerKey(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	w := &fakeWatcher{
+		name:    "fake",
+		fields:  []string{"token"},
+		sources: []WatchSource{{Mount: "kv", Path: "apps/x/keys/alice"}},
+	}
+	RegisterEngine("test-watch-event-dedup", w)
+	t.Cleanup(func() { UnregisterEngine("test-watch-event-dedup") })
+
+	m, _ := newWatchManagerForTest(vc, map[string]config.Enrolment{
+		"someapp": {Engine: "test-watch-event-dedup"},
+	})
+
+	evt := vault.Event{
+		EventType: "kv-v2/data-write",
+		MountPath: "kv/",
+		Path:      "apps/x/keys/alice",
+	}
+	// Three rapid events for the same source should produce exactly
+	// one queued trigger, otherwise a flapping upstream could swamp
+	// the channel buffer with duplicates of one key and starve other
+	// enrolments.
+	m.dispatchEvent(evt)
+	m.dispatchEvent(evt)
+	m.dispatchEvent(evt)
+
+	count := 0
+drain:
+	for {
+		select {
+		case <-m.triggerCh:
+			count++
+		default:
+			break drain
+		}
+	}
+	if count != 1 {
+		t.Errorf("queued triggers = %d, want 1 (events should dedupe per key)", count)
+	}
+}
+
 func TestEventMatchesSource(t *testing.T) {
 	tests := []struct {
 		name string

@@ -36,6 +36,16 @@ func TestCopyEngine_FieldsFromSettings(t *testing.T) {
 			want: []string{"apple", "mango", "zebra"},
 		},
 		{
+			name: "unquoted dynamic value",
+			settings: map[string]any{
+				// Action lands outside JSON string quotes; field
+				// inference must still work without rendering the
+				// template against real data.
+				"template": `{"port": {{ .data.port }}, "host": "{{ .data.host }}"}`,
+			},
+			want: []string{"host", "port"},
+		},
+		{
 			name:     "missing template",
 			settings: map[string]any{},
 			want:     nil,
@@ -54,6 +64,27 @@ func TestCopyEngine_FieldsFromSettings(t *testing.T) {
 			got := e.FieldsFromSettings(tt.settings)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("FieldsFromSettings() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripTemplateActions(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no action", `{"a":"b"}`, `{"a":"b"}`},
+		{"quoted action", `{"a":"{{.x}}"}`, `{"a":"null"}`},
+		{"unquoted action", `{"a":{{.x}}}`, `{"a":null}`},
+		{"multi-action", `{"a":"{{.x}}","b":{{.y}}}`, `{"a":"null","b":null}`},
+		{"unmatched open", `{"a":{{`, `{"a":{{`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripTemplateActions(tt.in); got != tt.want {
+				t.Errorf("stripTemplateActions(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}

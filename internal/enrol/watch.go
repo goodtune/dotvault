@@ -97,7 +97,16 @@ func NewWatchManager(
 		enrolments:   enrolments,
 		backoffs:     make(map[string]backoffState),
 		pending:      make(map[string]bool),
-		triggerCh:    make(chan string, 16),
+		// Size the trigger buffer for at least one slot per
+		// configured enrolment plus a small headroom, so a single
+		// burst of distinct events does not start dropping triggers
+		// before the run loop catches up. The 16-slot floor handles
+		// the common small-fleet case; UpdateConfig may add more
+		// enrolments later but cannot resize a Go channel, so very
+		// large fleets that grow post-startup will fall back to the
+		// next poll for any overflow — same as the documented
+		// channel-full behaviour in enqueueTrigger.
+		triggerCh: make(chan string, watchTriggerBufSize(len(enrolments))),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -470,4 +479,15 @@ func (m *WatchManager) resetBackoff(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.backoffs, key)
+}
+
+// watchTriggerBufSize returns the trigger-channel buffer size for a
+// fleet of n configured enrolments. Floored at 16 so small or empty
+// configurations still have headroom for transient bursts.
+func watchTriggerBufSize(n int) int {
+	const floor = 16
+	if n < floor {
+		return floor
+	}
+	return n
 }

@@ -39,12 +39,6 @@ var (
 )
 
 func main() {
-	// On Windows the binary is linked with -H=windowsgui so a double-click
-	// doesn't flash a console window. When the user runs the binary from
-	// cmd.exe / PowerShell instead, attach to the parent console so CLI
-	// subcommands still produce visible output. No-op on other platforms.
-	attachParentConsole()
-
 	rootCmd := &cobra.Command{
 		Use:   "dotvault",
 		Short: "Vault-to-file secret synchronisation daemon",

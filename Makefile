@@ -1,10 +1,11 @@
 VERSION := $(shell git describe --tags --always --dirty)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
-# Windows builds use the GUI subsystem so the binary can be double-clicked
-# without opening a console window. It still functions as a CLI when invoked
-# from cmd.exe / PowerShell — see console_windows.go for AttachConsole logic.
-WINDOWS_LDFLAGS := -ldflags "-s -w -H=windowsgui -X main.version=$(VERSION)"
+# Windows ships two binaries from the same source: dotvault.exe (Console
+# subsystem, behaves like a normal CLI under cmd.exe / PowerShell) and
+# dotvaultw.exe (GUI subsystem, for double-click + tray with no console).
+# The PE subsystem flag is immutable post-link, so we build twice.
+WINDOWS_GUI_LDFLAGS := -ldflags "-s -w -H=windowsgui -X main.version=$(VERSION)"
 
 .PHONY: test
 test:
@@ -29,8 +30,13 @@ build-darwin-amd64:
 build-darwin-arm64:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o dist/dotvault-darwin-arm64 ./cmd/dotvault
 
-build-windows-amd64:
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(WINDOWS_LDFLAGS) -o dist/dotvault-windows-amd64.exe ./cmd/dotvault
+build-windows-amd64: build-windows-amd64-cli build-windows-amd64-gui
+
+build-windows-amd64-cli:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/dotvault-windows-amd64.exe ./cmd/dotvault
+
+build-windows-amd64-gui:
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(WINDOWS_GUI_LDFLAGS) -o dist/dotvaultw-windows-amd64.exe ./cmd/dotvault
 
 .PHONY: clean
 clean:

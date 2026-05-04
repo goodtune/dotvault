@@ -33,7 +33,8 @@ builds:
       - windows_amd64
 
 archives:
-  - formats:
+  - allow_different_binary_count: true
+    formats:
       - tar.gz
     format_overrides:
       - goos: windows

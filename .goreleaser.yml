@@ -39,7 +39,7 @@ archives:
       - goos: windows
         formats:
           - zip
-    builds:
+    ids:
       - dotvault
       - dotvaultw
     files:

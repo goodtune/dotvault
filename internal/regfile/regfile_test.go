@@ -53,14 +53,14 @@ func TestGenerateMinimal(t *testing.T) {
 
 	wantContains := []string{
 		"Windows Registry Editor Version 5.00\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault]\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n",
 		"\"Address\"=\"https://vault.example.com:8200\"\r\n",
 		"\"DisableTokenRenewal\"=dword:00000000\r\n",
 		"\"TLSSkipVerify\"=dword:00000000\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Sync]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Sync]\r\n",
 		"\"Interval\"=\"15m\"\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Web]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Web]\r\n",
 		"\"Enabled\"=dword:00000000\r\n",
 	}
 	for _, want := range wantContains {
@@ -93,13 +93,13 @@ func TestGenerateRulesAndOAuth(t *testing.T) {
 	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules]\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\gh]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\gh]\r\n",
 		"\"Description\"=\"GitHub host config\"\r\n",
 		"\"TargetFormat\"=\"yaml\"\r\n",
 		"\"TargetPath\"=\"~/.config/gh/hosts.yml\"\r\n",
 		"\"VaultKey\"=\"gh\"\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\gh\\OAuth]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\gh\\OAuth]\r\n",
 		"\"Provider\"=\"github\"\r\n",
 		// REG_MULTI_SZ for ["repo", "read:org"]: "repo"\0"read:org"\0\0
 		// As UTF-16LE bytes the value starts with the prefix below; the
@@ -168,13 +168,13 @@ func TestGenerateEnrolments(t *testing.T) {
 	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments]\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh]\r\n",
 		"\"Engine\"=\"github\"\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh\\Settings]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh\\Settings]\r\n",
 		"\"host\"=\"github.com\"\r\n",
 		"\"scopes\"=hex(7):",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\ssh]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\ssh]\r\n",
 		"\"Engine\"=\"ssh\"\r\n",
 		"\"passphrase\"=\"recommended\"\r\n",
 	}
@@ -212,11 +212,11 @@ func TestGenerateNestedMapSetting(t *testing.T) {
 	got := mustGenerate(t, cfg)
 
 	wantContains := []string{
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\sample]\r\n",
 		"\"Engine\"=\"copy\"\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample\\Settings]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\sample\\Settings]\r\n",
 		"\"format\"=\"json\"\r\n",
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\sample\\Settings\\from]\r\n",
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\sample\\Settings\\from]\r\n",
 		"\"mount\"=\"kv\"\r\n",
 		"\"path\"=\"apps/sample/keys/{{.user}}\"\r\n",
 	}
@@ -352,10 +352,10 @@ func TestRulesAndEnrolmentsAreDeletedBeforeRecreate(t *testing.T) {
 	}
 	got := mustGenerate(t, cfg)
 
-	rulesDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`
-	rulesKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`
-	enrolDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Enrolments]`
-	enrolKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Enrolments]`
+	rulesDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Rules]`
+	rulesKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Rules]`
+	enrolDel := `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Enrolments]`
+	enrolKey := `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Enrolments]`
 
 	for _, want := range []string{rulesDel, rulesKey, enrolDel, enrolKey} {
 		if !strings.Contains(got, want) {
@@ -382,11 +382,11 @@ func TestEmptyRulesEmitsOnlyDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateText: %v", err)
 	}
-	if !strings.Contains(got, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`) {
+	if !strings.Contains(got, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Rules]`) {
 		t.Errorf("expected Rules deletion stanza even with no rules:\n%s", got)
 	}
 	// And no recreation key for Rules (no rules to put under it).
-	if strings.Contains(got, `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`+"\r\n") {
+	if strings.Contains(got, `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Rules]`+"\r\n") {
 		t.Errorf("did not expect Rules recreation when no rules present:\n%s", got)
 	}
 }

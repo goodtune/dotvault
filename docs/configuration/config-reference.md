@@ -15,7 +15,7 @@ dotvault run --config /path/to/config.yaml
 ```
 
 !!! warning "Windows Group Policy override"
-    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. The `--config` CLI flag is the only way to bypass this behaviour. See [Windows Group Policy](../admin/windows-gpo.md) for details.
+    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. The `--config` CLI flag is the only way to bypass this behaviour. See [Windows Group Policy](../admin/windows-gpo.md) for details.
 
 ## Full example
 

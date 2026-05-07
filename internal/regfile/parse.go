@@ -12,7 +12,7 @@ import (
 
 // Parse reads a Windows Registry Editor Version 5.00 .reg file and
 // reconstructs a *config.Config from values under
-// HKLM\SOFTWARE\Policies\dotvault.
+// HKLM\SOFTWARE\Policies\goodtune\dotvault.
 //
 // The input may be UTF-16LE with BOM (the canonical regedit.exe format
 // produced by Generate) or plain text/UTF-8 (the variant produced by
@@ -493,7 +493,7 @@ func canonicalizeKeyPath(path string) string {
 	return strings.Join(parts, `\`)
 }
 
-// pathInScope reports whether path lives under HKLM\SOFTWARE\Policies\dotvault.
+// pathInScope reports whether path lives under HKLM\SOFTWARE\Policies\goodtune\dotvault.
 func pathInScope(path string) bool {
 	if path == rootKey {
 		return true

@@ -13,15 +13,15 @@ import (
 
 const (
 	// registryPolicyPath is the GPO-managed registry path. Policies are read
-	// from HKLM\SOFTWARE\Policies\dotvault only. HKCU is intentionally not
-	// used as a trusted policy source because it is normally user-writable.
-	registryPolicyPath = `SOFTWARE\Policies\dotvault`
+	// from HKLM\SOFTWARE\Policies\goodtune\dotvault only. HKCU is intentionally
+	// not used as a trusted policy source because it is normally user-writable.
+	registryPolicyPath = `SOFTWARE\Policies\goodtune\dotvault`
 )
 
 // loadFromRegistry attempts to load configuration from Windows Registry
 // Group Policy keys. It reads machine-level values from
-// HKLM\SOFTWARE\Policies\dotvault. HKCU is not consulted because it is
-// user-writable and cannot be treated as a trusted policy boundary.
+// HKLM\SOFTWARE\Policies\goodtune\dotvault. HKCU is not consulted because it
+// is user-writable and cannot be treated as a trusted policy boundary.
 //
 // Returns (nil, false, nil) if no GPO registry keys are found.
 func loadFromRegistry() (*Config, bool, error) {

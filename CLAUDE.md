@@ -81,7 +81,7 @@ YAML config file at platform-specific system paths:
 - Linux: `/etc/xdg/dotvault/config.yaml` (also checks `$XDG_CONFIG_DIRS`)
 - Windows: `%ProgramData%\dotvault\config.yaml`
 
-On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\dotvault`, configuration is loaded entirely from the registry and the file-based config is ignored. Only machine-level (HKLM) policy is read; HKCU is intentionally skipped because it is user-writable.
+On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, configuration is loaded entirely from the registry and the file-based config is ignored. Only machine-level (HKLM) policy is read; HKCU is intentionally skipped because it is user-writable.
 
 ### Config Sections
 
@@ -118,7 +118,7 @@ user-facing form, `reg-import` casts a YAML config into the .reg form a
 Windows admin would push back into the registry.
 
 `reg-export` parses a `.reg` file (positional path or stdin when
-omitted/`-`) under `HKLM\SOFTWARE\Policies\dotvault` and emits the
+omitted/`-`) under `HKLM\SOFTWARE\Policies\goodtune\dotvault` and emits the
 equivalent dotvault YAML configuration to stdout (or `--output <path>`,
 0600). Both UTF-16LE-with-BOM and plain ASCII inputs are accepted — the
 encoding is detected from the leading BOM. The reconstructed YAML is
@@ -129,7 +129,7 @@ combine with `--ascii` for the plain-text variant of the v5 format.
 
 `reg-import` is the inverse: it reads and validates a YAML config, then
 emits a `Windows Registry Editor Version 5.00` file targeting
-`HKLM\SOFTWARE\Policies\dotvault` to stdout (or `--output <path>`,
+`HKLM\SOFTWARE\Policies\goodtune\dotvault` to stdout (or `--output <path>`,
 written with 0600 permissions). Default encoding is UTF-16LE with BOM,
 matching the canonical format produced by regedit.exe; `--ascii`
 produces an unencoded plain-text variant of the same v5 format.
@@ -359,7 +359,7 @@ Configurable markdown content via `web.login_text` and `web.secret_view_text` fi
 
 ## Windows Registry / Group Policy
 
-When HKLM registry keys exist at `SOFTWARE\Policies\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, and Web settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey.
+When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, and Web settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey.
 
 ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for Vault, Sync, and Web settings.
 

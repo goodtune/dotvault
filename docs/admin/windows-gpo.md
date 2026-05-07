@@ -4,7 +4,7 @@ On Windows, dotvault can be fully configured via Group Policy using the Windows 
 
 ## How it works
 
-When HKLM registry keys exist at `SOFTWARE\Policies\dotvault`, dotvault loads **all** configuration from the registry and ignores the YAML config file entirely. Only machine-level policy (HKLM) is read — HKCU is intentionally skipped because it is user-writable and therefore cannot be trusted for enforced configuration.
+When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, dotvault loads **all** configuration from the registry and ignores the YAML config file entirely. Only machine-level policy (HKLM) is read — HKCU is intentionally skipped because it is user-writable and therefore cannot be trusted for enforced configuration.
 
 !!! important "The `--config` flag always wins"
     If a user invokes dotvault with `--config path/to/config.yaml`, the specified file is used regardless of whether registry keys exist. This is useful for development and troubleshooting but means the user can bypass the managed configuration. In environments where strict enforcement is required, restrict access to the dotvault binary's command-line options.
@@ -65,26 +65,26 @@ The ADMX template provides UI for these settings in the Group Policy editor:
 
 ## Registry-only settings (Group Policy Preferences)
 
-Sync rules and enrolments are complex multi-field objects that cannot be fully expressed as ADMX policies. Configure these using **Group Policy Preferences > Registry**, targeting keys under `SOFTWARE\Policies\dotvault`.
+Sync rules and enrolments are complex multi-field objects that cannot be fully expressed as ADMX policies. Configure these using **Group Policy Preferences > Registry**, targeting keys under `SOFTWARE\Policies\goodtune\dotvault`.
 
 ### Rules
 
 Each rule is a subkey under `Rules\{RuleName}`:
 
 ```
-SOFTWARE\Policies\dotvault\Rules\gh\VaultKey        (REG_SZ)    "gh"
-SOFTWARE\Policies\dotvault\Rules\gh\TargetPath       (REG_SZ)    "~/.config/gh/hosts.yml"
-SOFTWARE\Policies\dotvault\Rules\gh\TargetFormat     (REG_SZ)    "yaml"
-SOFTWARE\Policies\dotvault\Rules\gh\TargetTemplate   (REG_SZ)    "github.com:\n  oauth_token: \"{{.oauth_token}}\""
-SOFTWARE\Policies\dotvault\Rules\gh\Description      (REG_SZ)    "GitHub CLI credentials"
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\VaultKey        (REG_SZ)    "gh"
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetPath       (REG_SZ)    "~/.config/gh/hosts.yml"
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetFormat     (REG_SZ)    "yaml"
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetTemplate   (REG_SZ)    "github.com:\n  oauth_token: \"{{.oauth_token}}\""
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\Description      (REG_SZ)    "GitHub CLI credentials"
 ```
 
 Optional OAuth subkey for rules with service onboarding:
 
 ```
-SOFTWARE\Policies\dotvault\Rules\gh\OAuth\EnginePath (REG_SZ)
-SOFTWARE\Policies\dotvault\Rules\gh\OAuth\Provider   (REG_SZ)
-SOFTWARE\Policies\dotvault\Rules\gh\OAuth\Scopes     (REG_MULTI_SZ)
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\OAuth\EnginePath (REG_SZ)
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\OAuth\Provider   (REG_SZ)
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\OAuth\Scopes     (REG_MULTI_SZ)
 ```
 
 ### Enrolments
@@ -92,9 +92,9 @@ SOFTWARE\Policies\dotvault\Rules\gh\OAuth\Scopes     (REG_MULTI_SZ)
 Each enrolment is a subkey under `Enrolments\{Name}`:
 
 ```
-SOFTWARE\Policies\dotvault\Enrolments\gh\Engine                  (REG_SZ)    "github"
-SOFTWARE\Policies\dotvault\Enrolments\gh\Settings\client_id      (REG_SZ)    "178c6fc778ccc68e1d6a"
-SOFTWARE\Policies\dotvault\Enrolments\gh\Settings\scopes         (REG_MULTI_SZ) "repo\0read:org\0gist"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Engine                  (REG_SZ)    "github"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\client_id      (REG_SZ)    "178c6fc778ccc68e1d6a"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\scopes         (REG_MULTI_SZ) "repo\0read:org\0gist"
 ```
 
 ## Example: deploying via GPO

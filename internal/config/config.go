@@ -153,8 +153,8 @@ var validFormats = map[string]bool{
 
 // LoadSystem loads configuration using the platform-appropriate source.
 // On Windows, if Group Policy registry keys exist under
-// HKLM\SOFTWARE\Policies\dotvault, configuration is loaded from the
-// registry and the file-based config at path is ignored. Only
+// HKLM\SOFTWARE\Policies\goodtune\dotvault, configuration is loaded from
+// the registry and the file-based config at path is ignored. Only
 // machine-level (HKLM) policy is read; HKCU is intentionally skipped
 // because it is user-writable and cannot be treated as a trusted policy
 // boundary on unmanaged machines.

@@ -19,6 +19,8 @@ Windows ships two binaries from the same source — the PE subsystem flag is imm
 
 Installer / Start Menu shortcuts should point at `dotvaultw.exe`; the PATH entry should be `dotvault.exe`.
 
+Both Windows binaries embed the application icon. `assets/dotvault.ico` is the multi-resolution source (16/24/32/48/64/128/256, generated from `assets/dotvault-no-text.png`); the Makefile and the `.goreleaser.yml` `before:` hook run `go tool rsrc` to emit `cmd/dotvault/rsrc_windows_amd64.syso`, which the Go linker picks up automatically for `windows_amd64` targets and ignores everywhere else. The `.syso` is a build artefact (regeneratable, gitignored). The system-tray code in `internal/tray/tray_windows.go` loads this icon by resource ID rather than the stock `IDI_APPLICATION`, so the tray, taskbar, and Start Menu shortcuts all carry the dotvault glyph; if the resource is missing (e.g. a hand-rolled `go build` skipping rsrc) the tray falls back to the system default.
+
 The web frontend lives in `internal/web/frontend/` (Preact + esbuild). After changing frontend code:
 
 ```sh

@@ -37,6 +37,18 @@ const (
 	mfString       = 0x00000000
 	mfSeparator    = 0x00000800
 
+	// Resource ID of the application icon embedded by rsrc into the .rsrc
+	// section at build time (see Makefile / .goreleaser.yml). rsrc emits the
+	// RT_GROUP_ICON at numeric ID 1.
+	iconResourceID = 1
+
+	imageIcon      = 1
+	lrDefaultColor = 0x00000000
+	smCXIcon       = 11
+	smCYIcon       = 12
+	smCXSmIcon     = 49
+	smCYSmIcon     = 50
+
 	menuIDView = 1001
 	menuIDExit = 1002
 )
@@ -48,6 +60,8 @@ var (
 
 	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
 	procLoadIconW          = user32.NewProc("LoadIconW")
+	procLoadImageW         = user32.NewProc("LoadImageW")
+	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
 	procLoadCursorW        = user32.NewProc("LoadCursorW")
 	procRegisterClassExW   = user32.NewProc("RegisterClassExW")
 	procCreateWindowExW    = user32.NewProc("CreateWindowExW")
@@ -146,7 +160,15 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("GetModuleHandle: %w", callErr)
 	}
 
-	hIcon, _, _ := procLoadIconW.Call(0, uintptr(idiApplication))
+	// Prefer the icon resource embedded by rsrc into the .rsrc section.
+	// Shell_NotifyIcon expects a small icon (16×16 at 100% DPI) and the
+	// window class wants a normal one (32×32 at 100% DPI); pull both from
+	// the same RT_GROUP_ICON resource via LoadImageW so the multi-resolution
+	// .ico picks the closest match. Fall back to the stock IDI_APPLICATION
+	// if the resource is missing (e.g. dev builds skipping rsrc), so the
+	// tray still works rather than failing class registration.
+	hIcon := loadAppIcon(hInstance, systemMetric(smCXIcon), systemMetric(smCYIcon))
+	hIconSmall := loadAppIcon(hInstance, systemMetric(smCXSmIcon), systemMetric(smCYSmIcon))
 	hCursor, _, _ := procLoadCursorW.Call(0, uintptr(idcArrow))
 
 	className, err := windows.UTF16PtrFromString("dotvaultTrayWnd")
@@ -161,7 +183,8 @@ func Run(ctx context.Context, cfg Config) error {
 	wc := wndClassEx{
 		lpfnWndProc:   windows.NewCallback(wndProc),
 		hInstance:     windows.Handle(hInstance),
-		hIcon:         windows.Handle(hIcon),
+		hIcon:         hIcon,
+		hIconSm:       hIconSmall,
 		hCursor:       windows.Handle(hCursor),
 		lpszClassName: className,
 	}
@@ -199,7 +222,7 @@ func Run(ctx context.Context, cfg Config) error {
 		uID:              1,
 		uFlags:           nifMessage | nifIcon | nifTip,
 		uCallbackMessage: wmTrayCB,
-		hIcon:            windows.Handle(hIcon),
+		hIcon:            hIconSmall,
 	}
 	trayState.nid.cbSize = uint32(unsafe.Sizeof(trayState.nid))
 	tip := cfg.Tooltip
@@ -394,6 +417,32 @@ func postTrayQuit() {
 		return
 	}
 	procPostMessageW.Call(uintptr(trayState.hwnd), wmTrayQuit, 0, 0)
+}
+
+// loadAppIcon loads the application icon embedded by rsrc into the binary's
+// .rsrc section, sized to cx by cy pixels. On any failure (resource missing,
+// load failed) it falls back to the stock IDI_APPLICATION so class
+// registration and Shell_NotifyIcon still succeed.
+func loadAppIcon(hInstance uintptr, cx, cy int) windows.Handle {
+	h, _, _ := procLoadImageW.Call(
+		hInstance,
+		uintptr(iconResourceID),
+		uintptr(imageIcon),
+		uintptr(cx),
+		uintptr(cy),
+		uintptr(lrDefaultColor),
+	)
+	if h == 0 {
+		h, _, _ = procLoadIconW.Call(0, uintptr(idiApplication))
+	}
+	return windows.Handle(h)
+}
+
+// systemMetric resolves a SM_* index to its current pixel value. Used to
+// honour the user's DPI / display-scale setting when picking icon sizes.
+func systemMetric(index int) int {
+	v, _, _ := procGetSystemMetrics.Call(uintptr(index))
+	return int(int32(v))
 }
 
 // copyUTF16 fills a fixed-size UTF-16 buffer from s, leaving room for a

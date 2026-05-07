@@ -61,6 +61,7 @@ var (
 	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
 	procLoadIconW          = user32.NewProc("LoadIconW")
 	procLoadImageW         = user32.NewProc("LoadImageW")
+	procDestroyIcon        = user32.NewProc("DestroyIcon")
 	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
 	procLoadCursorW        = user32.NewProc("LoadCursorW")
 	procRegisterClassExW   = user32.NewProc("RegisterClassExW")
@@ -167,8 +168,26 @@ func Run(ctx context.Context, cfg Config) error {
 	// .ico picks the closest match. Fall back to the stock IDI_APPLICATION
 	// if the resource is missing (e.g. dev builds skipping rsrc), so the
 	// tray still works rather than failing class registration.
-	hIcon := loadAppIcon(hInstance, systemMetric(smCXIcon), systemMetric(smCYIcon))
-	hIconSmall := loadAppIcon(hInstance, systemMetric(smCXSmIcon), systemMetric(smCYSmIcon))
+	//
+	// LoadImageW (without LR_SHARED) returns a non-shared HICON that the
+	// caller owns and must release with DestroyIcon. The IDI_APPLICATION
+	// fallback from LoadIconW is a system-shared icon and MUST NOT be
+	// destroyed. loadAppIcon returns an `owned` flag distinguishing the two;
+	// we register the cleanup defer immediately so every error-return path
+	// below (UTF16PtrFromString, RegisterClassEx, CreateWindowEx, NIM_ADD)
+	// frees the handles. The defer runs after the tray/window cleanup
+	// (LIFO), so NIM_DELETE and DestroyWindow have already released their
+	// references when DestroyIcon fires.
+	hIcon, hIconOwned := loadAppIcon(hInstance, systemMetric(smCXIcon), systemMetric(smCYIcon))
+	hIconSmall, hIconSmallOwned := loadAppIcon(hInstance, systemMetric(smCXSmIcon), systemMetric(smCYSmIcon))
+	defer func() {
+		if hIconOwned && hIcon != 0 {
+			procDestroyIcon.Call(uintptr(hIcon))
+		}
+		if hIconSmallOwned && hIconSmall != 0 {
+			procDestroyIcon.Call(uintptr(hIconSmall))
+		}
+	}()
 	hCursor, _, _ := procLoadCursorW.Call(0, uintptr(idcArrow))
 
 	className, err := windows.UTF16PtrFromString("dotvaultTrayWnd")
@@ -423,7 +442,12 @@ func postTrayQuit() {
 // .rsrc section, sized to cx by cy pixels. On any failure (resource missing,
 // load failed) it falls back to the stock IDI_APPLICATION so class
 // registration and Shell_NotifyIcon still succeed.
-func loadAppIcon(hInstance uintptr, cx, cy int) windows.Handle {
+//
+// The second return reports whether the caller owns the handle. Icons
+// loaded via LoadImageW without LR_SHARED are owned and must be released
+// with DestroyIcon; the IDI_APPLICATION fallback is a system-shared icon
+// whose lifetime is managed by the OS and must not be destroyed.
+func loadAppIcon(hInstance uintptr, cx, cy int) (windows.Handle, bool) {
 	h, _, _ := procLoadImageW.Call(
 		hInstance,
 		uintptr(iconResourceID),
@@ -432,10 +456,11 @@ func loadAppIcon(hInstance uintptr, cx, cy int) windows.Handle {
 		uintptr(cy),
 		uintptr(lrDefaultColor),
 	)
-	if h == 0 {
-		h, _, _ = procLoadIconW.Call(0, uintptr(idiApplication))
+	if h != 0 {
+		return windows.Handle(h), true
 	}
-	return windows.Handle(h)
+	h, _, _ = procLoadIconW.Call(0, uintptr(idiApplication))
+	return windows.Handle(h), false
 }
 
 // systemMetric resolves a SM_* index to its current pixel value. Used to

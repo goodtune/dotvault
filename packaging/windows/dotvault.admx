@@ -17,7 +17,7 @@
 
   Rules (sync rules) are complex multi-field objects that cannot be
   fully expressed as ADMX policies. Author them as a YAML config and
-  convert with `dotvault reg-export config.yaml -o dotvault.reg`, or
+  convert with `dotvault reg-import config.yaml -o dotvault.reg`, or
   configure them by hand via Group Policy Preferences > Registry, targeting:
     SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\VaultKey      (REG_SZ)
     SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\TargetPath    (REG_SZ)

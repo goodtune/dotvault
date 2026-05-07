@@ -3,6 +3,10 @@ version: 2
 before:
   hooks:
     - sh -c "cd internal/web/frontend && npm ci && npm run build"
+    # Embed the Windows .exe icon. rsrc emits a COFF object (.syso) that
+    # the Go linker picks up automatically for windows_amd64 targets and
+    # ignores everywhere else, so generating it unconditionally is safe.
+    - go tool rsrc -arch amd64 -ico assets/dotvault.ico -o cmd/dotvault/rsrc_windows_amd64.syso
 
 builds:
   - id: dotvault

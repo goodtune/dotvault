@@ -558,7 +558,7 @@ func newRegExportCmd() *cobra.Command {
 		Use:   "reg-export [config.reg]",
 		Short: "Export a Windows .reg file as YAML (default) or canonical .reg",
 		Long: `Read a Windows Registry .reg file representing dotvault policy under
-HKLM\SOFTWARE\Policies\dotvault and emit its contents in the requested
+HKLM\SOFTWARE\Policies\goodtune\dotvault and emit its contents in the requested
 form. The default output is the equivalent dotvault YAML configuration;
 pass --regedit to re-emit the .reg in its canonical Windows Registry
 Editor v5 form (--ascii alongside --regedit selects the plain-text
@@ -690,7 +690,7 @@ func newRegImportCmd() *cobra.Command {
 		Use:   "reg-import [config.yaml]",
 		Short: "Convert a YAML config into a Windows .reg file",
 		Long: `Convert a dotvault YAML configuration file into a Windows Registry
-.reg file targeting HKLM\SOFTWARE\Policies\dotvault.
+.reg file targeting HKLM\SOFTWARE\Policies\goodtune\dotvault.
 
 The input config path may be supplied as a positional argument or via the
 inherited --config flag; the positional argument takes precedence when

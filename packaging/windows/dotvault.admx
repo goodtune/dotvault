@@ -9,7 +9,7 @@
   Deploy the matching ADML file to the en-US subdirectory.
 
   Registry paths used:
-    Machine: HKLM\SOFTWARE\Policies\dotvault
+    Machine: HKLM\SOFTWARE\Policies\goodtune\dotvault
 
   Only machine-level (HKLM) policy is read by dotvault. HKCU is not
   consulted because it is user-writable. When any HKLM policy key is
@@ -19,23 +19,23 @@
   fully expressed as ADMX policies. Author them as a YAML config and
   convert with `dotvault reg-export config.yaml -o dotvault.reg`, or
   configure them by hand via Group Policy Preferences > Registry, targeting:
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\VaultKey      (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetPath    (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetFormat  (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetTemplate (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\TargetMerge   (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\Description   (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\VaultKey      (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\TargetPath    (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\TargetFormat  (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\TargetTemplate (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\TargetMerge   (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\Description   (REG_SZ)
   Optional OAuth subkey:
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\EnginePath (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Provider   (REG_SZ)
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Scopes     (REG_MULTI_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\OAuth\EnginePath (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\OAuth\Provider   (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Rules\<rule-name>\OAuth\Scopes     (REG_MULTI_SZ)
 
   Enrolments (credential acquisition flows) are also configured via
   Group Policy Preferences > Registry, targeting:
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Engine            (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Enrolments\<name>\Engine            (REG_SZ)
   Optional Settings subkey:
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_SZ)
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_MULTI_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Enrolments\<name>\Settings\<key>    (REG_SZ)
+    SOFTWARE\Policies\goodtune\dotvault\Enrolments\<name>\Settings\<key>    (REG_MULTI_SZ)
 -->
 <policyDefinitions
     xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -77,7 +77,7 @@
             class="Machine"
             displayName="$(string.VaultAddress)"
             explainText="$(string.VaultAddress_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultAddress)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -90,7 +90,7 @@
             class="Machine"
             displayName="$(string.VaultCACert)"
             explainText="$(string.VaultCACert_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultCACert)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -103,7 +103,7 @@
             class="Machine"
             displayName="$(string.VaultTLSSkipVerify)"
             explainText="$(string.VaultTLSSkipVerify_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             valueName="TLSSkipVerify">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -115,7 +115,7 @@
             class="Machine"
             displayName="$(string.VaultKVMount)"
             explainText="$(string.VaultKVMount_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultKVMount)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -128,7 +128,7 @@
             class="Machine"
             displayName="$(string.VaultUserPrefix)"
             explainText="$(string.VaultUserPrefix_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultUserPrefix)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -141,7 +141,7 @@
             class="Machine"
             displayName="$(string.VaultAuthMethod)"
             explainText="$(string.VaultAuthMethod_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultAuthMethod)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -158,7 +158,7 @@
             class="Machine"
             displayName="$(string.VaultAuthRole)"
             explainText="$(string.VaultAuthRole_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultAuthRole)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -171,7 +171,7 @@
             class="Machine"
             displayName="$(string.VaultAuthMount)"
             explainText="$(string.VaultAuthMount_Help)"
-            key="SOFTWARE\Policies\dotvault\Vault"
+            key="SOFTWARE\Policies\goodtune\dotvault\Vault"
             presentation="$(presentation.VaultAuthMount)">
       <parentCategory ref="Vault" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -188,7 +188,7 @@
             class="Machine"
             displayName="$(string.SyncInterval)"
             explainText="$(string.SyncInterval_Help)"
-            key="SOFTWARE\Policies\dotvault\Sync"
+            key="SOFTWARE\Policies\goodtune\dotvault\Sync"
             presentation="$(presentation.SyncInterval)">
       <parentCategory ref="Sync" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -205,7 +205,7 @@
             class="Machine"
             displayName="$(string.WebEnabled)"
             explainText="$(string.WebEnabled_Help)"
-            key="SOFTWARE\Policies\dotvault\Web"
+            key="SOFTWARE\Policies\goodtune\dotvault\Web"
             valueName="Enabled">
       <parentCategory ref="WebUI" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />
@@ -217,7 +217,7 @@
             class="Machine"
             displayName="$(string.WebListen)"
             explainText="$(string.WebListen_Help)"
-            key="SOFTWARE\Policies\dotvault\Web"
+            key="SOFTWARE\Policies\goodtune\dotvault\Web"
             presentation="$(presentation.WebListen)">
       <parentCategory ref="WebUI" />
       <supportedOn ref="windows:SUPPORTED_Windows_10_0" />

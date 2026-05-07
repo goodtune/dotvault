@@ -1,5 +1,5 @@
 // Package regfile renders a dotvault configuration as a Windows
-// Registry (.reg) file targeting HKLM\SOFTWARE\Policies\dotvault.
+// Registry (.reg) file targeting HKLM\SOFTWARE\Policies\goodtune\dotvault.
 //
 // The output is the canonical "Windows Registry Editor Version 5.00"
 // format encoded as UTF-16LE with a BOM, matching what regedit.exe
@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	rootKey    = `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault`
+	rootKey    = `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault`
 	header     = "Windows Registry Editor Version 5.00\r\n\r\n"
 	maxLineLen = 76
 )

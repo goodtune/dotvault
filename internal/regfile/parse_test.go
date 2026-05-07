@@ -196,7 +196,7 @@ func TestParseDeletionStanzaIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateText: %v", err)
 	}
-	if !strings.Contains(text, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\dotvault\Rules]`) {
+	if !strings.Contains(text, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Rules]`) {
 		t.Fatalf("generator should emit deletion stanza")
 	}
 	got, err := Parse([]byte(text))
@@ -343,9 +343,9 @@ func TestMarshalYAMLLoadsBack(t *testing.T) {
 // lowercase keys engines consume (e.g. `host`, `client_id`).
 func TestParseLowercasesEnrolmentSettingNames(t *testing.T) {
 	reg := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh]\r\n" +
 		"\"Engine\"=\"github\"\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
 		"\"Host\"=\"github.com\"\r\n" +
 		"\"Client_ID\"=\"abc123\"\r\n"
 
@@ -430,7 +430,7 @@ func TestMarshalYAMLMapKeysSorted(t *testing.T) {
 // fail loudly instead.
 func TestParseRejectsUnterminatedContinuation(t *testing.T) {
 	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r]\r\n" +
 		"\"TargetTemplate\"=hex(1):67,00,69,00,\\\r\n" // dangling continuation
 	_, err := Parse([]byte(bad))
 	if err == nil {
@@ -447,10 +447,10 @@ func TestParseRejectsUnterminatedContinuation(t *testing.T) {
 // stop reg-export from converting otherwise valid input.
 func TestParseSkipsValueDeletions(t *testing.T) {
 	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
 		"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
 		"\"DeprecatedSetting\"=-\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r]\r\n" +
 		"\"VaultKey\"=\"r\"\r\n" +
 		"\"TargetPath\"=\"/tmp/r\"\r\n" +
 		"\"TargetFormat\"=\"text\"\r\n" +
@@ -480,24 +480,24 @@ func TestParseKindMismatchErrors(t *testing.T) {
 	}{
 		{
 			name: "string where dword expected",
-			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
 				"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
 				"\"TLSSkipVerify\"=\"yes\"\r\n",
 			wantSubstr: "TLSSkipVerify",
 		},
 		{
 			name: "dword where string expected",
-			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Vault]\r\n" +
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
 				"\"Address\"=dword:00000001\r\n",
 			wantSubstr: "Address",
 		},
 		{
 			name: "string where multi-string expected",
-			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+			body: "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r]\r\n" +
 				"\"VaultKey\"=\"r\"\r\n" +
 				"\"TargetPath\"=\"/tmp/r\"\r\n" +
 				"\"TargetFormat\"=\"text\"\r\n" +
-				"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r\\OAuth]\r\n" +
+				"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r\\OAuth]\r\n" +
 				"\"Provider\"=\"github\"\r\n" +
 				"\"Scopes\"=\"repo\"\r\n",
 			wantSubstr: "Scopes",
@@ -529,14 +529,14 @@ func TestParseKindMismatchErrors(t *testing.T) {
 func TestParseCaseInsensitivePaths(t *testing.T) {
 	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
 		// Lower-case Software, mixed-case dotvault, lowercase vault
-		"[HKEY_LOCAL_MACHINE\\Software\\Policies\\DotVault\\vault]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\Software\\Policies\\goodtune\\DotVault\\vault]\r\n" +
 		"\"Address\"=\"https://vault.example.com:8200\"\r\n" +
 		// Lowercase rules + oauth under it.
-		"[hkey_local_machine\\SOFTWARE\\Policies\\dotvault\\RULES\\gh]\r\n" +
+		"[hkey_local_machine\\SOFTWARE\\Policies\\goodtune\\dotvault\\RULES\\gh]\r\n" +
 		"\"VaultKey\"=\"gh\"\r\n" +
 		"\"TargetPath\"=\"/tmp/gh\"\r\n" +
 		"\"TargetFormat\"=\"text\"\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\gh\\oauth]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\gh\\oauth]\r\n" +
 		"\"Provider\"=\"github\"\r\n"
 
 	got, err := Parse([]byte(src))
@@ -562,9 +562,9 @@ func TestParseCaseInsensitivePaths(t *testing.T) {
 // value would silently degrade the config without warning.
 func TestParseRejectsUnsupportedSettingType(t *testing.T) {
 	src := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh]\r\n" +
 		"\"Engine\"=\"github\"\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Enrolments\\gh\\Settings]\r\n" +
 		"\"port\"=dword:00000016\r\n"
 	_, err := Parse([]byte(src))
 	if err == nil {
@@ -622,11 +622,11 @@ func TestParseMultiSZPreservesMiddleEmptyElements(t *testing.T) {
 func TestParseRejectsUnterminatedMultiSZ(t *testing.T) {
 	// hex(7) for "ab" without the trailing NUL terminator pair.
 	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r]\r\n" +
 		"\"VaultKey\"=\"r\"\r\n" +
 		"\"TargetPath\"=\"/tmp/r\"\r\n" +
 		"\"TargetFormat\"=\"text\"\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r\\OAuth]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r\\OAuth]\r\n" +
 		"\"Provider\"=\"github\"\r\n" +
 		// 61,00,62,00 = "ab" UTF-16LE, missing the trailing 00,00 pair.
 		"\"Scopes\"=hex(7):61,00,62,00\r\n"
@@ -644,7 +644,7 @@ func TestParseRejectsUnterminatedMultiSZ(t *testing.T) {
 // silently producing partial config.
 func TestParseRejectsMalformedHex(t *testing.T) {
 	bad := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\dotvault\\Rules\\r]\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Rules\\r]\r\n" +
 		"\"TargetTemplate\"=hex(1):zz,zz\r\n"
 	if _, err := Parse([]byte(bad)); err == nil {
 		t.Errorf("expected error for malformed hex bytes")

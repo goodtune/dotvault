@@ -682,7 +682,23 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// No valid token: run the configured login flow.
+	// No valid token: preflight Vault connectivity before falling through
+	// to the configured login flow. Without this, an LDAP login would
+	// prompt for the user's password and only then discover that the
+	// network/TLS/Vault layer is broken — login-check is supposed to be
+	// quiet on a flaky boot, not interrogate the user mid-coffee.
+	// `Sys().Health` is unauthenticated and exposed on every Vault
+	// install, so it's the cheapest discriminator between "Vault is
+	// reachable, our token is just gone" and "Vault itself is
+	// unreachable".
+	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
+	_, healthErr := vc.ServerHealth(healthCtx)
+	healthCancel()
+	if healthErr != nil {
+		fmt.Fprintf(os.Stderr, "vault unreachable (will retry on next login): %v\n", healthErr)
+		return nil
+	}
+
 	username, err := paths.Username()
 	if err != nil {
 		return fmt.Errorf("resolve username: %w", err)

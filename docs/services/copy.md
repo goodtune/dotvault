@@ -127,7 +127,7 @@ dotvault writes the fields `username` and `password` at the target enrolment pat
 
 - The dotvault daemon's Vault token must have read permission on the source mount and path
 - The source secret must already exist when the enrolment runs — the engine does not create source secrets, only consumes them. Missing source secrets fail the enrolment with a clear error
-- Only `json` is supported for `format`. YAML / INI / TOML / text / netrc targets are out of scope: copy is for reshaping structured KV data, and JSON is the only round-trippable representation that aligns with KVv2's data model
+- The engine's `settings.format` must be `json`. This governs only how the rendered template is parsed before being written to Vault — sync rules consuming the resulting KVv2 secret can still target any of the supported file formats (`yaml`, `json`, `ini`, `toml`, `text`, `netrc`), as the minimal example above demonstrates with a `text` target
 
 ## Combining enrolment with sync
 

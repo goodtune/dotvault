@@ -102,7 +102,7 @@ The completeness check for the enrolment looks only at the fields the template e
 
 ### Dynamic field set
 
-Most engines declare a static list of fields they write via `Fields()`. The copy engine cannot — the field set is whatever the template produces. The engine implements the optional `SettingsFielder` interface instead, parsing the template source (with `{{ ... }}` actions replaced by `null`) to infer the top-level JSON keys without executing it. The manager treats the enrolment as complete only when every inferred key is present in the target secret.
+Most engines declare a static list of fields they write via `Fields()`. The copy engine cannot — the field set is whatever the template produces. The engine implements the optional `SettingsFielder` interface instead, parsing the template source (with `{{ ... }}` actions replaced by `null`) to infer the top-level JSON keys without executing it. The manager (via `enrol.HasAllFields`) treats the enrolment as complete only when every inferred key is present in the target secret **and** holds a non-empty string value (the check trims whitespace, so whitespace-only values count as empty). A template that renders `""` — or just whitespace — for an inferred field will keep the enrolment pending forever, so make sure each inferred key receives a real value (use `default` from the template helpers when the source field may be absent).
 
 !!! warning "Top-level keys must be literal"
     Field inference is performed on the raw template, with every `{{ ... }}` action substituted by `null`. This means top-level JSON keys are read straight from the template source: a key written as `"{{ .data.name }}"` is inferred as the literal string `"null"` (or, for multiple templated keys, deduplicated to a single `"null"` entry), the completeness check will look for a field called `null` in the target, and the enrolment will appear incomplete on every cycle. Always spell the top-level keys you intend to write as literal strings — `{{ ... }}` actions belong inside the values, not the keys.
@@ -130,7 +130,7 @@ template: |
   }
 ```
 
-dotvault writes the fields `username` and `password` at the target enrolment path. The completeness check expects exactly those two fields, regardless of what the source secret contains.
+dotvault writes the fields `username` and `password` at the target enrolment path. The completeness check expects exactly those two fields to be present as non-empty strings, regardless of what the source secret contains; if `.data.user` or `.data.api_key` is missing or empty, the rendered value will be empty and the enrolment will be retried on every cycle until the source secret is fixed.
 
 ## Requirements
 

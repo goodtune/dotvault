@@ -161,28 +161,51 @@ func (lm *LifecycleManager) clearReauth() {
 	lm.needsReauth.Store(false)
 }
 
-// tryReload re-reads the token file/env and, if a different value is
-// present, swaps it onto the Vault client and validates with LookupSelf.
-// Returns true iff the swap produced a working token. On failure the
-// previous (broken) token is restored so the caller's error-handling
-// path sees the same state it would have without a reload.
+// tryReload re-reads the token file (and VAULT_TOKEN env) and, if a
+// different value is present, swaps it onto the Vault client and
+// validates with LookupSelf. Returns true iff one of the candidates
+// produced a working token. On failure the previous (broken) token is
+// restored so the caller's error-handling path sees the same state it
+// would have without a reload.
+//
+// Candidate ordering: the token file is consulted before VAULT_TOKEN
+// because the env variable cannot be mutated by an external
+// `dotvault login` running in another shell — if VAULT_TOKEN itself is
+// the expired token the daemon was started with, ResolveToken's
+// env-first policy would keep selecting it and never see a fresh
+// value on disk. Reading the file first sidesteps that loop.
 func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 	if lm.tokenFilePath == "" {
 		return false
 	}
 	current := lm.client.Token()
-	candidate := ResolveToken(lm.tokenFilePath)
-	if candidate == "" || candidate == current {
+
+	candidates := make([]string, 0, 2)
+	if fileToken, _ := ReadTokenFile(lm.tokenFilePath); fileToken != "" && fileToken != current {
+		candidates = append(candidates, fileToken)
+	}
+	if envToken := ReadTokenEnv(); envToken != "" && envToken != current {
+		// Skip if we already queued an identical file token, but still
+		// try env when it differs from both the current and file values.
+		if len(candidates) == 0 || candidates[0] != envToken {
+			candidates = append(candidates, envToken)
+		}
+	}
+	if len(candidates) == 0 {
 		return false
 	}
-	lm.client.SetToken(candidate)
-	if _, err := lm.client.LookupSelf(ctx); err != nil {
-		slog.Warn("attempted token reload, candidate is also invalid", "error", err)
-		lm.client.SetToken(current)
-		return false
+
+	for _, candidate := range candidates {
+		lm.client.SetToken(candidate)
+		if _, err := lm.client.LookupSelf(ctx); err == nil {
+			slog.Info("picked up fresh vault token")
+			return true
+		} else {
+			slog.Warn("attempted token reload, candidate is also invalid", "error", err)
+		}
 	}
-	slog.Info("picked up fresh vault token from file")
-	return true
+	lm.client.SetToken(current)
+	return false
 }
 
 func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {

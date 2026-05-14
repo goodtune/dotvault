@@ -217,6 +217,74 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_ReloadPrefersFileOverStaleEnv guards against a
+// regression where ResolveToken's env-first policy would re-select the
+// stale VAULT_TOKEN value the daemon was originally started with and
+// never observe a fresh token written to disk by an external
+// `dotvault login`. The recovery path must read the file first.
+func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
+	var currentValid atomic.Value
+	currentValid.Store("file-token")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		expected := currentValid.Load().(string)
+		if r.Header.Get("X-Vault-Token") == expected {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          json.Number("3600"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	// VAULT_TOKEN is the same stale value the daemon is currently
+	// holding — the process environment can't be updated from another
+	// shell, so the file must take precedence during recovery.
+	t.Setenv("VAULT_TOKEN", "stale-token")
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+	if err := os.WriteFile(tokenPath, []byte("file-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	deadline := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "file-token" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := vc.Token(); got != "file-token" {
+		t.Fatalf("client token = %q after reload, want %q (file content); env-first ResolveToken regressed", got, "file-token")
+	}
+}
+
 // TestLifecycleManager_OnReauthFires verifies that when the token is
 // invalid AND no fresh value is available on disk, the OnReauth callback
 // fires exactly once (so web mode can clear the in-memory token and

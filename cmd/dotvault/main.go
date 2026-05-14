@@ -667,9 +667,18 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 			if handled {
 				return nil
 			}
-		} else {
-			// Token invalid — proceed to login.
+		} else if vault.IsForbidden(lookupErr) {
+			// 403: the cached token is revoked or otherwise invalid.
+			// Clear it and fall through to the interactive login flow.
 			vc.SetToken("")
+		} else {
+			// Transient Vault/TLS/network error. A shell startup hook
+			// should not invent an interactive login prompt every time
+			// the user opens a terminal while their VPN is reconnecting
+			// — warn and exit clean, leaving the cached token in place
+			// for the next shell invocation to retry.
+			fmt.Fprintf(os.Stderr, "vault token check failed (will retry on next login): %v\n", lookupErr)
+			return nil
 		}
 	}
 
@@ -706,10 +715,22 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Secret) (bool, error) {
 	ttlSec, ok := readSecondsField(secret.Data, "ttl")
 	if !ok {
-		// Non-expiring token (e.g. root) — nothing to do.
+		// No TTL field at all — non-expiring (e.g. root). Nothing to do.
 		return true, nil
 	}
 	ttl := time.Duration(ttlSec) * time.Second
+	if ttl <= 0 {
+		// Vault commonly returns ttl=0 for non-expiring tokens (root,
+		// service tokens minted without a TTL). A concrete expire_time
+		// alongside ttl=0 means the token has actually expired —
+		// surface that to the caller so login-check drops to the
+		// configured login flow. Mirrors the lifecycle manager's
+		// handling of the same shape.
+		if secret.Data["expire_time"] == nil {
+			return true, nil
+		}
+		return false, nil
+	}
 	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
 	creationTTL := time.Duration(creationTTLSec) * time.Second
 

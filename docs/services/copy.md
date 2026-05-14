@@ -2,7 +2,13 @@
 
 The `copy` enrolment engine mirrors an existing Vault KVv2 secret into the user's enrolment path, optionally reshaping it through a Go template. It is the right choice when another tool (or an operator workflow) already populates a per-user secret under a shared prefix and dotvault needs to expose that value to the user under their own path — usually with different field names — without re-running an interactive flow.
 
-Unlike the OAuth and key-generation engines, the copy engine is fully automated: there is no browser flow, no terminal prompt, and no clipboard handoff. The daemon's `WatchManager` runs the engine on its own — not the wizard — so a copy enrolment converges from the background even in headless mode (no TTY, no web UI), where the interactive wizard is skipped entirely. `WatchManager.Start` is invoked before any enrolment UI, and its first action is an immediate `tickAll` that performs the initial mirror, after which polling and (on Vault Enterprise) `kv-v2/data-write` events keep the target in sync whenever the source changes.
+Unlike the OAuth and key-generation engines, the copy engine is fully automated: there is no browser flow, no terminal prompt, and no clipboard handoff. Either of three paths can perform the initial mirror — whichever reaches the engine first wins, and the others see the target already populated and become no-ops:
+
+- The CLI wizard's `enrolMgr.CheckAll(ctx)` invocation, which calls `engine.Run` for any pending engine
+- The web enrolment runner, which does the same for the browser-driven flow
+- The daemon's `WatchManager`, whose `Start` is invoked before any enrolment UI and whose first action is an immediate `tickAll` that performs the mirror
+
+The practical consequence is that copy enrolments converge even in headless mode (no TTY, no web UI), where the interactive wizard is skipped entirely — `WatchManager` keeps running and will produce the same result on its first tick. After the initial population, polling and (on Vault Enterprise) `kv-v2/data-write` events keep the target in sync whenever the source changes.
 
 ## Configuration
 

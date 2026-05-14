@@ -62,6 +62,7 @@ nav:
       - GitHub CLI: services/github.md
       - JFrog Platform: services/jfrog.md
       - SSH Keys: services/ssh.md
+      - Copy: services/copy.md
   - Web UI: web-ui.md
   - Admin Guide:
       - Deployment: admin/deployment.md

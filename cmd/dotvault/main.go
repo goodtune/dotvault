@@ -672,6 +672,12 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 			// Clear it and fall through to the interactive login flow.
 			vc.SetToken("")
 		} else {
+			// Ctrl-C during LookupSelf surfaces as a wrapped
+			// context.Canceled here — exit silently to honour the
+			// command's documented "Ctrl-C without fanfare" contract.
+			if loginCheckCancelled(ctx, lookupErr) {
+				return nil
+			}
 			// Transient Vault/TLS/network error. A shell startup hook
 			// should not invent an interactive login prompt every time
 			// the user opens a terminal while their VPN is reconnecting
@@ -695,6 +701,12 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	_, healthErr := vc.ServerHealth(healthCtx)
 	healthCancel()
 	if healthErr != nil {
+		// Ctrl-C during the health probe inherits cancellation from the
+		// outer signal context. Suppress the warning in that case so the
+		// shell scrollback stays clean.
+		if loginCheckCancelled(ctx, healthErr) {
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "vault unreachable (will retry on next login): %v\n", healthErr)
 		return nil
 	}
@@ -713,7 +725,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	}
 	if err := mgr.Login(ctx); err != nil {
 		// Ctrl-C: silent exit. The user dismissed the prompt knowingly.
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		if loginCheckCancelled(ctx, err) {
 			return nil
 		}
 		return fmt.Errorf("login: %w", err)
@@ -781,6 +793,12 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 	}
 
 	if _, err := vc.RenewSelf(ctx, 0); err != nil {
+		// Ctrl-C during renewal: exit silently (the command's documented
+		// contract), leaving the cached token in place — it's still
+		// valid, just not yet renewed this session.
+		if loginCheckCancelled(ctx, err) {
+			return true, err
+		}
 		fmt.Fprintf(os.Stderr, "vault token renewal failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "token is still valid but nearing expiry: %s remaining, expires %s\n",
 			ttl.Truncate(time.Second), absoluteExpiry(ttl))
@@ -788,6 +806,21 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 	}
 	fmt.Fprintln(os.Stderr, "vault token renewed")
 	return true, nil
+}
+
+// loginCheckCancelled reports whether err is a context-cancellation
+// (i.e. the user pressed Ctrl-C). Used at every login-check error site
+// to honour the command's "Ctrl-C exits without fanfare" contract — a
+// cancelled lookup, health probe, or renewal must not leave warnings
+// in the shell's startup scrollback.
+func loginCheckCancelled(ctx context.Context, err error) bool {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return false
 }
 
 func readSecondsField(data map[string]any, key string) (int64, bool) {

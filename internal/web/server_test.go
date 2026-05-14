@@ -194,9 +194,6 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	}
 }
 
-// TestMiddlewareForbiddenHostNonAPIPlainText pins that requests outside
-// /api/ and /auth/ still get the human-readable text/plain 403 — useful
-// when a misconfigured browser hits `/` directly.
 // TestForceReauth verifies the two behaviours that keep the SPA and
 // WaitForAuth state consistent when the lifecycle manager declares the
 // cached Vault token unusable:
@@ -242,6 +239,9 @@ func TestForceReauth(t *testing.T) {
 	}
 }
 
+// TestMiddlewareForbiddenHostNonAPIPlainText pins that requests outside
+// /api/ and /auth/ still get the human-readable text/plain 403 — useful
+// when a misconfigured browser hits `/` directly.
 func TestMiddlewareForbiddenHostNonAPIPlainText(t *testing.T) {
 	s := testServer(t)
 	s.cfg.Listen = "127.0.0.1:0"

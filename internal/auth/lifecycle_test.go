@@ -285,6 +285,91 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_RecoversAfterTokenCleared simulates the
+// post-OnReauth state: the daemon's web-mode OnReauth callback has
+// cleared the in-memory Vault token, so the next lookup-self call
+// goes out with no `X-Vault-Token` header and Vault returns a
+// "missing client token" 400. Without the empty-token branch on the
+// recoverable-failure check this would slip into the transient-error
+// path, back off, and never observe a fresh token written to disk.
+// The test pins the recovery path: a new token is written to the
+// file after the clear, and the manager picks it up on its 10s
+// recovery poll.
+func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
+	var validToken atomic.Value
+	validToken.Store("new-token")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tok := r.Header.Get("X-Vault-Token")
+		switch {
+		case tok == "":
+			// Vault returns 400 for a request with no token header.
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"missing client token"}})
+		case tok == validToken.Load().(string):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          json.Number("3600"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: ""}) // already cleared
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	// Let the manager run a tick or two with the empty token — it should
+	// surface "missing client token" responses but stay on the recovery
+	// path (10s recovery interval, not the transient backoff).
+	time.Sleep(150 * time.Millisecond)
+	if !lm.NeedsReauth() {
+		t.Error("NeedsReauth() = false after empty-token checks; recovery path was not taken")
+	}
+
+	// Drop the new token on disk — the manager should pick it up.
+	if err := os.WriteFile(tokenPath, []byte("new-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	deadline := time.Now().Add(800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "new-token" && !lm.NeedsReauth() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := vc.Token(); got != "new-token" {
+		t.Fatalf("client token = %q after token-file write, want %q (recovery never fired)", got, "new-token")
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() = true after recovery picked up a working token")
+	}
+}
+
 // TestLifecycleManager_OnReauthFires verifies that when the token is
 // invalid AND no fresh value is available on disk, the OnReauth callback
 // fires exactly once (so web mode can clear the in-memory token and

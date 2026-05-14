@@ -101,7 +101,19 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				return
 			case <-timer.C:
 				if err := lm.checkAndRenew(ctx); err != nil {
-					if vault.IsForbidden(err) || IsExpired(err) {
+					// Recoverable failure modes:
+					//   - 403 (token revoked/invalid)
+					//   - sentinel for an expired token reported via
+					//     lookup-self with a concrete expire_time
+					//   - we are already in the needs-reauth state, OR the
+					//     current client token is empty (because OnReauth
+					//     just cleared it). In the empty-token case Vault
+					//     returns "missing client token" (400), which is
+					//     neither 403 nor the expired sentinel — without
+					//     this branch the manager would slip into the
+					//     transient-error path, back off to 5m, and never
+					//     observe a fresh token written to disk.
+					if vault.IsForbidden(err) || IsExpired(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
 						// Try reloading the token from disk/env before
 						// declaring re-auth — a parallel `dotvault login`
 						// may have already written a fresh token. If the

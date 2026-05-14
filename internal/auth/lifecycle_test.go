@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,6 +127,148 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 
 	if renewCalled {
 		t.Error("RenewSelf was called despite disable_token_renewal=true")
+	}
+}
+
+// TestLifecycleManager_ReloadFromTokenFile exercises the recovery path
+// where a token has expired/been revoked but a fresh value has been
+// written to the token file by an external process (e.g. an interactive
+// `dotvault login` running in another session). The manager must pick
+// up the new token on its next check and continue running instead of
+// permanently latching the needs-reauth state.
+func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
+	var currentValid atomic.Value // string — the token Vault will currently accept
+	currentValid.Store("good-token")
+
+	var lookups atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/lookup-self" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		lookups.Add(1)
+		expected := currentValid.Load().(string)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("X-Vault-Token") == expected {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          json.Number("3600"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	// Start with the old (now-revoked) token loaded on the client and
+	// the new valid token already written to disk — emulating the
+	// "user already ran `dotvault login` in another session" timing.
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+	if err := os.WriteFile(tokenPath, []byte("new-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	currentValid.Store("new-token") // server will only accept the new token now
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	var onReauthFired atomic.Bool
+	lm.SetOnReauth(func() { onReauthFired.Store(true) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+
+	// Drain errCh in the background — we don't assert on it here because
+	// the reload path may suppress the re-auth signal entirely.
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	// Wait until the manager has had a chance to run a check and reload.
+	deadline := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "new-token" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := vc.Token(); got != "new-token" {
+		t.Fatalf("client token = %q after reload, want %q", got, "new-token")
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() = true after successful reload")
+	}
+	if onReauthFired.Load() {
+		t.Error("OnReauth callback fired despite successful token-file reload")
+	}
+}
+
+// TestLifecycleManager_OnReauthFires verifies that when the token is
+// invalid AND no fresh value is available on disk, the OnReauth callback
+// fires exactly once (so web mode can clear the in-memory token and
+// force the SPA back to its login screen).
+func TestLifecycleManager_OnReauthFires(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "bad-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Empty token file: tryReload should return false and the manager
+	// should signal re-auth.
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	var fired atomic.Int64
+	lm.SetOnReauth(func() { fired.Add(1) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+
+	select {
+	case <-errCh:
+		// good — re-auth signalled
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected re-auth signal on errCh within 500ms")
+	}
+
+	if got := fired.Load(); got != 1 {
+		t.Errorf("OnReauth fired %d times, want exactly 1", got)
+	}
+	if !lm.NeedsReauth() {
+		t.Error("NeedsReauth() = false, want true after re-auth signal")
+	}
+
+	// Give it another tick or two to confirm the callback isn't re-fired
+	// on subsequent failures.
+	time.Sleep(300 * time.Millisecond)
+	if got := fired.Load(); got != 1 {
+		t.Errorf("OnReauth fired %d times after additional ticks, want exactly 1", got)
 	}
 }
 

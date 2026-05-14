@@ -2,7 +2,7 @@
 
 The `copy` enrolment engine mirrors an existing Vault KVv2 secret into the user's enrolment path, optionally reshaping it through a Go template. It is the right choice when another tool (or an operator workflow) already populates a per-user secret under a shared prefix and dotvault needs to expose that value to the user under their own path — usually with different field names — without re-running an interactive flow.
 
-Unlike the OAuth and key-generation engines, the copy engine is fully automated: there is no browser flow, no terminal prompt, and no clipboard handoff. The first invocation runs synchronously like any other enrolment, and after that the daemon's `WatchManager` keeps the target in sync whenever the source changes.
+Unlike the OAuth and key-generation engines, the copy engine is fully automated: there is no browser flow, no terminal prompt, and no clipboard handoff. The daemon's `WatchManager` runs the engine on its own — not the wizard — so a copy enrolment converges from the background even in headless mode (no TTY, no web UI), where the interactive wizard is skipped entirely. `WatchManager.Start` is invoked before any enrolment UI, and its first action is an immediate `tickAll` that performs the initial mirror, after which polling and (on Vault Enterprise) `kv-v2/data-write` events keep the target in sync whenever the source changes.
 
 ## Configuration
 
@@ -97,6 +97,9 @@ The completeness check for the enrolment looks only at the fields the template e
 ### Dynamic field set
 
 Most engines declare a static list of fields they write via `Fields()`. The copy engine cannot — the field set is whatever the template produces. The engine implements the optional `SettingsFielder` interface instead, parsing the template source (with `{{ ... }}` actions replaced by `null`) to infer the top-level JSON keys without executing it. The manager treats the enrolment as complete only when every inferred key is present in the target secret.
+
+!!! warning "Top-level keys must be literal"
+    Field inference is performed on the raw template, with every `{{ ... }}` action substituted by `null`. This means top-level JSON keys are read straight from the template source: a key written as `"{{ .data.name }}"` is inferred as the literal string `"null"` (or, for multiple templated keys, deduplicated to a single `"null"` entry), the completeness check will look for a field called `null` in the target, and the enrolment will appear incomplete on every cycle. Always spell the top-level keys you intend to write as literal strings — `{{ ... }}` actions belong inside the values, not the keys.
 
 If the template is missing, syntactically invalid JSON, or has actions inside quoted-string arguments containing literal `}}`, field inference falls back to `nil` and the manager treats the enrolment as incomplete on every cycle — surfacing the misconfiguration rather than silently skipping it.
 

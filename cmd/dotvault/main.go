@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -42,6 +43,8 @@ var (
 )
 
 func main() {
+	gui := isGUIBinary(os.Args[0])
+
 	rootCmd := &cobra.Command{
 		Use:   "dotvault",
 		Short: "Vault-to-file secret synchronisation daemon",
@@ -53,8 +56,14 @@ renew) the cached token on an interactive login, or "dotvault login" to
 force a fresh login flow.`,
 		// Cobra's default RunE for a command with no Run/RunE prints help
 		// when called bare, which is what we want — explicitly running the
-		// daemon now requires `dotvault run`.
+		// daemon now requires `dotvault run`. The GUI-subsystem variant
+		// (dotvaultw.exe) is wired below to default to the daemon instead,
+		// because it's launched by double-click and has no console to show
+		// help on.
 		SilenceUsage: true,
+	}
+	if gui {
+		rootCmd.RunE = runDaemon
 	}
 
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
@@ -1131,4 +1140,21 @@ func isStdoutTerminal() bool {
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// isGUIBinary reports whether the running executable is the GUI-subsystem
+// Windows variant (dotvaultw.exe). The two Windows binaries are built from
+// the same source with a different PE subsystem flag; the GUI build is
+// launched by double-click / Start Menu shortcut and must default to the
+// daemon because there's no console to show help on. Both `/` and `\` are
+// treated as path separators so the check behaves identically when run
+// from a Linux-hosted test suite and on Windows itself.
+func isGUIBinary(arg0 string) bool {
+	name := arg0
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.ToLower(name)
+	name = strings.TrimSuffix(name, ".exe")
+	return name == "dotvaultw"
 }

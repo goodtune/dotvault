@@ -34,7 +34,13 @@ func (m *Manager) Authenticate(ctx context.Context) error {
 		m.VaultClient.SetToken("")
 	}
 
-	// Step 2: Authenticate with configured method
+	return m.Login(ctx)
+}
+
+// Login runs the configured fresh-auth flow unconditionally, without
+// attempting to reuse an existing token. Used by `dotvault login` and as
+// the fallback path inside Authenticate.
+func (m *Manager) Login(ctx context.Context) error {
 	switch m.AuthMethod {
 	case "oidc":
 		return m.authenticateOIDC(ctx)

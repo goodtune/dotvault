@@ -320,6 +320,29 @@ func (s *Server) URL() string {
 	return fmt.Sprintf("http://%s/", s.listenAddr)
 }
 
+// ForceReauth clears the in-memory Vault token so /api/v1/status reports
+// authenticated=false on the next poll. The SPA is configured to redirect
+// to the login screen whenever that flag flips, which effectively
+// invalidates any browser session that was sitting on a stale "logged-in"
+// view while the underlying token rotted. The token file on disk is
+// intentionally left in place — operators may have written a fresh token
+// out-of-band that the daemon can pick up without involving the user.
+//
+// Also resets the authDone channel so a fresh call to WaitForAuth (e.g.
+// from a re-entry into the startup auth flow) will block until the user
+// completes the new login.
+func (s *Server) ForceReauth() {
+	if s.vault != nil {
+		s.vault.SetToken("")
+	}
+	// Drain any pending authDone signal — the previous auth is no
+	// longer current and shouldn't satisfy a fresh WaitForAuth.
+	select {
+	case <-s.authDone:
+	default:
+	}
+}
+
 func (s *Server) userKVPrefix() string {
 	return s.userPrefix + s.username + "/"
 }

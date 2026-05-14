@@ -103,14 +103,38 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 ## CLI
 
 ```
-dotvault            Run daemon (default command)
-dotvault run        Explicit daemon mode (same as bare invocation)
-dotvault sync       One-shot sync cycle, then exit
-dotvault status     Display auth state, token TTL, per-rule sync state
-dotvault version    Print build version
-dotvault reg-export Convert a Windows .reg file to YAML (or canonical .reg)
-dotvault reg-import Convert a YAML config to a Windows .reg file
+dotvault             Print help (no implicit daemon start)
+dotvault run         Run the long-lived daemon
+dotvault sync        One-shot sync cycle, then exit
+dotvault login       Force a fresh login via the configured auth method
+dotvault login-check Validate/renew cached token on interactive login (tty-aware)
+dotvault status      Display auth state, token TTL, per-rule sync state
+dotvault version     Print build version
+dotvault reg-export  Convert a Windows .reg file to YAML (or canonical .reg)
+dotvault reg-import  Convert a YAML config to a Windows .reg file
 ```
+
+Running `dotvault` with no subcommand prints help — the daemon is no
+longer the default. Use `dotvault run` to start it explicitly.
+
+`dotvault login` always runs the configured fresh-auth flow (OIDC, LDAP),
+ignoring any cached token. It is the dotvault-config-driven analogue of
+`vault login -address … -method …` and is the natural entry point when a
+running daemon needs a new token after expiry.
+
+`dotvault login-check` is intended for interactive-shell login profiles:
+
+- If stdout is not a TTY the command exits silently (status 0) so
+  non-interactive callers (cron, sshd ForceCommand, scp) never see a
+  prompt.
+- If a cached token is valid and still within the first half of its
+  creation TTL, exit clean.
+- If the cached token is valid but past the halfway mark, attempt renewal.
+  On renewal failure where the token is still valid, warn with the
+  absolute expiry time and exit 0.
+- If the cached token is missing or invalid, run the configured login
+  flow. Ctrl-C exits without fanfare (so a user can dismiss the prompt
+  on a fresh terminal without leaving an error in their scrollback).
 
 The naming follows regedit's `/e` (export) and `/s` (import) directional
 convention: `reg-export` pulls policy out of the registry world into a
@@ -146,7 +170,7 @@ in-memory `*config.Config` and routes through the same regfile renderers,
 so a daemon that loaded its config from a Windows GPO can be exported
 back as YAML (or vice versa) without restart.
 
-Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`, `--once` (redirects to sync from within runDaemon).
+Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`. Subcommand-scoped: `--once` on `dotvault run` redirects to the sync path.
 
 Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Always writes to stderr; no file-based logging.
 
@@ -179,7 +203,24 @@ Async login state machine (`internal/auth/login.go`) shared by CLI and web paths
 
 ### Token Lifecycle
 
-`LifecycleManager` checks token TTL every 5 minutes. Renews at 75% remaining TTL. Signals re-auth needed on 403 Forbidden or token expiration. In web mode, re-auth opens the browser to the web UI root.
+`LifecycleManager` checks token TTL every 5 minutes. Renews at 75% remaining TTL.
+On detecting an invalid/expired token (403 Forbidden or TTL=0 + concrete
+`expire_time`) the manager runs a recovery sequence:
+
+1. Re-read the token file (and `VAULT_TOKEN` env). If a different value
+   is present and `LookupSelf` succeeds with it, swap the in-memory token
+   on the Vault client, clear the needs-reauth flag, and return to the
+   normal 5-minute check cadence. This lets a parallel `dotvault login`
+   recover a running daemon without a restart.
+2. If no fresh token is on disk, signal re-auth: fire the registered
+   `OnReauth` callback (web mode clears the in-memory token, invalidating
+   any browser session sitting on a stale "logged-in" view), push an
+   error on the error channel, and switch to a 10-second recovery poll
+   so a subsequent token write is picked up quickly.
+
+In web mode the daemon also re-opens the browser to the web UI root when
+the lifecycle manager signals re-auth, subject to a 10-minute cooldown
+to avoid flapping during transient errors.
 
 ## Sync Engine
 

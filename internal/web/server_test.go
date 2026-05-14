@@ -194,6 +194,51 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	}
 }
 
+// TestForceReauth verifies the two behaviours that keep the SPA and
+// WaitForAuth state consistent when the lifecycle manager declares the
+// cached Vault token unusable:
+//
+//  1. The in-memory Vault token is cleared, so a follow-up GET
+//     /api/v1/status reports authenticated=false and the SPA bounces
+//     to its login screen.
+//  2. Any signal previously queued on authDone is drained so a fresh
+//     WaitForAuth (e.g. from a re-entry into the startup auth flow)
+//     blocks until the user completes the *new* login rather than
+//     immediately satisfying on the stale signal.
+func TestForceReauth(t *testing.T) {
+	s := testServer(t)
+	vc, err := vault.NewClient(vault.Config{Address: "http://127.0.0.1:8200", Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	s.vault = vc
+	s.authDone = make(chan struct{}, 1)
+
+	// Simulate the previous successful auth that left a signal queued.
+	s.authDone <- struct{}{}
+
+	s.ForceReauth()
+
+	if got := s.vault.Token(); got != "" {
+		t.Errorf("vault token after ForceReauth = %q, want \"\"", got)
+	}
+
+	// authDone must have been drained — a non-blocking read should
+	// observe an empty channel.
+	select {
+	case <-s.authDone:
+		t.Error("authDone still has a queued signal after ForceReauth; WaitForAuth would fire immediately")
+	default:
+	}
+
+	// A second invocation must be a no-op (idempotent) even with no
+	// token and no pending signal — exercises the empty-state branches.
+	s.ForceReauth()
+	if got := s.vault.Token(); got != "" {
+		t.Errorf("vault token after idempotent ForceReauth = %q, want \"\"", got)
+	}
+}
+
 // TestMiddlewareForbiddenHostNonAPIPlainText pins that requests outside
 // /api/ and /auth/ still get the human-readable text/plain 403 — useful
 // when a misconfigured browser hits `/` directly.

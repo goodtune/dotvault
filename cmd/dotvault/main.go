@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,6 +23,7 @@ import (
 	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
+	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -42,23 +45,65 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "dotvault",
 		Short: "Vault-to-file secret synchronisation daemon",
-		RunE:  runDaemon,
+		Long: `dotvault synchronises Vault KVv2 secrets into local config files.
+
+Run with no subcommand prints this help. Use "dotvault run" to start the
+long-lived daemon, "dotvault login-check" to validate (and optionally
+renew) the cached token on an interactive login, or "dotvault login" to
+force a fresh login flow.`,
+		// Cobra's default RunE for a command with no Run/RunE prints help
+		// when called bare, which is what we want — explicitly running the
+		// daemon now requires `dotvault run`.
+		SilenceUsage: true,
 	}
 
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
 
+	runCmd := &cobra.Command{
+		Use:   "run",
+		Short: "Run daemon in foreground",
+		RunE:  runDaemon,
+	}
+	// --once on the daemon means "do one sync and exit" — keep it as a
+	// subcommand-scoped flag so it doesn't pollute the global flag list.
+	runCmd.Flags().Bool("once", false, "run one sync cycle and exit")
+
 	rootCmd.AddCommand(
-		&cobra.Command{
-			Use:   "run",
-			Short: "Run daemon in foreground",
-			RunE:  runDaemon,
-		},
+		runCmd,
 		&cobra.Command{
 			Use:   "sync",
 			Short: "Run one sync cycle and exit",
 			RunE:  runSync,
+		},
+		&cobra.Command{
+			Use:   "login",
+			Short: "Run the configured Vault login flow (always fresh)",
+			Long: `Run the configured Vault login flow, ignoring any cached token.
+Equivalent to "vault login -address <vault.address> -method <vault.auth_method>"
+but driven by dotvault's loaded configuration (YAML or Group Policy).`,
+			RunE: runLogin,
+		},
+		&cobra.Command{
+			Use:   "login-check",
+			Short: "Validate cached token on interactive login, renew or re-login as needed",
+			Long: `Intended to be wired into shell rc / login-profile scripts.
+
+If stdout is not a terminal the command exits silently with status 0 so
+non-interactive environments (cron, system services, scp) never see a
+prompt.
+
+When run on an interactive terminal:
+  - If the cached token is valid and still within the first half of its
+    creation TTL, exit clean.
+  - If the cached token is valid but past the halfway point, attempt
+    renewal. If renewal succeeds, exit clean. If renewal fails but the
+    token is still valid, warn with the absolute expiry time and exit 0.
+  - If the cached token is missing or invalid, run the configured login
+    flow. Ctrl-C exits without fanfare so the user can dismiss the prompt
+    on a fresh terminal session.`,
+			RunE: runLoginCheck,
 		},
 		&cobra.Command{
 			Use:   "status",
@@ -75,9 +120,6 @@ func main() {
 		newRegExportCmd(),
 		newRegImportCmd(),
 	)
-
-	// --once as alias for sync
-	rootCmd.PersistentFlags().Bool("once", false, "run one sync cycle and exit")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -259,8 +301,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Start token lifecycle manager.
+	// Start token lifecycle manager. Wire the token-file path so that on
+	// detecting an invalid token the manager can pick up a fresh value
+	// written by an external facility (`dotvault login`) before forcing a
+	// full re-auth. In web mode register a callback that clears the
+	// in-memory token, invalidating any browser session sitting on a
+	// stale "logged-in" view.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
+	lm.SetTokenFilePath(tokenPath)
+	if webServer != nil {
+		lm.SetOnReauth(webServer.ForceReauth)
+	}
 	lifecycleErrCh := lm.Start(ctx)
 
 	// Start refresh manager for any enrolment whose engine rotates its own
@@ -516,6 +567,286 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// runLogin implements `dotvault login` — always forces a fresh login via
+// the configured method, ignoring any cached token. This mirrors
+// `vault login -address <vault.address> -method <vault.auth_method>` but
+// is driven from dotvault's loaded configuration (YAML or GPO) so the
+// user doesn't have to re-specify the same parameters on the CLI.
+func runLogin(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	username, err := paths.Username()
+	if err != nil {
+		return fmt.Errorf("resolve username: %w", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{
+		Address:       cfg.Vault.Address,
+		CACert:        cfg.Vault.CACert,
+		TLSSkipVerify: cfg.Vault.TLSSkipVerify,
+	})
+	if err != nil {
+		return fmt.Errorf("create vault client: %w", err)
+	}
+
+	mgr := &auth.Manager{
+		VaultClient:   vc,
+		TokenFilePath: paths.VaultTokenPath(),
+		AuthMethod:    cfg.Vault.AuthMethod,
+		AuthMount:     cfg.Vault.AuthMount,
+		AuthRole:      cfg.Vault.AuthRole,
+		Username:      username,
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := mgr.Login(ctx); err != nil {
+		// Ctrl-C should exit quietly — the user knows they cancelled.
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return fmt.Errorf("login: %w", err)
+	}
+	return nil
+}
+
+// runLoginCheck implements `dotvault login-check`, intended to be called
+// from a user's interactive-shell login profile. The semantics are
+// described in the command's Long help text.
+func runLoginCheck(cmd *cobra.Command, args []string) error {
+	// Only attach the slog default in interactive mode — non-interactive
+	// callers should be completely silent. We still log to stderr (text
+	// handler) in the interactive path so renewal/failure messages reach
+	// the operator.
+	if !isStdoutTerminal() {
+		// No tty: nothing for us to do. Exit clean rather than blocking
+		// or emitting JSON-shaped logs into the shell startup output.
+		return nil
+	}
+	setupLogging()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{
+		Address:       cfg.Vault.Address,
+		CACert:        cfg.Vault.CACert,
+		TLSSkipVerify: cfg.Vault.TLSSkipVerify,
+	})
+	if err != nil {
+		return fmt.Errorf("create vault client: %w", err)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	tokenPath := paths.VaultTokenPath()
+	token := auth.ResolveToken(tokenPath)
+	if token != "" {
+		vc.SetToken(token)
+		secret, lookupErr := vc.LookupSelf(ctx)
+		if lookupErr == nil {
+			// Token valid. Decide whether to renew based on how much of
+			// the original TTL has been consumed.
+			handled, err := handleValidToken(ctx, vc, secret)
+			if err != nil {
+				// Renewal failed but token still valid — already warned
+				// inside handleValidToken; exit 0 anyway.
+				return nil
+			}
+			if handled {
+				return nil
+			}
+		} else if vault.IsForbidden(lookupErr) {
+			// 403: the cached token is revoked or otherwise invalid.
+			// Clear it and fall through to the interactive login flow.
+			vc.SetToken("")
+		} else {
+			// Ctrl-C during LookupSelf surfaces as a wrapped
+			// context.Canceled here — exit silently to honour the
+			// command's documented "Ctrl-C without fanfare" contract.
+			if loginCheckCancelled(ctx, lookupErr) {
+				return nil
+			}
+			// Transient Vault/TLS/network error. A shell startup hook
+			// should not invent an interactive login prompt every time
+			// the user opens a terminal while their VPN is reconnecting
+			// — warn and exit clean, leaving the cached token in place
+			// for the next shell invocation to retry.
+			fmt.Fprintf(os.Stderr, "vault token check failed (will retry on next login): %v\n", lookupErr)
+			return nil
+		}
+	}
+
+	// No valid token: preflight Vault connectivity before falling through
+	// to the configured login flow. Without this, an LDAP login would
+	// prompt for the user's password and only then discover that the
+	// network/TLS/Vault layer is broken — login-check is supposed to be
+	// quiet on a flaky boot, not interrogate the user mid-coffee.
+	// `Sys().Health` is unauthenticated and exposed on every Vault
+	// install, so it's the cheapest discriminator between "Vault is
+	// reachable, our token is just gone" and "Vault itself is
+	// unreachable".
+	healthCtx, healthCancel := context.WithTimeout(ctx, 5*time.Second)
+	_, healthErr := vc.ServerHealth(healthCtx)
+	healthCancel()
+	if healthErr != nil {
+		// Ctrl-C during the health probe inherits cancellation from the
+		// outer signal context. Suppress the warning in that case so the
+		// shell scrollback stays clean.
+		if loginCheckCancelled(ctx, healthErr) {
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "vault unreachable (will retry on next login): %v\n", healthErr)
+		return nil
+	}
+
+	username, err := paths.Username()
+	if err != nil {
+		return fmt.Errorf("resolve username: %w", err)
+	}
+	mgr := &auth.Manager{
+		VaultClient:   vc,
+		TokenFilePath: tokenPath,
+		AuthMethod:    cfg.Vault.AuthMethod,
+		AuthMount:     cfg.Vault.AuthMount,
+		AuthRole:      cfg.Vault.AuthRole,
+		Username:      username,
+	}
+	if err := mgr.Login(ctx); err != nil {
+		// Ctrl-C: silent exit. The user dismissed the prompt knowingly.
+		if loginCheckCancelled(ctx, err) {
+			return nil
+		}
+		return fmt.Errorf("login: %w", err)
+	}
+	return nil
+}
+
+// handleValidToken inspects a successful LookupSelf response and decides
+// whether to renew the token.
+//
+// Returns (handled=true, err=nil) when the token is fresh enough to leave
+// alone, is non-expiring (no TTL field, or ttl<=0 without an
+// expire_time), or was renewed successfully.
+//
+// Returns (handled=false, err=nil) when the token has actually expired
+// (ttl<=0 with a concrete expire_time) — the caller falls through to the
+// configured login flow.
+//
+// Returns (handled=true, err=non-nil) when renewal was attempted and
+// failed but the cached token is still valid; the function has already
+// warned with the absolute expiry time and the caller should exit clean.
+func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Secret) (bool, error) {
+	ttlSec, ok := readSecondsField(secret.Data, "ttl")
+	if !ok {
+		// No TTL field at all — non-expiring (e.g. root). Nothing to do.
+		return true, nil
+	}
+	ttl := time.Duration(ttlSec) * time.Second
+	if ttl <= 0 {
+		// Vault commonly returns ttl=0 for non-expiring tokens (root,
+		// service tokens minted without a TTL). A concrete expire_time
+		// alongside ttl=0 means the token has actually expired —
+		// surface that to the caller so login-check drops to the
+		// configured login flow. Mirrors the lifecycle manager's
+		// handling of the same shape.
+		if secret.Data["expire_time"] == nil {
+			return true, nil
+		}
+		return false, nil
+	}
+	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
+	creationTTL := time.Duration(creationTTLSec) * time.Second
+
+	renewableRaw, _ := secret.Data["renewable"]
+	renewable, _ := renewableRaw.(bool)
+
+	// If we have a creation TTL, compare remaining TTL against half of
+	// it. Otherwise fall back to "remaining ttl > 15m means fresh", which
+	// matches the daemon's renewal heuristic for tokens with unknown
+	// creation TTL.
+	threshold := creationTTL / 2
+	if creationTTL == 0 {
+		threshold = 15 * time.Minute
+	}
+
+	if ttl > threshold {
+		// Still in the fresh half — nothing to do.
+		return true, nil
+	}
+
+	if !renewable {
+		fmt.Fprintf(os.Stderr, "vault token is past halfway (%s remaining) and not renewable; expires %s\n",
+			ttl.Truncate(time.Second), absoluteExpiry(ttl))
+		return true, nil
+	}
+
+	if _, err := vc.RenewSelf(ctx, 0); err != nil {
+		// Ctrl-C during renewal: exit silently (the command's documented
+		// contract), leaving the cached token in place — it's still
+		// valid, just not yet renewed this session.
+		if loginCheckCancelled(ctx, err) {
+			return true, err
+		}
+		fmt.Fprintf(os.Stderr, "vault token renewal failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "token is still valid but nearing expiry: %s remaining, expires %s\n",
+			ttl.Truncate(time.Second), absoluteExpiry(ttl))
+		return true, err
+	}
+	fmt.Fprintln(os.Stderr, "vault token renewed")
+	return true, nil
+}
+
+// loginCheckCancelled reports whether err is a context-cancellation
+// (i.e. the user pressed Ctrl-C). Used at every login-check error site
+// to honour the command's "Ctrl-C exits without fanfare" contract — a
+// cancelled lookup, health probe, or renewal must not leave warnings
+// in the shell's startup scrollback.
+func loginCheckCancelled(ctx context.Context, err error) bool {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return false
+}
+
+func readSecondsField(data map[string]any, key string) (int64, bool) {
+	v, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case json.Number:
+		s, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return s, true
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
+}
+
+func absoluteExpiry(ttl time.Duration) string {
+	return time.Now().Add(ttl).Format(time.RFC3339)
 }
 
 func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Client, error) {
@@ -787,6 +1118,13 @@ func validateYAML(data []byte) error {
 // pick the slog text vs JSON handler at startup.
 func isStderrTerminal() bool {
 	return term.IsTerminal(int(os.Stderr.Fd()))
+}
+
+// isStdoutTerminal reports whether stdout is connected to a TTY. Used by
+// `dotvault login-check` to silently no-op when invoked from a
+// non-interactive shell (cron, sshd ForceCommand, scp, etc.).
+func isStdoutTerminal() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether

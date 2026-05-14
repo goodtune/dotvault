@@ -57,7 +57,7 @@ enrolments:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `from.mount` | _(required)_ | KV mount of the source secret (e.g. `kv`) |
-| `from.path` | _(required)_ | Path of the source secret. Supports a `{{.user}}` substitution that resolves to the authenticated Vault username (`token_meta_username`) |
+| `from.path` | _(required)_ | Path of the source secret. Supports a `{{.user}}` substitution that resolves to the local OS username (`paths.Username()`, with any `DOMAIN\` prefix stripped) |
 | `format` | `json` | Output format. Only `json` is currently supported — anything else is rejected at run time |
 | `template` | _(required)_ | Go template that renders a JSON object. Top-level keys of the rendered object become the fields written to Vault |
 
@@ -66,13 +66,13 @@ The template receives two top-level values as dot context:
 | Reference | Description |
 |-----------|-------------|
 | `.data` | The source secret's data map. Access individual fields as `{{ .data.fieldname }}` |
-| `.user` | The authenticated Vault username (same value used to substitute `{{.user}}` in `from.path`) |
+| `.user` | The local OS username (same value used to substitute `{{.user}}` in `from.path`). In deployments where the Vault identity differs from the OS login, this is the OS-side login, not `token_meta_username` |
 
 The engine wraps `text/template`, so the same helpers documented in [Templates](../configuration/templates.md) (`env`, `base64encode`, `base64decode`, `default`, `quote`) are available inside the copy template as well.
 
 ## How it works
 
-1. The manager resolves the source path by substituting `{{.user}}` for the authenticated username (so a single config line covers every user)
+1. The manager resolves the source path by substituting `{{.user}}` for the local OS username (so a single config line covers every user)
 2. dotvault reads the source secret from Vault using the daemon's own token — the user must therefore have read permission on the source path
 3. The template is executed with `{"data": <source data>, "user": <username>}` as dot context
 4. The rendered output is parsed as a JSON object. Each top-level key becomes a field to write; non-string values are coerced to their JSON textual form
@@ -86,7 +86,10 @@ The target secret is **merged**, not overwritten:
 - Keys produced by the template are written (overwriting any existing value with the same name)
 - Pre-existing keys at the target path that the template does **not** name are preserved
 
-This makes it safe to co-tenant a copy enrolment with other writers — for example, an unrelated operator process that maintains a separate field at the same Vault path. The completeness check for the enrolment looks only at the fields the template emits, so the engine never reports "incomplete" because of fields it does not own.
+The completeness check for the enrolment looks only at the fields the template emits, so the engine never reports "incomplete" because of fields it does not own — letting an unrelated operator process maintain a separate field at the same Vault path without confusing the wizard.
+
+!!! warning "No CAS — concurrent writers can clobber each other"
+    The merge is not a compare-and-swap. The engine reads the current target, computes the merged result, and writes back via `KVv2.Put` without checking that the version has not changed in between. Any field a third party writes to the target path between the read and the write will be lost on the next copy refresh. The "merge, don't replace" guarantee therefore covers same-version snapshots and non-concurrent writers only; if you need stronger co-tenancy, drive the other writer through a workflow that runs while the daemon is paused, or partition fields so only one process ever writes a given path.
 
 !!! warning "Stringified preservation"
     Preserved values are stringified, not type-preserved. The engine returns `map[string]string`, so any pre-existing object, number, or boolean field at the target is JSON-marshalled to its textual form before being written back. This is intentional (dropping non-strings would lose data) but means the copy engine should not share a target path with workflows that depend on KVv2 fields keeping their original JSON type.

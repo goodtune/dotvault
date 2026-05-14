@@ -18,9 +18,12 @@ type LifecycleManager struct {
 	needsReauth    atomic.Bool
 
 	// Token file path. When the current in-memory token becomes invalid,
-	// the manager will first attempt to reload from this path (or the
-	// VAULT_TOKEN env var via ResolveToken) before signalling re-auth.
-	// Empty means no reload attempt is made.
+	// the manager will first read this file directly (and only then fall
+	// back to VAULT_TOKEN) before signalling re-auth. The file-first
+	// precedence is deliberate: VAULT_TOKEN cannot be updated from
+	// another shell, so if the env value is itself the broken token the
+	// daemon was started with, env-first ordering would loop on the
+	// same stale value. Empty means no reload attempt is made.
 	tokenFilePath string
 
 	// OnReauth, when non-nil, is invoked exactly once each time the

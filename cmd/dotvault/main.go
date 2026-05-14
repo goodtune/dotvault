@@ -706,12 +706,19 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 }
 
 // handleValidToken inspects a successful LookupSelf response and decides
-// whether to renew the token. Returns (handled=true, err=nil) when the
-// token is fresh enough to leave alone or was renewed successfully.
-// Returns (false, nil) for tokens with no TTL data (caller falls through
-// to login). On renewal failure where the token is still valid, the
-// function warns and returns (true, non-nil err) — the caller treats
-// this as "leave the token, exit clean".
+// whether to renew the token.
+//
+// Returns (handled=true, err=nil) when the token is fresh enough to leave
+// alone, is non-expiring (no TTL field, or ttl<=0 without an
+// expire_time), or was renewed successfully.
+//
+// Returns (handled=false, err=nil) when the token has actually expired
+// (ttl<=0 with a concrete expire_time) — the caller falls through to the
+// configured login flow.
+//
+// Returns (handled=true, err=non-nil) when renewal was attempted and
+// failed but the cached token is still valid; the function has already
+// warned with the absolute expiry time and the caller should exit clean.
 func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Secret) (bool, error) {
 	ttlSec, ok := readSecondsField(secret.Data, "ttl")
 	if !ok {

@@ -51,24 +51,35 @@ dotvault login [flags]
 
 ### `dotvault login-check`
 
-Intended to be wired into shell rc / login-profile scripts.
+Intended to be wired into shell rc / login-profile scripts via a thin
+wrapper that gates on interactivity, TTY, and daemon state. The binary
+trusts those preconditions and never re-checks them.
 
 ```sh
 dotvault login-check [flags]
 ```
 
-- If stdout is not a TTY, the command exits silently with status 0 so
-  non-interactive callers (cron, sshd ForceCommand, scp) never see a
-  prompt.
-- If the cached token is valid and still within the first half of its
-  creation TTL, exit clean.
-- If the cached token is valid but past the halfway mark, attempt
-  renewal. On success, exit clean. If renewal fails but the token is
-  still valid, warn with the absolute expiry time and exit 0.
-- If the cached token is missing or invalid, run the configured login
-  flow. Transient Vault/TLS/network errors warn and exit clean rather
-  than prompting. Ctrl-C exits without fanfare so the user can dismiss
-  the prompt on a fresh terminal session.
+- A suppression marker at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress`
+  is checked first (override path with `DOTVAULT_SUPPRESS_MARKER`,
+  primarily for testing). If its mtime is within
+  `DOTVAULT_SUPPRESS_HOURS` (default `6`), the command exits silently.
+  A future mtime is treated as stale so clock skew or backup restores
+  cannot lock suppression on indefinitely.
+- Otherwise: if the cached token is valid and still within the first
+  half of its creation TTL, exit clean. Past halfway, attempt renewal;
+  if renewal fails but the token is still valid, warn with the
+  absolute expiry time and exit 0. If no valid token, run the
+  configured login flow.
+- The marker is refreshed on every exit past the suppression check
+  (success, decline, failure, Ctrl+C, internal errors), so concurrent
+  shell startups only ever prompt once per window and a single Ctrl+C
+  is enough — no second Enter required.
+- Exit `0` on suppressed, success, decline, cancellation, or expected
+  authentication failure. Exit `1` only on invalid
+  `DOTVAULT_SUPPRESS_HOURS` or genuine internal errors. The shell
+  wrapper does not branch on exit code; signalling is via the marker
+  state and stderr output.
 
 ### `dotvault status`
 
@@ -107,6 +118,8 @@ project README and the Windows admin docs for details.
 | Variable | Description |
 |----------|-------------|
 | `VAULT_TOKEN` | Vault token (takes precedence over `~/.vault-token`) |
+| `DOTVAULT_SUPPRESS_HOURS` | `dotvault login-check` suppression window in whole hours (default `6`). Zero, negative, or non-integer values cause `login-check` to exit `1`. |
+| `DOTVAULT_SUPPRESS_MARKER` | Override path for the `login-check` suppression marker. Primarily used by tests; the default location is `${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress`. |
 
 ## Logging
 

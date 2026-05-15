@@ -18,6 +18,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/loginsuppress"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sync"
@@ -97,21 +98,30 @@ but driven by dotvault's loaded configuration (YAML or Group Policy).`,
 		&cobra.Command{
 			Use:   "login-check",
 			Short: "Validate cached token on interactive login, renew or re-login as needed",
-			Long: `Intended to be wired into shell rc / login-profile scripts.
+			Long: `Intended to be wired into shell rc / login-profile scripts via a thin
+wrapper that gates on interactivity, TTY, and daemon state. This binary
+trusts those preconditions and does not re-check them.
 
-If stdout is not a terminal the command exits silently with status 0 so
-non-interactive environments (cron, system services, scp) never see a
-prompt.
+Behaviour:
+  - A suppression marker at
+    ${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress
+    (overridable with DOTVAULT_SUPPRESS_MARKER) is checked first. If
+    the marker's mtime is within DOTVAULT_SUPPRESS_HOURS (default 6),
+    the command exits silently. A future mtime is treated as stale so
+    clock skew or backup restores cannot lock suppression on.
+  - Otherwise: if the cached token is valid and still within the first
+    half of its creation TTL, exit clean. Past halfway, attempt
+    renewal; if renewal fails but the token is still valid, warn with
+    the absolute expiry time. If no valid token, run the configured
+    fresh-auth flow.
+  - On every exit past the suppression check the marker is refreshed,
+    so a declined login, a failed login, an internal error, or Ctrl+C
+    all silence the next shell in the window. Ctrl+C exits immediately
+    without requiring an additional Enter.
 
-When run on an interactive terminal:
-  - If the cached token is valid and still within the first half of its
-    creation TTL, exit clean.
-  - If the cached token is valid but past the halfway point, attempt
-    renewal. If renewal succeeds, exit clean. If renewal fails but the
-    token is still valid, warn with the absolute expiry time and exit 0.
-  - If the cached token is missing or invalid, run the configured login
-    flow. Ctrl-C exits without fanfare so the user can dismiss the prompt
-    on a fresh terminal session.`,
+Exits 0 on suppressed, success, decline, cancellation, or expected
+authentication failure. Exits 1 on invalid DOTVAULT_SUPPRESS_HOURS or
+genuine internal errors.`,
 			RunE: runLoginCheck,
 		},
 		&cobra.Command{
@@ -627,20 +637,79 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runLoginCheck implements `dotvault login-check`, intended to be called
-// from a user's interactive-shell login profile. The semantics are
-// described in the command's Long help text.
+// runLoginCheck implements `dotvault login-check`, intended to be wired
+// into shell rc / login-profile scripts via a thin wrapper that handles
+// environment gating (interactive shell, TTYs, daemon active). The
+// binary trusts those preconditions and never re-checks them — see the
+// loginsuppress package and the login-check Long help for the full
+// contract.
 func runLoginCheck(cmd *cobra.Command, args []string) error {
-	// Only attach the slog default in interactive mode — non-interactive
-	// callers should be completely silent. We still log to stderr (text
-	// handler) in the interactive path so renewal/failure messages reach
-	// the operator.
-	if !isStdoutTerminal() {
-		// No tty: nothing for us to do. Exit clean rather than blocking
-		// or emitting JSON-shaped logs into the shell startup output.
+	setupLogging()
+
+	window, err := loginsuppress.Window()
+	if err != nil {
+		// Invalid DOTVAULT_SUPPRESS_HOURS: surface the problem loudly so
+		// the user fixes it. Bypass cobra's error printing so the message
+		// reads exactly as specified, and skip marker refresh — leaving
+		// the marker untouched means the next shell will also raise the
+		// error rather than masking it.
+		fmt.Fprintln(os.Stderr, "dotvault: "+err.Error())
+		os.Exit(1)
+	}
+
+	markerPath := loginsuppress.Path()
+	if loginsuppress.IsFresh(markerPath, window, time.Now()) {
+		// Suppressed: another invocation within the window already
+		// handled (or attempted) the check. Exit silently without
+		// touching the marker — refreshing here would extend
+		// suppression indefinitely under tight shell-fanout loops.
 		return nil
 	}
-	setupLogging()
+
+	// From here on every exit path refreshes the marker so the next
+	// shell startup is silent. The signal handler below explicitly
+	// refreshes too (defers do not run after os.Exit).
+	defer func() {
+		if rerr := loginsuppress.Refresh(markerPath); rerr != nil {
+			slog.Warn("failed to refresh login-check suppression marker", "error", rerr, "path", markerPath)
+		}
+	}()
+
+	// Capture the terminal state now so the SIGINT handler can restore
+	// it even if mgr.Login is mid-prompt (term.ReadPassword puts the
+	// terminal into a no-echo mode that bash cannot read out of cleanly
+	// on its own). If stdin isn't a TTY, GetState returns an error and
+	// we simply leave savedTermState nil.
+	fd := int(os.Stdin.Fd())
+	var savedTermState *term.State
+	if st, gerr := term.GetState(fd); gerr == nil {
+		savedTermState = st
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Dedicated signal handler rather than signal.NotifyContext: the
+	// password prompt inside the LDAP flow blocks in a read syscall that
+	// does not observe context cancellation, so the only reliable way
+	// to honour the "Ctrl+C exits immediately, no extra Enter" contract
+	// is to short-circuit to os.Exit from a goroutine. We restore the
+	// terminal and refresh the marker first since defers won't run.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			if savedTermState != nil {
+				_ = term.Restore(fd, savedTermState)
+				fmt.Fprintln(os.Stderr)
+			}
+			_ = loginsuppress.Refresh(markerPath)
+			os.Exit(0)
+		case <-ctx.Done():
+		}
+	}()
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -655,9 +724,6 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("create vault client: %w", err)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	tokenPath := paths.VaultTokenPath()
 	token := auth.ResolveToken(tokenPath)
@@ -737,7 +803,15 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		if loginCheckCancelled(ctx, err) {
 			return nil
 		}
-		return fmt.Errorf("login: %w", err)
+		// Login was attempted and failed for an expected reason (user
+		// declined, wrong password, auth method refused). Exit 0 so
+		// shell startup proceeds normally; the marker (refreshed via
+		// defer above) silences subsequent shells in the window.
+		hours := int(window / time.Hour)
+		fmt.Fprintf(os.Stderr,
+			"dotvault: login-check declined or failed (%v); suppressed for %dh (rm %s to retry)\n",
+			err, hours, markerPath)
+		return nil
 	}
 	return nil
 }
@@ -1127,13 +1201,6 @@ func validateYAML(data []byte) error {
 // pick the slog text vs JSON handler at startup.
 func isStderrTerminal() bool {
 	return term.IsTerminal(int(os.Stderr.Fd()))
-}
-
-// isStdoutTerminal reports whether stdout is connected to a TTY. Used by
-// `dotvault login-check` to silently no-op when invoked from a
-// non-interactive shell (cron, sshd ForceCommand, scp, etc.).
-func isStdoutTerminal() bool {
-	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether

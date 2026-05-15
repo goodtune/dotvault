@@ -62,6 +62,7 @@ internal/
   paths/                 OS-specific path resolution
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
+  loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -122,19 +123,45 @@ ignoring any cached token. It is the dotvault-config-driven analogue of
 `vault login -address … -method …` and is the natural entry point when a
 running daemon needs a new token after expiry.
 
-`dotvault login-check` is intended for interactive-shell login profiles:
+`dotvault login-check` is intended for interactive-shell login profiles
+wired in via a thin wrapper that gates on interactivity, TTY, and the
+daemon being active (`systemctl --user is-active dotvault.service`).
+The binary trusts those preconditions and never re-checks them, so the
+wrapper stays trivial and signal handling works correctly during shell
+startup.
 
-- If stdout is not a TTY the command exits silently (status 0) so
-  non-interactive callers (cron, sshd ForceCommand, scp) never see a
-  prompt.
+- A suppression marker at
+  `${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress`
+  is checked first. While its mtime is within `DOTVAULT_SUPPRESS_HOURS`
+  (positive integer, default `6`) the command exits silently with no
+  vault calls. A future mtime is treated as stale so clock skew, VM
+  snapshot rollback, or restored backups cannot lock suppression on.
+  The path can be overridden via `DOTVAULT_SUPPRESS_MARKER` (used by
+  tests). The path matches the previous shell-managed location, so
+  existing suppression state survives the rollout without migration.
+  Logic lives in `internal/loginsuppress/`.
 - If a cached token is valid and still within the first half of its
   creation TTL, exit clean.
 - If the cached token is valid but past the halfway mark, attempt renewal.
   On renewal failure where the token is still valid, warn with the
   absolute expiry time and exit 0.
 - If the cached token is missing or invalid, run the configured login
-  flow. Ctrl-C exits without fanfare (so a user can dismiss the prompt
-  on a fresh terminal without leaving an error in their scrollback).
+  flow. Ctrl-C exits immediately without requiring an extra Enter: a
+  dedicated signal handler restores the terminal state captured before
+  the password prompt, refreshes the marker, and `os.Exit(0)`s
+  (`term.ReadPassword` does not observe context cancellation, so going
+  through a goroutine + `os.Exit` is the only reliable way to honour
+  the contract).
+- The marker is refreshed on every exit past the freshness check
+  (success, decline, failure, Ctrl+C, internal errors) so concurrent
+  shells across tmux/IDE/SSH-multiplex fanout only ever prompt once
+  per window. Concurrent marker updates are intentionally
+  unsynchronised — duplicate prompts in a tight race are acceptable;
+  blocking shell startup on a `flock` is not.
+- Exits `0` for suppressed, success, decline, cancellation, or
+  expected authentication failure. Exits `1` only on invalid
+  `DOTVAULT_SUPPRESS_HOURS` or genuine internal errors. The shell
+  wrapper does not branch on exit code.
 
 The naming follows regedit's `/e` (export) and `/s` (import) directional
 convention: `reg-export` pulls policy out of the registry world into a

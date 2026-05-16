@@ -2,7 +2,9 @@
   <img src="assets/dotvault.png" alt=".vault logo" width="400">
 </p>
 
-A cross-platform daemon that runs in user context, authenticates to [HashiCorp Vault](https://www.vaultproject.io/), and performs one-way synchronisation of KVv2 secrets into local configuration files. It is intended to run as a long-lived daemon but can also be run interactively for one-off syncs.
+A cross-platform daemon that runs in user context, authenticates to [HashiCorp Vault](https://www.vaultproject.io/), and performs one-way synchronisation of KVv2 secrets into local configuration files. It is intended to run as a long-lived per-user service but can also be invoked for one-off syncs.
+
+Full documentation lives at **https://goodtune.github.io/dotvault/**.
 
 ## Why `dotvault`?
 
@@ -16,25 +18,19 @@ If you distribute system-level configuration to a fleet of machines — via NixO
 
 `dotvault` is intended to run as a per-user service. Sysops configure desktops and remote Linux machines to launch it in a user context so that each person has their own daemon, their own Vault identity, and their own secrets.
 
-On desktop environments it runs a local web service. If the current session is unauthenticated, `dotvault` launches a browser at its login page, triggering an OIDC authentication flow against Vault. When this is wired into an SSO provider, users are authenticated more or less transparently — no manual token juggling required.
-
-### Roadmap: OAuth token capture
-
-A planned feature is performing OAuth device-authorisation flows for common services such as GitHub. `dotvault` would complete the flow, capture the resulting OAuth token, persist it into Vault under the user's path, and then synchronise it out to the appropriate config files (e.g. `~/.config/gh/hosts.yml`) on every machine where `dotvault` is running. Log in once, authenticated everywhere.
-
-## Overview
-
-`dotvault` bridges the gap between centralised secret management and the dotfiles that CLI tools expect on disk. Define rules mapping Vault KV paths to local files, and `dotvault` keeps them in sync — polling for changes, merging safely, and re-syncing if files are modified or deleted externally.
+On desktop environments it can run a local web service. If the current session is unauthenticated, `dotvault` launches a browser at its login page, triggering an OIDC authentication flow against Vault. When this is wired into an SSO provider, users are authenticated more or less transparently — no manual token juggling required.
 
 ## Features
 
-- **Multiple auth methods** — OIDC (browser-based), LDAP, or token-based authentication to Vault
-- **Four output formats** — Write secrets as YAML, JSON, INI, or netrc, with deep merge support to preserve existing file content
+- **Multiple auth methods** — OIDC (browser-based), LDAP with MFA (Duo push, TOTP), or token-based authentication, with automatic token renewal at 75% TTL
+- **Six file formats** — Write secrets as YAML, JSON, INI, TOML, plain text, or netrc, each with a format-native merge strategy that preserves existing keys not managed by `dotvault`
 - **Go templates** — Optionally reshape secret data before writing, with helpers like `env`, `base64encode`, `default`, and `quote`
-- **Daemon mode** — Runs in the foreground with configurable polling intervals and automatic token refresh
-- **Web UI** — Optional local dashboard to view sync status, inspect secrets, and trigger manual syncs
+- **Hybrid event + poll sync** — Subscribes to the Vault Events API on Enterprise for sub-second reaction to changes; falls back transparently to polling on Community Vault
+- **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
+- **Web UI** — Optional loopback-only dashboard to drive login, view sync status, inspect secrets, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file
+- **Windows integration** — System-tray icon for double-click launch, plus full Group Policy support via an ADMX template (`HKLM\SOFTWARE\Policies\goodtune\dotvault`) that overrides the YAML config when present
 - **Dry-run mode** — Preview what would change without writing any files
-- **Cross-platform** — Builds for Linux, macOS, and Windows (amd64/arm64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
+- **Cross-platform** — Static, CGO-free binaries for Linux, macOS, and Windows (amd64/arm64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
 
 ## Quick start
 
@@ -56,6 +52,21 @@ Check connection and sync status:
 dotvault status
 ```
 
+### CLI commands
+
+| Command | Purpose |
+|---------|---------|
+| `dotvault run` | Run the long-lived daemon |
+| `dotvault sync` | One-shot sync cycle, then exit |
+| `dotvault login` | Force a fresh login via the configured auth method |
+| `dotvault login-check` | Validate or renew the cached token on interactive shell login |
+| `dotvault status` | Display auth state, token TTL, and per-rule sync state |
+| `dotvault reg-export` | Convert a Windows `.reg` file to YAML (or canonicalised `.reg`) |
+| `dotvault reg-import` | Convert a YAML config to a Windows `.reg` file |
+| `dotvault version` | Print build version |
+
+Global flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`.
+
 ## Configuration
 
 `dotvault` uses a YAML config file. A minimal example:
@@ -76,8 +87,14 @@ rules:
       format: yaml
       template: |
         github.com:
-          oauth_token: "{{.token}}"
+          oauth_token: "{{.oauth_token}}"
 ```
+
+Default config-file locations:
+
+- macOS: `/Library/Application Support/dotvault/config.yaml`
+- Linux: `/etc/xdg/dotvault/config.yaml`
+- Windows: `%ProgramData%\dotvault\config.yaml` (overridden by Group Policy when set)
 
 ### Vault
 
@@ -89,6 +106,7 @@ rules:
 | `user_prefix` | Prefix for per-user secret paths | `users/` |
 | `ca_cert` | Path to CA certificate for TLS | — |
 | `tls_skip_verify` | Skip TLS verification (dev only) | `false` |
+| `disable_token_renewal` | Skip `RenewSelf` calls; expiry still triggers re-auth | `false` |
 
 ### Rules
 
@@ -99,12 +117,14 @@ Each rule maps a Vault secret to a local file:
 | `name` | Unique rule identifier |
 | `vault_key` | Key in Vault (e.g. `gh` resolves to `kv/data/users/<you>/gh`) |
 | `target.path` | Local file path (supports `~`) |
-| `target.format` | One of: `yaml`, `json`, `ini`, `netrc` |
+| `target.format` | One of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc` |
 | `target.template` | Optional Go template for formatting |
+
+Managed files are written atomically at `0600`.
 
 ### Optional sections
 
-**`web`** — Enable a local web dashboard:
+**`web`** — Enable the local web dashboard (loopback-only is a hard invariant):
 
 ```yaml
 web:
@@ -112,19 +132,15 @@ web:
   listen: "127.0.0.1:9000"
 ```
 
-**`sync`** — Control polling behaviour:
-
-```yaml
-sync:
-  interval: "5m"
-```
+**`enrolments`** — Declare service enrolment engines so missing credentials are acquired interactively on first run and refreshed automatically thereafter. See the [service onboarding guides](https://goodtune.github.io/dotvault/services/overview/) for the supported engines.
 
 ## How it works
 
-1. `dotvault` authenticates to Vault using the configured auth method
-2. On each sync cycle, it reads each rule's secret from Vault
-3. If the secret version has changed (or the target file was modified/deleted), it renders the data through the optional template, merges with existing file content, and writes the result
-4. Sync state is persisted locally so unchanged secrets are skipped efficiently
+1. `dotvault` authenticates to Vault using the configured auth method and caches the token
+2. A lifecycle manager renews the token at 75% TTL and re-authenticates on expiry without restarting the daemon
+3. On each sync cycle (or on a Vault `kv-v2/data-write` event in Enterprise), it reads each rule's secret
+4. If the secret version or file checksum has changed, it renders the data through the optional template, merges with existing file content, and writes the result atomically
+5. Sync state (vault version, file checksum, timestamp) is persisted locally so unchanged secrets are skipped efficiently
 
 ## License
 

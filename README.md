@@ -22,15 +22,15 @@ On desktop environments it can run a local web service. If the current session i
 
 ## Features
 
-- **Multiple auth methods** — OIDC (browser-based), LDAP with MFA (Duo push, TOTP), or token-based authentication, with automatic token renewal at 75% TTL
-- **Six file formats** — Write secrets as YAML, JSON, INI, TOML, plain text, or netrc, each with a format-native merge strategy that preserves existing keys not managed by `dotvault`
+- **Multiple auth methods** — OIDC (browser-based), LDAP with MFA (Duo push, TOTP), or token-based authentication, with automatic token renewal and re-auth on expiry
+- **Six file formats** — Write secrets as YAML, JSON, INI, TOML, or netrc with format-native merges that preserve existing keys not managed by `dotvault`, plus a plain-text format for full-file content such as private keys and certificates
 - **Go templates** — Optionally reshape secret data before writing, with helpers like `env`, `base64encode`, `default`, and `quote`
 - **Hybrid event + poll sync** — Subscribes to the Vault Events API on Enterprise for sub-second reaction to changes; falls back transparently to polling on Community Vault
 - **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
 - **Web UI** — Optional loopback-only dashboard to drive login, view sync status, inspect secrets, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file
 - **Windows integration** — System-tray icon for double-click launch, plus full Group Policy support via an ADMX template (`HKLM\SOFTWARE\Policies\goodtune\dotvault`) that overrides the YAML config when present
 - **Dry-run mode** — Preview what would change without writing any files
-- **Cross-platform** — Static, CGO-free binaries for Linux, macOS, and Windows (amd64/arm64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
+- **Cross-platform** — Static, CGO-free binaries for Linux and macOS (amd64/arm64) and Windows (amd64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
 
 ## Quick start
 
@@ -137,7 +137,7 @@ web:
 ## How it works
 
 1. `dotvault` authenticates to Vault using the configured auth method and caches the token
-2. A lifecycle manager renews the token at 75% TTL and re-authenticates on expiry without restarting the daemon
+2. A lifecycle manager keeps the token fresh while it is valid and re-authenticates on expiry without restarting the daemon
 3. On each sync cycle (or on a Vault `kv-v2/data-write` event in Enterprise), it reads each rule's secret
 4. If the secret version or file checksum has changed, it renders the data through the optional template, merges with existing file content, and writes the result atomically
 5. Sync state (vault version, file checksum, timestamp) is persisted locally so unchanged secrets are skipped efficiently

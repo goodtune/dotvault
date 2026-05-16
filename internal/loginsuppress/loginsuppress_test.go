@@ -22,7 +22,7 @@ func TestWindow(t *testing.T) {
 		{"negative", "-1", 0, true},
 		{"non-integer", "1.5", 0, true},
 		{"alpha", "abc", 0, true},
-		{"empty-string-spaces", "  ", 0, true},
+		{"whitespace-only", "  ", 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

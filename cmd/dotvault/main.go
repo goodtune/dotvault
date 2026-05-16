@@ -644,8 +644,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 // loginsuppress package and the login-check Long help for the full
 // contract.
 func runLoginCheck(cmd *cobra.Command, args []string) error {
-	setupLogging()
-
 	window, err := loginsuppress.Window()
 	if err != nil {
 		// Invalid DOTVAULT_SUPPRESS_HOURS: surface the problem loudly so
@@ -663,8 +661,14 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		// handled (or attempted) the check. Exit silently without
 		// touching the marker — refreshing here would extend
 		// suppression indefinitely under tight shell-fanout loops.
+		// setupLogging() is deliberately deferred until past this point
+		// so the suppressed fast path performs zero side effects (no
+		// slog handler swap, no future startup-line leakage into shell
+		// scrollback).
 		return nil
 	}
+
+	setupLogging()
 
 	// From here on every exit path refreshes the marker so the next
 	// shell startup is silent. The signal handler below explicitly
@@ -695,12 +699,17 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	// to honour the "Ctrl+C exits immediately, no extra Enter" contract
 	// is to short-circuit to os.Exit from a goroutine. We restore the
 	// terminal and refresh the marker first since defers won't run.
+	// We also call cancel() — os.Exit usually wins the race, but if
+	// an in-flight Vault call happens to unwind first it will see
+	// context.Canceled and the loginCheckCancelled() backstops below
+	// can suppress its error message before exit.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 	go func() {
 		select {
 		case <-sigCh:
+			cancel()
 			if savedTermState != nil {
 				_ = term.Restore(fd, savedTermState)
 				fmt.Fprintln(os.Stderr)
@@ -747,9 +756,10 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 			// Clear it and fall through to the interactive login flow.
 			vc.SetToken("")
 		} else {
-			// Ctrl-C during LookupSelf surfaces as a wrapped
-			// context.Canceled here — exit silently to honour the
-			// command's documented "Ctrl-C without fanfare" contract.
+			// Backstop for context.Canceled: the SIGINT handler usually
+			// wins the race and os.Exits before this point, but if
+			// LookupSelf happens to unwind first we don't want a
+			// cancellation message in the shell scrollback.
 			if loginCheckCancelled(ctx, lookupErr) {
 				return nil
 			}
@@ -776,9 +786,10 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	_, healthErr := vc.ServerHealth(healthCtx)
 	healthCancel()
 	if healthErr != nil {
-		// Ctrl-C during the health probe inherits cancellation from the
-		// outer signal context. Suppress the warning in that case so the
-		// shell scrollback stays clean.
+		// Backstop for context.Canceled propagating from the outer
+		// context (cancelled by the SIGINT handler). os.Exit usually
+		// wins the race, but if the health probe unwinds first we
+		// suppress the warning to keep shell scrollback clean.
 		if loginCheckCancelled(ctx, healthErr) {
 			return nil
 		}
@@ -799,7 +810,10 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		Username:      username,
 	}
 	if err := mgr.Login(ctx); err != nil {
-		// Ctrl-C: silent exit. The user dismissed the prompt knowingly.
+		// Backstop for context.Canceled. The SIGINT handler normally
+		// reaches os.Exit before mgr.Login returns, so this branch
+		// only fires if a Vault-side cancellation unwinds first;
+		// either way we exit silently.
 		if loginCheckCancelled(ctx, err) {
 			return nil
 		}
@@ -876,9 +890,11 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 	}
 
 	if _, err := vc.RenewSelf(ctx, 0); err != nil {
-		// Ctrl-C during renewal: exit silently (the command's documented
-		// contract), leaving the cached token in place — it's still
-		// valid, just not yet renewed this session.
+		// Backstop for context.Canceled (the SIGINT handler cancels
+		// the outer context before os.Exit, but the race usually goes
+		// to os.Exit). If RenewSelf does happen to unwind first, exit
+		// silently and leave the cached token alone — it's still valid,
+		// just not yet renewed this session.
 		if loginCheckCancelled(ctx, err) {
 			return true, err
 		}
@@ -891,11 +907,12 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 	return true, nil
 }
 
-// loginCheckCancelled reports whether err is a context-cancellation
-// (i.e. the user pressed Ctrl-C). Used at every login-check error site
-// to honour the command's "Ctrl-C exits without fanfare" contract — a
-// cancelled lookup, health probe, or renewal must not leave warnings
-// in the shell's startup scrollback.
+// loginCheckCancelled reports whether err is a context-cancellation.
+// The login-check SIGINT handler primarily exits via os.Exit(0), but it
+// also cancel()s the outer context — this helper is a backstop at every
+// in-flight Vault call site for the rare race where the call unwinds
+// before os.Exit lands, suppressing the would-be warning so shell
+// startup scrollback stays clean.
 func loginCheckCancelled(ctx context.Context, err error) bool {
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return true

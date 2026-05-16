@@ -644,6 +644,21 @@ func runLogin(cmd *cobra.Command, args []string) error {
 // loginsuppress package and the login-check Long help for the full
 // contract.
 func runLoginCheck(cmd *cobra.Command, args []string) error {
+	// Catch SIGINT before any other work so a Ctrl+C arriving during
+	// setup (env parse, marker stat, term.GetState) cannot fall through
+	// to Go's default handler and bypass the terminal-restore +
+	// marker-refresh contract. The handler goroutine is started later,
+	// once it has marker path / saved terminal state to act on; signals
+	// arriving before then sit in the buffered channel and are picked
+	// up the moment the goroutine starts. We register only SIGINT
+	// because the contract is exclusively about user-initiated
+	// cancellation — SIGTERM from a session/process manager should
+	// follow Go's default (terminate with non-zero status) rather than
+	// silently extending suppression as if the check succeeded.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
 	window, err := loginsuppress.Window()
 	if err != nil {
 		// Invalid DOTVAULT_SUPPRESS_HOURS: surface the problem loudly so
@@ -693,19 +708,15 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Dedicated signal handler rather than signal.NotifyContext: the
-	// password prompt inside the LDAP flow blocks in a read syscall that
-	// does not observe context cancellation, so the only reliable way
-	// to honour the "Ctrl+C exits immediately, no extra Enter" contract
-	// is to short-circuit to os.Exit from a goroutine. We restore the
-	// terminal and refresh the marker first since defers won't run.
-	// We also call cancel() — os.Exit usually wins the race, but if
-	// an in-flight Vault call happens to unwind first it will see
-	// context.Canceled and the loginCheckCancelled() backstops below
-	// can suppress its error message before exit.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
+	// Now start the handler goroutine. It also calls cancel() — os.Exit
+	// usually wins the race, but if an in-flight Vault call happens to
+	// unwind first it will see context.Canceled and the
+	// loginCheckCancelled() backstops below can suppress its error
+	// message before exit. The password prompt inside the LDAP flow
+	// blocks in a read syscall that does not observe context
+	// cancellation, so the only reliable way to honour the
+	// "Ctrl+C exits immediately, no extra Enter" contract is to
+	// short-circuit to os.Exit from this goroutine.
 	go func() {
 		select {
 		case <-sigCh:

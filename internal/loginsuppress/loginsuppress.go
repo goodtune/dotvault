@@ -63,7 +63,10 @@ func Window() (time.Duration, error) {
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("invalid %s: must be a positive integer", envHours)
+		// Echo the offending value so the diagnostic is actionable in
+		// shell scrollback even when the user has forgotten what (or
+		// where) the variable was set.
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive integer", envHours, raw)
 	}
 	return time.Duration(n) * time.Hour, nil
 }

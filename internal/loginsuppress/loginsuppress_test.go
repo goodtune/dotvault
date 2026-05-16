@@ -68,10 +68,14 @@ func TestPath_XDGStateHome(t *testing.T) {
 func TestPath_HomeFallback(t *testing.T) {
 	unsetenv(t, envMarker)
 	unsetenv(t, "XDG_STATE_HOME")
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("no home directory available")
-	}
+
+	// Pin HOME (and USERPROFILE on Windows) to a temp dir so the
+	// assertion is deterministic and cannot accidentally agree with
+	// whatever the developer's real home directory contains.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
 	want := filepath.Join(home, ".local", "state", dirName, fileName)
 	if got := Path(); got != want {
 		t.Errorf("Path() = %q, want %q", got, want)

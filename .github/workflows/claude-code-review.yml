@@ -21,8 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
       id-token: write
 
     steps:
@@ -38,7 +38,28 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          prompt: |
+            You are orchestrating a council of reviewers for ${{ github.repository }}/pull/${{ github.event.pull_request.number }}.
+
+            First, read the PR diff, description, and the CLAUDE.md project guide so every persona shares the same context. Then dispatch the following personas IN PARALLEL via the Agent tool (single message, multiple Agent tool calls). Each persona is independent — do not chain them.
+
+            Personas (run each as its own Agent call):
+            1. Security reviewer — credential handling, file permissions (0600 invariants), CSRF/CSP on the web UI, loopback-only invariant, secrets in logs, registry/DACL on Windows, OAuth flows, template injection.
+            2. Architecture reviewer — package boundaries (internal/auth, sync, enrol, handlers, web), interface contracts (FileHandler, Engine, Refresher, Watcher, SettingsFielder), lifecycle ordering in the daemon, error handling vs. project conventions in CLAUDE.md.
+            3. Cross-platform / portability reviewer — Linux/macOS/Windows behaviour, CGO_ENABLED=0 invariant, path resolution (XDG vs %ProgramData% vs Application Support), Windows subsystem (console vs GUI), registry-vs-YAML config parity, atomic writes, signal handling.
+            4. Test & correctness reviewer — coverage of the changed code, table-driven idioms, integration-vs-unit balance, flake risk, missing edge cases the diff implies, whether `make test` would actually catch a regression in the touched area.
+            5. Docs & DX reviewer — CLAUDE.md / README / docs/ alignment with the change, CLI help text, config validation messages, breaking-change call-outs, dependabot/ecosystem entries when new manifests appear.
+
+            Brief each persona with: PR number, the diff, the relevant CLAUDE.md sections, and an instruction to report in under 250 words with concrete file:line references and a severity tag (blocker / major / minor / nit). Tell each persona to suppress "no findings" filler — if there is nothing to say, return a single line saying so.
+
+            When all personas return, consolidate into ONE PR review:
+            - Open with a 2-3 sentence summary of the PR's intent and overall verdict.
+            - Group findings by severity (blocker → major → minor → nit), not by persona.
+            - For each finding cite file:line and tag the originating persona in parentheses.
+            - Drop personas that reported nothing — do not list them.
+            - End with a short "what I checked" line so the author knows the breadth of the pass.
+
+            Post the consolidated review as a single PR review (not a top-level issue comment). Do not push code changes or open follow-up issues.
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 

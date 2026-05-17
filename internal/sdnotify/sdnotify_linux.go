@@ -54,13 +54,26 @@ func Stopping() error {
 
 // WatchdogLoop kicks WATCHDOG=1 at half the interval declared by
 // WATCHDOG_USEC. Returns when ctx is cancelled, when WATCHDOG_USEC is
-// unset/unparseable, or when NOTIFY_SOCKET is unset (in which case
-// every kick would no-op anyway and the spinning goroutine has no
-// purpose). The half-interval pacing matches the systemd manual
-// recommendation.
+// unset/unparseable, when NOTIFY_SOCKET is unset (in which case every
+// kick would no-op anyway and the spinning goroutine has no purpose),
+// or when WATCHDOG_PID is set and doesn't match the current PID.
+//
+// systemd uses WATCHDOG_PID to scope the watchdog to a specific
+// process in a multi-process service (e.g. a supervisor that forks
+// workers). Without the PID check, a child process that inherits
+// the env vars would also try to kick the watchdog, which is at
+// best wasted IPC and at worst masks a stalled main process.
+//
+// The half-interval pacing matches the systemd manual recommendation.
 func WatchdogLoop(ctx context.Context) {
 	if os.Getenv("NOTIFY_SOCKET") == "" {
 		return
+	}
+	if pidStr := os.Getenv("WATCHDOG_PID"); pidStr != "" {
+		wantPID, err := strconv.Atoi(pidStr)
+		if err != nil || wantPID != os.Getpid() {
+			return
+		}
 	}
 	raw := os.Getenv("WATCHDOG_USEC")
 	if raw == "" {

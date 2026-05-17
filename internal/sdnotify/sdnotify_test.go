@@ -95,6 +95,34 @@ func TestNotifyDeliversToAbstractSocket(t *testing.T) {
 	}
 }
 
+// TestWatchdogLoopHonoursWATCHDOG_PID verifies that the loop exits
+// immediately when WATCHDOG_PID is set to a PID that isn't ours.
+// This protects against a forked child process (or a misconfigured
+// supervisor) kicking the watchdog on behalf of someone else.
+func TestWatchdogLoopHonoursWATCHDOG_PID(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sd_notify is Linux-only")
+	}
+	t.Setenv("NOTIFY_SOCKET", "/tmp/fake-socket")
+	t.Setenv("WATCHDOG_USEC", "1000000")
+	// PID 1 is almost certainly not us.
+	t.Setenv("WATCHDOG_PID", "1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		WatchdogLoop(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good — returned without waiting for the ticker
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("WatchdogLoop did not exit when WATCHDOG_PID mismatched current PID")
+	}
+}
+
 // TestWatchdogLoopExitsOnCancel confirms the watchdog ticker honours
 // context cancellation (both as a fast-return when WATCHDOG_USEC is
 // unset and as a normal teardown when it isn't). Without this the

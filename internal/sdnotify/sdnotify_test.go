@@ -3,8 +3,10 @@ package sdnotify
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -105,8 +107,10 @@ func TestWatchdogLoopHonoursWATCHDOG_PID(t *testing.T) {
 	}
 	t.Setenv("NOTIFY_SOCKET", "/tmp/fake-socket")
 	t.Setenv("WATCHDOG_USEC", "1000000")
-	// PID 1 is almost certainly not us.
-	t.Setenv("WATCHDOG_PID", "1")
+	// os.Getpid()+1 is provably not us. Hard-coding "1" would
+	// false-pass in containers (Docker default PID namespace,
+	// many CI runners) where the test process *is* PID 1.
+	t.Setenv("WATCHDOG_PID", strconv.Itoa(os.Getpid()+1))
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

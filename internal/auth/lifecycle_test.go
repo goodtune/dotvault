@@ -328,12 +328,24 @@ func TestLifecycleManager_BaselineResetsOnTokenSwap(t *testing.T) {
 
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 
+	// readBaseline acquires baselineMu before snapshotting the
+	// field. The test calls checkAndRenew synchronously so there
+	// isn't an actual race today, but the field is documented as
+	// mutex-guarded and bare reads here would diverge from that
+	// contract — making the test the first thing to break if the
+	// guarded-access invariant slips elsewhere.
+	readBaseline := func() time.Duration {
+		lm.baselineMu.Lock()
+		defer lm.baselineMu.Unlock()
+		return lm.baselineTTL
+	}
+
 	// First, drive a check with the long token so the baseline anchors at 3600s.
 	if err := lm.checkAndRenew(context.Background()); err != nil {
 		t.Fatalf("checkAndRenew (long): %v", err)
 	}
-	if lm.baselineTTL != time.Hour {
-		t.Fatalf("baselineTTL = %v, want 1h after long-token observation", lm.baselineTTL)
+	if got := readBaseline(); got != time.Hour {
+		t.Fatalf("baselineTTL = %v, want 1h after long-token observation", got)
 	}
 
 	// Now swap the in-memory token to a shorter-TTL one. The
@@ -343,8 +355,8 @@ func TestLifecycleManager_BaselineResetsOnTokenSwap(t *testing.T) {
 	if err := lm.checkAndRenew(context.Background()); err != nil {
 		t.Fatalf("checkAndRenew (short): %v", err)
 	}
-	if lm.baselineTTL != 300*time.Second {
-		t.Errorf("baselineTTL after swap = %v, want 5m (baseline should have reset and rebound to the new token's TTL)", lm.baselineTTL)
+	if got := readBaseline(); got != 300*time.Second {
+		t.Errorf("baselineTTL after swap = %v, want 5m (baseline should have reset and rebound to the new token's TTL)", got)
 	}
 	if renews.Load() != 0 {
 		t.Errorf("RenewSelf fired %d time(s) after token swap; oversized baseline leaked through", renews.Load())

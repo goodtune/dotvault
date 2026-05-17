@@ -143,6 +143,16 @@ sensitive (e.g. an OTLP bearer token in `OTEL_EXPORTER_OTLP_HEADERS`).
 Create the file with `chmod 600`; all four are silently ignored if
 absent.
 
+!!! note "`%h` vs `~` in custom unit drop-ins"
+    The packaged unit references the per-user paths as
+    `%h/.config/dotvault/env` and `%h/.config/dotvault.env`. `%h`
+    is systemd's home-directory specifier — equivalent to `~` when
+    you're creating the file at the shell. If you reference the
+    file from a `systemctl --user edit` drop-in or a custom unit,
+    write `%h` (or `${HOME}`); systemd does **not** expand `~` in
+    `EnvironmentFile=` directives, so a literal `~/.config/...`
+    would be silently skipped.
+
 The unit hard-codes a couple of system paths that the package owns:
 `ExecStart=/usr/bin/dotvault run`, plus the `EnvironmentFile=` paths
 listed above. If you install dotvault into a non-standard location

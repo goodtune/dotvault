@@ -321,19 +321,22 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Defence-in-depth: reject CR/LF in observability header values
-	// and CR/LF/`:` in header names. Runs unconditionally — outside
-	// the `Enabled` guard — so a config that's toggled on later
-	// (e.g. via env-var-driven enablement or a future feature flag)
-	// starts from a sanitised baseline. The OTel SDK itself doesn't
-	// validate these characters; catching them here surfaces the
-	// problem at startup rather than at first export.
+	// Defence-in-depth: reject CR/LF/NUL in observability header
+	// values and CR/LF/NUL/`:` in header names. Runs unconditionally
+	// — outside the `Enabled` guard — so a config that's toggled on
+	// later (e.g. via env-var-driven enablement or a future feature
+	// flag) starts from a sanitised baseline. The OTel SDK itself
+	// doesn't validate these characters; catching them here
+	// surfaces the problem at startup. CR/LF block plain HTTP
+	// header smuggling; NUL is rejected because HTTP/2 and gRPC
+	// treat it as a field terminator in some implementations and
+	// proxies vary in handling.
 	for k, v := range c.Observability.Headers {
-		if strings.ContainsAny(k, "\r\n:") {
-			return fmt.Errorf("observability.headers: key %q must not contain CR, LF, or colon", k)
+		if strings.ContainsAny(k, "\r\n:\x00") {
+			return fmt.Errorf("observability.headers: key %q must not contain CR, LF, NUL, or colon", k)
 		}
-		if strings.ContainsAny(v, "\r\n") {
-			return fmt.Errorf("observability.headers[%q]: value must not contain CR or LF", k)
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("observability.headers[%q]: value must not contain CR, LF, or NUL", k)
 		}
 	}
 

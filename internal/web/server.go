@@ -303,8 +303,8 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			// holds for both the handler-level errors and the
 			// middleware-level rejection.
 			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
-				w.Header().Set("Cache-Control", "no-store")
-				w.Header().Set("Pragma", "no-cache")
+				rw.Header().Set("Cache-Control", "no-store")
+				rw.Header().Set("Pragma", "no-cache")
 				writeError(rw, "forbidden host", http.StatusForbidden)
 			} else {
 				http.Error(rw, "forbidden host", http.StatusForbidden)

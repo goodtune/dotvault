@@ -334,14 +334,17 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	baselineTTL := lm.baselineTTL
 	lm.baselineMu.Unlock()
 
+	// baseline is guaranteed positive here: the ttl<=0 early-return
+	// above means ttl is positive, and lm.baselineTTL was just
+	// max()'d up to ttl. The earlier draft had a `15 * time.Minute`
+	// floor for the "no baseline information at all" case, but the
+	// baselineTTL cache makes that branch unreachable — drop it
+	// rather than carry dead code.
 	baseline := creationTTL
 	if baseline <= 0 {
 		baseline = baselineTTL
 	}
 	renewThreshold := baseline / 4
-	if baseline <= 0 {
-		renewThreshold = 15 * time.Minute
-	}
 	if ttl <= renewThreshold && renewable && !lm.disableRenewal {
 		slog.Info("renewing token", "ttl_remaining", ttl)
 		_, err := lm.client.RenewSelf(ctx, 0)

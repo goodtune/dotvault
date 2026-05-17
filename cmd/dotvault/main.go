@@ -263,6 +263,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
+	// Zero out the bearer-token map now that the SDK has
+	// consumed it. cfg lives for the daemon's full lifetime;
+	// keeping Headers in the heap-resident Config struct gives a
+	// future log statement, JSON encoder, or debug handler a
+	// path to exfiltrate the credential. The OTel SDK keeps its
+	// own copy internally.
+	cfg.Observability.Headers = nil
 
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
@@ -558,6 +565,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// future cycles will retry; we don't want a single transient
 	// error to wedge readiness forever.
 	afterInitial := func() {
+		// The engine already gates on ctx.Err() before calling
+		// the hook, but a future refactor that invokes it via
+		// another path could bypass that guard. Re-check here so
+		// we never sequence READY=1 → STOPPING=1 in the same
+		// systemd start-up window — that confuses unit-state
+		// accounting and any After=dotvault.service ordering.
+		if ctx.Err() != nil {
+			return
+		}
 		if webServer != nil {
 			webServer.MarkInitialSyncComplete()
 		}
@@ -635,6 +651,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// exits.
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
+	// Zero out the bearer-token map post-Init for the same
+	// reason as the daemon path — keep credentials out of the
+	// heap-resident Config struct.
+	cfg.Observability.Headers = nil
 
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {

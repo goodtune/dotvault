@@ -114,7 +114,12 @@ func (e *Engine) RunLoop(ctx context.Context, opts ...RunLoopOption) error {
 	if err := e.RunOnce(ctx); err != nil {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
-	if cfg.afterInitialSync != nil {
+	// Don't fire the readiness hook if ctx has been cancelled
+	// during the initial RunOnce. Signalling sd_notify(READY=1) /
+	// flipping the web /readyz flag mid-shutdown would
+	// incorrectly unblock systemd dependencies or k8s
+	// readinessProbe consumers right before the daemon exits.
+	if cfg.afterInitialSync != nil && ctx.Err() == nil {
 		cfg.afterInitialSync()
 	}
 	return e.runLoopAfterInitial(ctx)

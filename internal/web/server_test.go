@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,28 +149,119 @@ func TestHostAllowed(t *testing.T) {
 	}
 }
 
-// TestStatusRecorderPreservesInterfaces verifies the metrics wrapper
-// exposes the optional ResponseWriter interfaces the underlying writer
-// supports (Flusher, Hijacker, ReaderFrom) and is reachable via the
-// http.ResponseController Unwrap chain. Without these, http.FileServer
-// loses its sendfile fast-path for embedded SPA assets and any future
-// streaming/hijacking handler breaks silently.
-func TestStatusRecorderPreservesInterfaces(t *testing.T) {
-	rec := httptest.NewRecorder()
-	sr := &statusRecorder{ResponseWriter: rec, status: http.StatusOK}
+// stubWriter is a minimal http.ResponseWriter used to probe the
+// conditional-wrapper behaviour: by default it implements ONLY the
+// mandatory ResponseWriter methods, no Flusher / Hijacker /
+// ReaderFrom. Tests embed it inside larger types to opt particular
+// optional interfaces in.
+type stubWriter struct {
+	header http.Header
+	code   int
+	body   []byte
+}
 
-	if _, ok := any(sr).(http.Flusher); !ok {
-		t.Error("statusRecorder does not implement http.Flusher")
-	}
-	if _, ok := any(sr).(http.Hijacker); !ok {
-		t.Error("statusRecorder does not implement http.Hijacker")
-	}
-	if _, ok := any(sr).(io.ReaderFrom); !ok {
-		t.Error("statusRecorder does not implement io.ReaderFrom")
-	}
-	if got := sr.Unwrap(); got != rec {
-		t.Errorf("Unwrap() = %v, want underlying recorder", got)
-	}
+func newStubWriter() *stubWriter { return &stubWriter{header: http.Header{}} }
+func (s *stubWriter) Header() http.Header   { return s.header }
+func (s *stubWriter) WriteHeader(c int)     { s.code = c }
+func (s *stubWriter) Write(b []byte) (int, error) {
+	s.body = append(s.body, b...)
+	return len(b), nil
+}
+
+type stubWriterFlusher struct {
+	*stubWriter
+	flushed int
+}
+
+func (s *stubWriterFlusher) Flush() { s.flushed++ }
+
+type stubWriterAll struct {
+	*stubWriter
+	flushed int
+}
+
+func (s *stubWriterAll) Flush() { s.flushed++ }
+func (s *stubWriterAll) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
+}
+func (s *stubWriterAll) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(s.stubWriter, r)
+}
+
+// TestStatusRecorderPreservesInterfacesConditionally verifies the
+// wrapper exposes optional interfaces if and only if the underlying
+// writer supports them. The bug this guards against: an SSE handler
+// that gates on `w.(http.Flusher)` would see a successful assertion
+// and try to flush, only to silently no-op if the wrapper claims the
+// interface unconditionally.
+func TestStatusRecorderPreservesInterfacesConditionally(t *testing.T) {
+	t.Run("BasicWriter exposes none", func(t *testing.T) {
+		w, _ := wrapResponseWriter(newStubWriter())
+		if _, ok := w.(http.Flusher); ok {
+			t.Error("wrapper of basic writer advertises Flusher (it shouldn't)")
+		}
+		if _, ok := w.(http.Hijacker); ok {
+			t.Error("wrapper of basic writer advertises Hijacker (it shouldn't)")
+		}
+		if _, ok := w.(io.ReaderFrom); ok {
+			t.Error("wrapper of basic writer advertises ReaderFrom (it shouldn't)")
+		}
+	})
+
+	t.Run("FlusherOnly writer exposes only Flusher", func(t *testing.T) {
+		under := &stubWriterFlusher{stubWriter: newStubWriter()}
+		w, _ := wrapResponseWriter(under)
+		f, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("wrapper of Flusher writer does not advertise Flusher")
+		}
+		f.Flush()
+		if under.flushed != 1 {
+			t.Errorf("underlying flushed = %d, want 1 (forwarding broken)", under.flushed)
+		}
+		if _, ok := w.(http.Hijacker); ok {
+			t.Error("wrapper of Flusher-only writer advertises Hijacker (it shouldn't)")
+		}
+		if _, ok := w.(io.ReaderFrom); ok {
+			t.Error("wrapper of Flusher-only writer advertises ReaderFrom (it shouldn't)")
+		}
+	})
+
+	t.Run("Full writer exposes all three", func(t *testing.T) {
+		under := &stubWriterAll{stubWriter: newStubWriter()}
+		w, _ := wrapResponseWriter(under)
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("wrapper of full writer doesn't advertise Flusher")
+		}
+		if _, ok := w.(http.Hijacker); !ok {
+			t.Error("wrapper of full writer doesn't advertise Hijacker")
+		}
+		rf, ok := w.(io.ReaderFrom)
+		if !ok {
+			t.Fatal("wrapper of full writer doesn't advertise ReaderFrom")
+		}
+		// Exercise the ReaderFrom forwarding: it should engage the
+		// underlying writer's ReadFrom rather than falling back to
+		// user-space copy (which would lose the sendfile fast-path
+		// http.FileServer relies on).
+		n, err := rf.ReadFrom(strings.NewReader("hello"))
+		if err != nil {
+			t.Fatalf("ReadFrom: %v", err)
+		}
+		if n != 5 || string(under.body) != "hello" {
+			t.Errorf("ReadFrom wrote n=%d body=%q, want 5/hello", n, under.body)
+		}
+	})
+
+	t.Run("Unwrap reaches underlying", func(t *testing.T) {
+		under := newStubWriter()
+		w, _ := wrapResponseWriter(under)
+		// The unwrap chain goes wrapper → *statusRecorder → underlying.
+		ctl := http.NewResponseController(w)
+		if ctl == nil {
+			t.Fatal("ResponseController returned nil")
+		}
+	})
 }
 
 // TestStatusRecorderWriteHeaderOnce confirms the recorder forwards

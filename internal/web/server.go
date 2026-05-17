@@ -222,14 +222,17 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
 		// Wrap the writer so the metrics middleware can read back the
-		// status. Defer the metric record so it fires on every exit
-		// path (handler return, panic recovery from net/http, etc.).
-		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		// status. wrapResponseWriter returns a variant that exposes
+		// only the optional interfaces (Flusher / Hijacker /
+		// ReaderFrom) that the underlying writer actually implements,
+		// so handlers gating SSE / WebSocket behaviour on
+		// `w.(http.Flusher)` etc. get an accurate assertion.
+		rw, rec := wrapResponseWriter(w)
 		defer func() {
 			observability.RecordWebRequest(
 				r.Context(),
 				routeLabel(r.URL.Path),
-				statusClass(rw.status),
+				statusClass(rec.status),
 			)
 		}()
 
@@ -263,16 +266,16 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 	})
 }
 
-// statusRecorder is a thin http.ResponseWriter wrapper that captures
-// the response status so the middleware can record it as a metric
-// attribute. WriteHeader is called at most once by net/http convention.
-//
-// The wrapper preserves the optional interfaces (http.Flusher,
-// http.Hijacker, io.ReaderFrom) that the underlying writer typically
-// implements, so http.FileServer's sendfile fast-path keeps working
-// for the embedded SPA assets and WebSocket handlers can still hijack
-// the connection. Unwrap is also exposed so http.NewResponseController
-// can reach the underlying writer for newer APIs.
+// statusRecorder is the bare http.ResponseWriter wrapper that
+// captures the response status so the middleware can record it as a
+// metric attribute. It implements only the mandatory ResponseWriter
+// methods plus Unwrap; the optional interfaces (Flusher / Hijacker /
+// ReaderFrom) are added at construction time by wrapResponseWriter,
+// which picks one of the 8 statusRecorder* variants below based on
+// what the underlying writer supports. The middleware-wrapper
+// pattern matches what httpsnoop, go-chi and gorilla/mux use: it's
+// the only way Go's static dispatch can give handlers an honest
+// answer to assertions like `w.(http.Flusher)`.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -306,40 +309,111 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// Flush implements http.Flusher when the underlying writer does. The
-// SPA file server doesn't use it directly, but Server-Sent-Events-style
-// handlers in tests rely on it.
-func (s *statusRecorder) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// Hijack implements http.Hijacker when the underlying writer does, so
-// any handler that needs to take over the connection (e.g. a future
-// WebSocket route) is not broken by the metrics wrapper.
-func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
-	}
-	return nil, nil, http.ErrNotSupported
-}
-
-// ReadFrom implements io.ReaderFrom when the underlying writer does.
-// http.FileServer relies on this to engage net/http's sendfile
-// fast-path for static asset delivery; without forwarding we'd silently
-// fall back to user-space copy through Write. Make sure WriteHeader has
-// been recorded before delegating, matching what the unwrapped writer
-// would have done implicitly on the first byte.
-func (s *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+// recordWriteHeader is the internal hook for the ReaderFrom variants,
+// which need to record an implicit 200 just like Write does before
+// they hand the io.Reader off to the underlying writer's ReadFrom.
+func (s *statusRecorder) recordWriteHeader() {
 	if !s.wroteHeader {
 		s.status = http.StatusOK
 		s.wroteHeader = true
 	}
-	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
+}
+
+// wrapResponseWriter returns a ResponseWriter that wraps w with
+// metrics-status capture and exposes exactly the optional interface
+// set w itself implements. The second return value is the underlying
+// recorder so callers can read back the captured status — the
+// wrapped interface value would hide it behind a concrete variant.
+//
+// The 8-way switch mirrors the well-known middleware pattern (see
+// httpsnoop, go-chi). Each variant embeds *statusRecorder so the
+// mandatory ResponseWriter methods (Header, Write, WriteHeader) and
+// Unwrap promote through; each adds explicit forwarding methods for
+// the optional interfaces it claims.
+func wrapResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *statusRecorder) {
+	sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	_, isF := w.(http.Flusher)
+	_, isH := w.(http.Hijacker)
+	_, isRF := w.(io.ReaderFrom)
+	switch {
+	case isF && isH && isRF:
+		return &statusRecorderFHR{statusRecorder: sr}, sr
+	case isF && isH:
+		return &statusRecorderFH{statusRecorder: sr}, sr
+	case isF && isRF:
+		return &statusRecorderFR{statusRecorder: sr}, sr
+	case isH && isRF:
+		return &statusRecorderHR{statusRecorder: sr}, sr
+	case isF:
+		return &statusRecorderF{statusRecorder: sr}, sr
+	case isH:
+		return &statusRecorderH{statusRecorder: sr}, sr
+	case isRF:
+		return &statusRecorderR{statusRecorder: sr}, sr
+	default:
+		return sr, sr
 	}
-	return io.Copy(s.ResponseWriter, r)
+}
+
+// statusRecorderF wraps a writer that implements http.Flusher only.
+type statusRecorderF struct{ *statusRecorder }
+
+func (s *statusRecorderF) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+
+// statusRecorderH wraps a writer that implements http.Hijacker only.
+type statusRecorderH struct{ *statusRecorder }
+
+func (s *statusRecorderH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+// statusRecorderR wraps a writer that implements io.ReaderFrom only.
+type statusRecorderR struct{ *statusRecorder }
+
+func (s *statusRecorderR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderFH wraps a writer that implements Flusher + Hijacker.
+type statusRecorderFH struct{ *statusRecorder }
+
+func (s *statusRecorderFH) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+// statusRecorderFR wraps a writer that implements Flusher + ReaderFrom.
+type statusRecorderFR struct{ *statusRecorder }
+
+func (s *statusRecorderFR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderHR wraps a writer that implements Hijacker + ReaderFrom.
+type statusRecorderHR struct{ *statusRecorder }
+
+func (s *statusRecorderHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (s *statusRecorderHR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderFHR wraps a writer that implements all three optional
+// interfaces — the common case under net/http's standard server.
+type statusRecorderFHR struct{ *statusRecorder }
+
+func (s *statusRecorderFHR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (s *statusRecorderFHR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
 }
 
 // statusClass returns a bounded label (1xx/2xx/3xx/4xx/5xx) so the

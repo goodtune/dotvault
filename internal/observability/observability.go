@@ -218,7 +218,11 @@ func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) 
 		}
 		return otlpmetrichttp.New(ctx, opts...)
 	default:
-		return nil, fmt.Errorf("unsupported observability protocol %q (use grpc or http/protobuf)", cfg.Protocol)
+		// Report the *resolved* protocol — when cfg.Protocol was
+		// empty and we picked the value up from OTEL_EXPORTER_OTLP_*
+		// env vars, that's the value the operator actually has in
+		// flight, not the empty config field.
+		return nil, fmt.Errorf("unsupported observability protocol %q (use grpc or http/protobuf)", protocol)
 	}
 }
 

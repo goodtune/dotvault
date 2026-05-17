@@ -57,10 +57,10 @@ func TestInitBadProtocol(t *testing.T) {
 	}
 }
 
-// TestProtocolFalthroughToEnv confirms an empty cfg.Protocol picks
+// TestProtocolFallthroughToEnv confirms an empty cfg.Protocol picks
 // up the OTel env-var convention. The metrics-specific override wins
 // over the generic one, matching the SDK's documented precedence.
-func TestProtocolFalthroughToEnv(t *testing.T) {
+func TestProtocolFallthroughToEnv(t *testing.T) {
 	// Pointing at an unreachable collector with a short context means
 	// the test exits quickly while still exercising the protocol
 	// selection. We don't need the export to succeed — we only care

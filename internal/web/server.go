@@ -13,6 +13,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -118,6 +119,14 @@ func (s *Server) registerRoutes() {
 	// Auth routes — Token
 	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
 
+	// Health probes. /healthz reports liveness — the daemon is running
+	// and able to serve. /readyz reports readiness — the daemon has
+	// completed Vault auth and is mid-sync (or further along). Both are
+	// loopback-only and return JSON so the OTel httpcheckreceiver can
+	// scrape state regardless of platform.
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+
 	// API routes
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
 	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
@@ -205,6 +214,18 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
+		// Wrap the writer so the metrics middleware can read back the
+		// status. Defer the metric record so it fires on every exit
+		// path (handler return, panic recovery from net/http, etc.).
+		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			observability.RecordWebRequest(
+				r.Context(),
+				routeLabel(r.URL.Path),
+				statusClass(rw.status),
+			)
+		}()
+
 		// DNS-rebinding defence. The listener is loopback-only by hard
 		// invariant (paths.ValidateLoopback), but a hostile origin can
 		// still resolve a name like rebound.attacker.test to 127.0.0.1
@@ -225,14 +246,89 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
 				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Pragma", "no-cache")
-				writeError(w, "forbidden host", http.StatusForbidden)
+				writeError(rw, "forbidden host", http.StatusForbidden)
 			} else {
-				http.Error(w, "forbidden host", http.StatusForbidden)
+				http.Error(rw, "forbidden host", http.StatusForbidden)
 			}
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(rw, r)
 	})
+}
+
+// statusRecorder is a thin http.ResponseWriter wrapper that captures
+// the response status so the middleware can record it as a metric
+// attribute. WriteHeader is called at most once by net/http convention.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		s.status = http.StatusOK
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// statusClass returns a bounded label (1xx/2xx/3xx/4xx/5xx) so the
+// time-series cardinality stays low. Out-of-range statuses (e.g. a
+// handler that wrote a zero status) collapse to "unknown".
+func statusClass(code int) string {
+	switch {
+	case code >= 100 && code < 200:
+		return "1xx"
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500 && code < 600:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}
+
+// routeLabel maps request paths onto a small set of bounded route
+// templates so the metric cardinality stays under control. Paths that
+// don't match a known prefix collapse to "other".
+func routeLabel(p string) string {
+	switch {
+	case p == "/":
+		return "/"
+	case p == "/healthz":
+		return "/healthz"
+	case p == "/readyz":
+		return "/readyz"
+	case strings.HasPrefix(p, "/auth/oidc/"):
+		return "/auth/oidc/*"
+	case strings.HasPrefix(p, "/auth/ldap/"):
+		return "/auth/ldap/*"
+	case strings.HasPrefix(p, "/auth/token/"):
+		return "/auth/token/*"
+	case strings.HasPrefix(p, "/api/v1/secrets/"):
+		return "/api/v1/secrets/*"
+	case strings.HasPrefix(p, "/api/v1/oauth/"):
+		return "/api/v1/oauth/*"
+	case strings.HasPrefix(p, "/api/v1/enrol/"):
+		return "/api/v1/enrol/*"
+	case strings.HasPrefix(p, "/api/v1/"):
+		return p
+	default:
+		return "other"
+	}
 }
 
 // hostAllowed reports whether r.Host names a loopback identity. It strips

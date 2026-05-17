@@ -146,6 +146,76 @@ func TestHostAllowed(t *testing.T) {
 	}
 }
 
+// TestHealthAndReadyEndpoints verifies the two probes round-trip:
+// /healthz always returns 200 (the daemon is alive once it's serving
+// HTTP), /readyz flips to 200 only once the daemon is authenticated to
+// Vault. An OTel httpcheckreceiver can rely on these without baking
+// in dotvault-specific knowledge.
+func TestHealthAndReadyEndpoints(t *testing.T) {
+	s := testServer(t)
+	s.mux = http.NewServeMux()
+	s.registerRoutes()
+
+	// Liveness probe is independent of Vault state.
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	r.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+	s.middleware(s.mux).ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("/healthz status = %d, want 200", w.Code)
+	}
+
+	// /readyz reports not_ready while unauthenticated and ready once a
+	// token is set, mirroring the rest of the API's auth gating.
+	r = httptest.NewRequest("GET", "/readyz", nil)
+	r.Host = "127.0.0.1"
+	w = httptest.NewRecorder()
+	s.middleware(s.mux).ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz unauthenticated status = %d, want 503", w.Code)
+	}
+
+	vc, err := vault.NewClient(vault.Config{Address: "http://127.0.0.1:8200"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	vc.SetToken("test-token")
+	s.vault = vc
+
+	r = httptest.NewRequest("GET", "/readyz", nil)
+	r.Host = "127.0.0.1"
+	w = httptest.NewRecorder()
+	s.middleware(s.mux).ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("/readyz authenticated status = %d, want 200", w.Code)
+	}
+}
+
+// TestRouteLabel pins the bounded route-template vocabulary used as a
+// metric attribute. Letting handler paths flow through verbatim would
+// unbound the cardinality (every /api/v1/secrets/foo, /api/v1/secrets/bar
+// would become its own series), so the mapping is enforced here.
+func TestRouteLabel(t *testing.T) {
+	cases := map[string]string{
+		"/":                                "/",
+		"/healthz":                         "/healthz",
+		"/readyz":                          "/readyz",
+		"/auth/oidc/start":                 "/auth/oidc/*",
+		"/auth/ldap/login":                 "/auth/ldap/*",
+		"/api/v1/status":                   "/api/v1/status",
+		"/api/v1/secrets/foo":              "/api/v1/secrets/*",
+		"/api/v1/secrets/very/deep/path":   "/api/v1/secrets/*",
+		"/api/v1/oauth/callback":           "/api/v1/oauth/*",
+		"/api/v1/enrol/jfrog/start":        "/api/v1/enrol/*",
+		"/somewhere/else":                  "other",
+	}
+	for in, want := range cases {
+		if got := routeLabel(in); got != want {
+			t.Errorf("routeLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestMiddlewareRejectsBadHost confirms the host check actually rejects
 // requests at the HTTP layer rather than just informing later handlers.
 func TestMiddlewareRejectsBadHost(t *testing.T) {

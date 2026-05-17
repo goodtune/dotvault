@@ -596,6 +596,41 @@ func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleHealthz reports daemon liveness — the process is running and
+// serving HTTP. Always returns 200 with a tiny JSON envelope so the
+// OTel httpcheckreceiver (and any other liveness probe) can rely on it
+// regardless of Vault state.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{
+		"status":  "ok",
+		"version": s.version,
+	})
+}
+
+// handleReadyz reports daemon readiness. The criterion is "authenticated
+// to Vault" — without a usable token the daemon cannot serve any of
+// its real work. Returns 503 with the same JSON shape until the daemon
+// reaches that state, so a startup-gated dependency can poll until
+// ready.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	authenticated := s.vault != nil && s.vault.Token() != ""
+	payload := map[string]any{
+		"status":        "ready",
+		"version":       s.version,
+		"authenticated": authenticated,
+	}
+	if !authenticated {
+		payload["status"] = "not_ready"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(payload)
+		return
+	}
+	writeJSON(w, payload)
+}
+
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)

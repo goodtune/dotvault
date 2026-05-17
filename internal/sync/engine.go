@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/handlers"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/tmpl"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -55,6 +56,7 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	start := time.Now()
 	var lastErr error
 	for _, rule := range e.cfg.Rules {
 		if err := e.syncRule(ctx, rule); err != nil {
@@ -62,6 +64,12 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 			lastErr = err
 		}
 	}
+	outcome := "ok"
+	if lastErr != nil {
+		outcome = "error"
+	}
+	observability.RecordSyncTick(ctx, outcome)
+	observability.RecordSyncDuration(ctx, time.Since(start), outcome)
 	return lastErr
 }
 

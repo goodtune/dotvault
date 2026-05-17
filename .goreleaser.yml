@@ -64,6 +64,17 @@ nfpms:
       - deb
       - apk
     bindir: /usr/bin
+    contents:
+      - src: packaging/linux/dotvault.service
+        dst: /usr/lib/systemd/system/dotvault.service
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault.service
+        dst: /lib/systemd/system/dotvault.service
+        file_info:
+          mode: 0644
+        packager: deb
 
 checksum:
   name_template: checksums.txt

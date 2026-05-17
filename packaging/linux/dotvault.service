@@ -1,0 +1,53 @@
+[Unit]
+Description=dotvault — Vault-to-file secret synchronisation daemon
+Documentation=https://github.com/goodtune/dotvault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify lets the daemon signal READY=1 once it has finished
+# authenticating to Vault and completed its initial sync, so anything
+# that depends on dotvault.service (login profiles, file watchers)
+# blocks until secrets are actually on disk. The daemon also sends
+# WATCHDOG=1 from its renewal loop; combined with WatchdogSec=120
+# below, systemd restarts the unit if the loop ever stalls.
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+
+# The CLI lives at /usr/bin/dotvault; "run" is the explicit foreground
+# daemon command (bare `dotvault` prints help since v0.x).
+ExecStart=/usr/bin/dotvault run
+
+# Restart on any non-clean exit. Keep the rate-limit loose so a config
+# error doesn't spin the service.
+Restart=on-failure
+RestartSec=5s
+
+# stdout/stderr go to the journal; the OTel `journaldreceiver` can
+# filter on _SYSTEMD_UNIT=dotvault.service to collect logs without
+# extra plumbing.
+StandardOutput=journal
+StandardError=journal
+
+# Allow environment overrides via /etc/default/dotvault. Useful for
+# wiring OTEL_EXPORTER_OTLP_ENDPOINT and friends without editing the
+# unit file directly.
+EnvironmentFile=-/etc/default/dotvault
+EnvironmentFile=-/etc/sysconfig/dotvault
+
+# Hardening. dotvault writes to user $HOME (sync targets) and reads
+# system config, so we avoid the most aggressive sandboxes but lock
+# down the obvious privileged surfaces.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

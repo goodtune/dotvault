@@ -10,6 +10,18 @@ web:
   enabled: true
   listen: "127.0.0.1:9000"
 
+# Observability is opt-in. Uncomment and point at a local OTel
+# collector to exercise the metric exporter end-to-end. The Endpoint
+# field accepts a host:port for gRPC (default) or a full URL for
+# http/protobuf.
+#
+# observability:
+#   enabled: true
+#   endpoint: "127.0.0.1:4317"
+#   protocol: "grpc"
+#   insecure: true
+#   export_interval: "15s"
+
 rules:
   - name: gh
     vault_key: "gh"

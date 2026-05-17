@@ -598,6 +598,99 @@ enrolments:
 	}
 }
 
+func TestLoadObservabilityValid(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  endpoint: "127.0.0.1:4317"
+  protocol: "grpc"
+  insecure: true
+  export_interval: "15s"
+  headers:
+    authorization: "Bearer foo"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Observability.Enabled {
+		t.Errorf("Observability.Enabled = false, want true")
+	}
+	if cfg.Observability.Endpoint != "127.0.0.1:4317" {
+		t.Errorf("Observability.Endpoint = %q, want 127.0.0.1:4317", cfg.Observability.Endpoint)
+	}
+	if cfg.Observability.ExportInterval != 15*time.Second {
+		t.Errorf("Observability.ExportInterval = %v, want 15s", cfg.Observability.ExportInterval)
+	}
+	if cfg.Observability.Headers["authorization"] != "Bearer foo" {
+		t.Errorf("Observability.Headers[authorization] = %q, want Bearer foo", cfg.Observability.Headers["authorization"])
+	}
+}
+
+func TestLoadObservabilityInvalidProtocol(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  protocol: "carrier-pigeon"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for unsupported observability protocol")
+	}
+}
+
+func TestLoadObservabilityInvalidInterval(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  export_interval: "-1s"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for negative observability.export_interval")
+	}
+}
+
 func writeTemp(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

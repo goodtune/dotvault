@@ -63,6 +63,8 @@ internal/
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
+  observability/         OTel metrics SDK wiring, package-level instrument helpers
+  sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -72,6 +74,7 @@ internal/
   tray/                  Windows system-tray icon (no-op on other platforms)
 test/integration/        Integration tests against real Vault
 packaging/windows/       ADMX Group Policy template
+packaging/linux/         systemd unit (shipped in RPM/DEB)
 ```
 
 ## Configuration
@@ -89,6 +92,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - **`vault`** — address (required), auth_method, auth_mount, auth_role, kv_mount (default `"kv"`), user_prefix (default `"users/"`, trailing slash enforced), ca_cert, tls_skip_verify, disable_token_renewal (default false — set true to prevent the daemon from calling RenewSelf; TTL expiry still triggers re-auth)
 - **`sync`** — interval as Go duration string (default `15m`)
 - **`web`** — enabled (default false), listen (loopback only, hard invariant), login_text (markdown), secret_view_text (markdown)
+- **`observability`** — enabled (default false), endpoint, protocol (`grpc` or `http/protobuf`), insecure, headers (map), export_interval. OTLP metrics exporter; falls through to standard `OTEL_*` env vars when fields are empty. Disabled by default — instruments fall back to the OTel no-op meter so call sites never need to branch.
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)
 - **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition
 

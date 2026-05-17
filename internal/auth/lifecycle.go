@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -161,6 +162,7 @@ func (lm *LifecycleManager) signalReauth(errCh chan<- error, err error) {
 		return
 	}
 	lm.needsReauth.Store(true)
+	observability.RecordTokenRenewal(context.Background(), "reauth_required")
 	if lm.onReauth != nil {
 		lm.onReauth()
 	}
@@ -245,6 +247,7 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	default:
 		return nil
 	}
+	observability.RecordTokenTTL(ctx, ttl)
 
 	// TTL=0 with no expire_time means non-expiring (root token)
 	if ttl <= 0 {
@@ -268,8 +271,10 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 		slog.Info("renewing token", "ttl_remaining", ttl)
 		_, err := lm.client.RenewSelf(ctx, 0)
 		if err != nil {
+			observability.RecordTokenRenewal(ctx, "failed")
 			return err
 		}
+		observability.RecordTokenRenewal(ctx, "renewed")
 		slog.Info("token renewed successfully")
 	}
 

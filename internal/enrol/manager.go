@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -107,6 +108,7 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		if !HasAllFields(data, EngineFields(engine, enrolment.Settings)) {
 			m.io.Log.Error("engine returned incomplete credentials, skipping vault write", "key", key, "engine", enrolment.Engine)
 			fmt.Fprintf(m.io.Out, "✗ %s — engine returned incomplete credentials (will retry next cycle)\n", key)
+			observability.RecordEnrolAttempt(ctx, enrolment.Engine, "error")
 			continue
 		}
 
@@ -114,9 +116,11 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		if writeErr := m.vault.WriteKVv2(ctx, cfg.KVMount, vaultPath, data); writeErr != nil {
 			m.io.Log.Error("failed to write enrolment to vault", "key", key, "error", writeErr)
 			fmt.Fprintf(m.io.Out, "✗ %s — vault write failed (credentials lost, will retry next cycle)\n", key)
+			observability.RecordEnrolAttempt(ctx, enrolment.Engine, "error")
 			continue
 		}
 		enrolled = true
+		observability.RecordEnrolAttempt(ctx, enrolment.Engine, "completed")
 		m.io.Log.Info("enrolment written to vault", "key", key, "path", vaultPath)
 	}
 

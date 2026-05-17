@@ -78,11 +78,25 @@ func ParseDuration(s string) (time.Duration, error) {
 
 // Config is the top-level system configuration.
 type Config struct {
-	Vault      VaultConfig          `yaml:"vault"`
-	Sync       SyncConfig           `yaml:"sync"`
-	Web        WebConfig            `yaml:"web"`
-	Rules      []Rule               `yaml:"rules"`
-	Enrolments map[string]Enrolment `yaml:"enrolments"`
+	Vault         VaultConfig          `yaml:"vault"`
+	Sync          SyncConfig           `yaml:"sync"`
+	Web           WebConfig            `yaml:"web"`
+	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
+	Rules         []Rule               `yaml:"rules"`
+	Enrolments    map[string]Enrolment `yaml:"enrolments"`
+}
+
+// ObservabilityConfig configures the OpenTelemetry metrics exporter.
+// Disabled by default — set Enabled and Endpoint (or the standard
+// OTEL_* env vars) to point the daemon at a local OTel collector.
+type ObservabilityConfig struct {
+	Enabled        bool              `yaml:"enabled"`
+	Endpoint       string            `yaml:"endpoint,omitempty"`
+	Protocol       string            `yaml:"protocol,omitempty"`
+	Insecure       bool              `yaml:"insecure,omitempty"`
+	Headers        map[string]string `yaml:"headers,omitempty"`
+	RawInterval    string            `yaml:"export_interval,omitempty"`
+	ExportInterval time.Duration     `yaml:"-"`
 }
 
 // Enrolment declares a credential acquisition flow for a Vault KV key.
@@ -236,6 +250,31 @@ func (c *Config) validate() error {
 		}
 		if err := paths.ValidateLoopback(c.Web.Listen); err != nil {
 			return fmt.Errorf("web.listen: %w", err)
+		}
+	}
+
+	// Observability validation. The block is optional — only validate
+	// shape when the user opted in. The OTel SDK applies its own
+	// defaults (60s export interval, standard env-var fallbacks) so
+	// most fields stay omittable.
+	if c.Observability.Enabled {
+		if c.Observability.Protocol != "" {
+			switch strings.ToLower(c.Observability.Protocol) {
+			case "grpc", "http", "http/protobuf":
+				// accepted
+			default:
+				return fmt.Errorf("observability.protocol %q: must be grpc or http/protobuf", c.Observability.Protocol)
+			}
+		}
+		if c.Observability.RawInterval != "" {
+			d, err := time.ParseDuration(c.Observability.RawInterval)
+			if err != nil {
+				return fmt.Errorf("observability.export_interval %q: %w", c.Observability.RawInterval, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("observability.export_interval %q: must be positive", c.Observability.RawInterval)
+			}
+			c.Observability.ExportInterval = d
 		}
 	}
 

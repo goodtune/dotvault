@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 
+	"github.com/goodtune/dotvault/internal/observability"
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
@@ -81,10 +82,13 @@ func (c *Client) ReadKVv2(ctx context.Context, mount, path string) (*Secret, err
 	if err != nil {
 		// Check for 404 — secret doesn't exist
 		if isNotFound(err) || errors.Is(err, vaultapi.ErrSecretNotFound) {
+			observability.RecordVaultCall(ctx, "read", "not_found")
 			return nil, nil
 		}
+		observability.RecordVaultCall(ctx, "read", classifyVaultErr(err))
 		return nil, fmt.Errorf("read kv %s/%s: %w", mount, path, err)
 	}
+	observability.RecordVaultCall(ctx, "read", "ok")
 	if secret == nil {
 		return nil, nil
 	}
@@ -149,8 +153,10 @@ func (c *Client) EnableKVv2(ctx context.Context, path string) error {
 func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[string]any) error {
 	_, err := c.raw.KVv2(mount).Put(ctx, path, data)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "write", classifyVaultErr(err))
 		return fmt.Errorf("write kv %s/%s: %w", mount, path, err)
 	}
+	observability.RecordVaultCall(ctx, "write", "ok")
 	return nil
 }
 
@@ -173,8 +179,10 @@ func (c *Client) DeleteKVv2(ctx context.Context, mount, path string) error {
 func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().LookupSelfWithContext(ctx)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "lookup_self", classifyVaultErr(err))
 		return nil, fmt.Errorf("token lookup-self: %w", err)
 	}
+	observability.RecordVaultCall(ctx, "lookup_self", "ok")
 	return secret, nil
 }
 
@@ -182,8 +190,10 @@ func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().RenewSelfWithContext(ctx, increment)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "renew_self", classifyVaultErr(err))
 		return nil, fmt.Errorf("token renew-self: %w", err)
 	}
+	observability.RecordVaultCall(ctx, "renew_self", "ok")
 	return secret, nil
 }
 
@@ -297,6 +307,34 @@ func isNotFound(err error) bool {
 		return respErr.StatusCode == 404
 	}
 	return false
+}
+
+// classifyVaultErr collapses a vault API error onto a small set of
+// status labels suitable for an OTel attribute. The vocabulary is
+// closed ("denied", "not_found", "unreachable", "unknown") so the
+// time-series cardinality stays bounded — full error strings (which
+// can include paths or messages) must never be used.
+func classifyVaultErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "denied"
+		case http.StatusNotFound:
+			return "not_found"
+		case http.StatusTooManyRequests:
+			return "throttled"
+		default:
+			if respErr.StatusCode >= 500 {
+				return "server_error"
+			}
+			return "client_error"
+		}
+	}
+	return "unreachable"
 }
 
 // IsForbidden returns true if the error is a Vault 403 response, indicating

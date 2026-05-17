@@ -101,29 +101,27 @@ Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the 
 
 ### systemd (Linux)
 
-Create a user service unit:
-
-```ini
-# ~/.config/systemd/user/dotvault.service
-[Unit]
-Description=dotvault secret sync daemon
-After=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/dotvault run
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-```
-
-Enable for all users by placing the unit in `/etc/systemd/user/`:
+The RPM and DEB packages ship a `dotvault.service` unit (a
+`Type=notify` system service with `WatchdogSec=120` and the
+documented OpenTelemetry-friendly logging settings). Once the
+package is installed:
 
 ```sh
-sudo cp dotvault.service /etc/systemd/user/
-sudo systemctl --global enable dotvault.service
+sudo systemctl enable --now dotvault.service
 ```
+
+To run dotvault per-user instead, drop the bundled unit into the user
+location (it works as-is — the unit doesn't hard-code system paths):
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp /usr/lib/systemd/system/dotvault.service ~/.config/systemd/user/
+systemctl --user enable --now dotvault.service
+```
+
+Environment-variable overrides (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`) can
+be set via `/etc/default/dotvault` or `/etc/sysconfig/dotvault` — both
+are referenced by the unit and ignored if absent.
 
 ### launchd (macOS)
 
@@ -180,7 +178,68 @@ dotvault run --log-level debug
 
 Available levels: `debug`, `info` (default), `warn`, `error`.
 
-There is no file-based logging — integrate with your platform's log collection (journald, syslog, Windows Event Log via a wrapper, etc.).
+Override the auto-selected format with `--log-format`:
+
+```sh
+dotvault run --log-format json   # force structured logs
+dotvault run --log-format text   # force human-readable logs
+dotvault run --log-format auto   # default — text on TTY, JSON otherwise
+```
+
+This is useful when running under a service manager that captures stderr
+but is connected to a TTY for debugging, or when forcing structured logs
+for ingestion into a log collector regardless of how the daemon was
+launched.
+
+There is no file-based logging — integrate with your platform's log
+collection (journald, syslog, Windows Event Log via a wrapper, etc.). On
+systemd hosts the packaged unit routes stderr to the journal, so the
+OpenTelemetry collector's `journaldreceiver` can filter on
+`_SYSTEMD_UNIT=dotvault.service` to pick logs up directly.
+
+## Observability
+
+dotvault can export OpenTelemetry metrics to a local OTel collector.
+Disabled by default; enable by adding an `observability:` block to
+`config.yaml`:
+
+```yaml
+observability:
+  enabled: true
+  endpoint: "127.0.0.1:4317"  # local OTel collector
+  protocol: "grpc"            # or "http/protobuf"
+  insecure: true              # disable TLS for the local hop
+  export_interval: "15s"
+  # headers:
+  #   authorization: "Bearer …"
+```
+
+The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the
+`endpoint`/`headers` fields can be left empty and managed centrally via
+`/etc/default/dotvault`.
+
+The exporter emits a bounded set of instruments:
+
+| Metric                          | Type      | Attributes                                           |
+| ------------------------------- | --------- | ---------------------------------------------------- |
+| `dotvault.sync.ticks`           | counter   | `outcome={ok,error}`                                 |
+| `dotvault.sync.duration`        | histogram | `outcome`                                            |
+| `dotvault.vault.calls`          | counter   | `op={read,write,lookup_self,renew_self}`, `status`   |
+| `dotvault.token.renewals`       | counter   | `outcome={renewed,reauth_required,failed}`           |
+| `dotvault.token.ttl_remaining`  | histogram | (no attrs)                                           |
+| `dotvault.enrol.attempts`       | counter   | `engine`, `outcome={completed,error}`                |
+| `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
+| `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
+| `dotvault.sighup.received`      | counter   | (no attrs)                                           |
+
+Health probes are exposed on the web UI listener when it's enabled:
+
+- `GET /healthz` — liveness, always 200 while serving
+- `GET /readyz` — readiness, 200 once authenticated to Vault, 503 otherwise
+
+Both return JSON and are loopback-only, suitable for the OTel
+`httpcheckreceiver`.
 
 ## Security considerations
 

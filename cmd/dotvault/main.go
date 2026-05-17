@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,8 +20,10 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
+	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -36,6 +39,7 @@ var version = "dev"
 var (
 	flagConfig       string
 	flagLogLevel     string
+	flagLogFormat    string
 	flagDryRun       bool
 	flagRegOutput    string
 	flagRegASCII     bool
@@ -69,6 +73,7 @@ force a fresh login flow.`,
 
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&flagLogFormat, "log-format", "auto", "log format (auto, text, json); auto picks text on TTY, json otherwise")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
 
 	runCmd := &cobra.Command{
@@ -129,13 +134,7 @@ genuine internal errors.`,
 			Short: "Show auth and sync status",
 			RunE:  runStatus,
 		},
-		&cobra.Command{
-			Use:   "version",
-			Short: "Print version",
-			Run: func(cmd *cobra.Command, args []string) {
-				fmt.Println(version)
-			},
-		},
+		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),
 	)
@@ -160,13 +159,54 @@ func setupLogging() {
 
 	opts := &slog.HandlerOptions{Level: level}
 
+	// --log-format forces a specific handler regardless of TTY state.
+	// "auto" preserves the historical behaviour (text on TTY, JSON
+	// otherwise) so existing systemd units and shell wrappers keep
+	// working unchanged.
+	useJSON := false
+	switch strings.ToLower(flagLogFormat) {
+	case "json":
+		useJSON = true
+	case "text":
+		useJSON = false
+	default:
+		useJSON = !isStderrTerminal()
+	}
+
 	var handler slog.Handler
-	if isStderrTerminal() {
-		handler = slog.NewTextHandler(os.Stderr, opts)
-	} else {
+	if useJSON {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+}
+
+// newVersionCmd builds the `dotvault version` command. The default form
+// prints the version string; pass --json for a machine-readable form
+// the OTel collector (and other tooling) can use to pin resource
+// attributes deterministically.
+func newVersionCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print version",
+		Run: func(cmd *cobra.Command, args []string) {
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
+					"version":    version,
+					"service":    "dotvault",
+					"go_version": runtime.Version(),
+					"os":         runtime.GOOS,
+					"arch":       runtime.GOARCH,
+				})
+				return
+			}
+			fmt.Println(version)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit version metadata as JSON")
+	return cmd
 }
 
 func loadConfig() (*config.Config, error) {
@@ -193,6 +233,32 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Init observability. A disabled block returns a no-op provider so
+	// instruments harmlessly route to the OTel global no-op meter.
+	obsProvider, obsErr := observability.Init(ctx, observability.Config{
+		Enabled:        cfg.Observability.Enabled,
+		Endpoint:       cfg.Observability.Endpoint,
+		Protocol:       cfg.Observability.Protocol,
+		Insecure:       cfg.Observability.Insecure,
+		Headers:        cfg.Observability.Headers,
+		ExportInterval: cfg.Observability.ExportInterval,
+		ServiceVersion: version,
+	})
+	if obsErr != nil {
+		// Telemetry must never take the daemon down. Log loudly and
+		// continue with a no-op provider so instrument call sites stay
+		// safe.
+		slog.Error("failed to initialise observability, continuing without metrics", "error", obsErr)
+		obsProvider = &observability.Provider{}
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := obsProvider.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("observability shutdown error", "error", err)
+		}
+	}()
+
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -206,6 +272,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				// TODO: Implement config reload on SIGHUP. This is deferred
 				// to a future release. For now, restart the daemon to pick
 				// up config changes.
+				observability.RecordSIGHUP(context.Background())
 				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
 			}
 		}
@@ -449,15 +516,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				case <-ticker.C:
 					reloaded, err := config.LoadSystem(configPath)
 					if err != nil {
+						observability.RecordConfigReload(ctx, "error")
 						slog.Warn("config reload failed", "error", err)
 						continue
 					}
 					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+						observability.RecordConfigReload(ctx, "applied")
 						slog.Info("enrolments config changed, re-checking")
 						enrolMgr.UpdateConfig(reloaded.Enrolments)
 						rm.UpdateConfig(reloaded.Enrolments)
 						wm.UpdateConfig(reloaded.Enrolments)
 						lastEnrolments = reloaded.Enrolments
+					} else {
+						observability.RecordConfigReload(ctx, "no_change")
 					}
 					if ok, err := enrolMgr.CheckAll(ctx); err != nil {
 						slog.Warn("enrolment check failed", "error", err)
@@ -470,6 +541,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
+
+	// systemd integration. sdnotify.Ready signals READY=1 so a
+	// Type=notify service unit reports active only once the daemon is
+	// authenticated and ready to sync. sdnotify.WatchdogLoop kicks the
+	// per-unit watchdog at half the configured WatchdogSec interval;
+	// both are no-ops on non-Linux and when NOTIFY_SOCKET / WATCHDOG_USEC
+	// are unset, so wiring them unconditionally is safe.
+	if err := sdnotify.Ready(); err != nil {
+		slog.Debug("sd_notify ready failed (ignored)", "error", err)
+	}
+	go sdnotify.WatchdogLoop(ctx)
 
 	// Run the sync engine on a goroutine and the tray (Windows) or a
 	// blocking ctx-wait (everything else) on the main goroutine. The tray
@@ -507,7 +589,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Tray returned because the user picked Exit or ctx was cancelled
 	// elsewhere (signal handler, lifecycle manager, headless fallback).
-	// Stop the sync loop and propagate its result.
+	// Stop the sync loop and propagate its result. Notify systemd we're
+	// stopping so the unit state reflects the shutdown sequence rather
+	// than appearing to crash.
+	_ = sdnotify.Stopping()
 	cancel()
 	return <-loopErrCh
 }
@@ -521,6 +606,32 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	ctx := context.Background()
+
+	// Cron-style one-shot invocations still need to push their metrics
+	// out before exit, so wire the same observability path the daemon
+	// uses and force-flush before returning. Init returns a no-op
+	// provider when the config block is disabled; the flush + shutdown
+	// path is a no-op in that case.
+	obsProvider, obsErr := observability.Init(ctx, observability.Config{
+		Enabled:        cfg.Observability.Enabled,
+		Endpoint:       cfg.Observability.Endpoint,
+		Protocol:       cfg.Observability.Protocol,
+		Insecure:       cfg.Observability.Insecure,
+		Headers:        cfg.Observability.Headers,
+		ExportInterval: cfg.Observability.ExportInterval,
+		ServiceVersion: version,
+	})
+	if obsErr != nil {
+		slog.Error("failed to initialise observability, continuing without metrics", "error", obsErr)
+		obsProvider = &observability.Provider{}
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := obsProvider.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("observability shutdown error", "error", err)
+		}
+	}()
 
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {

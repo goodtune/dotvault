@@ -545,6 +545,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if err := engine.RunOnce(ctx); err != nil {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
+	// Flip the web-server readiness gate so /readyz can report
+	// ready alongside sd_notify(READY=1). Partial first-cycle
+	// failures still count: the daemon has made its best attempt;
+	// future cycles will retry, and we don't want a single
+	// transient error to wedge readiness forever. The systemd
+	// READY signal below uses the same posture.
+	if webServer != nil {
+		webServer.MarkInitialSyncComplete()
+	}
 
 	// sd_notify(READY=1) is sent here, after authentication and the
 	// initial sync, so anything that depends on dotvault.service

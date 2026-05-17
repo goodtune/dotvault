@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -57,6 +58,16 @@ type Server struct {
 	enrolRunner        *EnrolmentRunner
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
+
+	// initialSyncDone flips to true once the daemon calls
+	// MarkInitialSyncComplete (which the main goroutine invokes
+	// after engine.RunOnce returns at startup). /readyz gates on
+	// it alongside the Vault-token check so k8s readinessProbe
+	// consumers and the OTel httpcheckreceiver don't observe a
+	// "ready" daemon before any secrets have been written to disk
+	// — matching the sd_notify(READY=1) contract on the systemd
+	// path.
+	initialSyncDone atomic.Bool
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -485,8 +496,21 @@ func routeLabel(p string) string {
 		return "/api/v1/oauth/*"
 	case strings.HasPrefix(p, "/api/v1/enrol/"):
 		return "/api/v1/enrol/*"
-	case strings.HasPrefix(p, "/api/v1/"):
+	case p == "/api/v1/csrf",
+		p == "/api/v1/status",
+		p == "/api/v1/rules",
+		p == "/api/v1/config",
+		p == "/api/v1/config/download",
+		p == "/api/v1/token",
+		p == "/api/v1/sync":
 		return p
+	case strings.HasPrefix(p, "/api/v1/"):
+		// Defensive collapse: a future endpoint added without
+		// updating the explicit list above would otherwise leak
+		// the verbatim request path (potentially including a
+		// username segment) into the metric backend, unbounding
+		// cardinality.
+		return "/api/v1/*"
 	default:
 		return "other"
 	}
@@ -575,6 +599,22 @@ func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 // URL returns the web UI root URL.
 func (s *Server) URL() string {
 	return fmt.Sprintf("http://%s/", s.listenAddr)
+}
+
+// MarkInitialSyncComplete flips the readiness flag. The daemon calls
+// this once engine.RunOnce returns at startup (success or per-rule
+// failure — partial progress is still "we've tried"). /readyz only
+// reports ready once this has fired AND the daemon holds a Vault
+// token, so a k8s readinessProbe or the OTel httpcheckreceiver
+// doesn't observe a green daemon before secrets exist on disk.
+func (s *Server) MarkInitialSyncComplete() {
+	s.initialSyncDone.Store(true)
+}
+
+// InitialSyncComplete reports whether MarkInitialSyncComplete has
+// fired. Exposed for tests and the /readyz handler.
+func (s *Server) InitialSyncComplete() bool {
+	return s.initialSyncDone.Load()
 }
 
 // ForceReauth clears the in-memory Vault token so /api/v1/status reports

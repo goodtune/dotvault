@@ -34,7 +34,6 @@ package observability
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -220,9 +219,14 @@ func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) 
 			// otlpmetrichttp distinguishes endpoint vs URL: WithEndpoint
 			// takes host[:port], WithEndpointURL takes a fully-qualified
 			// URL. The user-facing config is a single field, so we infer
-			// which to call from whether the value parses as a URL with
-			// a scheme.
-			if u, err := url.Parse(cfg.Endpoint); err == nil && u.Scheme != "" {
+			// which to call from the literal presence of "://": url.Parse
+			// will happily report `Scheme: "127.0.0.1"` for `127.0.0.1:4317`
+			// (interpreting the colon as a scheme separator), so a
+			// Scheme-only check would misroute host:port values to
+			// WithEndpointURL and produce a confusing init failure. The
+			// substring check is what the OTel SDK's own env-var loader
+			// does internally for the same reason.
+			if strings.Contains(cfg.Endpoint, "://") {
 				opts = append(opts, otlpmetrichttp.WithEndpointURL(cfg.Endpoint))
 			} else {
 				opts = append(opts, otlpmetrichttp.WithEndpoint(cfg.Endpoint))

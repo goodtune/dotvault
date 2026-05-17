@@ -347,9 +347,12 @@ func TestStatusRecorderWriteHeaderOnce(t *testing.T) {
 
 // TestHealthAndReadyEndpoints verifies the two probes round-trip:
 // /healthz always returns 200 (the daemon is alive once it's serving
-// HTTP), /readyz flips to 200 only once the daemon is authenticated to
-// Vault. An OTel httpcheckreceiver can rely on these without baking
-// in dotvault-specific knowledge.
+// HTTP), /readyz flips to 200 only once BOTH the Vault token is
+// present AND the daemon has marked the initial sync complete. An
+// OTel httpcheckreceiver or k8s readinessProbe can rely on these
+// without dotvault-specific knowledge; the dual gate matches the
+// systemd sd_notify(READY=1) contract so probe consumers never
+// observe a green daemon before secrets exist on disk.
 func TestHealthAndReadyEndpoints(t *testing.T) {
 	s := testServer(t)
 	s.mux = http.NewServeMux()
@@ -364,8 +367,7 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 		t.Errorf("/healthz status = %d, want 200", w.Code)
 	}
 
-	// /readyz reports not_ready while unauthenticated and ready once a
-	// token is set, mirroring the rest of the API's auth gating.
+	// /readyz is 503 with no Vault token and no initial sync.
 	r = httptest.NewRequest("GET", "/readyz", nil)
 	r.Host = "127.0.0.1"
 	w = httptest.NewRecorder()
@@ -381,12 +383,26 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 	vc.SetToken("test-token")
 	s.vault = vc
 
+	// /readyz is still 503 with auth but no initial sync yet —
+	// k8s readinessProbe consumers must NOT see green before
+	// secrets have been written.
+	r = httptest.NewRequest("GET", "/readyz", nil)
+	r.Host = "127.0.0.1"
+	w = httptest.NewRecorder()
+	s.middleware(s.mux).ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz auth-only status = %d, want 503 (initial sync not yet marked complete)", w.Code)
+	}
+
+	// Once the daemon flips initialSyncDone, both gates are
+	// satisfied and /readyz reports 200.
+	s.MarkInitialSyncComplete()
 	r = httptest.NewRequest("GET", "/readyz", nil)
 	r.Host = "127.0.0.1"
 	w = httptest.NewRecorder()
 	s.middleware(s.mux).ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
-		t.Errorf("/readyz authenticated status = %d, want 200", w.Code)
+		t.Errorf("/readyz fully-ready status = %d, want 200", w.Code)
 	}
 }
 
@@ -396,17 +412,25 @@ func TestHealthAndReadyEndpoints(t *testing.T) {
 // would become its own series), so the mapping is enforced here.
 func TestRouteLabel(t *testing.T) {
 	cases := map[string]string{
-		"/":                                "/",
-		"/healthz":                         "/healthz",
-		"/readyz":                          "/readyz",
-		"/auth/oidc/start":                 "/auth/oidc/*",
-		"/auth/ldap/login":                 "/auth/ldap/*",
-		"/api/v1/status":                   "/api/v1/status",
-		"/api/v1/secrets/foo":              "/api/v1/secrets/*",
-		"/api/v1/secrets/very/deep/path":   "/api/v1/secrets/*",
-		"/api/v1/oauth/callback":           "/api/v1/oauth/*",
-		"/api/v1/enrol/jfrog/start":        "/api/v1/enrol/*",
-		"/somewhere/else":                  "other",
+		"/":                              "/",
+		"/healthz":                       "/healthz",
+		"/readyz":                        "/readyz",
+		"/auth/oidc/start":               "/auth/oidc/*",
+		"/auth/ldap/login":               "/auth/ldap/*",
+		"/api/v1/status":                 "/api/v1/status",
+		"/api/v1/config/download":        "/api/v1/config/download",
+		"/api/v1/secrets/foo":            "/api/v1/secrets/*",
+		"/api/v1/secrets/very/deep/path": "/api/v1/secrets/*",
+		"/api/v1/oauth/callback":         "/api/v1/oauth/*",
+		"/api/v1/enrol/jfrog/start":      "/api/v1/enrol/*",
+		// Defensive collapse: a hypothetical future endpoint
+		// `/api/v1/users/{name}/whatever` must NOT leak the
+		// username into the metric backend. Anything under
+		// /api/v1/ that isn't on the explicit allowlist
+		// collapses to a single bucket.
+		"/api/v1/users/alice/keys":  "/api/v1/*",
+		"/api/v1/unknown-future-ep": "/api/v1/*",
+		"/somewhere/else":           "other",
 	}
 	for in, want := range cases {
 		if got := routeLabel(in); got != want {

@@ -630,23 +630,25 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleReadyz reports daemon readiness. The criterion is "the
-// daemon currently holds a Vault token" — without one the rest of
-// the API cannot do useful work. The check does NOT gate on the sync
-// engine having completed an initial cycle; that contract belongs to
-// sd_notify(READY=1) on the systemd path (where the daemon
-// explicitly delays Ready until after auth + initial sync). Returns
-// 503 with the same JSON shape until the token is present, so a
-// startup-gated dependency can poll until ready.
+// handleReadyz reports daemon readiness. Mirrors the systemd
+// sd_notify(READY=1) contract so k8s readinessProbe consumers and
+// the OTel httpcheckreceiver see green only after the daemon has
+// authenticated to Vault AND completed its initial sync cycle —
+// i.e. secrets are actually on disk. Either condition unmet
+// produces a 503 with a JSON envelope describing which gate
+// hasn't cleared, so a startup-gated dependency can poll until
+// ready.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	authenticated := s.vault != nil && s.vault.Token() != ""
+	initialSyncDone := s.InitialSyncComplete()
 	payload := map[string]any{
-		"status":        "ready",
-		"version":       s.version,
-		"authenticated": authenticated,
+		"status":            "ready",
+		"version":           s.version,
+		"authenticated":     authenticated,
+		"initial_sync_done": initialSyncDone,
 	}
-	if !authenticated {
+	if !authenticated || !initialSyncDone {
 		payload["status"] = "not_ready"
 		writeJSONStatus(w, http.StatusServiceUnavailable, payload)
 		return

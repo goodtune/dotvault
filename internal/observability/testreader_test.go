@@ -31,11 +31,7 @@ func newTestReader(t *testing.T) *sdkmetric.ManualReader {
 		// against our shut-down provider and Collect would no-op.
 		otel.SetMeterProvider(prev)
 		rebindInstruments()
-		_ = provider.Shutdown(testContext())
+		_ = provider.Shutdown(context.Background())
 	})
 	return reader
 }
-
-// testContext returns a background context, broken out so test
-// helpers don't need to import the context package inline.
-func testContext() context.Context { return context.Background() }

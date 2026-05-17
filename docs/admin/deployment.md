@@ -297,7 +297,7 @@ The exporter emits a bounded set of instruments:
 Health probes are exposed on the web UI listener when it's enabled:
 
 - `GET /healthz` — liveness, always 200 while serving
-- `GET /readyz` — readiness, 200 once authenticated to Vault, 503 otherwise
+- `GET /readyz` — readiness, 200 once the daemon is authenticated to Vault AND has completed its initial sync cycle, 503 otherwise. Mirrors the `sd_notify(READY=1)` contract so a Kubernetes `readinessProbe` or the OTel `httpcheckreceiver` never observes a green daemon before secrets exist on disk.
 
 Both return JSON and are loopback-only, suitable for the OTel
 `httpcheckreceiver`.

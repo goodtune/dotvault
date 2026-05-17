@@ -3,6 +3,8 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,11 +302,24 @@ func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
 // the loop re-syncing redundantly. Coverage here guards against a
 // future refactor accidentally reintroducing the initial sync into
 // the after-initial entry point.
+//
+// Runs as a standard unit test (no skipIfNoVault) — points the
+// vault.Client at an httptest server that 503s everything, so the
+// engine's ServerHealth probe fails fast, the event subscription is
+// skipped, and the loop just waits on ctx. With a one-hour sync
+// interval and a short context timeout, the ticker never fires;
+// the only way the target file appears is if the loop reintroduces
+// an implicit initial sync, which is what we're guarding against.
 func TestEngine_RunLoopAfterInitial(t *testing.T) {
-	skipIfNoVault(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "vault unavailable", http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
 
-	vc := testVaultClient(t)
-	seedVaultData(t, vc)
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "test"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 
 	dir := t.TempDir()
 	ghPath := filepath.Join(dir, "hosts.yml")
@@ -332,10 +347,6 @@ func TestEngine_RunLoopAfterInitial(t *testing.T) {
 
 	engine := NewEngine(cfg, vc, "testuser", statePath)
 
-	// RunLoopAfterInitial must not implicitly RunOnce — the file
-	// should not exist after a cancellation that arrives before the
-	// long sync.interval ticks. The caller would have called RunOnce
-	// itself; we deliberately skip it here to assert the contract.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if err := engine.RunLoopAfterInitial(ctx); err != nil {

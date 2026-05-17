@@ -122,10 +122,15 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
 
 	// Health probes. /healthz reports liveness — the daemon is running
-	// and able to serve. /readyz reports readiness — the daemon has
-	// completed Vault auth and is mid-sync (or further along). Both are
-	// loopback-only and return JSON so the OTel httpcheckreceiver can
-	// scrape state regardless of platform.
+	// and able to serve HTTP. /readyz reports readiness, which we
+	// define as "the daemon currently holds a Vault token" — that's
+	// the minimum precondition for the rest of the API to do useful
+	// work. It does not gate on the sync engine having completed an
+	// initial cycle; that contract belongs to sd_notify(READY=1) on
+	// the systemd path, where the daemon explicitly delays Ready
+	// until after auth + initial sync. Both probes are loopback-only
+	// and return JSON so the OTel httpcheckreceiver can scrape state
+	// regardless of platform.
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 

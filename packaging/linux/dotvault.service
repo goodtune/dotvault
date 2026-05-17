@@ -22,9 +22,16 @@ Wants=network-online.target
 # authenticating to Vault and completed its initial sync (the daemon
 # drives the initial sync synchronously before calling sd_notify, so
 # anything depending on dotvault.service blocks until secrets are
-# actually on disk). The daemon also sends WATCHDOG=1 from its
-# renewal loop; combined with WatchdogSec=120 below, systemd restarts
-# the unit if the loop ever stalls.
+# actually on disk).
+#
+# WATCHDOG=1 is kicked from a dedicated ticker goroutine at half the
+# WatchdogSec interval. The ticker proves the Go scheduler is still
+# running and the process hasn't deadlocked or panicked into a stuck
+# state — combined with WatchdogSec=120 below, systemd will restart
+# the unit if the process freezes outright. It does not detect
+# application-level stalls inside the sync or auth loops; for those
+# the OTel `dotvault.sync.ticks`/`dotvault.token.renewals` counters
+# are the canonical signal.
 Type=notify
 NotifyAccess=main
 WatchdogSec=120

@@ -33,7 +33,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // Config controls observability wiring. Mirrors config.ObservabilityConfig
@@ -165,7 +165,20 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 }
 
 func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	// Honour the OpenTelemetry env-var convention when cfg.Protocol
+	// is empty: a metrics-specific override
+	// (OTEL_EXPORTER_OTLP_METRICS_PROTOCOL) takes precedence over the
+	// generic one (OTEL_EXPORTER_OTLP_PROTOCOL); both fall back to
+	// gRPC when unset. Without this fallthrough, a centrally-managed
+	// environment that selects http/protobuf via env would be
+	// silently overridden to gRPC by the default below.
 	protocol := strings.ToLower(strings.TrimSpace(cfg.Protocol))
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")))
+	}
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")))
+	}
 	if protocol == "" {
 		protocol = "grpc"
 	}

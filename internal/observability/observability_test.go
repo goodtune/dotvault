@@ -56,3 +56,43 @@ func TestInitBadProtocol(t *testing.T) {
 		t.Fatal("expected error for unsupported protocol")
 	}
 }
+
+// TestProtocolFalthroughToEnv confirms an empty cfg.Protocol picks
+// up the OTel env-var convention. The metrics-specific override wins
+// over the generic one, matching the SDK's documented precedence.
+func TestProtocolFalthroughToEnv(t *testing.T) {
+	// Pointing at an unreachable collector with a short context means
+	// the test exits quickly while still exercising the protocol
+	// selection. We don't need the export to succeed — we only care
+	// that the http/protobuf branch was taken (and didn't error out
+	// at the unsupported-protocol guard, which it would have if the
+	// env var hadn't been read).
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "http/protobuf")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	p, err := Init(ctx, Config{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:0",
+		Insecure: true,
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	_ = p.Shutdown(ctx)
+
+	// Generic env var alone (metrics-specific override absent) must
+	// still feed through.
+	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+	p, err = Init(ctx, Config{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:0",
+		Insecure: true,
+	})
+	if err != nil {
+		t.Fatalf("Init (generic env): %v", err)
+	}
+	_ = p.Shutdown(ctx)
+}

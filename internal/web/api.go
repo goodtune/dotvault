@@ -608,11 +608,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleReadyz reports daemon readiness. The criterion is "authenticated
-// to Vault" — without a usable token the daemon cannot serve any of
-// its real work. Returns 503 with the same JSON shape until the daemon
-// reaches that state, so a startup-gated dependency can poll until
-// ready.
+// handleReadyz reports daemon readiness. The criterion is "the
+// daemon currently holds a Vault token" — without one the rest of
+// the API cannot do useful work. The check does NOT gate on the sync
+// engine having completed an initial cycle; that contract belongs to
+// sd_notify(READY=1) on the systemd path (where the daemon
+// explicitly delays Ready until after auth + initial sync). Returns
+// 503 with the same JSON shape until the token is present, so a
+// startup-gated dependency can poll until ready.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	authenticated := s.vault != nil && s.vault.Token() != ""

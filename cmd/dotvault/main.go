@@ -239,6 +239,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start the systemd watchdog loop as early as possible. The loop
+	// is a no-op outside systemd and when WATCHDOG_USEC/NOTIFY_SOCKET
+	// are unset, so calling it unconditionally is safe. We start it
+	// before Vault auth / initial sync because a slow authentication
+	// or first sync would otherwise miss the watchdog window
+	// (WatchdogSec=120s by default) and systemd would restart the
+	// process mid-startup. sd_notify(READY=1) is still delayed until
+	// after auth + initial sync further down.
+	go sdnotify.WatchdogLoop(ctx)
+
 	// Init observability. A disabled block returns a no-op provider so
 	// instruments harmlessly route to the OTel global no-op meter.
 	obsProvider, obsErr := observability.Init(ctx, observability.Config{
@@ -558,17 +568,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
 
-	// systemd integration. sdnotify.Ready signals READY=1 so a
-	// Type=notify service unit reports active only once the daemon
-	// has authenticated and completed its initial sync.
-	// sdnotify.WatchdogLoop kicks the per-unit watchdog at half the
-	// configured WatchdogSec interval; both are no-ops on non-Linux
-	// and when NOTIFY_SOCKET / WATCHDOG_USEC are unset, so wiring
-	// them unconditionally is safe.
+	// sd_notify(READY=1) is sent here, after authentication and the
+	// initial sync, so anything that depends on dotvault.service
+	// blocks until secrets are actually on disk. The watchdog
+	// ticker was started earlier (right after ctx) so a long
+	// startup doesn't miss the watchdog window. Both calls are
+	// no-ops on non-Linux and when NOTIFY_SOCKET is unset.
 	if err := sdnotify.Ready(); err != nil {
 		slog.Debug("sd_notify ready failed (ignored)", "error", err)
 	}
-	go sdnotify.WatchdogLoop(ctx)
 
 	// Run the sync engine on a goroutine and the tray (Windows) or a
 	// blocking ctx-wait (everything else) on the main goroutine. The tray

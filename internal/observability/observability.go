@@ -183,7 +183,7 @@ func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) 
 			opts = append(opts, otlpmetricgrpc.WithHeaders(cfg.Headers))
 		}
 		return otlpmetricgrpc.New(ctx, opts...)
-	case "http", "http/protobuf":
+	case "http/protobuf":
 		opts := []otlpmetrichttp.Option{}
 		if cfg.Endpoint != "" {
 			// otlpmetrichttp distinguishes endpoint vs URL: WithEndpoint

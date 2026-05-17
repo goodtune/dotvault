@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,6 +144,48 @@ func TestHostAllowed(t *testing.T) {
 				t.Errorf("hostAllowed(%q) = %v, want %v", tc.host, got, tc.ok)
 			}
 		})
+	}
+}
+
+// TestStatusRecorderPreservesInterfaces verifies the metrics wrapper
+// exposes the optional ResponseWriter interfaces the underlying writer
+// supports (Flusher, Hijacker, ReaderFrom) and is reachable via the
+// http.ResponseController Unwrap chain. Without these, http.FileServer
+// loses its sendfile fast-path for embedded SPA assets and any future
+// streaming/hijacking handler breaks silently.
+func TestStatusRecorderPreservesInterfaces(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sr := &statusRecorder{ResponseWriter: rec, status: http.StatusOK}
+
+	if _, ok := any(sr).(http.Flusher); !ok {
+		t.Error("statusRecorder does not implement http.Flusher")
+	}
+	if _, ok := any(sr).(http.Hijacker); !ok {
+		t.Error("statusRecorder does not implement http.Hijacker")
+	}
+	if _, ok := any(sr).(io.ReaderFrom); !ok {
+		t.Error("statusRecorder does not implement io.ReaderFrom")
+	}
+	if got := sr.Unwrap(); got != rec {
+		t.Errorf("Unwrap() = %v, want underlying recorder", got)
+	}
+}
+
+// TestStatusRecorderWriteHeaderOnce confirms the recorder forwards
+// only the first WriteHeader call. A second call must be a no-op so
+// net/http doesn't log "superfluous response.WriteHeader".
+func TestStatusRecorderWriteHeaderOnce(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sr := &statusRecorder{ResponseWriter: rec, status: http.StatusOK}
+
+	sr.WriteHeader(http.StatusCreated)
+	sr.WriteHeader(http.StatusInternalServerError)
+
+	if sr.status != http.StatusCreated {
+		t.Errorf("recorded status = %d, want 201", sr.status)
+	}
+	if rec.Code != http.StatusCreated {
+		t.Errorf("underlying recorder status = %d, want 201", rec.Code)
 	}
 }
 

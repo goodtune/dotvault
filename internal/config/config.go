@@ -260,8 +260,9 @@ func (c *Config) validate() error {
 	if c.Observability.Enabled {
 		if c.Observability.Protocol != "" {
 			switch strings.ToLower(c.Observability.Protocol) {
-			case "grpc", "http", "http/protobuf":
-				// accepted
+			case "grpc", "http/protobuf":
+				// accepted — the OTel canonical names from the
+				// OTEL_EXPORTER_OTLP_PROTOCOL spec.
 			default:
 				return fmt.Errorf("observability.protocol %q: must be grpc or http/protobuf", c.Observability.Protocol)
 			}

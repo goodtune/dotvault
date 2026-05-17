@@ -227,6 +227,14 @@ observability:
   #   authorization: "Bearer …"
 ```
 
+!!! note "Windows Group Policy"
+    The `observability` block is configured via the YAML config file
+    only — the GPO/registry layer (and the ADMX template) does not yet
+    expose it. On a GPO-managed Windows install, point the collector
+    via the standard `OTEL_*` environment variables (set through a
+    machine-wide environment policy) until the registry surface is
+    extended.
+
 The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the
 `endpoint`/`headers` fields can be left empty and managed centrally via

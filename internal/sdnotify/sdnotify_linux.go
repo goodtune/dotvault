@@ -53,10 +53,15 @@ func Stopping() error {
 }
 
 // WatchdogLoop kicks WATCHDOG=1 at half the interval declared by
-// WATCHDOG_USEC. Returns when ctx is cancelled or when the env var is
-// unset / unparseable. The half-interval pacing matches the systemd
-// manual recommendation.
+// WATCHDOG_USEC. Returns when ctx is cancelled, when WATCHDOG_USEC is
+// unset/unparseable, or when NOTIFY_SOCKET is unset (in which case
+// every kick would no-op anyway and the spinning goroutine has no
+// purpose). The half-interval pacing matches the systemd manual
+// recommendation.
 func WatchdogLoop(ctx context.Context) {
+	if os.Getenv("NOTIFY_SOCKET") == "" {
+		return
+	}
 	raw := os.Getenv("WATCHDOG_USEC")
 	if raw == "" {
 		return

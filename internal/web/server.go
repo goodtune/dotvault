@@ -1,8 +1,10 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -259,10 +261,23 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 // statusRecorder is a thin http.ResponseWriter wrapper that captures
 // the response status so the middleware can record it as a metric
 // attribute. WriteHeader is called at most once by net/http convention.
+//
+// The wrapper preserves the optional interfaces (http.Flusher,
+// http.Hijacker, io.ReaderFrom) that the underlying writer typically
+// implements, so http.FileServer's sendfile fast-path keeps working
+// for the embedded SPA assets and WebSocket handlers can still hijack
+// the connection. Unwrap is also exposed so http.NewResponseController
+// can reach the underlying writer for newer APIs.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
+}
+
+// Unwrap returns the underlying ResponseWriter so net/http's
+// ResponseController machinery (Go 1.20+) can walk past the wrapper.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
@@ -284,6 +299,42 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// Flush implements http.Flusher when the underlying writer does. The
+// SPA file server doesn't use it directly, but Server-Sent-Events-style
+// handlers in tests rely on it.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack implements http.Hijacker when the underlying writer does, so
+// any handler that needs to take over the connection (e.g. a future
+// WebSocket route) is not broken by the metrics wrapper.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+// ReadFrom implements io.ReaderFrom when the underlying writer does.
+// http.FileServer relies on this to engage net/http's sendfile
+// fast-path for static asset delivery; without forwarding we'd silently
+// fall back to user-space copy through Write. Make sure WriteHeader has
+// been recorded before delegating, matching what the unwrapped writer
+// would have done implicitly on the first byte.
+func (s *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+	if !s.wroteHeader {
+		s.status = http.StatusOK
+		s.wroteHeader = true
+	}
+	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(s.ResponseWriter, r)
 }
 
 // statusClass returns a bounded label (1xx/2xx/3xx/4xx/5xx) so the

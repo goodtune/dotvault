@@ -264,6 +264,36 @@ func TestStatusRecorderPreservesInterfacesConditionally(t *testing.T) {
 	})
 }
 
+// TestMiddlewareRecordsPanicAs5xx confirms a handler panic doesn't
+// silently report a 2xx outcome to the metrics layer. The defer
+// must detect the in-flight panic, mark the status 5xx, record the
+// metric, and re-panic so net/http's standard recovery still kicks
+// in and serves a 500.
+func TestMiddlewareRecordsPanicAs5xx(t *testing.T) {
+	s := testServer(t)
+	s.cfg.Listen = "127.0.0.1:0"
+
+	handler := s.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+
+	r := httptest.NewRequest("GET", "/api/v1/status", nil)
+	r.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+
+	defer func() {
+		rcv := recover()
+		if rcv == nil {
+			t.Fatal("middleware swallowed panic; expected it to re-panic")
+		}
+		if got, ok := rcv.(string); !ok || got != "boom" {
+			t.Errorf("re-panicked value = %v, want \"boom\"", rcv)
+		}
+	}()
+
+	handler.ServeHTTP(w, r)
+}
+
 // TestStatusRecorderWriteHeaderOnce confirms the recorder forwards
 // only the first WriteHeader call. A second call must be a no-op so
 // net/http doesn't log "superfluous response.WriteHeader".

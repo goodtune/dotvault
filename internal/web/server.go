@@ -229,6 +229,22 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// `w.(http.Flusher)` etc. get an accurate assertion.
 		rw, rec := wrapResponseWriter(w)
 		defer func() {
+			// If the handler panicked, the wrapped recorder hasn't
+			// seen a WriteHeader yet (net/http's top-level recovery
+			// writes the 500 only after our defers run), so the
+			// status would still read 200 and we'd record a 2xx
+			// outcome for a request that actually failed. Mark it
+			// 500 ourselves and re-panic so the standard server
+			// recovery still kicks in and serves the error response.
+			if rcv := recover(); rcv != nil {
+				rec.status = http.StatusInternalServerError
+				observability.RecordWebRequest(
+					r.Context(),
+					routeLabel(r.URL.Path),
+					statusClass(rec.status),
+				)
+				panic(rcv)
+			}
 			observability.RecordWebRequest(
 				r.Context(),
 				routeLabel(r.URL.Path),

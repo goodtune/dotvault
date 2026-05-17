@@ -251,7 +251,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Init observability. A disabled block returns a no-op provider so
 	// instruments harmlessly route to the OTel global no-op meter.
-	obsProvider, obsErr := observability.Init(ctx, observability.Config{
+	// Wrap with a short timeout so a misconfigured or unreachable
+	// collector can't stall daemon startup: failures degrade quickly
+	// to the no-op provider, keeping the daemon responsive.
+	initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+	obsProvider, obsErr := observability.Init(initCtx, observability.Config{
 		Enabled:        cfg.Observability.Enabled,
 		Endpoint:       cfg.Observability.Endpoint,
 		Protocol:       cfg.Observability.Protocol,
@@ -260,6 +264,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		ExportInterval: cfg.Observability.ExportInterval,
 		ServiceVersion: version,
 	})
+	initCancel()
 	if obsErr != nil {
 		// Telemetry must never take the daemon down. Log loudly and
 		// continue with a no-op provider so instrument call sites stay
@@ -637,8 +642,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// out before exit, so wire the same observability path the daemon
 	// uses and force-flush before returning. Init returns a no-op
 	// provider when the config block is disabled; the flush + shutdown
-	// path is a no-op in that case.
-	obsProvider, obsErr := observability.Init(ctx, observability.Config{
+	// path is a no-op in that case. Bound init with a short timeout
+	// so a misconfigured/unreachable collector can't stall a cron run.
+	initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
+	obsProvider, obsErr := observability.Init(initCtx, observability.Config{
 		Enabled:        cfg.Observability.Enabled,
 		Endpoint:       cfg.Observability.Endpoint,
 		Protocol:       cfg.Observability.Protocol,
@@ -647,6 +654,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		ExportInterval: cfg.Observability.ExportInterval,
 		ServiceVersion: version,
 	})
+	initCancel()
 	if obsErr != nil {
 		slog.Error("failed to initialise observability, continuing without metrics", "error", obsErr)
 		obsProvider = &observability.Provider{}

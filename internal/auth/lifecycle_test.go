@@ -223,6 +223,62 @@ func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_ShortTokenWithoutCreationTTL exercises the
+// baseline-caching path. A 5-minute token with no creation_ttl would
+// previously satisfy the 15-minute fallback threshold on every check
+// and the daemon would call RenewSelf at every poll interval; the
+// baseline cache locks the threshold to creation_ttl/4 (or the
+// largest observed ttl, whichever is greater) so a short-lived token
+// is only renewed when its remaining TTL crosses below 25% of its
+// observed lifetime.
+func TestLifecycleManager_ShortTokenWithoutCreationTTL(t *testing.T) {
+	var lookups, renews atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			lookups.Add(1)
+			// 5-minute (300s) token, no creation_ttl. Baseline cache
+			// kicks in: baseline becomes 300s after the first check,
+			// renew threshold becomes 75s. 300s is above 75s, so we
+			// shouldn't renew.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":         json.Number("300"),
+					"renewable":   true,
+					"expire_time": "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renews.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Tight loop interval so we get many checks within the test window.
+	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if lookups.Load() < 3 {
+		t.Fatalf("expected several lookups (got %d) — test conditions not satisfied", lookups.Load())
+	}
+	if renews.Load() != 0 {
+		t.Errorf("RenewSelf was called %d times for a 5min token whose remaining ttl is well above the cached-baseline threshold", renews.Load())
+	}
+}
+
 // TestLifecycleManager_ReloadFromTokenFile exercises the recovery path
 // where a token has expired/been revoked but a fresh value has been
 // written to the token file by an external process (e.g. an interactive

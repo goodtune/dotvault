@@ -43,6 +43,18 @@ type LifecycleManager struct {
 	// Exponential backoff state for check failures.
 	currentDelay time.Duration
 	maxDelay     time.Duration
+
+	// baselineTTL is the largest TTL we've observed for the current
+	// token. It anchors the renew-threshold computation when the
+	// Vault `creation_ttl` field is unavailable (some auth/token role
+	// configurations omit it): without a stable baseline a short-TTL
+	// token would otherwise satisfy the 15-minute fallback threshold
+	// on every check and the daemon would call RenewSelf at every
+	// poll interval. Updated whenever an observed TTL exceeds the
+	// stored value (which can only happen after a successful renewal
+	// or token swap), so the threshold tracks the live lease's
+	// shape without needing explicit reset hooks.
+	baselineTTL time.Duration
 }
 
 // NewLifecycleManager creates a new token lifecycle manager. When
@@ -265,18 +277,37 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	renewableRaw, _ := secret.Data["renewable"]
 	renewable, _ := renewableRaw.(bool)
 
-	// Renew when ≤25 % of the token's *creation* TTL remains, mirroring
+	// Renew when ≤25 % of the token's baseline TTL remains, mirroring
 	// the policy login-check uses. The previous form computed
 	// `renewThreshold := ttl / 4` and tested `ttl <= renewThreshold`,
 	// which can never be true for any positive TTL (ttl/4 < ttl) — so
 	// renewal silently never fired and tokens would only ever expire
-	// into a forced re-auth. Falling back to a fixed 15-minute window
-	// covers tokens whose creation_ttl is missing or unreadable
-	// (auth/token roles can elide it).
+	// into a forced re-auth.
+	//
+	// Baseline selection (in priority order):
+	//   1. `creation_ttl` from Vault — most reliable when present.
+	//   2. The largest TTL we've observed for the current token —
+	//      captures the lease's true shape after the first poll, even
+	//      when creation_ttl is missing.
+	//   3. A 15-minute floor — only relevant on the very first check
+	//      of a token whose creation_ttl is also unavailable.
+	//
+	// Anchoring on a stable baseline (step 2) is what prevents the
+	// pathological renew loop for short-lived tokens: without it, a
+	// 5-minute token with no creation_ttl would satisfy the 15-minute
+	// fallback threshold on every check and the daemon would call
+	// RenewSelf at every poll interval (~5min).
 	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
 	creationTTL := time.Duration(creationTTLSec) * time.Second
-	renewThreshold := creationTTL / 4
-	if creationTTL <= 0 {
+	if ttl > lm.baselineTTL {
+		lm.baselineTTL = ttl
+	}
+	baseline := creationTTL
+	if baseline <= 0 {
+		baseline = lm.baselineTTL
+	}
+	renewThreshold := baseline / 4
+	if baseline <= 0 {
 		renewThreshold = 15 * time.Minute
 	}
 	if ttl <= renewThreshold && renewable && !lm.disableRenewal {

@@ -268,7 +268,11 @@ func (c *Config) validate() error {
 			}
 		}
 		if c.Observability.RawInterval != "" {
-			d, err := time.ParseDuration(c.Observability.RawInterval)
+			// Use the project's ParseDuration so observability.export_interval
+			// accepts the same "Nd" day shorthand as other duration fields
+			// (token_ttl, etc.) — a stdlib time.ParseDuration here would
+			// reject `1d` and produce a confusing "unknown unit d" message.
+			d, err := ParseDuration(c.Observability.RawInterval)
 			if err != nil {
 				return fmt.Errorf("observability.export_interval %q: %w", c.Observability.RawInterval, err)
 			}

@@ -108,7 +108,7 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		if !HasAllFields(data, EngineFields(engine, enrolment.Settings)) {
 			m.io.Log.Error("engine returned incomplete credentials, skipping vault write", "key", key, "engine", enrolment.Engine)
 			fmt.Fprintf(m.io.Out, "✗ %s — engine returned incomplete credentials (will retry next cycle)\n", key)
-			observability.RecordEnrolAttempt(ctx, enrolment.Engine, "error")
+			observability.RecordEnrolAttempt(ctx, classifyEngine(enrolment.Engine), "error")
 			continue
 		}
 
@@ -116,11 +116,11 @@ func (m *Manager) CheckAll(ctx context.Context) (enrolled bool, err error) {
 		if writeErr := m.vault.WriteKVv2(ctx, cfg.KVMount, vaultPath, data); writeErr != nil {
 			m.io.Log.Error("failed to write enrolment to vault", "key", key, "error", writeErr)
 			fmt.Fprintf(m.io.Out, "✗ %s — vault write failed (credentials lost, will retry next cycle)\n", key)
-			observability.RecordEnrolAttempt(ctx, enrolment.Engine, "error")
+			observability.RecordEnrolAttempt(ctx, classifyEngine(enrolment.Engine), "error")
 			continue
 		}
 		enrolled = true
-		observability.RecordEnrolAttempt(ctx, enrolment.Engine, "completed")
+		observability.RecordEnrolAttempt(ctx, classifyEngine(enrolment.Engine), "completed")
 		m.io.Log.Info("enrolment written to vault", "key", key, "path", vaultPath)
 	}
 
@@ -165,6 +165,22 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 	}
 
 	return pending, nil
+}
+
+// classifyEngine collapses an enrolment engine name onto the
+// closed vocabulary the observability package's `engine` label
+// expects. Unrecognised values (a typo in config, a future
+// engine added without updating this list) collapse to "unknown"
+// so an arbitrary operator-controlled string can't unbound the
+// time-series cardinality — same defensive pattern
+// classifyVaultErr applies to Vault response codes.
+func classifyEngine(name string) string {
+	switch name {
+	case "copy", "github", "jfrog", "ssh":
+		return name
+	default:
+		return "unknown"
+	}
 }
 
 // HasAllFields reports whether every name in fields is present in data

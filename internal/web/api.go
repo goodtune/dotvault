@@ -432,6 +432,15 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.reg"`)
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		// The regfile package doesn't (yet) carry the
+		// Observability block — it would silently disappear from
+		// a .reg download. Surface this in the response headers
+		// so an operator who scripted around the endpoint sees
+		// the gap; the daemon log mirrors the same caveat.
+		if cfg.Observability.Enabled {
+			w.Header().Set("X-Dotvault-Warning", "observability block is not represented in the .reg form; manage via OTEL_* env vars on Windows")
+			slog.Warn("reg download requested with observability enabled; the .reg form does not carry the observability block (use OTEL_* env vars on Windows)")
+		}
 		w.Write(data)
 	default:
 		writeError(w, "unsupported format (use yaml or reg)", http.StatusBadRequest)
@@ -470,16 +479,19 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 	// the RawInterval YAML field, materialise the raw form so the
 	// download reflects the effective configuration.
 	//
-	// observability.headers can legitimately carry high-value bearer
-	// tokens (Datadog / Grafana Cloud / etc. OTLP keys). Drop the
-	// value-set from the downloaded YAML so an authenticated
-	// loopback caller can't exfiltrate them via /config/download. The
-	// key set is also stripped since leaking just the header names
-	// would still tell a malicious local process which vendor the
-	// operator is wired up to. Operators who need to round-trip the
-	// header set should manage it via the OTEL_EXPORTER_OTLP_HEADERS
-	// env var (documented as the GPO-friendly path in
-	// docs/admin/deployment.md).
+	// observability.headers values are stripped at three layers
+	// (defence in depth):
+	//   1. ObservabilityConfig.MarshalYAML strips Headers from
+	//      every yaml.Marshal of the config — the canonical
+	//      enforcement point.
+	//   2. NewServer nils Headers on the cached s.obsCfg copy so
+	//      a future handler that reads it directly doesn't see
+	//      live tokens.
+	//   3. This explicit strip here — belt-and-braces for the
+	//      download endpoint specifically.
+	// Operators who need to manage header values should use the
+	// OTEL_EXPORTER_OTLP_HEADERS env var via a per-user
+	// EnvironmentFile (see docs/admin/deployment.md).
 	obsCfg := s.obsCfg
 	if obsCfg.RawInterval == "" && obsCfg.ExportInterval > 0 {
 		obsCfg.RawInterval = formatDuration(obsCfg.ExportInterval)

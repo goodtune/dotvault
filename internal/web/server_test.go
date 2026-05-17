@@ -188,6 +188,40 @@ func (s *stubWriterAll) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(s.stubWriter, r)
 }
 
+// stubWriterH advertises only http.Hijacker.
+type stubWriterH struct{ *stubWriter }
+
+func (s *stubWriterH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
+}
+
+// stubWriterR advertises only io.ReaderFrom.
+type stubWriterR struct{ *stubWriter }
+
+func (s *stubWriterR) ReadFrom(r io.Reader) (int64, error) { return io.Copy(s.stubWriter, r) }
+
+// stubWriterFH advertises Flusher + Hijacker.
+type stubWriterFH struct{ *stubWriter }
+
+func (s *stubWriterFH) Flush() {}
+func (s *stubWriterFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
+}
+
+// stubWriterFR advertises Flusher + ReaderFrom.
+type stubWriterFR struct{ *stubWriter }
+
+func (s *stubWriterFR) Flush()                                  {}
+func (s *stubWriterFR) ReadFrom(r io.Reader) (int64, error)     { return io.Copy(s.stubWriter, r) }
+
+// stubWriterHR advertises Hijacker + ReaderFrom.
+type stubWriterHR struct{ *stubWriter }
+
+func (s *stubWriterHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
+}
+func (s *stubWriterHR) ReadFrom(r io.Reader) (int64, error) { return io.Copy(s.stubWriter, r) }
+
 // TestStatusRecorderPreservesInterfacesConditionally verifies the
 // wrapper exposes optional interfaces if and only if the underlying
 // writer supports them. The bug this guards against: an SSE handler
@@ -267,6 +301,58 @@ func TestStatusRecorderPreservesInterfacesConditionally(t *testing.T) {
 		ctl := http.NewResponseController(w)
 		if ctl == nil {
 			t.Fatal("ResponseController returned nil")
+		}
+	})
+
+	// Exhaustive coverage of the 8-way switch in wrapResponseWriter.
+	// Without this, the five intermediate variants (H-only, R-only,
+	// FH, FR, HR) had no test stubs — a typo in any of their
+	// forwarding methods would not be caught by `make test`.
+	t.Run("All eight interface combinations", func(t *testing.T) {
+		cases := []struct {
+			name           string
+			make           func() http.ResponseWriter
+			wantFlusher    bool
+			wantHijacker   bool
+			wantReaderFrom bool
+		}{
+			{"none", func() http.ResponseWriter { return newStubWriter() }, false, false, false},
+			{"F", func() http.ResponseWriter { return &stubWriterFlusher{stubWriter: newStubWriter()} }, true, false, false},
+			{"H", func() http.ResponseWriter { return &stubWriterH{stubWriter: newStubWriter()} }, false, true, false},
+			{"R", func() http.ResponseWriter { return &stubWriterR{stubWriter: newStubWriter()} }, false, false, true},
+			{"FH", func() http.ResponseWriter { return &stubWriterFH{stubWriter: newStubWriter()} }, true, true, false},
+			{"FR", func() http.ResponseWriter { return &stubWriterFR{stubWriter: newStubWriter()} }, true, false, true},
+			{"HR", func() http.ResponseWriter { return &stubWriterHR{stubWriter: newStubWriter()} }, false, true, true},
+			{"FHR", func() http.ResponseWriter { return &stubWriterAll{stubWriter: newStubWriter()} }, true, true, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				w, _ := wrapResponseWriter(tc.make())
+				if _, ok := w.(http.Flusher); ok != tc.wantFlusher {
+					t.Errorf("Flusher = %v, want %v", ok, tc.wantFlusher)
+				}
+				if _, ok := w.(http.Hijacker); ok != tc.wantHijacker {
+					t.Errorf("Hijacker = %v, want %v", ok, tc.wantHijacker)
+				}
+				if _, ok := w.(io.ReaderFrom); ok != tc.wantReaderFrom {
+					t.Errorf("ReaderFrom = %v, want %v", ok, tc.wantReaderFrom)
+				}
+				// Exercise each forwarding method we claim to
+				// have. A typo (e.g. wrong type assertion) would
+				// panic here rather than silently returning a
+				// zero value.
+				if tc.wantFlusher {
+					w.(http.Flusher).Flush()
+				}
+				if tc.wantHijacker {
+					_, _, _ = w.(http.Hijacker).Hijack()
+				}
+				if tc.wantReaderFrom {
+					if _, err := w.(io.ReaderFrom).ReadFrom(strings.NewReader("x")); err != nil {
+						t.Errorf("ReadFrom: %v", err)
+					}
+				}
+			})
 		}
 	})
 }

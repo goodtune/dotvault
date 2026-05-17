@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadValid(t *testing.T) {
@@ -688,6 +691,38 @@ rules:
 	path := writeTemp(t, yaml)
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for negative observability.export_interval")
+	}
+}
+
+// TestObservabilityMarshalYAMLStripsHeaders pins the security
+// invariant that yaml.Marshal of an ObservabilityConfig never
+// emits the Headers map — even a direct call (no Config wrapper,
+// no buildEffectiveConfig pre-strip) must produce a sanitised
+// document. This is the canonical enforcement point that every
+// future export path inherits for free.
+func TestObservabilityMarshalYAMLStripsHeaders(t *testing.T) {
+	obs := ObservabilityConfig{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:4317",
+		Protocol: "grpc",
+		Headers: map[string]string{
+			"authorization": "Bearer super-secret-marshal-yaml-test-token",
+			"x-vendor-id":   "datadog-internal-tenant-id",
+		},
+	}
+	data, err := yaml.Marshal(obs)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "super-secret-marshal-yaml-test-token") {
+		t.Errorf("yaml.Marshal leaked Headers value:\n%s", s)
+	}
+	if strings.Contains(s, "datadog-internal-tenant-id") {
+		t.Errorf("yaml.Marshal leaked Headers value:\n%s", s)
+	}
+	if strings.Contains(s, "authorization") || strings.Contains(s, "x-vendor-id") {
+		t.Errorf("yaml.Marshal leaked Headers key:\n%s", s)
 	}
 }
 

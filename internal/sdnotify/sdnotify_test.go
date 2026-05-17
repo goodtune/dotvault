@@ -175,9 +175,23 @@ func TestWatchdogLoopExitsOnCancel(t *testing.T) {
 			WatchdogLoop(ctx)
 			close(done)
 		}()
-		// Let the ticker run at least once so the goroutine is in
-		// its select, not its setup phase.
-		time.Sleep(150 * time.Millisecond)
+		// Wait for the actual ticker to fire by reading the first
+		// WATCHDOG=1 datagram. A bare time.Sleep here was a flake
+		// risk on loaded CI runners: if the goroutine hadn't been
+		// scheduled within the sleep window, cancel() would fire
+		// while WatchdogLoop was still in its pre-ticker setup,
+		// which has its own early-return path — the test would
+		// then pass vacuously without exercising the active-
+		// ticker cancellation. A successful read proves the
+		// ticker fired and the goroutine is parked in its
+		// select.
+		buf := make([]byte, 32)
+		if err := ln.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		if _, _, err := ln.ReadFrom(buf); err != nil {
+			t.Fatalf("waiting for first watchdog kick: %v", err)
+		}
 		cancel()
 		select {
 		case <-done:

@@ -109,6 +109,26 @@ type ObservabilityConfig struct {
 	ExportInterval time.Duration     `yaml:"-"`
 }
 
+// MarshalYAML strips Headers before serialisation. Headers can
+// legitimately hold OTLP bearer tokens (Datadog / Grafana Cloud
+// etc. credentials); enforcing the strip at the yaml.Marshaler
+// layer means every export path — the web download endpoint, the
+// reg-export YAML form, future serialisers — is automatically
+// safe, instead of relying on each call site to remember to nil
+// out Headers itself. Round-tripping a config through YAML
+// therefore clears Headers, which is the intended security
+// posture: secrets belong in OTEL_EXPORTER_OTLP_HEADERS / the
+// per-user EnvironmentFile, not in checked-in config files.
+//
+// Uses an unnamed-struct shadow type so the override doesn't
+// recurse into itself the way `type Alias ObservabilityConfig`
+// returning Alias(c) would.
+func (c ObservabilityConfig) MarshalYAML() (interface{}, error) {
+	type shadow ObservabilityConfig
+	c.Headers = nil
+	return shadow(c), nil
+}
+
 // Enrolment declares a credential acquisition flow for a Vault KV key.
 type Enrolment struct {
 	Engine   string         `yaml:"engine"`

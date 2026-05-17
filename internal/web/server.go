@@ -26,6 +26,7 @@ type Server struct {
 	cfg                config.WebConfig
 	vaultCfg           config.VaultConfig
 	syncCfg            config.SyncConfig
+	obsCfg             config.ObservabilityConfig
 	vault              *vault.Client
 	engine             *internalsync.Engine
 	csrf               *CSRFStore
@@ -63,6 +64,7 @@ type ServerConfig struct {
 	WebCfg        config.WebConfig
 	VaultCfg      config.VaultConfig
 	SyncCfg       config.SyncConfig
+	ObsCfg        config.ObservabilityConfig
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *internalsync.Engine
@@ -81,6 +83,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		cfg:                sc.WebCfg,
 		vaultCfg:           sc.VaultCfg,
 		syncCfg:            sc.SyncCfg,
+		obsCfg:             sc.ObsCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		csrf:               NewCSRFStore(),
@@ -229,15 +232,22 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// `w.(http.Flusher)` etc. get an accurate assertion.
 		rw, rec := wrapResponseWriter(w)
 		defer func() {
-			// If the handler panicked, the wrapped recorder hasn't
-			// seen a WriteHeader yet (net/http's top-level recovery
-			// writes the 500 only after our defers run), so the
-			// status would still read 200 and we'd record a 2xx
-			// outcome for a request that actually failed. Mark it
-			// 500 ourselves and re-panic so the standard server
-			// recovery still kicks in and serves the error response.
+			// If the handler panicked, the wrapped recorder may not
+			// have seen a WriteHeader yet — net/http's top-level
+			// recovery writes the 500 only after our defers run. In
+			// that case, record the metric as a 500 ourselves so the
+			// observability layer doesn't claim the request
+			// succeeded. If headers WERE already sent before the
+			// panic, the wire status is locked and we should leave
+			// rec.status alone — a partial 200 stream that crashed
+			// mid-body is a 2xx on the wire, even though it
+			// represents a server-side failure. Re-panic after
+			// recording so the standard server recovery still kicks
+			// in.
 			if rcv := recover(); rcv != nil {
-				rec.status = http.StatusInternalServerError
+				if !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+				}
 				observability.RecordWebRequest(
 					r.Context(),
 					routeLabel(r.URL.Path),

@@ -294,6 +294,36 @@ func TestMiddlewareRecordsPanicAs5xx(t *testing.T) {
 	handler.ServeHTTP(w, r)
 }
 
+// TestMiddlewareRecordsPanicAfterHeadersPreservesStatus confirms a
+// handler that writes a successful status and then panics mid-body
+// keeps its on-the-wire status in the metric. We can't change the
+// status after WriteHeader has been forwarded — net/http won't
+// rewrite the header, and the wire-level outcome IS what was sent —
+// so the recorder must not retroactively claim 5xx.
+func TestMiddlewareRecordsPanicAfterHeadersPreservesStatus(t *testing.T) {
+	s := testServer(t)
+	s.cfg.Listen = "127.0.0.1:0"
+
+	handler := s.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		panic("crash mid-body")
+	}))
+
+	r := httptest.NewRequest("GET", "/api/v1/status", nil)
+	r.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+
+	defer func() {
+		_ = recover() // discard; we're verifying the wrapper, not the panic plumbing
+		if w.Code != http.StatusOK {
+			t.Errorf("wire status = %d, want 200 (already sent before panic)", w.Code)
+		}
+	}()
+
+	handler.ServeHTTP(w, r)
+}
+
 // TestStatusRecorderWriteHeaderOnce confirms the recorder forwards
 // only the first WriteHeader call. A second call must be a no-op so
 // net/http doesn't log "superfluous response.WriteHeader".

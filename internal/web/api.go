@@ -465,12 +465,22 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		syncCfg.RawInterval = formatDuration(syncCfg.Interval)
 	}
 
+	// Mirror the syncCfg fix-up for observability.export_interval:
+	// if the user only set it programmatically (parsed) and not via
+	// the RawInterval YAML field, materialise the raw form so the
+	// download reflects the effective configuration.
+	obsCfg := s.obsCfg
+	if obsCfg.RawInterval == "" && obsCfg.ExportInterval > 0 {
+		obsCfg.RawInterval = formatDuration(obsCfg.ExportInterval)
+	}
+
 	return &config.Config{
-		Vault:      s.vaultCfg,
-		Sync:       syncCfg,
-		Web:        s.cfg,
-		Rules:      rules,
-		Enrolments: enrolments,
+		Vault:         s.vaultCfg,
+		Sync:          syncCfg,
+		Web:           s.cfg,
+		Observability: obsCfg,
+		Rules:         rules,
+		Enrolments:    enrolments,
 	}
 }
 

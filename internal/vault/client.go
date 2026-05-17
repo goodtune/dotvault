@@ -88,10 +88,16 @@ func (c *Client) ReadKVv2(ctx context.Context, mount, path string) (*Secret, err
 		observability.RecordVaultCall(ctx, "read", classifyVaultErr(err))
 		return nil, fmt.Errorf("read kv %s/%s: %w", mount, path, err)
 	}
-	observability.RecordVaultCall(ctx, "read", "ok")
+	// A nil secret without an error is the KVv2 client's
+	// soft-not-found response — the upstream call did not 404 but
+	// nothing exists at the path either. Count it under not_found so
+	// the metric reflects "we tried and got nothing" rather than
+	// inflating the ok bucket.
 	if secret == nil {
+		observability.RecordVaultCall(ctx, "read", "not_found")
 		return nil, nil
 	}
+	observability.RecordVaultCall(ctx, "read", "ok")
 
 	version := 0
 	if secret.VersionMetadata != nil {

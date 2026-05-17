@@ -101,6 +101,29 @@ Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the 
 
 ### systemd (Linux)
 
+!!! warning "Upgrading from a manually-created unit"
+    Previous versions of this guide showed an example
+    `~/.config/systemd/user/dotvault.service` snippet. If you
+    created one, **remove it** before enabling the packaged
+    unit — the per-user path shadows `/usr/lib/systemd/user/`
+    and your hand-rolled unit (which lacks `Type=notify`,
+    `WatchdogSec`, the env-file paths, etc.) will silently
+    take precedence:
+
+    ```sh
+    rm ~/.config/systemd/user/dotvault.service
+    systemctl --user daemon-reload
+    systemctl --user enable --now dotvault.service
+    ```
+
+    Behavioural change to be aware of: services declaring
+    `After=dotvault.service` now block until dotvault completes
+    its initial sync (the packaged unit uses `Type=notify` and
+    delays `READY=1` until secrets are on disk). The previous
+    hand-rolled unit had no readiness gate, so dependents
+    started in parallel. If a dependent's startup ordering
+    matters to you, this is the change to plan for.
+
 The RPM, DEB, and APK packages all ship a `dotvault.service`
 **user unit** (a `Type=notify` service with `WatchdogSec=120` and
 the OpenTelemetry-friendly logging settings) at the canonical

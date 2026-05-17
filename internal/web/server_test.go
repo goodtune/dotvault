@@ -438,6 +438,24 @@ func TestStatusRecorderWriteHeaderOnce(t *testing.T) {
 	}
 }
 
+// TestStatusRecorderWriteSendsImplicit200 mirrors net/http's
+// standard ResponseWriter contract: the first Write triggers an
+// implicit WriteHeader(StatusOK), and that signal must reach the
+// underlying writer too — not just the wrapper's recorded status.
+// Without this, a downstream ResponseWriter that doesn't auto-send
+// headers from Write would have its Code field stay at 0.
+func TestStatusRecorderWriteSendsImplicit200(t *testing.T) {
+	rec := httptest.NewRecorder()
+	sr := &statusRecorder{ResponseWriter: rec, status: http.StatusOK}
+
+	if _, err := sr.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("underlying recorder Code = %d, want 200 (Write must trigger an implicit WriteHeader on first byte)", rec.Code)
+	}
+}
+
 // TestHealthAndReadyEndpoints verifies the two probes round-trip:
 // /healthz always returns 200 (the daemon is alive once it's serving
 // HTTP), /readyz flips to 200 only once BOTH the Vault token is

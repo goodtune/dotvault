@@ -359,30 +359,13 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	return nil
 }
 
-// readSecondsField extracts an integer-seconds field from a Vault
-// secret data map, handling the json.Number / float64 / int variants
-// the underlying decoder may produce. Returns (0, false) when the key
-// is missing or the value isn't a parseable number.
+// readSecondsField proxies vault.ReadSecondsField, kept as an
+// unexported package-local alias so existing call sites stay
+// readable. The implementation lives in internal/vault so the
+// CLI's login-check path can share it without re-defining the
+// json.Number / float64 / int type switch.
 func readSecondsField(data map[string]any, key string) (int64, bool) {
-	v, ok := data[key]
-	if !ok {
-		return 0, false
-	}
-	switch n := v.(type) {
-	case json.Number:
-		s, err := n.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return s, true
-	case float64:
-		return int64(n), true
-	case int:
-		return int64(n), true
-	case int64:
-		return n, true
-	}
-	return 0, false
+	return vault.ReadSecondsField(data, key)
 }
 
 // errTokenExpired is the sentinel returned by checkAndRenew when

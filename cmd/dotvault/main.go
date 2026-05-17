@@ -284,7 +284,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				// TODO: Implement config reload on SIGHUP. This is deferred
 				// to a future release. For now, restart the daemon to pick
 				// up config changes.
-				observability.RecordSIGHUP(context.Background())
+				observability.RecordSIGHUP(ctx)
 				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
 			}
 		}
@@ -1068,26 +1068,11 @@ func loginCheckCancelled(ctx context.Context, err error) bool {
 	return false
 }
 
+// readSecondsField proxies vault.ReadSecondsField, kept as an
+// unexported package-local alias so the login-check call sites
+// stay readable.
 func readSecondsField(data map[string]any, key string) (int64, bool) {
-	v, ok := data[key]
-	if !ok {
-		return 0, false
-	}
-	switch n := v.(type) {
-	case json.Number:
-		s, err := n.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return s, true
-	case float64:
-		return int64(n), true
-	case int:
-		return int64(n), true
-	case int64:
-		return n, true
-	}
-	return 0, false
+	return vault.ReadSecondsField(data, key)
 }
 
 func absoluteExpiry(ttl time.Duration) string {

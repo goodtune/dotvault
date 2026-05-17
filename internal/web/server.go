@@ -351,9 +351,15 @@ func (s *statusRecorder) WriteHeader(code int) {
 }
 
 func (s *statusRecorder) Write(b []byte) (int, error) {
+	// Mirror net/http's standard ResponseWriter: the first Write
+	// triggers an implicit WriteHeader(StatusOK) on the
+	// underlying writer too, not just the wrapper's status
+	// field. Routing through s.WriteHeader keeps the recorded
+	// status and the wire status in lockstep across non-standard
+	// ResponseWriter implementations that don't auto-send
+	// headers from Write.
 	if !s.wroteHeader {
-		s.status = http.StatusOK
-		s.wroteHeader = true
+		s.WriteHeader(http.StatusOK)
 	}
 	return s.ResponseWriter.Write(b)
 }

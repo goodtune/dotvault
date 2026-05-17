@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -353,4 +354,37 @@ func IsForbidden(err error) bool {
 		return respErr.StatusCode == http.StatusForbidden
 	}
 	return false
+}
+
+// ReadSecondsField extracts an integer-seconds value from a Vault
+// secret data map, handling the json.Number / float64 / int variants
+// the underlying decoder may produce. Returns (0, false) when the key
+// is missing or the value isn't a parseable number.
+//
+// Lives in internal/vault because every call site is reading a field
+// off a *vaultapi.Secret's data map. Used by the lifecycle manager
+// for ttl / creation_ttl and by the CLI login-check for the same
+// fields; centralising avoids the duplicated type switch silently
+// diverging (e.g. when a future Vault SDK change introduces a
+// uint64 wire form).
+func ReadSecondsField(data map[string]any, key string) (int64, bool) {
+	v, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case json.Number:
+		s, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return s, true
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
 }

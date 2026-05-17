@@ -358,13 +358,17 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// recordWriteHeader is the internal hook for the ReaderFrom variants,
-// which need to record an implicit 200 just like Write does before
-// they hand the io.Reader off to the underlying writer's ReadFrom.
+// recordWriteHeader is the internal hook for the ReaderFrom variants
+// fired before they hand the io.Reader off to the underlying writer's
+// ReadFrom. It does the same WriteHeader(StatusOK) the standard
+// net/http response would do at its first byte — going through
+// s.WriteHeader so the implicit 200 reaches the underlying writer
+// too (some ResponseWriter implementations skip header emission
+// inside ReadFrom and rely on a prior WriteHeader call). Calling
+// WriteHeader is a no-op if the handler already set a status.
 func (s *statusRecorder) recordWriteHeader() {
 	if !s.wroteHeader {
-		s.status = http.StatusOK
-		s.wroteHeader = true
+		s.WriteHeader(http.StatusOK)
 	}
 }
 

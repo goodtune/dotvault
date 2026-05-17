@@ -243,13 +243,20 @@ func TestStatusRecorderPreservesInterfacesConditionally(t *testing.T) {
 		// Exercise the ReaderFrom forwarding: it should engage the
 		// underlying writer's ReadFrom rather than falling back to
 		// user-space copy (which would lose the sendfile fast-path
-		// http.FileServer relies on).
+		// http.FileServer relies on). Also asserts that
+		// recordWriteHeader forwarded an implicit 200 to the
+		// underlying writer — some ResponseWriter implementations
+		// skip header emission inside ReadFrom and rely on a prior
+		// WriteHeader call.
 		n, err := rf.ReadFrom(strings.NewReader("hello"))
 		if err != nil {
 			t.Fatalf("ReadFrom: %v", err)
 		}
 		if n != 5 || string(under.body) != "hello" {
 			t.Errorf("ReadFrom wrote n=%d body=%q, want 5/hello", n, under.body)
+		}
+		if under.code != http.StatusOK {
+			t.Errorf("underlying WriteHeader status = %d, want 200 (ReadFrom must trigger an implicit 200 before bytes flow)", under.code)
 		}
 	})
 

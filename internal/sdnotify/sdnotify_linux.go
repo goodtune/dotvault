@@ -38,6 +38,12 @@ func notify(state string) error {
 		return err
 	}
 	defer conn.Close()
+	// Bound the write so a stale or unresponsive peer (e.g. a
+	// misconfigured container runtime advertising a dead notify
+	// socket) can't stall daemon startup or shutdown. A unixgram
+	// send to the local kernel is sub-millisecond in normal
+	// operation; 1s is comfortably generous.
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 	_, err = conn.Write([]byte(state))
 	return err
 }

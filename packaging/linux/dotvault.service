@@ -1,8 +1,12 @@
 [Unit]
 Description=dotvault — Vault-to-file secret synchronisation daemon
 Documentation=https://github.com/goodtune/dotvault
-After=network-online.target
-Wants=network-online.target
+# Deliberately no After=/Wants=network-online.target: this is a
+# user-mode unit, and network-online.target is a system-level
+# target that doesn't exist in the per-user manager. Declaring it
+# here would produce a "unit not found" warning at every session
+# start. The daemon's own auth retry/backoff handles the case
+# where Vault is briefly unreachable at session start anyway.
 
 [Service]
 # dotvault is a per-user daemon: it authenticates to Vault with the
@@ -63,9 +67,15 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 
-# Allow environment overrides via /etc/default/dotvault. Useful for
-# wiring OTEL_EXPORTER_OTLP_ENDPOINT and friends without editing the
-# unit file directly.
+# Allow environment overrides via per-user and system-wide
+# EnvironmentFile paths. The per-user path under $XDG_CONFIG_HOME
+# is preferred for anything sensitive (OTLP bearer tokens etc.) —
+# the system-wide paths under /etc are typically world-readable so
+# putting secrets there exposes them to every local account. All
+# four paths are optional (the leading `-` makes systemd ignore a
+# missing file).
+EnvironmentFile=-%h/.config/dotvault/env
+EnvironmentFile=-%h/.config/dotvault.env
 EnvironmentFile=-/etc/default/dotvault
 EnvironmentFile=-/etc/sysconfig/dotvault
 

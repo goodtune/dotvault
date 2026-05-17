@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,13 @@ type LifecycleManager struct {
 	// a fresh token, an OnReauth-driven re-login) the baseline is
 	// reset so a new shorter-TTL token cannot inherit an oversized
 	// baseline from its predecessor.
+	//
+	// baselineMu guards both baseline fields. checkAndRenew is the
+	// only writer today, but a future code path that exposes the
+	// renewal cadence (e.g. for /api/v1/status or a metric) would
+	// race with the lifecycle goroutine without this lock. Matches
+	// the mutex-around-mutable-state pattern Engine uses.
+	baselineMu    sync.Mutex
 	baselineTTL   time.Duration
 	baselineToken string
 }
@@ -309,7 +317,11 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	// Reset the cached baseline when the token swaps so a shorter
 	// new token doesn't inherit an oversized baseline from a longer
 	// previous one (which would make `ttl <= baseline/4` true on
-	// every check and trigger RenewSelf in a tight loop).
+	// every check and trigger RenewSelf in a tight loop). The
+	// read-compare-write pair runs under baselineMu so a concurrent
+	// reader (added in a future status / metric path) can't observe
+	// a torn state.
+	lm.baselineMu.Lock()
 	if currentToken := lm.client.Token(); currentToken != lm.baselineToken {
 		lm.baselineTTL = 0
 		lm.baselineToken = currentToken
@@ -317,9 +329,12 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	if ttl > lm.baselineTTL {
 		lm.baselineTTL = ttl
 	}
+	baselineTTL := lm.baselineTTL
+	lm.baselineMu.Unlock()
+
 	baseline := creationTTL
 	if baseline <= 0 {
-		baseline = lm.baselineTTL
+		baseline = baselineTTL
 	}
 	renewThreshold := baseline / 4
 	if baseline <= 0 {

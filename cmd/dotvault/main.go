@@ -562,7 +562,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// startup doesn't miss the watchdog window. Both calls are
 	// no-ops on non-Linux and when NOTIFY_SOCKET is unset.
 	if err := sdnotify.Ready(); err != nil {
-		slog.Debug("sd_notify ready failed (ignored)", "error", err)
+		// sd_notify is a no-op when NOTIFY_SOCKET is unset; a
+		// non-nil return therefore means a real socket write
+		// failure. The daemon keeps running, but systemd will
+		// time out the unit at TimeoutStartSec and restart it —
+		// surface this loudly so the cause isn't hidden behind
+		// a misleading systemd "start-limit-hit" log.
+		slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
 	}
 
 	// Run the sync engine on a goroutine and the tray (Windows) or a

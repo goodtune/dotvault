@@ -135,16 +135,16 @@ func (s *Server) registerRoutes() {
 	// Auth routes — Token
 	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
 
-	// Health probes. /healthz reports liveness — the daemon is running
-	// and able to serve HTTP. /readyz reports readiness, which we
-	// define as "the daemon currently holds a Vault token" — that's
-	// the minimum precondition for the rest of the API to do useful
-	// work. It does not gate on the sync engine having completed an
-	// initial cycle; that contract belongs to sd_notify(READY=1) on
-	// the systemd path, where the daemon explicitly delays Ready
-	// until after auth + initial sync. Both probes are loopback-only
-	// and return JSON so the OTel httpcheckreceiver can scrape state
-	// regardless of platform.
+	// Health probes. /healthz reports liveness — the daemon is
+	// running and able to serve HTTP. /readyz reports readiness:
+	// 200 only after BOTH a Vault token is present AND the
+	// daemon has marked its initial sync complete (via
+	// MarkInitialSyncComplete, called from the daemon main
+	// goroutine after engine.RunOnce returns). This mirrors the
+	// sd_notify(READY=1) contract on the systemd path so a
+	// Kubernetes readinessProbe or the OTel httpcheckreceiver
+	// never observes a green daemon before secrets exist on
+	// disk. Both probes are loopback-only and return JSON.
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 

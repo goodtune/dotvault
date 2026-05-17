@@ -129,8 +129,19 @@ sudo systemctl --global enable dotvault.service
 their own instance and authenticates with their own Vault identity.
 
 Environment-variable overrides (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`)
-can be set via `/etc/default/dotvault` or `/etc/sysconfig/dotvault`
-— both paths are referenced by the unit and ignored if absent.
+can be set via four optional `EnvironmentFile=` paths referenced
+by the unit:
+
+- `~/.config/dotvault/env` (preferred for per-user secrets)
+- `~/.config/dotvault.env`
+- `/etc/default/dotvault`
+- `/etc/sysconfig/dotvault`
+
+The system-wide paths are typically world-readable, so the
+per-user `~/.config/dotvault/env` is the right place for anything
+sensitive (e.g. an OTLP bearer token in `OTEL_EXPORTER_OTLP_HEADERS`).
+Create the file with `chmod 600`; all four are silently ignored if
+absent.
 
 The unit hard-codes a couple of system paths that the package owns:
 `ExecStart=/usr/bin/dotvault run`, plus the `EnvironmentFile=` paths
@@ -294,7 +305,12 @@ The exporter emits a bounded set of instruments:
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
 | `dotvault.sighup.received`      | counter   | (no attrs)                                           |
 
-Health probes are exposed on the web UI listener when it's enabled:
+Health probes are served on the same loopback listener as the
+web UI and are therefore **only available when `web.enabled:
+true`**. A deployment with the OTel metrics block enabled but the
+web UI disabled has nothing to probe; point the
+`httpcheckreceiver` only at hosts where `web` is also enabled,
+or rely on the systemd `sd_notify(READY=1)` signal instead.
 
 - `GET /healthz` — liveness, always 200 while serving
 - `GET /readyz` — readiness, 200 once the daemon is authenticated to Vault AND has completed its initial sync cycle, 503 otherwise. Mirrors the `sd_notify(READY=1)` contract so a Kubernetes `readinessProbe` or the OTel `httpcheckreceiver` never observes a green daemon before secrets exist on disk.

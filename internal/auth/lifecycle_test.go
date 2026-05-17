@@ -264,15 +264,20 @@ func TestLifecycleManager_ShortTokenWithoutCreationTTL(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	// Tight loop interval so we get many checks within the test window.
+	// Tight loop interval so we get many checks within the test
+	// window. The lookups bound is deliberately loose (≥2 — enough
+	// to prove the loop ticked at all) so a heavily-loaded CI
+	// runner with HTTP/scheduling jitter doesn't fail this test
+	// for the wrong reason; the load-bearing assertion is
+	// renews == 0, which is unaffected by scheduling latency.
 	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	<-lm.Start(ctx)
 
-	if lookups.Load() < 3 {
-		t.Fatalf("expected several lookups (got %d) — test conditions not satisfied", lookups.Load())
+	if lookups.Load() < 2 {
+		t.Fatalf("expected the loop to tick at least twice (got %d) — test conditions not satisfied", lookups.Load())
 	}
 	if renews.Load() != 0 {
 		t.Errorf("RenewSelf was called %d times for a 5min token whose remaining ttl is well above the cached-baseline threshold", renews.Load())

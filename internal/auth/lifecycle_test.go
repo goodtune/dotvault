@@ -92,7 +92,7 @@ func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 }
 
 func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
-	renewCalled := false
+	var renewCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -105,7 +105,7 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 				},
 			})
 		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
-			renewCalled = true
+			renewCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
 		default:
@@ -125,7 +125,7 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 
 	<-lm.Start(ctx)
 
-	if renewCalled {
+	if renewCalled.Load() {
 		t.Error("RenewSelf was called despite disable_token_renewal=true")
 	}
 }
@@ -137,7 +137,7 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 // ttl — renewal silently never fired and tokens were left to expire
 // into a forced re-auth.
 func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
-	renewCalled := false
+	var renewCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -153,7 +153,7 @@ func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
 				},
 			})
 		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
-			renewCalled = true
+			renewCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
 		default:
@@ -173,7 +173,7 @@ func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
 
 	<-lm.Start(ctx)
 
-	if !renewCalled {
+	if !renewCalled.Load() {
 		t.Error("RenewSelf was not called despite ttl being well below the renew threshold")
 	}
 }
@@ -182,7 +182,7 @@ func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
 // called when the remaining TTL is still above the threshold. Pairs
 // with the previous test to pin the policy on both sides.
 func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
-	renewCalled := false
+	var renewCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -198,7 +198,7 @@ func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
 				},
 			})
 		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
-			renewCalled = true
+			renewCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
 		default:
@@ -218,7 +218,7 @@ func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
 
 	<-lm.Start(ctx)
 
-	if renewCalled {
+	if renewCalled.Load() {
 		t.Error("RenewSelf was called despite ttl being above the renew threshold")
 	}
 }

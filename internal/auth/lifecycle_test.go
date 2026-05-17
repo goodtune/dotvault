@@ -130,6 +130,99 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_RenewWhenInsideThreshold confirms RenewSelf is
+// actually called once the remaining TTL crosses below 25% of
+// creation_ttl. Earlier the threshold was computed as `ttl / 4` and
+// then compared `ttl <= ttl/4`, which can never hold for any positive
+// ttl — renewal silently never fired and tokens were left to expire
+// into a forced re-auth.
+func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
+	renewCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					// creation_ttl=3600 → renew threshold = 900s.
+					// ttl=120s is well below it.
+					"ttl":          json.Number("120"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renewCalled = true
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if !renewCalled {
+		t.Error("RenewSelf was not called despite ttl being well below the renew threshold")
+	}
+}
+
+// TestLifecycleManager_SkipRenewWhenFresh confirms RenewSelf is NOT
+// called when the remaining TTL is still above the threshold. Pairs
+// with the previous test to pin the policy on both sides.
+func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
+	renewCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					// creation_ttl=3600 → renew threshold = 900s.
+					// ttl=3000s is well above it; nothing to do.
+					"ttl":          json.Number("3000"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renewCalled = true
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if renewCalled {
+		t.Error("RenewSelf was called despite ttl being above the renew threshold")
+	}
+}
+
 // TestLifecycleManager_ReloadFromTokenFile exercises the recovery path
 // where a token has expired/been revoked but a fresh value has been
 // written to the token file by an external process (e.g. an interactive

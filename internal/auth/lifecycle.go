@@ -265,8 +265,20 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	renewableRaw, _ := secret.Data["renewable"]
 	renewable, _ := renewableRaw.(bool)
 
-	// Renew at 75% of TTL (i.e., when only 25% remains), unless renewal is disabled.
-	renewThreshold := ttl / 4
+	// Renew when ≤25 % of the token's *creation* TTL remains, mirroring
+	// the policy login-check uses. The previous form computed
+	// `renewThreshold := ttl / 4` and tested `ttl <= renewThreshold`,
+	// which can never be true for any positive TTL (ttl/4 < ttl) — so
+	// renewal silently never fired and tokens would only ever expire
+	// into a forced re-auth. Falling back to a fixed 15-minute window
+	// covers tokens whose creation_ttl is missing or unreadable
+	// (auth/token roles can elide it).
+	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
+	creationTTL := time.Duration(creationTTLSec) * time.Second
+	renewThreshold := creationTTL / 4
+	if creationTTL <= 0 {
+		renewThreshold = 15 * time.Minute
+	}
 	if ttl <= renewThreshold && renewable && !lm.disableRenewal {
 		slog.Info("renewing token", "ttl_remaining", ttl)
 		_, err := lm.client.RenewSelf(ctx, 0)
@@ -279,6 +291,32 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// readSecondsField extracts an integer-seconds field from a Vault
+// secret data map, handling the json.Number / float64 / int variants
+// the underlying decoder may produce. Returns (0, false) when the key
+// is missing or the value isn't a parseable number.
+func readSecondsField(data map[string]any, key string) (int64, bool) {
+	v, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case json.Number:
+		s, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return s, true
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
 }
 
 // errTokenExpired is the sentinel returned by checkAndRenew when

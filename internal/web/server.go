@@ -266,10 +266,15 @@ type statusRecorder struct {
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
-	if !s.wroteHeader {
-		s.status = code
-		s.wroteHeader = true
+	// Forward only the first WriteHeader. Subsequent calls would
+	// trigger net/http's "superfluous response.WriteHeader" log and
+	// can confuse wrappers — they're a no-op for the recorded status
+	// too, since net/http itself ignores them.
+	if s.wroteHeader {
+		return
 	}
+	s.status = code
+	s.wroteHeader = true
 	s.ResponseWriter.WriteHeader(code)
 }
 

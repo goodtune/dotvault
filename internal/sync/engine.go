@@ -74,10 +74,23 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 }
 
 // RunLoop runs the hybrid event/poll sync loop until ctx is cancelled.
+//
+// RunLoop performs an initial sync cycle before entering the ticker /
+// event loop. Callers that have already driven the initial sync
+// themselves (e.g. the daemon, which needs to know the first cycle is
+// done before signalling systemd's READY=1) should use
+// RunLoopAfterInitial instead to avoid the duplicate work.
 func (e *Engine) RunLoop(ctx context.Context) error {
 	// Initial sync
 	e.RunOnce(ctx)
+	return e.RunLoopAfterInitial(ctx)
+}
 
+// RunLoopAfterInitial runs the hybrid event/poll sync loop without an
+// implicit initial sync. The first cycle is left to the caller, which
+// lets the daemon gate sd_notify(READY=1) on the initial sync
+// completing without paying for a redundant second pass.
+func (e *Engine) RunLoopAfterInitial(ctx context.Context) error {
 	// Check Vault edition — events API requires Enterprise.
 	var eventsAvailable bool
 	if health, err := e.vault.ServerHealth(ctx); err != nil {

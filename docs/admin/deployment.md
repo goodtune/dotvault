@@ -101,27 +101,39 @@ Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the 
 
 ### systemd (Linux)
 
-The RPM and DEB packages ship a `dotvault.service` unit (a
-`Type=notify` system service with `WatchdogSec=120` and the
-documented OpenTelemetry-friendly logging settings). Once the
-package is installed:
+The RPM and DEB packages ship a `dotvault.service` **user unit** (a
+`Type=notify` service with `WatchdogSec=120` and the OpenTelemetry-
+friendly logging settings — installed under
+`/usr/lib/systemd/user/`). dotvault is a per-user daemon — it
+authenticates to Vault with the OS user's identity and writes secrets
+into that user's `$HOME` — so installing it as a system service that
+runs as root would write to root's `$HOME` and authenticate to Vault
+as root, which is almost never what you want.
+
+Enable per-user once the package is installed:
 
 ```sh
-sudo systemctl enable --now dotvault.service
-```
-
-To run dotvault per-user instead, drop the bundled unit into the user
-location (it works as-is — the unit doesn't hard-code system paths):
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp /usr/lib/systemd/system/dotvault.service ~/.config/systemd/user/
 systemctl --user enable --now dotvault.service
 ```
 
-Environment-variable overrides (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`) can
-be set via `/etc/default/dotvault` or `/etc/sysconfig/dotvault` — both
-are referenced by the unit and ignored if absent.
+Or enable globally for every login session on the machine:
+
+```sh
+sudo systemctl --global enable dotvault.service
+```
+
+`--global` enables the unit in every user's session; each user runs
+their own instance and authenticates with their own Vault identity.
+
+Environment-variable overrides (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`)
+can be set via `/etc/default/dotvault` or `/etc/sysconfig/dotvault`
+— both paths are referenced by the unit and ignored if absent.
+
+The unit hard-codes a couple of system paths that the package owns:
+`ExecStart=/usr/bin/dotvault run`, plus the `EnvironmentFile=` paths
+listed above. If you install dotvault into a non-standard location
+(e.g. `/usr/local/bin`), copy the unit out to
+`~/.config/systemd/user/dotvault.service` and adjust those lines.
 
 ### launchd (macOS)
 
@@ -195,7 +207,8 @@ There is no file-based logging — integrate with your platform's log
 collection (journald, syslog, Windows Event Log via a wrapper, etc.). On
 systemd hosts the packaged unit routes stderr to the journal, so the
 OpenTelemetry collector's `journaldreceiver` can filter on
-`_SYSTEMD_UNIT=dotvault.service` to pick logs up directly.
+`_SYSTEMD_USER_UNIT=dotvault.service` (or `_SYSTEMD_UNIT` when the
+unit was enabled with `systemctl --global`) to pick logs up directly.
 
 ## Observability
 

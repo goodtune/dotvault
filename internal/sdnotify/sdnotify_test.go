@@ -2,6 +2,9 @@ package sdnotify
 
 import (
 	"context"
+	"net"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -16,6 +19,79 @@ func TestReadyWithoutSocket(t *testing.T) {
 	}
 	if err := Stopping(); err != nil {
 		t.Errorf("Stopping() with no NOTIFY_SOCKET = %v, want nil", err)
+	}
+}
+
+// TestNotifyDeliversToFilesystemSocket spins up a unixgram listener at
+// a real path, points NOTIFY_SOCKET at it, and verifies Ready() writes
+// the expected payload. Linux-only — the Linux build of notify is the
+// one being exercised, and the unixgram + abstract-socket plumbing
+// only exists there.
+func TestNotifyDeliversToFilesystemSocket(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sd_notify is Linux-only")
+	}
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "notify.sock")
+	addr := &net.UnixAddr{Name: socketPath, Net: "unixgram"}
+	ln, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		t.Fatalf("listen unixgram: %v", err)
+	}
+	defer ln.Close()
+
+	t.Setenv("NOTIFY_SOCKET", socketPath)
+	if err := Ready(); err != nil {
+		t.Fatalf("Ready(): %v", err)
+	}
+
+	buf := make([]byte, 64)
+	if err := ln.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, _, err := ln.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if got := string(buf[:n]); got != "READY=1" {
+		t.Errorf("payload = %q, want READY=1", got)
+	}
+}
+
+// TestNotifyDeliversToAbstractSocket verifies the '@'→NUL translation
+// that sd_notify requires for abstract sockets — a footgun under some
+// container runtimes if the leading '@' is passed through verbatim,
+// because the kernel would then look for a filesystem path starting
+// with '@' rather than the abstract namespace.
+func TestNotifyDeliversToAbstractSocket(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("sd_notify is Linux-only")
+	}
+	// Abstract namespace is "\x00" + name; we advertise the same with
+	// "@" + name and expect notify() to translate.
+	name := "dotvault-test-" + t.Name()
+	addr := &net.UnixAddr{Name: "\x00" + name, Net: "unixgram"}
+	ln, err := net.ListenUnixgram("unixgram", addr)
+	if err != nil {
+		t.Fatalf("listen abstract unixgram: %v", err)
+	}
+	defer ln.Close()
+
+	t.Setenv("NOTIFY_SOCKET", "@"+name)
+	if err := Ready(); err != nil {
+		t.Fatalf("Ready(): %v", err)
+	}
+
+	buf := make([]byte, 64)
+	if err := ln.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	n, _, err := ln.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if got := string(buf[:n]); got != "READY=1" {
+		t.Errorf("payload = %q, want READY=1", got)
 	}
 }
 

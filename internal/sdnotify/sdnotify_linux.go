@@ -7,16 +7,28 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // notify writes a single sd_notify message to $NOTIFY_SOCKET. Returns
 // nil when the env var is unset so the daemon doesn't error on a
 // non-systemd boot.
+//
+// systemd advertises two socket forms: a filesystem path (the
+// common case under user / system services) and an abstract socket
+// when NOTIFY_SOCKET starts with '@'. The abstract form needs the
+// leading '@' translated to a leading NUL byte before it can be
+// passed to the kernel — without this rewrite, READY=1 is silently
+// dropped under setups (including some container runtimes) that
+// expose the notify socket abstractly.
 func notify(state string) error {
 	socket := os.Getenv("NOTIFY_SOCKET")
 	if socket == "" {
 		return nil
+	}
+	if strings.HasPrefix(socket, "@") {
+		socket = "\x00" + socket[1:]
 	}
 	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{
 		Name: socket,

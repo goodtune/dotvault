@@ -311,9 +311,11 @@ func isNotFound(err error) bool {
 
 // classifyVaultErr collapses a vault API error onto a small set of
 // status labels suitable for an OTel attribute. The vocabulary is
-// closed ("denied", "not_found", "unreachable", "unknown") so the
-// time-series cardinality stays bounded — full error strings (which
-// can include paths or messages) must never be used.
+// closed and matches the values actually returned below:
+// "ok", "denied", "not_found", "throttled", "server_error",
+// "client_error", "unreachable". Full error strings (which can
+// include paths or messages) must never be used as label values —
+// they would unbound the metric cardinality.
 func classifyVaultErr(err error) string {
 	if err == nil {
 		return "ok"

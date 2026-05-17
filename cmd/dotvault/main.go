@@ -162,15 +162,21 @@ func setupLogging() {
 	// --log-format forces a specific handler regardless of TTY state.
 	// "auto" preserves the historical behaviour (text on TTY, JSON
 	// otherwise) so existing systemd units and shell wrappers keep
-	// working unchanged.
+	// working unchanged. Unknown values exit non-zero rather than
+	// silently falling back to auto, so a typo in a system unit or
+	// shell wrapper surfaces immediately instead of producing
+	// surprising log output.
 	useJSON := false
 	switch strings.ToLower(flagLogFormat) {
 	case "json":
 		useJSON = true
 	case "text":
 		useJSON = false
-	default:
+	case "auto", "":
 		useJSON = !isStderrTerminal()
+	default:
+		fmt.Fprintf(os.Stderr, "dotvault: invalid --log-format %q (want auto, text, or json)\n", flagLogFormat)
+		os.Exit(2)
 	}
 
 	var handler slog.Handler
@@ -542,12 +548,23 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 
+	// Initial sync runs synchronously before we tell systemd we're
+	// ready, so any unit that depends on dotvault.service blocks
+	// until secrets are actually on disk. The plain `engine.RunOnce`
+	// is the same call RunLoop would have made as its first action;
+	// pairing it with RunLoopAfterInitial below avoids a redundant
+	// second pass.
+	if err := engine.RunOnce(ctx); err != nil {
+		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
+	}
+
 	// systemd integration. sdnotify.Ready signals READY=1 so a
-	// Type=notify service unit reports active only once the daemon is
-	// authenticated and ready to sync. sdnotify.WatchdogLoop kicks the
-	// per-unit watchdog at half the configured WatchdogSec interval;
-	// both are no-ops on non-Linux and when NOTIFY_SOCKET / WATCHDOG_USEC
-	// are unset, so wiring them unconditionally is safe.
+	// Type=notify service unit reports active only once the daemon
+	// has authenticated and completed its initial sync.
+	// sdnotify.WatchdogLoop kicks the per-unit watchdog at half the
+	// configured WatchdogSec interval; both are no-ops on non-Linux
+	// and when NOTIFY_SOCKET / WATCHDOG_USEC are unset, so wiring
+	// them unconditionally is safe.
 	if err := sdnotify.Ready(); err != nil {
 		slog.Debug("sd_notify ready failed (ignored)", "error", err)
 	}
@@ -561,7 +578,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// tray.Run up and let the daemon shut down cleanly.
 	loopErrCh := make(chan error, 1)
 	go func() {
-		loopErrCh <- engine.RunLoop(ctx)
+		loopErrCh <- engine.RunLoopAfterInitial(ctx)
 		cancel()
 	}()
 

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -115,6 +116,16 @@ func TestInitBadProtocol(t *testing.T) {
 // up the OTel env-var convention. The metrics-specific override wins
 // over the generic one, matching the SDK's documented precedence.
 func TestProtocolFallthroughToEnv(t *testing.T) {
+	// Init mutates the process-wide MeterProvider global. Save and
+	// restore it (and the package-level instruments) so later tests
+	// in the same package don't observe a non-default or
+	// Shutdown()'d provider — mirrors newTestReader's discipline.
+	prev := otel.GetMeterProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prev)
+		rebindInstruments()
+	})
+
 	// Pointing at an unreachable collector with a short context means
 	// the test exits quickly while still exercising the protocol
 	// selection. We don't need the export to succeed — we only care

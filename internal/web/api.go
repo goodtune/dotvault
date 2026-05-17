@@ -638,6 +638,18 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // produces a 503 with a JSON envelope describing which gate
 // hasn't cleared, so a startup-gated dependency can poll until
 // ready.
+//
+// The token-presence check reflects the *cached* in-memory token,
+// not a per-probe LookupSelf against Vault. A token that expires
+// or is revoked between lifecycle checks (default cadence 5
+// minutes) will keep /readyz green until the lifecycle goroutine
+// next runs — at which point it triggers OnReauth, which clears
+// the in-memory token and flips /readyz back to 503. This is
+// deliberate: a per-probe Vault round-trip would multiply the
+// daemon's Vault load by every readiness probe and provide
+// little extra signal — operators wanting confirmed Vault
+// reachability should poll the engine's per-rule sync state
+// (via /api/v1/status) rather than /readyz.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	authenticated := s.vault != nil && s.vault.Token() != ""

@@ -313,7 +313,7 @@ web UI disabled has nothing to probe; point the
 or rely on the systemd `sd_notify(READY=1)` signal instead.
 
 - `GET /healthz` — liveness, always 200 while serving
-- `GET /readyz` — readiness, 200 once the daemon is authenticated to Vault AND has completed its initial sync cycle, 503 otherwise. Mirrors the `sd_notify(READY=1)` contract so a Kubernetes `readinessProbe` or the OTel `httpcheckreceiver` never observes a green daemon before secrets exist on disk.
+- `GET /readyz` — readiness, 200 once the daemon is authenticated to Vault AND has completed its initial sync cycle, 503 otherwise. Mirrors the `sd_notify(READY=1)` contract so a Kubernetes `readinessProbe` or the OTel `httpcheckreceiver` never observes a green daemon before secrets exist on disk. The auth check reflects the cached in-memory token, not a per-probe Vault round-trip; a revoked token flips `/readyz` back to 503 within the lifecycle check cadence (default 5 min).
 
 Both return JSON and are loopback-only, suitable for the OTel
 `httpcheckreceiver`.

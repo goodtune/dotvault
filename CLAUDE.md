@@ -114,7 +114,7 @@ dotvault sync        One-shot sync cycle, then exit
 dotvault login       Force a fresh login via the configured auth method
 dotvault login-check Validate/renew cached token on interactive login (tty-aware)
 dotvault status      Display auth state, token TTL, per-rule sync state
-dotvault version     Print build version
+dotvault version     Print build version (--json for machine-readable resource metadata)
 dotvault reg-export  Convert a Windows .reg file to YAML (or canonical .reg)
 dotvault reg-import  Convert a YAML config to a Windows .reg file
 ```
@@ -201,7 +201,7 @@ in-memory `*config.Config` and routes through the same regfile renderers,
 so a daemon that loaded its config from a Windows GPO can be exported
 back as YAML (or vice versa) without restart.
 
-Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--dry-run`. Subcommand-scoped: `--once` on `dotvault run` redirects to the sync path.
+Flags: `--config <path>`, `--log-level debug|info|warn|error`, `--log-format auto|text|json` (forces the slog handler; default `auto` picks text on TTY, JSON otherwise), `--dry-run`. Subcommand-scoped: `--once` on `dotvault run` redirects to the sync path; `--json` on `dotvault version` emits a structured `{version, service, go_version, os, arch}` envelope.
 
 Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Always writes to stderr; no file-based logging.
 
@@ -413,6 +413,10 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 - `GET /auth/ldap/status` — poll login status
 - `POST /auth/ldap/totp` — submit TOTP passcode (CSRF-protected)
 - `POST /auth/token/login` — validate and set token (CSRF-protected)
+
+**Health probes** (require `web.enabled: true` — served on the loopback web listener):
+- `GET /healthz` — liveness, always 200 while serving
+- `GET /readyz` — readiness, 200 once the daemon holds a Vault token AND has marked the initial sync complete (mirrors the `sd_notify(READY=1)` contract). 503 otherwise. Token check reflects the cached in-memory state, not a per-probe Vault round-trip.
 
 **API:**
 - `GET /api/v1/csrf` — issue CSRF token (one-time use, max 1000 in memory)

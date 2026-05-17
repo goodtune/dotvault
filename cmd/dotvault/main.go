@@ -199,12 +199,24 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print version",
 		Run: func(cmd *cobra.Command, args []string) {
 			if jsonOut {
-				_ = json.NewEncoder(os.Stdout).Encode(map[string]string{
-					"version":    version,
-					"service":    "dotvault",
-					"go_version": runtime.Version(),
-					"os":         runtime.GOOS,
-					"arch":       runtime.GOARCH,
+				// Explicit struct so JSON field order is fixed
+				// (version, service, go_version, os, arch) rather
+				// than the alphabetical order encoding/json
+				// applies to maps — easier to grep and copy/paste
+				// for OTel resource attribute pipelines.
+				type versionInfo struct {
+					Version   string `json:"version"`
+					Service   string `json:"service"`
+					GoVersion string `json:"go_version"`
+					OS        string `json:"os"`
+					Arch      string `json:"arch"`
+				}
+				_ = json.NewEncoder(os.Stdout).Encode(versionInfo{
+					Version:   version,
+					Service:   "dotvault",
+					GoVersion: runtime.Version(),
+					OS:        runtime.GOOS,
+					Arch:      runtime.GOARCH,
 				})
 				return
 			}

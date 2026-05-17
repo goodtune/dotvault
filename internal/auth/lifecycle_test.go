@@ -279,6 +279,73 @@ func TestLifecycleManager_ShortTokenWithoutCreationTTL(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_BaselineResetsOnTokenSwap covers the case where
+// the in-memory token changes mid-lifecycle: a new shorter-TTL token
+// must not inherit the oversized baseline cached from its
+// predecessor. Without the reset, `ttl <= baseline/4` would fire
+// immediately on the new token and the daemon would call RenewSelf
+// every poll interval.
+func TestLifecycleManager_BaselineResetsOnTokenSwap(t *testing.T) {
+	var renews atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			// Vault would never report different TTLs for the same
+			// token across calls; we vary it by the inbound header
+			// so the test simulates a token swap.
+			tok := r.Header.Get("X-Vault-Token")
+			ttl := "3600"
+			if tok == "short-token" {
+				ttl = "300"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":         json.Number(ttl),
+					"renewable":   true,
+					"expire_time": "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renews.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "long-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+
+	// First, drive a check with the long token so the baseline anchors at 3600s.
+	if err := lm.checkAndRenew(context.Background()); err != nil {
+		t.Fatalf("checkAndRenew (long): %v", err)
+	}
+	if lm.baselineTTL != time.Hour {
+		t.Fatalf("baselineTTL = %v, want 1h after long-token observation", lm.baselineTTL)
+	}
+
+	// Now swap the in-memory token to a shorter-TTL one. The
+	// baseline must reset, otherwise `300 <= 3600/4` would be true
+	// and the renew check would fire spuriously.
+	vc.SetToken("short-token")
+	if err := lm.checkAndRenew(context.Background()); err != nil {
+		t.Fatalf("checkAndRenew (short): %v", err)
+	}
+	if lm.baselineTTL != 300*time.Second {
+		t.Errorf("baselineTTL after swap = %v, want 5m (baseline should have reset and rebound to the new token's TTL)", lm.baselineTTL)
+	}
+	if renews.Load() != 0 {
+		t.Errorf("RenewSelf fired %d time(s) after token swap; oversized baseline leaked through", renews.Load())
+	}
+}
+
 // TestLifecycleManager_ReloadFromTokenFile exercises the recovery path
 // where a token has expired/been revoked but a fresh value has been
 // written to the token file by an external process (e.g. an interactive

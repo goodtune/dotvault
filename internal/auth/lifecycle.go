@@ -54,7 +54,14 @@ type LifecycleManager struct {
 	// stored value (which can only happen after a successful renewal
 	// or token swap), so the threshold tracks the live lease's
 	// shape without needing explicit reset hooks.
-	baselineTTL time.Duration
+	//
+	// baselineToken pins the baseline to the token it was measured
+	// against: when the in-memory token swaps (tryReload picking up
+	// a fresh token, an OnReauth-driven re-login) the baseline is
+	// reset so a new shorter-TTL token cannot inherit an oversized
+	// baseline from its predecessor.
+	baselineTTL   time.Duration
+	baselineToken string
 }
 
 // NewLifecycleManager creates a new token lifecycle manager. When
@@ -299,6 +306,14 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	// RenewSelf at every poll interval (~5min).
 	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
 	creationTTL := time.Duration(creationTTLSec) * time.Second
+	// Reset the cached baseline when the token swaps so a shorter
+	// new token doesn't inherit an oversized baseline from a longer
+	// previous one (which would make `ttl <= baseline/4` true on
+	// every check and trigger RenewSelf in a tight loop).
+	if currentToken := lm.client.Token(); currentToken != lm.baselineToken {
+		lm.baselineTTL = 0
+		lm.baselineToken = currentToken
+	}
 	if ttl > lm.baselineTTL {
 		lm.baselineTTL = ttl
 	}

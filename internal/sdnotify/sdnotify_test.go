@@ -123,21 +123,62 @@ func TestWatchdogLoopHonoursWATCHDOG_PID(t *testing.T) {
 	}
 }
 
-// TestWatchdogLoopExitsOnCancel confirms the watchdog ticker honours
-// context cancellation (both as a fast-return when WATCHDOG_USEC is
-// unset and as a normal teardown when it isn't). Without this the
-// daemon shutdown sequence could hang waiting on a stuck loop.
+// TestWatchdogLoopExitsOnCancel covers two paths: the fast no-op
+// return when systemd env vars are unset, and the actual ticker
+// teardown when they are. The second case is the one the daemon
+// shutdown sequence actually hits — without an exit on ctx
+// cancellation the sync loop's defer chain would hang waiting on
+// a stuck goroutine.
 func TestWatchdogLoopExitsOnCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		WatchdogLoop(ctx)
-		close(done)
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("WatchdogLoop did not exit on context cancellation")
-	}
+	t.Run("FastReturnWithoutSystemd", func(t *testing.T) {
+		// NOTIFY_SOCKET unset → WatchdogLoop returns immediately.
+		t.Setenv("NOTIFY_SOCKET", "")
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			WatchdogLoop(ctx)
+			close(done)
+		}()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("WatchdogLoop did not exit on context cancellation (fast-return path)")
+		}
+	})
+
+	t.Run("TickerExitsOnCancel", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("sd_notify is Linux-only")
+		}
+		// Real unixgram socket so notify() succeeds; tiny
+		// WATCHDOG_USEC so the ticker is genuinely running by the
+		// time cancel fires.
+		dir := t.TempDir()
+		socketPath := filepath.Join(dir, "notify.sock")
+		addr := &net.UnixAddr{Name: socketPath, Net: "unixgram"}
+		ln, err := net.ListenUnixgram("unixgram", addr)
+		if err != nil {
+			t.Fatalf("listen unixgram: %v", err)
+		}
+		defer ln.Close()
+		t.Setenv("NOTIFY_SOCKET", socketPath)
+		t.Setenv("WATCHDOG_USEC", "200000") // 200ms → tick every 100ms
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			WatchdogLoop(ctx)
+			close(done)
+		}()
+		// Let the ticker run at least once so the goroutine is in
+		// its select, not its setup phase.
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("WatchdogLoop did not exit on context cancellation (active-ticker path)")
+		}
+	})
 }

@@ -90,11 +90,23 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("web.listen: %w", err)
 	}
 
+	// Defence-in-depth: drop the Headers map from the cached copy.
+	// buildEffectiveConfig already strips it before serialising
+	// the download, but holding the live bearer tokens on the
+	// Server struct for the daemon's lifetime is needless surface
+	// — any future handler / test helper that reads s.obsCfg
+	// would still see them. The narrowed copy keeps everything
+	// the download endpoint needs to advertise (enabled,
+	// endpoint, protocol, insecure, export_interval) without
+	// the credential map.
+	narrowedObsCfg := sc.ObsCfg
+	narrowedObsCfg.Headers = nil
+
 	s := &Server{
 		cfg:                sc.WebCfg,
 		vaultCfg:           sc.VaultCfg,
 		syncCfg:            sc.SyncCfg,
-		obsCfg:             sc.ObsCfg,
+		obsCfg:             narrowedObsCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		csrf:               NewCSRFStore(),

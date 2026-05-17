@@ -294,23 +294,24 @@ func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
 	}
 }
 
-// TestEngine_RunLoopAfterInitial confirms the public API contract:
-// RunLoopAfterInitial does NOT perform an implicit initial sync (the
-// caller has already driven RunOnce themselves), and it exits
-// cleanly when ctx is cancelled. The main daemon path uses this
-// split so it can call RunOnce → sd_notify(READY=1) → loop without
-// the loop re-syncing redundantly. Coverage here guards against a
-// future refactor accidentally reintroducing the initial sync into
-// the after-initial entry point.
+// TestEngine_RunLoopAfterInitialSyncHook confirms two contracts of
+// the RunLoop public API:
+//
+//  1. The AfterInitialSync hook fires exactly once, between the
+//     initial RunOnce and the long-running loop. The daemon uses
+//     this to gate sd_notify(READY=1) and the web /readyz flag.
+//  2. The loop body itself does not implicitly perform a *second*
+//     sync — once the hook has fired, only the ticker/event
+//     triggers move the engine forward.
 //
 // Runs as a standard unit test (no skipIfNoVault) — points the
 // vault.Client at an httptest server that 503s everything, so the
-// engine's ServerHealth probe fails fast, the event subscription is
-// skipped, and the loop just waits on ctx. With a one-hour sync
-// interval and a short context timeout, the ticker never fires;
-// the only way the target file appears is if the loop reintroduces
-// an implicit initial sync, which is what we're guarding against.
-func TestEngine_RunLoopAfterInitial(t *testing.T) {
+// engine's ServerHealth probe fails fast and ReadKVv2 returns the
+// not-found path. With a one-hour sync interval and a short
+// context timeout, the only way the hook fires twice is if the
+// loop reintroduces a redundant initial cycle, which is what
+// we're guarding against.
+func TestEngine_RunLoopAfterInitialSyncHook(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "vault unavailable", http.StatusServiceUnavailable)
 	}))
@@ -349,11 +350,14 @@ func TestEngine_RunLoopAfterInitial(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if err := engine.RunLoopAfterInitial(ctx); err != nil {
-		t.Fatalf("RunLoopAfterInitial: %v", err)
-	}
 
-	if _, err := os.Stat(ghPath); err == nil {
-		t.Errorf("RunLoopAfterInitial wrote %s — it must not perform an implicit initial sync", ghPath)
+	var hookCalls int
+	if err := engine.RunLoop(ctx, AfterInitialSync(func() {
+		hookCalls++
+	})); err != nil {
+		t.Fatalf("RunLoop: %v", err)
+	}
+	if hookCalls != 1 {
+		t.Errorf("AfterInitialSync hook called %d time(s), want 1", hookCalls)
 	}
 }

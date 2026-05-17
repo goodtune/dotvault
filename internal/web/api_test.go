@@ -261,15 +261,19 @@ func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
 	}
 	// observability.headers can carry bearer tokens — the download
 	// endpoint must NEVER leak them via the loopback API. The
-	// configured value above includes a fake bearer token; assert
-	// it doesn't appear anywhere in the response body, and that the
-	// `headers:` key itself is stripped so even the vendor name is
-	// not exposed.
+	// configured value above includes a fake bearer token plus a
+	// vendor-revealing key name; assert neither appears.
+	//
+	// `headers: {}` (an empty map) is allowed: the project's
+	// round-trip-clearing convention emits empty optional fields
+	// explicitly so a re-import can clear previously-set values.
+	// What we forbid is the populated form `authorization: …`
+	// appearing anywhere in the output.
 	if strings.Contains(body, "super-secret-token") {
 		t.Errorf("download leaked observability.headers value:\n%s", body)
 	}
-	if strings.Contains(body, "headers:") {
-		t.Errorf("download exposed observability.headers key set:\n%s", body)
+	if strings.Contains(body, "authorization:") {
+		t.Errorf("download exposed observability.headers vendor key:\n%s", body)
 	}
 }
 

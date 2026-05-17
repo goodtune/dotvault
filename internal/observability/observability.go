@@ -248,8 +248,16 @@ func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) 
 	}
 }
 
+// stripScheme normalises an OTLP gRPC endpoint by removing a
+// URL-style scheme so the underlying gRPC dialer receives a bare
+// host:port (which is what otlpmetricgrpc.WithEndpoint expects).
+//
+// dns:/// is deliberately preserved: it is a valid gRPC resolver
+// prefix (not a URL scheme) that enables the DNS resolver for
+// multi-address service discovery / load balancing. Stripping it
+// would change the dial-target semantics and break those setups.
 func stripScheme(s string) string {
-	for _, prefix := range []string{"https://", "http://", "grpc://", "dns:///"} {
+	for _, prefix := range []string{"https://", "http://", "grpc://"} {
 		if strings.HasPrefix(s, prefix) {
 			return strings.TrimPrefix(s, prefix)
 		}

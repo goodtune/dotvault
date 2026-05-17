@@ -537,38 +537,30 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 
 	// Initial sync runs synchronously before we tell systemd we're
-	// ready, so any unit that depends on dotvault.service blocks
-	// until secrets are actually on disk. The plain `engine.RunOnce`
-	// is the same call RunLoop would have made as its first action;
-	// pairing it with RunLoopAfterInitial below avoids a redundant
-	// second pass.
-	if err := engine.RunOnce(ctx); err != nil {
-		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
-	}
-	// Flip the web-server readiness gate so /readyz can report
-	// ready alongside sd_notify(READY=1). Partial first-cycle
-	// failures still count: the daemon has made its best attempt;
-	// future cycles will retry, and we don't want a single
-	// transient error to wedge readiness forever. The systemd
-	// READY signal below uses the same posture.
-	if webServer != nil {
-		webServer.MarkInitialSyncComplete()
-	}
-
-	// sd_notify(READY=1) is sent here, after authentication and the
-	// initial sync, so anything that depends on dotvault.service
-	// blocks until secrets are actually on disk. The watchdog
-	// ticker was started earlier (right after ctx) so a long
-	// startup doesn't miss the watchdog window. Both calls are
-	// no-ops on non-Linux and when NOTIFY_SOCKET is unset.
-	if err := sdnotify.Ready(); err != nil {
-		// sd_notify is a no-op when NOTIFY_SOCKET is unset; a
-		// non-nil return therefore means a real socket write
-		// failure. The daemon keeps running, but systemd will
-		// time out the unit at TimeoutStartSec and restart it —
-		// surface this loudly so the cause isn't hidden behind
-		// a misleading systemd "start-limit-hit" log.
-		slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
+	// The sync engine drives the initial RunOnce internally; the
+	// AfterInitialSync hook below fires the daemon's readiness
+	// signals (web-server /readyz gate, sd_notify(READY=1))
+	// exactly once, synchronously, between the initial cycle and
+	// the long-running loop. Partial first-cycle failures still
+	// count as "ready": the daemon has made its best attempt and
+	// future cycles will retry; we don't want a single transient
+	// error to wedge readiness forever.
+	afterInitial := func() {
+		if webServer != nil {
+			webServer.MarkInitialSyncComplete()
+		}
+		// sd_notify(READY=1) is sent here, after auth and the
+		// initial sync, so anything depending on dotvault.service
+		// blocks until secrets are actually on disk. The
+		// watchdog ticker was started earlier (right after ctx)
+		// so a long startup doesn't miss the watchdog window.
+		// Both calls are no-ops on non-Linux and when
+		// NOTIFY_SOCKET is unset; a non-nil return from Ready()
+		// means a genuine socket write failure (warn loudly so
+		// the systemd "start-limit-hit" log has a breadcrumb).
+		if err := sdnotify.Ready(); err != nil {
+			slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
+		}
 	}
 
 	// Run the sync engine on a goroutine and the tray (Windows) or a
@@ -579,7 +571,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// tray.Run up and let the daemon shut down cleanly.
 	loopErrCh := make(chan error, 1)
 	go func() {
-		loopErrCh <- engine.RunLoopAfterInitial(ctx)
+		loopErrCh <- engine.RunLoop(ctx, sync.AfterInitialSync(afterInitial))
 		cancel()
 	}()
 

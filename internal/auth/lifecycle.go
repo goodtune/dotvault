@@ -155,7 +155,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						}
 						nextDelay := lm.recoveryInterval
 						slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
-						lm.signalReauth(errCh, err)
+						lm.signalReauth(ctx, errCh, err)
 						lm.currentDelay = nextDelay
 					} else {
 						// Transient error: backoff up to maxDelay.
@@ -184,12 +184,14 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 // signalReauth flips the manager into the needs-reauth state and invokes
 // the OnReauth callback once per transition. The error is pushed onto errCh
 // non-blockingly so a consumer that has stopped reading doesn't deadlock.
-func (lm *LifecycleManager) signalReauth(errCh chan<- error, err error) {
+// Takes the lifecycle goroutine's ctx so the metric record carries
+// the same cancellation / trace context the rest of the cycle uses.
+func (lm *LifecycleManager) signalReauth(ctx context.Context, errCh chan<- error, err error) {
 	if lm.needsReauth.Load() {
 		return
 	}
 	lm.needsReauth.Store(true)
-	observability.RecordTokenRenewal(context.Background(), "reauth_required")
+	observability.RecordTokenRenewal(ctx, "reauth_required")
 	if lm.onReauth != nil {
 		lm.onReauth()
 	}

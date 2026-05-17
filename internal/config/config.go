@@ -89,13 +89,23 @@ type Config struct {
 // ObservabilityConfig configures the OpenTelemetry metrics exporter.
 // Disabled by default — set Enabled and Endpoint (or the standard
 // OTEL_* env vars) to point the daemon at a local OTel collector.
+//
+// The inner fields deliberately do NOT carry `omitempty`. The
+// project's YAML/regfile round-trip contract (see
+// internal/regfile/yaml.go) emits empty optional fields explicitly
+// so a re-import can clear previously-set values; omitempty here
+// would let a cleared endpoint or protocol silently persist its
+// previous value across an export → re-import cycle. The
+// top-level Observability field on Config keeps `omitempty` so
+// operators who don't use observability at all don't see a noisy
+// empty block in their downloads.
 type ObservabilityConfig struct {
 	Enabled        bool              `yaml:"enabled"`
-	Endpoint       string            `yaml:"endpoint,omitempty"`
-	Protocol       string            `yaml:"protocol,omitempty"`
-	Insecure       bool              `yaml:"insecure,omitempty"`
-	Headers        map[string]string `yaml:"headers,omitempty"`
-	RawInterval    string            `yaml:"export_interval,omitempty"`
+	Endpoint       string            `yaml:"endpoint"`
+	Protocol       string            `yaml:"protocol"`
+	Insecure       bool              `yaml:"insecure"`
+	Headers        map[string]string `yaml:"headers"`
+	RawInterval    string            `yaml:"export_interval"`
 	ExportInterval time.Duration     `yaml:"-"`
 }
 
@@ -288,6 +298,20 @@ func (c *Config) validate() error {
 			// WithInterval (which doesn't validate). Zero is fine
 			// — the SDK falls back to its default 60s.
 			return fmt.Errorf("observability.export_interval %v: must be positive", c.Observability.ExportInterval)
+		}
+		// Defence-in-depth: reject CR/LF in header values and
+		// CR/LF/`:` in header names so a malformed config can't
+		// smuggle additional HTTP headers into the OTLP/HTTP
+		// exporter's outbound request. The OTel SDK itself
+		// doesn't validate this; catching it here surfaces the
+		// problem at startup rather than at first export.
+		for k, v := range c.Observability.Headers {
+			if strings.ContainsAny(k, "\r\n:") {
+				return fmt.Errorf("observability.headers: key %q must not contain CR, LF, or colon", k)
+			}
+			if strings.ContainsAny(v, "\r\n") {
+				return fmt.Errorf("observability.headers[%q]: value must not contain CR or LF", k)
+			}
 		}
 	}
 

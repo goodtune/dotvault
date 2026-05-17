@@ -73,31 +73,49 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	return lastErr
 }
 
+// RunLoopOption tunes RunLoop's behaviour without exposing the
+// engine's internal sequencing to callers.
+type RunLoopOption func(*runLoopConfig)
+
+type runLoopConfig struct {
+	afterInitialSync func()
+}
+
+// AfterInitialSync registers a callback invoked exactly once,
+// synchronously, after RunLoop's initial RunOnce returns and before
+// the ticker / event loop starts. The daemon uses this to gate
+// sd_notify(READY=1) and the web server's readiness flag on the
+// initial sync completing — without leaking the initial-sync-then-
+// loop sequencing to every caller via a separately-exported
+// RunLoopAfterInitial entry point.
+func AfterInitialSync(fn func()) RunLoopOption {
+	return func(c *runLoopConfig) { c.afterInitialSync = fn }
+}
+
 // RunLoop runs the hybrid event/poll sync loop until ctx is cancelled.
-//
-// RunLoop performs an initial sync cycle before entering the ticker /
-// event loop. Callers that have already driven the initial sync
-// themselves (e.g. the daemon, which needs to know the first cycle is
-// done before signalling systemd's READY=1) should use
-// RunLoopAfterInitial instead to avoid the duplicate work.
-//
-// The initial RunOnce error is logged here so a caller using this
-// convenience wrapper (tests, future integrations) gets a signal in
-// stderr that the first cycle failed; subsequent rules can still
-// succeed, and the loop carries on regardless — matching the
-// per-rule isolation policy the engine guarantees elsewhere.
-func (e *Engine) RunLoop(ctx context.Context) error {
+// It performs an initial RunOnce up front, fires any
+// AfterInitialSync hook, then enters the ticker / event loop. The
+// initial RunOnce error is logged but does not abort the loop —
+// per-rule isolation is the engine's invariant.
+func (e *Engine) RunLoop(ctx context.Context, opts ...RunLoopOption) error {
+	cfg := &runLoopConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 	if err := e.RunOnce(ctx); err != nil {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
-	return e.RunLoopAfterInitial(ctx)
+	if cfg.afterInitialSync != nil {
+		cfg.afterInitialSync()
+	}
+	return e.runLoopAfterInitial(ctx)
 }
 
-// RunLoopAfterInitial runs the hybrid event/poll sync loop without an
-// implicit initial sync. The first cycle is left to the caller, which
-// lets the daemon gate sd_notify(READY=1) on the initial sync
-// completing without paying for a redundant second pass.
-func (e *Engine) RunLoopAfterInitial(ctx context.Context) error {
+// runLoopAfterInitial runs the hybrid event/poll sync loop without
+// an implicit initial sync. Unexported because the initial-sync
+// sequencing is an engine invariant — callers compose via
+// RunLoopOption hooks instead.
+func (e *Engine) runLoopAfterInitial(ctx context.Context) error {
 	// Check Vault edition — events API requires Enterprise.
 	var eventsAvailable bool
 	if health, err := e.vault.ServerHealth(ctx); err != nil {

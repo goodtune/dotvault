@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // TestInitDisabled confirms the disabled path returns an inactive
@@ -42,6 +44,58 @@ func TestRecordWithoutInit(t *testing.T) {
 	RecordWebRequest(ctx, "/api/v1/status", "2xx")
 	RecordConfigReload(ctx, "no_change")
 	RecordSIGHUP(ctx)
+}
+
+// TestRecordReachesActiveMeterProvider is the behavioural test for
+// rebindInstruments: after the package-level Record* helpers are
+// rebuilt to point at the active MeterProvider, a recorded counter
+// must actually appear in the provider's reader. Without this
+// assertion, rebindInstruments could be a no-op and TestInitDisabled
+// + TestRecordWithoutInit would still pass (both rely on the
+// no-op meter being the failure mode).
+//
+// Uses a ManualReader installed directly on a test-local
+// MeterProvider, then routes the global meter provider at it via
+// otel.SetMeterProvider so the package-level instruments rebind
+// onto our reader. Cleanup restores the previous global so other
+// tests don't see our reader.
+func TestRecordReachesActiveMeterProvider(t *testing.T) {
+	reader := newTestReader(t)
+
+	ctx := context.Background()
+	RecordSyncTick(ctx, "ok")
+	RecordVaultCall(ctx, "read", "ok")
+	RecordEnrolAttempt(ctx, "ssh", "completed")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+
+	counters := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			var total int64
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+			counters[m.Name] = total
+		}
+	}
+
+	for _, name := range []string{
+		"dotvault.sync.ticks",
+		"dotvault.vault.calls",
+		"dotvault.enrol.attempts",
+	} {
+		if counters[name] < 1 {
+			t.Errorf("counter %q = %d, want ≥1 — rebindInstruments did not wire it to the active provider", name, counters[name])
+		}
+	}
 }
 
 // TestInitBadProtocol verifies the validation path rejects unknown

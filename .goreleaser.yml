@@ -81,6 +81,17 @@ nfpms:
         file_info:
           mode: 0644
         packager: deb
+      # APK doesn't ship a unit-file consumer by default (Alpine
+      # uses OpenRC, not systemd), but the systemd-elogind /
+      # systemd-shim packages search /usr/lib/systemd/user/. The
+      # entry below makes the unit available on the small subset of
+      # Alpine installations that have opted into systemd; on
+      # OpenRC-only hosts the file is just dormant.
+      - src: packaging/linux/dotvault.service
+        dst: /usr/lib/systemd/user/dotvault.service
+        file_info:
+          mode: 0644
+        packager: apk
 
 checksum:
   name_template: checksums.txt

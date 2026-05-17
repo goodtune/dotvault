@@ -228,6 +228,9 @@ func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
 		Protocol:       "grpc",
 		Insecure:       true,
 		ExportInterval: 15 * time.Second,
+		Headers: map[string]string{
+			"authorization": "Bearer super-secret-token",
+		},
 	}
 	s.rules = []config.Rule{
 		{
@@ -255,6 +258,18 @@ func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
 	// raw form should be materialised so the download round-trips.
 	if !strings.Contains(body, "export_interval: 15s") {
 		t.Errorf("expected materialised export_interval `15s`; got:\n%s", body)
+	}
+	// observability.headers can carry bearer tokens — the download
+	// endpoint must NEVER leak them via the loopback API. The
+	// configured value above includes a fake bearer token; assert
+	// it doesn't appear anywhere in the response body, and that the
+	// `headers:` key itself is stripped so even the vendor name is
+	// not exposed.
+	if strings.Contains(body, "super-secret-token") {
+		t.Errorf("download leaked observability.headers value:\n%s", body)
+	}
+	if strings.Contains(body, "headers:") {
+		t.Errorf("download exposed observability.headers key set:\n%s", body)
 	}
 }
 

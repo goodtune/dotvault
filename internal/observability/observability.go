@@ -7,6 +7,21 @@
 // off to the global no-op meter, so every call site can record without
 // nil-checking. Initialise once at daemon start, defer Shutdown.
 //
+// Architecture: lower-level packages (auth, sync, vault, enrol, web)
+// import this one and call package-level Record* helpers directly,
+// rather than receiving a callback from the daemon entrypoint. This
+// matches dotvault's convention for cross-cutting concerns (slog is
+// imported at every layer in the same way); both rely on a
+// well-behaved no-op default for tests that don't initialise the
+// global, and both keep the call sites free of plumbing. Init
+// mutates a process-wide global (otel.SetMeterProvider + the
+// rebindInstruments rebind under instrMu) — it's expected to run
+// exactly once per process at startup. The test suite in this
+// package does not run subtests with t.Parallel(), so the sequential
+// invocations of Init in tests do not race; do not add t.Parallel()
+// without also serialising Init through a sync.Once or test-scoped
+// lock.
+//
 // Attribute conventions:
 //   - Outcomes use a small fixed vocabulary ({ok, error, skipped,
 //     renewed, reauth_required, failed, completed, denied, …}) so the
@@ -93,9 +108,12 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 }
 
 // ForceFlush blocks until the periodic reader has exported any
-// in-flight metrics, up to the deadline on ctx. Used by `dotvault sync`
-// and `dotvault run --once` so cron-style invocations don't drop their
-// last cycle's metrics. No-op for an inactive provider.
+// in-flight metrics, up to the deadline on ctx. Available for
+// callers that want to flush mid-flight without tearing the
+// provider down; Shutdown already invokes ForceFlush internally,
+// so the one-shot `dotvault sync` and `dotvault run --once`
+// paths rely on their deferred Shutdown rather than calling this
+// directly. No-op for an inactive provider.
 func (p *Provider) ForceFlush(ctx context.Context) error {
 	if p == nil || p.mp == nil {
 		return nil

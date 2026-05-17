@@ -80,9 +80,16 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 // themselves (e.g. the daemon, which needs to know the first cycle is
 // done before signalling systemd's READY=1) should use
 // RunLoopAfterInitial instead to avoid the duplicate work.
+//
+// The initial RunOnce error is logged here so a caller using this
+// convenience wrapper (tests, future integrations) gets a signal in
+// stderr that the first cycle failed; subsequent rules can still
+// succeed, and the loop carries on regardless — matching the
+// per-rule isolation policy the engine guarantees elsewhere.
 func (e *Engine) RunLoop(ctx context.Context) error {
-	// Initial sync
-	e.RunOnce(ctx)
+	if err := e.RunOnce(ctx); err != nil {
+		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
+	}
 	return e.RunLoopAfterInitial(ctx)
 }
 

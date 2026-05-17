@@ -291,3 +291,58 @@ func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
 		t.Errorf("re-synced file missing token:\n%s", data)
 	}
 }
+
+// TestEngine_RunLoopAfterInitial confirms the public API contract:
+// RunLoopAfterInitial does NOT perform an implicit initial sync (the
+// caller has already driven RunOnce themselves), and it exits
+// cleanly when ctx is cancelled. The main daemon path uses this
+// split so it can call RunOnce → sd_notify(READY=1) → loop without
+// the loop re-syncing redundantly. Coverage here guards against a
+// future refactor accidentally reintroducing the initial sync into
+// the after-initial entry point.
+func TestEngine_RunLoopAfterInitial(t *testing.T) {
+	skipIfNoVault(t)
+
+	vc := testVaultClient(t)
+	seedVaultData(t, vc)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			KVMount:    "secret",
+			UserPrefix: "users/",
+		},
+		Sync: config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: config.Target{
+					Path:     ghPath,
+					Format:   "yaml",
+					Template: "github.com:\n  oauth_token: \"{{.token}}\"",
+					Merge:    "deep",
+				},
+			},
+		},
+	}
+
+	engine := NewEngine(cfg, vc, "testuser", statePath)
+
+	// RunLoopAfterInitial must not implicitly RunOnce — the file
+	// should not exist after a cancellation that arrives before the
+	// long sync.interval ticks. The caller would have called RunOnce
+	// itself; we deliberately skip it here to assert the contract.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := engine.RunLoopAfterInitial(ctx); err != nil {
+		t.Fatalf("RunLoopAfterInitial: %v", err)
+	}
+
+	if _, err := os.Stat(ghPath); err == nil {
+		t.Errorf("RunLoopAfterInitial wrote %s — it must not perform an implicit initial sync", ghPath)
+	}
+}

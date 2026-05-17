@@ -264,12 +264,15 @@ func TestStatusRecorderPreservesInterfacesConditionally(t *testing.T) {
 	})
 }
 
-// TestMiddlewareRecordsPanicAs5xx confirms a handler panic doesn't
-// silently report a 2xx outcome to the metrics layer. The defer
-// must detect the in-flight panic, mark the status 5xx, record the
-// metric, and re-panic so net/http's standard recovery still kicks
-// in and serves a 500.
-func TestMiddlewareRecordsPanicAs5xx(t *testing.T) {
+// TestMiddlewareRePanicsAfterHandlerPanic confirms a handler panic
+// is re-thrown after the metrics defer runs, so net/http's
+// standard recovery can still serve the 500. The metric value
+// recorded for the panic path is exercised behaviourally in
+// observability/observability_test.go's ManualReader-backed
+// assertions; this test deliberately stops at the re-panic
+// boundary because wiring a test-scoped MeterProvider here would
+// duplicate that machinery.
+func TestMiddlewareRePanicsAfterHandlerPanic(t *testing.T) {
 	s := testServer(t)
 	s.cfg.Listen = "127.0.0.1:0"
 

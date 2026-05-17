@@ -138,6 +138,26 @@ listed above. If you install dotvault into a non-standard location
 (e.g. `/usr/local/bin`), copy the unit out to
 `~/.config/systemd/user/dotvault.service` and adjust those lines.
 
+!!! warning "Slow initial sync may trip the watchdog"
+    The packaged unit declares `WatchdogSec=120` and uses
+    `Type=notify` — systemd marks the service ready only after the
+    daemon authenticates to Vault and completes its first sync
+    cycle. On a resource-constrained host (many rules, slow Vault,
+    cold TLS handshake) the first cycle may exceed 120 seconds and
+    systemd will restart the daemon mid-boot before `READY=1` is
+    ever sent, causing a boot loop. Raise the timeout in a drop-in
+    override:
+
+    ```sh
+    systemctl --user edit dotvault.service
+    # Under [Service]: WatchdogSec=300
+    ```
+
+    Note also that anything declaring `After=dotvault.service` now
+    blocks until the first sync completes — a behavioural change
+    from the previous manually-created unit which had no
+    `Type=notify` gate.
+
 ### launchd (macOS)
 
 ```xml

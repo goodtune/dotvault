@@ -469,10 +469,22 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 	// if the user only set it programmatically (parsed) and not via
 	// the RawInterval YAML field, materialise the raw form so the
 	// download reflects the effective configuration.
+	//
+	// observability.headers can legitimately carry high-value bearer
+	// tokens (Datadog / Grafana Cloud / etc. OTLP keys). Drop the
+	// value-set from the downloaded YAML so an authenticated
+	// loopback caller can't exfiltrate them via /config/download. The
+	// key set is also stripped since leaking just the header names
+	// would still tell a malicious local process which vendor the
+	// operator is wired up to. Operators who need to round-trip the
+	// header set should manage it via the OTEL_EXPORTER_OTLP_HEADERS
+	// env var (documented as the GPO-friendly path in
+	// docs/admin/deployment.md).
 	obsCfg := s.obsCfg
 	if obsCfg.RawInterval == "" && obsCfg.ExportInterval > 0 {
 		obsCfg.RawInterval = formatDuration(obsCfg.ExportInterval)
 	}
+	obsCfg.Headers = nil
 
 	return &config.Config{
 		Vault:         s.vaultCfg,
@@ -636,9 +648,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if !authenticated {
 		payload["status"] = "not_ready"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(payload)
+		writeJSONStatus(w, http.StatusServiceUnavailable, payload)
 		return
 	}
 	writeJSON(w, payload)
@@ -649,8 +659,16 @@ func writeJSON(w http.ResponseWriter, data any) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func writeError(w http.ResponseWriter, message string, code int) {
+// writeJSONStatus is the explicit-status sibling of writeJSON for
+// handlers that need to set a non-default status (e.g. /readyz's
+// 503 envelope, which carries a structured payload rather than the
+// generic {"error": …} shape writeError provides).
+func writeJSONStatus(w http.ResponseWriter, code int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, message string, code int) {
+	writeJSONStatus(w, code, map[string]string{"error": message})
 }

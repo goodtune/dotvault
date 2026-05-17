@@ -249,36 +249,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// after auth + initial sync further down.
 	go sdnotify.WatchdogLoop(ctx)
 
-	// Init observability. A disabled block returns a no-op provider so
-	// instruments harmlessly route to the OTel global no-op meter.
-	// Wrap with a short timeout so a misconfigured or unreachable
-	// collector can't stall daemon startup: failures degrade quickly
-	// to the no-op provider, keeping the daemon responsive.
-	initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
-	obsProvider, obsErr := observability.Init(initCtx, observability.Config{
-		Enabled:        cfg.Observability.Enabled,
-		Endpoint:       cfg.Observability.Endpoint,
-		Protocol:       cfg.Observability.Protocol,
-		Insecure:       cfg.Observability.Insecure,
-		Headers:        cfg.Observability.Headers,
-		ExportInterval: cfg.Observability.ExportInterval,
-		ServiceVersion: version,
-	})
-	initCancel()
-	if obsErr != nil {
-		// Telemetry must never take the daemon down. Log loudly and
-		// continue with a no-op provider so instrument call sites stay
-		// safe.
-		slog.Error("failed to initialise observability, continuing without metrics", "error", obsErr)
-		obsProvider = &observability.Provider{}
-	}
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := obsProvider.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("observability shutdown error", "error", err)
-		}
-	}()
+	obsProvider := initObservability(ctx, cfg.Observability)
+	defer shutdownObservability(obsProvider)
 
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
@@ -639,33 +611,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
 	// Cron-style one-shot invocations still need to push their metrics
-	// out before exit, so wire the same observability path the daemon
-	// uses and force-flush before returning. Init returns a no-op
-	// provider when the config block is disabled; the flush + shutdown
-	// path is a no-op in that case. Bound init with a short timeout
-	// so a misconfigured/unreachable collector can't stall a cron run.
-	initCtx, initCancel := context.WithTimeout(ctx, 10*time.Second)
-	obsProvider, obsErr := observability.Init(initCtx, observability.Config{
-		Enabled:        cfg.Observability.Enabled,
-		Endpoint:       cfg.Observability.Endpoint,
-		Protocol:       cfg.Observability.Protocol,
-		Insecure:       cfg.Observability.Insecure,
-		Headers:        cfg.Observability.Headers,
-		ExportInterval: cfg.Observability.ExportInterval,
-		ServiceVersion: version,
-	})
-	initCancel()
-	if obsErr != nil {
-		slog.Error("failed to initialise observability, continuing without metrics", "error", obsErr)
-		obsProvider = &observability.Provider{}
-	}
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := obsProvider.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("observability shutdown error", "error", err)
-		}
-	}()
+	// out before exit. The deferred Shutdown invokes ForceFlush
+	// internally, so the last batch makes it out before the process
+	// exits.
+	obsProvider := initObservability(ctx, cfg.Observability)
+	defer shutdownObservability(obsProvider)
 
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {
@@ -1380,6 +1330,46 @@ func isStderrTerminal() bool {
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// initObservability builds an observability.Provider from the loaded
+// configuration, scoped by a short timeout so a misconfigured or
+// unreachable collector can't stall daemon startup. Always returns a
+// non-nil provider — on Init failure it returns the no-op variant so
+// the caller can defer Shutdown unconditionally. Shared between
+// runDaemon and runSync because divergence between the two call
+// sites had been a real source of regressions.
+func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *observability.Provider {
+	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	provider, err := observability.Init(initCtx, observability.Config{
+		Enabled:        cfg.Enabled,
+		Endpoint:       cfg.Endpoint,
+		Protocol:       cfg.Protocol,
+		Insecure:       cfg.Insecure,
+		Headers:        cfg.Headers,
+		ExportInterval: cfg.ExportInterval,
+		ServiceVersion: version,
+	})
+	if err != nil {
+		// Telemetry must never take the daemon down. Log loudly and
+		// continue with a no-op provider so instrument call sites
+		// stay safe.
+		slog.Error("failed to initialise observability, continuing without metrics", "error", err)
+		return &observability.Provider{}
+	}
+	return provider
+}
+
+// shutdownObservability flushes and tears down the MeterProvider
+// behind p with a bounded timeout. Paired with initObservability so
+// runDaemon and runSync share the same shutdown contract.
+func shutdownObservability(p *observability.Provider) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		slog.Warn("observability shutdown error", "error", err)
+	}
 }
 
 // isGUIBinary reports whether the running executable is the GUI-subsystem

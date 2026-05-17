@@ -101,17 +101,15 @@ Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the 
 
 ### systemd (Linux)
 
-The RPM and DEB packages ship a `dotvault.service` **user unit** (a
-`Type=notify` service with `WatchdogSec=120` and the OpenTelemetry-
-friendly logging settings). The install path depends on the
-distribution: the RPM installs to `/usr/lib/systemd/user/`, the DEB
-to `/lib/systemd/user/`. Both directories are part of the standard
-systemd user-unit search path, so the enablement commands below are
-the same regardless of packaging format. dotvault is a per-user
-daemon — it authenticates to Vault with the OS user's identity and
-writes secrets into that user's `$HOME` — so installing it as a
-system service that runs as root would write to root's `$HOME` and
-authenticate to Vault as root, which is almost never what you want.
+The RPM, DEB, and APK packages all ship a `dotvault.service`
+**user unit** (a `Type=notify` service with `WatchdogSec=120` and
+the OpenTelemetry-friendly logging settings) at the canonical
+`/usr/lib/systemd/user/` path. dotvault is a per-user daemon —
+it authenticates to Vault with the OS user's identity and writes
+secrets into that user's `$HOME` — so installing it as a system
+service that runs as root would write to root's `$HOME` and
+authenticate to Vault as root, which is almost never what you
+want.
 
 Enable per-user once the package is installed:
 

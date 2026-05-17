@@ -53,10 +53,25 @@ func (e *Engine) TriggerSync() {
 
 // RunOnce executes a single sync cycle across all rules.
 func (e *Engine) RunOnce(ctx context.Context) error {
+	start := time.Now()
+	lastErr := e.runOnceLocked(ctx)
+	outcome := "ok"
+	if lastErr != nil {
+		outcome = "error"
+	}
+	// Record outside the mutex: metric ops are independent of the
+	// engine's critical section, and dragging them inside would
+	// inflate the lock-hold window if the OTel exporter (or a
+	// future instrument) ever blocks.
+	observability.RecordSyncTick(ctx, outcome)
+	observability.RecordSyncDuration(ctx, time.Since(start), outcome)
+	return lastErr
+}
+
+func (e *Engine) runOnceLocked(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	start := time.Now()
 	var lastErr error
 	for _, rule := range e.cfg.Rules {
 		if err := e.syncRule(ctx, rule); err != nil {
@@ -64,12 +79,6 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 			lastErr = err
 		}
 	}
-	outcome := "ok"
-	if lastErr != nil {
-		outcome = "error"
-	}
-	observability.RecordSyncTick(ctx, outcome)
-	observability.RecordSyncDuration(ctx, time.Since(start), outcome)
 	return lastErr
 }
 

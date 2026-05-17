@@ -13,10 +13,11 @@ import (
 // onto it, and registers a Cleanup that restores the previous global.
 //
 // The returned reader can be Collect()ed against to assert what the
-// instruments emitted during the test. Lives in a non-test file so
-// the web package's tests can import it through a sibling helper if
-// needed in the future — keeping it inside the observability package
-// preserves the package-level instrument-rebind contract.
+// instruments emitted during the test. Lives in a _test.go file so
+// its `testing` import doesn't leak into production builds; if other
+// packages' tests ever need this helper, lift it into an
+// `observabilitytest` subpackage rather than promoting it back into
+// the production tree.
 func newTestReader(t *testing.T) *sdkmetric.ManualReader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()

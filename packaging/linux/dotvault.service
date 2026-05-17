@@ -34,6 +34,18 @@ Wants=network-online.target
 # are the canonical signal.
 Type=notify
 NotifyAccess=main
+# TimeoutStartSec bounds the pre-READY window: systemd waits this
+# long for the daemon to send sd_notify(READY=1) before declaring
+# the start a failure. Because we deliberately delay READY=1 until
+# after Vault auth + initial sync, the default ~90s can trigger
+# unwanted restarts on a slow first sync (many rules, slow Vault,
+# cold TLS handshake). 300s gives a comfortable margin; operators
+# with pathological first-sync times can raise it further (up to
+# `infinity`) via a drop-in.
+TimeoutStartSec=300
+# WatchdogSec governs post-ready liveness — the daemon kicks the
+# watchdog at half this interval; if the kicks stop, systemd
+# restarts the unit.
 WatchdogSec=120
 
 # The CLI lives at /usr/bin/dotvault when installed from the official

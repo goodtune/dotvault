@@ -280,6 +280,14 @@ func (c *Config) validate() error {
 				return fmt.Errorf("observability.export_interval %q: must be positive", c.Observability.RawInterval)
 			}
 			c.Observability.ExportInterval = d
+		} else if c.Observability.ExportInterval < 0 {
+			// ExportInterval can be set programmatically (a test
+			// fixture, a future internal config builder) without
+			// RawInterval being populated. A negative value would
+			// otherwise be passed straight to the OTel SDK's
+			// WithInterval (which doesn't validate). Zero is fine
+			// — the SDK falls back to its default 60s.
+			return fmt.Errorf("observability.export_interval %v: must be positive", c.Observability.ExportInterval)
 		}
 	}
 

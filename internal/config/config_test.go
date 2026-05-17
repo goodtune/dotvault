@@ -691,6 +691,37 @@ rules:
 	}
 }
 
+// TestValidateRejectsProgrammaticNegativeExportInterval covers the
+// path where Observability.ExportInterval is set programmatically
+// (RawInterval empty) but with a non-positive value — e.g. a future
+// internal config builder or a test fixture that bypasses YAML. The
+// OTel SDK's WithInterval doesn't validate the value itself, so the
+// daemon would otherwise pass a negative duration through to the
+// periodic reader.
+func TestValidateRejectsProgrammaticNegativeExportInterval(t *testing.T) {
+	cfg := &Config{
+		Vault: VaultConfig{Address: "https://vault.example.com:8200"},
+		Sync:  SyncConfig{RawInterval: "5m"},
+		Observability: ObservabilityConfig{
+			Enabled:        true,
+			ExportInterval: -1 * time.Second,
+		},
+		Rules: []Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: Target{
+					Path:   "~/.config/gh/hosts.yml",
+					Format: "yaml",
+				},
+			},
+		},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected error for programmatic negative ExportInterval")
+	}
+}
+
 func writeTemp(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

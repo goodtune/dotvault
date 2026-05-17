@@ -97,11 +97,20 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			// creation_ttl=120 → renew threshold = 30s.
+			// ttl=20 is below the threshold, so renewal WOULD
+			// fire if disableRenewal weren't set. The earlier
+			// shape (ttl=30, no creation_ttl) made the baseline
+			// cache anchor at 30s and the threshold at 7.5s,
+			// which meant the assertion passed vacuously: no
+			// renewal would have happened regardless of the
+			// flag.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{
-					"ttl":       json.Number("30"), // well within renewal threshold
-					"renewable": true,
-					"expire_time": "2099-01-01T00:00:00Z",
+					"ttl":          json.Number("20"),
+					"creation_ttl": json.Number("120"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
 				},
 			})
 		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:

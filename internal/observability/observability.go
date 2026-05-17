@@ -23,9 +23,10 @@
 // lock.
 //
 // Attribute conventions:
-//   - Outcomes use a small fixed vocabulary ({ok, error, skipped,
-//     renewed, reauth_required, failed, completed, denied, …}) so the
-//     exported series stay bounded.
+//   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
+//     reauth_required, failed, completed, denied, …}) so the
+//     exported series stay bounded. See the per-instrument
+//     RecordXxx godoc for the exact set each instrument emits.
 //   - We never attach usernames, Vault paths, secret keys, repo URLs,
 //     or JFrog server hostnames to instruments — the same scrubbing
 //     discipline the slog handlers follow.
@@ -34,6 +35,7 @@ package observability
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"strings"
@@ -182,6 +184,16 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 }
 
 func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	// Footgun guard: insecure transport + auth headers means a
+	// bearer token (e.g. a Datadog / Grafana Cloud OTLP key) goes
+	// over plaintext to the collector. Loopback collectors that
+	// don't terminate TLS are a legitimate case, but the
+	// combination usually signals a misconfiguration. Log at Warn
+	// so it surfaces in the journal without blocking startup.
+	if cfg.Insecure && len(cfg.Headers) > 0 {
+		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext; use a TLS-protected endpoint for production")
+	}
+
 	// Honour the OpenTelemetry env-var convention when cfg.Protocol
 	// is empty: a metrics-specific override
 	// (OTEL_EXPORTER_OTLP_METRICS_PROTOCOL) takes precedence over the
@@ -353,8 +365,10 @@ func rebindInstruments() {
 }
 
 // RecordSyncTick increments the sync-tick counter with the outcome
-// attribute. Outcomes are drawn from a closed vocabulary
-// ({"ok","error","skipped"}) so cardinality stays bounded.
+// attribute. The sync engine emits "ok" (every rule succeeded) or
+// "error" (at least one rule failed); per-rule skip cases roll up
+// into "ok" at the cycle level so there's no separate "skipped"
+// outcome to forecast.
 func RecordSyncTick(ctx context.Context, outcome string) {
 	instrMu.RLock()
 	c := syncTicks
@@ -393,7 +407,7 @@ func RecordVaultCall(ctx context.Context, op, status string) {
 }
 
 // RecordTokenRenewal records the outcome of a token renewal attempt.
-// Outcomes: "renewed", "reauth_required", "failed", "skipped".
+// Outcomes emitted today: "renewed", "reauth_required", "failed".
 func RecordTokenRenewal(ctx context.Context, outcome string) {
 	instrMu.RLock()
 	c := tokenRenewals
@@ -418,8 +432,9 @@ func RecordTokenTTL(ctx context.Context, ttl time.Duration) {
 }
 
 // RecordEnrolAttempt records an enrolment attempt by engine and outcome.
-// Engines are the registered set ({"copy","github","jfrog","ssh"}),
-// outcomes a closed vocabulary ({"completed","skipped","error"}).
+// Engine values pass through classifyEngine in internal/enrol, so the
+// label is one of {"copy","github","jfrog","ssh","unknown"}. Outcomes
+// emitted today: "completed", "error".
 func RecordEnrolAttempt(ctx context.Context, engine, outcome string) {
 	instrMu.RLock()
 	c := enrolAttempts

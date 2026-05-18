@@ -95,7 +95,16 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 	}
 	vc.SetToken(token)
 	if _, err := vc.LookupSelf(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "dotvault: cached vault token is invalid (%v); run `dotvault login` first\n", err)
+		// Distinguish "token genuinely rejected" (403, login helps)
+		// from "Vault unreachable / TLS / transient" (login won't
+		// help and pointing the user at it would mask the real
+		// operational problem). Mirrors runLoginCheck's behaviour
+		// for the same call.
+		if vault.IsForbidden(err) {
+			fmt.Fprintf(os.Stderr, "dotvault: cached vault token is invalid (%v); run `dotvault login` first\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "dotvault: vault unreachable (%v)\n", err)
 		os.Exit(1)
 	}
 

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,6 +233,68 @@ enrolments:
 	}
 	if !strings.Contains(string(out), "dotvault login") {
 		t.Errorf("output should point at `dotvault login`\noutput:\n%s", out)
+	}
+}
+
+// TestEnrolTransientVaultError_SubprocessRoundTrip exercises the
+// path Copilot flagged in the fourth review pass: a LookupSelf
+// failure that isn't a 403 (transient network/TLS/Vault-down) must
+// surface as a connectivity message, not "run dotvault login". The
+// test points the binary at an httptest server returning 404 on
+// every request, which the Vault SDK turns into a non-Forbidden
+// ResponseError.
+func TestEnrolTransientVaultError_SubprocessRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("subprocess test exercises POSIX-shell semantics")
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 404 (not 403) — outside vault.IsForbidden's predicate so
+		// the test exercises the non-Forbidden branch. retryablehttp
+		// doesn't retry on 4xx so the test stays fast.
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "dotvault")
+	build := exec.Command("go", "build", "-o", binPath, ".")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("go build: %v", err)
+	}
+
+	workDir := t.TempDir()
+	configPath := filepath.Join(workDir, "config.yaml")
+	cfgYAML := "vault:\n  address: " + srv.URL + "\nrules:\n  - name: r1\n    vault_key: k1\n    target:\n      path: /tmp/dotvault-test\n      format: text\nenrolments:\n  gh:\n    engine: github\n"
+	if err := os.WriteFile(configPath, []byte(cfgYAML), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "--config", configPath, "enrol")
+	// Provide a token so the auth check moves past the "no token"
+	// branch and exercises LookupSelf against our fake server.
+	cmd.Env = append(os.Environ(),
+		"VAULT_TOKEN=fake-token-for-test",
+		"HOME="+workDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got success\noutput:\n%s", out)
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if code := exitErr.ExitCode(); code != 1 {
+			t.Errorf("exit code = %d, want 1\noutput:\n%s", code, out)
+		}
+	}
+	if !strings.Contains(string(out), "vault unreachable") {
+		t.Errorf("output missing %q (should mention vault unreachable, not login)\noutput:\n%s", "vault unreachable", out)
+	}
+	if strings.Contains(string(out), "dotvault login") {
+		t.Errorf("transient error path should not point at `dotvault login` — that wouldn't help here\noutput:\n%s", out)
 	}
 }
 

@@ -318,7 +318,9 @@ func TestStatuses(t *testing.T) {
 }
 
 func TestRunOne_Unknown(t *testing.T) {
-	vc := skipIfNoVault(t)
+	// The unknown-name path errors out before any Vault round-trip, so
+	// this test is deliberately not gated on skipIfNoVault — the error
+	// contract must be enforced even when no dev Vault is reachable.
 	ctx := context.Background()
 
 	var buf bytes.Buffer
@@ -328,7 +330,7 @@ func TestRunOne_Unknown(t *testing.T) {
 		},
 		KVMount:    "kv",
 		UserPrefix: testPrefix(t),
-	}, vc, testIO(&buf))
+	}, nil, testIO(&buf))
 
 	err := mgr.RunOne(ctx, "does-not-exist")
 	if !errors.Is(err, ErrUnknownEnrolment) {

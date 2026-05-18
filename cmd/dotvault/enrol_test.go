@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -70,7 +73,12 @@ func TestTuiModel_Render(t *testing.T) {
 		}
 	}
 
-	// The cursor (index 1, "ssh") should be inside the inverted region.
+	// Exactly one inverted region (the cursor row) is expected — a
+	// regression that highlighted everything would still satisfy a
+	// "contains \x1b[7m" check, so we count and bound the region.
+	if got := strings.Count(out, "\x1b[7m"); got != 1 {
+		t.Errorf("expected exactly one inverted region (\\x1b[7m), got %d:\n%s", got, out)
+	}
 	invStart := strings.Index(out, "\x1b[7m")
 	invEnd := strings.Index(out, "\x1b[0m")
 	if invStart < 0 || invEnd < invStart {
@@ -82,6 +90,58 @@ func TestTuiModel_Render(t *testing.T) {
 	}
 	if strings.Contains(highlighted, "github") {
 		t.Errorf("highlighted region should not contain %q, got %q", "github", highlighted)
+	}
+}
+
+func TestSanitizeOneLine(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "hello world", "hello world"},
+		{"keeps unicode", "café — ☕", "café — ☕"},
+		{"strips esc", "before\x1b[31mafter", "before[31mafter"},
+		{"strips newline", "line one\nline two", "line oneline two"},
+		{"strips bell", "ding\x07dong", "dingdong"},
+		{"strips osc title", "x\x1b]0;evil\x07y", "x]0;evily"},
+		{"strips delete", "a\x7fb", "ab"},
+		{"empty", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeOneLine(tc.in); got != tc.want {
+				t.Errorf("sanitizeOneLine(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTuiRender_SanitizesUntrustedFields(t *testing.T) {
+	// Vault could theoretically return an error message containing
+	// ESC sequences. They must not survive into the rendered line.
+	m := &tuiModel{
+		statuses: []enrol.Status{
+			{Key: "evil\x1b]0;owned\x07", Engine: "x", EngineName: "X\x1bbroken", Error: "boom\nnewline"},
+		},
+	}
+	var buf bytes.Buffer
+	m.render(&buf)
+	out := buf.String()
+	// The leading `\x1b[H\x1b[2J` clear and the `\x1b[7m`/`\x1b[0m`
+	// highlight ANSI come from render's own templates; they're safe.
+	// Strip those before checking for untrusted ESC.
+	cleaned := strings.NewReplacer(
+		"\x1b[H", "",
+		"\x1b[2J", "",
+		"\x1b[7m", "",
+		"\x1b[0m", "",
+	).Replace(out)
+	if strings.ContainsRune(cleaned, 0x1b) {
+		t.Errorf("render leaked an untrusted ESC into output:\n%q", cleaned)
+	}
+	if strings.ContainsRune(cleaned, 0x07) {
+		t.Errorf("render leaked an untrusted BEL into output:\n%q", cleaned)
 	}
 }
 
@@ -99,6 +159,77 @@ func pipeKeys(t *testing.T, b []byte) *os.File {
 		_, _ = w.Write(b)
 	}()
 	return r
+}
+
+// TestEnrolUnauthenticated_SubprocessRoundTrip exercises the "no
+// token, point at `dotvault login`" exit path end-to-end by invoking
+// the compiled binary with no VAULT_TOKEN and a HOME that contains no
+// .vault-token file. The auth check at the top of runEnrol must
+// short-circuit before any Vault round-trip and exit 1 with the
+// documented message. Done as a subprocess test because runEnrol
+// calls os.Exit directly and is not refactorable into an in-process
+// table test without an exit injection seam.
+func TestEnrolUnauthenticated_SubprocessRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	if runtime.GOOS == "windows" {
+		// PATH/exec semantics under a Go-built test binary differ
+		// enough on Windows that this round-trip is best-effort POSIX.
+		// The unit tests on tuiModel / readSingleKey / sanitizeOneLine
+		// already cover the platform-independent surface.
+		t.Skip("subprocess test exercises POSIX-shell semantics")
+	}
+
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "dotvault")
+	build := exec.Command("go", "build", "-o", binPath, ".")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("go build: %v", err)
+	}
+
+	workDir := t.TempDir()
+	configPath := filepath.Join(workDir, "config.yaml")
+	cfgYAML := `vault:
+  address: http://127.0.0.1:8200
+rules:
+  - name: r1
+    vault_key: k1
+    target:
+      path: /tmp/dotvault-test
+      format: text
+enrolments:
+  gh:
+    engine: github
+`
+	if err := os.WriteFile(configPath, []byte(cfgYAML), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "--config", configPath, "enrol")
+	// Force "no token" — empty VAULT_TOKEN, HOME pointing at a fresh
+	// dir without a .vault-token file.
+	cmd.Env = append(os.Environ(),
+		"VAULT_TOKEN=",
+		"HOME="+workDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got success\noutput:\n%s", out)
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if code := exitErr.ExitCode(); code != 1 {
+			t.Errorf("exit code = %d, want 1\noutput:\n%s", code, out)
+		}
+	}
+	wantSubstr := "not authenticated"
+	if !strings.Contains(string(out), wantSubstr) {
+		t.Errorf("output missing %q\noutput:\n%s", wantSubstr, out)
+	}
+	if !strings.Contains(string(out), "dotvault login") {
+		t.Errorf("output should point at `dotvault login`\noutput:\n%s", out)
+	}
 }
 
 func TestReadSingleKey(t *testing.T) {

@@ -152,7 +152,16 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 	// printing a list would surprise scripts expecting either a clean
 	// run or an explicit error.
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
-		fmt.Fprintln(os.Stderr, "dotvault: enrol with no argument requires a terminal; pass an enrolment name to run non-interactively")
+		fmt.Fprintln(os.Stderr, "dotvault: enrol with no argument requires a terminal")
+		fmt.Fprintln(os.Stderr, "pass one of the configured enrolment names to run non-interactively:")
+		keys := make([]string, 0, len(cfg.Enrolments))
+		for k := range cfg.Enrolments {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(os.Stderr, "  %s\n", k)
+		}
 		os.Exit(1)
 	}
 
@@ -230,6 +239,12 @@ func (m *tuiModel) down() {
 // Always starts at the top of the screen and clears each line; this
 // is enough for a small fixed list without resorting to a full
 // terminal-state library.
+//
+// All upstream-controlled strings (Engine, EngineName, Error) are
+// scrubbed with sanitizeOneLine before interpolation. Vault is a
+// trusted backend, but an OSC sequence in a Vault error response
+// would otherwise survive into the user's terminal scrollback after
+// term.Restore — cheap defense-in-depth.
 func (m *tuiModel) render(w io.Writer) {
 	var sb strings.Builder
 	// Move cursor home + clear screen.
@@ -266,9 +281,14 @@ func (m *tuiModel) render(w io.Writer) {
 			status = "enrolled"
 		}
 		if s.Error != "" {
-			status = "error: " + s.Error
+			status = "error: " + sanitizeOneLine(s.Error)
 		}
-		line := fmt.Sprintf("%s  %-*s  %-*s  %s", marker, nameWidth, s.Key, engineWidth, display, status)
+		line := fmt.Sprintf("%s  %-*s  %-*s  %s",
+			marker,
+			nameWidth, sanitizeOneLine(s.Key),
+			engineWidth, sanitizeOneLine(display),
+			status,
+		)
 		if i == m.cursor {
 			// Inverted highlight for the selected row.
 			sb.WriteString("\x1b[7m")
@@ -283,17 +303,48 @@ func (m *tuiModel) render(w io.Writer) {
 	_, _ = w.Write([]byte(sb.String()))
 }
 
+// sanitizeOneLine drops ASCII control characters (including newlines
+// and ESC) so adversary-controlled bytes from Vault responses or
+// upstream identities cannot inject ANSI escape sequences into the
+// rendered TUI line — control chars would either break column
+// alignment or, in the case of OSC sequences, persist into the
+// terminal's title bar or scrollback after the picker exits.
+func sanitizeOneLine(s string) string {
+	if !strings.ContainsFunc(s, isControlRune) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if isControlRune(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f
+}
+
 // tuiSelect runs one cycle of the picker: switch the terminal into
 // raw mode, render-and-read until the user picks a row or quits, then
 // restore the cooked terminal state. Returns (selectedKey, quit,
 // error); when quit is true the caller should return cleanly.
-func tuiSelect(in *os.File, tty io.Writer, model *tuiModel) (string, bool, error) {
+func tuiSelect(in *os.File, tty *os.File, model *tuiModel) (string, bool, error) {
 	fd := int(in.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return "", false, fmt.Errorf("enter raw mode: %w", err)
 	}
 	defer term.Restore(fd, oldState) //nolint:errcheck
+
+	// On Windows, MakeRaw enables VT input but not VT output; without
+	// this the ANSI sequences in render() print as literal text on
+	// bare cmd.exe. No-op everywhere else.
+	restoreVT := enableVTOutput(tty)
+	defer restoreVT()
 
 	for {
 		model.render(tty)
@@ -362,9 +413,11 @@ func readSingleKey(in *os.File) (keyKind, error) {
 	case n == 1 && (b[0] == 'q' || b[0] == 'Q'):
 		return keyQuit, nil
 	case n == 1 && b[0] == 0x03:
-		// Ctrl-C: signal.NotifyContext on the parent ctx catches
-		// SIGINT, but a raw-mode tty swallows it, so we exit via
-		// the picker instead.
+		// Ctrl-C: term.MakeRaw disables ISIG on POSIX (and
+		// ENABLE_PROCESSED_INPUT on Windows), so Ctrl-C arrives
+		// as the literal byte 0x03 rather than firing the parent
+		// ctx's SIGINT handler. Translate it to quit so the
+		// picker exits cleanly without the user having to type q.
 		return keyQuit, nil
 	}
 	return keyNone, nil

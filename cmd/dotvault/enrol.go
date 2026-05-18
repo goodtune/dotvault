@@ -184,7 +184,7 @@ func runEnrolTUI(ctx context.Context, mgr *enrol.Manager) error {
 	}
 
 	for {
-		choice, quit, err := tuiSelect(in, tty, model)
+		choice, quit, err := tuiSelect(ctx, in, tty, model)
 		if err != nil {
 			return err
 		}
@@ -208,8 +208,14 @@ func runEnrolTUI(ctx context.Context, mgr *enrol.Manager) error {
 		}
 		// Terminal is back in cooked mode (Restore deferred inside
 		// tuiSelect ran), so stdin is line-buffered — a "press any
-		// key" prompt would actually wait for Enter anyway.
+		// key" prompt would actually wait for Enter anyway. Plumb
+		// ctx through blockUntilInput so an external signal during
+		// the wait exits cleanly instead of leaving the prompt
+		// hanging until the user types something.
 		fmt.Fprint(tty, "\nPress Enter to return to the menu... ")
+		if err := blockUntilInput(ctx, in.Fd()); err != nil {
+			return nil
+		}
 		buf := make([]byte, 16)
 		if _, rerr := in.Read(buf); rerr != nil && !errors.Is(rerr, io.EOF) {
 			return rerr
@@ -332,8 +338,11 @@ func isControlRune(r rune) bool {
 // tuiSelect runs one cycle of the picker: switch the terminal into
 // raw mode, render-and-read until the user picks a row or quits, then
 // restore the cooked terminal state. Returns (selectedKey, quit,
-// error); when quit is true the caller should return cleanly.
-func tuiSelect(in *os.File, tty *os.File, model *tuiModel) (string, bool, error) {
+// error); when quit is true the caller should return cleanly. ctx
+// is plumbed into readSingleKey so an external SIGTERM/SIGINT
+// arriving while the picker is idle exits the loop without waiting
+// for a keystroke.
+func tuiSelect(ctx context.Context, in *os.File, tty *os.File, model *tuiModel) (string, bool, error) {
 	fd := int(in.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -349,7 +358,7 @@ func tuiSelect(in *os.File, tty *os.File, model *tuiModel) (string, bool, error)
 
 	for {
 		model.render(tty)
-		key, err := readSingleKey(in)
+		key, err := readSingleKey(ctx, in)
 		if err != nil {
 			return "", false, err
 		}
@@ -394,7 +403,18 @@ const (
 // would mis-fire as quit, or worse, hang half-classified at n=2.
 // Ctrl-C and EOF also collapse to quit so the caller can exit cleanly
 // without a special path.
-func readSingleKey(in *os.File) (keyKind, error) {
+//
+// ctx is observed before the initial Read via blockUntilInput so an
+// external SIGTERM/SIGINT delivered while the picker is idle resolves
+// within ~100ms (POSIX) instead of waiting for the user to press a
+// key. The drain loop after a bare ESC deliberately ignores ctx
+// because it operates on a tight 50ms deadline already and racing
+// cancellation against a half-arrived escape sequence is more
+// confusing than helpful.
+func readSingleKey(ctx context.Context, in *os.File) (keyKind, error) {
+	if err := blockUntilInput(ctx, in.Fd()); err != nil {
+		return keyQuit, nil
+	}
 	buf := make([]byte, 16)
 	n, err := in.Read(buf)
 	if err != nil {

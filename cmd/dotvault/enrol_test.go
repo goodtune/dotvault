@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -260,7 +261,7 @@ func TestReadSingleKey_SplitArrowSequence(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 		_, _ = w.Write([]byte{'[', 'A'})
 	}()
-	got, err := readSingleKey(r)
+	got, err := readSingleKey(context.Background(), r)
 	if err != nil {
 		t.Fatalf("readSingleKey: %v", err)
 	}
@@ -289,12 +290,57 @@ func TestReadSingleKey_OneByteAtATime(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
-	got, err := readSingleKey(r)
+	got, err := readSingleKey(context.Background(), r)
 	if err != nil {
 		t.Fatalf("readSingleKey: %v", err)
 	}
 	if got != keyDown {
 		t.Errorf("one-byte-at-a-time arrow = %v, want keyDown", got)
+	}
+}
+
+// TestReadSingleKey_ContextCancellation verifies that an external
+// SIGTERM/SIGINT (modelled here by cancelling the parent ctx) wakes
+// the picker out of an idle blocking read on POSIX — without the
+// blockUntilInput poll loop the goroutine would stay parked in Read
+// until something arrived on the pipe.
+func TestReadSingleKey_ContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// On Windows blockUntilInput returns immediately, so the
+		// Read remains plain blocking — ctx cancellation isn't
+		// observable mid-Read and the test would hang. The picker
+		// on Windows observes ctx after the next keystroke.
+		t.Skip("ctx-aware blocking read is POSIX-only")
+	}
+	// A pipe with the writer still open and no data — Read on the
+	// read side would block forever without ctx awareness.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = r.Close()
+		_ = w.Close()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan keyKind, 1)
+	go func() {
+		got, _ := readSingleKey(ctx, r)
+		done <- got
+	}()
+
+	// Give the goroutine a moment to park in blockUntilInput.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case got := <-done:
+		if got != keyQuit {
+			t.Errorf("ctx cancellation returned %v, want keyQuit", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readSingleKey did not return within 2s of ctx cancellation")
 	}
 }
 
@@ -320,7 +366,7 @@ func TestReadSingleKey_EscThenOtherKey(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 		_, _ = w.Write([]byte{'x'})
 	}()
-	got, err := readSingleKey(r)
+	got, err := readSingleKey(context.Background(), r)
 	if err != nil {
 		t.Fatalf("readSingleKey: %v", err)
 	}
@@ -353,7 +399,7 @@ func TestReadSingleKey(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := pipeKeys(t, tc.input)
-			got, err := readSingleKey(r)
+			got, err := readSingleKey(context.Background(), r)
 			if err != nil && err != io.EOF {
 				t.Fatalf("readSingleKey: %v", err)
 			}

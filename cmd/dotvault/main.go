@@ -57,8 +57,9 @@ func main() {
 
 Run with no subcommand prints this help. Use "dotvault run" to start the
 long-lived daemon, "dotvault login-check" to validate (and optionally
-renew) the cached token on an interactive login, or "dotvault login" to
-force a fresh login flow.`,
+renew) the cached token on an interactive login, "dotvault login" to
+force a fresh login flow, or "dotvault enrol" to drive a credential
+enrolment flow from the terminal.`,
 		// Cobra's default RunE for a command with no Run/RunE prints help
 		// when called bare, which is what we want — explicitly running the
 		// daemon now requires `dotvault run`. The GUI-subsystem variant
@@ -134,6 +135,7 @@ genuine internal errors.`,
 			Short: "Show auth and sync status",
 			RunE:  runStatus,
 		},
+		newEnrolCmd(),
 		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),

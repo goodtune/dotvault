@@ -2,6 +2,7 @@ package enrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	iolib "io"
 	"log/slog"
@@ -13,6 +14,30 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/vault"
 )
+
+// ErrUnknownEnrolment indicates that a caller asked Manager.RunOne to
+// run an enrolment that is not configured.
+var ErrUnknownEnrolment = errors.New("unknown enrolment")
+
+// Status is a snapshot of a single configured enrolment's state. Used
+// by callers (CLI, web UI) that want to display enrolment state without
+// running the wizard.
+type Status struct {
+	// Key is the configured enrolment key (the map key under the YAML
+	// `enrolments:` section, also the final path segment in Vault).
+	Key string
+	// Engine is the engine identifier from config (e.g. "github").
+	Engine string
+	// EngineName is the human-readable display name from Engine.Name().
+	// Empty when the engine is unknown.
+	EngineName string
+	// Enrolled is true when every field the engine writes is present
+	// at the target Vault path.
+	Enrolled bool
+	// Error carries an explanatory message when the engine is unknown
+	// or the Vault read failed; otherwise empty.
+	Error string
+}
 
 // ManagerConfig holds configuration for the Manager.
 type ManagerConfig struct {
@@ -165,6 +190,110 @@ func (m *Manager) findPending(ctx context.Context, cfg ManagerConfig) ([]pending
 	}
 
 	return pending, nil
+}
+
+// Statuses returns the current state of every configured enrolment,
+// sorted by key. Engines that are unknown to the registry are still
+// included with the Error field set so callers can surface the
+// misconfiguration. Read failures populate Error per-entry and are not
+// fatal — partial results are returned so the UI can still list the
+// rest.
+func (m *Manager) Statuses(ctx context.Context) []Status {
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+
+	keys := make([]string, 0, len(cfg.Enrolments))
+	for key := range cfg.Enrolments {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make([]Status, 0, len(keys))
+	for _, key := range keys {
+		e := cfg.Enrolments[key]
+		st := Status{Key: key, Engine: e.Engine}
+		engine, ok := GetEngine(e.Engine)
+		if !ok {
+			st.Error = fmt.Sprintf("unknown engine %q", e.Engine)
+			out = append(out, st)
+			continue
+		}
+		st.EngineName = engine.Name()
+		secret, err := m.vault.ReadKVv2(ctx, cfg.KVMount, cfg.UserPrefix+key)
+		if err != nil {
+			st.Error = err.Error()
+			out = append(out, st)
+			continue
+		}
+		if secret != nil && HasAllFields(secret.Data, EngineFields(engine, e.Settings)) {
+			st.Enrolled = true
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// RunOne runs the enrolment flow for a single configured key and
+// writes the result to Vault on success. Returns ErrUnknownEnrolment
+// if the key is not configured. The engine output is rendered through
+// the Manager's IO writer.
+//
+// This is the entry point used by `dotvault enrol <name>`; it is
+// intentionally separate from CheckAll so the CLI can force a re-run
+// of an already-complete enrolment without first deleting the Vault
+// secret.
+func (m *Manager) RunOne(ctx context.Context, key string) error {
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+
+	e, ok := cfg.Enrolments[key]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownEnrolment, key)
+	}
+	engine, ok := GetEngine(e.Engine)
+	if !ok {
+		return fmt.Errorf("unknown engine %q for enrolment %q", e.Engine, key)
+	}
+
+	vaultPath := cfg.UserPrefix + key
+	engineIO := m.io
+	engineIO.TargetPath = vaultPath
+
+	fmt.Fprintf(m.io.Out, "Enrolment: %s (%s)\n\n", key, engine.Name())
+	creds, err := engine.Run(ctx, e.Settings, engineIO)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		observability.RecordEnrolAttempt(ctx, classifyEngine(e.Engine), "error")
+		return fmt.Errorf("enrolment %q failed: %w", key, err)
+	}
+
+	data := make(map[string]any, len(creds))
+	for k, v := range creds {
+		data[k] = v
+	}
+	if !HasAllFields(data, EngineFields(engine, e.Settings)) {
+		observability.RecordEnrolAttempt(ctx, classifyEngine(e.Engine), "error")
+		return fmt.Errorf("enrolment %q: engine returned incomplete credentials", key)
+	}
+
+	if err := m.vault.WriteKVv2(ctx, cfg.KVMount, vaultPath, data); err != nil {
+		observability.RecordEnrolAttempt(ctx, classifyEngine(e.Engine), "error")
+		return fmt.Errorf("write enrolment %q to vault: %w", key, err)
+	}
+
+	observability.RecordEnrolAttempt(ctx, classifyEngine(e.Engine), "completed")
+	m.io.Log.Info("enrolment written to vault", "key", key, "path", vaultPath)
+	user := creds["user"]
+	if user != "" {
+		fmt.Fprintf(m.io.Out, "\n✓ %s (%s) — credentials acquired for @%s\n", key, engine.Name(), user)
+	} else {
+		fmt.Fprintf(m.io.Out, "\n✓ %s (%s) — credentials acquired\n", key, engine.Name())
+	}
+	return nil
 }
 
 // classifyEngine collapses an enrolment engine name onto the

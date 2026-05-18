@@ -18,6 +18,16 @@ Skip the review only when the user explicitly tells you to, or when the push is 
 
 This is non-negotiable for code-changing pushes. Doc-only changes can use the review at your judgement.
 
+## PR descriptions and commit messages
+
+Write PR bodies and long-form commit messages in **flowing prose** — one long line per paragraph or bullet, no manual line wrapping inside a paragraph. GitHub renders both as Markdown and re-wraps to the viewer's column width; hard-wrapping in the source produces ragged right edges in the rendered HTML, makes single-sentence edits churn multiple lines in a diff, and breaks copy-paste into other tools.
+
+Hard breaks are still right for a new bullet, a new numbered step, a blank line between paragraphs, or the boundaries of a code block / table. Inside a paragraph or bullet, let the renderer wrap. (Commit-message *subject* lines remain ~50 chars; this rule applies to the body.)
+
+This convention is non-negotiable when an agent writes a PR description — re-flow any prose written by a previous step that violates it before opening or updating the PR.
+
+Do **not** mention the pre-push review in PR descriptions. Running `/precommit-review` is the default workflow on this repo (per the section above) — calling it out in every PR body is noise. The audit trail lives in the commit series itself: a separate `fix(...): address precommit review findings` commit (or an inline rationale in the implementation commit) is sufficient when the review produced material follow-ups. If the review found nothing, there is nothing to say.
+
 ## Build & Test
 
 ```sh
@@ -129,6 +139,7 @@ dotvault run         Run the long-lived daemon
 dotvault sync        One-shot sync cycle, then exit
 dotvault login       Force a fresh login via the configured auth method
 dotvault login-check Validate/renew cached token on interactive login (tty-aware)
+dotvault enrol       Interactive enrolment picker (`dotvault enrol <name>` to run one directly)
 dotvault status      Display auth state, token TTL, per-rule sync state
 dotvault version     Print build version (--json for machine-readable resource metadata)
 dotvault reg-export  Convert a Windows .reg file to YAML (or canonical .reg)
@@ -182,6 +193,27 @@ startup.
   expected authentication failure. Exits `1` only on invalid
   `DOTVAULT_SUPPRESS_HOURS` or genuine internal errors. The shell
   wrapper does not branch on exit code.
+
+`dotvault enrol` is the CLI counterpart to the web UI's enrolment page,
+intended for terminal-only users (servers, headless setups, devs who
+don't run the local web UI). With no argument it draws a small raw-mode
+picker listing every configured enrolment alongside its current state
+(`enrolled` / `not enrolled` / `error: …` for unknown engines or Vault
+read failures); arrow keys navigate, Enter runs the highlighted entry,
+`q` or Esc exits. With a single positional argument it skips the picker
+and runs that enrolment directly, looking the name up against the
+configured `enrolments:` map. An unknown name prints the configured
+keys and exits non-zero.
+
+Both forms require a valid cached Vault token and refuse to initiate
+fresh authentication — the user is pointed at `dotvault login` instead.
+The picker also refuses to run without a TTY on both stdin and stderr,
+because a headless caller has no way to drive the selection; pass an
+explicit name to enrol non-interactively. The underlying engine runs
+through `enrol.Manager.RunOne`, which is deliberately a re-run-on-demand
+entry point: unlike `CheckAll`, it executes the engine even if the
+target is already populated, so the command doubles as a way to refresh
+expiring credentials without first wiping the Vault secret.
 
 The naming follows regedit's `/e` (export) and `/s` (import) directional
 convention: `reg-export` pulls policy out of the registry world into a

@@ -3,6 +3,7 @@ package enrol
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -249,6 +250,222 @@ func TestCheckAll_Empty(t *testing.T) {
 	}
 	if enrolled {
 		t.Error("enrolled=true, want false — no enrolments configured")
+	}
+}
+
+func TestStatuses(t *testing.T) {
+	vc := skipIfNoVault(t)
+	ctx := context.Background()
+
+	engEnrolled := &mockEngine{name: "Enrolled", fields: []string{"token"}}
+	engPending := &mockEngine{name: "Pending", fields: []string{"token"}}
+	RegisterEngine("test-statuses-enrolled", engEnrolled)
+	RegisterEngine("test-statuses-pending", engPending)
+	t.Cleanup(func() {
+		UnregisterEngine("test-statuses-enrolled")
+		UnregisterEngine("test-statuses-pending")
+	})
+
+	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
+	seedKVv2(t, vc, "kv", prefix+"done", map[string]any{"token": "abc"})
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"done":    {Engine: "test-statuses-enrolled"},
+			"todo":    {Engine: "test-statuses-pending"},
+			"unknown": {Engine: "nonexistent-engine"},
+		},
+		KVMount:    "kv",
+		UserPrefix: prefix,
+	}, vc, testIO(&buf))
+
+	statuses := mgr.Statuses(ctx)
+	if len(statuses) != 3 {
+		t.Fatalf("len(statuses) = %d, want 3", len(statuses))
+	}
+
+	// Statuses are sorted by key: done, todo, unknown
+	want := []struct {
+		key      string
+		engine   string
+		enrolled bool
+		hasErr   bool
+	}{
+		{"done", "test-statuses-enrolled", true, false},
+		{"todo", "test-statuses-pending", false, false},
+		{"unknown", "nonexistent-engine", false, true},
+	}
+	for i, w := range want {
+		got := statuses[i]
+		if got.Key != w.key {
+			t.Errorf("statuses[%d].Key = %q, want %q", i, got.Key, w.key)
+		}
+		if got.Engine != w.engine {
+			t.Errorf("statuses[%d].Engine = %q, want %q", i, got.Engine, w.engine)
+		}
+		if got.Enrolled != w.enrolled {
+			t.Errorf("statuses[%d].Enrolled = %v, want %v", i, got.Enrolled, w.enrolled)
+		}
+		if (got.Error != "") != w.hasErr {
+			t.Errorf("statuses[%d].Error = %q, wanted error=%v", i, got.Error, w.hasErr)
+		}
+	}
+	if statuses[0].EngineName != "Enrolled" {
+		t.Errorf("statuses[0].EngineName = %q, want %q", statuses[0].EngineName, "Enrolled")
+	}
+}
+
+func TestRunOne_Unknown(t *testing.T) {
+	// The unknown-name path errors out before any Vault round-trip, so
+	// this test is deliberately not gated on skipIfNoVault — the error
+	// contract must be enforced even when no dev Vault is reachable.
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"gh": {Engine: "github"},
+		},
+		KVMount:    "kv",
+		UserPrefix: testPrefix(t),
+	}, nil, testIO(&buf))
+
+	err := mgr.RunOne(ctx, "does-not-exist")
+	if !errors.Is(err, ErrUnknownEnrolment) {
+		t.Fatalf("RunOne unknown: err = %v, want wraps ErrUnknownEnrolment", err)
+	}
+}
+
+func TestRunOne_Success(t *testing.T) {
+	vc := skipIfNoVault(t)
+	ctx := context.Background()
+
+	eng := &mockEngine{name: "RunOne", fields: []string{"token"}, creds: map[string]string{"token": "v1"}}
+	RegisterEngine("test-runone", eng)
+	t.Cleanup(func() { UnregisterEngine("test-runone") })
+
+	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"item": {Engine: "test-runone"},
+		},
+		KVMount:    "kv",
+		UserPrefix: prefix,
+	}, vc, testIO(&buf))
+
+	if err := mgr.RunOne(ctx, "item"); err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if eng.called != 1 {
+		t.Errorf("engine called %d times, want 1", eng.called)
+	}
+	secret, err := vc.ReadKVv2(ctx, "kv", prefix+"item")
+	if err != nil {
+		t.Fatalf("ReadKVv2: %v", err)
+	}
+	if secret == nil || secret.Data["token"] != "v1" {
+		t.Errorf("vault token = %v, want %q", secret, "v1")
+	}
+}
+
+func TestRunOne_Rerun(t *testing.T) {
+	// RunOne deliberately re-runs an enrolment even if its target is
+	// already populated — CheckAll is the "fill gaps" path; RunOne is
+	// the explicit re-enrol entry point.
+	vc := skipIfNoVault(t)
+	ctx := context.Background()
+
+	eng := &mockEngine{name: "Rerun", fields: []string{"token"}, creds: map[string]string{"token": "fresh"}}
+	RegisterEngine("test-rerun", eng)
+	t.Cleanup(func() { UnregisterEngine("test-rerun") })
+
+	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
+	seedKVv2(t, vc, "kv", prefix+"item", map[string]any{"token": "stale"})
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"item": {Engine: "test-rerun"},
+		},
+		KVMount:    "kv",
+		UserPrefix: prefix,
+	}, vc, testIO(&buf))
+
+	if err := mgr.RunOne(ctx, "item"); err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if eng.called != 1 {
+		t.Errorf("engine should run despite existing creds, called %d times", eng.called)
+	}
+	secret, _ := vc.ReadKVv2(ctx, "kv", prefix+"item")
+	if secret.Data["token"] != "fresh" {
+		t.Errorf("token = %v, want %q", secret.Data["token"], "fresh")
+	}
+}
+
+func TestRunOne_EngineFailure(t *testing.T) {
+	vc := skipIfNoVault(t)
+	ctx := context.Background()
+
+	eng := &mockEngine{name: "Fail", fields: []string{"token"}, err: fmt.Errorf("boom")}
+	RegisterEngine("test-runone-fail", eng)
+	t.Cleanup(func() { UnregisterEngine("test-runone-fail") })
+
+	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"item": {Engine: "test-runone-fail"},
+		},
+		KVMount:    "kv",
+		UserPrefix: prefix,
+	}, vc, testIO(&buf))
+
+	err := mgr.RunOne(ctx, "item")
+	if err == nil {
+		t.Fatal("RunOne should fail when engine errors")
+	}
+	// Engine error message should propagate so the CLI can show it.
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %v, want it to contain %q", err, "boom")
+	}
+}
+
+func TestRunOne_IncompleteCredentials(t *testing.T) {
+	vc := skipIfNoVault(t)
+	ctx := context.Background()
+
+	// Engine returns success but omits the required "token" field.
+	eng := &mockEngine{name: "Partial", fields: []string{"token"}, creds: map[string]string{}}
+	RegisterEngine("test-runone-partial", eng)
+	t.Cleanup(func() { UnregisterEngine("test-runone-partial") })
+
+	enableKVv2(t, vc, "kv")
+	prefix := testPrefix(t)
+
+	var buf bytes.Buffer
+	mgr := NewManager(ManagerConfig{
+		Enrolments: map[string]config.Enrolment{
+			"item": {Engine: "test-runone-partial"},
+		},
+		KVMount:    "kv",
+		UserPrefix: prefix,
+	}, vc, testIO(&buf))
+
+	err := mgr.RunOne(ctx, "item")
+	if err == nil {
+		t.Fatal("RunOne should fail when engine returns incomplete credentials")
+	}
+	if !strings.Contains(err.Error(), "incomplete") {
+		t.Errorf("error = %v, want it to mention incomplete credentials", err)
 	}
 }
 

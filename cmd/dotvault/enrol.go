@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/enrol"
@@ -383,9 +384,14 @@ const (
 
 // readSingleKey reads one keystroke from in (which must already be in
 // raw mode) and classifies it. Arrow keys arrive as 3-byte ANSI escape
-// sequences in a single read on every terminal that matters; a bare
-// ESC (1 byte) collapses to keyQuit. Ctrl-C and EOF also collapse to
-// quit so the caller can exit cleanly without a special path.
+// sequences; on local pty's all three bytes show up in a single Read,
+// but VMIN=1 VTIME=0 (the POSIX raw-mode contract term.MakeRaw applies)
+// means a Read returns as soon as one byte is available, so in
+// principle a slow link could split the sequence. When we see a lone
+// ESC we peek briefly via waitForMoreInput and pull in any tail bytes
+// before classifying — without that an arrow on a high-latency link
+// would mis-fire as quit. Ctrl-C and EOF also collapse to quit so the
+// caller can exit cleanly without a special path.
 func readSingleKey(in *os.File) (keyKind, error) {
 	buf := make([]byte, 16)
 	n, err := in.Read(buf)
@@ -397,6 +403,12 @@ func readSingleKey(in *os.File) (keyKind, error) {
 	}
 	if n == 0 {
 		return keyNone, nil
+	}
+	if n == 1 && buf[0] == 0x1b && waitForMoreInput(in.Fd(), 50*time.Millisecond) {
+		m, rerr := in.Read(buf[n:])
+		if rerr == nil && m > 0 {
+			n += m
+		}
 	}
 	b := buf[:n]
 	switch {

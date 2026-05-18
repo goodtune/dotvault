@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/enrol"
 )
@@ -229,6 +230,41 @@ enrolments:
 	}
 	if !strings.Contains(string(out), "dotvault login") {
 		t.Errorf("output should point at `dotvault login`\noutput:\n%s", out)
+	}
+}
+
+// TestReadSingleKey_SplitArrowSequence exercises the slow-link path
+// flagged in PR #70 review: under VMIN=1 VTIME=0 a Read may return as
+// soon as the ESC byte is available, with the `[A` tail arriving
+// later. The peek-after-ESC logic should pull the tail in and
+// classify it as an arrow rather than collapsing to keyQuit.
+func TestReadSingleKey_SplitArrowSequence(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// On Windows term.MakeRaw enables VT input, which delivers
+		// each keystroke atomically — splits don't occur and the
+		// waitForMoreInput shim is a no-op.
+		t.Skip("split-escape peek is POSIX-only")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	go func() {
+		defer w.Close()
+		_, _ = w.Write([]byte{0x1b})
+		// Gap stays well below the 50ms peek window so the follow-up
+		// Read picks the tail up. Long enough that it's plausibly the
+		// kind of split a real terminal might produce.
+		time.Sleep(15 * time.Millisecond)
+		_, _ = w.Write([]byte{'[', 'A'})
+	}()
+	got, err := readSingleKey(r)
+	if err != nil {
+		t.Fatalf("readSingleKey: %v", err)
+	}
+	if got != keyUp {
+		t.Errorf("split arrow = %v, want keyUp", got)
 	}
 }
 

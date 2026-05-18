@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,8 +20,10 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
+	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -36,6 +39,7 @@ var version = "dev"
 var (
 	flagConfig       string
 	flagLogLevel     string
+	flagLogFormat    string
 	flagDryRun       bool
 	flagRegOutput    string
 	flagRegASCII     bool
@@ -69,6 +73,7 @@ force a fresh login flow.`,
 
 	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&flagLogFormat, "log-format", "auto", "log format (auto, text, json); auto picks text on TTY, json otherwise")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
 
 	runCmd := &cobra.Command{
@@ -129,13 +134,7 @@ genuine internal errors.`,
 			Short: "Show auth and sync status",
 			RunE:  runStatus,
 		},
-		&cobra.Command{
-			Use:   "version",
-			Short: "Print version",
-			Run: func(cmd *cobra.Command, args []string) {
-				fmt.Println(version)
-			},
-		},
+		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),
 	)
@@ -160,13 +159,72 @@ func setupLogging() {
 
 	opts := &slog.HandlerOptions{Level: level}
 
+	// --log-format forces a specific handler regardless of TTY state.
+	// "auto" preserves the historical behaviour (text on TTY, JSON
+	// otherwise) so existing systemd units and shell wrappers keep
+	// working unchanged. Unknown values exit non-zero rather than
+	// silently falling back to auto, so a typo in a system unit or
+	// shell wrapper surfaces immediately instead of producing
+	// surprising log output.
+	useJSON := false
+	switch strings.ToLower(flagLogFormat) {
+	case "json":
+		useJSON = true
+	case "text":
+		useJSON = false
+	case "auto", "":
+		useJSON = !isStderrTerminal()
+	default:
+		fmt.Fprintf(os.Stderr, "dotvault: invalid --log-format %q (want auto, text, or json)\n", flagLogFormat)
+		os.Exit(2)
+	}
+
 	var handler slog.Handler
-	if isStderrTerminal() {
-		handler = slog.NewTextHandler(os.Stderr, opts)
-	} else {
+	if useJSON {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
 	}
 	slog.SetDefault(slog.New(handler))
+}
+
+// newVersionCmd builds the `dotvault version` command. The default form
+// prints the version string; pass --json for a machine-readable form
+// the OTel collector (and other tooling) can use to pin resource
+// attributes deterministically.
+func newVersionCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print version",
+		Run: func(cmd *cobra.Command, args []string) {
+			if jsonOut {
+				// Explicit struct so JSON field order is fixed
+				// (version, service, go_version, os, arch) rather
+				// than the alphabetical order encoding/json
+				// applies to maps — easier to grep and copy/paste
+				// for OTel resource attribute pipelines.
+				type versionInfo struct {
+					Version   string `json:"version"`
+					Service   string `json:"service"`
+					GoVersion string `json:"go_version"`
+					OS        string `json:"os"`
+					Arch      string `json:"arch"`
+				}
+				_ = json.NewEncoder(os.Stdout).Encode(versionInfo{
+					Version:   version,
+					Service:   "dotvault",
+					GoVersion: runtime.Version(),
+					OS:        runtime.GOOS,
+					Arch:      runtime.GOARCH,
+				})
+				return
+			}
+			fmt.Println(version)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit version metadata as JSON")
+	return cmd
 }
 
 func loadConfig() (*config.Config, error) {
@@ -193,6 +251,26 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start the systemd watchdog loop as early as possible. The loop
+	// is a no-op outside systemd and when WATCHDOG_USEC/NOTIFY_SOCKET
+	// are unset, so calling it unconditionally is safe. We start it
+	// before Vault auth / initial sync because a slow authentication
+	// or first sync would otherwise miss the watchdog window
+	// (WatchdogSec=120s by default) and systemd would restart the
+	// process mid-startup. sd_notify(READY=1) is still delayed until
+	// after auth + initial sync further down.
+	go sdnotify.WatchdogLoop(ctx)
+
+	obsProvider := initObservability(ctx, cfg.Observability)
+	defer shutdownObservability(obsProvider)
+	// Zero out the bearer-token map now that the SDK has
+	// consumed it. cfg lives for the daemon's full lifetime;
+	// keeping Headers in the heap-resident Config struct gives a
+	// future log statement, JSON encoder, or debug handler a
+	// path to exfiltrate the credential. The OTel SDK keeps its
+	// own copy internally.
+	cfg.Observability.Headers = nil
+
 	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -206,6 +284,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				// TODO: Implement config reload on SIGHUP. This is deferred
 				// to a future release. For now, restart the daemon to pick
 				// up config changes.
+				observability.RecordSIGHUP(ctx)
 				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
 			}
 		}
@@ -253,6 +332,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
+			ObsCfg:        cfg.Observability,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
@@ -449,15 +529,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				case <-ticker.C:
 					reloaded, err := config.LoadSystem(configPath)
 					if err != nil {
+						observability.RecordConfigReload(ctx, "error")
 						slog.Warn("config reload failed", "error", err)
 						continue
 					}
 					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+						observability.RecordConfigReload(ctx, "applied")
 						slog.Info("enrolments config changed, re-checking")
 						enrolMgr.UpdateConfig(reloaded.Enrolments)
 						rm.UpdateConfig(reloaded.Enrolments)
 						wm.UpdateConfig(reloaded.Enrolments)
 						lastEnrolments = reloaded.Enrolments
+					} else {
+						observability.RecordConfigReload(ctx, "no_change")
 					}
 					if ok, err := enrolMgr.CheckAll(ctx); err != nil {
 						slog.Warn("enrolment check failed", "error", err)
@@ -471,6 +555,41 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 
+	// The sync engine drives the initial RunOnce internally; the
+	// AfterInitialSync hook below fires the daemon's readiness
+	// signals (web-server /readyz gate, sd_notify(READY=1))
+	// exactly once, synchronously, between the initial cycle and
+	// the long-running loop. Partial first-cycle failures still
+	// count as "ready": the daemon has made its best attempt and
+	// future cycles will retry; we don't want a single transient
+	// error to wedge readiness forever.
+	afterInitial := func() {
+		// The engine already gates on ctx.Err() before calling
+		// the hook, but a future refactor that invokes it via
+		// another path could bypass that guard. Re-check here so
+		// we never sequence READY=1 → STOPPING=1 in the same
+		// systemd start-up window — that confuses unit-state
+		// accounting and any After=dotvault.service ordering.
+		if ctx.Err() != nil {
+			return
+		}
+		if webServer != nil {
+			webServer.MarkInitialSyncComplete()
+		}
+		// sd_notify(READY=1) is sent here, after auth and the
+		// initial sync, so anything depending on dotvault.service
+		// blocks until secrets are actually on disk. The
+		// watchdog ticker was started earlier (right after ctx)
+		// so a long startup doesn't miss the watchdog window.
+		// Both calls are no-ops on non-Linux and when
+		// NOTIFY_SOCKET is unset; a non-nil return from Ready()
+		// means a genuine socket write failure (warn loudly so
+		// the systemd "start-limit-hit" log has a breadcrumb).
+		if err := sdnotify.Ready(); err != nil {
+			slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
+		}
+	}
+
 	// Run the sync engine on a goroutine and the tray (Windows) or a
 	// blocking ctx-wait (everything else) on the main goroutine. The tray
 	// must own the main goroutine because the Win32 message pump requires
@@ -479,7 +598,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// tray.Run up and let the daemon shut down cleanly.
 	loopErrCh := make(chan error, 1)
 	go func() {
-		loopErrCh <- engine.RunLoop(ctx)
+		loopErrCh <- engine.RunLoop(ctx, sync.AfterInitialSync(afterInitial))
 		cancel()
 	}()
 
@@ -507,7 +626,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Tray returned because the user picked Exit or ctx was cancelled
 	// elsewhere (signal handler, lifecycle manager, headless fallback).
-	// Stop the sync loop and propagate its result.
+	// Stop the sync loop and propagate its result. Notify systemd we're
+	// stopping so the unit state reflects the shutdown sequence rather
+	// than appearing to crash.
+	_ = sdnotify.Stopping()
 	cancel()
 	return <-loopErrCh
 }
@@ -521,6 +643,17 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	ctx := context.Background()
+
+	// Cron-style one-shot invocations still need to push their metrics
+	// out before exit. The deferred Shutdown invokes ForceFlush
+	// internally, so the last batch makes it out before the process
+	// exits.
+	obsProvider := initObservability(ctx, cfg.Observability)
+	defer shutdownObservability(obsProvider)
+	// Zero out the bearer-token map post-Init for the same
+	// reason as the daemon path — keep credentials out of the
+	// heap-resident Config struct.
+	cfg.Observability.Headers = nil
 
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {
@@ -934,26 +1067,11 @@ func loginCheckCancelled(ctx context.Context, err error) bool {
 	return false
 }
 
+// readSecondsField proxies vault.ReadSecondsField, kept as an
+// unexported package-local alias so the login-check call sites
+// stay readable.
 func readSecondsField(data map[string]any, key string) (int64, bool) {
-	v, ok := data[key]
-	if !ok {
-		return 0, false
-	}
-	switch n := v.(type) {
-	case json.Number:
-		s, err := n.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return s, true
-	case float64:
-		return int64(n), true
-	case int:
-		return int64(n), true
-	case int64:
-		return n, true
-	}
-	return 0, false
+	return vault.ReadSecondsField(data, key)
 }
 
 func absoluteExpiry(ttl time.Duration) string {
@@ -1235,6 +1353,46 @@ func isStderrTerminal() bool {
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// initObservability builds an observability.Provider from the loaded
+// configuration, scoped by a short timeout so a misconfigured or
+// unreachable collector can't stall daemon startup. Always returns a
+// non-nil provider — on Init failure it returns the no-op variant so
+// the caller can defer Shutdown unconditionally. Shared between
+// runDaemon and runSync because divergence between the two call
+// sites had been a real source of regressions.
+func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *observability.Provider {
+	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	provider, err := observability.Init(initCtx, observability.Config{
+		Enabled:        cfg.Enabled,
+		Endpoint:       cfg.Endpoint,
+		Protocol:       cfg.Protocol,
+		Insecure:       cfg.Insecure,
+		Headers:        cfg.Headers,
+		ExportInterval: cfg.ExportInterval,
+		ServiceVersion: version,
+	})
+	if err != nil {
+		// Telemetry must never take the daemon down. Log loudly and
+		// continue with a no-op provider so instrument call sites
+		// stay safe.
+		slog.Error("failed to initialise observability, continuing without metrics", "error", err)
+		return &observability.Provider{}
+	}
+	return provider
+}
+
+// shutdownObservability flushes and tears down the MeterProvider
+// behind p with a bounded timeout. Paired with initObservability so
+// runDaemon and runSync share the same shutdown contract.
+func shutdownObservability(p *observability.Provider) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		slog.Warn("observability shutdown error", "error", err)
+	}
 }
 
 // isGUIBinary reports whether the running executable is the GUI-subsystem

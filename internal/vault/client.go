@@ -2,11 +2,13 @@ package vault
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 
+	"github.com/goodtune/dotvault/internal/observability"
 	vaultapi "github.com/hashicorp/vault/api"
 )
 
@@ -81,13 +83,22 @@ func (c *Client) ReadKVv2(ctx context.Context, mount, path string) (*Secret, err
 	if err != nil {
 		// Check for 404 — secret doesn't exist
 		if isNotFound(err) || errors.Is(err, vaultapi.ErrSecretNotFound) {
+			observability.RecordVaultCall(ctx, "read", "not_found")
 			return nil, nil
 		}
+		observability.RecordVaultCall(ctx, "read", classifyVaultErr(err))
 		return nil, fmt.Errorf("read kv %s/%s: %w", mount, path, err)
 	}
+	// A nil secret without an error is the KVv2 client's
+	// soft-not-found response — the upstream call did not 404 but
+	// nothing exists at the path either. Count it under not_found so
+	// the metric reflects "we tried and got nothing" rather than
+	// inflating the ok bucket.
 	if secret == nil {
+		observability.RecordVaultCall(ctx, "read", "not_found")
 		return nil, nil
 	}
+	observability.RecordVaultCall(ctx, "read", "ok")
 
 	version := 0
 	if secret.VersionMetadata != nil {
@@ -149,8 +160,10 @@ func (c *Client) EnableKVv2(ctx context.Context, path string) error {
 func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[string]any) error {
 	_, err := c.raw.KVv2(mount).Put(ctx, path, data)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "write", classifyVaultErr(err))
 		return fmt.Errorf("write kv %s/%s: %w", mount, path, err)
 	}
+	observability.RecordVaultCall(ctx, "write", "ok")
 	return nil
 }
 
@@ -173,8 +186,10 @@ func (c *Client) DeleteKVv2(ctx context.Context, mount, path string) error {
 func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().LookupSelfWithContext(ctx)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "lookup_self", classifyVaultErr(err))
 		return nil, fmt.Errorf("token lookup-self: %w", err)
 	}
+	observability.RecordVaultCall(ctx, "lookup_self", "ok")
 	return secret, nil
 }
 
@@ -182,8 +197,10 @@ func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().RenewSelfWithContext(ctx, increment)
 	if err != nil {
+		observability.RecordVaultCall(ctx, "renew_self", classifyVaultErr(err))
 		return nil, fmt.Errorf("token renew-self: %w", err)
 	}
+	observability.RecordVaultCall(ctx, "renew_self", "ok")
 	return secret, nil
 }
 
@@ -299,6 +316,36 @@ func isNotFound(err error) bool {
 	return false
 }
 
+// classifyVaultErr collapses a vault API error onto a small set of
+// status labels suitable for an OTel attribute. The vocabulary is
+// closed and matches the values actually returned below:
+// "ok", "denied", "not_found", "throttled", "server_error",
+// "client_error", "unreachable". Full error strings (which can
+// include paths or messages) must never be used as label values —
+// they would unbound the metric cardinality.
+func classifyVaultErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "denied"
+		case http.StatusNotFound:
+			return "not_found"
+		case http.StatusTooManyRequests:
+			return "throttled"
+		default:
+			if respErr.StatusCode >= 500 {
+				return "server_error"
+			}
+			return "client_error"
+		}
+	}
+	return "unreachable"
+}
+
 // IsForbidden returns true if the error is a Vault 403 response, indicating
 // the token is invalid, revoked, or lacks permissions.
 func IsForbidden(err error) bool {
@@ -307,4 +354,37 @@ func IsForbidden(err error) bool {
 		return respErr.StatusCode == http.StatusForbidden
 	}
 	return false
+}
+
+// ReadSecondsField extracts an integer-seconds value from a Vault
+// secret data map, handling the json.Number / float64 / int variants
+// the underlying decoder may produce. Returns (0, false) when the key
+// is missing or the value isn't a parseable number.
+//
+// Lives in internal/vault because every call site is reading a field
+// off a *vaultapi.Secret's data map. Used by the lifecycle manager
+// for ttl / creation_ttl and by the CLI login-check for the same
+// fields; centralising avoids the duplicated type switch silently
+// diverging (e.g. when a future Vault SDK change introduces a
+// uint64 wire form).
+func ReadSecondsField(data map[string]any, key string) (int64, bool) {
+	v, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case json.Number:
+		s, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return s, true
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	}
+	return 0, false
 }

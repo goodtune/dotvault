@@ -432,6 +432,15 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", `attachment; filename="dotvault-config.reg"`)
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		// The regfile package doesn't (yet) carry the
+		// Observability block — it would silently disappear from
+		// a .reg download. Surface this in the response headers
+		// so an operator who scripted around the endpoint sees
+		// the gap; the daemon log mirrors the same caveat.
+		if cfg.Observability.Enabled {
+			w.Header().Set("X-Dotvault-Warning", "observability block is not represented in the .reg form; manage via OTEL_* env vars on Windows")
+			slog.Warn("reg download requested with observability enabled; the .reg form does not carry the observability block (use OTEL_* env vars on Windows)")
+		}
 		w.Write(data)
 	default:
 		writeError(w, "unsupported format (use yaml or reg)", http.StatusBadRequest)
@@ -465,12 +474,37 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		syncCfg.RawInterval = formatDuration(syncCfg.Interval)
 	}
 
+	// Mirror the syncCfg fix-up for observability.export_interval:
+	// if the user only set it programmatically (parsed) and not via
+	// the RawInterval YAML field, materialise the raw form so the
+	// download reflects the effective configuration.
+	//
+	// observability.headers values are stripped at three layers
+	// (defence in depth):
+	//   1. ObservabilityConfig.MarshalYAML strips Headers from
+	//      every yaml.Marshal of the config — the canonical
+	//      enforcement point.
+	//   2. NewServer nils Headers on the cached s.obsCfg copy so
+	//      a future handler that reads it directly doesn't see
+	//      live tokens.
+	//   3. This explicit strip here — belt-and-braces for the
+	//      download endpoint specifically.
+	// Operators who need to manage header values should use the
+	// OTEL_EXPORTER_OTLP_HEADERS env var via a per-user
+	// EnvironmentFile (see docs/admin/deployment.md).
+	obsCfg := s.obsCfg
+	if obsCfg.RawInterval == "" && obsCfg.ExportInterval > 0 {
+		obsCfg.RawInterval = formatDuration(obsCfg.ExportInterval)
+	}
+	obsCfg.Headers = nil
+
 	return &config.Config{
-		Vault:      s.vaultCfg,
-		Sync:       syncCfg,
-		Web:        s.cfg,
-		Rules:      rules,
-		Enrolments: enrolments,
+		Vault:         s.vaultCfg,
+		Sync:          syncCfg,
+		Web:           s.cfg,
+		Observability: obsCfg,
+		Rules:         rules,
+		Enrolments:    enrolments,
 	}
 }
 
@@ -596,13 +630,71 @@ func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleHealthz reports daemon liveness — the process is running and
+// serving HTTP. Always returns 200 with a tiny JSON envelope so the
+// OTel httpcheckreceiver (and any other liveness probe) can rely on it
+// regardless of Vault state.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{
+		"status":  "ok",
+		"version": s.version,
+	})
+}
+
+// handleReadyz reports daemon readiness. Mirrors the systemd
+// sd_notify(READY=1) contract so k8s readinessProbe consumers and
+// the OTel httpcheckreceiver see green only after the daemon has
+// authenticated to Vault AND completed its initial sync cycle —
+// i.e. secrets are actually on disk. Either condition unmet
+// produces a 503 with a JSON envelope describing which gate
+// hasn't cleared, so a startup-gated dependency can poll until
+// ready.
+//
+// The token-presence check reflects the *cached* in-memory token,
+// not a per-probe LookupSelf against Vault. A token that expires
+// or is revoked between lifecycle checks (default cadence 5
+// minutes) will keep /readyz green until the lifecycle goroutine
+// next runs — at which point it triggers OnReauth, which clears
+// the in-memory token and flips /readyz back to 503. This is
+// deliberate: a per-probe Vault round-trip would multiply the
+// daemon's Vault load by every readiness probe and provide
+// little extra signal — operators wanting confirmed Vault
+// reachability should poll the engine's per-rule sync state
+// (via /api/v1/status) rather than /readyz.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	authenticated := s.vault != nil && s.vault.Token() != ""
+	initialSyncDone := s.InitialSyncComplete()
+	payload := map[string]any{
+		"status":            "ready",
+		"version":           s.version,
+		"authenticated":     authenticated,
+		"initial_sync_done": initialSyncDone,
+	}
+	if !authenticated || !initialSyncDone {
+		payload["status"] = "not_ready"
+		writeJSONStatus(w, http.StatusServiceUnavailable, payload)
+		return
+	}
+	writeJSON(w, payload)
+}
+
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
 }
 
-func writeError(w http.ResponseWriter, message string, code int) {
+// writeJSONStatus is the explicit-status sibling of writeJSON for
+// handlers that need to set a non-default status (e.g. /readyz's
+// 503 envelope, which carries a structured payload rather than the
+// generic {"error": …} shape writeError provides).
+func writeJSONStatus(w http.ResponseWriter, code int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, message string, code int) {
+	writeJSONStatus(w, code, map[string]string{"error": message})
 }

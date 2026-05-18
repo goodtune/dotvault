@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -42,6 +44,32 @@ type LifecycleManager struct {
 	// Exponential backoff state for check failures.
 	currentDelay time.Duration
 	maxDelay     time.Duration
+
+	// baselineTTL is the largest TTL we've observed for the current
+	// token. It anchors the renew-threshold computation when the
+	// Vault `creation_ttl` field is unavailable (some auth/token role
+	// configurations omit it): without a stable baseline a short-TTL
+	// token would otherwise satisfy the 15-minute fallback threshold
+	// on every check and the daemon would call RenewSelf at every
+	// poll interval. Updated whenever an observed TTL exceeds the
+	// stored value (which can only happen after a successful renewal
+	// or token swap), so the threshold tracks the live lease's
+	// shape without needing explicit reset hooks.
+	//
+	// baselineToken pins the baseline to the token it was measured
+	// against: when the in-memory token swaps (tryReload picking up
+	// a fresh token, an OnReauth-driven re-login) the baseline is
+	// reset so a new shorter-TTL token cannot inherit an oversized
+	// baseline from its predecessor.
+	//
+	// baselineMu guards both baseline fields. checkAndRenew is the
+	// only writer today, but a future code path that exposes the
+	// renewal cadence (e.g. for /api/v1/status or a metric) would
+	// race with the lifecycle goroutine without this lock. Matches
+	// the mutex-around-mutable-state pattern Engine uses.
+	baselineMu    sync.Mutex
+	baselineTTL   time.Duration
+	baselineToken string
 }
 
 // NewLifecycleManager creates a new token lifecycle manager. When
@@ -127,7 +155,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						}
 						nextDelay := lm.recoveryInterval
 						slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
-						lm.signalReauth(errCh, err)
+						lm.signalReauth(ctx, errCh, err)
 						lm.currentDelay = nextDelay
 					} else {
 						// Transient error: backoff up to maxDelay.
@@ -156,11 +184,14 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 // signalReauth flips the manager into the needs-reauth state and invokes
 // the OnReauth callback once per transition. The error is pushed onto errCh
 // non-blockingly so a consumer that has stopped reading doesn't deadlock.
-func (lm *LifecycleManager) signalReauth(errCh chan<- error, err error) {
+// Takes the lifecycle goroutine's ctx so the metric record carries
+// the same cancellation / trace context the rest of the cycle uses.
+func (lm *LifecycleManager) signalReauth(ctx context.Context, errCh chan<- error, err error) {
 	if lm.needsReauth.Load() {
 		return
 	}
 	lm.needsReauth.Store(true)
+	observability.RecordTokenRenewal(ctx, "reauth_required")
 	if lm.onReauth != nil {
 		lm.onReauth()
 	}
@@ -245,6 +276,7 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	default:
 		return nil
 	}
+	observability.RecordTokenTTL(ctx, ttl)
 
 	// TTL=0 with no expire_time means non-expiring (root token)
 	if ttl <= 0 {
@@ -262,18 +294,78 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	renewableRaw, _ := secret.Data["renewable"]
 	renewable, _ := renewableRaw.(bool)
 
-	// Renew at 75% of TTL (i.e., when only 25% remains), unless renewal is disabled.
-	renewThreshold := ttl / 4
+	// Renew when ≤25 % of the token's baseline TTL remains, mirroring
+	// the policy login-check uses. The previous form computed
+	// `renewThreshold := ttl / 4` and tested `ttl <= renewThreshold`,
+	// which can never be true for any positive TTL (ttl/4 < ttl) — so
+	// renewal silently never fired and tokens would only ever expire
+	// into a forced re-auth.
+	//
+	// Baseline selection (in priority order):
+	//   1. `creation_ttl` from Vault — most reliable when present.
+	//   2. The largest TTL we've observed for the current token —
+	//      captures the lease's true shape after the first poll, even
+	//      when creation_ttl is missing.
+	//   3. A 15-minute floor — only relevant on the very first check
+	//      of a token whose creation_ttl is also unavailable.
+	//
+	// Anchoring on a stable baseline (step 2) is what prevents the
+	// pathological renew loop for short-lived tokens: without it, a
+	// 5-minute token with no creation_ttl would satisfy the 15-minute
+	// fallback threshold on every check and the daemon would call
+	// RenewSelf at every poll interval (~5min).
+	creationTTLSec, _ := readSecondsField(secret.Data, "creation_ttl")
+	creationTTL := time.Duration(creationTTLSec) * time.Second
+	// Reset the cached baseline when the token swaps so a shorter
+	// new token doesn't inherit an oversized baseline from a longer
+	// previous one (which would make `ttl <= baseline/4` true on
+	// every check and trigger RenewSelf in a tight loop). The
+	// read-compare-write pair runs under baselineMu so a concurrent
+	// reader (added in a future status / metric path) can't observe
+	// a torn state.
+	lm.baselineMu.Lock()
+	if currentToken := lm.client.Token(); currentToken != lm.baselineToken {
+		lm.baselineTTL = 0
+		lm.baselineToken = currentToken
+	}
+	if ttl > lm.baselineTTL {
+		lm.baselineTTL = ttl
+	}
+	baselineTTL := lm.baselineTTL
+	lm.baselineMu.Unlock()
+
+	// baseline is guaranteed positive here: the ttl<=0 early-return
+	// above means ttl is positive, and lm.baselineTTL was just
+	// max()'d up to ttl. The earlier draft had a `15 * time.Minute`
+	// floor for the "no baseline information at all" case, but the
+	// baselineTTL cache makes that branch unreachable — drop it
+	// rather than carry dead code.
+	baseline := creationTTL
+	if baseline <= 0 {
+		baseline = baselineTTL
+	}
+	renewThreshold := baseline / 4
 	if ttl <= renewThreshold && renewable && !lm.disableRenewal {
 		slog.Info("renewing token", "ttl_remaining", ttl)
 		_, err := lm.client.RenewSelf(ctx, 0)
 		if err != nil {
+			observability.RecordTokenRenewal(ctx, "failed")
 			return err
 		}
+		observability.RecordTokenRenewal(ctx, "renewed")
 		slog.Info("token renewed successfully")
 	}
 
 	return nil
+}
+
+// readSecondsField proxies vault.ReadSecondsField, kept as an
+// unexported package-local alias so existing call sites stay
+// readable. The implementation lives in internal/vault so the
+// CLI's login-check path can share it without re-defining the
+// json.Number / float64 / int type switch.
+func readSecondsField(data map[string]any, key string) (int64, bool) {
+	return vault.ReadSecondsField(data, key)
 }
 
 // errTokenExpired is the sentinel returned by checkAndRenew when

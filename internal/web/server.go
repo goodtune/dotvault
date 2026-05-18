@@ -1,18 +1,22 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -23,6 +27,7 @@ type Server struct {
 	cfg                config.WebConfig
 	vaultCfg           config.VaultConfig
 	syncCfg            config.SyncConfig
+	obsCfg             config.ObservabilityConfig
 	vault              *vault.Client
 	engine             *internalsync.Engine
 	csrf               *CSRFStore
@@ -53,6 +58,17 @@ type Server struct {
 	enrolRunner        *EnrolmentRunner
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
+
+	// initialSyncDone flips to true once the daemon calls
+	// MarkInitialSyncComplete (wired into the sync engine's
+	// AfterInitialSync hook in runDaemon — fires exactly once,
+	// between the initial RunOnce and the long-running loop).
+	// /readyz gates on it alongside the Vault-token check so k8s
+	// readinessProbe consumers and the OTel httpcheckreceiver
+	// don't observe a "ready" daemon before any secrets have been
+	// written to disk — matching the sd_notify(READY=1) contract
+	// on the systemd path.
+	initialSyncDone atomic.Bool
 }
 
 // ServerConfig holds all dependencies for the web server.
@@ -60,6 +76,7 @@ type ServerConfig struct {
 	WebCfg        config.WebConfig
 	VaultCfg      config.VaultConfig
 	SyncCfg       config.SyncConfig
+	ObsCfg        config.ObservabilityConfig
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *internalsync.Engine
@@ -74,10 +91,23 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("web.listen: %w", err)
 	}
 
+	// Defence-in-depth: drop the Headers map from the cached copy.
+	// buildEffectiveConfig already strips it before serialising
+	// the download, but holding the live bearer tokens on the
+	// Server struct for the daemon's lifetime is needless surface
+	// — any future handler / test helper that reads s.obsCfg
+	// would still see them. The narrowed copy keeps everything
+	// the download endpoint needs to advertise (enabled,
+	// endpoint, protocol, insecure, export_interval) without
+	// the credential map.
+	narrowedObsCfg := sc.ObsCfg
+	narrowedObsCfg.Headers = nil
+
 	s := &Server{
 		cfg:                sc.WebCfg,
 		vaultCfg:           sc.VaultCfg,
 		syncCfg:            sc.SyncCfg,
+		obsCfg:             narrowedObsCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		csrf:               NewCSRFStore(),
@@ -117,6 +147,20 @@ func (s *Server) registerRoutes() {
 
 	// Auth routes — Token
 	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
+
+	// Health probes. /healthz reports liveness — the daemon is
+	// running and able to serve HTTP. /readyz reports readiness:
+	// 200 only after BOTH a Vault token is present AND the
+	// daemon has marked its initial sync complete (via
+	// MarkInitialSyncComplete, called from the sync engine's
+	// AfterInitialSync hook after the initial RunOnce returns).
+	// This mirrors the sd_notify(READY=1) contract on the systemd
+	// path so a Kubernetes readinessProbe or the OTel
+	// httpcheckreceiver never observes a green daemon before
+	// secrets exist on disk. Both probes are loopback-only and
+	// return JSON.
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 
 	// API routes
 	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
@@ -205,6 +249,44 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
+		// Wrap the writer so the metrics middleware can read back the
+		// status. wrapResponseWriter returns a variant that exposes
+		// only the optional interfaces (Flusher / Hijacker /
+		// ReaderFrom) that the underlying writer actually implements,
+		// so handlers gating SSE / WebSocket behaviour on
+		// `w.(http.Flusher)` etc. get an accurate assertion.
+		rw, rec := wrapResponseWriter(w)
+		defer func() {
+			// If the handler panicked, the wrapped recorder may not
+			// have seen a WriteHeader yet — net/http's top-level
+			// recovery writes the 500 only after our defers run. In
+			// that case, record the metric as a 500 ourselves so the
+			// observability layer doesn't claim the request
+			// succeeded. If headers WERE already sent before the
+			// panic, the wire status is locked and we should leave
+			// rec.status alone — a partial 200 stream that crashed
+			// mid-body is a 2xx on the wire, even though it
+			// represents a server-side failure. Re-panic after
+			// recording so the standard server recovery still kicks
+			// in.
+			if rcv := recover(); rcv != nil {
+				if !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+				}
+				observability.RecordWebRequest(
+					r.Context(),
+					routeLabel(r.URL.Path),
+					statusClass(rec.status),
+				)
+				panic(rcv)
+			}
+			observability.RecordWebRequest(
+				r.Context(),
+				routeLabel(r.URL.Path),
+				statusClass(rec.status),
+			)
+		}()
+
 		// DNS-rebinding defence. The listener is loopback-only by hard
 		// invariant (paths.ValidateLoopback), but a hostile origin can
 		// still resolve a name like rebound.attacker.test to 127.0.0.1
@@ -223,16 +305,239 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			// holds for both the handler-level errors and the
 			// middleware-level rejection.
 			if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
-				w.Header().Set("Cache-Control", "no-store")
-				w.Header().Set("Pragma", "no-cache")
-				writeError(w, "forbidden host", http.StatusForbidden)
+				rw.Header().Set("Cache-Control", "no-store")
+				rw.Header().Set("Pragma", "no-cache")
+				writeError(rw, "forbidden host", http.StatusForbidden)
 			} else {
-				http.Error(w, "forbidden host", http.StatusForbidden)
+				http.Error(rw, "forbidden host", http.StatusForbidden)
 			}
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(rw, r)
 	})
+}
+
+// statusRecorder is the bare http.ResponseWriter wrapper that
+// captures the response status so the middleware can record it as a
+// metric attribute. It implements only the mandatory ResponseWriter
+// methods plus Unwrap; the optional interfaces (Flusher / Hijacker /
+// ReaderFrom) are added at construction time by wrapResponseWriter,
+// which picks one of the 8 statusRecorder* variants below based on
+// what the underlying writer supports. The middleware-wrapper
+// pattern matches what httpsnoop, go-chi and gorilla/mux use: it's
+// the only way Go's static dispatch can give handlers an honest
+// answer to assertions like `w.(http.Flusher)`.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+// Unwrap returns the underlying ResponseWriter so net/http's
+// ResponseController machinery (Go 1.20+) can walk past the wrapper.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	// Forward only the first WriteHeader. Subsequent calls would
+	// trigger net/http's "superfluous response.WriteHeader" log and
+	// can confuse wrappers — they're a no-op for the recorded status
+	// too, since net/http itself ignores them.
+	if s.wroteHeader {
+		return
+	}
+	s.status = code
+	s.wroteHeader = true
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	// Mirror net/http's standard ResponseWriter: the first Write
+	// triggers an implicit WriteHeader(StatusOK) on the
+	// underlying writer too, not just the wrapper's status
+	// field. Routing through s.WriteHeader keeps the recorded
+	// status and the wire status in lockstep across non-standard
+	// ResponseWriter implementations that don't auto-send
+	// headers from Write.
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// recordWriteHeader is the internal hook for the ReaderFrom variants
+// fired before they hand the io.Reader off to the underlying writer's
+// ReadFrom. It does the same WriteHeader(StatusOK) the standard
+// net/http response would do at its first byte — going through
+// s.WriteHeader so the implicit 200 reaches the underlying writer
+// too (some ResponseWriter implementations skip header emission
+// inside ReadFrom and rely on a prior WriteHeader call). Calling
+// WriteHeader is a no-op if the handler already set a status.
+func (s *statusRecorder) recordWriteHeader() {
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
+	}
+}
+
+// wrapResponseWriter returns a ResponseWriter that wraps w with
+// metrics-status capture and exposes exactly the optional interface
+// set w itself implements. The second return value is the underlying
+// recorder so callers can read back the captured status — the
+// wrapped interface value would hide it behind a concrete variant.
+//
+// The 8-way switch mirrors the well-known middleware pattern (see
+// httpsnoop, go-chi). Each variant embeds *statusRecorder so the
+// mandatory ResponseWriter methods (Header, Write, WriteHeader) and
+// Unwrap promote through; each adds explicit forwarding methods for
+// the optional interfaces it claims.
+func wrapResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *statusRecorder) {
+	sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	_, isF := w.(http.Flusher)
+	_, isH := w.(http.Hijacker)
+	_, isRF := w.(io.ReaderFrom)
+	switch {
+	case isF && isH && isRF:
+		return &statusRecorderFHR{statusRecorder: sr}, sr
+	case isF && isH:
+		return &statusRecorderFH{statusRecorder: sr}, sr
+	case isF && isRF:
+		return &statusRecorderFR{statusRecorder: sr}, sr
+	case isH && isRF:
+		return &statusRecorderHR{statusRecorder: sr}, sr
+	case isF:
+		return &statusRecorderF{statusRecorder: sr}, sr
+	case isH:
+		return &statusRecorderH{statusRecorder: sr}, sr
+	case isRF:
+		return &statusRecorderR{statusRecorder: sr}, sr
+	default:
+		return sr, sr
+	}
+}
+
+// statusRecorderF wraps a writer that implements http.Flusher only.
+type statusRecorderF struct{ *statusRecorder }
+
+func (s *statusRecorderF) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+
+// statusRecorderH wraps a writer that implements http.Hijacker only.
+type statusRecorderH struct{ *statusRecorder }
+
+func (s *statusRecorderH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+// statusRecorderR wraps a writer that implements io.ReaderFrom only.
+type statusRecorderR struct{ *statusRecorder }
+
+func (s *statusRecorderR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderFH wraps a writer that implements Flusher + Hijacker.
+type statusRecorderFH struct{ *statusRecorder }
+
+func (s *statusRecorderFH) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+// statusRecorderFR wraps a writer that implements Flusher + ReaderFrom.
+type statusRecorderFR struct{ *statusRecorder }
+
+func (s *statusRecorderFR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderHR wraps a writer that implements Hijacker + ReaderFrom.
+type statusRecorderHR struct{ *statusRecorder }
+
+func (s *statusRecorderHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (s *statusRecorderHR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusRecorderFHR wraps a writer that implements all three optional
+// interfaces — the common case under net/http's standard server.
+type statusRecorderFHR struct{ *statusRecorder }
+
+func (s *statusRecorderFHR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return s.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (s *statusRecorderFHR) ReadFrom(r io.Reader) (int64, error) {
+	s.recordWriteHeader()
+	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
+}
+
+// statusClass returns a bounded label (1xx/2xx/3xx/4xx/5xx) so the
+// time-series cardinality stays low. Out-of-range statuses (e.g. a
+// handler that wrote a zero status) collapse to "unknown".
+func statusClass(code int) string {
+	switch {
+	case code >= 100 && code < 200:
+		return "1xx"
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500 && code < 600:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}
+
+// routeLabel maps request paths onto a small set of bounded route
+// templates so the metric cardinality stays under control. Paths that
+// don't match a known prefix collapse to "other".
+func routeLabel(p string) string {
+	switch {
+	case p == "/":
+		return "/"
+	case p == "/healthz":
+		return "/healthz"
+	case p == "/readyz":
+		return "/readyz"
+	case strings.HasPrefix(p, "/auth/oidc/"):
+		return "/auth/oidc/*"
+	case strings.HasPrefix(p, "/auth/ldap/"):
+		return "/auth/ldap/*"
+	case strings.HasPrefix(p, "/auth/token/"):
+		return "/auth/token/*"
+	case strings.HasPrefix(p, "/api/v1/secrets/"):
+		return "/api/v1/secrets/*"
+	case strings.HasPrefix(p, "/api/v1/oauth/"):
+		return "/api/v1/oauth/*"
+	case strings.HasPrefix(p, "/api/v1/enrol/"):
+		return "/api/v1/enrol/*"
+	case p == "/api/v1/csrf",
+		p == "/api/v1/status",
+		p == "/api/v1/rules",
+		p == "/api/v1/config",
+		p == "/api/v1/config/download",
+		p == "/api/v1/token",
+		p == "/api/v1/sync":
+		return p
+	case strings.HasPrefix(p, "/api/v1/"):
+		// Defensive collapse: a future endpoint added without
+		// updating the explicit list above would otherwise leak
+		// the verbatim request path (potentially including a
+		// username segment) into the metric backend, unbounding
+		// cardinality.
+		return "/api/v1/*"
+	default:
+		return "other"
+	}
 }
 
 // hostAllowed reports whether r.Host names a loopback identity. It strips
@@ -318,6 +623,22 @@ func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 // URL returns the web UI root URL.
 func (s *Server) URL() string {
 	return fmt.Sprintf("http://%s/", s.listenAddr)
+}
+
+// MarkInitialSyncComplete flips the readiness flag. The daemon calls
+// this once engine.RunOnce returns at startup (success or per-rule
+// failure — partial progress is still "we've tried"). /readyz only
+// reports ready once this has fired AND the daemon holds a Vault
+// token, so a k8s readinessProbe or the OTel httpcheckreceiver
+// doesn't observe a green daemon before secrets exist on disk.
+func (s *Server) MarkInitialSyncComplete() {
+	s.initialSyncDone.Store(true)
+}
+
+// InitialSyncComplete reports whether MarkInitialSyncComplete has
+// fired. Exposed for tests and the /readyz handler.
+func (s *Server) InitialSyncComplete() bool {
+	return s.initialSyncDone.Load()
 }
 
 // ForceReauth clears the in-memory Vault token so /api/v1/status reports

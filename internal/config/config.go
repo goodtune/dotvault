@@ -78,11 +78,55 @@ func ParseDuration(s string) (time.Duration, error) {
 
 // Config is the top-level system configuration.
 type Config struct {
-	Vault      VaultConfig          `yaml:"vault"`
-	Sync       SyncConfig           `yaml:"sync"`
-	Web        WebConfig            `yaml:"web"`
-	Rules      []Rule               `yaml:"rules"`
-	Enrolments map[string]Enrolment `yaml:"enrolments"`
+	Vault         VaultConfig          `yaml:"vault"`
+	Sync          SyncConfig           `yaml:"sync"`
+	Web           WebConfig            `yaml:"web"`
+	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
+	Rules         []Rule               `yaml:"rules"`
+	Enrolments    map[string]Enrolment `yaml:"enrolments"`
+}
+
+// ObservabilityConfig configures the OpenTelemetry metrics exporter.
+// Disabled by default — set Enabled and Endpoint (or the standard
+// OTEL_* env vars) to point the daemon at a local OTel collector.
+//
+// The inner fields deliberately do NOT carry `omitempty`. The
+// project's YAML/regfile round-trip contract (see
+// internal/regfile/yaml.go) emits empty optional fields explicitly
+// so a re-import can clear previously-set values; omitempty here
+// would let a cleared endpoint or protocol silently persist its
+// previous value across an export → re-import cycle. The
+// top-level Observability field on Config keeps `omitempty` so
+// operators who don't use observability at all don't see a noisy
+// empty block in their downloads.
+type ObservabilityConfig struct {
+	Enabled        bool              `yaml:"enabled"`
+	Endpoint       string            `yaml:"endpoint"`
+	Protocol       string            `yaml:"protocol"`
+	Insecure       bool              `yaml:"insecure"`
+	Headers        map[string]string `yaml:"headers"`
+	RawInterval    string            `yaml:"export_interval"`
+	ExportInterval time.Duration     `yaml:"-"`
+}
+
+// MarshalYAML strips Headers before serialisation. Headers can
+// legitimately hold OTLP bearer tokens (Datadog / Grafana Cloud
+// etc. credentials); enforcing the strip at the yaml.Marshaler
+// layer means every export path — the web download endpoint, the
+// reg-export YAML form, future serialisers — is automatically
+// safe, instead of relying on each call site to remember to nil
+// out Headers itself. Round-tripping a config through YAML
+// therefore clears Headers, which is the intended security
+// posture: secrets belong in OTEL_EXPORTER_OTLP_HEADERS / the
+// per-user EnvironmentFile, not in checked-in config files.
+//
+// Uses an unnamed-struct shadow type so the override doesn't
+// recurse into itself the way `type Alias ObservabilityConfig`
+// returning Alias(c) would.
+func (c ObservabilityConfig) MarshalYAML() (interface{}, error) {
+	type shadow ObservabilityConfig
+	c.Headers = nil
+	return shadow(c), nil
 }
 
 // Enrolment declares a credential acquisition flow for a Vault KV key.
@@ -236,6 +280,63 @@ func (c *Config) validate() error {
 		}
 		if err := paths.ValidateLoopback(c.Web.Listen); err != nil {
 			return fmt.Errorf("web.listen: %w", err)
+		}
+	}
+
+	// Observability validation. The block is optional — only validate
+	// shape when the user opted in. The OTel SDK applies its own
+	// defaults (60s export interval, standard env-var fallbacks) so
+	// most fields stay omittable.
+	if c.Observability.Enabled {
+		if c.Observability.Protocol != "" {
+			switch strings.ToLower(c.Observability.Protocol) {
+			case "grpc", "http/protobuf":
+				// accepted — the OTel canonical names from the
+				// OTEL_EXPORTER_OTLP_PROTOCOL spec.
+			default:
+				return fmt.Errorf("observability.protocol %q: must be grpc or http/protobuf", c.Observability.Protocol)
+			}
+		}
+		if c.Observability.RawInterval != "" {
+			// Use the project's ParseDuration so observability.export_interval
+			// accepts the same "Nd" day shorthand as other duration fields
+			// (token_ttl, etc.) — a stdlib time.ParseDuration here would
+			// reject `1d` and produce a confusing "unknown unit d" message.
+			d, err := ParseDuration(c.Observability.RawInterval)
+			if err != nil {
+				return fmt.Errorf("observability.export_interval %q: %w", c.Observability.RawInterval, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("observability.export_interval %q: must be positive", c.Observability.RawInterval)
+			}
+			c.Observability.ExportInterval = d
+		} else if c.Observability.ExportInterval < 0 {
+			// ExportInterval can be set programmatically (a test
+			// fixture, a future internal config builder) without
+			// RawInterval being populated. A negative value would
+			// otherwise be passed straight to the OTel SDK's
+			// WithInterval (which doesn't validate). Zero is fine
+			// — the SDK falls back to its default 60s.
+			return fmt.Errorf("observability.export_interval %v: must be positive", c.Observability.ExportInterval)
+		}
+	}
+
+	// Defence-in-depth: reject CR/LF/NUL in observability header
+	// values and CR/LF/NUL/`:` in header names. Runs unconditionally
+	// — outside the `Enabled` guard — so a config that's toggled on
+	// later (e.g. via env-var-driven enablement or a future feature
+	// flag) starts from a sanitised baseline. The OTel SDK itself
+	// doesn't validate these characters; catching them here
+	// surfaces the problem at startup. CR/LF block plain HTTP
+	// header smuggling; NUL is rejected because HTTP/2 and gRPC
+	// treat it as a field terminator in some implementations and
+	// proxies vary in handling.
+	for k, v := range c.Observability.Headers {
+		if strings.ContainsAny(k, "\r\n:\x00") {
+			return fmt.Errorf("observability.headers: key %q must not contain CR, LF, NUL, or colon", k)
+		}
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("observability.headers[%q]: value must not contain CR, LF, or NUL", k)
 		}
 	}
 

@@ -64,6 +64,41 @@ nfpms:
       - deb
       - apk
     bindir: /usr/bin
+    contents:
+      # dotvault is a per-user daemon (each user has their own Vault
+      # identity and their own secrets), so the unit ships under the
+      # user-unit search path. Enable per-user with
+      # `systemctl --user enable --now dotvault.service` or globally
+      # across all login sessions with `systemctl --global enable
+      # dotvault.service` — neither path runs the daemon as root.
+      # /usr/lib/systemd/user/ is the canonical user-unit search
+      # path across RPM, DEB, and APK packagers. On Debian Bullseye+
+      # and Ubuntu 20.04+ the historical /lib path is a symlink to
+      # /usr/lib so either form works; on Debian Buster (10) /lib is
+      # a separate directory NOT on the user-unit search path, so
+      # using a single canonical path avoids a silent "unit not
+      # found" on those hosts.
+      - src: packaging/linux/dotvault.service
+        dst: /usr/lib/systemd/user/dotvault.service
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault.service
+        dst: /usr/lib/systemd/user/dotvault.service
+        file_info:
+          mode: 0644
+        packager: deb
+      # APK doesn't ship a unit-file consumer by default (Alpine
+      # uses OpenRC, not systemd), but the systemd-elogind /
+      # systemd-shim packages search /usr/lib/systemd/user/. The
+      # entry below makes the unit available on the small subset of
+      # Alpine installations that have opted into systemd; on
+      # OpenRC-only hosts the file is just dormant.
+      - src: packaging/linux/dotvault.service
+        dst: /usr/lib/systemd/user/dotvault.service
+        file_info:
+          mode: 0644
+        packager: apk
 
 checksum:
   name_template: checksums.txt

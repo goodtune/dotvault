@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/handlers"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/tmpl"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -52,6 +53,22 @@ func (e *Engine) TriggerSync() {
 
 // RunOnce executes a single sync cycle across all rules.
 func (e *Engine) RunOnce(ctx context.Context) error {
+	start := time.Now()
+	lastErr := e.runOnceLocked(ctx)
+	outcome := "ok"
+	if lastErr != nil {
+		outcome = "error"
+	}
+	// Record outside the mutex: metric ops are independent of the
+	// engine's critical section, and dragging them inside would
+	// inflate the lock-hold window if the OTel exporter (or a
+	// future instrument) ever blocks.
+	observability.RecordSyncTick(ctx, outcome)
+	observability.RecordSyncDuration(ctx, time.Since(start), outcome)
+	return lastErr
+}
+
+func (e *Engine) runOnceLocked(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -65,11 +82,54 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	return lastErr
 }
 
-// RunLoop runs the hybrid event/poll sync loop until ctx is cancelled.
-func (e *Engine) RunLoop(ctx context.Context) error {
-	// Initial sync
-	e.RunOnce(ctx)
+// RunLoopOption tunes RunLoop's behaviour without exposing the
+// engine's internal sequencing to callers.
+type RunLoopOption func(*runLoopConfig)
 
+type runLoopConfig struct {
+	afterInitialSync func()
+}
+
+// AfterInitialSync registers a callback invoked exactly once,
+// synchronously, after RunLoop's initial RunOnce returns and before
+// the ticker / event loop starts. The daemon uses this to gate
+// sd_notify(READY=1) and the web server's readiness flag on the
+// initial sync completing — without leaking the initial-sync-then-
+// loop sequencing to every caller via a separately-exported
+// RunLoopAfterInitial entry point.
+func AfterInitialSync(fn func()) RunLoopOption {
+	return func(c *runLoopConfig) { c.afterInitialSync = fn }
+}
+
+// RunLoop runs the hybrid event/poll sync loop until ctx is cancelled.
+// It performs an initial RunOnce up front, fires any
+// AfterInitialSync hook, then enters the ticker / event loop. The
+// initial RunOnce error is logged but does not abort the loop —
+// per-rule isolation is the engine's invariant.
+func (e *Engine) RunLoop(ctx context.Context, opts ...RunLoopOption) error {
+	cfg := &runLoopConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if err := e.RunOnce(ctx); err != nil {
+		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
+	}
+	// Don't fire the readiness hook if ctx has been cancelled
+	// during the initial RunOnce. Signalling sd_notify(READY=1) /
+	// flipping the web /readyz flag mid-shutdown would
+	// incorrectly unblock systemd dependencies or k8s
+	// readinessProbe consumers right before the daemon exits.
+	if cfg.afterInitialSync != nil && ctx.Err() == nil {
+		cfg.afterInitialSync()
+	}
+	return e.runLoopAfterInitial(ctx)
+}
+
+// runLoopAfterInitial runs the hybrid event/poll sync loop without
+// an implicit initial sync. Unexported because the initial-sync
+// sequencing is an engine invariant — callers compose via
+// RunLoopOption hooks instead.
+func (e *Engine) runLoopAfterInitial(ctx context.Context) error {
 	// Check Vault edition — events API requires Enterprise.
 	var eventsAvailable bool
 	if health, err := e.vault.ServerHealth(ctx); err != nil {

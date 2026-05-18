@@ -3,6 +3,8 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -289,5 +291,119 @@ func TestEngine_RunOnceResyncAfterFileModified(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "ghp_testtoken123") {
 		t.Errorf("re-synced file missing token:\n%s", data)
+	}
+}
+
+// TestEngine_RunLoopAfterInitialSyncHook confirms three contracts
+// of the RunLoop public API:
+//
+//  1. The AfterInitialSync hook fires exactly once, between the
+//     initial RunOnce and the long-running loop. The daemon uses
+//     this to gate sd_notify(READY=1) and the web /readyz flag.
+//  2. The hook fires AFTER the initial RunOnce completes (proven
+//     by checking the target file exists at the time the hook
+//     runs).
+//  3. The loop body itself does not implicitly perform a *second*
+//     sync — once the hook has fired, only the ticker / event
+//     triggers move the engine forward. With a one-hour sync
+//     interval and a short context timeout, a spurious second
+//     RunOnce would re-write the file (the test pins file
+//     modification time to catch this).
+//
+// Runs as a standard unit test (no skipIfNoVault) — the httptest
+// server serves /sys/health as 503 (so the Enterprise events
+// subscription is skipped) and a valid KVv2 envelope for the
+// secret read (so a real RunOnce actually writes a file). This
+// is what makes the negative-second-sync assertion load-bearing:
+// a future regression that re-introduces an implicit sync inside
+// the loop body would advance the file's mtime, which we check.
+func TestEngine_RunLoopAfterInitialSyncHook(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /sys/health: fail so the engine treats this as a
+		// community Vault and skips event subscription.
+		if strings.HasSuffix(r.URL.Path, "/sys/health") {
+			http.Error(w, "vault unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		// /v1/{mount}/data/{path}: return a valid KVv2
+		// envelope so a successful RunOnce writes the file.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"data": map[string]any{"token": "test-token-value"},
+				"metadata": map[string]any{
+					"version":       json.Number("1"),
+					"created_time":  "2024-01-01T00:00:00Z",
+					"deletion_time": "",
+					"destroyed":     false,
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "test"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			KVMount:    "secret",
+			UserPrefix: "users/",
+		},
+		Sync: config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: config.Target{
+					Path:     ghPath,
+					Format:   "yaml",
+					Template: "github.com:\n  oauth_token: \"{{.token}}\"",
+					Merge:    "deep",
+				},
+			},
+		},
+	}
+
+	engine := NewEngine(cfg, vc, "testuser", statePath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	var (
+		hookCalls          int
+		fileExistedAtHook  bool
+		mtimeAtHook        time.Time
+	)
+	if err := engine.RunLoop(ctx, AfterInitialSync(func() {
+		hookCalls++
+		if info, err := os.Stat(ghPath); err == nil {
+			fileExistedAtHook = true
+			mtimeAtHook = info.ModTime()
+		}
+	})); err != nil {
+		t.Fatalf("RunLoop: %v", err)
+	}
+	if hookCalls != 1 {
+		t.Errorf("AfterInitialSync hook called %d time(s), want 1", hookCalls)
+	}
+	if !fileExistedAtHook {
+		t.Error("AfterInitialSync fired before the initial RunOnce wrote the target file")
+	}
+	// A spurious second RunOnce inside the loop body would
+	// advance the file's mtime past mtimeAtHook (the engine
+	// would refresh content / permissions). With the one-hour
+	// sync interval, the ticker can't have fired in our 200ms
+	// window, so any post-hook write is a regression.
+	if info, err := os.Stat(ghPath); err != nil {
+		t.Fatalf("stat target after loop: %v", err)
+	} else if !info.ModTime().Equal(mtimeAtHook) {
+		t.Errorf("target mtime advanced after the hook (%v → %v) — loop performed a redundant second sync", mtimeAtHook, info.ModTime())
 	}
 }

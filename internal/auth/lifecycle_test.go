@@ -92,20 +92,29 @@ func TestLifecycleManager_403TriggersReauth(t *testing.T) {
 }
 
 func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
-	renewCalled := false
+	var renewCalled atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			// creation_ttl=120 → renew threshold = 30s.
+			// ttl=20 is below the threshold, so renewal WOULD
+			// fire if disableRenewal weren't set. The earlier
+			// shape (ttl=30, no creation_ttl) made the baseline
+			// cache anchor at 30s and the threshold at 7.5s,
+			// which meant the assertion passed vacuously: no
+			// renewal would have happened regardless of the
+			// flag.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{
-					"ttl":       json.Number("30"), // well within renewal threshold
-					"renewable": true,
-					"expire_time": "2099-01-01T00:00:00Z",
+					"ttl":          json.Number("20"),
+					"creation_ttl": json.Number("120"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
 				},
 			})
 		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
-			renewCalled = true
+			renewCalled.Store(true)
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
 		default:
@@ -125,8 +134,241 @@ func TestLifecycleManager_DisableRenewalSkipsRenewCall(t *testing.T) {
 
 	<-lm.Start(ctx)
 
-	if renewCalled {
+	if renewCalled.Load() {
 		t.Error("RenewSelf was called despite disable_token_renewal=true")
+	}
+}
+
+// TestLifecycleManager_RenewWhenInsideThreshold confirms RenewSelf is
+// actually called once the remaining TTL crosses below 25% of
+// creation_ttl. Earlier the threshold was computed as `ttl / 4` and
+// then compared `ttl <= ttl/4`, which can never hold for any positive
+// ttl — renewal silently never fired and tokens were left to expire
+// into a forced re-auth.
+func TestLifecycleManager_RenewWhenInsideThreshold(t *testing.T) {
+	var renewCalled atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					// creation_ttl=3600 → renew threshold = 900s.
+					// ttl=120s is well below it.
+					"ttl":          json.Number("120"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renewCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if !renewCalled.Load() {
+		t.Error("RenewSelf was not called despite ttl being well below the renew threshold")
+	}
+}
+
+// TestLifecycleManager_SkipRenewWhenFresh confirms RenewSelf is NOT
+// called when the remaining TTL is still above the threshold. Pairs
+// with the previous test to pin the policy on both sides.
+func TestLifecycleManager_SkipRenewWhenFresh(t *testing.T) {
+	var renewCalled atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					// creation_ttl=3600 → renew threshold = 900s.
+					// ttl=3000s is well above it; nothing to do.
+					"ttl":          json.Number("3000"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+					"expire_time":  "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renewCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if renewCalled.Load() {
+		t.Error("RenewSelf was called despite ttl being above the renew threshold")
+	}
+}
+
+// TestLifecycleManager_ShortTokenWithoutCreationTTL exercises the
+// baseline-caching path. A 5-minute token with no creation_ttl would
+// previously satisfy the 15-minute fallback threshold on every check
+// and the daemon would call RenewSelf at every poll interval; the
+// baseline cache locks the threshold to creation_ttl/4 (or the
+// largest observed ttl, whichever is greater) so a short-lived token
+// is only renewed when its remaining TTL crosses below 25% of its
+// observed lifetime.
+func TestLifecycleManager_ShortTokenWithoutCreationTTL(t *testing.T) {
+	var lookups, renews atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			lookups.Add(1)
+			// 5-minute (300s) token, no creation_ttl. Baseline cache
+			// kicks in: baseline becomes 300s after the first check,
+			// renew threshold becomes 75s. 300s is above 75s, so we
+			// shouldn't renew.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":         json.Number("300"),
+					"renewable":   true,
+					"expire_time": "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renews.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "some-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Tight loop interval so we get many checks within the test
+	// window. The lookups bound is deliberately loose (≥2 — enough
+	// to prove the loop ticked at all) so a heavily-loaded CI
+	// runner with HTTP/scheduling jitter doesn't fail this test
+	// for the wrong reason; the load-bearing assertion is
+	// renews == 0, which is unaffected by scheduling latency.
+	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	<-lm.Start(ctx)
+
+	if lookups.Load() < 2 {
+		t.Fatalf("expected the loop to tick at least twice (got %d) — test conditions not satisfied", lookups.Load())
+	}
+	if renews.Load() != 0 {
+		t.Errorf("RenewSelf was called %d times for a 5min token whose remaining ttl is well above the cached-baseline threshold", renews.Load())
+	}
+}
+
+// TestLifecycleManager_BaselineResetsOnTokenSwap covers the case where
+// the in-memory token changes mid-lifecycle: a new shorter-TTL token
+// must not inherit the oversized baseline cached from its
+// predecessor. Without the reset, `ttl <= baseline/4` would fire
+// immediately on the new token and the daemon would call RenewSelf
+// every poll interval.
+func TestLifecycleManager_BaselineResetsOnTokenSwap(t *testing.T) {
+	var renews atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/auth/token/lookup-self" && r.Method == http.MethodGet:
+			// Vault would never report different TTLs for the same
+			// token across calls; we vary it by the inbound header
+			// so the test simulates a token swap.
+			tok := r.Header.Get("X-Vault-Token")
+			ttl := "3600"
+			if tok == "short-token" {
+				ttl = "300"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":         json.Number(ttl),
+					"renewable":   true,
+					"expire_time": "2099-01-01T00:00:00Z",
+				},
+			})
+		case r.URL.Path == "/v1/auth/token/renew-self" && r.Method == http.MethodPut:
+			renews.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "tok"}})
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "long-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+
+	// readBaseline acquires baselineMu before snapshotting the
+	// field. The test calls checkAndRenew synchronously so there
+	// isn't an actual race today, but the field is documented as
+	// mutex-guarded and bare reads here would diverge from that
+	// contract — making the test the first thing to break if the
+	// guarded-access invariant slips elsewhere.
+	readBaseline := func() time.Duration {
+		lm.baselineMu.Lock()
+		defer lm.baselineMu.Unlock()
+		return lm.baselineTTL
+	}
+
+	// First, drive a check with the long token so the baseline anchors at 3600s.
+	if err := lm.checkAndRenew(context.Background()); err != nil {
+		t.Fatalf("checkAndRenew (long): %v", err)
+	}
+	if got := readBaseline(); got != time.Hour {
+		t.Fatalf("baselineTTL = %v, want 1h after long-token observation", got)
+	}
+
+	// Now swap the in-memory token to a shorter-TTL one. The
+	// baseline must reset, otherwise `300 <= 3600/4` would be true
+	// and the renew check would fire spuriously.
+	vc.SetToken("short-token")
+	if err := lm.checkAndRenew(context.Background()); err != nil {
+		t.Fatalf("checkAndRenew (short): %v", err)
+	}
+	if got := readBaseline(); got != 300*time.Second {
+		t.Errorf("baselineTTL after swap = %v, want 5m (baseline should have reset and rebound to the new token's TTL)", got)
+	}
+	if renews.Load() != 0 {
+		t.Errorf("RenewSelf fired %d time(s) after token swap; oversized baseline leaked through", renews.Load())
 	}
 }
 

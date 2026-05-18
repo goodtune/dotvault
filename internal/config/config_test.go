@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadValid(t *testing.T) {
@@ -595,6 +598,162 @@ enrolments:
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("expected error for unparseable token_ttl")
+	}
+}
+
+func TestLoadObservabilityValid(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  endpoint: "127.0.0.1:4317"
+  protocol: "grpc"
+  insecure: true
+  export_interval: "15s"
+  headers:
+    authorization: "Bearer foo"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Observability.Enabled {
+		t.Errorf("Observability.Enabled = false, want true")
+	}
+	if cfg.Observability.Endpoint != "127.0.0.1:4317" {
+		t.Errorf("Observability.Endpoint = %q, want 127.0.0.1:4317", cfg.Observability.Endpoint)
+	}
+	if cfg.Observability.ExportInterval != 15*time.Second {
+		t.Errorf("Observability.ExportInterval = %v, want 15s", cfg.Observability.ExportInterval)
+	}
+	if cfg.Observability.Headers["authorization"] != "Bearer foo" {
+		t.Errorf("Observability.Headers[authorization] = %q, want Bearer foo", cfg.Observability.Headers["authorization"])
+	}
+}
+
+func TestLoadObservabilityInvalidProtocol(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  protocol: "carrier-pigeon"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for unsupported observability protocol")
+	}
+}
+
+func TestLoadObservabilityInvalidInterval(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+
+sync:
+  interval: "5m"
+
+observability:
+  enabled: true
+  export_interval: "-1s"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for negative observability.export_interval")
+	}
+}
+
+// TestObservabilityMarshalYAMLStripsHeaders pins the security
+// invariant that yaml.Marshal of an ObservabilityConfig never
+// emits the Headers map — even a direct call (no Config wrapper,
+// no buildEffectiveConfig pre-strip) must produce a sanitised
+// document. This is the canonical enforcement point that every
+// future export path inherits for free.
+func TestObservabilityMarshalYAMLStripsHeaders(t *testing.T) {
+	obs := ObservabilityConfig{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:4317",
+		Protocol: "grpc",
+		Headers: map[string]string{
+			"authorization": "Bearer super-secret-marshal-yaml-test-token",
+			"x-vendor-id":   "datadog-internal-tenant-id",
+		},
+	}
+	data, err := yaml.Marshal(obs)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "super-secret-marshal-yaml-test-token") {
+		t.Errorf("yaml.Marshal leaked Headers value:\n%s", s)
+	}
+	if strings.Contains(s, "datadog-internal-tenant-id") {
+		t.Errorf("yaml.Marshal leaked Headers value:\n%s", s)
+	}
+	if strings.Contains(s, "authorization") || strings.Contains(s, "x-vendor-id") {
+		t.Errorf("yaml.Marshal leaked Headers key:\n%s", s)
+	}
+}
+
+// TestValidateRejectsProgrammaticNegativeExportInterval covers the
+// path where Observability.ExportInterval is set programmatically
+// (RawInterval empty) but with a non-positive value — e.g. a future
+// internal config builder or a test fixture that bypasses YAML. The
+// OTel SDK's WithInterval doesn't validate the value itself, so the
+// daemon would otherwise pass a negative duration through to the
+// periodic reader.
+func TestValidateRejectsProgrammaticNegativeExportInterval(t *testing.T) {
+	cfg := &Config{
+		Vault: VaultConfig{Address: "https://vault.example.com:8200"},
+		Sync:  SyncConfig{RawInterval: "5m"},
+		Observability: ObservabilityConfig{
+			Enabled:        true,
+			ExportInterval: -1 * time.Second,
+		},
+		Rules: []Rule{
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: Target{
+					Path:   "~/.config/gh/hosts.yml",
+					Format: "yaml",
+				},
+			},
+		},
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected error for programmatic negative ExportInterval")
 	}
 }
 

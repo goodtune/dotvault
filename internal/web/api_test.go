@@ -212,6 +212,71 @@ func TestHandleConfigDownload_DefaultIntervalMaterialised(t *testing.T) {
 	}
 }
 
+// TestHandleConfigDownload_IncludesObservability verifies the
+// effective-config builder threads the observability block through to
+// the downloaded YAML. Previously buildEffectiveConfig dropped it
+// entirely, so a daemon with metrics enabled would download a config
+// missing the observability section and re-importing it would silently
+// turn metrics off.
+func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
+	s.obsCfg = config.ObservabilityConfig{
+		Enabled:        true,
+		Endpoint:       "127.0.0.1:4317",
+		Protocol:       "grpc",
+		Insecure:       true,
+		ExportInterval: 15 * time.Second,
+		Headers: map[string]string{
+			"authorization": "Bearer super-secret-token",
+		},
+	}
+	s.rules = []config.Rule{
+		{
+			Name:     "r",
+			VaultKey: "r",
+			Target:   config.Target{Path: "/tmp/r", Format: "text"},
+		},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=yaml", nil)
+	w := httptest.NewRecorder()
+	s.handleConfigDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "observability:") {
+		t.Errorf("expected observability block; got:\n%s", body)
+	}
+	if !strings.Contains(body, "endpoint: 127.0.0.1:4317") {
+		t.Errorf("expected observability.endpoint; got:\n%s", body)
+	}
+	// export_interval was supplied via the parsed field only — the
+	// raw form should be materialised so the download round-trips.
+	if !strings.Contains(body, "export_interval: 15s") {
+		t.Errorf("expected materialised export_interval `15s`; got:\n%s", body)
+	}
+	// observability.headers can carry bearer tokens — the download
+	// endpoint must NEVER leak them via the loopback API. The
+	// configured value above includes a fake bearer token plus a
+	// vendor-revealing key name; assert neither appears.
+	//
+	// `headers: {}` (an empty map) is allowed: the project's
+	// round-trip-clearing convention emits empty optional fields
+	// explicitly so a re-import can clear previously-set values.
+	// What we forbid is the populated form `authorization: …`
+	// appearing anywhere in the output.
+	if strings.Contains(body, "super-secret-token") {
+		t.Errorf("download leaked observability.headers value:\n%s", body)
+	}
+	if strings.Contains(body, "authorization:") {
+		t.Errorf("download exposed observability.headers vendor key:\n%s", body)
+	}
+}
+
 func TestHandleConfigDownload_YAML(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}

@@ -60,13 +60,14 @@ type Server struct {
 	shutdownCancel     context.CancelFunc
 
 	// initialSyncDone flips to true once the daemon calls
-	// MarkInitialSyncComplete (which the main goroutine invokes
-	// after engine.RunOnce returns at startup). /readyz gates on
-	// it alongside the Vault-token check so k8s readinessProbe
-	// consumers and the OTel httpcheckreceiver don't observe a
-	// "ready" daemon before any secrets have been written to disk
-	// — matching the sd_notify(READY=1) contract on the systemd
-	// path.
+	// MarkInitialSyncComplete (wired into the sync engine's
+	// AfterInitialSync hook in runDaemon — fires exactly once,
+	// between the initial RunOnce and the long-running loop).
+	// /readyz gates on it alongside the Vault-token check so k8s
+	// readinessProbe consumers and the OTel httpcheckreceiver
+	// don't observe a "ready" daemon before any secrets have been
+	// written to disk — matching the sd_notify(READY=1) contract
+	// on the systemd path.
 	initialSyncDone atomic.Bool
 }
 
@@ -151,12 +152,13 @@ func (s *Server) registerRoutes() {
 	// running and able to serve HTTP. /readyz reports readiness:
 	// 200 only after BOTH a Vault token is present AND the
 	// daemon has marked its initial sync complete (via
-	// MarkInitialSyncComplete, called from the daemon main
-	// goroutine after engine.RunOnce returns). This mirrors the
-	// sd_notify(READY=1) contract on the systemd path so a
-	// Kubernetes readinessProbe or the OTel httpcheckreceiver
-	// never observes a green daemon before secrets exist on
-	// disk. Both probes are loopback-only and return JSON.
+	// MarkInitialSyncComplete, called from the sync engine's
+	// AfterInitialSync hook after the initial RunOnce returns).
+	// This mirrors the sd_notify(READY=1) contract on the systemd
+	// path so a Kubernetes readinessProbe or the OTel
+	// httpcheckreceiver never observes a green daemon before
+	// secrets exist on disk. Both probes are loopback-only and
+	// return JSON.
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 

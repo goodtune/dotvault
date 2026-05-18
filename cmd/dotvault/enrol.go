@@ -387,11 +387,13 @@ const (
 // sequences; on local pty's all three bytes show up in a single Read,
 // but VMIN=1 VTIME=0 (the POSIX raw-mode contract term.MakeRaw applies)
 // means a Read returns as soon as one byte is available, so in
-// principle a slow link could split the sequence. When we see a lone
-// ESC we peek briefly via waitForMoreInput and pull in any tail bytes
-// before classifying — without that an arrow on a high-latency link
-// would mis-fire as quit. Ctrl-C and EOF also collapse to quit so the
-// caller can exit cleanly without a special path.
+// principle a slow link could split the sequence one byte at a time.
+// When we see a lone ESC we keep polling+reading via waitForMoreInput
+// until either the buffer holds a complete known sequence or a short
+// deadline expires — without that an arrow on a high-latency link
+// would mis-fire as quit, or worse, hang half-classified at n=2.
+// Ctrl-C and EOF also collapse to quit so the caller can exit cleanly
+// without a special path.
 func readSingleKey(in *os.File) (keyKind, error) {
 	buf := make([]byte, 16)
 	n, err := in.Read(buf)
@@ -404,11 +406,8 @@ func readSingleKey(in *os.File) (keyKind, error) {
 	if n == 0 {
 		return keyNone, nil
 	}
-	if n == 1 && buf[0] == 0x1b && waitForMoreInput(in.Fd(), 50*time.Millisecond) {
-		m, rerr := in.Read(buf[n:])
-		if rerr == nil && m > 0 {
-			n += m
-		}
+	if n >= 1 && buf[0] == 0x1b {
+		n = drainEscapeTail(in, buf, n, 50*time.Millisecond)
 	}
 	b := buf[:n]
 	switch {
@@ -416,12 +415,18 @@ func readSingleKey(in *os.File) (keyKind, error) {
 		return keyUp, nil
 	case n >= 3 && b[0] == 0x1b && b[1] == '[' && b[2] == 'B':
 		return keyDown, nil
+	case b[0] == 0x1b && (n == 1 || b[1] != '['):
+		// Bare ESC, or ESC followed by a non-CSI byte (the user
+		// pressed Esc and then another key within the peek window).
+		// Treat as quit. A truncated CSI sequence (ESC '[' with no
+		// final byte) deliberately falls through to keyNone — the
+		// drain loop already waited the full deadline, so reaching
+		// this point means the rest is genuinely never coming and
+		// surprising the user with a quit would be worse than a
+		// silent no-op they can re-try.
+		return keyQuit, nil
 	case n == 1 && (b[0] == '\r' || b[0] == '\n'):
 		return keyEnter, nil
-	case n == 1 && b[0] == 0x1b:
-		// Bare ESC — treat as quit (a multi-byte escape sequence
-		// would have come in a single read).
-		return keyQuit, nil
 	case n == 1 && (b[0] == 'q' || b[0] == 'Q'):
 		return keyQuit, nil
 	case n == 1 && b[0] == 0x03:
@@ -433,4 +438,45 @@ func readSingleKey(in *os.File) (keyKind, error) {
 		return keyQuit, nil
 	}
 	return keyNone, nil
+}
+
+// drainEscapeTail keeps polling and reading from in until either buf
+// holds a complete recognised ANSI escape sequence (ESC '[' followed
+// by a final byte) or the cumulative wait exceeds timeout, then
+// returns the new byte count. Called after readSingleKey sees an ESC
+// byte at the start of buf.
+//
+// The loop matters because POSIX raw mode (VMIN=1 VTIME=0) lets a
+// single Read return the moment one byte is in the buffer, so on a
+// slow link the three bytes of an arrow sequence can arrive in three
+// separate reads (ESC, then '[', then 'A'/'B'). A one-shot peek isn't
+// enough — we need to keep collecting until we have a classifiable
+// sequence or we time out.
+//
+// We stop early when:
+//   - the buffer fills (defensive, never expected in practice);
+//   - we already have at least 3 bytes (the recognised arrow length);
+//   - the second byte isn't '[' (the sequence isn't a CSI escape, so
+//     waiting for more bytes won't help — the input is Esc-then-
+//     something the caller will treat as quit).
+func drainEscapeTail(in *os.File, buf []byte, have int, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for have < 3 && have < len(buf) {
+		if have >= 2 && buf[1] != '[' {
+			break
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if !waitForMoreInput(in.Fd(), remaining) {
+			break
+		}
+		m, rerr := in.Read(buf[have:])
+		if rerr != nil || m == 0 {
+			break
+		}
+		have += m
+	}
+	return have
 }

@@ -236,8 +236,9 @@ enrolments:
 // TestReadSingleKey_SplitArrowSequence exercises the slow-link path
 // flagged in PR #70 review: under VMIN=1 VTIME=0 a Read may return as
 // soon as the ESC byte is available, with the `[A` tail arriving
-// later. The peek-after-ESC logic should pull the tail in and
-// classify it as an arrow rather than collapsing to keyQuit.
+// later. The drain loop should keep polling+reading until it has a
+// classifiable sequence and return keyUp rather than collapsing to
+// quit.
 func TestReadSingleKey_SplitArrowSequence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// On Windows term.MakeRaw enables VT input, which delivers
@@ -265,6 +266,66 @@ func TestReadSingleKey_SplitArrowSequence(t *testing.T) {
 	}
 	if got != keyUp {
 		t.Errorf("split arrow = %v, want keyUp", got)
+	}
+}
+
+// TestReadSingleKey_OneByteAtATime exercises the worst case Copilot
+// flagged in the second review pass: every byte of the arrow sequence
+// arrives in its own Read. The drain loop must keep accumulating
+// across multiple polls until the full ESC '[' 'A' is in hand.
+func TestReadSingleKey_OneByteAtATime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("split-escape peek is POSIX-only")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	go func() {
+		defer w.Close()
+		for _, b := range []byte{0x1b, '[', 'B'} {
+			_, _ = w.Write([]byte{b})
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	got, err := readSingleKey(r)
+	if err != nil {
+		t.Fatalf("readSingleKey: %v", err)
+	}
+	if got != keyDown {
+		t.Errorf("one-byte-at-a-time arrow = %v, want keyDown", got)
+	}
+}
+
+// TestReadSingleKey_EscThenOtherKey exercises the "Esc then immediate
+// other key" race: a user presses Esc and types another key within
+// the 50ms peek window. The drain loop pulls the follow-up byte in,
+// notices it isn't '[' (so not a CSI sequence), stops early, and the
+// classifier treats the leading ESC as quit. The follow-up byte is
+// intentionally dropped — it would take a sub-50ms two-key burst for
+// this to happen in practice.
+func TestReadSingleKey_EscThenOtherKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("split-escape peek is POSIX-only")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	go func() {
+		defer w.Close()
+		_, _ = w.Write([]byte{0x1b})
+		time.Sleep(5 * time.Millisecond)
+		_, _ = w.Write([]byte{'x'})
+	}()
+	got, err := readSingleKey(r)
+	if err != nil {
+		t.Fatalf("readSingleKey: %v", err)
+	}
+	if got != keyQuit {
+		t.Errorf("esc-then-other = %v, want keyQuit", got)
 	}
 }
 

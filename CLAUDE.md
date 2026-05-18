@@ -2,6 +2,22 @@
 
 Cross-platform daemon (Go) that runs in user context, authenticates to HashiCorp Vault, and synchronises KVv2 secrets into local configuration files via surgical, field-level merges.
 
+## Agent workflow: review before pushing
+
+Every Claude agent on this repo runs a five-persona pre-push review of the unpushed changes BEFORE executing `git push`. The personas are security, architecture, cross-platform, test & correctness, and docs & DX. This replaces the previous PR-time CI review (`.github/workflows/claude-code-review.yml`, since deleted), which generated a round-trip comment loop that the author always had to babysit one commit behind.
+
+How:
+
+1. **Invoke `/precommit-review`.** The skill at `.claude/skills/precommit-review/` packages the dispatch logic: it inspects the unpushed diff, fires five `Agent` tool calls in a single message (one per persona), and waits for all of them. Each persona reports under 250 words with `file:line` references and a severity tag (`blocker` / `major` / `minor` / `nit`).
+2. **Address the findings** in the same commit series — fix in place, don't push and then fix in a follow-up.
+   - `blocker` and `major`: fix, or push a commit whose message names the persona and explains why the trade-off was made deliberately.
+   - `minor` and `nit`: fix when cheap; otherwise mention in the commit message.
+3. **Push once.** A clean series with the review baked in is the deliverable.
+
+Skip the review only when the user explicitly tells you to, or when the push is purely administrative (rebase pointer update with no diff change, tag, etc.). When in doubt, run it — five short agent calls are cheap; a public-PR comment loop with a human in the middle is not.
+
+This is non-negotiable for code-changing pushes. Doc-only changes can use the review at your judgement.
+
 ## Build & Test
 
 ```sh

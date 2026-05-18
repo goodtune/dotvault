@@ -555,7 +555,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 
-	// Initial sync runs synchronously before we tell systemd we're
 	// The sync engine drives the initial RunOnce internally; the
 	// AfterInitialSync hook below fires the daemon's readiness
 	// signals (web-server /readyz gate, sd_notify(READY=1))

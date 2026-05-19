@@ -1,0 +1,7 @@
+[Unit]
+Description=Watch ~/.vault-token for changes
+PartOf=dotvault.service
+
+[Path]
+PathChanged=%h/.vault-token
+Unit=dotvault-token-watch.service

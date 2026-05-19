@@ -334,7 +334,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.enrol.attempts`       | counter   | `engine`, `outcome={completed,error}`                |
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
-| `dotvault.sighup.received`      | counter   | (no attrs)                                           |
+| `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.vault-token` re-read |
 
 Health probes are served on the same loopback listener as the
 web UI and are therefore **only available when `web.enabled:
@@ -360,6 +360,8 @@ Both return JSON and are loopback-only, suitable for the OTel
 ## Config reload
 
 !!! note
-    dotvault does **not** support config reload via SIGHUP. The daemon must be fully restarted to pick up configuration changes.
+    dotvault does **not** support full config reload via SIGHUP. The daemon must be fully restarted to pick up configuration changes (the exception is the `enrolments` section, which is re-read on each polling tick).
 
-    The exception is the `enrolments` section, which is re-read on each polling tick.
+    SIGHUP **does** trigger an immediate `~/.vault-token` re-read — so when an interactive `dotvault login` writes a fresh token, the running daemon picks it up within seconds instead of waiting for the next five-minute lifecycle tick. The RPM/DEB/APK package ships a `dotvault-token-watch.path` user unit that watches `~/.vault-token` and forwards changes to the daemon via `systemctl --user kill --signal=SIGHUP dotvault.service`. The path unit is pulled in automatically by `dotvault.service`'s `[Install] Also=` directive, so enabling the daemon enables the watcher; if you installed dotvault some other way and want the same behaviour, `systemctl --user enable --now dotvault-token-watch.path`.
+
+    The macOS launchd plist has no equivalent path-watcher today — `kill -HUP $(pgrep -x dotvault)` works manually, but operators who want automatic re-read should script it.

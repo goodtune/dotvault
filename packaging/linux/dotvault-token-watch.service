@@ -1,0 +1,14 @@
+[Unit]
+Description=Forward ~/.vault-token change to dotvault.service via SIGHUP
+PartOf=dotvault.service
+
+[Service]
+Type=oneshot
+# `systemctl --user kill --signal=SIGHUP dotvault.service` targets the
+# unit's MainPID directly rather than scanning the user's process
+# table for anything named `dotvault` — that name-match approach
+# would terminate unrelated `dotvault sync`, `go run`, or test
+# binaries running under the same UID, because SIGHUP's default
+# disposition for processes that don't install a handler is to
+# terminate.
+ExecStart=/usr/bin/systemctl --user kill --signal=SIGHUP dotvault.service

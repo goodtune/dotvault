@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -273,7 +274,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// own copy internally.
 	cfg.Observability.Headers = nil
 
-	// Handle signals
+	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
+	// via the LifecycleManager (the bundled dotvault-token-watch.path unit
+	// drives this so a fresh token written by `dotvault login` is picked
+	// up within seconds, without waiting for the 5-minute tick). Full
+	// config reload on SIGHUP is still not implemented.
+	//
+	// lmPtr bridges the asynchronous signal goroutine (set up here, before
+	// any Vault work) and the LifecycleManager (constructed only after
+	// auth completes further down). A SIGHUP arriving before lm exists is
+	// metered and logged as a debug no-op rather than dropped silently.
+	var lmPtr atomic.Pointer[auth.LifecycleManager]
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -283,11 +294,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				slog.Info("received shutdown signal", "signal", sig)
 				cancel()
 			case syscall.SIGHUP:
-				// TODO: Implement config reload on SIGHUP. This is deferred
-				// to a future release. For now, restart the daemon to pick
-				// up config changes.
 				observability.RecordSIGHUP(ctx)
-				slog.Warn("received SIGHUP but config reload is not yet implemented; restart the daemon to apply config changes")
+				if lm := lmPtr.Load(); lm != nil {
+					slog.Info("received SIGHUP, re-reading vault token file")
+					lm.Reload()
+				} else {
+					slog.Debug("received SIGHUP before lifecycle manager is ready; ignoring")
+				}
 			}
 		}
 	}()
@@ -413,6 +426,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
 	}
+	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
 
 	// Start refresh manager for any enrolment whose engine rotates its own

@@ -120,6 +120,8 @@ Enable per-user once the package is installed:
 systemctl --user enable --now dotvault.service
 ```
 
+This pulls in the bundled `dotvault-token-watch.path` user unit too — via the service unit's `[Install] Also=` directive — so subsequent rewrites of `~/.vault-token` (typically from an interactive `dotvault login` in another shell) trigger a SIGHUP-driven token re-read on the running daemon within seconds. See [Config reload](#config-reload) for the full mechanism.
+
 Or enable globally for every login session on the machine:
 
 ```sh

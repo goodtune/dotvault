@@ -26,3 +26,8 @@ jobs:
 
       - name: Verify binary runs
         run: ./dotvault version
+
+      - name: Verify packaged systemd unit
+        run: |
+          sudo install -m 0755 ./dotvault /usr/bin/dotvault
+          systemd-analyze verify packaging/linux/dotvault.service

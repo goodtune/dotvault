@@ -82,11 +82,21 @@ EnvironmentFile=-/etc/sysconfig/dotvault
 # Modest hardening. dotvault writes to $HOME (sync targets) and reads
 # system config, so we avoid the most aggressive sandboxes but lock
 # down the obvious privileged surfaces.
+#
+# Only directives that work under the per-user systemd manager are
+# enabled here. The sandbox knobs we deliberately leave out —
+# PrivateDevices=, ProtectKernelTunables=, ProtectKernelModules=,
+# ProtectControlGroups=, ProtectClock= and similar — drop entries
+# from the capability bounding set (needs CAP_SETPCAP) and/or remount
+# kernel filesystems in a private mount namespace (needs CAP_SYS_ADMIN).
+# A non-root user manager holds neither, so enabling them causes
+# systemd to fail the spawn at step CAPABILITIES with exit code 218
+# (and emit "Couldn't stat device /run/systemd/inaccessible/{chr,blk}"
+# along the way as PrivateDevices fails to bind-mount its placeholders).
+# By design dotvault never runs as root (see the [Service] header
+# above), so there is no supported deployment that could re-enable
+# these — the trade-off is intentional, not a TODO.
 NoNewPrivileges=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-PrivateDevices=true
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true

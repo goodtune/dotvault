@@ -69,12 +69,22 @@ dotvault login-check [flags]
 - Otherwise: if the cached token is valid and still within the first
   half of its creation TTL, exit clean. Past halfway, attempt renewal;
   if renewal fails but the token is still valid, warn with the
-  absolute expiry time and exit 0. If no valid token, run the
-  configured login flow.
+  absolute expiry time and exit 0. If no valid token, print a one-line
+  explanation of why an authentication prompt is about to appear ("no
+  cached Vault token was found", "the cached Vault token has expired",
+  or "the cached Vault token is no longer valid") and then run the
+  configured login flow. The line is yellow on a colour-capable TTY
+  (ANSI SGR 33; honours `NO_COLOR`) and plain text otherwise — without
+  it, a profile-script invocation would surface a context-free password
+  prompt the user did not ask for.
 - The marker is refreshed on every exit past the suppression check
   (success, decline, failure, Ctrl+C, internal errors), so concurrent
   shell startups only ever prompt once per window and a single Ctrl+C
   is enough — no second Enter required.
+- Pass `--quiet` to suppress just the explanation line — the prompt
+  still appears. Use this from wrappers that already surface their
+  own context (a Window Manager indicator, a desktop notification,
+  etc.) and don't want a duplicate message on stderr.
 - Exit `0` on suppressed, success, decline, cancellation, or expected
   authentication failure. Exit `1` only on invalid
   `DOTVAULT_SUPPRESS_HOURS` or genuine internal errors. The shell

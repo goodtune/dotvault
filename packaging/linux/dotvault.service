@@ -1,95 +1,34 @@
 [Unit]
 Description=dotvault — Vault-to-file secret synchronisation daemon
 Documentation=https://github.com/goodtune/dotvault
-# Deliberately no After=/Wants=network-online.target: this is a
-# user-mode unit, and network-online.target is a system-level
-# target that doesn't exist in the per-user manager. Declaring it
-# here would produce a "unit not found" warning at every session
-# start. The daemon's own auth retry/backoff handles the case
-# where Vault is briefly unreachable at session start anyway.
 
 [Service]
-# dotvault is a per-user daemon: it authenticates to Vault with the
-# OS user's identity and writes secrets into that user's $HOME
-# (~/.config, ~/.netrc, etc.). The packaged unit is therefore a
-# user-mode unit shipped under /usr/lib/systemd/user/ rather than a
-# system service — installing it system-wide and running it as root
-# would write to root's $HOME (and authenticate to Vault as root),
-# which is almost never what an operator wants.
-#
-# Enable per-user with:
-#   systemctl --user enable --now dotvault.service
-# Or enable globally for every login session with:
-#   sudo systemctl --global enable dotvault.service
-#
-# Type=notify lets the daemon signal READY=1 once it has finished
-# authenticating to Vault and completed its initial sync (the daemon
-# drives the initial sync synchronously before calling sd_notify, so
-# anything depending on dotvault.service blocks until secrets are
-# actually on disk).
-#
-# WATCHDOG=1 is kicked from a dedicated ticker goroutine at half the
-# WatchdogSec interval. The ticker proves the Go scheduler is still
-# running and the process hasn't deadlocked or panicked into a stuck
-# state — combined with WatchdogSec=120 below, systemd will restart
-# the unit if the process freezes outright. It does not detect
-# application-level stalls inside the sync or auth loops; for those
-# the OTel `dotvault.sync.ticks`/`dotvault.token.renewals` counters
-# are the canonical signal.
 Type=notify
 NotifyAccess=main
-# TimeoutStartSec bounds the pre-READY window: systemd waits this
-# long for the daemon to send sd_notify(READY=1) before declaring
-# the start a failure. Because we deliberately delay READY=1 until
-# after Vault auth + initial sync, the default ~90s can trigger
-# unwanted restarts on a slow first sync (many rules, slow Vault,
-# cold TLS handshake). 300s gives a comfortable margin; operators
-# with pathological first-sync times can raise it further (up to
-# `infinity`) via a drop-in.
 TimeoutStartSec=300
-# WatchdogSec governs post-ready liveness — the daemon kicks the
-# watchdog at half this interval; if the kicks stop, systemd
-# restarts the unit.
 WatchdogSec=120
 
-# The CLI lives at /usr/bin/dotvault when installed from the official
-# RPM/DEB. Adapt for non-packaged installs (e.g. /usr/local/bin).
 ExecStart=/usr/bin/dotvault run
 
-# Restart on any non-clean exit. Keep the rate-limit loose so a config
-# error doesn't spin the service.
 Restart=on-failure
 RestartSec=5s
 
-# stdout/stderr go to the journal; the OTel `journaldreceiver` can
-# filter on _SYSTEMD_USER_UNIT=dotvault.service (or _SYSTEMD_UNIT for
-# the --global install path) to collect logs without extra plumbing.
 StandardOutput=journal
 StandardError=journal
 
-# Allow environment overrides via per-user and system-wide
-# EnvironmentFile paths. The per-user path under $XDG_CONFIG_HOME
-# is preferred for anything sensitive (OTLP bearer tokens etc.) —
-# the system-wide paths under /etc are typically world-readable so
-# putting secrets there exposes them to every local account. All
-# four paths are optional (the leading `-` makes systemd ignore a
-# missing file).
 EnvironmentFile=-%h/.config/dotvault/env
 EnvironmentFile=-%h/.config/dotvault.env
 EnvironmentFile=-/etc/default/dotvault
 EnvironmentFile=-/etc/sysconfig/dotvault
 
-# Modest hardening. dotvault writes to $HOME (sync targets) and reads
-# system config, so we avoid the most aggressive sandboxes but lock
-# down the obvious privileged surfaces.
+# Only sandbox directives that work in a non-root user manager. The
+# Protect*/Private* knobs need CAP_SETPCAP / CAP_SYS_ADMIN and would
+# fail the spawn at step CAPABILITIES with exit 218.
 NoNewPrivileges=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-PrivateDevices=true
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
 [Install]
 WantedBy=default.target
+Also=dotvault-token-watch.path

@@ -356,11 +356,10 @@ func rebindInstruments() {
 	sighupAttempts, _ = meter.Int64Counter(
 		"dotvault.sighup.received",
 		// Permanently zero on Windows (SIGHUP isn't delivered to
-		// processes there); on Linux and macOS this counts
-		// operator reload attempts even though config reload
-		// isn't implemented yet — the gap is intentional so
-		// alerting rules can spot operators trying to reload.
-		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Config reload is not currently implemented."),
+		// processes there); on Linux and macOS each SIGHUP forces
+		// the LifecycleManager to re-read ~/.vault-token. Full
+		// config reload still requires a daemon restart.
+		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate vault-token file re-read; full config reload still requires a daemon restart."),
 	)
 }
 
@@ -478,8 +477,9 @@ func RecordConfigReload(ctx context.Context, outcome string) {
 	c.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
 }
 
-// RecordSIGHUP records a SIGHUP receipt. Useful even before live reload
-// is implemented: it surfaces how often operators try to reload.
+// RecordSIGHUP records a SIGHUP receipt. Each SIGHUP triggers an
+// immediate ~/.vault-token re-read via LifecycleManager.Reload;
+// the counter surfaces how often that path fires.
 func RecordSIGHUP(ctx context.Context) {
 	instrMu.RLock()
 	c := sighupAttempts

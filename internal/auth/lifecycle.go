@@ -19,6 +19,12 @@ type LifecycleManager struct {
 	disableRenewal bool
 	needsReauth    atomic.Bool
 
+	// reloadCh is signalled by Reload() to force an immediate tryReload
+	// on the lifecycle goroutine. Buffered size 1 so a burst of signals
+	// coalesces to a single pass; the surplus is dropped because every
+	// reload reads the same file and an extra round-trip adds nothing.
+	reloadCh chan struct{}
+
 	// Token file path. When the current in-memory token becomes invalid,
 	// the manager will first read this file directly (and only then fall
 	// back to VAULT_TOKEN) before signalling re-auth. The file-first
@@ -87,6 +93,22 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disa
 		recoveryInterval: recovery,
 		currentDelay:     checkInterval,
 		maxDelay:         5 * time.Minute,
+		reloadCh:         make(chan struct{}, 1),
+	}
+}
+
+// Reload signals the lifecycle goroutine to perform an immediate
+// tryReload on the next scheduling pass — used by the SIGHUP handler
+// (driven in turn by the bundled dotvault-token-watch.path unit) so a
+// freshly-written ~/.vault-token is picked up without waiting for the
+// 5-minute lifecycle tick. Coalescing: concurrent or back-to-back
+// calls collapse into a single reload. Safe to call before or after
+// Start; calls made before Start are buffered and consumed by the
+// goroutine on its first select.
+func (lm *LifecycleManager) Reload() {
+	select {
+	case lm.reloadCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -127,6 +149,25 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 			select {
 			case <-ctx.Done():
 				return
+			case <-lm.reloadCh:
+				// External nudge (SIGHUP → Reload()). Try to swap to a
+				// fresh token from disk. On success, reset the timer to
+				// the normal check interval so a recovery-mode 10s tick
+				// doesn't fire shortly after. On failure (no candidate,
+				// or all candidates invalid) leave the schedule alone —
+				// the original timer.C tick will run checkAndRenew on
+				// its existing cadence.
+				if lm.tryReload(ctx) {
+					lm.clearReauth()
+					lm.currentDelay = lm.checkInterval
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(lm.currentDelay)
+				}
 			case <-timer.C:
 				if err := lm.checkAndRenew(ctx); err != nil {
 					// Recoverable failure modes:

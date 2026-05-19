@@ -100,7 +100,7 @@ internal/
   tray/                  Windows system-tray icon (no-op on other platforms)
 test/integration/        Integration tests against real Vault
 packaging/windows/       ADMX Group Policy template
-packaging/linux/         systemd unit (shipped in RPM/DEB)
+packaging/linux/         systemd units (dotvault.service + token-watch path/service, shipped in RPM/DEB)
 ```
 
 ## Configuration
@@ -266,7 +266,9 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 9. Background goroutine reloads config on each tick for enrolment changes only
 10. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
 
-Config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
+SIGHUP triggers an immediate `~/.vault-token` re-read via `LifecycleManager.Reload` — handy for picking up a token freshly written by `dotvault login` without waiting for the 5-minute lifecycle tick. The shipped `packaging/linux/dotvault-token-watch.path` unit drives this automatically: any change to `~/.vault-token` activates `dotvault-token-watch.service`, which runs `systemctl --user kill --signal=SIGHUP dotvault.service`. The systemd-native path is deliberate — it targets the unit's MainPID rather than scanning the process table for anything named `dotvault`, so a developer running `go run ./cmd/dotvault` or `dotvault sync` from a shell while the daemon also happens to be running won't have those side processes SIGHUP'd (their default disposition for SIGHUP is *terminate*).
+
+Full config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
 
 ## Authentication
 

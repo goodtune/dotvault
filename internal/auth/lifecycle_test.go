@@ -527,6 +527,210 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_ReloadPicksUpFreshToken verifies that Reload()
+// triggers an immediate tryReload pass on the lifecycle goroutine —
+// the SIGHUP / dotvault-token-watch.path entry point. The test uses a
+// long checkInterval so the timer-based reload path cannot satisfy the
+// assertion: only Reload() can make the swap happen in time. The
+// ctx/poll deadlines are generous (5s/3s) because on a CI runner under
+// `-race` the goroutine scheduler can lag a few hundred ms between
+// Reload() and the select arm firing.
+func TestLifecycleManager_ReloadPicksUpFreshToken(t *testing.T) {
+	var currentValid atomic.Value
+	currentValid.Store("fresh-token")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("X-Vault-Token") == currentValid.Load().(string) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          json.Number("3600"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+	if err := os.WriteFile(tokenPath, []byte("fresh-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// 1h check interval: the timer-based path will not fire during the
+	// 5s test deadline, so the assertion can only be satisfied by Reload().
+	lm := NewLifecycleManager(vc, 1*time.Hour, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	lm.Reload()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "fresh-token" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := vc.Token(); got != "fresh-token" {
+		t.Fatalf("client token = %q after Reload(), want %q", got, "fresh-token")
+	}
+}
+
+// TestLifecycleManager_ReloadCoalesces verifies that back-to-back
+// Reload() calls collapse into at most one queued reload pass on the
+// lifecycle goroutine. The handler returns 403 for every request so
+// tryReload's candidate is rejected and the in-memory token is never
+// updated to match the file — every tryReload entry therefore makes
+// exactly one LookupSelf call we can count. The first call parks
+// inside the handler so we can fire 50 Reload()s while the goroutine
+// is mid-tryReload; if the size-1 reloadCh buffer regressed (became
+// unbuffered with a backlog, or larger), the handler would be hit 51
+// times after release instead of the expected 2.
+func TestLifecycleManager_ReloadCoalesces(t *testing.T) {
+	release := make(chan struct{})
+	var hits atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n == 1 {
+			<-release // park only the first request so the goroutine is mid-tryReload
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+	if err := os.WriteFile(tokenPath, []byte("fresh-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	lm := NewLifecycleManager(vc, 1*time.Hour, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	// First Reload: parks the goroutine inside the handler.
+	lm.Reload()
+	for hits.Load() == 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("handler not entered within deadline")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// 50 more Reload()s while the goroutine is parked. The buffered
+	// reloadCh (size 1) holds one queued nudge and the other 49 hit
+	// Reload's default-branch drop.
+	for i := 0; i < 50; i++ {
+		lm.Reload()
+	}
+
+	// Release. The parked tryReload finishes (candidate rejected, no
+	// token swap), goroutine consumes the one queued nudge and runs a
+	// second tryReload — handler hits=2. No further nudges remain.
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hits.Load() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("LookupSelf called %d times after 51 Reload() calls, want exactly 2 (1 parked + 1 coalesced); >2 means buffered-1 reloadCh coalescing regressed", got)
+	}
+}
+
+// TestLifecycleManager_ReloadNoOpWhenFileUnchanged pins that Reload()
+// does NOT disturb the schedule when tryReload returns false (the
+// common case: the file token equals the in-memory token, so no swap
+// candidate is produced). A regression that mistakenly reset the
+// timer on every reload would let a flapping editor save starve the
+// normal 5-minute lookup cycle.
+func TestLifecycleManager_ReloadNoOpWhenFileUnchanged(t *testing.T) {
+	var hits atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"ttl":          json.Number("3600"),
+				"creation_ttl": json.Number("3600"),
+				"renewable":    true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".vault-token")
+	// File token == in-memory token, so tryReload short-circuits.
+	if err := os.WriteFile(tokenPath, []byte("same-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "same-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	lm := NewLifecycleManager(vc, 1*time.Hour, false)
+	lm.SetTokenFilePath(tokenPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	for i := 0; i < 20; i++ {
+		lm.Reload()
+	}
+	// Let the goroutine drain any queued nudges.
+	time.Sleep(300 * time.Millisecond)
+
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("LookupSelf called %d times after no-op Reload bursts, want 0 (a no-op reload must not trigger a Vault round-trip)", got)
+	}
+}
+
 // TestLifecycleManager_RecoversAfterTokenCleared simulates the
 // post-OnReauth state: the daemon's web-mode OnReauth callback has
 // cleared the in-memory Vault token, so the next lookup-self call

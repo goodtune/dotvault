@@ -176,13 +176,22 @@ startup.
 - If the cached token is valid but past the halfway mark, attempt renewal.
   On renewal failure where the token is still valid, warn with the
   absolute expiry time and exit 0.
-- If the cached token is missing or invalid, run the configured login
-  flow. Ctrl-C exits immediately without requiring an extra Enter: a
-  dedicated signal handler restores the terminal state captured before
-  the password prompt, refreshes the marker, and `os.Exit(0)`s
-  (`term.ReadPassword` does not observe context cancellation, so going
-  through a goroutine + `os.Exit` is the only reliable way to honour
-  the contract).
+- If the cached token is missing or invalid, print a one-line
+  explanation of why an authentication prompt is about to appear
+  ("no cached Vault token was found", "the cached Vault token has
+  expired", "the cached Vault token is no longer valid") and then
+  run the configured login flow. The line is yellow on a colour-capable
+  TTY (ANSI SGR 33; honours `NO_COLOR`; ANSI is gated on the writer
+  being `os.Stderr` so test buffers / piped output stay plain) and
+  plain text otherwise. Without it, a profile-script invocation would
+  drop the user straight into a context-free password prompt. Pass
+  `--quiet` to suppress just the notice (the prompt still appears) for
+  wrappers that surface their own context. Ctrl-C exits immediately
+  without requiring an extra Enter: a dedicated signal handler restores
+  the terminal state captured before the password prompt, refreshes the
+  marker, and `os.Exit(0)`s (`term.ReadPassword` does not observe
+  context cancellation, so going through a goroutine + `os.Exit` is the
+  only reliable way to honour the contract).
 - The marker is refreshed on every exit past the freshness check
   (success, decline, failure, Ctrl+C, internal errors) so concurrent
   shells across tmux/IDE/SSH-multiplex fanout only ever prompt once

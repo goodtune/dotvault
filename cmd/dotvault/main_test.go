@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +36,86 @@ func TestIsGUIBinary(t *testing.T) {
 				t.Errorf("isGUIBinary(%q) = %v, want %v", tc.arg0, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPrintLoginNotice exercises the happy paths for the explanation
+// message printed before login-check drops into an interactive auth
+// prompt. The colour gate is exercised by writing to a *bytes.Buffer
+// (not os.Stderr), which forces plain-text output regardless of the
+// surrounding test environment's TTY state — covering both the
+// content of the message and the fact that ANSI escapes are gated
+// on the writer identity rather than emitted unconditionally.
+func TestPrintLoginNotice(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{
+			name:   "missing token",
+			reason: "no cached Vault token was found",
+			want:   "dotvault: no cached Vault token was found — starting Vault login flow...\n",
+		},
+		{
+			name:   "expired token",
+			reason: "the cached Vault token has expired",
+			want:   "dotvault: the cached Vault token has expired — starting Vault login flow...\n",
+		},
+		{
+			name:   "revoked token",
+			reason: "the cached Vault token is no longer valid",
+			want:   "dotvault: the cached Vault token is no longer valid — starting Vault login flow...\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			printLoginNotice(&buf, tc.reason)
+			if got := buf.String(); got != tc.want {
+				t.Errorf("printLoginNotice() = %q, want %q", got, tc.want)
+			}
+			// Defensive: a buffer is not os.Stderr, so the helper must
+			// never emit ANSI colour through it. Catches a future
+			// regression where the gate is widened without intent.
+			if strings.Contains(buf.String(), "\x1b[") {
+				t.Errorf("printLoginNotice() leaked ANSI escape into non-stderr writer: %q", buf.String())
+			}
+		})
+	}
+}
+
+// TestStderrSupportsColour verifies the cheap branch of the gating
+// logic used by printLoginNotice — NO_COLOR forces false even against
+// a real terminal. The "stderr is a TTY" branch can't be exercised
+// portably in a unit test (the surrounding test harness drives stderr
+// to a pipe), so we accept that gap; the test still pins NO_COLOR
+// behaviour, which is the more frequently-broken half.
+func TestStderrSupportsColour(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	if stderrSupportsColour() {
+		t.Error("stderrSupportsColour() with NO_COLOR set = true, want false")
+	}
+}
+
+// TestLoginCheckQuietFlagRegistered locks in the --quiet flag wiring on
+// the login-check command. The flag is the user-visible escape hatch
+// for the new login notice; deleting it (or renaming it) would silently
+// break callers that pass --quiet in their shell wrapper. A subprocess
+// test exercising the full flag flow would need a stub Vault server to
+// reach the notice branch — out of scope here; this assertion catches
+// the regression that matters most cheaply.
+func TestLoginCheckQuietFlagRegistered(t *testing.T) {
+	cmd := newLoginCheckCmd()
+	flag := cmd.Flags().Lookup("quiet")
+	if flag == nil {
+		t.Fatal("--quiet flag not registered on login-check command")
+	}
+	if flag.Value.Type() != "bool" {
+		t.Errorf("--quiet flag type = %q, want bool", flag.Value.Type())
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--quiet flag default = %q, want false", flag.DefValue)
 	}
 }
 

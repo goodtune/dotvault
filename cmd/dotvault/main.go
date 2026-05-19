@@ -102,35 +102,7 @@ Equivalent to "vault login -address <vault.address> -method <vault.auth_method>"
 but driven by dotvault's loaded configuration (YAML or Group Policy).`,
 			RunE: runLogin,
 		},
-		&cobra.Command{
-			Use:   "login-check",
-			Short: "Validate cached token on interactive login, renew or re-login as needed",
-			Long: `Intended to be wired into shell rc / login-profile scripts via a thin
-wrapper that gates on interactivity, TTY, and daemon state. This binary
-trusts those preconditions and does not re-check them.
-
-Behaviour:
-  - A suppression marker at
-    ${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress
-    (overridable with DOTVAULT_SUPPRESS_MARKER) is checked first. If
-    the marker's mtime is within DOTVAULT_SUPPRESS_HOURS (default 6),
-    the command exits silently. A future mtime is treated as stale so
-    clock skew or backup restores cannot lock suppression on.
-  - Otherwise: if the cached token is valid and still within the first
-    half of its creation TTL, exit clean. Past halfway, attempt
-    renewal; if renewal fails but the token is still valid, warn with
-    the absolute expiry time. If no valid token, run the configured
-    fresh-auth flow.
-  - On every exit past the suppression check the marker is refreshed,
-    so a declined login, a failed login, an internal error, or Ctrl+C
-    all silence the next shell in the window. Ctrl+C exits immediately
-    without requiring an additional Enter.
-
-Exits 0 on suppressed, success, decline, cancellation, or expected
-authentication failure. Exits 1 on invalid DOTVAULT_SUPPRESS_HOURS or
-genuine internal errors.`,
-			RunE: runLoginCheck,
-		},
+		newLoginCheckCmd(),
 		&cobra.Command{
 			Use:   "status",
 			Short: "Show auth and sync status",
@@ -786,6 +758,47 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// newLoginCheckCmd defines the `login-check` subcommand. The body of
+// the work lives in runLoginCheck; this builder exists so the command
+// can carry its own --quiet flag without polluting the top-level flag
+// namespace shared by every other subcommand.
+func newLoginCheckCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "login-check",
+		Short: "Validate cached token on interactive login, renew or re-login as needed",
+		Long: `Intended to be wired into shell rc / login-profile scripts via a thin
+wrapper that gates on interactivity, TTY, and daemon state. This binary
+trusts those preconditions and does not re-check them.
+
+Behaviour:
+  - A suppression marker at
+    ${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress
+    (overridable with DOTVAULT_SUPPRESS_MARKER) is checked first. If
+    the marker's mtime is within DOTVAULT_SUPPRESS_HOURS (default 6),
+    the command exits silently. A future mtime is treated as stale so
+    clock skew or backup restores cannot lock suppression on.
+  - Otherwise: if the cached token is valid and still within the first
+    half of its creation TTL, exit clean. Past halfway, attempt
+    renewal; if renewal fails but the token is still valid, warn with
+    the absolute expiry time. If no valid token, print a short
+    explanation of why an authentication prompt is about to appear
+    (yellow on a colour-capable TTY, plain text otherwise) and then
+    run the configured fresh-auth flow. Pass --quiet to suppress that
+    explanation when the caller has its own context display.
+  - On every exit past the suppression check the marker is refreshed,
+    so a declined login, a failed login, an internal error, or Ctrl+C
+    all silence the next shell in the window. Ctrl+C exits immediately
+    without requiring an additional Enter.
+
+Exits 0 on suppressed, success, decline, cancellation, or expected
+authentication failure. Exits 1 on invalid DOTVAULT_SUPPRESS_HOURS or
+genuine internal errors.`,
+		RunE: runLoginCheck,
+	}
+	cmd.Flags().Bool("quiet", false, "suppress the explanation printed before triggering an interactive login")
+	return cmd
+}
+
 // runLoginCheck implements `dotvault login-check`, intended to be wired
 // into shell rc / login-profile scripts via a thin wrapper that handles
 // environment gating (interactive shell, TTYs, daemon active). The
@@ -793,6 +806,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 // loginsuppress package and the login-check Long help for the full
 // contract.
 func runLoginCheck(cmd *cobra.Command, args []string) error {
+	quiet, _ := cmd.Flags().GetBool("quiet")
+
 	// Catch SIGINT before any other work so a Ctrl+C arriving during
 	// setup (env parse, marker stat, term.GetState) cannot fall through
 	// to Go's default handler and bypass the terminal-restore +
@@ -896,6 +911,13 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 
 	tokenPath := paths.VaultTokenPath()
 	token := auth.ResolveToken(tokenPath)
+	// loginReason captures why we're about to drop the user into an
+	// interactive login prompt — printed (yellow on a colour-capable
+	// TTY) before the prompt unless --quiet is set, so a shell-startup
+	// invocation doesn't surface a context-free password prompt.
+	// Default covers the "no cached token" path; the branches below
+	// overwrite it for the expired / revoked cases.
+	loginReason := "no cached Vault token was found"
 	if token != "" {
 		vc.SetToken(token)
 		secret, lookupErr := vc.LookupSelf(ctx)
@@ -911,10 +933,12 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 			if handled {
 				return nil
 			}
+			loginReason = "the cached Vault token has expired"
 		} else if vault.IsForbidden(lookupErr) {
 			// 403: the cached token is revoked or otherwise invalid.
 			// Clear it and fall through to the interactive login flow.
 			vc.SetToken("")
+			loginReason = "the cached Vault token is no longer valid"
 		} else {
 			// Backstop for context.Canceled: the SIGINT handler usually
 			// wins the race and os.Exits before this point, but if
@@ -968,6 +992,9 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		Username:      username,
+	}
+	if !quiet {
+		printLoginNotice(os.Stderr, loginReason)
 	}
 	if err := mgr.Login(ctx); err != nil {
 		// Backstop for context.Canceled. The SIGINT handler normally
@@ -1362,6 +1389,45 @@ func validateYAML(data []byte) error {
 // isStderrTerminal reports whether stderr is connected to a TTY, used to
 // pick the slog text vs JSON handler at startup.
 func isStderrTerminal() bool {
+	return term.IsTerminal(int(os.Stderr.Fd()))
+}
+
+// printLoginNotice tells the user why dotvault is about to interrupt
+// them with an authentication prompt. A profile-script-triggered
+// login-check would otherwise present a context-free password prompt
+// to a user who didn't ask for one — printing the reason first gives
+// them a chance to either consent or Ctrl-C out.
+//
+// Yellow on a colour-capable TTY, plain text otherwise (so log
+// captures, piped output, and dumb terminals stay readable). Honours
+// NO_COLOR. Enables ENABLE_VIRTUAL_TERMINAL_PROCESSING on Windows for
+// the duration so the ANSI sequence renders rather than printing as
+// literal text on conhost; matches the convention used by the enrol
+// picker (cmd/dotvault/enrol.go).
+//
+// Writes to w (passed in so tests can capture output). Colour is gated
+// on the writer being os.Stderr — anything else (a *bytes.Buffer in
+// tests, stderr piped into a logger) gets plain text regardless of
+// the host terminal's capability.
+func printLoginNotice(w io.Writer, reason string) {
+	msg := fmt.Sprintf("dotvault: %s — starting Vault login flow...", reason)
+	if w != os.Stderr || !stderrSupportsColour() {
+		fmt.Fprintln(w, msg)
+		return
+	}
+	restore := enableVTOutput(os.Stderr)
+	defer restore()
+	fmt.Fprintf(w, "\x1b[33m%s\x1b[0m\n", msg)
+}
+
+// stderrSupportsColour reports whether the current stderr is safe to
+// emit ANSI colour to: a real TTY with NO_COLOR unset (per
+// https://no-color.org). Used by printLoginNotice; takes no arguments
+// because the only meaningful question is about os.Stderr specifically.
+func stderrSupportsColour() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
 	return term.IsTerminal(int(os.Stderr.Fd()))
 }
 

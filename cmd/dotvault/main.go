@@ -203,11 +203,33 @@ func newVersionCmd() *cobra.Command {
 }
 
 func loadConfig() (*config.Config, error) {
-	path := flagConfig
-	if path == "" {
-		path = paths.SystemConfigPath()
+	return config.LoadSystem(configPath())
+}
+
+// configPath resolves the system config file path, honouring the
+// --config override when set. Shared by every caller that wants the
+// same path Load saw — both the config loader itself (so reload uses
+// the same source) and the registry-config notification (so the
+// emitted log attribute matches what was actually inspected).
+func configPath() string {
+	if flagConfig != "" {
+		return flagConfig
 	}
-	return config.LoadSystem(path)
+	return paths.SystemConfigPath()
+}
+
+// emitConfigSourceLog surfaces a WARN OTel log record when the
+// running config came from the Windows Registry (Group Policy) rather
+// than the YAML file. Called from runDaemon and runSync after
+// initObservability has installed the LoggerProvider — wiring this
+// up in two call sites kept failing review because either could
+// silently regress, so the actual emit lives behind a single helper
+// the regression test in main_test.go pins down.
+func emitConfigSourceLog(ctx context.Context, cfg *config.Config) {
+	if !cfg.Managed {
+		return
+	}
+	observability.LogRegistryConfigManaged(ctx, configPath())
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
@@ -245,6 +267,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// path to exfiltrate the credential. The OTel SDK keeps its
 	// own copy internally.
 	cfg.Observability.Headers = nil
+
+	// Surface the registry-config notification through the OTel
+	// LoggerProvider now that it's installed. Deliberately not
+	// slog.Info'd from inside config.LoadSystem — that path runs
+	// before observability.Init and would either land on stdout/stderr
+	// (loud noise on every CLI invocation against a GPO-managed
+	// Windows box) or be lost to the no-op global logger.
+	emitConfigSourceLog(ctx, cfg)
 
 	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
 	// via the LifecycleManager (the bundled dotvault-token-watch.path unit
@@ -502,10 +532,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 
 		// Background goroutine: reload config on each tick and re-check enrolments.
-		configPath := flagConfig
-		if configPath == "" {
-			configPath = paths.SystemConfigPath()
-		}
+		reloadPath := configPath()
 		go func() {
 			ticker := time.NewTicker(cfg.Sync.Interval)
 			defer ticker.Stop()
@@ -515,7 +542,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					reloaded, err := config.LoadSystem(configPath)
+					reloaded, err := config.LoadSystem(reloadPath)
 					if err != nil {
 						observability.RecordConfigReload(ctx, "error")
 						slog.Warn("config reload failed", "error", err)
@@ -642,6 +669,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// reason as the daemon path — keep credentials out of the
 	// heap-resident Config struct.
 	cfg.Observability.Headers = nil
+
+	// Same rationale as runDaemon — emit the GPO-managed notification
+	// after the LoggerProvider is wired up. See emitConfigSourceLog.
+	emitConfigSourceLog(ctx, cfg)
 
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {

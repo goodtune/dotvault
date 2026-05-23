@@ -89,7 +89,7 @@ internal/
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
-  observability/         OTel metrics SDK wiring, package-level instrument helpers
+  observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
@@ -118,7 +118,9 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - **`vault`** — address (required), auth_method, auth_mount, auth_role, kv_mount (default `"kv"`), user_prefix (default `"users/"`, trailing slash enforced), ca_cert, tls_skip_verify, disable_token_renewal (default false — set true to prevent the daemon from calling RenewSelf; TTL expiry still triggers re-auth)
 - **`sync`** — interval as Go duration string (default `15m`)
 - **`web`** — enabled (default false), listen (loopback only, hard invariant), login_text (markdown), secret_view_text (markdown)
-- **`observability`** — enabled (default false), endpoint, protocol (`grpc` or `http/protobuf`), insecure, headers (map), export_interval. OTLP metrics exporter; falls through to standard `OTEL_*` env vars when fields are empty. Disabled by default — instruments fall back to the OTel no-op meter so call sites never need to branch. **Treat `headers` as a credential** — values typically carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.). Store the config file at 0600 and prefer setting them via the per-user `EnvironmentFile` (`~/.config/dotvault/env`) rather than checked-in YAML. `ObservabilityConfig.MarshalYAML` strips `Headers` from every export so a downloaded config or `reg-export` artefact never contains the live token.
+- **`observability`** — enabled (default false), endpoint, protocol (`grpc` or `http/protobuf`), insecure, headers (map), export_interval. OTLP metrics + logs exporters share the same block: a single endpoint/protocol/headers configuration drives both signals. Falls through to standard `OTEL_*` env vars when fields are empty (signal-specific overrides `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` / `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` take precedence over the generic `OTEL_EXPORTER_OTLP_PROTOCOL`). Disabled by default — metric instruments fall back to the OTel no-op meter and `Log*` helpers fall back to the no-op global logger, so call sites never need to branch. **Treat `headers` as a credential** — values typically carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.). Store the config file at 0600 and prefer setting them via the per-user `EnvironmentFile` (`~/.config/dotvault/env`) rather than checked-in YAML. `ObservabilityConfig.MarshalYAML` strips `Headers` from every export so a downloaded config or `reg-export` artefact never contains the live token.
+
+  Logs vs. slog: the OTel logs exporter is **not** a slog replacement. Operational logging continues to go through `log/slog` to stderr. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal — currently only `LogRegistryConfigManaged`, which surfaces "GPO config is active, file config is ignored" as a WARN record once per daemon/sync startup. Routing this through slog would print an INFO line on every CLI invocation against a GPO-managed Windows box, which is exactly the noise we wanted to eliminate.
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)
 - **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition
 

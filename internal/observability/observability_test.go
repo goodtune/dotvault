@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -109,6 +110,63 @@ func TestInitBadProtocol(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported protocol")
+	}
+}
+
+// TestLogRegistryConfigManagedNoProvider confirms the helper is safe
+// to call before Init wires up the SDK LoggerProvider. The contract
+// mirrors the metric Record* helpers — call sites invoke it
+// unconditionally and rely on the no-op global swallowing the record
+// when observability is disabled. This is the whole point of routing
+// through OTel rather than slog: a CLI invocation on a GPO-managed
+// Windows box must not leak the "configuration loaded from Windows
+// Registry" message to stdout.
+func TestLogRegistryConfigManagedNoProvider(t *testing.T) {
+	// Force a fresh rebind so ordering relative to other tests in
+	// this package can't leave a recording LoggerProvider installed
+	// (which would silently flip this assertion from "no-op" to
+	// "real emit" without anyone noticing).
+	rebindLogger()
+	// Must not panic. The package init rebind installs the no-op
+	// global logger, so this exercises the disabled-observability
+	// code path directly.
+	LogRegistryConfigManaged(context.Background(), `C:\ProgramData\dotvault\config.yaml`)
+}
+
+// TestLogRegistryConfigManagedReachesActiveProvider verifies that
+// once an SDK LoggerProvider is installed, the helper emits a
+// WARN-severity record with the expected body and path attribute.
+// Without this assertion the rebindLogger plumbing could be a no-op
+// and TestLogRegistryConfigManagedNoProvider would still pass.
+func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
+	rec := newTestLogProcessor(t)
+
+	const path = `C:\ProgramData\dotvault\config.yaml`
+	LogRegistryConfigManaged(context.Background(), path)
+
+	records := rec.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	r := records[0]
+	if got, want := r.Severity(), log.SeverityWarn; got != want {
+		t.Errorf("severity = %v, want %v", got, want)
+	}
+	if body := bodyString(t, r.Body()); body != "configuration loaded from Windows Registry (Group Policy); file-based config is ignored" {
+		t.Errorf("body = %q", body)
+	}
+	var foundPath bool
+	r.WalkAttributes(func(kv log.KeyValue) bool {
+		if kv.Key == "path" {
+			foundPath = true
+			if got := kv.Value.AsString(); got != path {
+				t.Errorf("path attribute = %q, want %q", got, path)
+			}
+		}
+		return true
+	})
+	if !foundPath {
+		t.Error("path attribute not present on emitted record")
 	}
 }
 

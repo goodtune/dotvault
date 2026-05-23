@@ -68,11 +68,12 @@ func installRecordingLogger(t *testing.T) *recordingProcessor {
 
 // TestEmitConfigSourceLog pins down the wiring between the daemon
 // entry points (runDaemon, runSync) and
-// observability.LogRegistryConfigManaged. Without this test the
-// `emitConfigSourceLog` call could be silently deleted from either
-// entry point and only manual operator testing would catch the
-// regression — exactly the failure mode the precommit-review's
-// test-correctness persona flagged.
+// observability.LogRegistryConfigManaged. The helper is two lines —
+// trivially deletable in a refactor — and the regression mode it
+// guards against is operator-visible only on GPO-managed Windows
+// boxes, where the symptom (the WARN record stops reaching the
+// collector) is silent unless someone is actively watching their
+// OTLP backend. This test fails loudly in CI instead.
 func TestEmitConfigSourceLog(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -224,7 +224,7 @@ func configPath() string {
 // initObservability has installed the LoggerProvider — wiring this
 // up in two call sites kept failing review because either could
 // silently regress, so the actual emit lives behind a single helper
-// the regression test in main_test.go pins down.
+// the regression test in configlog_test.go pins down.
 func emitConfigSourceLog(ctx context.Context, cfg *config.Config) {
 	if !cfg.Managed {
 		return

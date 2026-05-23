@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -174,14 +175,22 @@ func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
 // up the OTel env-var convention. The metrics-specific override wins
 // over the generic one, matching the SDK's documented precedence.
 func TestProtocolFallthroughToEnv(t *testing.T) {
-	// Init mutates the process-wide MeterProvider global. Save and
-	// restore it (and the package-level instruments) so later tests
-	// in the same package don't observe a non-default or
-	// Shutdown()'d provider — mirrors newTestReader's discipline.
-	prev := otel.GetMeterProvider()
+	// Init mutates two process-wide globals (MeterProvider and
+	// LoggerProvider). Save and restore both, and rebind the
+	// package-level instrument/logger handles, so later tests in the
+	// same package don't observe a non-default or Shutdown()'d
+	// provider — mirrors newTestReader / newTestLogProcessor's
+	// discipline. Originally only MeterProvider was saved; the log
+	// provider was missed when Init grew the second signal, and a
+	// later test (the no-provider log test) would see a stale
+	// recording or shut-down LoggerProvider.
+	prevMP := otel.GetMeterProvider()
+	prevLP := global.GetLoggerProvider()
 	t.Cleanup(func() {
-		otel.SetMeterProvider(prev)
+		otel.SetMeterProvider(prevMP)
+		global.SetLoggerProvider(prevLP)
 		rebindInstruments()
+		rebindLogger()
 	})
 
 	// Pointing at an unreachable collector with a short context means

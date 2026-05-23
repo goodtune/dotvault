@@ -161,6 +161,11 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 
 	logExporter, err := buildLogExporter(ctx, cfg)
 	if err != nil {
+		// metricExporter already holds a gRPC/HTTP connection; shut it
+		// down before the error escapes so a transient log-exporter
+		// init failure doesn't leak the metric side. Bounded by the
+		// caller's ctx — initObservability passes a 10s budget.
+		_ = metricExporter.Shutdown(ctx)
 		return nil, fmt.Errorf("build OTLP log exporter: %w", err)
 	}
 
@@ -177,6 +182,11 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 		),
 	)
 	if err != nil {
+		// Both exporters are open — clean them up so the process isn't
+		// left with two background dialers pointing at a collector for
+		// a daemon that never actually started.
+		_ = metricExporter.Shutdown(ctx)
+		_ = logExporter.Shutdown(ctx)
 		return nil, fmt.Errorf("build resource: %w", err)
 	}
 

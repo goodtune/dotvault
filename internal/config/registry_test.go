@@ -58,7 +58,11 @@ rules:
 // Managed=true, and this test pins down that the YAML path never
 // flips the flag.
 func TestLoadSystemFileBranchClearsManaged(t *testing.T) {
-	if _, managed, _ := loadFromRegistry(); managed {
+	_, managed, err := loadFromRegistry()
+	if err != nil {
+		t.Fatalf("loadFromRegistry: %v", err)
+	}
+	if managed {
 		t.Skip("GPO registry keys found on this machine; cannot exercise file branch")
 	}
 	yaml := `

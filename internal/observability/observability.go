@@ -15,14 +15,16 @@
 // well-behaved no-op default for tests that don't initialise the
 // global, and both keep the call sites free of plumbing. Init
 // mutates two process-wide globals (otel.SetMeterProvider +
-// global.SetLoggerProvider) and their associated rebinds
-// (rebindInstruments under instrMu, rebindLogger under loggerMu) —
-// it's expected to run exactly once per process at startup. The test
-// suite in this package does not run subtests with t.Parallel(), so
-// the sequential invocations of Init in tests do not race; do not
-// add t.Parallel() to any test that installs a MeterProvider or
-// LoggerProvider (newTestReader / newTestLogProcessor) without also
-// serialising through a sync.Once or test-scoped lock.
+// global.SetLoggerProvider) and rebinds the metric instruments
+// (rebindInstruments under instrMu) — it's expected to run exactly
+// once per process at startup. Log helpers resolve the logger
+// per-call from global.GetLoggerProvider() so no cached handle
+// needs rebinding. The test suite in this package does not run
+// subtests with t.Parallel(), so the sequential invocations of Init
+// in tests do not race; do not add t.Parallel() to any test that
+// installs a MeterProvider or LoggerProvider (newTestReader /
+// newTestLogProcessor) without also serialising through a sync.Once
+// or test-scoped lock.
 //
 // Attribute conventions:
 //   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
@@ -208,13 +210,14 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	)
 	global.SetLoggerProvider(lp)
 
-	// Rebind instruments and the package-level logger so subsequent
-	// record-site calls hit the active providers rather than the no-op
-	// globals captured at process start. Safe to call repeatedly —
-	// instruments are recreated each time, but creation is cheap and
-	// Init runs once per process.
+	// Rebind instruments so subsequent record-site calls hit the
+	// active MeterProvider rather than the no-op global captured at
+	// process start. The logger handle isn't cached — Log* helpers
+	// resolve it from global.GetLoggerProvider() per call — so no
+	// equivalent rebind is needed for the log signal. Safe to call
+	// repeatedly: instruments are recreated each time, but creation
+	// is cheap and Init runs once per process.
 	rebindInstruments()
-	rebindLogger()
 
 	return &Provider{
 		mp: mp,
@@ -400,7 +403,6 @@ var (
 
 func init() {
 	rebindInstruments()
-	rebindLogger()
 }
 
 // rebindInstruments rebuilds every package-level instrument from the
@@ -587,34 +589,6 @@ func RecordSIGHUP(ctx context.Context) {
 	c.Add(ctx, 1)
 }
 
-// Package-level logger handle for OTel log emissions. Rebound by
-// rebindLogger from the currently-installed global LoggerProvider —
-// the OTel no-op at package init, the SDK LoggerProvider after Init.
-// Log* helpers below dereference this under loggerMu so concurrent
-// Init / emit calls stay safe. Reads use the global directly via
-// rebindLogger rather than calling global.GetLoggerProvider on every
-// emit so the hot path doesn't take a lock for atomic-pointer
-// dereferences inside the OTel global accessor.
-var (
-	loggerMu sync.RWMutex
-	logger   log.Logger
-)
-
-func rebindLogger() {
-	loggerMu.Lock()
-	defer loggerMu.Unlock()
-	logger = global.GetLoggerProvider().Logger("github.com/goodtune/dotvault")
-}
-
-// RebindGlobalLogger is the exported sibling of rebindLogger, intended
-// for downstream test packages that need to swap the global
-// LoggerProvider (via global.SetLoggerProvider) and force the
-// package-level logger handle to re-bind onto it. Production code
-// must not call this — Init handles the rebind during normal
-// startup. Lives in production code rather than a *_test.go file
-// because external test packages can't reach unexported symbols.
-func RebindGlobalLogger() { rebindLogger() }
-
 // LogRegistryConfigManaged emits a WARN-severity OTel log record
 // signalling that the daemon's configuration came from the Windows
 // Registry (Group Policy) and the file at path is being ignored.
@@ -625,13 +599,15 @@ func RebindGlobalLogger() { rebindLogger() }
 // CLI invocation on a GPO-managed Windows box. When observability is
 // disabled the global LoggerProvider is a no-op and the record is
 // silently dropped, which is exactly the desired behaviour.
+//
+// Resolves the logger from the current global LoggerProvider on every
+// call rather than caching a handle behind a mutex. The previous
+// cached-handle design carried an exported RebindGlobalLogger purely
+// for tests; this is called once per daemon/sync startup so a single
+// global lookup per emit is fine and removes that test-only API from
+// the production surface.
 func LogRegistryConfigManaged(ctx context.Context, path string) {
-	loggerMu.RLock()
-	l := logger
-	loggerMu.RUnlock()
-	if l == nil {
-		return
-	}
+	l := global.GetLoggerProvider().Logger("github.com/goodtune/dotvault")
 	var rec log.Record
 	rec.SetTimestamp(time.Now())
 	rec.SetSeverity(log.SeverityWarn)

@@ -123,22 +123,20 @@ func TestInitBadProtocol(t *testing.T) {
 // Windows box must not leak the "configuration loaded from Windows
 // Registry" message to stdout.
 func TestLogRegistryConfigManagedNoProvider(t *testing.T) {
-	// Force a fresh rebind so ordering relative to other tests in
-	// this package can't leave a recording LoggerProvider installed
-	// (which would silently flip this assertion from "no-op" to
-	// "real emit" without anyone noticing).
-	rebindLogger()
-	// Must not panic. The package init rebind installs the no-op
-	// global logger, so this exercises the disabled-observability
-	// code path directly.
+	// Must not panic. The helper resolves the logger from the
+	// current global LoggerProvider on each call — at this point in
+	// the test suite (no recording provider installed), that's the
+	// OTel no-op global, and the record is silently dropped.
 	LogRegistryConfigManaged(context.Background(), `C:\ProgramData\dotvault\config.yaml`)
 }
 
 // TestLogRegistryConfigManagedReachesActiveProvider verifies that
-// once an SDK LoggerProvider is installed, the helper emits a
-// WARN-severity record with the expected body and path attribute.
-// Without this assertion the rebindLogger plumbing could be a no-op
-// and TestLogRegistryConfigManagedNoProvider would still pass.
+// once an SDK LoggerProvider is installed via global.SetLoggerProvider,
+// the helper resolves it and emits a WARN-severity record with the
+// expected body and path attribute. Without this assertion, a future
+// regression that hard-codes the no-op global inside the helper
+// (or otherwise bypasses the global lookup) would still let
+// TestLogRegistryConfigManagedNoProvider pass.
 func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
 	rec := newTestLogProcessor(t)
 
@@ -176,21 +174,18 @@ func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
 // over the generic one, matching the SDK's documented precedence.
 func TestProtocolFallthroughToEnv(t *testing.T) {
 	// Init mutates two process-wide globals (MeterProvider and
-	// LoggerProvider). Save and restore both, and rebind the
-	// package-level instrument/logger handles, so later tests in the
+	// LoggerProvider). Save and restore both so later tests in the
 	// same package don't observe a non-default or Shutdown()'d
 	// provider — mirrors newTestReader / newTestLogProcessor's
-	// discipline. Originally only MeterProvider was saved; the log
-	// provider was missed when Init grew the second signal, and a
-	// later test (the no-provider log test) would see a stale
-	// recording or shut-down LoggerProvider.
+	// discipline. The MeterProvider also needs an explicit instrument
+	// rebind because Record* helpers cache instrument handles; the
+	// logger has no such cache, so the global restore is sufficient.
 	prevMP := otel.GetMeterProvider()
 	prevLP := global.GetLoggerProvider()
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
 		global.SetLoggerProvider(prevLP)
 		rebindInstruments()
-		rebindLogger()
 	})
 
 	// Pointing at an unreachable collector with a short context means

@@ -75,19 +75,18 @@ func (p *recordingLogProcessor) Snapshot() []sdklog.Record {
 }
 
 // newTestLogProcessor installs a recording LoggerProvider as the
-// global, rebinds the package-level logger handle onto it, and
-// registers a Cleanup that restores the previous global. Mirrors
-// newTestReader for the log signal.
+// global and registers a Cleanup that restores the previous global.
+// Mirrors newTestReader for the log signal. No rebind is needed —
+// Log* helpers resolve the logger per call from
+// global.GetLoggerProvider().
 func newTestLogProcessor(t *testing.T) *recordingLogProcessor {
 	t.Helper()
 	rec := &recordingLogProcessor{}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(rec))
 	prev := global.GetLoggerProvider()
 	global.SetLoggerProvider(provider)
-	rebindLogger()
 	t.Cleanup(func() {
 		global.SetLoggerProvider(prev)
-		rebindLogger()
 		_ = provider.Shutdown(context.Background())
 	})
 	return rec

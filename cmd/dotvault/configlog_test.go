@@ -9,7 +9,6 @@ import (
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 
 	"github.com/goodtune/dotvault/internal/config"
-	"github.com/goodtune/dotvault/internal/observability"
 )
 
 // recordingProcessor captures every emitted log record. Duplicated
@@ -45,11 +44,13 @@ func (p *recordingProcessor) snapshot() []sdklog.Record {
 }
 
 // installRecordingLogger swaps in a LoggerProvider that records every
-// emitted record, asks observability to rebind its package-level
-// logger handle, and registers cleanup to restore the previous global.
-// observability.Init is the only other thing that touches this global,
-// and it runs once at daemon startup — never inside tests — so there
-// is no race with parallel test execution as long as no caller invokes
+// emitted record and registers cleanup to restore the previous
+// global. observability.LogRegistryConfigManaged resolves its logger
+// from global.GetLoggerProvider() per call, so swapping the global
+// is sufficient — no cached handle to rebind. observability.Init is
+// the only other thing that touches this global, and it runs once
+// at daemon startup — never inside tests — so there is no race with
+// parallel test execution as long as no caller invokes
 // observability.Init concurrently with these tests.
 func installRecordingLogger(t *testing.T) *recordingProcessor {
 	t.Helper()
@@ -57,10 +58,8 @@ func installRecordingLogger(t *testing.T) *recordingProcessor {
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(rec))
 	prev := global.GetLoggerProvider()
 	global.SetLoggerProvider(provider)
-	observability.RebindGlobalLogger()
 	t.Cleanup(func() {
 		global.SetLoggerProvider(prev)
-		observability.RebindGlobalLogger()
 		_ = provider.Shutdown(context.Background())
 	})
 	return rec

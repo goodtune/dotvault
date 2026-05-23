@@ -94,7 +94,7 @@ func TestEmitConfigSourceLog(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := installRecordingLogger(t)
-			emitConfigSourceLog(context.Background(), tc.cfg)
+			emitConfigSourceLog(context.Background(), tc.cfg, "/test/path/config.yaml")
 			if got := len(rec.snapshot()); got != tc.wantRecords {
 				t.Fatalf("emitConfigSourceLog: got %d records, want %d", got, tc.wantRecords)
 			}

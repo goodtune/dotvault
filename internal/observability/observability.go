@@ -71,8 +71,13 @@ type Config struct {
 	// no-op meter.
 	Enabled bool
 
-	// Endpoint is the OTLP collector address (e.g. "localhost:4317" for
-	// gRPC, "https://otel.example/v1/metrics" for HTTP). When empty the
+	// Endpoint is the OTLP collector address shared between metric
+	// and log exports. For gRPC: "host:port" (e.g. "localhost:4317").
+	// For HTTP: a *base* URL with no signal-specific path (e.g.
+	// "https://otel.example") — the exporters append "/v1/metrics"
+	// and "/v1/logs" themselves. Passing a URL that already ends in
+	// "/v1/metrics" (or any other signal-specific path) routes both
+	// signals to the same wrong path on the collector. When empty the
 	// SDK falls through to OTEL_EXPORTER_OTLP_ENDPOINT.
 	Endpoint string
 
@@ -156,7 +161,7 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 		return &Provider{}, nil
 	}
 
-	metricExporter, err := buildExporter(ctx, cfg)
+	metricExporter, err := buildMetricExporter(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build OTLP metric exporter: %w", err)
 	}
@@ -232,7 +237,7 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	}, nil
 }
 
-func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
 	// Footgun guard: insecure transport + auth headers means a
 	// bearer token (e.g. a Datadog / Grafana Cloud OTLP key) goes
 	// over plaintext to the collector on both the metric and log
@@ -240,7 +245,7 @@ func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) 
 	// Loopback collectors that don't terminate TLS are a legitimate
 	// case, but the combination usually signals a misconfiguration.
 	// Logged once here (rather than duplicated in buildLogExporter)
-	// because buildExporter runs first during Init.
+	// because buildMetricExporter runs first during Init.
 	if cfg.Insecure && len(cfg.Headers) > 0 {
 		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext on both metric and log exports; use a TLS-protected endpoint for production")
 	}
@@ -340,7 +345,7 @@ func resolveProtocol(configured, signalEnvVar string) string {
 	return protocol
 }
 
-// buildLogExporter mirrors buildExporter for OTLP log records. It
+// buildLogExporter mirrors buildMetricExporter for OTLP log records. It
 // reuses the same Endpoint / Insecure / Headers / Protocol knobs as
 // the metric exporter — a single observability block configures both
 // signals against the same collector — but reads the

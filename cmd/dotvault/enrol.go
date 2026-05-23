@@ -61,7 +61,7 @@ this command does not initiate fresh authentication itself.`,
 func runEnrol(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, err := loadConfig()
+	cfg, _, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

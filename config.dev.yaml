@@ -81,6 +81,13 @@ rules:
 enrolments:
   gh:
     engine: github
+    # Uncomment to force GitHub-engine traffic through a specific HTTPS
+    # proxy. When unset, the host's native proxy machinery applies — on
+    # Windows that is the IE/WinHTTP configuration including any PAC
+    # script (so per-host routing decisions are honoured); elsewhere it
+    # is HTTPS_PROXY / HTTP_PROXY / NO_PROXY from the daemon environment.
+    # settings:
+    #   https_proxy: http://squid.example.com:3128
   ssh:
     engine: ssh
     settings:

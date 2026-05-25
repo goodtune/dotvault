@@ -6,6 +6,7 @@ require (
 	github.com/cli/oauth v1.2.2
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
+	github.com/mattn/go-ieproxy v0.0.12
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/spf13/cobra v1.10.2
 	go.opentelemetry.io/otel v1.43.0

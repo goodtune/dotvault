@@ -65,17 +65,23 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		return nil, fmt.Errorf("parse github host: %w", err)
 	}
 
+	httpClient, err := engineHTTPClient(settings, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("configure http client: %w", err)
+	}
+
 	in := io.In
 	if in == nil {
 		in = os.Stdin
 	}
 
 	flow := &oauth.Flow{
-		Host:     host,
-		ClientID: clientID,
-		Scopes:   scopes,
-		Stdout:   io.Out,
-		Stdin:    in,
+		Host:       host,
+		ClientID:   clientID,
+		Scopes:     scopes,
+		HTTPClient: httpClient,
+		Stdout:     io.Out,
+		Stdin:      in,
 		DisplayCode: func(userCode, verificationURI string) error {
 			copyToClipboard(userCode)
 			fmt.Fprintf(io.Out, "! First, copy your one-time code: %s\n", userCode)
@@ -117,7 +123,7 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		if r.err != nil {
 			return nil, fmt.Errorf("device flow: %w", r.err)
 		}
-		user, err := fetchGitHubUser(ctx, hostURL, r.token)
+		user, err := fetchGitHubUser(ctx, httpClient, hostURL, r.token)
 		if err != nil {
 			io.Log.Warn("could not fetch github username", "error", err)
 			user = ""
@@ -131,7 +137,7 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 	}
 }
 
-func fetchGitHubUser(ctx context.Context, hostURL, token string) (string, error) {
+func fetchGitHubUser(ctx context.Context, client *http.Client, hostURL, token string) (string, error) {
 	normalizedHostURL := strings.TrimRight(hostURL, "/")
 
 	var userURL string
@@ -149,7 +155,6 @@ func fetchGitHubUser(ctx context.Context, hostURL, token string) (string, error)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

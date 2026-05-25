@@ -38,6 +38,7 @@ enrolments:
         - read:org
         - gist
         - workflow
+      https_proxy: http://squid.example.com:3128   # default: system proxy machinery
 ```
 
 ## Settings reference
@@ -47,6 +48,23 @@ enrolments:
 | `client_id` | `178c6fc778ccc68e1d6a` (GitHub CLI's app) | OAuth application client ID |
 | `host` | `github.com` | GitHub host (for GitHub Enterprise Server) |
 | `scopes` | `repo`, `read:org`, `gist` | OAuth scopes to request |
+| `https_proxy` | host's system proxy machinery | Override HTTPS proxy for all outbound calls from this enrolment. `http_proxy` is accepted as an alias. |
+
+## Behind a corporate proxy
+
+By default the engine consults the host's native proxy machinery on a per-request basis. On Windows that is the IE / WinHTTP configuration — PAC scripts included, so a policy that returns DIRECT for one host and a proxy for another is honoured. On Linux and macOS the resolver reads the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables from the daemon's environment. Native CFNetwork-based detection on macOS would require CGO, which dotvault avoids; export the variables in your `launchd` plist (or `systemd` `EnvironmentFile`) instead.
+
+When you cannot rely on host-level configuration — for example because the daemon's environment is curated and a per-enrolment override is the cleanest place to land the URL — set `https_proxy` (or `http_proxy`, accepted as an alias) on the enrolment:
+
+```yaml
+enrolments:
+  gh:
+    engine: github
+    settings:
+      https_proxy: http://squid.example.com:3128
+```
+
+The override pins every outbound request from this enrolment to that proxy, bypassing the per-URL PAC routing that the system resolver would otherwise apply. That is deliberate — when the operator says "use this proxy", we use it. Accepted schemes are `http`, `https`, `socks5`, and `socks5h`. Credentials embedded in the URL (`http://user:pass@proxy:3128`) are forwarded to the proxy as a `Proxy-Authorization` header.
 
 ## How the device flow works
 

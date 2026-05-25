@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/cli/oauth"
+
+	"github.com/goodtune/dotvault/internal/httpproxy"
 )
 
 const (
@@ -65,7 +67,7 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		return nil, fmt.Errorf("parse github host: %w", err)
 	}
 
-	httpClient, err := engineHTTPClient(settings, 30*time.Second)
+	httpClient, err := httpproxy.ClientFromSettings(settings, 30*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("configure http client: %w", err)
 	}

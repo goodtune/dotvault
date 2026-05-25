@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,10 +43,13 @@ func TestStatic_PinsAllRequests(t *testing.T) {
 
 func TestStatic_RejectsMalformed(t *testing.T) {
 	cases := map[string]string{
-		"empty":     "",
-		"no scheme": "squid.example.com:3128",
-		"no host":   "http://",
-		"garbage":   "://%%",
+		"empty":              "",
+		"scheme only":        "http://",
+		"schemeless host":    "squid.example.com:3128",
+		"schemeless //auth":  "//squid.example.com:3128",
+		"garbage":            "://%%",
+		"unsupported scheme": "ftp://squid.example.com:3128",
+		"javascript scheme":  "javascript://x:1",
 	}
 	for name, in := range cases {
 		if _, err := Static(in); err == nil {
@@ -54,13 +58,33 @@ func TestStatic_RejectsMalformed(t *testing.T) {
 	}
 }
 
+func TestStatic_ErrorDoesNotLeakUserinfoPassword(t *testing.T) {
+	// Force the "missing host" branch by giving a userinfo block with
+	// no authority host. The error wraps the URL — it must not surface
+	// the password.
+	_, err := Static("http://alice:hunter2@/")
+	if err == nil {
+		t.Fatal("Static: want error, got nil")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error %q leaks password", err.Error())
+	}
+}
+
 func TestNewClient_RoutesThroughResolver(t *testing.T) {
 	// A miniature CONNECT-less proxy that records every request and
-	// answers everything with 200 OK. Because the resolver returns this
-	// server's URL, both targets in the test should hit it.
-	var hits atomic.Int32
+	// answers with 200 OK. Because the resolver returns this server's
+	// URL, both targets in the test should hit it.
+	var (
+		hits  atomic.Int32
+		mu    sync.Mutex
+		seen  []string
+	)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
+		mu.Lock()
+		seen = append(seen, r.URL.String())
+		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, r.URL.String())
 	}))
@@ -71,10 +95,10 @@ func TestNewClient_RoutesThroughResolver(t *testing.T) {
 		t.Fatalf("parse proxy URL: %v", err)
 	}
 
-	resolver := http.ProxyURL(proxyURL)
-	client := NewClient(resolver, 5*time.Second)
+	client := NewClient(http.ProxyURL(proxyURL), 5*time.Second)
 
-	for _, target := range []string{"http://foo.example.com/x", "http://bar.example.com/y"} {
+	targets := []string{"http://foo.example.com/x", "http://bar.example.com/y"}
+	for _, target := range targets {
 		resp, err := client.Get(target)
 		if err != nil {
 			t.Fatalf("Get(%s): %v", target, err)
@@ -88,6 +112,16 @@ func TestNewClient_RoutesThroughResolver(t *testing.T) {
 	}
 	if got := hits.Load(); got != 2 {
 		t.Errorf("proxy hits = %d, want 2", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != len(targets) {
+		t.Fatalf("proxy saw %d requests, want %d", len(seen), len(targets))
+	}
+	for i, want := range targets {
+		if seen[i] != want {
+			t.Errorf("proxy saw %q at %d, want %q", seen[i], i, want)
+		}
 	}
 }
 

@@ -130,8 +130,11 @@ func TestNew_Defaults(t *testing.T) {
 	if c.cfg.Vault.UserPrefix != "users/" {
 		t.Errorf("UserPrefix = %q, want users/", c.cfg.Vault.UserPrefix)
 	}
-	if c.cfg.TokenFile == "" {
-		t.Error("TokenFile should default to a non-empty path")
+	// TokenFile defaults to DefaultTokenFile(), which is "" when the home
+	// directory can't be resolved (a documented contract), so only assert
+	// non-empty when home actually resolves.
+	if _, err := os.UserHomeDir(); err == nil && c.cfg.TokenFile == "" {
+		t.Error("TokenFile should default to a non-empty path when home resolves")
 	}
 }
 

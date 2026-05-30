@@ -23,11 +23,12 @@ cli, err := client.New(cfg)
 if err != nil { /* fail closed */ }
 
 // VAULT_TOKEN env → token file → interactive login (OIDC browser / LDAP prompt).
+// Authenticate logs in when no cached token works, so it returns ErrUnreachable
+// or ErrAuthFailed — not ErrLoginRequired (that's AuthenticateCached's outcome).
 if err := cli.Authenticate(ctx); err != nil {
     switch {
-    case errors.Is(err, client.ErrUnreachable):   // vault down — retry / back off
-    case errors.Is(err, client.ErrAuthFailed):    // a login ran but failed
-    case errors.Is(err, client.ErrLoginRequired): // no usable token; prompt the user
+    case errors.Is(err, client.ErrUnreachable): // vault down — retry / back off
+    case errors.Is(err, client.ErrAuthFailed):  // a login ran but failed
     }
     return err
 }

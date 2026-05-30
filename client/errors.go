@@ -41,11 +41,11 @@ import (
 // errors, not categorised: they are programmer errors surfaced before any
 // Vault interaction, outside the sentinel taxonomy below.
 var (
-	// ErrLoginRequired indicates no usable cached token was found (neither
-	// VAULT_TOKEN nor the token file yielded a token that LookupSelf
-	// accepts) and no interactive login was performed. Returned by
-	// AuthenticateCached, and by Authenticate when the caller has opted out
-	// of interactive login.
+	// ErrLoginRequired indicates no usable cached token was found — neither
+	// VAULT_TOKEN nor the token file yielded a token that LookupSelf accepts.
+	// It is returned by AuthenticateCached (which never prompts). Authenticate
+	// does not return it: on a reachable Vault it consumes this condition and
+	// proceeds to an interactive Login instead.
 	ErrLoginRequired = errors.New("dotvault: login required (no valid cached token)")
 
 	// ErrAuthFailed indicates the configured fresh-auth flow (Login, or the

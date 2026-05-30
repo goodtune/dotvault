@@ -29,9 +29,12 @@
 //	cfg, err := client.LoadConfig(client.DefaultConfigPath())
 //	cli, err := client.New(cfg) // optionally: client.New(cfg, client.WithIdentity("alice"))
 //	if err := cli.Authenticate(ctx); err != nil {
-//	    // categorise with errors.Is, one sentinel at a time, e.g.
+//	    // categorise with errors.Is, one sentinel at a time. Authenticate
+//	    // yields ErrUnreachable or ErrAuthFailed (it consumes the no-token
+//	    // case and logs in); AuthenticateCached is what surfaces
+//	    // ErrLoginRequired.
 //	    //   errors.Is(err, client.ErrUnreachable)
-//	    //   errors.Is(err, client.ErrLoginRequired)
+//	    //   errors.Is(err, client.ErrAuthFailed)
 //	    return err
 //	}
 //	tok, found, err := cli.ReadUserSecret(ctx, "gh", "oauth_token")
@@ -214,26 +217,22 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 // binary, which has no console) should drive auth through OIDC, or stick to
 // AuthenticateCached and surface ErrLoginRequired to the operator.
 func (c *Client) Login(ctx context.Context) error {
-	mgr, err := c.manager()
-	if err != nil {
-		return err
-	}
-	if err := mgr.Login(ctx); err != nil {
+	if err := c.manager().Login(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
 	}
 	return nil
 }
 
 // manager builds an auth.Manager wired to this Client's Vault client and
-// config. The Username is always the OS-derived name (used only as the
-// default for the LDAP password prompt); it is deliberately independent of
-// WithIdentity, which overrides only the kv/users/<identity>/... path segment,
-// not the login credential.
-func (c *Client) manager() (*auth.Manager, error) {
-	username, err := paths.Username()
-	if err != nil {
-		return nil, fmt.Errorf("dotvault: resolve username: %w", err)
-	}
+// config. Username is the OS-derived name and is only used as the default for
+// the LDAP password prompt; it is deliberately independent of WithIdentity
+// (which overrides only the kv/users/<identity>/... path segment, not the
+// login credential). Resolution is best-effort: OIDC and token auth don't need
+// a username, so a failure to resolve it (e.g. user.Current erroring in a
+// minimal container) must not break those flows — it's left empty and only an
+// LDAP login would notice.
+func (c *Client) manager() *auth.Manager {
+	username, _ := paths.Username()
 	return &auth.Manager{
 		VaultClient:   c.vc,
 		TokenFilePath: c.cfg.TokenFile,
@@ -241,7 +240,7 @@ func (c *Client) manager() (*auth.Manager, error) {
 		AuthMount:     c.cfg.Vault.AuthMount,
 		AuthRole:      c.cfg.Vault.AuthRole,
 		Username:      username,
-	}, nil
+	}
 }
 
 // IdentityName returns the <user> path segment dotvault uses to lay out

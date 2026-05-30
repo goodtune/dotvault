@@ -270,11 +270,64 @@ func TestReadUserSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentityName: %v", err)
 	}
-	fv.secrets["kv/users/"+id+"/litellm"] = map[string]any{"token": "sk-xyz"}
+	fv.secrets["kv/users/"+id+"/svc"] = map[string]any{"token": "sk-xyz"}
 
-	val, found, err := c.ReadUserSecret(context.Background(), "litellm", "token")
+	val, found, err := c.ReadUserSecret(context.Background(), "svc", "token")
 	if err != nil || !found || val != "sk-xyz" {
 		t.Fatalf("got (%q, %v, %v), want (sk-xyz, true, nil)", val, found, err)
+	}
+}
+
+func TestWithIdentity(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	}, WithIdentity("override-user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := c.IdentityName()
+	if err != nil || id != "override-user" {
+		t.Fatalf("IdentityName = %q (err %v), want override-user", id, err)
+	}
+
+	// ReadUserSecret must compose the path with the overridden identity, not
+	// the host OS user.
+	fv.secrets["kv/users/override-user/gh"] = map[string]any{"oauth_token": "ghp_z"}
+	val, found, err := c.ReadUserSecret(context.Background(), "gh", "oauth_token")
+	if err != nil || !found || val != "ghp_z" {
+		t.Fatalf("got (%q, %v, %v), want (ghp_z, true, nil)", val, found, err)
+	}
+}
+
+func TestWithIdentity_EmptyFallsBack(t *testing.T) {
+	fv := newFakeVault(t)
+	base, err := New(&Config{Vault: VaultConfig{Address: fv.srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	over, err := New(&Config{Vault: VaultConfig{Address: fv.srv.URL}}, WithIdentity(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseID, err := base.IdentityName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	overID, err := over.IdentityName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An empty WithIdentity must be ignored, falling back to the OS user —
+	// identical to constructing with no option.
+	if overID == "" || overID != baseID {
+		t.Fatalf("empty WithIdentity should fall back to OS user: base=%q override=%q", baseID, overID)
 	}
 }
 

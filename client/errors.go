@@ -70,9 +70,11 @@ func classify(err error) error {
 		case respErr.StatusCode >= 500:
 			return ErrUnreachable
 		default:
-			// 4xx other than 401/403 (e.g. 400, 404 surfaced as an error
-			// by a non-KV endpoint). Treat as denied-ish client error; the
-			// caller still gets the wrapped detail.
+			// 4xx other than 401/403 (e.g. 400). A KV-read 404 never
+			// reaches here — ReadKVv2 intercepts it and ReadKVField returns
+			// found == false — so this bucket is for genuine client errors
+			// on other endpoints. Treat as denied-ish; the caller still gets
+			// the wrapped detail.
 			return ErrDenied
 		}
 	}

@@ -1,9 +1,8 @@
 // Package client is dotvault's public, importable Go API. It exposes
 // dotvault's connectivity, token-resolution, login, and user-path conventions
-// so other tools (e.g. an agent runner that reads identity tokens out of
-// Vault) can talk to the same Vault, authenticate the same way, and read from
-// the exact path dotvault writes to — without re-implementing any of it and
-// risking silent divergence.
+// so any Go module can talk to the same Vault, authenticate the same way, and
+// read from the exact path dotvault writes to — without re-implementing any of
+// it and risking silent divergence.
 //
 // dotvault remains the single source of truth for:
 //
@@ -32,8 +31,7 @@
 //	if err := cli.Authenticate(ctx); err != nil {
 //	    // errors.Is(err, client.ErrLoginRequired | ErrUnreachable | ErrAuthFailed)
 //	}
-//	gh,  _, err := cli.ReadUserSecret(ctx, "gh",      "oauth_token")
-//	ll,  _, err := cli.ReadUserSecret(ctx, "litellm", "token")
+//	tok, found, err := cli.ReadUserSecret(ctx, "gh", "oauth_token")
 package client
 
 import (
@@ -50,18 +48,49 @@ import (
 // Construct one with New. A Client is not safe for concurrent Authenticate /
 // Login calls, but concurrent reads after authentication are fine.
 type Client struct {
-	cfg Config
-	vc  *vault.Client
+	cfg      Config
+	vc       *vault.Client
+	identity string // overrides the OS-user identity when non-empty (see WithIdentity)
 }
 
-// New constructs a Client from cfg. It builds the underlying Vault client
-// (applying TLS/CA settings) but performs no network calls and does not
-// authenticate — call Authenticate (or Login) before reading secrets.
+// Option configures a Client at construction time. Options are the
+// forward-compatible extension point for New: new behaviour can be added as
+// an Option without changing New's signature, so existing callers keep
+// compiling. See WithIdentity.
+//
+// Options are applied to the already-built Client after the underlying Vault
+// client is constructed, so they tune the Client's own behaviour. An option
+// that needs to influence Vault-client construction itself (a custom HTTP
+// transport, say) would require New to grow a separate build step first; the
+// current options do not.
+type Option func(*Client)
+
+// WithIdentity overrides the identity segment used to lay out
+// kv/users/<identity>/... paths. By default the Client derives it from the OS
+// user (see IdentityName), which assumes the consumer runs as the same OS
+// account as the dotvault that wrote the secrets. A consumer that runs under a
+// different account (a service, a container) — or a test that needs a
+// deterministic identity — sets this explicitly. It does not change the
+// username used for an interactive LDAP login prompt, only the KV path.
+//
+// The value is interpolated verbatim into the Vault KV path and is not
+// sanitised — it is a caller-controlled value used by the caller's own token,
+// and what that token can read is bounded by its Vault policy regardless of
+// the path composed, so this grants no authority the token didn't already
+// have. An empty string is ignored (the OS user is used).
+func WithIdentity(name string) Option {
+	return func(c *Client) { c.identity = name }
+}
+
+// New constructs a Client from cfg, applying any options. It builds the
+// underlying Vault client (applying TLS/CA settings) but performs no network
+// calls and does not authenticate — call Authenticate (or Login) before
+// reading secrets.
 //
 // Empty optional fields in cfg are filled with dotvault's defaults (KVMount
 // "kv", UserPrefix "users/", TokenFile ~/.vault-token), so a directly
 // constructed Config behaves the same as one returned by LoadConfig.
-func New(cfg *Config) (*Client, error) {
+func New(cfg *Config, opts ...Option) (*Client, error) {
 	if cfg == nil {
 		return nil, errors.New("dotvault: nil config")
 	}
@@ -78,7 +107,13 @@ func New(cfg *Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dotvault: create vault client: %w", err)
 	}
-	return &Client{cfg: resolved, vc: vc}, nil
+	c := &Client{cfg: resolved, vc: vc}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c, nil
 }
 
 // Authenticate makes the Client hold a usable Vault token, following
@@ -192,9 +227,13 @@ func (c *Client) manager() (*auth.Manager, error) {
 // so they hit the same path dotvault writes to.
 //
 // It performs no Vault call and takes no context: the value comes from the OS
-// account the process runs as. Callers that need secrets written by a given
-// dotvault instance must run as the same OS user.
+// account the process runs as, unless overridden with WithIdentity. Callers
+// that need secrets written by a given dotvault instance must either run as
+// the same OS user or set WithIdentity to that user's name.
 func (c *Client) IdentityName() (string, error) {
+	if c.identity != "" {
+		return c.identity, nil
+	}
 	name, err := paths.Username()
 	if err != nil {
 		return "", fmt.Errorf("dotvault: resolve identity: %w", err)
@@ -257,3 +296,25 @@ func (c *Client) ReadUserSecret(ctx context.Context, service, field string) (str
 	path := c.cfg.Vault.UserPrefix + identity + "/" + service
 	return c.ReadKVField(ctx, c.cfg.Vault.KVMount, path, field)
 }
+
+// Reader is the read-side contract a consumer depends on after a Client is
+// authenticated. It exists so downstream code can accept this narrow
+// interface and substitute a fake in tests without standing up a Vault — the
+// shape is owned here so every consumer fakes the same thing and the methods
+// can't drift between them. *Client satisfies it.
+//
+// Authentication (Authenticate/Login) is intentionally excluded: it has side
+// effects (token file writes, browser/terminal interaction) that belong to
+// process wiring, not to the unit under test. Construct and authenticate a
+// real *Client in main; depend on Reader everywhere a secret is consumed.
+type Reader interface {
+	// IdentityName returns the kv/users/<identity>/... path segment.
+	IdentityName() (string, error)
+	// ReadKVField reads one field of a KV v2 secret. See Client.ReadKVField.
+	ReadKVField(ctx context.Context, mount, path, field string) (string, bool, error)
+	// ReadUserSecret reads kv/users/<identity>/<service> field <field>.
+	ReadUserSecret(ctx context.Context, service, field string) (string, bool, error)
+}
+
+// Compile-time assertion that *Client satisfies Reader.
+var _ Reader = (*Client)(nil)

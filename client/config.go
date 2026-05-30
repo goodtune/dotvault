@@ -124,19 +124,19 @@ func fromInternal(cfg *config.Config) *Config {
 // defaults LoadConfig would have applied. Used by New so a directly
 // constructed Config behaves identically to a loaded one.
 //
-// These defaults mirror internal/config.(*Config).validate (KVMount "kv",
-// UserPrefix normalised to a single trailing slash). For the LoadConfig path
-// the internal validator has already applied them, so this loop is inert
-// there; it matters only for a Config a caller builds by hand. If the
-// canonical defaults in internal/config ever change, update them here too —
-// there is no shared exported helper to lean on yet.
+// The default values come from the shared config.DefaultKVMount /
+// config.DefaultUserPrefix constants, so the defaults themselves can't drift
+// from internal/config.(*Config).validate. (The trailing-slash normalisation
+// is trivially duplicated; the logic is small and stable.) For the LoadConfig
+// path the internal validator has already applied these, so this is inert
+// there; it matters only for a Config a caller builds by hand.
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.Vault.KVMount == "" {
-		out.Vault.KVMount = "kv"
+		out.Vault.KVMount = config.DefaultKVMount
 	}
 	if out.Vault.UserPrefix == "" {
-		out.Vault.UserPrefix = "users/"
+		out.Vault.UserPrefix = config.DefaultUserPrefix
 	} else {
 		out.Vault.UserPrefix = strings.TrimRight(out.Vault.UserPrefix, "/") + "/"
 	}

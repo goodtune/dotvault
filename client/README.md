@@ -1,6 +1,6 @@
 # dotvault public client API
 
-`github.com/goodtune/dotvault/client` is dotvault's public, importable Go surface. It lets another tool — for example an agent runner that reads identity tokens out of Vault — talk to the same Vault, authenticate the same way, and read from the exact path dotvault writes to, without re-implementing connectivity, token resolution, the login flow, or the user-path convention. dotvault stays the single source of truth; consumers can't silently diverge.
+`github.com/goodtune/dotvault/client` is dotvault's public, importable Go surface. It lets any Go module talk to the same Vault, authenticate the same way, and read from the exact path dotvault writes to, without re-implementing connectivity, token resolution, the login flow, or the user-path convention. dotvault stays the single source of truth; consumers can't silently diverge. A common use is a tool that needs to read a per-user credential (a token, an SSH key) that dotvault enrolled and keeps current — but the surface is deliberately generic and makes no assumptions about who is calling.
 
 The package is a thin facade over dotvault's internals (`internal/config`, `internal/auth`, `internal/vault`). Those packages stay internal — the facade is the only supported import boundary, so dotvault can refactor freely behind it.
 
@@ -8,6 +8,8 @@ The package is a thin facade over dotvault's internals (`internal/config`, `inte
 
 ```go
 import "github.com/goodtune/dotvault/client"
+
+ctx := context.Background()
 
 // DefaultConfigPath() resolves per-OS: /etc/xdg/dotvault/config.yaml (Linux,
 // honouring XDG_CONFIG_DIRS), %ProgramData%\dotvault\config.yaml (Windows, or
@@ -23,27 +25,32 @@ if err := cli.Authenticate(ctx); err != nil {
     // errors.Is(err, client.ErrUnreachable | client.ErrAuthFailed | client.ErrLoginRequired)
 }
 
-gh, _, err := cli.ReadUserSecret(ctx, "gh",      "oauth_token") // → GITHUB_TOKEN
-ll, _, err := cli.ReadUserSecret(ctx, "litellm", "token")       // → LITELLM_API_KEY / ANTHROPIC_AUTH_TOKEN
+// service is an enrolment path segment under kv/users/<user>/; field is a
+// key within that secret. E.g. the github enrolment engine writes oauth_token.
+tok, found, err := cli.ReadUserSecret(ctx, "gh", "oauth_token")
 ```
 
-Prefer the `dotvault` alias if you want the proposal's spelling: `import dotvault "github.com/goodtune/dotvault/client"`.
+A runnable version of this flow, and a non-interactive-preflight variant, are in the package's `Example` functions (godoc / `example_test.go`). Prefer the `dotvault` import alias if you want a shorter qualifier: `import dotvault "github.com/goodtune/dotvault/client"`.
 
 ## Identity: it's the OS user, not the token
 
 This is the one thing to internalise before depending on the package. dotvault derives the `<user>` segment of `kv/users/<user>/...` from the **OS account the process runs as** (the username with any `DOMAIN\` prefix stripped), *not* from the Vault token's `display_name`, entity name, or metadata. `IdentityName()` returns that OS-derived name, and `ReadUserSecret` composes paths with it.
 
-The practical consequence: a consumer must run as the **same OS user** as the dotvault that populated the secrets. That is normally true — dotvault is a per-user daemon running in the user's own context — but it means a service account or container running as a different user will read from a different (probably empty) path. If your deployment can't guarantee same-user, raise it; baking a token-derived identity into dotvault is a larger change with its own migration story.
+The practical consequence: by default a consumer must run as the **same OS user** as the dotvault that populated the secrets. That is normally true — dotvault is a per-user daemon running in the user's own context — but it means a service account or container running as a different user will, by default, read from a different (probably empty) path. The failure mode is silent: a wrong identity reads a non-existent path, which surfaces as `found == false`, *not* an error.
 
-`IdentityName()` takes no context and makes no Vault call — the value is local.
+If your deployment can't guarantee same-user, pass `client.WithIdentity("<name>")` to `New` to set the path segment explicitly: `cli, err := client.New(cfg, client.WithIdentity("alice"))`. This also makes downstream tests deterministic (no dependence on the host's OS account). It does not change the username used for an interactive LDAP prompt — only the `kv/users/<name>/...` path.
+
+`IdentityName()` takes no context and makes no Vault call — the value is local (the override if set, else the OS user).
 
 ## Authentication entry points
 
 | Method | Behaviour | Use when |
 | --- | --- | --- |
 | `Authenticate(ctx)` | `VAULT_TOKEN` → token file → interactive login. Short-circuits with `ErrUnreachable` (no prompt) if Vault is down. | Normal startup where a human is present. |
-| `AuthenticateCached(ctx)` | env → file only. Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), CI-ish callers. |
+| `AuthenticateCached(ctx)` | env → file only. Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
 | `Login(ctx)` | Unconditional fresh login (ignores cached token). Equivalent to `dotvault login`. | Forcing re-auth. |
+
+> **`Authenticate` and `Login` are interactive.** They can open a browser (OIDC) or block reading a password and MFA code from the terminal (LDAP). That is surprising inside a library call: **do not call them from a non-interactive service or daemon.** In those contexts use `AuthenticateCached` and surface `ErrLoginRequired` to the operator, or arrange for a token to be present some other way. LDAP `Login` without a TTY returns an error wrapping `ErrAuthFailed` rather than hanging.
 
 Token precedence, the token file location (`~/.vault-token`), and the login flow are all dotvault's — unchanged.
 
@@ -57,10 +64,12 @@ Sentinels are `errors.Is`-able and map to a small, stable set of outcomes:
 | `ErrLoginRequired` | no usable cached token; login not run | `missing_token` |
 | `ErrDenied` | Vault rejected the request (401/403) | `denied` |
 | `ErrUnreachable` | DNS/connection/TLS/timeout/5xx | `unreachable` |
-| `ErrAuthFailed` | interactive login ran but didn't yield a token | `denied` |
+| `ErrAuthFailed` | interactive login ran but didn't yield a token | `denied` (your choice) |
 | `(value, false, nil)` from a read | secret/field absent | `missing_field` |
 
-A missing secret path and a missing field both return `found == false` with a `nil` error, so "the field isn't there" is never conflated with "couldn't reach Vault".
+`ErrAuthFailed` is a distinct sentinel from `ErrDenied` so you *can* tell "wrong/declined credentials" from "token lacks the policy". Folding both into a `denied` metric label is reasonable but is your decision, not the library's.
+
+A missing secret path and a missing field both return `found == false` with a `nil` error, so "the field isn't there" is never conflated with "couldn't reach Vault". On each error sentinel a consumer typically: `ErrLoginRequired` → tell the user to run `dotvault login` (or call `Authenticate` interactively); `ErrUnreachable` → retry / back off; `ErrDenied` / `ErrAuthFailed` → fail closed and surface the auth problem; `found == false` → treat the credential as not-yet-enrolled.
 
 ## KV mount and path layout
 
@@ -70,4 +79,8 @@ Vault namespaces are not a dotvault config field; the underlying client honours 
 
 ## Testing on the consumer side
 
-The methods you'll call (`Authenticate`, `AuthenticateCached`, `ReadUserSecret`, `IdentityName`) are a small set — define your own interface over them in your tests and substitute a fake. No live Vault required. dotvault's own tests for this package stand up an `httptest` server (`client/client_test.go`) if you want a reference.
+The package ships `client.Reader`, a narrow interface covering the read side (`IdentityName`, `ReadKVField`, `ReadUserSecret`) that `*client.Client` satisfies. Depend on `client.Reader` wherever your code consumes a secret, and substitute a hand-written fake in tests — no live Vault, no network. See the runnable `ExampleReader` in `example_test.go` for a ~15-line fake.
+
+Authentication is intentionally left out of `Reader`: it has side effects (token-file writes, browser/terminal interaction) that belong in `main`, not in the unit under test. Construct and authenticate a real `*client.Client` at startup; pass it (as a `Reader`) into the code that reads.
+
+One caveat: `Authenticate`/`AuthenticateCached` read process environment (`VAULT_TOKEN`, `VAULT_NAMESPACE`), so tests that exercise the real client must use `t.Setenv` and can't run with `t.Parallel()`. The `Reader` fake sidesteps this entirely.

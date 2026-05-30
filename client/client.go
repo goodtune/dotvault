@@ -145,7 +145,17 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		// login flow that cannot succeed.
 		return err
 	case errors.Is(err, ErrLoginRequired):
-		// Fall through to the interactive flow below.
+		// No usable cached token. Before dropping into the interactive flow
+		// — which for LDAP prompts for a password on the terminal *before*
+		// it ever contacts Vault — confirm the server is actually reachable,
+		// so the documented "short-circuit ErrUnreachable without prompting"
+		// contract holds even on the no-token path. sys/health needs no auth
+		// and the SDK normalises standby/sealed/uninitialised to a non-error
+		// status, so this only fails on a genuine transport problem.
+		if _, herr := c.vc.ServerHealth(ctx); herr != nil {
+			return fmt.Errorf("%w: %w", ErrUnreachable, herr)
+		}
+		// Reachable — fall through to the interactive flow below.
 	default:
 		return err
 	}

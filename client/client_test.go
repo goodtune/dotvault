@@ -51,6 +51,18 @@ func newFakeVault(t *testing.T) *fakeVault {
 		})
 	})
 
+	// sys/health needs no auth; only a transport failure (modelled by
+	// unreachable) makes ServerHealth error.
+	mux.HandleFunc("/v1/sys/health", func(w http.ResponseWriter, r *http.Request) {
+		if fv.unreachable {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"initialized": true, "sealed": false, "standby": false, "version": "1.0.0",
+		})
+	})
+
 	// KV v2 reads land on /v1/<mount>/data/<path>.
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		if fv.unreachable {
@@ -220,6 +232,37 @@ func TestAuthenticate_UnreachableDoesNotLogin(t *testing.T) {
 	err := c.Authenticate(context.Background())
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestAuthenticate_NoTokenUnreachableDoesNotLogin(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t)
+	fv.unreachable = true
+	c := newTestClient(t, fv)
+
+	// No cached token: AuthenticateCached returns ErrLoginRequired with no
+	// network call. Authenticate must then probe sys/health, find Vault
+	// unreachable, and surface ErrUnreachable rather than entering the
+	// interactive login flow.
+	err := c.Authenticate(context.Background())
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestAuthenticate_NoTokenReachableProceedsToLogin(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv) // AuthMethod "token"
+
+	// No cached token but Vault is reachable: the health probe passes and
+	// Authenticate proceeds to Login, which fails for AuthMethod "token"
+	// (nothing to do) with ErrAuthFailed — proving the probe doesn't block
+	// a reachable server from reaching the login flow.
+	err := c.Authenticate(context.Background())
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Fatalf("err = %v, want ErrAuthFailed", err)
 	}
 }
 

@@ -82,13 +82,13 @@ type agentStatusProvider interface {
 
 // ServerConfig holds all dependencies for the web server.
 type ServerConfig struct {
-	WebCfg        config.WebConfig
-	VaultCfg      config.VaultConfig
-	SyncCfg       config.SyncConfig
-	ObsCfg        config.ObservabilityConfig
-	Rules         []config.Rule
-	Vault         *vault.Client
-	Engine        *internalsync.Engine
+	WebCfg   config.WebConfig
+	VaultCfg config.VaultConfig
+	SyncCfg  config.SyncConfig
+	ObsCfg   config.ObservabilityConfig
+	Rules    []config.Rule
+	Vault    *vault.Client
+	Engine   *internalsync.Engine
 	// Agent, when non-nil, exposes the SSH agent status on /api/v1/status.
 	Agent         agentStatusProvider
 	Username      string

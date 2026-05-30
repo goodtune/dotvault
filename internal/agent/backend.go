@@ -180,12 +180,12 @@ var ErrKeyNotFound = fmt.Errorf("no matching key")
 
 // --- read-only surface: dotvault is one-way, so the agent is too. ---
 
-func (b *Backend) Add(key agent.AddedKey) error    { return ErrReadOnly }
-func (b *Backend) Remove(key ssh.PublicKey) error  { return ErrReadOnly }
-func (b *Backend) RemoveAll() error                { return ErrReadOnly }
-func (b *Backend) Lock(passphrase []byte) error    { return ErrReadOnly }
-func (b *Backend) Unlock(passphrase []byte) error  { return ErrReadOnly }
-func (b *Backend) Signers() ([]ssh.Signer, error)  { return nil, ErrReadOnly }
+func (b *Backend) Add(key agent.AddedKey) error   { return ErrReadOnly }
+func (b *Backend) Remove(key ssh.PublicKey) error { return ErrReadOnly }
+func (b *Backend) RemoveAll() error               { return ErrReadOnly }
+func (b *Backend) Lock(passphrase []byte) error   { return ErrReadOnly }
+func (b *Backend) Unlock(passphrase []byte) error { return ErrReadOnly }
+func (b *Backend) Signers() ([]ssh.Signer, error) { return nil, ErrReadOnly }
 
 // Extension reports no extensions are supported.
 func (b *Backend) Extension(extensionType string, contents []byte) ([]byte, error) {

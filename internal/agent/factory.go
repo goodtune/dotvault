@@ -26,8 +26,8 @@ func newErrSource(name, typ string, err error) Source {
 	return &errSource{name: name, typ: typ, err: err}
 }
 
-func (s *errSource) Name() string                                { return s.name }
-func (s *errSource) Type() string                                { return s.typ }
+func (s *errSource) Name() string                                   { return s.name }
+func (s *errSource) Type() string                                   { return s.typ }
 func (s *errSource) Identities(context.Context) ([]Identity, error) { return nil, s.err }
 func (s *errSource) Sign(context.Context, ssh.PublicKey, []byte, agent.SignatureFlags) (*ssh.Signature, bool, error) {
 	return nil, false, nil

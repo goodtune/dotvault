@@ -12,9 +12,9 @@ import (
 )
 
 type fakeCA struct {
-	caSigner   ssh.Signer
-	calls      int
-	lastPrinc  []string
+	caSigner  ssh.Signer
+	calls     int
+	lastPrinc []string
 }
 
 func newFakeCA(t *testing.T) *fakeCA {

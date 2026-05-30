@@ -153,15 +153,15 @@ type Enrolment struct {
 
 // VaultConfig holds Vault connection settings.
 type VaultConfig struct {
-	Address              string `yaml:"address"`
-	CACert               string `yaml:"ca_cert"`
-	TLSSkipVerify        bool   `yaml:"tls_skip_verify"`
-	KVMount              string `yaml:"kv_mount"`
-	UserPrefix           string `yaml:"user_prefix"`
-	AuthMethod           string `yaml:"auth_method"`
-	AuthRole             string `yaml:"auth_role"`
-	AuthMount            string `yaml:"auth_mount"`
-	DisableTokenRenewal  bool   `yaml:"disable_token_renewal"`
+	Address             string `yaml:"address"`
+	CACert              string `yaml:"ca_cert"`
+	TLSSkipVerify       bool   `yaml:"tls_skip_verify"`
+	KVMount             string `yaml:"kv_mount"`
+	UserPrefix          string `yaml:"user_prefix"`
+	AuthMethod          string `yaml:"auth_method"`
+	AuthRole            string `yaml:"auth_role"`
+	AuthMount           string `yaml:"auth_mount"`
+	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
 }
 
 // SyncConfig holds sync settings.
@@ -497,4 +497,3 @@ func (c *Config) validate() error {
 
 	return nil
 }
-

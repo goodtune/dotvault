@@ -9,6 +9,9 @@ The package is a thin facade over dotvault's internals (`internal/config`, `inte
 ```go
 import "github.com/goodtune/dotvault/client"
 
+// DefaultConfigPath() resolves per-OS: /etc/xdg/dotvault/config.yaml (Linux,
+// honouring XDG_CONFIG_DIRS), %ProgramData%\dotvault\config.yaml (Windows, or
+// the GPO registry if present), Application Support (macOS).
 cfg, err := client.LoadConfig(client.DefaultConfigPath())
 if err != nil { /* fail closed */ }
 

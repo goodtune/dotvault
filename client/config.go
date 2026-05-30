@@ -123,6 +123,13 @@ func fromInternal(cfg *config.Config) *Config {
 // withDefaults returns a copy of cfg with empty fields filled in to match the
 // defaults LoadConfig would have applied. Used by New so a directly
 // constructed Config behaves identically to a loaded one.
+//
+// These defaults mirror internal/config.(*Config).validate (KVMount "kv",
+// UserPrefix normalised to a single trailing slash). For the LoadConfig path
+// the internal validator has already applied them, so this loop is inert
+// there; it matters only for a Config a caller builds by hand. If the
+// canonical defaults in internal/config ever change, update them here too —
+// there is no shared exported helper to lean on yet.
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.Vault.KVMount == "" {

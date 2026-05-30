@@ -152,7 +152,10 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 // error wrapping ErrAuthFailed.
 //
 // Login requires an interactive context for LDAP (a terminal on stdin); it
-// will not prompt when stdin is not a TTY and instead returns an error.
+// will not prompt when stdin is not a TTY and instead returns an error
+// wrapping ErrAuthFailed. Headless callers (including the Windows GUI-subsystem
+// binary, which has no console) should drive auth through OIDC, or stick to
+// AuthenticateCached and surface ErrLoginRequired to the operator.
 func (c *Client) Login(ctx context.Context) error {
 	mgr, err := c.manager()
 	if err != nil {
@@ -215,8 +218,10 @@ func (c *Client) Token() string {
 //   - ("", false, err)    for transport/auth failures, wrapping ErrUnreachable
 //     or ErrDenied.
 //
-// Non-string field values are stringified (numbers/bools via fmt), matching
-// how dotvault stores credential material as strings.
+// Non-string field values are stringified via fmt's %v: numbers and bools
+// render as you'd expect; a nested object or array renders as its Go-syntax
+// form (map[...]/[...]). dotvault stores credential material as strings, so in
+// practice the fields a consumer reads are already strings.
 func (c *Client) ReadKVField(ctx context.Context, mount, path, field string) (string, bool, error) {
 	secret, err := c.vc.ReadKVv2(ctx, mount, path)
 	if err != nil {

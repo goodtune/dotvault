@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -27,6 +28,11 @@ type fakeVault struct {
 
 func newFakeVault(t *testing.T) *fakeVault {
 	t.Helper()
+	// The unreachable-path tests make the server answer 5xx, which the
+	// Vault SDK retries with backoff by default (~3s per call). Disable
+	// retries so the suite stays fast and deterministic on loaded CI
+	// runners. NewClient reads this env at construction time.
+	t.Setenv("VAULT_MAX_RETRIES", "0")
 	fv := &fakeVault{secrets: map[string]map[string]any{}, tokenValid: true}
 	mux := http.NewServeMux()
 
@@ -54,7 +60,7 @@ func newFakeVault(t *testing.T) *fakeVault {
 		// Strip "/v1/" prefix, then split "<mount>/data/<path>".
 		rest := r.URL.Path[len("/v1/"):]
 		const marker = "/data/"
-		i := indexOf(rest, marker)
+		i := strings.Index(rest, marker)
 		if i < 0 {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -78,15 +84,6 @@ func newFakeVault(t *testing.T) *fakeVault {
 	fv.srv = httptest.NewServer(mux)
 	t.Cleanup(fv.srv.Close)
 	return fv
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 func newTestClient(t *testing.T, fv *fakeVault) *Client {

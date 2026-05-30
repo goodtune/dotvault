@@ -12,18 +12,26 @@ import (
 // by this package that fits one of these categories wraps the corresponding
 // sentinel, so callers use errors.Is rather than comparing values directly.
 //
-// The categories line up with the outcomes rat tracks:
+// The categories line up with the outcomes a consumer tracks:
 //
 //	success         → nil error
 //	missing_token   → ErrLoginRequired
-//	denied          → ErrDenied
+//	denied          → ErrDenied, ErrAuthFailed
 //	unreachable     → ErrUnreachable
 //	missing_field   → (value, false, nil) from ReadKVField/ReadUserSecret
 //
 // ErrAuthFailed covers an interactive login that started but did not yield a
 // usable token (bad password, declined MFA, OIDC callback error). It is
 // distinct from ErrLoginRequired, which means "no usable token was found and
-// no interactive login was attempted".
+// no interactive login was attempted"; a consumer that buckets outcomes for
+// metrics can fold it into the same "denied" label as ErrDenied, but it is a
+// separate sentinel so callers that want to distinguish "wrong creds" from
+// "no creds offered" can.
+//
+// Every error this package returns wraps the original cause with %w. The
+// wrapped text comes from Vault's API error (which echoes the server response
+// body, never the request token) plus the mount/path being read — none of it
+// carries token material, so callers may log these errors verbatim.
 var (
 	// ErrLoginRequired indicates no usable cached token was found (neither
 	// VAULT_TOKEN nor the token file yielded a token that LookupSelf

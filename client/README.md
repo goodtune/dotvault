@@ -22,7 +22,12 @@ if err != nil { /* fail closed */ }
 
 // VAULT_TOKEN env → token file → interactive login (OIDC browser / LDAP prompt).
 if err := cli.Authenticate(ctx); err != nil {
-    // errors.Is(err, client.ErrUnreachable | client.ErrAuthFailed | client.ErrLoginRequired)
+    switch {
+    case errors.Is(err, client.ErrUnreachable):   // vault down — retry / back off
+    case errors.Is(err, client.ErrAuthFailed):    // a login ran but failed
+    case errors.Is(err, client.ErrLoginRequired): // no usable token; prompt the user
+    }
+    return err
 }
 
 // service is an enrolment path segment under kv/users/<user>/; field is a

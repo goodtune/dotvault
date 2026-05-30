@@ -57,6 +57,13 @@ func newFakeVault(t *testing.T) *fakeVault {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
+		// Real Vault gates KV reads on the token, same as lookup-self, so the
+		// fake does too — otherwise read-path tests couldn't exercise ErrDenied.
+		if !fv.tokenValid || r.Header.Get("X-Vault-Token") == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
 		// Strip "/v1/" prefix, then split "<mount>/data/<path>".
 		rest := r.URL.Path[len("/v1/"):]
 		const marker = "/data/"
@@ -243,7 +250,7 @@ func TestReadKVField(t *testing.T) {
 	}
 }
 
-func TestReadKVField_Denied(t *testing.T) {
+func TestReadKVField_Unreachable(t *testing.T) {
 	t.Setenv("VAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
@@ -328,6 +335,22 @@ func TestWithIdentity_EmptyFallsBack(t *testing.T) {
 	// identical to constructing with no option.
 	if overID == "" || overID != baseID {
 		t.Fatalf("empty WithIdentity should fall back to OS user: base=%q override=%q", baseID, overID)
+	}
+}
+
+func TestReadKVField_Denied(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Authenticated, then the token loses access (e.g. policy change/revocation)
+	// — a read must surface ErrDenied, distinct from ErrUnreachable.
+	fv.tokenValid = false
+	_, _, err := c.ReadKVField(context.Background(), "kv", "users/tester/gh", "oauth_token")
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("err = %v, want ErrDenied", err)
 	}
 }
 

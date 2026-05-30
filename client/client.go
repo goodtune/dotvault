@@ -29,7 +29,10 @@
 //	cfg, err := client.LoadConfig(client.DefaultConfigPath())
 //	cli, err := client.New(cfg)
 //	if err := cli.Authenticate(ctx); err != nil {
-//	    // errors.Is(err, client.ErrLoginRequired | ErrUnreachable | ErrAuthFailed)
+//	    // categorise with errors.Is, one sentinel at a time, e.g.
+//	    //   errors.Is(err, client.ErrUnreachable)
+//	    //   errors.Is(err, client.ErrLoginRequired)
+//	    return err
 //	}
 //	tok, found, err := cli.ReadUserSecret(ctx, "gh", "oauth_token")
 package client
@@ -168,13 +171,14 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	if _, err := c.vc.LookupSelf(ctx); err != nil {
 		c.vc.SetToken("")
 		// An unreachable Vault is a transient/infra problem, distinct from a
-		// genuinely invalid token. Preserve that distinction for callers.
+		// genuinely invalid token. Preserve that distinction for callers, and
+		// wrap the cause too (multiple %w) so they can errors.As it.
 		if cat := classify(err); errors.Is(cat, ErrUnreachable) {
-			return fmt.Errorf("%w: %v", ErrUnreachable, err)
+			return fmt.Errorf("%w: %w", ErrUnreachable, err)
 		}
 		// Reachable Vault rejected the token (403) or it has no TTL left:
 		// from the caller's perspective a fresh login is required.
-		return fmt.Errorf("%w: cached token rejected: %v", ErrLoginRequired, err)
+		return fmt.Errorf("%w: cached token rejected: %w", ErrLoginRequired, err)
 	}
 	return nil
 }
@@ -197,7 +201,7 @@ func (c *Client) Login(ctx context.Context) error {
 		return err
 	}
 	if err := mgr.Login(ctx); err != nil {
-		return fmt.Errorf("%w: %v", ErrAuthFailed, err)
+		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
 	}
 	return nil
 }
@@ -264,7 +268,7 @@ func (c *Client) Token() string {
 func (c *Client) ReadKVField(ctx context.Context, mount, path, field string) (string, bool, error) {
 	secret, err := c.vc.ReadKVv2(ctx, mount, path)
 	if err != nil {
-		return "", false, fmt.Errorf("%w: read %s/%s: %v", classify(err), mount, path, err)
+		return "", false, fmt.Errorf("%w: read %s/%s: %w", classify(err), mount, path, err)
 	}
 	if secret == nil {
 		// Path does not exist — treat as missing field, not an error, so the

@@ -165,6 +165,30 @@ func TestAuthenticateCached_NoToken(t *testing.T) {
 	}
 }
 
+func TestAuthenticateCached_NoTokenEmptyFilePath(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t)
+	c, err := New(&Config{Vault: VaultConfig{Address: fv.srv.URL}, TokenFile: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// New fills an empty TokenFile via DefaultTokenFile(); force it back to
+	// "" to model the home-unresolvable case, then check the message reads
+	// cleanly rather than "...no token at " with a blank path.
+	c.cfg.TokenFile = ""
+
+	err = c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired", err)
+	}
+	if strings.Contains(err.Error(), "no token at ") {
+		t.Errorf("error message has a blank path: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no token file configured") {
+		t.Errorf("error message = %q, want it to mention no token file configured", err.Error())
+	}
+}
+
 func TestAuthenticateCached_EnvToken(t *testing.T) {
 	t.Setenv("VAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)

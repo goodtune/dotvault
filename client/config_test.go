@@ -107,23 +107,37 @@ func TestDefaultPaths(t *testing.T) {
 	if DefaultConfigPath() == "" {
 		t.Error("DefaultConfigPath empty")
 	}
-	if DefaultTokenFile() == "" {
-		t.Error("DefaultTokenFile empty")
+	// DefaultTokenFile is documented to return "" when the home directory
+	// can't be resolved, so we don't assert non-empty here (that would
+	// contradict the contract and fail in constrained environments). When a
+	// home dir IS resolvable — the normal case and what CI provides — it
+	// should be non-empty; gate the assertion on that.
+	if _, err := os.UserHomeDir(); err == nil && DefaultTokenFile() == "" {
+		t.Error("DefaultTokenFile empty despite a resolvable home directory")
 	}
 }
 
 // TestDefaultTokenFile_HomeUnavailable verifies DefaultTokenFile recovers the
 // panic paths.VaultTokenPath raises when the home directory can't be resolved,
-// returning "" rather than crashing a consumer. On non-Windows, an empty $HOME
-// makes os.UserHomeDir fail; Windows uses %USERPROFILE% and doesn't panic, so
-// skip there.
+// returning "" rather than crashing a consumer. Forcing that condition is
+// platform-dependent (empty $HOME makes os.UserHomeDir fail on Unix, but
+// Windows reads %USERPROFILE% and doesn't panic), so rather than assume, we
+// gate on whether os.UserHomeDir actually errors under the forced environment
+// and skip otherwise — keeping the test correct everywhere.
 func TestDefaultTokenFile_HomeUnavailable(t *testing.T) {
 	if runtime.GOOS == "windows" {
+		// VaultTokenPath reads %USERPROFILE% directly (not os.UserHomeDir)
+		// and never panics, so there's no recover path to exercise here.
 		t.Skip("VaultTokenPath uses USERPROFILE on Windows; no panic path")
 	}
 	t.Setenv("HOME", "")
-	got := DefaultTokenFile()
-	if got != "" {
+	if _, err := os.UserHomeDir(); err == nil {
+		// Some environments still resolve a home dir with $HOME empty; the
+		// panic (and thus the recover) can't be triggered, so skip rather
+		// than assert a condition that doesn't hold here.
+		t.Skip("home directory still resolvable with $HOME empty; can't exercise the recover path")
+	}
+	if got := DefaultTokenFile(); got != "" {
 		t.Fatalf("DefaultTokenFile() = %q, want \"\" when home is unresolvable", got)
 	}
 }

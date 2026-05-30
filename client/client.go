@@ -177,6 +177,10 @@ func (c *Client) Authenticate(ctx context.Context) error {
 func (c *Client) AuthenticateCached(ctx context.Context) error {
 	token := auth.ResolveToken(c.cfg.TokenFile)
 	if token == "" {
+		if c.cfg.TokenFile == "" {
+			return fmt.Errorf("%w: no VAULT_TOKEN set and no token file configured",
+				ErrLoginRequired)
+		}
 		return fmt.Errorf("%w: no VAULT_TOKEN and no token at %s",
 			ErrLoginRequired, c.cfg.TokenFile)
 	}

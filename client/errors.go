@@ -44,8 +44,14 @@ var (
 	// of interactive login.
 	ErrLoginRequired = errors.New("dotvault: login required (no valid cached token)")
 
-	// ErrAuthFailed indicates an interactive login flow ran but did not
-	// produce a usable token.
+	// ErrAuthFailed indicates the configured fresh-auth flow (Login, or the
+	// login fallback inside Authenticate) ran but did not yield a usable
+	// token. This covers a genuine auth failure (bad password, declined MFA,
+	// OIDC callback error, no TTY for an LDAP prompt) as well as a
+	// misconfigured auth method (an unsupported AuthMethod, or AuthMethod
+	// "token" with no token on disk — for which Login has nothing to do).
+	// It is distinct from ErrLoginRequired, which means a fresh login was
+	// not attempted at all.
 	ErrAuthFailed = errors.New("dotvault: authentication failed")
 
 	// ErrDenied indicates Vault rejected the request with 401/403 — the

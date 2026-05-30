@@ -27,7 +27,7 @@
 // # Typical use
 //
 //	cfg, err := client.LoadConfig(client.DefaultConfigPath())
-//	cli, err := client.New(cfg)
+//	cli, err := client.New(cfg) // optionally: client.New(cfg, client.WithIdentity("alice"))
 //	if err := cli.Authenticate(ctx); err != nil {
 //	    // categorise with errors.Is, one sentinel at a time, e.g.
 //	    //   errors.Is(err, client.ErrUnreachable)
@@ -187,8 +187,9 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 // cached token — the equivalent of `dotvault login`. OIDC opens a browser;
 // LDAP prompts for a password (and MFA) on the terminal. On success the new
 // token is written to the configured token file (matching dotvault) and held
-// on the Client. A login that runs but fails to yield a token returns an
-// error wrapping ErrAuthFailed.
+// on the Client. Any failure to produce a token — a genuine auth failure or a
+// misconfigured auth method (unsupported AuthMethod, or "token" with nothing
+// on disk) — returns an error wrapping ErrAuthFailed.
 //
 // Login requires an interactive context for LDAP (a terminal on stdin); it
 // will not prompt when stdin is not a TTY and instead returns an error

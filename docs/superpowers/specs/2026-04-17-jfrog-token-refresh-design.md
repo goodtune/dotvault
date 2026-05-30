@@ -105,6 +105,8 @@ Current JFrog KV secret (8 fields):
 After this change (7 fields):
 `access_token, refresh_token, url, server_id, user, issued_at, expires_at`
 
+> **Later addendum (reference-token support):** a subsequent change added an 8th field, `reference_token` — the opaque equivalent of the JWT access token, captured unconditionally via `include_reference_token=true` and stored empty on servers older than Access 7.38.4. It is not rendered by default and is excluded from `Fields()`, mirroring `user`. CLAUDE.md's JFrog Engine section is the authoritative schema reference.
+
 Changes:
 
 - **Add `issued_at`** — RFC3339. Stamped when the token is minted (or refreshed).

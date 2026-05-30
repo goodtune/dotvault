@@ -520,9 +520,11 @@ Configurable markdown content via `web.login_text` and `web.secret_view_text` fi
 
 ## Windows Registry / Group Policy
 
-When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, and Web settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey.
+When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, Web, and Observability settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey.
 
-ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for Vault, Sync, and Web settings.
+`Observability` carries `Enabled` (REG_DWORD), `Endpoint` / `Protocol` / `ExportInterval` (REG_SZ), and `Insecure` (REG_DWORD). `Headers` is deliberately **not** modelled in the registry layer — it carries OTLP bearer tokens, so it lives in the per-user `EnvironmentFile` (`OTEL_EXPORTER_OTLP_HEADERS`) where regular user-writable secrets belong. Without the Observability subkey wired up, a GPO-managed daemon would have `Observability.Enabled=false`, `observability.Init` would short-circuit, and `LogRegistryConfigManaged`'s WARN record would vanish into the no-op global logger — defeating the whole point of routing the registry-config notice through OTel rather than slog.
+
+ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for Vault, Sync, and Web settings (Observability keys are currently registry-only; admins can set them with `reg-import` or regedit).
 
 ## File Permissions & Security
 

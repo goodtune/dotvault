@@ -76,6 +76,18 @@ type registryLayer struct {
 	// Web
 	WebEnabled *uint32
 	WebListen  string
+
+	// Observability. Headers are intentionally not modelled here —
+	// they carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.)
+	// and live in the per-user EnvironmentFile per the credential
+	// rule documented in CLAUDE.md. The SDK reads them from
+	// OTEL_EXPORTER_OTLP_HEADERS regardless of how the rest of this
+	// block is sourced.
+	ObservabilityEnabled        *uint32
+	ObservabilityEndpoint       string
+	ObservabilityProtocol       string
+	ObservabilityInsecure       *uint32
+	ObservabilityExportInterval string
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
@@ -132,6 +144,25 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.WebListen, _ = readRegString(wk, "Listen")
 	}
 
+	// Read Observability subkey. Without this, a GPO-managed daemon
+	// has Observability.Enabled=false (zero value), Init short-circuits
+	// to an inactive Provider, and the WARN record from
+	// LogRegistryConfigManaged vanishes into the no-op global logger —
+	// silently dropping the very notification this PR set out to make
+	// reachable.
+	ok, err := registry.OpenKey(root, registryPolicyPath+`\Observability`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Observability policy key: %w", err)
+	}
+	if err == nil {
+		defer ok.Close()
+		layer.ObservabilityEnabled = readRegDWORD(ok, "Enabled")
+		layer.ObservabilityEndpoint, _ = readRegString(ok, "Endpoint")
+		layer.ObservabilityProtocol, _ = readRegString(ok, "Protocol")
+		layer.ObservabilityInsecure = readRegDWORD(ok, "Insecure")
+		layer.ObservabilityExportInterval, _ = readRegString(ok, "ExportInterval")
+	}
+
 	return layer, true, nil
 }
 
@@ -173,6 +204,21 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.WebListen != "" {
 		cfg.Web.Listen = layer.WebListen
+	}
+	if layer.ObservabilityEnabled != nil {
+		cfg.Observability.Enabled = *layer.ObservabilityEnabled != 0
+	}
+	if layer.ObservabilityEndpoint != "" {
+		cfg.Observability.Endpoint = layer.ObservabilityEndpoint
+	}
+	if layer.ObservabilityProtocol != "" {
+		cfg.Observability.Protocol = layer.ObservabilityProtocol
+	}
+	if layer.ObservabilityInsecure != nil {
+		cfg.Observability.Insecure = *layer.ObservabilityInsecure != 0
+	}
+	if layer.ObservabilityExportInterval != "" {
+		cfg.Observability.RawInterval = layer.ObservabilityExportInterval
 	}
 }
 

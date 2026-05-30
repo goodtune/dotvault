@@ -92,10 +92,13 @@ SOFTWARE\Policies\goodtune\dotvault\Rules\gh\OAuth\Scopes     (REG_MULTI_SZ)
 Each enrolment is a subkey under `Enrolments\{Name}`:
 
 ```
-SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Engine                  (REG_SZ)    "github"
-SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\client_id      (REG_SZ)    "178c6fc778ccc68e1d6a"
-SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\scopes         (REG_MULTI_SZ) "repo\0read:org\0gist"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Engine                    (REG_SZ)        "github"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\client_id        (REG_SZ)        "178c6fc778ccc68e1d6a"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\scopes           (REG_MULTI_SZ)  "repo\0read:org\0gist"
+SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\https_proxy      (REG_SZ)        "http://squid.example.com:3128"
 ```
+
+The `https_proxy` value (or its `http_proxy` alias) is optional. When unset, the engine consults the machine's IE / WinHTTP proxy configuration — including any deployed PAC script — once per outbound request. Set it explicitly here only when you want this enrolment pinned to a specific proxy regardless of the system-level policy.
 
 ## Example: deploying via GPO
 

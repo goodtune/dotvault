@@ -83,6 +83,7 @@ The vault-init container seeds sample secrets, enables OIDC auth via Dex, and ex
 
 ```
 cmd/dotvault/main.go     CLI entry point (Cobra)
+client/                  Public, importable Go API (facade over internal/{config,auth,vault}) — see "Public client API"
 internal/
   config/                Config loading: YAML file + Windows Registry (GPO)
   paths/                 OS-specific path resolution
@@ -91,6 +92,7 @@ internal/
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
+  httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -314,6 +316,16 @@ In web mode the daemon also re-opens the browser to the web UI root when
 the lifecycle manager signals re-auth, subject to a 10-minute cooldown
 to avoid flapping during transient errors.
 
+## Public client API
+
+`client/` (`github.com/goodtune/dotvault/client`) is the only supported import boundary for other Go modules. It is a thin facade over `internal/config`, `internal/auth`, and `internal/vault` that exposes dotvault's connectivity, token-resolution order, login flow, and `kv/users/<user>/...` path convention so a consumer reads from exactly where dotvault writes instead of re-deriving any of it. The surface is deliberately generic — it makes no assumptions about the calling tool. The internals stay internal; the facade lets them be refactored freely. See `client/README.md` for the consumer-facing write-up.
+
+Surface: `LoadConfig(path)` (projects the validated system config onto a connectivity-and-auth-only `Config`; `DefaultConfigPath()` / `DefaultTokenFile()` give the canonical locations), `New(cfg, ...Option)`, and on `*Client`: `Authenticate` (env → file → interactive login, short-circuiting `ErrUnreachable` without prompting), `AuthenticateCached` (env → file only, never prompts — for side-effect-free `doctor`-style preflight, returns `ErrLoginRequired` when no token is usable), `Login` (unconditional fresh login, `= dotvault login`), `IdentityName`, `Token`, `ReadKVField(ctx, mount, path, field)`, and `ReadUserSecret(ctx, service, field)` (composes `{kv_mount}/{user_prefix}{identity}/{service}`). Reads return `(value, found, err)` so a missing path/field is `found == false` with `err == nil`, never conflated with a transport failure. Error categories are `errors.Is`-able sentinels: `ErrLoginRequired`, `ErrAuthFailed`, `ErrDenied`, `ErrUnreachable`. `New` takes functional `Option`s (extension point kept open so future inputs don't break callers); `WithIdentity(name)` overrides the path-identity segment. The exported `Reader` interface (`IdentityName`/`ReadKVField`/`ReadUserSecret`, which `*Client` satisfies) is the seam consumers depend on and fake in tests — auth is excluded from it because it has side effects that belong in `main`.
+
+**Identity is the OS user, not the token.** `IdentityName` (deliberately ctx-less — a local OS lookup, no Vault call) returns `paths.Username()` (the OS account, `DOMAIN\` prefix stripped) — the same value the sync engine and enrolment manager use to lay out `kv/users/<user>/...`. It is deliberately *not* derived from the Vault token's `display_name`/entity/metadata, because that is not what dotvault writes under. Consumers must therefore run as the same OS user as the dotvault that populated the secrets (normally true for a per-user daemon) or pass `WithIdentity(name)` to set the segment explicitly when they can't (a service account, a container) — `WithIdentity` also makes downstream tests deterministic. This is the one place the public API contradicts a naive "identity comes from the token" assumption, and it is load-bearing — changing the *default* derivation would be a path-layout migration, not a facade tweak.
+
+The facade legally imports `internal/*` because it lives inside the same module; external modules import only `client`, never the internals. When the connectivity/auth shape of the system config changes, update the `client.Config` projection (`client/config.go`) in lockstep so the public surface doesn't silently drift from what the daemon parses.
+
 ## Sync Engine
 
 Hybrid event-driven + polling model (`internal/sync/`):
@@ -388,6 +400,16 @@ Optional interfaces extend the contract for engines that need them:
 
 Overridable via settings: `client_id`, `scopes`, `host`. Returns `{"oauth_token": "<token>", "user": "<username>"}`.
 
+Outbound HTTPS (device-code request, polling, and the post-flow `/user` lookup) is routed through `internal/httpproxy`. By default the resolver consults the host's native proxy machinery — on Windows that's `ieproxy.GetProxyFunc()`, which evaluates the IE/WinHTTP configuration (PAC scripts included) once per request, so a policy returning DIRECT for one host and a proxy for another is honoured. On Linux and macOS the resolver falls back to `http.ProxyFromEnvironment` (HTTP_PROXY / HTTPS_PROXY / NO_PROXY); native CFNetwork detection on macOS would require CGO and is deliberately avoided. A per-enrolment override is available via the `https_proxy` (or `http_proxy`, accepted as an alias) setting — when set, every request is pinned to that URL and host-conditional PAC routing is bypassed, by design. The override accepts the `http`, `https`, `socks5`, and `socks5h` schemes; anything else fails at config-load. The settings adapter lives in `internal/httpproxy.ClientFromSettings` so the JFrog engine and any future HTTP-talking package can opt in to the same YAML key contract without duplication (#76). Example:
+
+```yaml
+enrolments:
+  gh:
+    engine: github
+    settings:
+      https_proxy: http://squid.example.com:3128
+```
+
 ### JFrog Engine
 
 Mirrors the `jf login` web login flow from `jfrog-cli`, then mints a dotvault-owned refreshable token with a configurable TTL. No public OAuth app exists — JFrog Platform hosts its own browser login endpoint, so the engine just requires the platform URL.
@@ -404,18 +426,20 @@ Flow (enrolment — runs once per user):
 1. POST `{url}/access/api/v2/authentication/jfrog_client_login/request` with a random UUID
 2. Open `{url}/ui/login?jfClientSession=<uuid>&jfClientName=JFrog-CLI&jfClientCode=1` — user confirms the last 4 chars of the UUID after sign-in
 3. Poll GET `{url}/access/api/v2/authentication/jfrog_client_login/token/<uuid>` until 200 — returns a bootstrap token with the JFrog server default TTL (typically 1 year)
-4. POST `{url}/access/api/v1/tokens` with `Authorization: Bearer <bootstrap>` and `{"expires_in":<token_ttl_seconds>,"refreshable":true,"scope":"applied-permissions/user"}` — mints the dotvault-owned pair; the bootstrap token is discarded. v1 rather than v2 because v2 is admin-only on most JFrog deployments (non-admins and older Artifactory versions see it as a 404); v1 has been the self-token endpoint since Artifactory 7.21.1 and is what `jfrog-client-go` uses.
+4. POST `{url}/access/api/v1/tokens` with `Authorization: Bearer <bootstrap>` and `{"expires_in":<token_ttl_seconds>,"refreshable":true,"scope":"applied-permissions/user","include_reference_token":true}` — mints the dotvault-owned pair; the bootstrap token is discarded. v1 rather than v2 because v2 is admin-only on most JFrog deployments (non-admins and older Artifactory versions see it as a 404); v1 has been the self-token endpoint since Artifactory 7.21.1 and is what `jfrog-client-go` uses. `include_reference_token` is always sent so the response also carries an opaque `reference_token` alongside the JWT `access_token`; on servers older than Access 7.38.4 the field is simply absent and `reference_token` is stored empty.
 
 Flow (refresh — periodic, driven by `RefreshManager`):
 1. Every `check_interval` (daemon-wired at 5 min), iterate all enrolments whose engine implements `Refresher`
 2. For each, read the secret and skip unless `now >= issued_at + (expires_at - issued_at) / 2`
-3. POST `{url}/access/api/v1/tokens` with `grant_type=refresh_token&access_token=<current>&refresh_token=<current>` — **JFrog rotates both tokens on every successful refresh**, so the old refresh_token is invalid immediately
+3. POST `{url}/access/api/v1/tokens` with `grant_type=refresh_token&access_token=<current>&refresh_token=<current>&include_reference_token=true` — **JFrog rotates both tokens (and the reference token) on every successful refresh**, so the old refresh_token is invalid immediately
 4. Stamp new `issued_at: now`, `expires_at: now + token_ttl` (dotvault's configured TTL, not whatever JFrog returns), write the replacement map atomically
 5. `401`/`403` from the refresh endpoint is treated as permanent revocation — the secret is deleted from Vault and the user is prompted to re-enrol. Other errors are transient; the existing secret is kept and retried with exponential backoff
 
-Vault schema (7 fields): `access_token`, `refresh_token`, `url`, `server_id`, `user`, `issued_at` (RFC3339), `expires_at` (RFC3339). The rendered `jfrog-cli.conf.v6` only contains `accessToken` — `refreshToken` and `webLogin: true` are deliberately omitted so `jf` never attempts its own refresh (which would race the sync-engine clobber).
+Vault schema (8 fields): `access_token`, `refresh_token`, `reference_token`, `url`, `server_id`, `user`, `issued_at` (RFC3339), `expires_at` (RFC3339). The rendered `jfrog-cli.conf.v6` only contains `accessToken` — `refreshToken` and `webLogin: true` are deliberately omitted so `jf` never attempts its own refresh (which would race the sync-engine clobber). `reference_token` is the opaque equivalent of the JWT access token — useful where a compact credential is preferred (Docker/registry logins, clients that choke on long JWTs). It is captured unconditionally but not written to any target by default; a sync rule opts in by referencing `{{ .reference_token }}` in its template.
 
-`server_id` is deduced from the platform hostname (e.g. `mycompany.jfrog.io` → `mycompany`, IP addresses → `default-server`); `user` is extracted from the access-token JWT subject. Requires JFrog Artifactory 7.64.0 or newer on the remote side.
+`server_id` is deduced from the platform hostname (e.g. `mycompany.jfrog.io` → `mycompany`, IP addresses → `default-server`); `user` is extracted from the access-token JWT subject. Requires JFrog Artifactory 7.64.0 or newer on the remote side. `reference_token` additionally requires Access 7.38.4 or newer; older servers leave it empty.
+
+`reference_token` and `user` are written when available but are deliberately excluded from the engine's `Fields()` set, so `enrol.Manager.HasAllFields` does not reject enrolments on deployments that don't return them.
 
 ### SSH Engine
 

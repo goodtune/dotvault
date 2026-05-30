@@ -76,6 +76,15 @@ func ParseDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
+// Default connectivity values applied by validate(). Exported so the public
+// client facade (client/config.go) can apply the same defaults to a
+// hand-constructed config without re-typing the literals — keeping the two
+// from silently drifting.
+const (
+	DefaultKVMount    = "kv"
+	DefaultUserPrefix = "users/"
+)
+
 // Config is the top-level system configuration.
 type Config struct {
 	Vault         VaultConfig          `yaml:"vault"`
@@ -266,13 +275,13 @@ func (c *Config) validate() error {
 
 	// Default KV mount
 	if c.Vault.KVMount == "" {
-		c.Vault.KVMount = "kv"
+		c.Vault.KVMount = DefaultKVMount
 	}
 
 	// Default user prefix; ensure exactly one trailing slash so all
 	// consumers (sync engine, enrolment manager) build consistent paths.
 	if c.Vault.UserPrefix == "" {
-		c.Vault.UserPrefix = "users/"
+		c.Vault.UserPrefix = DefaultUserPrefix
 	} else {
 		c.Vault.UserPrefix = strings.TrimRight(c.Vault.UserPrefix, "/") + "/"
 	}

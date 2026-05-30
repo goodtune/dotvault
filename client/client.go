@@ -280,6 +280,14 @@ func (c *Client) Token() string {
 //   - ("", false, err)    for transport/auth failures, wrapping ErrUnreachable
 //     or ErrDenied.
 //
+// Caveat: Vault answers a read against a missing or disabled KV mount with a
+// 404, which is indistinguishable here from a not-yet-written secret — both
+// yield ("", false, nil). So a wrong mount (a mis-set kv_mount) reads as
+// "not enrolled" rather than an error. A caller that wants to tell a
+// misconfigured deployment apart from an un-enrolled user should verify the
+// mount independently (e.g. a known-present sentinel path) rather than infer
+// it from found == false.
+//
 // Non-string field values are stringified via fmt's %v: numbers and bools
 // render as you'd expect; a nested object or array renders as its Go-syntax
 // form (map[...]/[...]). dotvault stores credential material as strings, so in

@@ -149,9 +149,12 @@ func (c *Client) Authenticate(ctx context.Context) error {
 		// — which for LDAP prompts for a password on the terminal *before*
 		// it ever contacts Vault — confirm the server is actually reachable,
 		// so the documented "short-circuit ErrUnreachable without prompting"
-		// contract holds even on the no-token path. sys/health needs no auth
-		// and the SDK normalises standby/sealed/uninitialised to a non-error
-		// status, so this only fails on a genuine transport problem.
+		// contract holds even on the no-token path. sys/health needs no auth,
+		// and the Vault SDK sends uninitcode/sealedcode/standbycode=299 on the
+		// health request so an uninitialised, sealed, or standby node returns
+		// a non-error 2xx — meaning ServerHealth errors only on a genuine
+		// transport failure (DNS, refused, TLS, timeout), which is exactly the
+		// reachability signal we want.
 		if _, herr := c.vc.ServerHealth(ctx); herr != nil {
 			return fmt.Errorf("%w: %w", ErrUnreachable, herr)
 		}
@@ -218,8 +221,10 @@ func (c *Client) Login(ctx context.Context) error {
 }
 
 // manager builds an auth.Manager wired to this Client's Vault client and
-// config. The Username is the OS-derived identity (used for the LDAP prompt
-// and consistent with the path convention).
+// config. The Username is always the OS-derived name (used only as the
+// default for the LDAP password prompt); it is deliberately independent of
+// WithIdentity, which overrides only the kv/users/<identity>/... path segment,
+// not the login credential.
 func (c *Client) manager() (*auth.Manager, error) {
 	username, err := paths.Username()
 	if err != nil {

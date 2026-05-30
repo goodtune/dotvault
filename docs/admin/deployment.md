@@ -232,7 +232,7 @@ There is no file-based logging — integrate with your platform's log collection
 
 ## Observability
 
-dotvault can export OpenTelemetry metrics to a local OTel collector. Disabled by default; enable by adding an `observability:` block to `config.yaml`:
+dotvault can export OpenTelemetry **metrics and logs** to a local OTel collector — a single `observability:` block in `config.yaml` drives both signals against the same endpoint. Disabled by default; enable with:
 
 ```yaml
 observability:
@@ -245,8 +245,10 @@ observability:
   #   authorization: "Bearer …"
 ```
 
+For `http/protobuf`, set `endpoint` to a *base* URL like `https://otel.example` — the SDK appends `/v1/metrics` and `/v1/logs` itself. A URL that already includes a signal-specific path (e.g. ending in `/v1/metrics`) routes both signals to the same wrong route.
+
 !!! note "Windows Group Policy"
-    The `observability` block is configured via the YAML config file only — the GPO/registry layer (and the ADMX template) does not yet expose it. On a GPO-managed Windows install, point the collector via the standard `OTEL_*` environment variables (set through a machine-wide environment policy) until the registry surface is extended.
+    The `observability` block is now readable from the registry layer under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Observability` (`Enabled` REG_DWORD, `Endpoint` / `Protocol` / `ExportInterval` REG_SZ, `Insecure` REG_DWORD). Push the block via `reg-import` or set the keys directly with regedit; the ADMX policy editor doesn't yet surface them. **Headers are intentionally not registry-managed** — they typically carry OTLP bearer tokens, so they live in `OTEL_EXPORTER_OTLP_HEADERS` (set through a machine-wide environment policy) rather than checked-in registry values.
 
 The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the `endpoint`/`headers` fields can be left empty and managed centrally via `/etc/default/dotvault`.
 
@@ -263,6 +265,12 @@ The exporter emits a bounded set of instruments:
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
 | `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.vault-token` re-read |
+
+### Log records
+
+The OTel logs exporter is **not** a wholesale replacement for stderr — operational logging still goes through `log/slog` to stderr / journald. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal. Currently the only emit is:
+
+- **`configuration loaded from Windows Registry (Group Policy); file-based config is ignored`** — WARN severity, attribute `path=<would-be config file>`. Fires once per daemon/sync startup on a GPO-managed Windows box. Replaces the per-invocation `slog.Info` line that previously leaked onto stdout for every CLI invocation on a GPO-managed install.
 
 Health probes are served on the same loopback listener as the web UI and are therefore **only available when `web.enabled: true`**. A deployment with the OTel metrics block enabled but the web UI disabled has nothing to probe; point the `httpcheckreceiver` only at hosts where `web` is also enabled, or rely on the systemd `sd_notify(READY=1)` signal instead.
 

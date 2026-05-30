@@ -98,6 +98,22 @@ SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\scopes           (REG
 SOFTWARE\Policies\goodtune\dotvault\Enrolments\gh\Settings\https_proxy      (REG_SZ)        "http://squid.example.com:3128"
 ```
 
+### Observability
+
+OpenTelemetry metric and log exporter settings under `Observability`:
+
+```
+SOFTWARE\Policies\goodtune\dotvault\Observability\Enabled         (REG_DWORD)  1
+SOFTWARE\Policies\goodtune\dotvault\Observability\Endpoint        (REG_SZ)     "https://otel.example"
+SOFTWARE\Policies\goodtune\dotvault\Observability\Protocol        (REG_SZ)     "http/protobuf"
+SOFTWARE\Policies\goodtune\dotvault\Observability\Insecure        (REG_DWORD)  0
+SOFTWARE\Policies\goodtune\dotvault\Observability\ExportInterval  (REG_SZ)     "15s"
+```
+
+The block drives both signals (metrics and logs) against the same collector. For `http/protobuf`, `Endpoint` must be a base URL — the SDK appends `/v1/metrics` and `/v1/logs` itself; a URL ending in a signal-specific path routes both signals to the same wrong route.
+
+**Headers are intentionally not registry-managed.** They typically carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.) — push them via `OTEL_EXPORTER_OTLP_HEADERS` from a machine-wide environment policy rather than committing them to the registry. Without the `Observability` keys, a GPO-managed daemon runs with telemetry disabled and the `LogRegistryConfigManaged` WARN record (which signals "this daemon is on GPO-managed config") is silently dropped.
+
 The `https_proxy` value (or its `http_proxy` alias) is optional. When unset, the engine consults the machine's IE / WinHTTP proxy configuration — including any deployed PAC script — once per outbound request. Set it explicitly here only when you want this enrolment pinned to a specific proxy regardless of the system-level policy.
 
 ## Example: deploying via GPO

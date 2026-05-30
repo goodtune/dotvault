@@ -204,9 +204,10 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 
 	var gotSession, gotBearer string
 	var gotMintBody struct {
-		ExpiresIn   int64  `json:"expires_in"`
-		Refreshable bool   `json:"refreshable"`
-		Scope       string `json:"scope"`
+		ExpiresIn             int64  `json:"expires_in"`
+		Refreshable           bool   `json:"refreshable"`
+		Scope                 string `json:"scope"`
+		IncludeReferenceToken bool   `json:"include_reference_token"`
 	}
 	var requestHits, tokenHits, mintHits int
 
@@ -246,9 +247,10 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{
-				AccessToken:  mintedAccess,
-				RefreshToken: "dotvault-refresh-1",
-				TokenType:    "Bearer",
+				AccessToken:    mintedAccess,
+				RefreshToken:   "dotvault-refresh-1",
+				ReferenceToken: "minted-reference-1",
+				TokenType:      "Bearer",
 			})
 		default:
 			http.NotFound(w, r)
@@ -286,6 +288,9 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 	}
 	if creds["refresh_token"] != "dotvault-refresh-1" {
 		t.Errorf("refresh_token = %q, want %q", creds["refresh_token"], "dotvault-refresh-1")
+	}
+	if creds["reference_token"] != "minted-reference-1" {
+		t.Errorf("reference_token = %q, want %q", creds["reference_token"], "minted-reference-1")
 	}
 	if creds["user"] != "alice" {
 		t.Errorf("user = %q, want %q", creds["user"], "alice")
@@ -330,6 +335,9 @@ func TestJFrogEngine_Run_FullFlow(t *testing.T) {
 	}
 	if gotMintBody.Scope != "applied-permissions/user" {
 		t.Errorf("mint scope = %q, want %q", gotMintBody.Scope, "applied-permissions/user")
+	}
+	if !gotMintBody.IncludeReferenceToken {
+		t.Error("mint include_reference_token = false, want true")
 	}
 	if gotSession == "" {
 		t.Error("server did not observe a session uuid")
@@ -401,6 +409,12 @@ func TestJFrogEngine_Run_MintUsesV1Endpoint(t *testing.T) {
 	}
 	if creds["access_token"] != minted {
 		t.Errorf("access_token = %q, want minted %q", creds["access_token"], minted)
+	}
+	// This server omits reference_token (pre-7.38.4 behaviour). The field must
+	// still be present in the stored secret as an empty string rather than
+	// absent, so downstream `{{ .reference_token }}` templates render cleanly.
+	if rt, ok := creds["reference_token"]; !ok || rt != "" {
+		t.Errorf("reference_token = %q (present=%t), want present and empty", rt, ok)
 	}
 	if v1Hits != 1 {
 		t.Errorf("v1 /tokens hits = %d, want 1", v1Hits)
@@ -505,8 +519,9 @@ func TestJFrogEngine_Refresh_Success(t *testing.T) {
 			_ = r.ParseForm()
 			gotForm = r.PostForm
 			_ = json.NewEncoder(w).Encode(jfrogCommonTokenParams{
-				AccessToken:  rotatedAccess,
-				RefreshToken: "new-refresh",
+				AccessToken:    rotatedAccess,
+				RefreshToken:   "new-refresh",
+				ReferenceToken: "rotated-reference",
 			})
 			return
 		}
@@ -535,6 +550,9 @@ func TestJFrogEngine_Refresh_Success(t *testing.T) {
 	if got["refresh_token"] != "new-refresh" {
 		t.Errorf("refresh_token = %q, want %q", got["refresh_token"], "new-refresh")
 	}
+	if got["reference_token"] != "rotated-reference" {
+		t.Errorf("reference_token = %q, want %q", got["reference_token"], "rotated-reference")
+	}
 	if got["user"] != "alice" {
 		t.Errorf("user = %q, want alice", got["user"])
 	}
@@ -555,6 +573,9 @@ func TestJFrogEngine_Refresh_Success(t *testing.T) {
 	}
 	if gotForm.Get("refresh_token") != "old-refresh" {
 		t.Errorf("form refresh_token = %q, want old-refresh", gotForm.Get("refresh_token"))
+	}
+	if gotForm.Get("include_reference_token") != "true" {
+		t.Errorf("form include_reference_token = %q, want true", gotForm.Get("include_reference_token"))
 	}
 }
 
@@ -583,6 +604,11 @@ func TestJFrogEngine_Refresh_NonJWTKeepsUser(t *testing.T) {
 	}
 	if got["user"] != "alice" {
 		t.Errorf("user = %q, want alice (preserved from existing)", got["user"])
+	}
+	// The rotated response carries no reference_token; the field must be
+	// present-and-empty rather than absent.
+	if rt, ok := got["reference_token"]; !ok || rt != "" {
+		t.Errorf("reference_token = %q (present=%t), want present and empty", rt, ok)
 	}
 }
 

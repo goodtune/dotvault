@@ -58,6 +58,9 @@ rules:
     target:
       path: "~/tmp/.jfrog/jfrog-cli.conf.v6"
       format: json
+      # The enrolment also stores `reference_token` (the opaque equivalent
+      # of `access_token`); reference it via `{{ .reference_token }}` in a
+      # rule template if a downstream tool prefers the short form.
       template: |
         {
           "servers": [

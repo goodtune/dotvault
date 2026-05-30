@@ -63,6 +63,11 @@ func (e *JFrogEngine) Name() string { return "JFrog" }
 // enrolments with reference-token deployments. GitHub's engine takes the
 // same approach — its `user` value is written when available but isn't
 // required for `HasAllFields`.
+//
+// `reference_token` is likewise NOT listed: the engine always requests one
+// (include_reference_token=true) and writes it when present, but JFrog only
+// returns it on Access 7.38.4+. Requiring it would reject enrolments on
+// older servers; downstream sync rules opt in via `{{ .reference_token }}`.
 func (e *JFrogEngine) Fields() []string {
 	return []string{
 		"access_token",
@@ -213,18 +218,19 @@ func (e *JFrogEngine) Run(ctx context.Context, settings map[string]any, io IO) (
 
 	now := e.clock()
 	result := map[string]string{
-		"access_token":  minted.AccessToken,
-		"refresh_token": minted.RefreshToken,
-		"url":           platformURL,
-		"server_id":     serverID,
-		"user":          user,
-		"issued_at":     now.UTC().Format(time.RFC3339),
-		"expires_at":    now.Add(ttl).UTC().Format(time.RFC3339),
+		"access_token":    minted.AccessToken,
+		"refresh_token":   minted.RefreshToken,
+		"reference_token": minted.ReferenceToken,
+		"url":             platformURL,
+		"server_id":       serverID,
+		"user":            user,
+		"issued_at":       now.UTC().Format(time.RFC3339),
+		"expires_at":      now.Add(ttl).UTC().Format(time.RFC3339),
 	}
 	return result, nil
 }
 
-// Refresh rotates a dotvault-owned JFrog token pair. Returns the same 7
+// Refresh rotates a dotvault-owned JFrog token pair. Returns the same 8
 // fields that Run returns so the caller can atomically replace the Vault
 // secret. A 401/403 from the access service means the refresh token itself
 // has been revoked upstream — callers should treat that as permanent and
@@ -278,13 +284,14 @@ func (e *JFrogEngine) Refresh(ctx context.Context, settings map[string]any, exis
 
 	now := e.clock()
 	return map[string]string{
-		"access_token":  rotated.AccessToken,
-		"refresh_token": rotated.RefreshToken,
-		"url":           platformURL,
-		"server_id":     serverID,
-		"user":          user,
-		"issued_at":     now.UTC().Format(time.RFC3339),
-		"expires_at":    now.Add(ttl).UTC().Format(time.RFC3339),
+		"access_token":    rotated.AccessToken,
+		"refresh_token":   rotated.RefreshToken,
+		"reference_token": rotated.ReferenceToken,
+		"url":             platformURL,
+		"server_id":       serverID,
+		"user":            user,
+		"issued_at":       now.UTC().Format(time.RFC3339),
+		"expires_at":      now.Add(ttl).UTC().Format(time.RFC3339),
 	}, nil
 }
 
@@ -349,11 +356,12 @@ func deduceJFrogServerID(platformURL string) (string, error) {
 
 // jfrogCommonTokenParams mirrors jfrog-client-go's auth.CommonTokenParams.
 type jfrogCommonTokenParams struct {
-	Scope        string `json:"scope,omitempty"`
-	AccessToken  string `json:"access_token,omitempty"`
-	ExpiresIn    *uint  `json:"expires_in,omitempty"`
-	TokenType    string `json:"token_type,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope          string `json:"scope,omitempty"`
+	AccessToken    string `json:"access_token,omitempty"`
+	ExpiresIn      *uint  `json:"expires_in,omitempty"`
+	TokenType      string `json:"token_type,omitempty"`
+	RefreshToken   string `json:"refresh_token,omitempty"`
+	ReferenceToken string `json:"reference_token,omitempty"`
 }
 
 // jfrogSendLoginRequest performs the initial POST to the JFrog Access service
@@ -459,13 +467,20 @@ func jfrogPollForToken(ctx context.Context, client *http.Client, platformURL, se
 func jfrogMintRefreshableToken(ctx context.Context, client *http.Client, platformURL, bootstrapToken string, ttl time.Duration) (jfrogCommonTokenParams, error) {
 	endpoint := platformURL + "/access/api/v1/tokens"
 	body, err := json.Marshal(struct {
-		ExpiresIn   int64  `json:"expires_in"`
-		Refreshable bool   `json:"refreshable"`
-		Scope       string `json:"scope"`
+		ExpiresIn             int64  `json:"expires_in"`
+		Refreshable           bool   `json:"refreshable"`
+		Scope                 string `json:"scope"`
+		IncludeReferenceToken bool   `json:"include_reference_token"`
 	}{
 		ExpiresIn:   int64(ttl.Seconds()),
 		Refreshable: true,
 		Scope:       "applied-permissions/user",
+		// Always ask JFrog to also mint an opaque reference token alongside
+		// the JWT access token. Downstream sync rules decide whether to write
+		// it out; capturing it here is free and avoids a re-enrolment later.
+		// On servers older than Access 7.38.4 the field is simply absent from
+		// the response, so reference_token ends up empty — never an error.
+		IncludeReferenceToken: true,
 	})
 	if err != nil {
 		return jfrogCommonTokenParams{}, err
@@ -510,9 +525,10 @@ func jfrogMintRefreshableToken(ctx context.Context, client *http.Client, platfor
 func jfrogExchangeRefreshToken(ctx context.Context, client *http.Client, platformURL, accessToken, refreshToken string) (jfrogCommonTokenParams, error) {
 	endpoint := platformURL + "/access/api/v1/tokens"
 	form := url.Values{
-		"grant_type":    []string{"refresh_token"},
-		"access_token":  []string{accessToken},
-		"refresh_token": []string{refreshToken},
+		"grant_type":              []string{"refresh_token"},
+		"access_token":            []string{accessToken},
+		"refresh_token":           []string{refreshToken},
+		"include_reference_token": []string{"true"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {

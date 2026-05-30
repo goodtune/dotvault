@@ -28,14 +28,18 @@ import (
 // separate sentinel so callers that want to distinguish "wrong creds" from
 // "no creds offered" can.
 //
-// Every categorised error that has an underlying cause wraps both the sentinel
-// and that cause with %w, so a caller can errors.Is the sentinel and errors.As
-// the cause (a *vaultapi.ResponseError) from the same value. (A few errors have
-// no Vault cause to wrap — e.g. the no-token branch of AuthenticateCached or a
-// construction failure in New — and wrap only the sentinel.) The wrapped text
-// comes from Vault's API error (which echoes the server response body, never
-// the request token) plus the mount/path being read — none of it carries token
-// material, so callers may log these errors verbatim.
+// Every categorised error wraps one of these sentinels with %w, so a caller
+// can errors.Is it. Where there is an underlying Vault cause, that cause is
+// wrapped too (a second %w), so the same value also errors.As to a
+// *vaultapi.ResponseError; the no-token branch of AuthenticateCached has no
+// such cause and wraps only the sentinel. The wrapped text comes from Vault's
+// API error (which echoes the server response body, never the request token)
+// plus the mount/path being read — none of it carries token material, so
+// callers may log these errors verbatim.
+//
+// New's own input-validation errors (nil config, missing address) are plain
+// errors, not categorised: they are programmer errors surfaced before any
+// Vault interaction, outside the sentinel taxonomy below.
 var (
 	// ErrLoginRequired indicates no usable cached token was found (neither
 	// VAULT_TOKEN nor the token file yielded a token that LookupSelf

@@ -11,9 +11,11 @@ import "github.com/goodtune/dotvault/client"
 
 ctx := context.Background()
 
-// DefaultConfigPath() resolves per-OS: /etc/xdg/dotvault/config.yaml (Linux,
-// honouring XDG_CONFIG_DIRS), %ProgramData%\dotvault\config.yaml (Windows, or
-// the GPO registry if present), Application Support (macOS).
+// DefaultConfigPath() returns the per-OS config *file* path:
+// /etc/xdg/dotvault/config.yaml (Linux, honouring XDG_CONFIG_DIRS),
+// %ProgramData%\dotvault\config.yaml (Windows), Application Support (macOS).
+// LoadConfig reads that file — or, on Windows, the GPO registry instead when
+// policy keys are present (it routes through config.LoadSystem).
 cfg, err := client.LoadConfig(client.DefaultConfigPath())
 if err != nil { /* fail closed */ }
 

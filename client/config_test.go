@@ -3,6 +3,7 @@ package client
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -108,5 +109,21 @@ func TestDefaultPaths(t *testing.T) {
 	}
 	if DefaultTokenFile() == "" {
 		t.Error("DefaultTokenFile empty")
+	}
+}
+
+// TestDefaultTokenFile_HomeUnavailable verifies DefaultTokenFile recovers the
+// panic paths.VaultTokenPath raises when the home directory can't be resolved,
+// returning "" rather than crashing a consumer. On non-Windows, an empty $HOME
+// makes os.UserHomeDir fail; Windows uses %USERPROFILE% and doesn't panic, so
+// skip there.
+func TestDefaultTokenFile_HomeUnavailable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("VaultTokenPath uses USERPROFILE on Windows; no panic path")
+	}
+	t.Setenv("HOME", "")
+	got := DefaultTokenFile()
+	if got != "" {
+		t.Fatalf("DefaultTokenFile() = %q, want \"\" when home is unresolvable", got)
 	}
 }

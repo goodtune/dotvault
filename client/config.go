@@ -80,8 +80,24 @@ func DefaultConfigPath() string {
 }
 
 // DefaultTokenFile returns the platform-appropriate path to the Vault token
-// file dotvault reads and writes (~/.vault-token).
-func DefaultTokenFile() string {
+// file dotvault reads and writes (~/.vault-token), or "" if the OS home
+// directory cannot be resolved.
+//
+// paths.VaultTokenPath panics (via mustHomeDir) when os.UserHomeDir fails —
+// acceptable inside the daemon, but a public library must not panic on a
+// recoverable environment condition. We therefore guard it and return ""
+// rather than fabricating a path. An empty token-file path is already
+// well-defined throughout the package: token resolution simply skips the file
+// and uses VAULT_TOKEN only. Returning "" (not a relative ".vault-token", which
+// would be cwd-dependent and could silently diverge from where the daemon
+// looks) keeps that contract honest; a caller that needs a specific location
+// sets Config.TokenFile explicitly.
+func DefaultTokenFile() (path string) {
+	defer func() {
+		if recover() != nil {
+			path = ""
+		}
+	}()
 	return paths.VaultTokenPath()
 }
 

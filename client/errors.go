@@ -58,13 +58,19 @@ var (
 	// not attempted at all.
 	ErrAuthFailed = errors.New("dotvault: authentication failed")
 
-	// ErrDenied indicates Vault rejected the request with 401/403 — the
-	// token is missing the required policy, or was revoked between the
-	// LookupSelf check and the read (see TestReadKVField_Denied).
+	// ErrDenied indicates Vault rejected a KV read with 401/403 — the token
+	// is missing the required policy, or was revoked between the LookupSelf
+	// check and the read (see TestReadKVField_Denied). Note that a 401/403
+	// from validating a *cached* token during AuthenticateCached is reported
+	// as ErrLoginRequired instead (the token needs replacing, not the
+	// caller's authority), so ErrDenied is the read-path authorisation
+	// failure, not every 403 the package sees.
 	ErrDenied = errors.New("dotvault: vault denied the request")
 
 	// ErrUnreachable indicates the Vault server could not be reached
-	// (DNS, connection refused, TLS handshake, timeout) or returned a 5xx.
+	// (DNS, connection refused, TLS handshake, timeout) or could not service
+	// the request right now (5xx, or 429 rate-limiting) — i.e. a retryable
+	// transport/availability problem rather than an authorisation decision.
 	ErrUnreachable = errors.New("dotvault: vault unreachable")
 )
 
@@ -81,10 +87,14 @@ func classify(err error) error {
 		case respErr.StatusCode == http.StatusUnauthorized,
 			respErr.StatusCode == http.StatusForbidden:
 			return ErrDenied
+		case respErr.StatusCode == http.StatusTooManyRequests:
+			// 429 is Vault rate-limiting/quota — retryable, not an auth
+			// decision. Bucket it with ErrUnreachable so callers back off.
+			return ErrUnreachable
 		case respErr.StatusCode >= 500:
 			return ErrUnreachable
 		default:
-			// 4xx other than 401/403 (e.g. 400). A KV-read 404 never
+			// 4xx other than 401/403/429 (e.g. 400). A KV-read 404 never
 			// reaches here — ReadKVv2 intercepts it and ReadKVField returns
 			// found == false — so this bucket is for genuine client errors
 			// on other endpoints. Treat as denied-ish; the caller still gets

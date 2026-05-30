@@ -237,13 +237,13 @@ func TestReadKVField(t *testing.T) {
 		t.Fatalf("got (%q, %v, %v), want (ghp_abc, true, nil)", val, found, err)
 	}
 
-	// Missing field on an existing secret → (",", false, nil).
+	// Missing field on an existing secret → ("", false, nil).
 	_, found, err = c.ReadKVField(context.Background(), "kv", "users/tester/gh", "nope")
 	if err != nil || found {
 		t.Fatalf("missing field: got (found=%v, err=%v), want (false, nil)", found, err)
 	}
 
-	// Missing secret path → (",", false, nil).
+	// Missing secret path → ("", false, nil).
 	_, found, err = c.ReadKVField(context.Background(), "kv", "users/tester/absent", "x")
 	if err != nil || found {
 		t.Fatalf("missing path: got (found=%v, err=%v), want (false, nil)", found, err)

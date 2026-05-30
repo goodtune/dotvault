@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
@@ -311,11 +312,24 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
 
+	// Build the SSH agent backend if enabled. Construction is side-effect-free
+	// (no Vault calls — vault-ca ephemeral keys are generated in memory), so
+	// it is safe before authentication and lets the web server surface agent
+	// status. The transport listener itself is started only after the first
+	// successful Vault auth, below.
+	var agentSvc *agent.Service
+	if cfg.Agent.Enabled {
+		agentSvc, err = agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
+		if err != nil {
+			return fmt.Errorf("ssh agent: %w", err)
+		}
+	}
+
 	// Start web UI if enabled. We start it before authentication so it can
 	// serve the OIDC browser-based login flow.
 	var webServer *web.Server
 	if cfg.Web.Enabled {
-		webServer, err = web.NewServer(web.ServerConfig{
+		webCfg := web.ServerConfig{
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
@@ -326,7 +340,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
-		})
+		}
+		if agentSvc != nil {
+			webCfg.Agent = agentSvc.Backend
+		}
+		webServer, err = web.NewServer(webCfg)
 		if err != nil {
 			slog.Error("failed to create web server", "error", err)
 		} else {
@@ -400,6 +418,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
+
+	// Start the SSH agent listener now that we hold a Vault token. The gate is
+	// wired before the listener accepts connections so a Sign issued during a
+	// token refresh blocks briefly on the lifecycle manager instead of failing.
+	// Run supervises the listener (restart-on-terminate) until ctx is
+	// cancelled; the backend persists across token refreshes without a restart.
+	if agentSvc != nil {
+		agentSvc.Backend.SetReauthGate(lm)
+		go agentSvc.Run(ctx)
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint())
+	}
 
 	// Start refresh manager for any enrolment whose engine rotates its own
 	// credentials (currently JFrog). Failures are logged and retried on the
@@ -706,7 +735,58 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printAgentStatus(ctx, cfg, vc, token)
+
 	return nil
+}
+
+// printAgentStatus renders the SSH agent section of `dotvault status`: the
+// resolved endpoint and, when a valid token is available, the live identities
+// (with per-cert TTL) and any per-source resolution error. Resolving
+// identities reaches into Vault, so it is skipped without a token. This runs
+// against a freshly-built backend in the status process, not the daemon, so it
+// reflects what the daemon would serve rather than its in-memory cache.
+func printAgentStatus(ctx context.Context, cfg *config.Config, vc *vault.Client, token string) {
+	if !cfg.Agent.Enabled {
+		return
+	}
+	fmt.Println("\nSSH Agent:")
+	username, err := paths.Username()
+	if err != nil {
+		fmt.Printf("  resolve username: %v\n", err)
+		return
+	}
+	svc, err := agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
+	if err != nil {
+		fmt.Printf("  error: %v\n", err)
+		return
+	}
+	fmt.Printf("  endpoint: %s\n", svc.Endpoint())
+	if token == "" {
+		fmt.Println("  identities: (not authenticated — run dotvault login)")
+		return
+	}
+	st := svc.Backend.Status(ctx)
+	for _, src := range st.Sources {
+		if src.Error != "" {
+			fmt.Printf("  %-16s error: %s\n", src.Name, src.Error)
+			continue
+		}
+		if len(src.Identities) == 0 {
+			fmt.Printf("  %-16s (no identities)\n", src.Name)
+			continue
+		}
+		for _, id := range src.Identities {
+			line := fmt.Sprintf("  %-16s %s", src.Name, id.Fingerprint)
+			if id.Comment != "" {
+				line += " " + id.Comment
+			}
+			if id.IsCert && id.ExpiresAt != "" {
+				line += fmt.Sprintf(" (cert, expires %s)", id.ExpiresAt)
+			}
+			fmt.Println(line)
+		}
+	}
 }
 
 // runLogin implements `dotvault login` — always forces a fresh login via

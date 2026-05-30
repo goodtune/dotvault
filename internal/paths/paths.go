@@ -65,6 +65,18 @@ func VaultTokenPath() string {
 	}
 }
 
+// DefaultAgentSocket returns the per-user Unix domain socket path for the SSH
+// agent when agent.unix.path is unset. It prefers the runtime dir
+// ($XDG_RUNTIME_DIR/dotvault/agent.sock), which is owner-only and cleared on
+// logout, and falls back to the cache dir dotvault already resolves when
+// XDG_RUNTIME_DIR is empty (typical on macOS).
+func DefaultAgentSocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "agent.sock")
+	}
+	return filepath.Join(CacheDir(), "agent.sock")
+}
+
 // Username returns the current OS username with any domain prefix stripped.
 func Username() (string, error) {
 	u, err := user.Current()

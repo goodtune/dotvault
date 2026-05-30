@@ -69,6 +69,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// SSH agent status (listed identities, per-cert TTL, source errors),
+	// parallel to the per-rule sync state above. Authenticated only — it
+	// reaches into Vault to resolve identities.
+	if authenticated && s.agentStatus != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		status["agent"] = s.agentStatus.Status(ctx)
+	}
+
 	writeJSON(w, status)
 }
 

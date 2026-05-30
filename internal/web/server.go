@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
@@ -30,6 +31,7 @@ type Server struct {
 	obsCfg             config.ObservabilityConfig
 	vault              *vault.Client
 	engine             *internalsync.Engine
+	agentStatus        agentStatusProvider
 	csrf               *CSRFStore
 	oauth              *OAuthManager
 	login              *auth.LoginTracker
@@ -71,6 +73,13 @@ type Server struct {
 	initialSyncDone atomic.Bool
 }
 
+// agentStatusProvider yields the SSH agent's current status snapshot for the
+// dashboard. *agent.Backend satisfies it. Kept as an interface so the web
+// server stays testable without constructing a real agent.
+type agentStatusProvider interface {
+	Status(ctx context.Context) agent.Status
+}
+
 // ServerConfig holds all dependencies for the web server.
 type ServerConfig struct {
 	WebCfg        config.WebConfig
@@ -80,6 +89,8 @@ type ServerConfig struct {
 	Rules         []config.Rule
 	Vault         *vault.Client
 	Engine        *internalsync.Engine
+	// Agent, when non-nil, exposes the SSH agent status on /api/v1/status.
+	Agent         agentStatusProvider
 	Username      string
 	TokenFilePath string
 	Version       string
@@ -110,6 +121,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		obsCfg:             narrowedObsCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
+		agentStatus:        sc.Agent,
 		csrf:               NewCSRFStore(),
 		oauth:              NewOAuthManager(),
 		login:              auth.NewLoginTracker(sc.Vault),

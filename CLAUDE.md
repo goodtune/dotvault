@@ -83,6 +83,7 @@ The vault-init container seeds sample secrets, enables OIDC auth via Dex, and ex
 
 ```
 cmd/dotvault/main.go     CLI entry point (Cobra)
+client/                  Public, importable Go API (facade over internal/{config,auth,vault}) — see "Public client API"
 internal/
   config/                Config loading: YAML file + Windows Registry (GPO)
   paths/                 OS-specific path resolution
@@ -312,6 +313,16 @@ On detecting an invalid/expired token (403 Forbidden or TTL=0 + concrete
 In web mode the daemon also re-opens the browser to the web UI root when
 the lifecycle manager signals re-auth, subject to a 10-minute cooldown
 to avoid flapping during transient errors.
+
+## Public client API
+
+`client/` (`github.com/goodtune/dotvault/client`) is the only supported import boundary for other Go modules. It is a thin facade over `internal/config`, `internal/auth`, and `internal/vault` that exposes dotvault's connectivity, token-resolution order, login flow, and `kv/users/<user>/...` path convention so a consumer (e.g. the `rat` agent runner, optiver-global/agent-sandbox#187) reads from exactly where dotvault writes instead of re-deriving any of it. The internals stay internal; the facade lets them be refactored freely. See `client/README.md` for the consumer-facing write-up.
+
+Surface: `LoadConfig(path)` (projects the validated system config onto a connectivity-and-auth-only `Config`; `DefaultConfigPath()` / `DefaultTokenFile()` give the canonical locations), `New(cfg)`, and on `*Client`: `Authenticate` (env → file → interactive login, short-circuiting `ErrUnreachable` without prompting), `AuthenticateCached` (env → file only, never prompts — for side-effect-free `doctor`-style preflight, returns `ErrLoginRequired` when no token is usable), `Login` (unconditional fresh login, `= dotvault login`), `IdentityName`, `Token`, `ReadKVField(ctx, mount, path, field)`, and `ReadUserSecret(ctx, service, field)` (composes `{kv_mount}/{user_prefix}{identity}/{service}`). Reads return `(value, found, err)` so a missing path/field is `found == false` with `err == nil`, never conflated with a transport failure. Error categories are `errors.Is`-able sentinels: `ErrLoginRequired`, `ErrAuthFailed`, `ErrDenied`, `ErrUnreachable`.
+
+**Identity is the OS user, not the token.** `IdentityName` returns `paths.Username()` (the OS account, `DOMAIN\` prefix stripped) — the same value the sync engine and enrolment manager use to lay out `kv/users/<user>/...`. It is deliberately *not* derived from the Vault token's `display_name`/entity/metadata, because that is not what dotvault writes under. Consumers must therefore run as the same OS user as the dotvault that populated the secrets (normally true for a per-user daemon). This is the one place the public API contradicts a naive "identity comes from the token" assumption, and it is load-bearing — changing it would be a path-layout migration, not a facade tweak.
+
+The facade legally imports `internal/*` because it lives inside the same module; external modules import only `client`, never the internals. When the connectivity/auth shape of the system config changes, update the `client.Config` projection (`client/config.go`) in lockstep so the public surface doesn't silently drift from what the daemon parses.
 
 ## Sync Engine
 

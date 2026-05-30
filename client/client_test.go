@@ -1,0 +1,296 @@
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// fakeVault stands up an httptest server that answers the handful of Vault
+// endpoints this package exercises: token lookup-self and KV v2 reads. It
+// lets the tests run without a live Vault and without the network.
+type fakeVault struct {
+	srv *httptest.Server
+	// secrets maps "<mount>/<path>" to its data map.
+	secrets map[string]map[string]any
+	// tokenValid controls whether lookup-self succeeds.
+	tokenValid bool
+	// unreachable, when set, makes every endpoint return 502 (simulating a
+	// dead upstream that still answers at the socket).
+	unreachable bool
+}
+
+func newFakeVault(t *testing.T) *fakeVault {
+	t.Helper()
+	fv := &fakeVault{secrets: map[string]map[string]any{}, tokenValid: true}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/auth/token/lookup-self", func(w http.ResponseWriter, r *http.Request) {
+		if fv.unreachable {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if !fv.tokenValid || r.Header.Get("X-Vault-Token") == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"id": "tok", "ttl": 3600, "creation_ttl": 7200},
+		})
+	})
+
+	// KV v2 reads land on /v1/<mount>/data/<path>.
+	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
+		if fv.unreachable {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		// Strip "/v1/" prefix, then split "<mount>/data/<path>".
+		rest := r.URL.Path[len("/v1/"):]
+		const marker = "/data/"
+		i := indexOf(rest, marker)
+		if i < 0 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mount := rest[:i]
+		path := rest[i+len(marker):]
+		data, ok := fv.secrets[mount+"/"+path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"data":     data,
+				"metadata": map[string]any{"version": 1},
+			},
+		})
+	})
+
+	fv.srv = httptest.NewServer(mux)
+	t.Cleanup(fv.srv.Close)
+	return fv
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func newTestClient(t *testing.T, fv *fakeVault) *Client {
+	t.Helper()
+	c, err := New(&Config{
+		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token"},
+		// Point the token file somewhere empty by default; tests that want a
+		// cached token set VAULT_TOKEN or override.
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return c
+}
+
+func TestNew_Defaults(t *testing.T) {
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.cfg.Vault.KVMount != "kv" {
+		t.Errorf("KVMount = %q, want kv", c.cfg.Vault.KVMount)
+	}
+	if c.cfg.Vault.UserPrefix != "users/" {
+		t.Errorf("UserPrefix = %q, want users/", c.cfg.Vault.UserPrefix)
+	}
+	if c.cfg.TokenFile == "" {
+		t.Error("TokenFile should default to a non-empty path")
+	}
+}
+
+func TestNew_RequiresAddress(t *testing.T) {
+	if _, err := New(&Config{}); err == nil {
+		t.Fatal("expected error for empty address")
+	}
+	if _, err := New(nil); err == nil {
+		t.Fatal("expected error for nil config")
+	}
+}
+
+func TestUserPrefixNormalised(t *testing.T) {
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://x", UserPrefix: "team/users"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.cfg.Vault.UserPrefix != "team/users/" {
+		t.Errorf("UserPrefix = %q, want team/users/", c.cfg.Vault.UserPrefix)
+	}
+}
+
+func TestAuthenticateCached_NoToken(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+
+	err := c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired", err)
+	}
+}
+
+func TestAuthenticateCached_EnvToken(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "good-token" {
+		t.Errorf("Token = %q, want good-token", c.Token())
+	}
+}
+
+func TestAuthenticateCached_FileToken(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	fv := newFakeVault(t)
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
+	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(&Config{Vault: VaultConfig{Address: fv.srv.URL}, TokenFile: tokenFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "file-token" {
+		t.Errorf("Token = %q, want file-token (trimmed)", c.Token())
+	}
+}
+
+func TestAuthenticateCached_InvalidToken(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "stale")
+	fv := newFakeVault(t)
+	fv.tokenValid = false
+	c := newTestClient(t, fv)
+
+	err := c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired for rejected token", err)
+	}
+}
+
+func TestAuthenticateCached_Unreachable(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "tok")
+	fv := newFakeVault(t)
+	fv.unreachable = true
+	c := newTestClient(t, fv)
+
+	err := c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestAuthenticate_UnreachableDoesNotLogin(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "tok")
+	fv := newFakeVault(t)
+	fv.unreachable = true
+	c := newTestClient(t, fv)
+
+	// AuthMethod "token" would error in Login; but Authenticate must
+	// short-circuit on unreachable before reaching Login.
+	err := c.Authenticate(context.Background())
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestReadKVField(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	fv.secrets["kv/users/tester/gh"] = map[string]any{"oauth_token": "ghp_abc", "user": "tester"}
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	val, found, err := c.ReadKVField(context.Background(), "kv", "users/tester/gh", "oauth_token")
+	if err != nil || !found || val != "ghp_abc" {
+		t.Fatalf("got (%q, %v, %v), want (ghp_abc, true, nil)", val, found, err)
+	}
+
+	// Missing field on an existing secret → (",", false, nil).
+	_, found, err = c.ReadKVField(context.Background(), "kv", "users/tester/gh", "nope")
+	if err != nil || found {
+		t.Fatalf("missing field: got (found=%v, err=%v), want (false, nil)", found, err)
+	}
+
+	// Missing secret path → (",", false, nil).
+	_, found, err = c.ReadKVField(context.Background(), "kv", "users/tester/absent", "x")
+	if err != nil || found {
+		t.Fatalf("missing path: got (found=%v, err=%v), want (false, nil)", found, err)
+	}
+}
+
+func TestReadKVField_Denied(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Flip the server to reject everything as unreachable after auth.
+	fv.unreachable = true
+	_, _, err := c.ReadKVField(context.Background(), "kv", "users/tester/gh", "oauth_token")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestReadUserSecret(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := c.IdentityName()
+	if err != nil {
+		t.Fatalf("IdentityName: %v", err)
+	}
+	fv.secrets["kv/users/"+id+"/litellm"] = map[string]any{"token": "sk-xyz"}
+
+	val, found, err := c.ReadUserSecret(context.Background(), "litellm", "token")
+	if err != nil || !found || val != "sk-xyz" {
+		t.Fatalf("got (%q, %v, %v), want (sk-xyz, true, nil)", val, found, err)
+	}
+}
+
+func TestReadKVField_NonStringStringified(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	fv.secrets["kv/users/tester/meta"] = map[string]any{"count": 42, "on": true}
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	val, found, err := c.ReadKVField(context.Background(), "kv", "users/tester/meta", "count")
+	if err != nil || !found || val != "42" {
+		t.Fatalf("got (%q, %v, %v), want (42, true, nil)", val, found, err)
+	}
+}

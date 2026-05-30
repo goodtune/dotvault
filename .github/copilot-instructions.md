@@ -1,33 +1,24 @@
-# Copilot instructions for dotvault
+# Copilot review instructions — dotvault
 
-dotvault is a cross-platform Go daemon that authenticates to HashiCorp Vault and synchronises KVv2 secrets into local config files. These notes capture project conventions so reviews and suggestions stay aligned with how the codebase actually works. Prefer them over generic Go heuristics where they conflict.
+Go daemon syncing HashiCorp Vault KVv2 secrets to local files. Project facts below override generic Go heuristics. Don't re-raise points already covered here.
 
-## Go examples (`ExampleXxx` in `_test.go`)
+## Go examples — do not flag as non-hermetic
 
-`go test` only **executes** an example function when it has an `// Output:` (or `// Unordered output:`) comment. An example with no output directive is **compiled but never run** — it serves purely as godoc. This is standard `testing` package behaviour (see https://pkg.go.dev/testing#hdr-Examples), not a project quirk.
-
-Consequently, in `client/example_test.go`:
-
-- `Example` and `ExampleClient_AuthenticateCached` have **no** `// Output:` directive. They are never run by `go test`, so they do **not** load host config, contact Vault, prompt interactively, or call `os.Exit`. They are intentionally illustrative godoc showing the real-world flow, mirroring how the standard library ships compile-checked-but-not-run examples.
-- `ExampleReader` is the only runnable example: it is fully in-memory (a fake `client.Reader`) with a deterministic `// Output:`.
-
-Do **not** flag the non-running examples as making the test suite non-hermetic, hang CI, or risk `os.Exit` — they cannot, because they never execute. Suggestions to gate them behind an env var or add an `os` import are unnecessary (that import would be unused in functions that don't run). This point has been raised and resolved repeatedly; please don't re-raise it.
+`go test` runs an `ExampleXxx` only if it has an `// Output:` comment; without one it is compiled but never executed (https://pkg.go.dev/testing#hdr-Examples). In `client/example_test.go`, `Example` and `ExampleClient_AuthenticateCached` have no `// Output:`, so they never run — they cannot load host config, contact Vault, prompt, hang CI, or call `os.Exit`. They are deliberate godoc. `ExampleReader` is the only runnable one (in-memory fake, deterministic output). Do not suggest env-guards, an `os` import, renaming, or httptest rewrites for the non-running examples.
 
 ## Error wrapping
 
-The public `client` package uses `errors.Is`-able sentinels (`ErrLoginRequired`, `ErrAuthFailed`, `ErrDenied`, `ErrUnreachable`). Categorised errors wrap the sentinel with `%w`, and where a Vault cause exists they wrap it too (a second `%w`, valid since Go 1.20), so a value can both `errors.Is` the sentinel and `errors.As` the underlying `*vaultapi.ResponseError`. `New`'s input-validation errors (nil config, missing address) are deliberately plain, non-categorised programmer errors. Don't suggest replacing the documented `%w` pattern with `%v`.
+`client` uses `errors.Is`-able sentinels (`ErrLoginRequired`, `ErrAuthFailed`, `ErrDenied`, `ErrUnreachable`). Categorised errors wrap the sentinel with `%w`, and where a Vault cause exists wrap it too (second `%w`, valid Go 1.20+) so the value also `errors.As`-es to `*vaultapi.ResponseError`. Keep `%w`; don't suggest `%v`. `New`'s validation errors (nil config, missing address) are intentionally plain, non-categorised programmer errors.
 
-## Vault SDK behaviour worth knowing
+## Vault SDK facts
 
-- `Sys().Health()`/`HealthWithContext` sends `uninitcode`/`sealedcode`/`standbycode=299` query params, so an uninitialised, sealed, or standby node returns a **non-error 2xx**. `internal/vault.ServerHealth` therefore errors only on a genuine transport failure — it is a reachability probe, not a readiness check. Don't flag standby/sealed as an error path for it.
-- The Vault API decodes JSON with `UseNumber()`, so numbers arrive as `json.Number` (a string kind); `fmt`'s `%v` renders them in canonical decimal form. No scientific-notation hazard.
+- `Sys().Health()` sends `uninitcode`/`sealedcode`/`standbycode=299`, so uninitialised/sealed/standby return non-error 2xx. `internal/vault.ServerHealth` errors only on transport failure — it's a reachability probe, not readiness. Don't flag standby/sealed as an error path.
+- Vault decodes JSON with `UseNumber()`; numbers are `json.Number` (string kind), so `%v` renders canonical decimal. No scientific-notation hazard.
 
-## Identity / KV path convention
+## Identity / KV paths
 
-dotvault lays out secrets at `{kv_mount}/{user_prefix}{identity}/{service}`. The `<identity>` segment defaults to the **OS username** (domain-stripped), not the Vault token's display name — this is load-bearing and matches what the sync engine and enrolment manager write. `client.WithIdentity(name)` overrides only the KV-path identity; it deliberately does **not** change the OS-derived username used as the LDAP login-prompt default. Don't suggest deriving identity from the token by default.
+Layout: `{kv_mount}/{user_prefix}{identity}/{service}`. `<identity>` defaults to the OS username (domain-stripped), matching what the sync engine and enrolment write — not the token display name. `client.WithIdentity(name)` overrides only the KV-path identity, deliberately not the OS-derived username used as the LDAP prompt default. Don't suggest token-derived identity by default. Vault KV paths use literal `/`, never `filepath.Join`.
 
-## General
+## Invariants
 
-- Pure Go only; `CGO_ENABLED=0` is an invariant. Don't suggest CGO-requiring dependencies.
-- Vault KV paths use literal `/`, never `filepath.Join` (which would break on Windows).
-- The public surface is `client/`; `internal/*` is the implementation. The facade legally imports `internal/*` because it is in the same module.
+Pure Go; `CGO_ENABLED=0` — no CGO deps. Public surface is `client/`; `internal/*` is implementation (the facade legally imports it, same module).

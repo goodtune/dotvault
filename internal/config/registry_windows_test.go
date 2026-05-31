@@ -97,11 +97,11 @@ func TestApplyRegistryLayerObservability(t *testing.T) {
 	enabled := uint32(1)
 	insecure := uint32(0)
 	layer := registryLayer{
-		ObservabilityEnabled:        &enabled,
-		ObservabilityEndpoint:       "https://otel.example",
-		ObservabilityProtocol:       "http/protobuf",
-		ObservabilityInsecure:       &insecure,
-		ObservabilityExportInterval: "30s",
+		ObservabilityEnabled:  &enabled,
+		ObservabilityEndpoint: "https://otel.example",
+		ObservabilityProtocol: "http/protobuf",
+		ObservabilityInsecure: &insecure,
+		ObservabilityInterval: "30s",
 	}
 	applyRegistryLayer(cfg, layer)
 
@@ -412,6 +412,74 @@ func TestReadRegistryAgentKeysNonNumericRejected(t *testing.T) {
 	_, err = readRegistryAgentKeys(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad`)
 	if err == nil {
 		t.Fatalf("expected an error for a non-integer key subkey name")
+	}
+}
+
+// TestApplyRegistryLayerWebText covers the Web markdown fields applied from
+// the registry layer; the observability scalars are covered by
+// TestApplyRegistryLayerObservability above.
+func TestApplyRegistryLayerWebText(t *testing.T) {
+	cfg := &Config{}
+	layer := registryLayer{
+		WebLoginText:      "# Welcome",
+		WebSecretViewText: "Handle with care.",
+	}
+	applyRegistryLayer(cfg, layer)
+
+	if cfg.Web.LoginText != "# Welcome" {
+		t.Errorf("Web.LoginText = %q", cfg.Web.LoginText)
+	}
+	if cfg.Web.SecretViewText != "Handle with care." {
+		t.Errorf("Web.SecretViewText = %q", cfg.Web.SecretViewText)
+	}
+}
+
+func TestReadRegistryObservabilityHeaders(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-obs\Observability\Headers`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-obs\Observability`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-obs`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-obs\Observability\Headers`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Headers key: %v", err)
+	}
+	// Mixed-case header name to confirm the loader preserves case verbatim.
+	if err := k.SetStringValue("X-Honeycomb-Team", "abc123"); err != nil {
+		t.Fatalf("set header: %v", err)
+	}
+	if err := k.SetStringValue("Authorization", "Bearer tok"); err != nil {
+		t.Fatalf("set header: %v", err)
+	}
+	k.Close()
+
+	headers, err := readRegistryObservabilityHeaders(registry.CURRENT_USER, `SOFTWARE\dotvault-test-obs`)
+	if err != nil {
+		t.Fatalf("readRegistryObservabilityHeaders: %v", err)
+	}
+	if len(headers) != 2 {
+		t.Fatalf("len(headers) = %d, want 2", len(headers))
+	}
+	if headers["X-Honeycomb-Team"] != "abc123" {
+		t.Errorf("X-Honeycomb-Team = %q, want %q", headers["X-Honeycomb-Team"], "abc123")
+	}
+	if headers["Authorization"] != "Bearer tok" {
+		t.Errorf("Authorization = %q, want %q", headers["Authorization"], "Bearer tok")
+	}
+}
+
+func TestReadRegistryObservabilityHeadersNotExist(t *testing.T) {
+	headers, err := readRegistryObservabilityHeaders(registry.CURRENT_USER, `SOFTWARE\dotvault-nonexistent-obs`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if headers != nil {
+		t.Errorf("expected nil headers, got %v", headers)
 	}
 }
 

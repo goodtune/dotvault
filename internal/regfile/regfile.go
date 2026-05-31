@@ -46,6 +46,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeVault(cfg.Vault)
 	e.writeSync(cfg.Sync)
 	e.writeWeb(cfg.Web)
+	e.writeObservability(cfg.Observability)
 	e.writeAgent(cfg.Agent)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -113,6 +114,52 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 	e.writeKey(rootKey + `\Web`)
 	e.writeBool("Enabled", w.Enabled)
 	e.writeString("Listen", w.Listen)
+	// LoginText / SecretViewText are markdown blobs that may span multiple
+	// lines; writeString falls through to hex(1) when it spots a newline or
+	// non-ASCII byte, so they round-trip the same way rule templates do.
+	e.writeString("LoginText", w.LoginText)
+	e.writeString("SecretViewText", w.SecretViewText)
+	e.WriteString("\r\n")
+}
+
+// writeObservability emits the Observability section: the scalar fields,
+// then the Headers map as a dedicated subkey.
+//
+// Headers routinely carry OTLP bearer tokens, but dotvault treats config
+// conversion as lossless in every direction (mirroring
+// ObservabilityConfig, which no longer strips them on YAML export), so they
+// are emitted verbatim. Each header is a REG_SZ value under
+// Observability\Headers named after the header key; header names are case
+// preserved (HTTP folds case, but a faithful round-trip keeps the authored
+// form). Like Rules / Enrolments / Agent\Keys the dynamic subtree is
+// deleted before re-creation so a header removed from the source clears on
+// re-import rather than lingering.
+func (e *emitter) writeObservability(o config.ObservabilityConfig) {
+	e.writeKey(rootKey + `\Observability`)
+	e.writeBool("Enabled", o.Enabled)
+	e.writeString("Endpoint", o.Endpoint)
+	e.writeString("Protocol", o.Protocol)
+	e.writeBool("Insecure", o.Insecure)
+	// Emit RawInterval as the user wrote it (matching writeSync); the value
+	// name mirrors the YAML key (export_interval) capitalised for the registry.
+	e.writeString("ExportInterval", o.RawInterval)
+	e.WriteString("\r\n")
+
+	// Always pre-delete the Headers subtree so removals round-trip. No-op on
+	// a registry that never had it.
+	e.writeKeyDeletion(rootKey + `\Observability\Headers`)
+	if len(o.Headers) == 0 {
+		return
+	}
+	e.writeKey(rootKey + `\Observability\Headers`)
+	names := make([]string, 0, len(o.Headers))
+	for n := range o.Headers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		e.writeString(n, o.Headers[n])
+	}
 	e.WriteString("\r\n")
 }
 

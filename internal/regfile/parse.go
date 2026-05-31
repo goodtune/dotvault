@@ -456,13 +456,14 @@ func unescapeREGString(s string) string {
 // because canonicalizeKeyPath only canonicalises positions it expects
 // to be a fixed segment.
 var canonicalSegments = map[string]string{
-	"vault":      "Vault",
-	"sync":       "Sync",
-	"web":        "Web",
-	"rules":      "Rules",
-	"enrolments": "Enrolments",
-	"oauth":      "OAuth",
-	"settings":   "Settings",
+	"vault":         "Vault",
+	"sync":          "Sync",
+	"web":           "Web",
+	"observability": "Observability",
+	"rules":         "Rules",
+	"enrolments":    "Enrolments",
+	"oauth":         "OAuth",
+	"settings":      "Settings",
 }
 
 // canonicalizeKeyPath normalises path so that comparisons against
@@ -494,6 +495,15 @@ func canonicalizeKeyPath(path string) string {
 		if c, ok := canonicalSegments[strings.ToLower(parts[rootDepth+2])]; ok {
 			parts[rootDepth+2] = c
 		}
+	}
+	// Observability\Headers is the one fixed segment at rootDepth+1 (a
+	// position otherwise reserved for user-defined rule/enrolment names,
+	// which we never fold). Canonicalise it only when its parent is the
+	// Observability section so a hand-authored .reg using `headers` in any
+	// case still matches the exact-string lookups in applyValues.
+	if len(parts) > rootDepth+1 && parts[rootDepth] == "Observability" &&
+		strings.EqualFold(parts[rootDepth+1], "Headers") {
+		parts[rootDepth+1] = "Headers"
 	}
 	return strings.Join(parts, `\`)
 }
@@ -626,8 +636,53 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	if err := applyBool(&cfg.Web.Enabled, webKey, "Enabled"); err != nil {
 		return err
 	}
-	if err := apply(&cfg.Web.Listen, webKey, "Listen"); err != nil {
+	for _, fn := range []func() error{
+		func() error { return apply(&cfg.Web.Listen, webKey, "Listen") },
+		func() error { return apply(&cfg.Web.LoginText, webKey, "LoginText") },
+		func() error { return apply(&cfg.Web.SecretViewText, webKey, "SecretViewText") },
+	} {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+
+	// Observability. The scalar fields mirror the renderer; Headers live in
+	// a dedicated subkey (see below) because they're a dynamic key/value map.
+	obsKey := rootKey + `\Observability`
+	if err := applyBool(&cfg.Observability.Enabled, obsKey, "Enabled"); err != nil {
 		return err
+	}
+	if err := applyBool(&cfg.Observability.Insecure, obsKey, "Insecure"); err != nil {
+		return err
+	}
+	for _, fn := range []func() error{
+		func() error { return apply(&cfg.Observability.Endpoint, obsKey, "Endpoint") },
+		func() error { return apply(&cfg.Observability.Protocol, obsKey, "Protocol") },
+		func() error { return apply(&cfg.Observability.RawInterval, obsKey, "ExportInterval") },
+	} {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	// Observability headers: every REG_SZ value directly under
+	// Observability\Headers. Conversion is lossless in every direction, so the
+	// renderer emits these verbatim and an admin may also author them by hand /
+	// GPO; either way we read them back. Header names are preserved verbatim —
+	// HTTP folds case, but a faithful round-trip keeps the authored form,
+	// unlike the lowercased enrolment Settings names.
+	headersKey := obsKey + `\Headers`
+	headers := map[string]string{}
+	for vk, v := range values {
+		if vk.key != headersKey {
+			continue
+		}
+		if v.kind != rvSZ {
+			return fmt.Errorf("registry value %s\\%s has unsupported type %s for an observability header (only REG_SZ is supported)", headersKey, vk.name, kindName(v.kind))
+		}
+		headers[vk.name] = v.str
+	}
+	if len(headers) > 0 {
+		cfg.Observability.Headers = headers
 	}
 
 	// Agent.

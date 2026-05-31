@@ -280,12 +280,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
-	// Zero out the bearer-token map now that the SDK has
-	// consumed it. cfg lives for the daemon's full lifetime;
-	// keeping Headers in the heap-resident Config struct gives a
-	// future log statement, JSON encoder, or debug handler a
-	// path to exfiltrate the credential. The OTel SDK keeps its
-	// own copy internally.
+	// Capture the observability config (including Headers) for the web
+	// server before we scrub the daemon's long-lived copy below. The
+	// config-download endpoint serves the effective config losslessly, so
+	// it needs the live header values. A struct copy shares the underlying
+	// Headers map, and the scrub below only reassigns cfg's field, so this
+	// copy retains the real headers. Only consumed when web is enabled.
+	obsCfgForWeb := cfg.Observability
+	// Zero out the bearer-token map on the daemon's long-lived cfg now that
+	// the SDK has consumed it. cfg lives for the daemon's full lifetime;
+	// keeping Headers in the heap-resident Config struct gives a future log
+	// statement, JSON encoder, or debug handler a path to exfiltrate the
+	// credential. The OTel SDK keeps its own copy internally; the web
+	// server (if enabled) holds obsCfgForWeb.
 	cfg.Observability.Headers = nil
 
 	// Surface the registry-config notification through the OTel
@@ -384,7 +391,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
-			ObsCfg:        cfg.Observability,
+			ObsCfg:        obsCfgForWeb,
 			AgentCfg:      cfg.Agent,
 			Rules:         cfg.Rules,
 			Vault:         vc,

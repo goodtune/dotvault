@@ -438,7 +438,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
 		go agentSvc.Run(ctx)
-		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint())
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
 	// Watch the token file for replacement and nudge the lifecycle

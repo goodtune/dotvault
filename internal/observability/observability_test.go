@@ -169,6 +169,40 @@ func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
 	}
 }
 
+// TestInitBuildsResource locks in the empty-schema-URL contract in
+// Init (observability.go): the custom resource must merge with
+// resource.Default() without a "conflicting Schema URL" error,
+// regardless of which semconv schema the installed otel/sdk pins in
+// Default(). This is the regression guard for the otel/sdk bump that
+// moved Default()'s schema ahead of the semconv version this package
+// imports — without the empty schema URL, Init returns an error here.
+// TestProtocolFallthroughToEnv covers this too, incidentally, but its
+// name signposts protocol selection rather than resource construction.
+func TestInitBuildsResource(t *testing.T) {
+	prevMP := otel.GetMeterProvider()
+	prevLP := global.GetLoggerProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		global.SetLoggerProvider(prevLP)
+		rebindInstruments()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	p, err := Init(ctx, Config{
+		Enabled:  true,
+		Endpoint: "127.0.0.1:0",
+		Insecure: true,
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if p == nil {
+		t.Fatal("Init returned a nil provider")
+	}
+	_ = p.Shutdown(ctx)
+}
+
 // TestProtocolFallthroughToEnv confirms an empty cfg.Protocol picks
 // up the OTel env-var convention. The metrics-specific override wins
 // over the generic one, matching the SDK's documented precedence.

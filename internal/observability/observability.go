@@ -178,10 +178,21 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 
 	hostname, _ := os.Hostname()
 
+	// The supplementary resource is deliberately created with an empty
+	// schema URL rather than semconv.SchemaURL. resource.Merge errors with
+	// "conflicting Schema URL" when both operands carry a non-empty but
+	// differing schema, and resource.Default() tracks whichever semconv
+	// version the installed otel/sdk embeds — which advances independently
+	// of the semconv package this file imports. Hard-coding our schema here
+	// reintroduces that conflict on every SDK bump that moves the default
+	// schema (e.g. sdk v1.44.0 moved it to 1.41.0 while we import v1.40.0).
+	// Leaving it empty lets Merge adopt Default()'s schema, so the
+	// attribute keys stay canonical without coupling us to the SDK's
+	// semconv revision.
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
+			"",
 			semconv.ServiceName("dotvault"),
 			semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
 			semconv.HostName(hostname),

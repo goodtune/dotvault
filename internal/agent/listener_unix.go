@@ -7,15 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
-	"syscall"
 	"time"
 )
-
-// umaskMu serialises the umask swap around bind so a concurrent file write
-// elsewhere in the daemon can't observe (or be created under) the temporary
-// 0177 mask. The window is a single Listen call.
-var umaskMu sync.Mutex
 
 // platformListen creates the Unix domain socket with 0600 permissions and a
 // 0700 parent directory. A stale socket left by an unclean shutdown is removed
@@ -46,14 +39,15 @@ func (l *Listener) platformListen() (net.Listener, error) {
 		}
 	}
 
-	// Bind under a 0177 umask so the socket is created 0600 with no window at
-	// looser permissions, then chmod as belt-and-braces (some platforms apply
-	// the umask differently to AF_UNIX nodes).
-	umaskMu.Lock()
-	old := syscall.Umask(0o177)
+	// Bind, then immediately tighten the socket to 0600. We deliberately do not
+	// touch the process-global umask (syscall.Umask): it would apply to every
+	// file any other daemon goroutine creates during the bind window — the sync
+	// engine writing a managed file, the state store saving — giving them
+	// unexpectedly tight modes. The brief moment the socket itself sits at the
+	// default-umask mode before the chmod is closed by the 0700 parent dir
+	// created above: no other user can traverse into it to reach the socket,
+	// whatever the socket's own bits are.
 	ln, err := net.Listen("unix", path)
-	syscall.Umask(old)
-	umaskMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("listen unix %s: %w", path, err)
 	}

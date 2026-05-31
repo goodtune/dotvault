@@ -114,9 +114,16 @@ directory. Only you can connect either way — the equivalent of dotvault's
 
 ## Status
 
-The agent's listed identities, per-certificate TTL, and any per-source
-resolution errors appear in `dotvault status` and on the web dashboard,
-parallel to the per-rule sync state.
+The agent's listed identities and any per-source resolution errors appear in
+`dotvault status` and on the web dashboard, parallel to the per-rule sync state.
+
+`dotvault status` resolves KV sources into live key fingerprints, but
+*describes* vault-ca sources from configuration rather than minting a
+certificate — a short-lived CLI invocation minting a throwaway cert on every
+`status` call would hit Vault and produce a certificate unrelated to the one the
+running daemon serves. The **web dashboard** is the authoritative view of the
+actual minted certificate and its remaining TTL, since it reads the live
+daemon's cached cert.
 
 ```
 $ dotvault status
@@ -124,7 +131,7 @@ $ dotvault status
 SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
   kv:ssh           SHA256:… users/alice/ssh/laptop
-  vault-ca:dotvault-user  SHA256:… vault-ca:dotvault-user (cert, expires 2026-05-30T12:15:00Z)
+  vault-ca:dotvault-user  certificate minted on demand (mount=ssh-client-signer, role=dotvault-user, ttl=15m0s)
 ```
 
 ## Server-side prerequisite for cert mode

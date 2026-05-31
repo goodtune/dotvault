@@ -741,32 +741,28 @@ func runStatus(cmd *cobra.Command, args []string) error {
 }
 
 // printAgentStatus renders the SSH agent section of `dotvault status`: the
-// resolved endpoint and, when a valid token is available, the live identities
-// (with per-cert TTL) and any per-source resolution error. Resolving
-// identities reaches into Vault, so it is skipped without a token. This runs
-// against a freshly-built backend in the status process, not the daemon, so it
-// reflects what the daemon would serve rather than its in-memory cache.
+// resolved endpoint and, when a valid token is available, the configured key
+// sources. KV sources are resolved into live identities (cheap, read-only KV
+// lookups); vault-ca sources are described from configuration rather than
+// minted, so a status call never generates a throwaway key or hits Vault's sign
+// endpoint. The running daemon's web dashboard is the authoritative view of the
+// actual minted certificate and its remaining TTL.
 func printAgentStatus(ctx context.Context, cfg *config.Config, vc *vault.Client, token string) {
 	if !cfg.Agent.Enabled {
 		return
 	}
 	fmt.Println("\nSSH Agent:")
+	fmt.Printf("  endpoint: %s\n", agent.ResolveEndpoint(cfg.Agent))
+	if token == "" {
+		fmt.Println("  identities: (not authenticated — run dotvault login)")
+		return
+	}
 	username, err := paths.Username()
 	if err != nil {
 		fmt.Printf("  resolve username: %v\n", err)
 		return
 	}
-	svc, err := agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
-	if err != nil {
-		fmt.Printf("  error: %v\n", err)
-		return
-	}
-	fmt.Printf("  endpoint: %s\n", svc.Endpoint())
-	if token == "" {
-		fmt.Println("  identities: (not authenticated — run dotvault login)")
-		return
-	}
-	st := svc.Backend.Status(ctx)
+	st := agent.DescribeConfig(ctx, cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username)
 	for _, src := range st.Sources {
 		if src.Error != "" {
 			fmt.Printf("  %-16s error: %s\n", src.Name, src.Error)
@@ -777,7 +773,10 @@ func printAgentStatus(ctx context.Context, cfg *config.Config, vc *vault.Client,
 			continue
 		}
 		for _, id := range src.Identities {
-			line := fmt.Sprintf("  %-16s %s", src.Name, id.Fingerprint)
+			line := fmt.Sprintf("  %-16s", src.Name)
+			if id.Fingerprint != "" {
+				line += " " + id.Fingerprint
+			}
 			if id.Comment != "" {
 				line += " " + id.Comment
 			}

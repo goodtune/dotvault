@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -18,6 +19,12 @@ type ReauthGate interface {
 	NeedsReauth() bool
 }
 
+// gateHolder wraps a ReauthGate so it can live in an atomic.Value. atomic.Value
+// panics if successive Stores use different concrete types; wrapping every gate
+// in this single struct type keeps the stored type stable regardless of which
+// ReauthGate implementation (the real LifecycleManager, a test stub) is wired.
+type gateHolder struct{ gate ReauthGate }
+
 const (
 	defaultListCacheTTL  = 8 * time.Second
 	defaultReauthTimeout = 30 * time.Second
@@ -30,7 +37,12 @@ type Backend struct {
 	sources  []Source
 	endpoint string
 
-	gate          ReauthGate
+	// gate holds a gateHolder. It is read on every Sign and written by
+	// SetReauthGate (which the daemon calls after construction, before the
+	// listener accepts connections). The atomic.Value makes that wiring safe
+	// against a concurrent Sign rather than relying on the happens-before being
+	// obvious to a future caller.
+	gate          atomic.Value
 	reauthTimeout time.Duration
 	cacheTTL      time.Duration
 	now           func() time.Time
@@ -45,11 +57,29 @@ type Option func(*Backend)
 
 // WithReauthGate wires the token-lifecycle gate used to block Sign briefly
 // during a re-authentication window.
-func WithReauthGate(g ReauthGate) Option { return func(b *Backend) { b.gate = g } }
+func WithReauthGate(g ReauthGate) Option { return func(b *Backend) { b.setGate(g) } }
 
-// SetReauthGate wires the gate after construction. Call it before the listener
-// begins accepting connections so it never races a concurrent Sign.
-func (b *Backend) SetReauthGate(g ReauthGate) { b.gate = g }
+// SetReauthGate wires the gate after construction. Safe to call concurrently
+// with Sign — the store is atomic — though in practice the daemon sets it once,
+// before the listener begins accepting connections. A nil argument is a no-op
+// (the gate cannot be un-wired); nothing relies on clearing it.
+func (b *Backend) SetReauthGate(g ReauthGate) { b.setGate(g) }
+
+// setGate stores the gate, ignoring a nil so WithReauthGate(nil) (the headless
+// / no-lifecycle case) leaves the backend gate-less rather than boxing a nil.
+func (b *Backend) setGate(g ReauthGate) {
+	if g != nil {
+		b.gate.Store(gateHolder{gate: g})
+	}
+}
+
+// reauthGate returns the wired gate, or nil if none has been set.
+func (b *Backend) reauthGate() ReauthGate {
+	if h, ok := b.gate.Load().(gateHolder); ok {
+		return h.gate
+	}
+	return nil
+}
 
 // WithReauthTimeout bounds how long Sign waits for re-auth to clear.
 func WithReauthTimeout(d time.Duration) Option {
@@ -158,7 +188,8 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 // progress, up to the deadline carried by ctx. Without a gate it returns
 // immediately.
 func (b *Backend) waitForToken(ctx context.Context) error {
-	if b.gate == nil || !b.gate.NeedsReauth() {
+	gate := b.reauthGate()
+	if gate == nil || !gate.NeedsReauth() {
 		return nil
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -168,7 +199,7 @@ func (b *Backend) waitForToken(ctx context.Context) error {
 		case <-ctx.Done():
 			return fmt.Errorf("ssh agent: vault token unavailable (re-auth in progress): %w", ctx.Err())
 		case <-ticker.C:
-			if !b.gate.NeedsReauth() {
+			if !gate.NeedsReauth() {
 				return nil
 			}
 		}

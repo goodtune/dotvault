@@ -27,7 +27,7 @@ func NewService(agentCfg config.AgentConfig, vc *vault.Client, kvMount, userPref
 	if err != nil {
 		return nil, err
 	}
-	addr := resolveEndpoint(agentCfg)
+	addr := ResolveEndpoint(agentCfg)
 	backend := NewBackend(sources, WithReauthGate(gate), WithEndpoint(addr))
 	return &Service{
 		Backend:  backend,
@@ -65,9 +65,10 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 
-// resolveEndpoint picks the platform endpoint, applying per-user defaults when
-// the config leaves the path/pipe empty.
-func resolveEndpoint(agentCfg config.AgentConfig) string {
+// ResolveEndpoint picks the platform endpoint, applying per-user defaults when
+// the config leaves the path/pipe empty. Exported so the CLI status command can
+// report the endpoint without constructing a full Service.
+func ResolveEndpoint(agentCfg config.AgentConfig) string {
 	if runtime.GOOS == "windows" {
 		if agentCfg.Windows.Pipe != "" {
 			return agentCfg.Windows.Pipe

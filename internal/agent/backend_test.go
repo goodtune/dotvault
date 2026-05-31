@@ -169,6 +169,31 @@ func TestBackendSignConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
+// TestBackendSetReauthGateRace exercises the exact race the atomic gate guards:
+// the daemon calling SetReauthGate after construction while clients are already
+// issuing Sign calls. Run under -race, an unsynchronised gate field trips the
+// detector here.
+func TestBackendSetReauthGateRace(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+	b := NewBackend([]Source{srcA})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.SetReauthGate(&stubGate{}) // each store is a distinct gate value
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = b.Sign(pubA, []byte("x"))
+		}()
+	}
+	wg.Wait()
+}
+
 // ensure *Backend satisfies the x/crypto ExtendedAgent interface.
 var _ agent.ExtendedAgent = (*Backend)(nil)
 

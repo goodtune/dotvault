@@ -15,6 +15,12 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
+// defaultCertTTL is the vault-ca certificate lifetime applied when a source
+// omits `ttl`. Shared by newVaultCASource (the live mint path) and
+// DescribeConfig (the `dotvault status` description) so the two can't report
+// different defaults.
+const defaultCertTTL = 15 * time.Minute
+
 // certSigner mints an SSH certificate from a Vault SSH-CA role. Abstracted so
 // the source is unit-testable without a live Vault SSH secrets engine.
 type certSigner interface {
@@ -51,7 +57,7 @@ func newVaultCASource(name string, signer certSigner, mount, role string, princi
 		return newErrSource(name, "vault-ca", fmt.Errorf("vault-ca requires ephemeral_key: true")), nil
 	}
 	if ttl <= 0 {
-		ttl = 15 * time.Minute
+		ttl = defaultCertTTL
 	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

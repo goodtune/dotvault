@@ -92,6 +92,7 @@ internal/
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   observability/         OTel metrics SDK wiring, package-level instrument helpers
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
+  tokenwatch/            Watches ~/.vault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
@@ -102,7 +103,7 @@ internal/
   tray/                  Windows system-tray icon (no-op on other platforms)
 test/integration/        Integration tests against real Vault
 packaging/windows/       ADMX Group Policy template
-packaging/linux/         systemd units (dotvault.service + token-watch path/service, shipped in RPM/DEB)
+packaging/linux/         systemd units (dotvault.service, shipped in RPM/DEB/APK)
 ```
 
 ## Configuration
@@ -277,7 +278,7 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 9. Background goroutine reloads config on each tick for enrolment changes only
 10. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
 
-SIGHUP triggers an immediate `~/.vault-token` re-read via `LifecycleManager.Reload` — handy for picking up a token freshly written by `dotvault login` without waiting for the 5-minute lifecycle tick. The shipped `packaging/linux/dotvault-token-watch.path` unit drives this automatically: any change to `~/.vault-token` activates `dotvault-token-watch.service`, which runs `systemctl --user kill --signal=SIGHUP dotvault.service`. The systemd-native path is deliberate — it targets the unit's MainPID rather than scanning the process table for anything named `dotvault`, so a developer running `go run ./cmd/dotvault` or `dotvault sync` from a shell while the daemon also happens to be running won't have those side processes SIGHUP'd (their default disposition for SIGHUP is *terminate*).
+The daemon watches `~/.vault-token` for replacement and re-reads it immediately via `LifecycleManager.Reload` — handy for picking up a token freshly written by `dotvault login` without waiting for the 5-minute lifecycle tick. On Linux this uses inotify on the token file's parent directory (`internal/tokenwatch/`, watching the directory rather than the inode because atomic writers replace it via temp-file+rename); creation and write-completion events trigger a reload, deletes are ignored so the daemon keeps using its current in-memory token until a new one is written. On non-Linux platforms the watcher is a no-op. This replaces the previously shipped `dotvault-token-watch.path`/`.service` systemd units, which forwarded `~/.vault-token` changes to the daemon via SIGHUP out-of-process. SIGHUP still triggers the same re-read manually (`LifecycleManager.Reload`) on every platform where it is delivered (not Windows), e.g. `systemctl --user kill --signal=SIGHUP dotvault.service`, which targets the unit's MainPID rather than scanning the process table for anything named `dotvault`, so a developer running `go run ./cmd/dotvault` or `dotvault sync` from a shell while the daemon also happens to be running won't have those side processes SIGHUP'd (their default disposition for SIGHUP is *terminate*).
 
 Full config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
 

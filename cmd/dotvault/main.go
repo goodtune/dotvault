@@ -26,6 +26,7 @@ import (
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
+	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
@@ -247,10 +248,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	cfg.Observability.Headers = nil
 
 	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
-	// via the LifecycleManager (the bundled dotvault-token-watch.path unit
-	// drives this so a fresh token written by `dotvault login` is picked
-	// up within seconds, without waiting for the 5-minute tick). Full
-	// config reload on SIGHUP is still not implemented.
+	// via the LifecycleManager so a fresh token written by `dotvault
+	// login` is picked up within seconds, without waiting for the
+	// 5-minute tick. This is the manual counterpart to the in-process
+	// inotify watcher (internal/tokenwatch) wired in further down, which
+	// performs the same re-read automatically on token-file changes.
+	// Full config reload on SIGHUP is still not implemented.
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
@@ -400,6 +403,25 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
+
+	// Watch the token file for replacement and nudge the lifecycle
+	// manager to re-read it immediately. This is the in-process
+	// analogue of the old systemd `.path` unit (which SIGHUP'd the
+	// daemon on every ~/.vault-token change) and is complementary to
+	// the still-present SIGHUP handler. On Linux it uses inotify on the
+	// token file's parent directory; on other platforms it is a no-op
+	// that blocks until shutdown. Creation and update events trigger a
+	// reload; deletes are ignored so the daemon keeps using its current
+	// token until a new one is written.
+	go func() {
+		onTokenChange := func() {
+			slog.Debug("vault token file changed, re-reading")
+			lm.Reload()
+		}
+		if err := tokenwatch.Watch(ctx, tokenPath, onTokenChange); err != nil && ctx.Err() == nil {
+			slog.Warn("token-file watcher stopped", "error", err)
+		}
+	}()
 
 	// Start refresh manager for any enrolment whose engine rotates its own
 	// credentials (currently JFrog). Failures are logged and retried on the

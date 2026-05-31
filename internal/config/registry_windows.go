@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
@@ -54,20 +56,27 @@ func loadFromRegistry() (*Config, bool, error) {
 	}
 	cfg.Enrolments = enrolments
 
+	// Read the ordered agent key sources from the machine-level policy key.
+	agentKeys, err := readRegistryAgentKeys(registry.LOCAL_MACHINE, registryPolicyPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("read registry agent keys: %w", err)
+	}
+	cfg.Agent.Keys = agentKeys
+
 	return cfg, true, nil
 }
 
 // registryLayer holds the flat values read from a single registry hive.
 type registryLayer struct {
 	// Vault
-	VaultAddress            string
-	VaultCACert             string
-	VaultTLSSkipVerify      *uint32
-	VaultKVMount            string
-	VaultUserPrefix         string
-	VaultAuthMethod         string
-	VaultAuthRole           string
-	VaultAuthMount          string
+	VaultAddress             string
+	VaultCACert              string
+	VaultTLSSkipVerify       *uint32
+	VaultKVMount             string
+	VaultUserPrefix          string
+	VaultAuthMethod          string
+	VaultAuthRole            string
+	VaultAuthMount           string
 	VaultDisableTokenRenewal *uint32
 
 	// Sync
@@ -76,6 +85,12 @@ type registryLayer struct {
 	// Web
 	WebEnabled *uint32
 	WebListen  string
+
+	// Agent (scalar transport settings; the ordered Keys list is read
+	// separately by readRegistryAgentKeys).
+	AgentEnabled     *uint32
+	AgentUnixPath    string
+	AgentWindowsPipe string
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
@@ -132,6 +147,18 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.WebListen, _ = readRegString(wk, "Listen")
 	}
 
+	// Read Agent subkey (scalar transport settings only).
+	ak, err := registry.OpenKey(root, registryPolicyPath+`\Agent`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Agent policy key: %w", err)
+	}
+	if err == nil {
+		defer ak.Close()
+		layer.AgentEnabled = readRegDWORD(ak, "Enabled")
+		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
+		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
+	}
+
 	return layer, true, nil
 }
 
@@ -173,6 +200,15 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.WebListen != "" {
 		cfg.Web.Listen = layer.WebListen
+	}
+	if layer.AgentEnabled != nil {
+		cfg.Agent.Enabled = *layer.AgentEnabled != 0
+	}
+	if layer.AgentUnixPath != "" {
+		cfg.Agent.Unix.Path = layer.AgentUnixPath
+	}
+	if layer.AgentWindowsPipe != "" {
+		cfg.Agent.Windows.Pipe = layer.AgentWindowsPipe
 	}
 }
 
@@ -360,6 +396,94 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 	}
 
 	return enrolment, nil
+}
+
+// readRegistryAgentKeys reads the ordered SSH-agent key sources from
+// Agent\Keys under the given root. Each source is a subkey named after its
+// zero-based list index; the names are sorted numerically so the slice is
+// rebuilt in the order the YAML/.reg encoded it. A non-integer subkey name is
+// a hard error — the renderer only ever emits numeric indices, so anything
+// else means hand-edited or foreign input and silently reordering (or
+// dropping) it would change which key the agent presents.
+// Returns (nil, nil) when the Agent\Keys key does not exist. basePath is the
+// registry path containing the Agent subkey (registryPolicyPath in production;
+// a temporary path under HKCU in tests).
+//
+// The numeric-sort-with-reject logic here is a twin of
+// regfile.sortAgentKeyNames (internal/regfile/parse.go). They can't share code
+// — this file is //go:build windows, regfile is platform-neutral — so keep the
+// two in lockstep when the ordering contract changes.
+func readRegistryAgentKeys(root registry.Key, basePath string) ([]AgentKeySource, error) {
+	keysPath := basePath + `\Agent\Keys`
+	key, err := registry.OpenKey(root, keysPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open Agent\\Keys key at %s: %w", keysPath, err)
+	}
+	defer key.Close()
+
+	info, err := key.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Agent\\Keys key: %w", err)
+	}
+
+	names, err := key.ReadSubKeyNames(int(info.SubKeyCount))
+	if err != nil {
+		return nil, fmt.Errorf("enumerate agent key subkeys: %w", err)
+	}
+
+	type idx struct {
+		name string
+		n    int
+	}
+	parsed := make([]idx, 0, len(names))
+	for _, name := range names {
+		n, err := strconv.Atoi(name)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("agent key subkey %q under HKLM\\%s is not a non-negative integer index", name, keysPath)
+		}
+		parsed = append(parsed, idx{name: name, n: n})
+	}
+	sort.Slice(parsed, func(i, j int) bool { return parsed[i].n < parsed[j].n })
+
+	sources := make([]AgentKeySource, 0, len(parsed))
+	for _, p := range parsed {
+		src, err := readSingleAgentKey(root, keysPath+`\`+p.name)
+		if err != nil {
+			return nil, fmt.Errorf("read agent key %q: %w", p.name, err)
+		}
+		sources = append(sources, src)
+	}
+	return sources, nil
+}
+
+// readSingleAgentKey reads one AgentKeySource from its registry subkey.
+func readSingleAgentKey(root registry.Key, path string) (AgentKeySource, error) {
+	key, err := registry.OpenKey(root, path, registry.READ)
+	if err != nil {
+		return AgentKeySource{}, err
+	}
+	defer key.Close()
+
+	src := AgentKeySource{}
+	src.Source, _ = readRegString(key, "Source")
+	src.PathPrefix, _ = readRegString(key, "PathPrefix")
+	src.Mount, _ = readRegString(key, "Mount")
+	src.Role, _ = readRegString(key, "Role")
+	src.TTL, _ = readRegString(key, "TTL")
+	if v := readRegDWORD(key, "EphemeralKey"); v != nil {
+		src.EphemeralKey = *v != 0
+	}
+	// readRegMultiString returns nil for both an absent and an empty
+	// REG_MULTI_SZ. Unlike the regfile parser (which preserves the
+	// `principals: []` vs absent distinction for .reg round-trip fidelity),
+	// the live loader doesn't need it: nil and []string{} both mean "no
+	// principals" to the agent, which substitutes the role's defaults. This
+	// matches how the existing OAuth Scopes registry read already behaves.
+	src.Principals = readRegMultiString(key, "Principals")
+	return src, nil
 }
 
 // readRegistrySettingsBlock reads scalar values directly under keyPath

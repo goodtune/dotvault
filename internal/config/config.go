@@ -83,6 +83,12 @@ func ParseDuration(s string) (time.Duration, error) {
 const (
 	DefaultKVMount    = "kv"
 	DefaultUserPrefix = "users/"
+
+	// DefaultAgentPipe is the Windows named pipe the SSH agent listens on
+	// when agent.windows.pipe is unset. dotvault claims its own pipe rather
+	// than the well-known \\.\pipe\openssh-ssh-agent so it never contends
+	// with the built-in ssh-agent service.
+	DefaultAgentPipe = `\\.\pipe\dotvault-agent`
 )
 
 // Config is the top-level system configuration.
@@ -91,6 +97,7 @@ type Config struct {
 	Sync          SyncConfig           `yaml:"sync"`
 	Web           WebConfig            `yaml:"web"`
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
+	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
 }
@@ -146,15 +153,15 @@ type Enrolment struct {
 
 // VaultConfig holds Vault connection settings.
 type VaultConfig struct {
-	Address              string `yaml:"address"`
-	CACert               string `yaml:"ca_cert"`
-	TLSSkipVerify        bool   `yaml:"tls_skip_verify"`
-	KVMount              string `yaml:"kv_mount"`
-	UserPrefix           string `yaml:"user_prefix"`
-	AuthMethod           string `yaml:"auth_method"`
-	AuthRole             string `yaml:"auth_role"`
-	AuthMount            string `yaml:"auth_mount"`
-	DisableTokenRenewal  bool   `yaml:"disable_token_renewal"`
+	Address             string `yaml:"address"`
+	CACert              string `yaml:"ca_cert"`
+	TLSSkipVerify       bool   `yaml:"tls_skip_verify"`
+	KVMount             string `yaml:"kv_mount"`
+	UserPrefix          string `yaml:"user_prefix"`
+	AuthMethod          string `yaml:"auth_method"`
+	AuthRole            string `yaml:"auth_role"`
+	AuthMount           string `yaml:"auth_mount"`
+	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
 }
 
 // SyncConfig holds sync settings.
@@ -169,6 +176,57 @@ type WebConfig struct {
 	Listen         string `yaml:"listen"`
 	LoginText      string `yaml:"login_text"`
 	SecretViewText string `yaml:"secret_view_text"`
+}
+
+// AgentConfig configures the SSH agent surface. Disabled by default; when
+// enabled the daemon serves an agent.ExtendedAgent over a Unix domain socket
+// (Linux/macOS) or a named pipe (Windows), backed by the live Vault token.
+//
+// The inner fields deliberately omit `omitempty` for the same round-trip
+// reason as ObservabilityConfig: an exported config must re-emit cleared
+// optional values so a re-import can blank a previously-set path or pipe. The
+// top-level Agent field keeps `omitempty` so operators who don't use the agent
+// see no empty block in downloads.
+type AgentConfig struct {
+	Enabled bool               `yaml:"enabled"`
+	Unix    AgentUnixConfig    `yaml:"unix"`
+	Windows AgentWindowsConfig `yaml:"windows"`
+	Keys    []AgentKeySource   `yaml:"keys"`
+}
+
+// AgentUnixConfig holds the Unix-domain-socket transport settings.
+type AgentUnixConfig struct {
+	// Path is the socket path. Empty resolves to the per-user runtime path
+	// at agent-construction time (see paths.DefaultAgentSocket).
+	Path string `yaml:"path"`
+}
+
+// AgentWindowsConfig holds the named-pipe transport settings.
+type AgentWindowsConfig struct {
+	// Pipe is the pipe name. Empty resolves to DefaultAgentPipe.
+	Pipe string `yaml:"pipe"`
+}
+
+// AgentKeySource is one ordered origin of signing identities: either raw keys
+// discovered under a KV path prefix, or short-lived certificates minted by a
+// Vault SSH CA.
+type AgentKeySource struct {
+	// Source selects the engine: "kv" or "vault-ca".
+	Source string `yaml:"source"`
+
+	// PathPrefix (kv) is resolved under kv/data/{user_prefix}{you}/; every
+	// secret beneath it is treated as an SSH key (public_key/private_key
+	// fields). Empty means the whole per-user prefix.
+	PathPrefix string `yaml:"path_prefix,omitempty"`
+
+	// Mount, Role, Principals, TTL, EphemeralKey (vault-ca) describe the SSH
+	// CA secrets engine and the certificate to mint. Principals are Go
+	// templates evaluated against {vault_username}.
+	Mount        string   `yaml:"mount,omitempty"`
+	Role         string   `yaml:"role,omitempty"`
+	Principals   []string `yaml:"principals,omitempty"`
+	TTL          string   `yaml:"ttl,omitempty"`
+	EphemeralKey bool     `yaml:"ephemeral_key,omitempty"`
 }
 
 // Rule defines a single sync rule.
@@ -349,6 +407,41 @@ func (c *Config) validate() error {
 		}
 	}
 
+	// Agent validation. The block is optional — only validate shape when the
+	// user opted in. Transport paths are left empty-able: the agent applies
+	// per-user defaults at construction (Unix runtime socket / DefaultAgentPipe).
+	if c.Agent.Enabled {
+		if len(c.Agent.Keys) == 0 {
+			return fmt.Errorf("agent.keys: at least one key source is required when the agent is enabled")
+		}
+		for i, k := range c.Agent.Keys {
+			switch k.Source {
+			case "kv":
+				// path_prefix is optional (empty = whole user prefix).
+			case "vault-ca":
+				if k.Mount == "" {
+					return fmt.Errorf("agent.keys[%d]: mount is required for a vault-ca source", i)
+				}
+				if k.Role == "" {
+					return fmt.Errorf("agent.keys[%d]: role is required for a vault-ca source", i)
+				}
+				if k.TTL != "" {
+					d, err := ParseDuration(k.TTL)
+					if err != nil {
+						return fmt.Errorf("agent.keys[%d].ttl %q: %w", i, k.TTL, err)
+					}
+					if d <= 0 {
+						return fmt.Errorf("agent.keys[%d].ttl %q: must be positive", i, k.TTL)
+					}
+				}
+			case "":
+				return fmt.Errorf("agent.keys[%d]: source is required (kv or vault-ca)", i)
+			default:
+				return fmt.Errorf("agent.keys[%d]: invalid source %q (must be kv or vault-ca)", i, k.Source)
+			}
+		}
+	}
+
 	// Rules validation
 	if len(c.Rules) == 0 {
 		return fmt.Errorf("at least one rule is required")
@@ -404,4 +497,3 @@ func (c *Config) validate() error {
 
 	return nil
 }
-

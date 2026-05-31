@@ -7,7 +7,7 @@ can answer signing requests without ever writing a private key to disk.
 Two key sources are supported:
 
 - **KV keys** — raw key pairs discovered under a KV path prefix (the same
-  `public_key` / `private_key` schema the [SSH enrolment engine](enrolment.md)
+  `public_key` / `private_key` schema the [SSH enrolment engine](../services/ssh.md)
   writes).
 - **Vault-CA certificates** — short-lived certificates minted on demand by a
   Vault SSH CA secrets engine. The private key is generated in memory and never

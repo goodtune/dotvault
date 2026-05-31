@@ -31,4 +31,3 @@ LockPersonality=true
 
 [Install]
 WantedBy=default.target
-Also=dotvault-token-watch.path

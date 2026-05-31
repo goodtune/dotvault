@@ -529,7 +529,7 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 
 // TestLifecycleManager_ReloadPicksUpFreshToken verifies that Reload()
 // triggers an immediate tryReload pass on the lifecycle goroutine —
-// the SIGHUP / dotvault-token-watch.path entry point. The test uses a
+// the SIGHUP / tokenwatch entry point. The test uses a
 // long checkInterval so the timer-based reload path cannot satisfy the
 // assertion: only Reload() can make the swap happen in time. The
 // ctx/poll deadlines are generous (5s/3s) because on a CI runner under

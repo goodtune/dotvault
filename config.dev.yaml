@@ -31,6 +31,7 @@ agent:
     path: ""              # default: per-user runtime socket
   windows:
     pipe: "\\\\.\\pipe\\dotvault-agent"
+    putty: true           # also serve the Pageant-convention pipe (default true)
   keys:
     # Raw keys discovered under kv/data/users/<you>/ssh/* (the SSH enrolment
     # engine writes here): public_key + private_key fields per secret.

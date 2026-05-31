@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func baseConfigWithAgent(agent AgentConfig) *Config {
@@ -89,5 +91,69 @@ func TestAgentValidateInvalidSource(t *testing.T) {
 	})
 	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "source is required") {
 		t.Errorf("want source-required error, got %v", err)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestAgentPuttyEnabledDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		in   *bool
+		want bool
+	}{
+		{"unset defaults true", nil, true},
+		{"explicit true", boolPtr(true), true},
+		{"explicit false", boolPtr(false), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := AgentWindowsConfig{Putty: tt.in}
+			if got := w.PuttyEnabled(); got != tt.want {
+				t.Errorf("PuttyEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAgentPuttyYAMLRoundTrip confirms the tri-state pointer survives a YAML
+// marshal/unmarshal: unset stays nil (default), explicit false stays false.
+func TestAgentPuttyYAMLRoundTrip(t *testing.T) {
+	// Unset: omitempty drops it, and it parses back to nil (default true).
+	out, err := yaml.Marshal(AgentWindowsConfig{Pipe: `\\.\pipe\dotvault-agent`})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "putty") {
+		t.Errorf("unset putty should be omitted, got:\n%s", out)
+	}
+	var back AgentWindowsConfig
+	if err := yaml.Unmarshal(out, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Putty != nil {
+		t.Errorf("unset putty should parse to nil, got %v", *back.Putty)
+	}
+	if !back.PuttyEnabled() {
+		t.Errorf("unset putty should default enabled")
+	}
+
+	// Explicit false must round-trip as false.
+	out, err = yaml.Marshal(AgentWindowsConfig{Putty: boolPtr(false)})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "putty: false") {
+		t.Errorf("explicit false should emit `putty: false`, got:\n%s", out)
+	}
+	back = AgentWindowsConfig{}
+	if err := yaml.Unmarshal(out, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Putty == nil || *back.Putty {
+		t.Errorf("explicit false should round-trip as false, got %v", back.Putty)
+	}
+	if back.PuttyEnabled() {
+		t.Errorf("explicit false should report disabled")
 	}
 }

@@ -593,6 +593,20 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		}
 		return nil
 	}
+	// applyBoolPtr is the tri-state variant for `*bool` defaults: an absent
+	// value stays nil (the field's documented default) rather than being
+	// forced to false.
+	applyBoolPtr := func(target **bool, keyPath, name string) error {
+		v, ok, err := getDWORD(keyPath, name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			b := v != 0
+			*target = &b
+		}
+		return nil
+	}
 
 	// Vault.
 	vaultKey := rootKey + `\Vault`
@@ -680,6 +694,9 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 	if err := apply(&cfg.Agent.Windows.Pipe, agentKey, "WindowsPipe"); err != nil {
+		return err
+	}
+	if err := applyBoolPtr(&cfg.Agent.Windows.Putty, agentKey, "WindowsPutty"); err != nil {
 		return err
 	}
 	// Agent key sources. Each is a subkey under Agent\Keys named after its

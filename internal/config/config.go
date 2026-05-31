@@ -100,9 +100,18 @@ type Config struct {
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
+
+	// Managed is set by LoadSystem when the config originated from the
+	// Windows Registry (Group Policy) rather than the YAML file. The
+	// daemon uses it to emit a one-shot WARN OTel log record after
+	// observability.Init runs; deliberately not serialised so an
+	// exported YAML/.reg artefact never carries the flag back in.
+	Managed bool `yaml:"-"`
 }
 
-// ObservabilityConfig configures the OpenTelemetry metrics exporter.
+// ObservabilityConfig configures the OpenTelemetry metric and log
+// exporters. A single block drives both signals against the same
+// collector — Endpoint / Protocol / Insecure / Headers are shared.
 // Disabled by default — set Enabled and Endpoint (or the standard
 // OTEL_* env vars) to point the daemon at a local OTel collector.
 //
@@ -195,6 +204,29 @@ type AgentUnixConfig struct {
 type AgentWindowsConfig struct {
 	// Pipe is the pipe name. Empty resolves to DefaultAgentPipe.
 	Pipe string `yaml:"pipe"`
+
+	// Putty controls whether a second named pipe following the PuTTY/Pageant
+	// naming convention (\\.\pipe\pageant.<user>.<hash>) is served alongside
+	// Pipe, so PuTTY-family clients (PuTTY, WinSCP, FileZilla, …) that speak
+	// the Pageant protocol over a named pipe find the agent without any
+	// client-side configuration. A Windows named pipe carries exactly one
+	// name, so this is an additional parallel listener, not an alias of Pipe.
+	// Defaults to true; only takes effect when the agent is enabled and only
+	// on Windows.
+	//
+	// A pointer (unlike the surrounding fields) so an unset value defaults to
+	// true while an explicit `putty: false` stays distinguishable and
+	// round-trips. `omitempty` is therefore correct here — a nil pointer is
+	// the default, not a "cleared" value that must be re-emitted, so it does
+	// not share the round-trip rationale documented on AgentConfig for the
+	// string fields.
+	Putty *bool `yaml:"putty,omitempty"`
+}
+
+// PuttyEnabled reports whether the Pageant-compatible named pipe should be
+// served. An unset value (nil) defaults to true.
+func (w AgentWindowsConfig) PuttyEnabled() bool {
+	return w.Putty == nil || *w.Putty
 }
 
 // AgentKeySource is one ordered origin of signing identities: either raw keys
@@ -260,17 +292,23 @@ var validFormats = map[string]bool{
 // because it is user-writable and cannot be treated as a trusted policy
 // boundary on unmanaged machines.
 // On non-Windows platforms this falls back to Load(path).
+//
+// When the registry path wins, the returned Config has Managed=true so
+// the caller can emit a deployment-fact notification (today: a
+// WARN-severity OTel log record via observability.LogRegistryConfigManaged)
+// after the OTel logger provider is wired up. Doing so here would
+// either spam stdout on every CLI invocation under GPO or vanish into
+// the no-op logger that exists before observability.Init runs.
 func LoadSystem(path string) (*Config, error) {
 	cfg, managed, err := loadFromRegistry()
 	if err != nil {
 		return nil, fmt.Errorf("read registry config: %w", err)
 	}
 	if managed {
-		slog.Info("configuration loaded from Windows Registry (Group Policy); file-based config is ignored",
-			"path", path)
 		if err := cfg.validate(); err != nil {
 			return nil, fmt.Errorf("validate registry config: %w", err)
 		}
+		cfg.Managed = true
 		return cfg, nil
 	}
 	return Load(path)

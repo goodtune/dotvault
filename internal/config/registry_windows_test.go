@@ -84,6 +84,44 @@ func TestApplyRegistryLayerBooleans(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerObservability covers the Observability subkey
+// that gates the OTel LoggerProvider wiring. Without these fields
+// populated from the registry, a GPO-managed daemon would have
+// Observability.Enabled=false (zero value), Init would short-circuit
+// to an inactive Provider, and the WARN record from
+// LogRegistryConfigManaged — the entire point of this code path —
+// would vanish into the no-op global logger.
+func TestApplyRegistryLayerObservability(t *testing.T) {
+	cfg := &Config{}
+
+	enabled := uint32(1)
+	insecure := uint32(0)
+	layer := registryLayer{
+		ObservabilityEnabled:  &enabled,
+		ObservabilityEndpoint: "https://otel.example",
+		ObservabilityProtocol: "http/protobuf",
+		ObservabilityInsecure: &insecure,
+		ObservabilityInterval: "30s",
+	}
+	applyRegistryLayer(cfg, layer)
+
+	if !cfg.Observability.Enabled {
+		t.Error("Observability.Enabled should be true when DWORD is 1")
+	}
+	if cfg.Observability.Endpoint != "https://otel.example" {
+		t.Errorf("Endpoint = %q, want %q", cfg.Observability.Endpoint, "https://otel.example")
+	}
+	if cfg.Observability.Protocol != "http/protobuf" {
+		t.Errorf("Protocol = %q, want %q", cfg.Observability.Protocol, "http/protobuf")
+	}
+	if cfg.Observability.Insecure {
+		t.Error("Insecure should be false when DWORD is 0")
+	}
+	if cfg.Observability.RawInterval != "30s" {
+		t.Errorf("RawInterval = %q, want %q", cfg.Observability.RawInterval, "30s")
+	}
+}
+
 func TestReadSingleEnrolment(t *testing.T) {
 	// Register cleanup first so stray keys are removed even on early failure.
 	// Deletes children before parents (required on Windows).
@@ -248,6 +286,35 @@ func TestApplyRegistryLayerAgent(t *testing.T) {
 	if cfg.Agent.Windows.Pipe != `\\.\pipe\dotvault-agent` {
 		t.Errorf("Agent.Windows.Pipe = %q", cfg.Agent.Windows.Pipe)
 	}
+	// WindowsPutty absent from the layer: the tri-state stays nil (default true).
+	if cfg.Agent.Windows.Putty != nil {
+		t.Errorf("Agent.Windows.Putty = %v, want nil (default)", *cfg.Agent.Windows.Putty)
+	}
+}
+
+// TestApplyRegistryLayerAgentPutty confirms an explicit WindowsPutty DWORD
+// maps onto the tri-state pointer (0 => &false, non-zero => &true).
+func TestApplyRegistryLayerAgentPutty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dw   uint32
+		want bool
+	}{
+		{"zero disables", 0, false},
+		{"one enables", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			dw := tc.dw
+			applyRegistryLayer(cfg, registryLayer{AgentWindowsPutty: &dw})
+			if cfg.Agent.Windows.Putty == nil {
+				t.Fatalf("Putty = nil, want %v", tc.want)
+			}
+			if *cfg.Agent.Windows.Putty != tc.want {
+				t.Errorf("Putty = %v, want %v", *cfg.Agent.Windows.Putty, tc.want)
+			}
+		})
+	}
 }
 
 func TestReadRegistryAgentKeysOrdered(t *testing.T) {
@@ -348,18 +415,14 @@ func TestReadRegistryAgentKeysNonNumericRejected(t *testing.T) {
 	}
 }
 
-func TestApplyRegistryLayerObservabilityAndWebText(t *testing.T) {
+// TestApplyRegistryLayerWebText covers the Web markdown fields applied from
+// the registry layer; the observability scalars are covered by
+// TestApplyRegistryLayerObservability above.
+func TestApplyRegistryLayerWebText(t *testing.T) {
 	cfg := &Config{}
-	enabled := uint32(1)
-	insecure := uint32(1)
 	layer := registryLayer{
-		WebLoginText:          "# Welcome",
-		WebSecretViewText:     "Handle with care.",
-		ObservabilityEnabled:  &enabled,
-		ObservabilityEndpoint: "otel.example.com:4317",
-		ObservabilityProtocol: "grpc",
-		ObservabilityInsecure: &insecure,
-		ObservabilityInterval: "45s",
+		WebLoginText:      "# Welcome",
+		WebSecretViewText: "Handle with care.",
 	}
 	applyRegistryLayer(cfg, layer)
 
@@ -368,21 +431,6 @@ func TestApplyRegistryLayerObservabilityAndWebText(t *testing.T) {
 	}
 	if cfg.Web.SecretViewText != "Handle with care." {
 		t.Errorf("Web.SecretViewText = %q", cfg.Web.SecretViewText)
-	}
-	if !cfg.Observability.Enabled {
-		t.Error("Observability.Enabled = false, want true")
-	}
-	if cfg.Observability.Endpoint != "otel.example.com:4317" {
-		t.Errorf("Observability.Endpoint = %q", cfg.Observability.Endpoint)
-	}
-	if cfg.Observability.Protocol != "grpc" {
-		t.Errorf("Observability.Protocol = %q", cfg.Observability.Protocol)
-	}
-	if !cfg.Observability.Insecure {
-		t.Error("Observability.Insecure = false, want true")
-	}
-	if cfg.Observability.RawInterval != "45s" {
-		t.Errorf("Observability.RawInterval = %q", cfg.Observability.RawInterval)
 	}
 }
 

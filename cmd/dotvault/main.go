@@ -211,12 +211,45 @@ func newVersionCmd() *cobra.Command {
 	return cmd
 }
 
-func loadConfig() (*config.Config, error) {
-	path := flagConfig
-	if path == "" {
-		path = paths.SystemConfigPath()
+// loadConfig resolves the system config path (honouring the --config
+// flag) and loads it. Returns the resolved path alongside the Config
+// so callers can use the same string for both the loaded config and
+// any subsequent reference (reload, log attribute, status output)
+// without re-running the resolver — paths.SystemConfigPath on Linux
+// consults XDG_CONFIG_DIRS via os.Stat, so two back-to-back calls
+// can disagree if the filesystem changes between them.
+func loadConfig() (*config.Config, string, error) {
+	path := configPath()
+	cfg, err := config.LoadSystem(path)
+	return cfg, path, err
+}
+
+// configPath resolves the system config file path, honouring the
+// --config override when set. Lower-level helper for loadConfig;
+// most call sites should use loadConfig's returned path instead of
+// invoking this directly, to keep the load path and subsequent
+// references in sync.
+func configPath() string {
+	if flagConfig != "" {
+		return flagConfig
 	}
-	return config.LoadSystem(path)
+	return paths.SystemConfigPath()
+}
+
+// emitConfigSourceLog surfaces a WARN OTel log record when the
+// running config came from the Windows Registry (Group Policy) rather
+// than the YAML file. Called from runDaemon and runSync after
+// initObservability has installed the LoggerProvider — wiring this
+// up in two call sites kept failing review because either could
+// silently regress, so the actual emit lives behind a single helper
+// the regression test in configlog_test.go pins down. The path
+// parameter is the same string returned by loadConfig so the log
+// attribute matches what was actually inspected.
+func emitConfigSourceLog(ctx context.Context, cfg *config.Config, path string) {
+	if !cfg.Managed {
+		return
+	}
+	observability.LogRegistryConfigManaged(ctx, path)
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
@@ -227,7 +260,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return runSync(cmd, args)
 	}
 
-	cfg, err := loadConfig()
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -261,6 +294,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// credential. The OTel SDK keeps its own copy internally; the web
 	// server (if enabled) holds obsCfgForWeb.
 	cfg.Observability.Headers = nil
+
+	// Surface the registry-config notification through the OTel
+	// LoggerProvider now that it's installed. Deliberately not
+	// slog.Info'd from inside config.LoadSystem — that path runs
+	// before observability.Init and would either land on stdout/stderr
+	// (loud noise on every CLI invocation against a GPO-managed
+	// Windows box) or be lost to the no-op global logger.
+	emitConfigSourceLog(ctx, cfg, cfgPath)
 
 	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
 	// via the LifecycleManager so a fresh token written by `dotvault
@@ -445,7 +486,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
 		go agentSvc.Run(ctx)
-		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint())
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
 	// Watch the token file for replacement and nudge the lifecycle
@@ -568,10 +609,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 
 		// Background goroutine: reload config on each tick and re-check enrolments.
-		configPath := flagConfig
-		if configPath == "" {
-			configPath = paths.SystemConfigPath()
-		}
+		// Reuses cfgPath captured at startup so the reload loop tracks the same
+		// file the daemon first loaded, even if the filesystem state that
+		// SystemConfigPath consults (XDG_CONFIG_DIRS on Linux) changes.
+		reloadPath := cfgPath
 		go func() {
 			ticker := time.NewTicker(cfg.Sync.Interval)
 			defer ticker.Stop()
@@ -581,7 +622,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					reloaded, err := config.LoadSystem(configPath)
+					reloaded, err := config.LoadSystem(reloadPath)
 					if err != nil {
 						observability.RecordConfigReload(ctx, "error")
 						slog.Warn("config reload failed", "error", err)
@@ -691,7 +732,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 func runSync(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, err := loadConfig()
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -709,6 +750,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// heap-resident Config struct.
 	cfg.Observability.Headers = nil
 
+	// Same rationale as runDaemon — emit the GPO-managed notification
+	// after the LoggerProvider is wired up. See emitConfigSourceLog.
+	emitConfigSourceLog(ctx, cfg, cfgPath)
+
 	username, vc, err := authenticate(ctx, cfg)
 	if err != nil {
 		return err
@@ -725,7 +770,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 func runStatus(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, err := loadConfig()
+	cfg, _, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -828,7 +873,7 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 func runLogin(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, err := loadConfig()
+	cfg, _, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -1006,7 +1051,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	cfg, err := loadConfig()
+	cfg, _, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

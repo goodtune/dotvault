@@ -71,6 +71,8 @@ Every YAML field has a registry equivalent. The tables below give the value name
 | `Observability\ExportInterval` | REG_SZ | Export interval (e.g. `30s`, `1m`) |
 | `Observability\Headers\<name>` | REG_SZ | OTLP header value (see note) |
 
+The block drives both signals (metrics and logs) against the same collector. For `http/protobuf`, `Endpoint` must be a *base* URL like `https://otel.example` — the exporters append `/v1/metrics` and `/v1/logs` themselves; a URL that already ends in a signal-specific path routes both signals to the wrong route.
+
 !!! warning "Observability headers carry credentials"
     OTLP `headers` typically hold bearer tokens (Datadog / Grafana Cloud / Honeycomb, etc.). Config conversion is lossless in every direction, so `reg-export` and `reg-import` **do** round-trip header values verbatim (each as a REG_SZ value under `Observability\Headers`) — which means a generated `.reg` artefact contains the live tokens. Treat it as a secret: store it at restricted permissions and don't check it in. If you would rather keep tokens out of the policy hive and out of any exported artefact, leave `headers` empty and set them via the per-user `EnvironmentFile` (`OTEL_EXPORTER_OTLP_HEADERS`) instead — the SDK falls through to those env vars.
 

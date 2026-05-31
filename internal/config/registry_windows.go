@@ -84,8 +84,10 @@ func loadFromRegistry() (*Config, bool, error) {
 // enrolment Settings): HTTP folds header case, but a faithful round-trip
 // keeps whatever the admin authored.
 //
-// These values are credentials, so the regfile renderer never emits them;
-// they exist only when an admin sets them directly via Group Policy.
+// These values are credentials (OTLP bearer tokens). Config conversion is
+// lossless in every direction, so the regfile renderer does emit them and
+// this loader reads them back; an admin can also author them directly via
+// Group Policy.
 func readRegistryObservabilityHeaders(root registry.Key, basePath string) (map[string]string, error) {
 	headersPath := basePath + `\Observability\Headers`
 	key, err := registry.OpenKey(root, headersPath, registry.READ)
@@ -151,9 +153,10 @@ type registryLayer struct {
 
 	// Agent (scalar transport settings; the ordered Keys list is read
 	// separately by readRegistryAgentKeys).
-	AgentEnabled     *uint32
-	AgentUnixPath    string
-	AgentWindowsPipe string
+	AgentEnabled      *uint32
+	AgentUnixPath     string
+	AgentWindowsPipe  string
+	AgentWindowsPutty *uint32
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
@@ -214,6 +217,10 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 
 	// Read Observability subkey (scalar fields only; Headers is a nested
 	// key/value map read separately by readRegistryObservabilityHeaders).
+	// Without this a GPO-managed daemon would have Observability.Enabled
+	// false, Init would short-circuit to an inactive Provider, and the WARN
+	// record from LogRegistryConfigManaged would vanish into the no-op
+	// global logger — silently dropping the registry-config notification.
 	obk, err := registry.OpenKey(root, registryPolicyPath+`\Observability`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Observability policy key: %w", err)
@@ -237,6 +244,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentEnabled = readRegDWORD(ak, "Enabled")
 		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
 		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
+		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
 	}
 
 	return layer, true, nil
@@ -310,6 +318,10 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.AgentWindowsPipe != "" {
 		cfg.Agent.Windows.Pipe = layer.AgentWindowsPipe
+	}
+	if layer.AgentWindowsPutty != nil {
+		b := *layer.AgentWindowsPutty != 0
+		cfg.Agent.Windows.Putty = &b
 	}
 }
 

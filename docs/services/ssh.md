@@ -51,6 +51,73 @@ enrolments:
 | `recommended` | User is prompted but can press Enter to skip |
 | `unsafe` | No passphrase prompt; private key is stored unencrypted |
 
+### Choosing a mode: it depends on how the key is consumed
+
+The passphrase protects the private key **at rest on disk**. So the right mode
+depends entirely on whether the key ever lands on a filesystem:
+
+- **File-sync mode** (a sync rule writes the private key to `~/.ssh/…` via
+  `format: text`): the key sits on disk, where it can be read by a stolen
+  laptop, a backup, or any process running as you. **Encourage a passphrase**
+  (`required`) — it is the only thing protecting the key at rest, exactly as it
+  would for a hand-generated `ssh-keygen` key.
+
+- **Agent mode** (the [SSH agent](../guide/ssh-agent.md) reads the key from
+  Vault on demand and signs in-process — the key is never written to a
+  filesystem): the at-rest protection is **Vault**, not the passphrase. The
+  daemon is headless and cannot prompt to decrypt, so a passphrase-encrypted key
+  cannot be used by the agent at all. Use **`unsafe`**. Despite the name it is
+  *not* unsafe here: the secret is encrypted at rest in Vault and gated by your
+  token policy. The one assumption is that **you never exfiltrate the secret to
+  disk** (e.g. don't also add a file-sync rule for the same key, and don't
+  `vault kv get … > id_ed25519`) — doing so silently reintroduces the at-rest
+  exposure that the passphrase would have covered.
+
+In short: a passphrase on a key that also lives unencrypted in Vault and gets
+used by the agent adds friction with no security gain; a passphrase on a key
+written to disk is essential.
+
+#### Minimum safe example — file-sync mode (passphrase required)
+
+```yaml
+enrolments:
+  ssh:
+    engine: ssh
+    settings:
+      passphrase: required        # key lands on disk — protect it at rest
+
+rules:
+  - name: ssh-private-key
+    vault_key: "ssh"
+    target:
+      path: "~/.ssh/id_ed25519"
+      format: text
+      template: "{{ .private_key }}"
+  - name: ssh-public-key
+    vault_key: "ssh"
+    target:
+      path: "~/.ssh/id_ed25519.pub"
+      format: text
+      template: "{{ .public_key }}"
+```
+
+#### Minimum safe example — agent mode (unsafe, key never on disk)
+
+```yaml
+enrolments:
+  ssh:
+    engine: ssh
+    settings:
+      passphrase: unsafe          # Vault is the at-rest protection; agent can't prompt
+
+agent:
+  enabled: true
+  keys:
+    - source: kv
+      path_prefix: "ssh/"         # kv/data/users/<you>/ssh/*
+# Note: deliberately NO sync rule writing the private key to disk.
+```
+
 ## How key generation works
 
 1. dotvault generates an Ed25519 key pair using Go's `crypto/ed25519`

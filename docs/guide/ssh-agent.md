@@ -61,8 +61,22 @@ pair (`public_key` in authorized-keys form, `private_key` as an OpenSSH PEM).
 Keys are *discovered*, not declared — a secret appearing or disappearing in
 Vault changes the agent's identities on the next `ssh-add -l` without a restart.
 
-Private keys protected by a passphrase cannot be used by the agent (it has no
-way to prompt); store them unencrypted, or prefer cert mode.
+#### Passphrases and KV keys
+
+A passphrase protects a private key **at rest on disk**. In agent mode the key
+is never written to a filesystem — it lives encrypted at rest in Vault, gated by
+your token policy, and is read and signed with in-process — so the passphrase
+is redundant here, and the headless daemon has no way to prompt to decrypt one.
+Enrol KV keys destined for the agent with `passphrase: unsafe`: the name is a
+misnomer in this context, because Vault is the at-rest protection. The standing
+assumption is that you **never exfiltrate the secret to disk** (no parallel
+file-sync rule for the same key, no `vault kv get … > id_ed25519`); if you do,
+you reintroduce the at-rest exposure a passphrase would have covered, so encrypt
+it then — see [Choosing a mode](../services/ssh.md#choosing-a-mode-it-depends-on-how-the-key-is-consumed).
+
+The agent therefore rejects a passphrase-encrypted KV key at signing time rather
+than silently failing. Store agent keys unencrypted in Vault, or prefer cert
+mode (no key material at all).
 
 ### Vault-CA source
 

@@ -63,6 +63,7 @@ nav:
       - JFrog Platform: services/jfrog.md
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
+  - SSH Agent: guide/ssh-agent.md
   - Web UI: web-ui.md
   - Admin Guide:
       - Deployment: admin/deployment.md

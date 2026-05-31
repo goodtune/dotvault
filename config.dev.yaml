@@ -22,6 +22,31 @@ web:
 #   insecure: true
 #   export_interval: "15s"
 
+# SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
+# domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
+# live Vault token. Point SSH_AUTH_SOCK at the socket to use it.
+agent:
+  enabled: true
+  unix:
+    path: ""              # default: per-user runtime socket
+  windows:
+    pipe: "\\\\.\\pipe\\dotvault-agent"
+  keys:
+    # Raw keys discovered under kv/data/users/<you>/ssh/* (the SSH enrolment
+    # engine writes here): public_key + private_key fields per secret.
+    - source: kv
+      path_prefix: "ssh/"
+    # Short-lived certificates minted by a Vault SSH CA. Requires the
+    # ssh-client-signer engine + dotvault-user role to exist in the dev Vault;
+    # absent those, the source reports an error in status without breaking the
+    # daemon. Cert mode is the recommended direction (key never on disk).
+    - source: vault-ca
+      mount: "ssh-client-signer"
+      role: "dotvault-user"
+      principals: ["{{.vault_username}}"]
+      ttl: "15m"
+      ephemeral_key: true
+
 rules:
   - name: gh
     vault_key: "gh"

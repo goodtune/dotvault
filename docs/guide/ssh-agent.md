@@ -53,6 +53,14 @@ agent:
 | `agent.windows.pipe` | Windows pipe name                                 | `\\.\pipe\dotvault-agent`   |
 | `agent.keys[]`       | Ordered list of key sources (see below)           | —                           |
 
+On Windows, the entire `agent` section can be deployed via Group Policy / the
+registry under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Agent` instead of YAML
+— including the ordered `keys[]` list, which is stored as numbered subkeys
+(`Agent\Keys\0`, `\1`, …). Author the registry values directly, or generate them
+from a YAML file with `dotvault reg-import config.yaml` (and recover YAML from a
+`.reg` with `dotvault reg-export`). When the registry policy keys exist, they
+take precedence and the YAML file is ignored.
+
 ### KV source
 
 `source: kv` with an optional `path_prefix`, resolved under

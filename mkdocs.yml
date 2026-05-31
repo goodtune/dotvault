@@ -4,6 +4,11 @@ site_url: https://goodtune.github.io/dotvault/
 repo_url: https://github.com/goodtune/dotvault
 repo_name: goodtune/dotvault
 
+# Internal planning/spec artifacts live under docs/superpowers/ for repo-local
+# reference but are not part of the published site.
+exclude_docs: |
+  superpowers/
+
 theme:
   name: material
   palette:

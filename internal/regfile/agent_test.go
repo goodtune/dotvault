@@ -147,6 +147,46 @@ func TestAgentNonNumericKeySubkeyRejected(t *testing.T) {
 	}
 }
 
+// TestAgentPuttyTriStateRoundTrip confirms the windows putty option's
+// tri-state semantics survive a .reg round-trip: unset stays nil (the
+// default), explicit true and explicit false each recover their value via the
+// WindowsPutty DWORD.
+func TestAgentPuttyTriStateRoundTrip(t *testing.T) {
+	roundTrip := func(t *testing.T, in *bool) *bool {
+		t.Helper()
+		src := validBaseConfig()
+		src.Agent.Enabled = true
+		src.Agent.Keys = []config.AgentKeySource{{Source: "kv", PathPrefix: "ssh/"}}
+		src.Agent.Windows = config.AgentWindowsConfig{Pipe: `\\.\pipe\dotvault-agent`, Putty: in}
+
+		text, err := GenerateText(src)
+		if err != nil {
+			t.Fatalf("GenerateText: %v", err)
+		}
+		// An unset pointer must not emit the DWORD at all.
+		if in == nil && strings.Contains(text, "WindowsPutty") {
+			t.Errorf("unset putty should not emit WindowsPutty:\n%s", text)
+		}
+		got, err := Parse([]byte(text))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		return got.Agent.Windows.Putty
+	}
+
+	if p := roundTrip(t, nil); p != nil {
+		t.Errorf("unset putty should round-trip as nil, got %v", *p)
+	}
+	if p := roundTrip(t, boolPtr(true)); p == nil || !*p {
+		t.Errorf("explicit true should round-trip as true, got %v", p)
+	}
+	if p := roundTrip(t, boolPtr(false)); p == nil || *p {
+		t.Errorf("explicit false should round-trip as false, got %v", p)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
 // itoa avoids pulling strconv into the test for a single small int.
 func itoa(i int) string {
 	if i == 0 {

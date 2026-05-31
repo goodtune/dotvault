@@ -88,9 +88,10 @@ type registryLayer struct {
 
 	// Agent (scalar transport settings; the ordered Keys list is read
 	// separately by readRegistryAgentKeys).
-	AgentEnabled     *uint32
-	AgentUnixPath    string
-	AgentWindowsPipe string
+	AgentEnabled      *uint32
+	AgentUnixPath     string
+	AgentWindowsPipe  string
+	AgentWindowsPutty *uint32
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
@@ -157,6 +158,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentEnabled = readRegDWORD(ak, "Enabled")
 		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
 		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
+		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
 	}
 
 	return layer, true, nil
@@ -209,6 +211,10 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.AgentWindowsPipe != "" {
 		cfg.Agent.Windows.Pipe = layer.AgentWindowsPipe
+	}
+	if layer.AgentWindowsPutty != nil {
+		b := *layer.AgentWindowsPutty != 0
+		cfg.Agent.Windows.Putty = &b
 	}
 }
 

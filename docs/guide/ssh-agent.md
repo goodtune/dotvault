@@ -35,6 +35,7 @@ agent:
     path: ""          # default: $XDG_RUNTIME_DIR/dotvault/agent.sock
   windows:
     pipe: "\\\\.\\pipe\\dotvault-agent"
+    putty: true       # also serve the Pageant-convention pipe (default true)
   keys:
     - source: kv
       path_prefix: "ssh/"          # kv/data/users/<you>/ssh/*
@@ -51,6 +52,7 @@ agent:
 | `agent.enabled`      | Master switch for the agent listener              | `false`                     |
 | `agent.unix.path`    | Unix socket path                                  | per-user runtime path       |
 | `agent.windows.pipe` | Windows pipe name                                 | `\\.\pipe\dotvault-agent`   |
+| `agent.windows.putty` | Also serve a Pageant-convention pipe (Windows)   | `true`                      |
 | `agent.keys[]`       | Ordered list of key sources (see below)           | —                           |
 
 On Windows, the entire `agent` section can be deployed via Group Policy / the
@@ -110,15 +112,26 @@ integration step, left to you (or your fleet tooling).
   ssh-add -l   # list the identities dotvault is serving
   ```
 
-- **PuTTY / Pageant (Windows):** point PuTTY's agent-pipe location at the
-  dotvault pipe name (`\\.\pipe\dotvault-agent`). The same pipe serves both
-  OpenSSH and PuTTY clients — the agent protocol over the pipe is identical for
-  both families.
+- **PuTTY / Pageant (Windows):** modern PuTTY-family clients (PuTTY 0.71+,
+  WinSCP, FileZilla, …) locate Pageant over a named pipe whose name follows a
+  fixed convention — `\\.\pipe\pageant.<user>.<hash>` — that they compute
+  themselves and cannot be told to ignore. So that those clients find the agent
+  with **no configuration at all**, dotvault serves a second listener on exactly
+  that pipe whenever `agent.windows.putty` is true (the default). A named pipe
+  carries a single name, so this is a parallel listener over the same backend,
+  not an alias of `agent.windows.pipe`. Both pipes serve the identical agent
+  protocol. Set `putty: false` to serve only `agent.windows.pipe` (e.g. when a
+  separate Pageant is already running and you don't want dotvault to claim that
+  name). The option only takes effect when `agent.enabled` is true and is a
+  no-op off Windows.
 
-The Windows pipe is created with a security descriptor granting access only to
-the owning user and LocalSystem; the Unix socket is created `0600` in a `0700`
-directory. Only you can connect either way — the equivalent of dotvault's
-`0600` invariant on its managed files.
+  Clients that let you point at an explicit pipe (or Windows OpenSSH via
+  `SSH_AUTH_SOCK`) can still target `\\.\pipe\dotvault-agent` directly.
+
+The Windows pipe(s) are created with a security descriptor granting access only
+to the owning user and LocalSystem; the Unix socket is created `0600` in a
+`0700` directory. Only you can connect either way — the equivalent of
+dotvault's `0600` invariant on its managed files.
 
 ## Status
 

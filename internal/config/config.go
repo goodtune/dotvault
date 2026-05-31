@@ -205,6 +205,29 @@ type AgentUnixConfig struct {
 type AgentWindowsConfig struct {
 	// Pipe is the pipe name. Empty resolves to DefaultAgentPipe.
 	Pipe string `yaml:"pipe"`
+
+	// Putty controls whether a second named pipe following the PuTTY/Pageant
+	// naming convention (\\.\pipe\pageant.<user>.<hash>) is served alongside
+	// Pipe, so PuTTY-family clients (PuTTY, WinSCP, FileZilla, …) that speak
+	// the Pageant protocol over a named pipe find the agent without any
+	// client-side configuration. A Windows named pipe carries exactly one
+	// name, so this is an additional parallel listener, not an alias of Pipe.
+	// Defaults to true; only takes effect when the agent is enabled and only
+	// on Windows.
+	//
+	// A pointer (unlike the surrounding fields) so an unset value defaults to
+	// true while an explicit `putty: false` stays distinguishable and
+	// round-trips. `omitempty` is therefore correct here — a nil pointer is
+	// the default, not a "cleared" value that must be re-emitted, so it does
+	// not share the round-trip rationale documented on AgentConfig for the
+	// string fields.
+	Putty *bool `yaml:"putty,omitempty"`
+}
+
+// PuttyEnabled reports whether the Pageant-compatible named pipe should be
+// served. An unset value (nil) defaults to true.
+func (w AgentWindowsConfig) PuttyEnabled() bool {
+	return w.Putty == nil || *w.Putty
 }
 
 // AgentKeySource is one ordered origin of signing identities: either raw keys

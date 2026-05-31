@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -112,17 +114,77 @@ func TestInitBadProtocol(t *testing.T) {
 	}
 }
 
+// TestLogRegistryConfigManagedNoProvider confirms the helper is safe
+// to call before Init wires up the SDK LoggerProvider. The contract
+// mirrors the metric Record* helpers — call sites invoke it
+// unconditionally and rely on the no-op global swallowing the record
+// when observability is disabled. This is the whole point of routing
+// through OTel rather than slog: a CLI invocation on a GPO-managed
+// Windows box must not leak the "configuration loaded from Windows
+// Registry" message to stdout.
+func TestLogRegistryConfigManagedNoProvider(t *testing.T) {
+	// Must not panic. The helper resolves the logger from the
+	// current global LoggerProvider on each call — at this point in
+	// the test suite (no recording provider installed), that's the
+	// OTel no-op global, and the record is silently dropped.
+	LogRegistryConfigManaged(context.Background(), `C:\ProgramData\dotvault\config.yaml`)
+}
+
+// TestLogRegistryConfigManagedReachesActiveProvider verifies that
+// once an SDK LoggerProvider is installed via global.SetLoggerProvider,
+// the helper resolves it and emits a WARN-severity record with the
+// expected body and path attribute. Without this assertion, a future
+// regression that hard-codes the no-op global inside the helper
+// (or otherwise bypasses the global lookup) would still let
+// TestLogRegistryConfigManagedNoProvider pass.
+func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
+	rec := newTestLogProcessor(t)
+
+	const path = `C:\ProgramData\dotvault\config.yaml`
+	LogRegistryConfigManaged(context.Background(), path)
+
+	records := rec.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	r := records[0]
+	if got, want := r.Severity(), log.SeverityWarn; got != want {
+		t.Errorf("severity = %v, want %v", got, want)
+	}
+	if body := bodyString(t, r.Body()); body != "configuration loaded from Windows Registry (Group Policy); file-based config is ignored" {
+		t.Errorf("body = %q", body)
+	}
+	var foundPath bool
+	r.WalkAttributes(func(kv log.KeyValue) bool {
+		if kv.Key == "path" {
+			foundPath = true
+			if got := kv.Value.AsString(); got != path {
+				t.Errorf("path attribute = %q, want %q", got, path)
+			}
+		}
+		return true
+	})
+	if !foundPath {
+		t.Error("path attribute not present on emitted record")
+	}
+}
+
 // TestProtocolFallthroughToEnv confirms an empty cfg.Protocol picks
 // up the OTel env-var convention. The metrics-specific override wins
 // over the generic one, matching the SDK's documented precedence.
 func TestProtocolFallthroughToEnv(t *testing.T) {
-	// Init mutates the process-wide MeterProvider global. Save and
-	// restore it (and the package-level instruments) so later tests
-	// in the same package don't observe a non-default or
-	// Shutdown()'d provider — mirrors newTestReader's discipline.
-	prev := otel.GetMeterProvider()
+	// Init mutates two process-wide globals (MeterProvider and
+	// LoggerProvider). Save and restore both so later tests in the
+	// same package don't observe a non-default or Shutdown()'d
+	// provider — mirrors newTestReader / newTestLogProcessor's
+	// discipline. The MeterProvider also needs an explicit instrument
+	// rebind because Record* helpers cache instrument handles; the
+	// logger has no such cache, so the global restore is sufficient.
+	prevMP := otel.GetMeterProvider()
+	prevLP := global.GetLoggerProvider()
 	t.Cleanup(func() {
-		otel.SetMeterProvider(prev)
+		otel.SetMeterProvider(prevMP)
+		global.SetLoggerProvider(prevLP)
 		rebindInstruments()
 	})
 

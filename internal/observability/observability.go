@@ -14,13 +14,17 @@
 // imported at every layer in the same way); both rely on a
 // well-behaved no-op default for tests that don't initialise the
 // global, and both keep the call sites free of plumbing. Init
-// mutates a process-wide global (otel.SetMeterProvider + the
-// rebindInstruments rebind under instrMu) — it's expected to run
-// exactly once per process at startup. The test suite in this
-// package does not run subtests with t.Parallel(), so the sequential
-// invocations of Init in tests do not race; do not add t.Parallel()
-// without also serialising Init through a sync.Once or test-scoped
-// lock.
+// mutates two process-wide globals (otel.SetMeterProvider +
+// global.SetLoggerProvider) and rebinds the metric instruments
+// (rebindInstruments under instrMu) — it's expected to run exactly
+// once per process at startup. Log helpers resolve the logger
+// per-call from global.GetLoggerProvider() so no cached handle
+// needs rebinding. The test suite in this package does not run
+// subtests with t.Parallel(), so the sequential invocations of Init
+// in tests do not race; do not add t.Parallel() to any test that
+// installs a MeterProvider or LoggerProvider (newTestReader /
+// newTestLogProcessor) without also serialising through a sync.Once
+// or test-scoped lock.
 //
 // Attribute conventions:
 //   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
@@ -34,6 +38,7 @@ package observability
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -44,9 +49,14 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/metric"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
@@ -61,8 +71,13 @@ type Config struct {
 	// no-op meter.
 	Enabled bool
 
-	// Endpoint is the OTLP collector address (e.g. "localhost:4317" for
-	// gRPC, "https://otel.example/v1/metrics" for HTTP). When empty the
+	// Endpoint is the OTLP collector address shared between metric
+	// and log exports. For gRPC: "host:port" (e.g. "localhost:4317").
+	// For HTTP: a *base* URL with no signal-specific path (e.g.
+	// "https://otel.example") — the exporters append "/v1/metrics"
+	// and "/v1/logs" themselves. Passing a URL that already ends in
+	// "/v1/metrics" (or any other signal-specific path) routes both
+	// signals to the same wrong path on the collector. When empty the
 	// SDK falls through to OTEL_EXPORTER_OTLP_ENDPOINT.
 	Endpoint string
 
@@ -88,18 +103,20 @@ type Config struct {
 	ServiceVersion string
 }
 
-// Provider is a thin wrapper over an SDK MeterProvider, holding the
-// state needed to flush and shut it down cleanly. The zero value
-// represents an inactive provider whose Shutdown is a no-op — that's
-// what callers get when observability is disabled, so the daemon
-// shutdown path doesn't have to branch on whether Init succeeded.
+// Provider is a thin wrapper over the SDK MeterProvider and
+// LoggerProvider, holding the state needed to flush and shut them down
+// cleanly. The zero value represents an inactive provider whose
+// Shutdown is a no-op — that's what callers get when observability is
+// disabled, so the daemon shutdown path doesn't have to branch on
+// whether Init succeeded.
 type Provider struct {
 	mp       *sdkmetric.MeterProvider
+	lp       *sdklog.LoggerProvider
 	shutdown func(context.Context) error
 }
 
-// Shutdown flushes any pending metric exports and tears down the
-// provider. Always returns nil for an inactive provider so callers
+// Shutdown flushes any pending metric and log exports and tears down
+// the provider. Always returns nil for an inactive provider so callers
 // can defer it unconditionally.
 func (p *Provider) Shutdown(ctx context.Context) error {
 	if p == nil || p.shutdown == nil {
@@ -108,34 +125,55 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	return p.shutdown(ctx)
 }
 
-// ForceFlush blocks until the periodic reader has exported any
-// in-flight metrics, up to the deadline on ctx. Available for
-// callers that want to flush mid-flight without tearing the
-// provider down; Shutdown already invokes ForceFlush internally,
-// so the one-shot `dotvault sync` and `dotvault run --once`
-// paths rely on their deferred Shutdown rather than calling this
-// directly. No-op for an inactive provider.
+// ForceFlush blocks until the periodic reader and log processor have
+// exported any in-flight records, up to the deadline on ctx. Available
+// for callers that want to flush mid-flight without tearing the
+// provider down; Shutdown already invokes ForceFlush internally, so
+// the one-shot `dotvault sync` and `dotvault run --once` paths rely
+// on their deferred Shutdown rather than calling this directly. No-op
+// for an inactive provider. Returns errors.Join so a collector outage
+// affecting both signals surfaces both failures instead of masking the
+// second one.
 func (p *Provider) ForceFlush(ctx context.Context) error {
-	if p == nil || p.mp == nil {
+	if p == nil {
 		return nil
 	}
-	return p.mp.ForceFlush(ctx)
+	var mErr, lErr error
+	if p.mp != nil {
+		mErr = p.mp.ForceFlush(ctx)
+	}
+	if p.lp != nil {
+		lErr = p.lp.ForceFlush(ctx)
+	}
+	return errors.Join(mErr, lErr)
 }
 
-// Init initialises the OTLP metric exporter and installs a global
-// MeterProvider. Subsequent calls to package-level instruments (Sync,
-// Vault, Token, …) record into this provider. When cfg.Enabled is
-// false, Init returns an inactive Provider whose Shutdown is a no-op
-// and leaves the global meter unchanged (so instruments back off to
-// the OTel no-op meter).
+// Init initialises the OTLP metric and log exporters and installs the
+// global MeterProvider and LoggerProvider. Subsequent calls to
+// package-level instruments (Sync, Vault, Token, …) record into the
+// MeterProvider, and Log* helpers emit through the LoggerProvider.
+// When cfg.Enabled is false, Init returns an inactive Provider whose
+// Shutdown is a no-op and leaves the global meter and logger
+// unchanged (so instruments back off to the OTel no-op meter and log
+// emissions go to the no-op global logger).
 func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	if !cfg.Enabled {
 		return &Provider{}, nil
 	}
 
-	exporter, err := buildExporter(ctx, cfg)
+	metricExporter, err := buildMetricExporter(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("build OTLP exporter: %w", err)
+		return nil, fmt.Errorf("build OTLP metric exporter: %w", err)
+	}
+
+	logExporter, err := buildLogExporter(ctx, cfg)
+	if err != nil {
+		// metricExporter already holds a gRPC/HTTP connection; shut it
+		// down before the error escapes so a transient log-exporter
+		// init failure doesn't leak the metric side. Bounded by the
+		// caller's ctx — initObservability passes a 10s budget.
+		_ = metricExporter.Shutdown(ctx)
+		return nil, fmt.Errorf("build OTLP log exporter: %w", err)
 	}
 
 	hostname, _ := os.Hostname()
@@ -151,6 +189,11 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 		),
 	)
 	if err != nil {
+		// Both exporters are open — clean them up so the process isn't
+		// left with two background dialers pointing at a collector for
+		// a daemon that never actually started.
+		_ = metricExporter.Shutdown(ctx)
+		_ = logExporter.Shutdown(ctx)
 		return nil, fmt.Errorf("build resource: %w", err)
 	}
 
@@ -158,7 +201,7 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	if cfg.ExportInterval > 0 {
 		readerOpts = append(readerOpts, sdkmetric.WithInterval(cfg.ExportInterval))
 	}
-	reader := sdkmetric.NewPeriodicReader(exporter, readerOpts...)
+	reader := sdkmetric.NewPeriodicReader(metricExporter, readerOpts...)
 
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithResource(res),
@@ -166,51 +209,48 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	)
 	otel.SetMeterProvider(mp)
 
-	// Rebind instruments so subsequent record-site calls hit the active
-	// MeterProvider rather than the no-op global captured at process
-	// start. Safe to call repeatedly — instruments are recreated each
-	// time, but creation is cheap and Init runs once per process.
+	lp := sdklog.NewLoggerProvider(
+		sdklog.WithResource(res),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+	)
+	global.SetLoggerProvider(lp)
+
+	// Rebind instruments so subsequent record-site calls hit the
+	// active MeterProvider rather than the no-op global captured at
+	// process start. The logger handle isn't cached — Log* helpers
+	// resolve it from global.GetLoggerProvider() per call — so no
+	// equivalent rebind is needed for the log signal. Safe to call
+	// repeatedly: instruments are recreated each time, but creation
+	// is cheap and Init runs once per process.
 	rebindInstruments()
 
 	return &Provider{
 		mp: mp,
+		lp: lp,
 		shutdown: func(ctx context.Context) error {
 			// Best-effort flush before shutdown so the last batch makes
 			// it out even when the caller passes a tight context.
 			_ = mp.ForceFlush(ctx)
-			return mp.Shutdown(ctx)
+			_ = lp.ForceFlush(ctx)
+			return errors.Join(mp.Shutdown(ctx), lp.Shutdown(ctx))
 		},
 	}, nil
 }
 
-func buildExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
 	// Footgun guard: insecure transport + auth headers means a
 	// bearer token (e.g. a Datadog / Grafana Cloud OTLP key) goes
-	// over plaintext to the collector. Loopback collectors that
-	// don't terminate TLS are a legitimate case, but the
-	// combination usually signals a misconfiguration. Log at Warn
-	// so it surfaces in the journal without blocking startup.
+	// over plaintext to the collector on both the metric and log
+	// exports (the cfg.Headers map is reused for both signals).
+	// Loopback collectors that don't terminate TLS are a legitimate
+	// case, but the combination usually signals a misconfiguration.
+	// Logged once here (rather than duplicated in buildLogExporter)
+	// because buildMetricExporter runs first during Init.
 	if cfg.Insecure && len(cfg.Headers) > 0 {
-		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext; use a TLS-protected endpoint for production")
+		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext on both metric and log exports; use a TLS-protected endpoint for production")
 	}
 
-	// Honour the OpenTelemetry env-var convention when cfg.Protocol
-	// is empty: a metrics-specific override
-	// (OTEL_EXPORTER_OTLP_METRICS_PROTOCOL) takes precedence over the
-	// generic one (OTEL_EXPORTER_OTLP_PROTOCOL); both fall back to
-	// gRPC when unset. Without this fallthrough, a centrally-managed
-	// environment that selects http/protobuf via env would be
-	// silently overridden to gRPC by the default below.
-	protocol := strings.ToLower(strings.TrimSpace(cfg.Protocol))
-	if protocol == "" {
-		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")))
-	}
-	if protocol == "" {
-		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")))
-	}
-	if protocol == "" {
-		protocol = "grpc"
-	}
+	protocol := resolveProtocol(cfg.Protocol, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
 
 	switch protocol {
 	case "grpc":
@@ -282,6 +322,70 @@ func stringOr(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// resolveProtocol honours the OpenTelemetry env-var convention when
+// cfg.Protocol is empty: a signal-specific override (e.g.
+// OTEL_EXPORTER_OTLP_METRICS_PROTOCOL / _LOGS_PROTOCOL) takes
+// precedence over the generic OTEL_EXPORTER_OTLP_PROTOCOL; both fall
+// back to gRPC when unset. Without this fallthrough, a
+// centrally-managed environment that selects http/protobuf via env
+// would be silently overridden to gRPC by the default below.
+func resolveProtocol(configured, signalEnvVar string) string {
+	protocol := strings.ToLower(strings.TrimSpace(configured))
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv(signalEnvVar)))
+	}
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")))
+	}
+	if protocol == "" {
+		protocol = "grpc"
+	}
+	return protocol
+}
+
+// buildLogExporter mirrors buildMetricExporter for OTLP log records. It
+// reuses the same Endpoint / Insecure / Headers / Protocol knobs as
+// the metric exporter — a single observability block configures both
+// signals against the same collector — but reads the
+// signal-specific OTEL_EXPORTER_OTLP_LOGS_PROTOCOL override before
+// the generic OTEL_EXPORTER_OTLP_PROTOCOL.
+func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) {
+	protocol := resolveProtocol(cfg.Protocol, "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+
+	switch protocol {
+	case "grpc":
+		opts := []otlploggrpc.Option{}
+		if cfg.Endpoint != "" {
+			opts = append(opts, otlploggrpc.WithEndpoint(stripScheme(cfg.Endpoint)))
+		}
+		if cfg.Insecure {
+			opts = append(opts, otlploggrpc.WithInsecure())
+		}
+		if len(cfg.Headers) > 0 {
+			opts = append(opts, otlploggrpc.WithHeaders(cfg.Headers))
+		}
+		return otlploggrpc.New(ctx, opts...)
+	case "http/protobuf":
+		opts := []otlploghttp.Option{}
+		if cfg.Endpoint != "" {
+			if strings.Contains(cfg.Endpoint, "://") {
+				opts = append(opts, otlploghttp.WithEndpointURL(cfg.Endpoint))
+			} else {
+				opts = append(opts, otlploghttp.WithEndpoint(cfg.Endpoint))
+			}
+		}
+		if cfg.Insecure {
+			opts = append(opts, otlploghttp.WithInsecure())
+		}
+		if len(cfg.Headers) > 0 {
+			opts = append(opts, otlploghttp.WithHeaders(cfg.Headers))
+		}
+		return otlploghttp.New(ctx, opts...)
+	default:
+		return nil, fmt.Errorf("unsupported observability protocol %q (use grpc or http/protobuf)", protocol)
+	}
 }
 
 // Instrument handles. These are rebound from Init so their recorders
@@ -492,4 +596,32 @@ func RecordSIGHUP(ctx context.Context) {
 		return
 	}
 	c.Add(ctx, 1)
+}
+
+// LogRegistryConfigManaged emits a WARN-severity OTel log record
+// signalling that the daemon's configuration came from the Windows
+// Registry (Group Policy) and the file at path is being ignored.
+// Routed through the OTel logger rather than slog because the message
+// surfaces a deployment fact an operator cares about (GPO mode is
+// active) but is *not* something an end-user running the CLI should
+// see on stdout/stderr — slog there leaks an INFO line out of every
+// CLI invocation on a GPO-managed Windows box. When observability is
+// disabled the global LoggerProvider is a no-op and the record is
+// silently dropped, which is exactly the desired behaviour.
+//
+// Resolves the logger from the current global LoggerProvider on every
+// call rather than caching a handle behind a mutex. The previous
+// cached-handle design carried an exported RebindGlobalLogger purely
+// for tests; this is called once per daemon/sync startup so a single
+// global lookup per emit is fine and removes that test-only API from
+// the production surface.
+func LogRegistryConfigManaged(ctx context.Context, path string) {
+	l := global.GetLoggerProvider().Logger("github.com/goodtune/dotvault")
+	var rec log.Record
+	rec.SetTimestamp(time.Now())
+	rec.SetSeverity(log.SeverityWarn)
+	rec.SetSeverityText("WARN")
+	rec.SetBody(log.StringValue("configuration loaded from Windows Registry (Group Policy); file-based config is ignored"))
+	rec.AddAttributes(log.String("path", path))
+	l.Emit(ctx, rec)
 }

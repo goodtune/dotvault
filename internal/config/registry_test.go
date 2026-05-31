@@ -48,6 +48,44 @@ rules:
 	}
 }
 
+// TestLoadSystemFileBranchClearsManaged covers the symmetric half of
+// the Managed contract: a file-loaded config must carry Managed=false
+// so the daemon does not emit a spurious GPO-managed OTel log record.
+// The registry-branch (Managed=true) assignment lives behind a
+// Windows-only registry-write path that isn't unit-testable without
+// HKLM mutation; the daemon-side test
+// (cmd/dotvault.TestEmitConfigSourceLog) pins down what happens when
+// Managed=true, and this test pins down that the YAML path never
+// flips the flag.
+func TestLoadSystemFileBranchClearsManaged(t *testing.T) {
+	_, managed, err := loadFromRegistry()
+	if err != nil {
+		t.Fatalf("loadFromRegistry: %v", err)
+	}
+	if managed {
+		t.Skip("GPO registry keys found on this machine; cannot exercise file branch")
+	}
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+sync:
+  interval: "5m"
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+`
+	cfg, err := LoadSystem(writeTemp(t, yaml))
+	if err != nil {
+		t.Fatalf("LoadSystem: %v", err)
+	}
+	if cfg.Managed {
+		t.Errorf("Managed = true after file-branch LoadSystem; want false")
+	}
+}
+
 func TestLoadSystemFileNotFound(t *testing.T) {
 	// Skip on Windows machines that have GPO registry keys installed,
 	// because LoadSystem will return managed registry config rather than

@@ -84,6 +84,44 @@ func TestApplyRegistryLayerBooleans(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerObservability covers the Observability subkey
+// that gates the OTel LoggerProvider wiring. Without these fields
+// populated from the registry, a GPO-managed daemon would have
+// Observability.Enabled=false (zero value), Init would short-circuit
+// to an inactive Provider, and the WARN record from
+// LogRegistryConfigManaged — the entire point of this code path —
+// would vanish into the no-op global logger.
+func TestApplyRegistryLayerObservability(t *testing.T) {
+	cfg := &Config{}
+
+	enabled := uint32(1)
+	insecure := uint32(0)
+	layer := registryLayer{
+		ObservabilityEnabled:        &enabled,
+		ObservabilityEndpoint:       "https://otel.example",
+		ObservabilityProtocol:       "http/protobuf",
+		ObservabilityInsecure:       &insecure,
+		ObservabilityExportInterval: "30s",
+	}
+	applyRegistryLayer(cfg, layer)
+
+	if !cfg.Observability.Enabled {
+		t.Error("Observability.Enabled should be true when DWORD is 1")
+	}
+	if cfg.Observability.Endpoint != "https://otel.example" {
+		t.Errorf("Endpoint = %q, want %q", cfg.Observability.Endpoint, "https://otel.example")
+	}
+	if cfg.Observability.Protocol != "http/protobuf" {
+		t.Errorf("Protocol = %q, want %q", cfg.Observability.Protocol, "http/protobuf")
+	}
+	if cfg.Observability.Insecure {
+		t.Error("Insecure should be false when DWORD is 0")
+	}
+	if cfg.Observability.RawInterval != "30s" {
+		t.Errorf("RawInterval = %q, want %q", cfg.Observability.RawInterval, "30s")
+	}
+}
+
 func TestReadSingleEnrolment(t *testing.T) {
 	// Register cleanup first so stray keys are removed even on early failure.
 	// Deletes children before parents (required on Windows).

@@ -1173,7 +1173,11 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 		return true, nil
 	}
 
-	if _, err := vc.RenewSelf(ctx, 0); err != nil {
+	renew := func(ctx context.Context) error {
+		_, err := vc.RenewSelf(ctx, 0)
+		return err
+	}
+	if err := renewTokenWithProgress(ctx, renew, os.Stderr); err != nil {
 		// Backstop for context.Canceled (the SIGINT handler cancels
 		// the outer context before os.Exit, but the race usually goes
 		// to os.Exit). If RenewSelf does happen to unwind first, exit
@@ -1182,13 +1186,81 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 		if loginCheckCancelled(ctx, err) {
 			return true, err
 		}
-		fmt.Fprintf(os.Stderr, "vault token renewal failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "token is still valid but nearing expiry: %s remaining, expires %s\n",
 			ttl.Truncate(time.Second), absoluteExpiry(ttl))
 		return true, err
 	}
-	fmt.Fprintln(os.Stderr, "vault token renewed")
 	return true, nil
+}
+
+// renewProgressTick is the interval between progress dots emitted while a
+// token renewal is in flight. Small enough that a slow renewal feels
+// responsive, large enough that the dots read as a deliberate "working…"
+// animation rather than a stutter.
+const renewProgressTick = 400 * time.Millisecond
+
+// renewTokenWithProgress runs renew while keeping the user informed that
+// something is happening. login-check frequently runs at shell startup,
+// and a token renewal can block for a noticeable beat against a slow or
+// distant Vault — with no output the terminal looks hung (the user
+// reported exactly this). We print a prefix, emit a dot every
+// renewProgressTick while the renewal is in flight, and finish the line
+// with the outcome, all on a single line: a successful renewal reads as
+//
+//	Vault token needs extending... renewed.
+//
+// The dot animation is gated on w being the real stderr TTY; piped output
+// and test buffers get the prefix, a static ellipsis, and the outcome with
+// no interstitial ticking so captured logs stay on one tidy line.
+//
+// On failure the line ends with " failed: <err>" and the error is
+// returned for the caller to add its own follow-up detail. On Ctrl+C
+// (context cancellation) the error is returned without writing an outcome:
+// the SIGINT handler owns the newline and the exit, so we leave the
+// dangling line for it to terminate rather than racing a second write onto
+// it.
+//
+// renew is injected (rather than taking the Vault client directly) so the
+// presentation stays decoupled from Vault plumbing and is unit-testable
+// with a fake. It must honour ctx; the wait blocks until it returns. The
+// done channel is buffered so the renew goroutine never leaks even if this
+// function has already returned on cancellation.
+func renewTokenWithProgress(ctx context.Context, renew func(context.Context) error, w io.Writer) error {
+	fmt.Fprint(w, "Vault token needs extending")
+
+	done := make(chan error, 1)
+	go func() { done <- renew(ctx) }()
+
+	var err error
+	if w == os.Stderr && term.IsTerminal(int(os.Stderr.Fd())) {
+		// Anchor the ellipsis with an immediate dot so even an
+		// instantaneous renewal reads coherently, then tick for as long
+		// as the renewal is in flight.
+		fmt.Fprint(w, ".")
+		ticker := time.NewTicker(renewProgressTick)
+		defer ticker.Stop()
+		for waiting := true; waiting; {
+			select {
+			case err = <-done:
+				waiting = false
+			case <-ticker.C:
+				fmt.Fprint(w, ".")
+			}
+		}
+	} else {
+		fmt.Fprint(w, "...")
+		err = <-done
+	}
+
+	if err != nil {
+		if loginCheckCancelled(ctx, err) {
+			return err
+		}
+		fmt.Fprintf(w, " failed: %v\n", err)
+		return err
+	}
+	fmt.Fprintln(w, " renewed.")
+	return nil
 }
 
 // loginCheckCancelled reports whether err is a context-cancellation.

@@ -46,6 +46,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeVault(cfg.Vault)
 	e.writeSync(cfg.Sync)
 	e.writeWeb(cfg.Web)
+	e.writeObservability(cfg.Observability)
 	e.writeAgent(cfg.Agent)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -113,6 +114,35 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 	e.writeKey(rootKey + `\Web`)
 	e.writeBool("Enabled", w.Enabled)
 	e.writeString("Listen", w.Listen)
+	// LoginText / SecretViewText are markdown blobs that may span multiple
+	// lines; writeString falls through to hex(1) when it spots a newline or
+	// non-ASCII byte, so they round-trip the same way rule templates do.
+	e.writeString("LoginText", w.LoginText)
+	e.writeString("SecretViewText", w.SecretViewText)
+	e.WriteString("\r\n")
+}
+
+// writeObservability emits the Observability section's scalar fields.
+//
+// Headers are deliberately omitted. They routinely carry OTLP bearer
+// tokens (Datadog / Grafana Cloud etc.), and ObservabilityConfig.MarshalYAML
+// strips them from every YAML export for exactly this reason; keeping the
+// .reg export header-free honours the documented invariant that a
+// reg-export artefact never contains the live token. An admin who must
+// push headers through Group Policy authors the Observability\Headers
+// subkey directly (REG_SZ value per header); both the live registry loader
+// and the .reg parser read it back. Because we never emit Headers, we also
+// never emit a Headers-subtree deletion stanza — that would clobber
+// admin-authored credentials on re-import of a tool-generated .reg.
+func (e *emitter) writeObservability(o config.ObservabilityConfig) {
+	e.writeKey(rootKey + `\Observability`)
+	e.writeBool("Enabled", o.Enabled)
+	e.writeString("Endpoint", o.Endpoint)
+	e.writeString("Protocol", o.Protocol)
+	e.writeBool("Insecure", o.Insecure)
+	// Emit RawInterval as the user wrote it (matching writeSync); the value
+	// name mirrors the YAML key (export_interval) capitalised for the registry.
+	e.writeString("ExportInterval", o.RawInterval)
 	e.WriteString("\r\n")
 }
 

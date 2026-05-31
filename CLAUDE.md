@@ -103,7 +103,7 @@ internal/
   tray/                  Windows system-tray icon (no-op on other platforms)
   agent/                 SSH agent: read-only ExtendedAgent backend + Unix-socket (Linux/macOS) and named-pipe (Windows) listeners
 test/integration/        Integration tests against real Vault
-packaging/windows/       ADMX Group Policy template
+packaging/windows/       NSIS installer script + build helper
 packaging/linux/         systemd units (dotvault.service, shipped in RPM/DEB/APK)
 ```
 
@@ -534,11 +534,13 @@ Configurable markdown content via `web.login_text` and `web.secret_view_text` fi
 
 ## Windows Registry / Group Policy
 
-When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, Web, and Agent (scalar transport: `Enabled`, `UnixPath`, `WindowsPipe`) settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey. Enrolments are subkeys under `Enrolments\{Name}` with an optional `Settings` subkey.
+When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, Web (`Enabled`, `Listen`, `LoginText`, `SecretViewText`), Observability (`Enabled`, `Endpoint`, `Protocol`, `Insecure`, `ExportInterval`), and Agent (scalar transport: `Enabled`, `UnixPath`, `WindowsPipe`) settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey. Enrolments are subkeys under `Enrolments\{Name}` with an optional `Settings` subkey.
+
+**Coverage is total: every YAML field has a registry equivalent and round-trips losslessly through `reg-import`/`reg-export` and the live loader.** The one deliberate exception is `observability.headers`: those values carry OTLP bearer tokens, so — exactly like `ObservabilityConfig.MarshalYAML` strips them from YAML exports — the regfile renderer never emits the `Observability\Headers` subtree, and never emits a deletion stanza for it (so a tool-generated `.reg` import can't clobber hand-authored credentials). The live loader (`readRegistryObservabilityHeaders`) and the `.reg` parser still *read* `Observability\Headers\<name>` REG_SZ values if an admin authors them directly, preserving header-name case verbatim (unlike the lowercased enrolment `Settings` names). The recommended home for these secrets remains `OTEL_EXPORTER_OTLP_HEADERS` in the per-user `EnvironmentFile`, not Group Policy. When adding a new config field, extend all three surfaces in lockstep — `internal/config/registry_windows.go` (live loader), `internal/regfile/regfile.go` (render), and `internal/regfile/parse.go` (parse) — and add a round-trip test; the `internal/regfile` tests are platform-neutral and run everywhere, while the `registry_windows*` loader tests are `//go:build windows`.
 
 The `agent.keys[]` list is **ordered**, unlike the name-keyed rules/enrolments maps. It is stored under `Agent\Keys\{N}` where `{N}` is the zero-based list index (`Agent\Keys\0`, `\1`, …); both the live registry loader (`readRegistryAgentKeys`) and the regfile parser sort those subkey names numerically to rebuild the slice in order, and reject a non-integer subkey name as a hard error rather than silently reordering or dropping a key. `Principals` round-trips as a REG_MULTI_SZ (like OAuth `Scopes`); an explicit empty list is preserved as a non-nil empty slice.
 
-This means a Windows GPO deployment can configure the SSH agent end-to-end, and `reg-export` / `reg-import` (plus the web `GET /api/v1/config/download`) round-trip the `agent` section through both the YAML and `.reg` forms. The ADMX template is not maintained (Group Policy UI for the agent section is out of scope); admins author the registry values directly (e.g. via `reg-import`).
+This means a Windows GPO deployment can configure the SSH agent end-to-end, and `reg-export` / `reg-import` (plus the web `GET /api/v1/config/download`) round-trip the `agent` section through both the YAML and `.reg` forms. dotvault does **not** ship an ADMX administrative template and there is no plan to — it was never adequately tested and has been removed entirely. Admins author the registry values directly (e.g. via `reg-import` from a YAML config); the registry surface is the supported Group Policy integration.
 
 ## File Permissions & Security
 

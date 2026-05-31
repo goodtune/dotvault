@@ -4,9 +4,9 @@
 
 **Goal:** Load enrolment configuration from Windows Registry GPO keys, matching the existing Rules registry pattern.
 
-**Architecture:** Add `readRegistryEnrolments` / `readSingleEnrolment` functions mirroring `readRegistryRules` / `readSingleRule`. Each enrolment is a named subkey under `Enrolments\` with an `Engine` REG_SZ value and optional `Settings\` subkey. Update the ADMX template with an Enrolments category and GP Preferences documentation comment.
+**Architecture:** Add `readRegistryEnrolments` / `readSingleEnrolment` functions mirroring `readRegistryRules` / `readSingleRule`. Each enrolment is a named subkey under `Enrolments\` with an `Engine` REG_SZ value and optional `Settings\` subkey.
 
-**Tech Stack:** Go, `golang.org/x/sys/windows/registry`, ADMX XML
+**Tech Stack:** Go, `golang.org/x/sys/windows/registry`
 
 ---
 
@@ -14,7 +14,6 @@
 
 - **Modify:** `internal/config/registry_windows.go` — add `readRegistryEnrolments`, `readSingleEnrolment`, wire into `loadFromRegistry`
 - **Modify:** `internal/config/registry_windows_test.go` — add tests for new functions
-- **Modify:** `packaging/windows/dotvault.admx` — add Enrolments category and GP Preferences comment
 
 ---
 
@@ -368,73 +367,7 @@ The existing `readRegistryRules` and helpers hard-code `registryPolicyPath`. For
 
 ---
 
-### Task 5: Update ADMX template
-
-**Files:**
-- Modify: `packaging/windows/dotvault.admx`
-
-- [ ] **Step 1: Add Enrolments comment and category to ADMX**
-
-In `packaging/windows/dotvault.admx`, add the enrolments GP Preferences comment after the existing Rules comment block (after line 30, before the closing `-->`), and add the Enrolments category to the categories block.
-
-Replace the closing comment and policyDefinitions opening (lines 30-57) with:
-
-```xml
-    SOFTWARE\Policies\dotvault\Rules\<rule-name>\OAuth\Scopes     (REG_MULTI_SZ)
-
-  Enrolments (credential acquisition flows) are also configured via
-  Group Policy Preferences > Registry, targeting:
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Engine            (REG_SZ)
-  Optional Settings subkey:
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_SZ)
-    SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_MULTI_SZ)
--->
-<policyDefinitions
-    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    revision="1.0"
-    schemaVersion="1.0"
-    xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
-
-  <policyNamespaces>
-    <target prefix="dotvault" namespace="goodtune.dotvault" />
-    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
-  </policyNamespaces>
-
-  <resources minRequiredRevision="1.0" />
-
-  <categories>
-    <category name="Dotvault" displayName="$(string.Cat_Dotvault)" />
-    <category name="Vault" displayName="$(string.Cat_Vault)">
-      <parentCategory ref="Dotvault" />
-    </category>
-    <category name="Sync" displayName="$(string.Cat_Sync)">
-      <parentCategory ref="Dotvault" />
-    </category>
-    <category name="WebUI" displayName="$(string.Cat_WebUI)">
-      <parentCategory ref="Dotvault" />
-    </category>
-    <category name="Enrolments" displayName="$(string.Cat_Enrolments)">
-      <parentCategory ref="Dotvault" />
-    </category>
-  </categories>
-```
-
-- [ ] **Step 2: Verify ADMX is well-formed XML**
-
-Run: `xmllint --noout packaging/windows/dotvault.admx`
-Expected: No errors (if xmllint is available; otherwise visually inspect)
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add packaging/windows/dotvault.admx
-git commit -m "Add Enrolments category and GP Preferences docs to ADMX (#21)"
-```
-
----
-
-### Task 6: Final verification
+### Task 5: Final verification
 
 - [ ] **Step 1: Run full test suite**
 

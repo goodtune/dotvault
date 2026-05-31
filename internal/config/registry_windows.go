@@ -63,7 +63,60 @@ func loadFromRegistry() (*Config, bool, error) {
 	}
 	cfg.Agent.Keys = agentKeys
 
+	// Read observability headers (a dynamic key/value map) from the
+	// machine-level policy key. The scalar observability fields are handled
+	// by applyRegistryLayer above; headers live under their own subkey.
+	headers, err := readRegistryObservabilityHeaders(registry.LOCAL_MACHINE, registryPolicyPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("read registry observability headers: %w", err)
+	}
+	if len(headers) > 0 {
+		cfg.Observability.Headers = headers
+	}
+
 	return cfg, true, nil
+}
+
+// readRegistryObservabilityHeaders reads the OTLP header map from
+// Observability\Headers under the given basePath. Each header is a REG_SZ
+// value whose name is the header key. Returns (nil, nil) when the key does
+// not exist. Header names are preserved verbatim (not lowercased like
+// enrolment Settings): HTTP folds header case, but a faithful round-trip
+// keeps whatever the admin authored.
+//
+// These values are credentials, so the regfile renderer never emits them;
+// they exist only when an admin sets them directly via Group Policy.
+func readRegistryObservabilityHeaders(root registry.Key, basePath string) (map[string]string, error) {
+	headersPath := basePath + `\Observability\Headers`
+	key, err := registry.OpenKey(root, headersPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open Observability\\Headers key at %s: %w", headersPath, err)
+	}
+	defer key.Close()
+
+	info, err := key.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Observability\\Headers key: %w", err)
+	}
+	if info.ValueCount == 0 {
+		return nil, nil
+	}
+
+	names, err := key.ReadValueNames(int(info.ValueCount))
+	if err != nil {
+		return nil, fmt.Errorf("read Observability\\Headers value names: %w", err)
+	}
+
+	headers := make(map[string]string, len(names))
+	for _, name := range names {
+		if v, ok := readRegString(key, name); ok {
+			headers[name] = v
+		}
+	}
+	return headers, nil
 }
 
 // registryLayer holds the flat values read from a single registry hive.
@@ -83,8 +136,18 @@ type registryLayer struct {
 	SyncInterval string
 
 	// Web
-	WebEnabled *uint32
-	WebListen  string
+	WebEnabled        *uint32
+	WebListen         string
+	WebLoginText      string
+	WebSecretViewText string
+
+	// Observability (scalar fields; the Headers map is read separately by
+	// readRegistryObservabilityHeaders).
+	ObservabilityEnabled  *uint32
+	ObservabilityEndpoint string
+	ObservabilityProtocol string
+	ObservabilityInsecure *uint32
+	ObservabilityInterval string
 
 	// Agent (scalar transport settings; the ordered Keys list is read
 	// separately by readRegistryAgentKeys).
@@ -145,6 +208,23 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		defer wk.Close()
 		layer.WebEnabled = readRegDWORD(wk, "Enabled")
 		layer.WebListen, _ = readRegString(wk, "Listen")
+		layer.WebLoginText, _ = readRegString(wk, "LoginText")
+		layer.WebSecretViewText, _ = readRegString(wk, "SecretViewText")
+	}
+
+	// Read Observability subkey (scalar fields only; Headers is a nested
+	// key/value map read separately by readRegistryObservabilityHeaders).
+	obk, err := registry.OpenKey(root, registryPolicyPath+`\Observability`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Observability policy key: %w", err)
+	}
+	if err == nil {
+		defer obk.Close()
+		layer.ObservabilityEnabled = readRegDWORD(obk, "Enabled")
+		layer.ObservabilityEndpoint, _ = readRegString(obk, "Endpoint")
+		layer.ObservabilityProtocol, _ = readRegString(obk, "Protocol")
+		layer.ObservabilityInsecure = readRegDWORD(obk, "Insecure")
+		layer.ObservabilityInterval, _ = readRegString(obk, "ExportInterval")
 	}
 
 	// Read Agent subkey (scalar transport settings only).
@@ -200,6 +280,27 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.WebListen != "" {
 		cfg.Web.Listen = layer.WebListen
+	}
+	if layer.WebLoginText != "" {
+		cfg.Web.LoginText = layer.WebLoginText
+	}
+	if layer.WebSecretViewText != "" {
+		cfg.Web.SecretViewText = layer.WebSecretViewText
+	}
+	if layer.ObservabilityEnabled != nil {
+		cfg.Observability.Enabled = *layer.ObservabilityEnabled != 0
+	}
+	if layer.ObservabilityEndpoint != "" {
+		cfg.Observability.Endpoint = layer.ObservabilityEndpoint
+	}
+	if layer.ObservabilityProtocol != "" {
+		cfg.Observability.Protocol = layer.ObservabilityProtocol
+	}
+	if layer.ObservabilityInsecure != nil {
+		cfg.Observability.Insecure = *layer.ObservabilityInsecure != 0
+	}
+	if layer.ObservabilityInterval != "" {
+		cfg.Observability.RawInterval = layer.ObservabilityInterval
 	}
 	if layer.AgentEnabled != nil {
 		cfg.Agent.Enabled = *layer.AgentEnabled != 0

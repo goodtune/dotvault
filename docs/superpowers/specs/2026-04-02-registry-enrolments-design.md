@@ -6,7 +6,7 @@
 
 ## Problem
 
-When dotvault is managed via Windows Group Policy (HKLM registry keys), `loadFromRegistry()` populates Vault, Sync, Web, and Rules config but never reads enrolments. The ADMX template also has no enrolment policies. Enrolments configured via GPO are silently ignored.
+When dotvault is managed via Windows Group Policy (HKLM registry keys), `loadFromRegistry()` populates Vault, Sync, Web, and Rules config but never reads enrolments. Enrolments configured via GPO are silently ignored.
 
 ## Solution
 
@@ -60,29 +60,6 @@ if err != nil {
 cfg.Enrolments = enrolments
 ```
 
-## ADMX Changes
-
-### `packaging/windows/dotvault.admx`
-
-Add an `Enrolments` category under `Dotvault` in the `<categories>` block:
-
-```xml
-<category name="Enrolments" displayName="$(string.Cat_Enrolments)">
-  <parentCategory ref="Dotvault" />
-</category>
-```
-
-Add an XML comment block documenting the GP Preferences registry paths, following the same pattern as the existing Rules comment:
-
-```
-Enrolments are complex multi-field objects that cannot be fully expressed
-as ADMX policies. Configure enrolments via Group Policy Preferences >
-Registry, targeting:
-  SOFTWARE\Policies\dotvault\Enrolments\<name>\Engine            (REG_SZ)
-  SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_SZ)
-  SOFTWARE\Policies\dotvault\Enrolments\<name>\Settings\<key>    (REG_MULTI_SZ)
-```
-
 ## Tests
 
 ### `internal/config/registry_windows_test.go`
@@ -96,6 +73,5 @@ These tests can only run on Windows (build-tagged `windows`). They exercise the 
 ## Out of Scope
 
 - No changes to config validation — existing validation (`enrolments[key].engine is required`) already applies to registry-loaded enrolments
-- ADML changes limited to adding the `Cat_Enrolments` string resource to `packaging/windows/en-US/dotvault.adml`
 - No changes to the enrolment manager, engine interface, or any other package
 - Settings are flat only (no nested maps) — sufficient for all current engines

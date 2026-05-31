@@ -246,7 +246,7 @@ observability:
 ```
 
 !!! note "Windows Group Policy"
-    The `observability` block is configured via the YAML config file only — the GPO/registry layer (and the ADMX template) does not yet expose it. On a GPO-managed Windows install, point the collector via the standard `OTEL_*` environment variables (set through a machine-wide environment policy) until the registry surface is extended.
+    The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`). Header values are the one exception: they carry bearer tokens and are never written to a `.reg` export, so set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) rather than the registry. See [Windows Group Policy](windows-gpo.md#observability-settings-observability-subkey) for the full registry schema.
 
 The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the `endpoint`/`headers` fields can be left empty and managed centrally via `/etc/default/dotvault`.
 

@@ -512,6 +512,7 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		Sync:          syncCfg,
 		Web:           s.cfg,
 		Observability: obsCfg,
+		Agent:         s.agentCfg,
 		Rules:         rules,
 		Enrolments:    enrolments,
 	}

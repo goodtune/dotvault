@@ -32,6 +32,7 @@ type Server struct {
 	vault              *vault.Client
 	engine             *internalsync.Engine
 	agentStatus        agentStatusProvider
+	agentCfg           config.AgentConfig
 	csrf               *CSRFStore
 	oauth              *OAuthManager
 	login              *auth.LoginTracker
@@ -90,7 +91,12 @@ type ServerConfig struct {
 	Vault    *vault.Client
 	Engine   *internalsync.Engine
 	// Agent, when non-nil, exposes the SSH agent status on /api/v1/status.
-	Agent         agentStatusProvider
+	Agent agentStatusProvider
+	// AgentCfg is the loaded agent configuration. It is the section the
+	// config-download endpoint re-emits, so it round-trips through the same
+	// YAML/.reg renderers as every other section even when the daemon loaded
+	// its config from a Windows GPO.
+	AgentCfg      config.AgentConfig
 	Username      string
 	TokenFilePath string
 	Version       string
@@ -122,6 +128,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		vault:              sc.Vault,
 		engine:             sc.Engine,
 		agentStatus:        sc.Agent,
+		agentCfg:           sc.AgentCfg,
 		csrf:               NewCSRFStore(),
 		oauth:              NewOAuthManager(),
 		login:              auth.NewLoginTracker(sc.Vault),

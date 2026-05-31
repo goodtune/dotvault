@@ -334,6 +334,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
 			ObsCfg:        cfg.Observability,
+			AgentCfg:      cfg.Agent,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,

@@ -23,6 +23,12 @@ else
   exit 1
 fi
 
+# Tags are v-prefixed (v0.19.0) for Go-module consumption, but the installer
+# filename, NSIS Name, and Windows DisplayVersion must match GoReleaser's
+# v-stripped {{.Version}}. metadata.json is already stripped; this normalises a
+# v-prefixed value passed manually as $1 so both paths agree.
+VERSION="${VERSION#v}"
+
 # Find the Windows binary from goreleaser output
 BINARY=""
 for candidate in \

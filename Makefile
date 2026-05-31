@@ -1,4 +1,9 @@
-VERSION := $(shell git describe --tags --always --dirty)
+# Strip a leading "v" from the tag so the injected main.version matches what
+# GoReleaser produces ({{.Version}} is always v-stripped). Tags are v-prefixed
+# (v0.19.0) for Go-module consumption; the binary version string is not, so the
+# web UI (which prepends its own "v") and packaging stay consistent across the
+# local-build and release paths.
+VERSION := $(shell git describe --tags --always --dirty | sed 's/^v//')
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
 # Windows ships two binaries from the same source: dotvault.exe (Console

@@ -122,24 +122,42 @@ directory. Only you can connect either way — the equivalent of dotvault's
 
 ## Status
 
-The agent's listed identities and any per-source resolution errors appear in
-`dotvault status` and on the web dashboard, parallel to the per-rule sync state.
+When the agent is enabled, `dotvault status` connects to the running daemon's
+socket / pipe and lists the identities it is actually serving — the `ssh-add -l`
+equivalent, spoken over the agent protocol. Because it queries the live daemon
+rather than re-deriving anything from config, the output reflects exactly what
+the agent offers: the keys currently discoverable in Vault and, for cert
+sources, the daemon's cached certificate with its **true remaining validity**.
+`dotvault status` is a read-only client here — it never creates the endpoint.
 
-`dotvault status` resolves KV sources into live key fingerprints, but
-*describes* vault-ca sources from configuration rather than minting a
-certificate — a short-lived CLI invocation minting a throwaway cert on every
-`status` call would hit Vault and produce a certificate unrelated to the one the
-running daemon serves. The **web dashboard** is the authoritative view of the
-actual minted certificate and its remaining TTL, since it reads the live
-daemon's cached cert.
+The same identities appear on the web dashboard, parallel to the per-rule sync
+state. The dashboard additionally groups them **by source** and shows per-source
+resolution errors (an unknown engine, a Vault read failure, a missing CA role) —
+detail the CLI can't show, because it lists identities over the agent protocol,
+which carries no notion of which configured source produced each one. For
+"why is this source not resolving?", consult the dashboard.
 
 ```
 $ dotvault status
 ...
 SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
-  kv:ssh           SHA256:… users/alice/ssh/laptop
-  vault-ca:dotvault-user  certificate minted on demand (mount=ssh-client-signer, role=dotvault-user, ttl=15m0s)
+  SHA256:… users/alice/ssh/laptop
+  SHA256:… dotvault-user (cert, expires 2026-05-30T12:15:00Z)
+```
+
+Because the agent is only relevant when configured, `dotvault status` consults
+the endpoint only when `agent.enabled` is set. A failure to connect in that case
+is reported as unexpected — it means the daemon isn't running, or hasn't
+authenticated far enough to start the listener:
+
+```
+$ dotvault status
+...
+SSH Agent:
+  endpoint: /run/user/1000/dotvault/agent.sock
+  unreachable: dial unix /run/user/1000/dotvault/agent.sock: connect: no such file or directory
+  (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)
 ```
 
 ## Server-side prerequisite for cert mode

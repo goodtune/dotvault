@@ -3,11 +3,19 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"net"
 
 	"github.com/Microsoft/go-winio"
 )
+
+// dialEndpoint connects to an existing agent named pipe as a client. It never
+// creates the pipe — `dotvault status` must observe the running daemon, not
+// stand up a competing listener.
+func dialEndpoint(ctx context.Context, addr string) (net.Conn, error) {
+	return winio.DialPipeContext(ctx, addr)
+}
 
 // agentPipeSDDL is the security descriptor applied to the named pipe. Windows
 // has no per-user protected subspace in the pipe namespace, so the ACL is the

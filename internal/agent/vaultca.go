@@ -16,9 +16,7 @@ import (
 )
 
 // defaultCertTTL is the vault-ca certificate lifetime applied when a source
-// omits `ttl`. Shared by newVaultCASource (the live mint path) and
-// DescribeConfig (the `dotvault status` description) so the two can't report
-// different defaults.
+// omits `ttl`.
 const defaultCertTTL = 15 * time.Minute
 
 // certSigner mints an SSH certificate from a Vault SSH-CA role. Abstracted so

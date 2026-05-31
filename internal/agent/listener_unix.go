@@ -3,12 +3,21 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+// dialEndpoint connects to an existing agent endpoint as a client. It never
+// creates the socket — `dotvault status` must observe the running daemon, not
+// stand up a competing listener.
+func dialEndpoint(ctx context.Context, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", addr)
+}
 
 // platformListen creates the Unix domain socket with 0600 permissions and a
 // 0700 parent directory. A stale socket left by an unclean shutdown is removed

@@ -735,56 +735,51 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	printAgentStatus(ctx, cfg, vc, token)
+	printAgentStatus(ctx, cfg)
 
 	return nil
 }
 
-// printAgentStatus renders the SSH agent section of `dotvault status`: the
-// resolved endpoint and, when a valid token is available, the configured key
-// sources. KV sources are resolved into live identities (cheap, read-only KV
-// lookups); vault-ca sources are described from configuration rather than
-// minted, so a status call never generates a throwaway key or hits Vault's sign
-// endpoint. The running daemon's web dashboard is the authoritative view of the
-// actual minted certificate and its remaining TTL.
-func printAgentStatus(ctx context.Context, cfg *config.Config, vc *vault.Client, token string) {
+// printAgentStatus renders the SSH agent section of `dotvault status`. The
+// agent is only relevant when configured: if `agent.enabled` is false there is
+// nothing to show and we never touch the endpoint. When enabled, status acts as
+// an agent *client* — it dials the running daemon's socket / pipe and lists the
+// identities being served (the `ssh-add -l` equivalent), so the output reflects
+// what the daemon actually offers, including a minted certificate's true
+// remaining validity. status never creates the endpoint; a failure to connect
+// is therefore unexpected (the daemon isn't running, or hasn't authenticated
+// far enough to start the listener) and is reported as such.
+func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Agent.Enabled {
 		return
 	}
+	endpoint := agent.ResolveEndpoint(cfg.Agent)
 	fmt.Println("\nSSH Agent:")
-	fmt.Printf("  endpoint: %s\n", agent.ResolveEndpoint(cfg.Agent))
-	if token == "" {
-		fmt.Println("  identities: (not authenticated — run dotvault login)")
-		return
-	}
-	username, err := paths.Username()
+	fmt.Printf("  endpoint: %s\n", endpoint)
+
+	ids, err := agent.QueryListening(ctx, endpoint)
 	if err != nil {
-		fmt.Printf("  resolve username: %v\n", err)
+		fmt.Printf("  unreachable: %v\n", err)
+		fmt.Println("  (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)")
 		return
 	}
-	st := agent.DescribeConfig(ctx, cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username)
-	for _, src := range st.Sources {
-		if src.Error != "" {
-			fmt.Printf("  %-16s error: %s\n", src.Name, src.Error)
-			continue
+	if len(ids) == 0 {
+		fmt.Println("  (no identities loaded)")
+		return
+	}
+	for _, id := range ids {
+		line := "  " + id.Fingerprint
+		if id.Comment != "" {
+			line += " " + id.Comment
 		}
-		if len(src.Identities) == 0 {
-			fmt.Printf("  %-16s (no identities)\n", src.Name)
-			continue
-		}
-		for _, id := range src.Identities {
-			line := fmt.Sprintf("  %-16s", src.Name)
-			if id.Fingerprint != "" {
-				line += " " + id.Fingerprint
-			}
-			if id.Comment != "" {
-				line += " " + id.Comment
-			}
-			if id.IsCert && id.ExpiresAt != "" {
+		if id.IsCert {
+			if id.ExpiresAt != "" {
 				line += fmt.Sprintf(" (cert, expires %s)", id.ExpiresAt)
+			} else {
+				line += " (cert)"
 			}
-			fmt.Println(line)
 		}
+		fmt.Println(line)
 	}
 }
 

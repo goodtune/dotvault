@@ -36,7 +36,7 @@ make build         # build for current platform
 make build-all     # cross-compile linux/darwin (amd64/arm64) and windows (amd64)
 ```
 
-All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`).
+All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`). Release tags are `v`-prefixed (`v0.19.0`) for Go-module consumption, but `main.version` is the v-stripped semantic version (`0.19.0`): GoReleaser's `{{.Version}}` strips the prefix and the Makefile strips it via `sed`, so local and release builds agree. Consumers (the `version` command, `/api/v1/status`, the OTel `service.version` attribute, the tray tooltip, and the web UI header which prepends its own `v`) treat the value as v-stripped and must not add or assume a leading `v`.
 
 Windows ships two binaries from the same source — the PE subsystem flag is immutable post-link, so the only correct fix is to build twice:
 

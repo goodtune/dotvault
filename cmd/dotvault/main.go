@@ -37,6 +37,13 @@ import (
 	"golang.org/x/term"
 )
 
+// version is injected at build time via -ldflags "-X main.version=...".
+// Release tags are v-prefixed (v0.19.0) for Go-module consumption, but this
+// value is the v-stripped semantic version (0.19.0): GoReleaser's {{.Version}}
+// strips it and the Makefile strips it via sed, so it stays consistent across
+// local and release builds. Every consumer (the version command, /api/v1/status,
+// the OTel service.version attribute, the tray tooltip) re-emits it verbatim and
+// must not assume or add a leading v.
 var version = "dev"
 
 var (

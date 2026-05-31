@@ -88,9 +88,10 @@ type registryLayer struct {
 
 	// Agent (scalar transport settings; the ordered Keys list is read
 	// separately by readRegistryAgentKeys).
-	AgentEnabled     *uint32
-	AgentUnixPath    string
-	AgentWindowsPipe string
+	AgentEnabled      *uint32
+	AgentUnixPath     string
+	AgentWindowsPipe  string
+	AgentWindowsPutty *uint32
 
 	// Observability. Headers are intentionally not modelled here —
 	// they carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.)
@@ -169,6 +170,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentEnabled = readRegDWORD(ak, "Enabled")
 		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
 		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
+		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
 	}
 
 	// Read Observability subkey. Without this, a GPO-managed daemon
@@ -240,6 +242,10 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.AgentWindowsPipe != "" {
 		cfg.Agent.Windows.Pipe = layer.AgentWindowsPipe
+	}
+	if layer.AgentWindowsPutty != nil {
+		b := *layer.AgentWindowsPutty != 0
+		cfg.Agent.Windows.Putty = &b
 	}
 	if layer.ObservabilityEnabled != nil {
 		cfg.Observability.Enabled = *layer.ObservabilityEnabled != 0

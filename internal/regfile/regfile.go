@@ -128,6 +128,12 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 	e.writeBool("Enabled", a.Enabled)
 	e.writeString("UnixPath", a.Unix.Path)
 	e.writeString("WindowsPipe", a.Windows.Pipe)
+	// Putty is tri-state (default true): emit the DWORD only when explicitly
+	// set so an unset value round-trips as the default rather than being
+	// pinned to whatever the export observed.
+	if a.Windows.Putty != nil {
+		e.writeBool("WindowsPutty", *a.Windows.Putty)
+	}
 	e.WriteString("\r\n")
 
 	// Always pre-delete the Keys subtree so removals round-trip. This is a

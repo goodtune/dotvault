@@ -67,6 +67,13 @@ func (l *Listener) platformListen() (net.Listener, error) {
 	return ln, nil
 }
 
+// pageantPipeName is Windows-only; the Pageant named-pipe convention has no
+// Unix analogue. resolveServeEndpoints never calls this off Windows (it gates
+// on runtime.GOOS first), but the symbol must exist for the package to build.
+func pageantPipeName() (string, error) {
+	return "", fmt.Errorf("pageant pipe is only supported on windows")
+}
+
 // platformCleanup removes the socket file. net.UnixListener.Close already
 // unlinks it in the common case; this is a best-effort backstop for paths it
 // doesn't (e.g. a bind that failed after creating the node).

@@ -286,6 +286,35 @@ func TestApplyRegistryLayerAgent(t *testing.T) {
 	if cfg.Agent.Windows.Pipe != `\\.\pipe\dotvault-agent` {
 		t.Errorf("Agent.Windows.Pipe = %q", cfg.Agent.Windows.Pipe)
 	}
+	// WindowsPutty absent from the layer: the tri-state stays nil (default true).
+	if cfg.Agent.Windows.Putty != nil {
+		t.Errorf("Agent.Windows.Putty = %v, want nil (default)", *cfg.Agent.Windows.Putty)
+	}
+}
+
+// TestApplyRegistryLayerAgentPutty confirms an explicit WindowsPutty DWORD
+// maps onto the tri-state pointer (0 => &false, non-zero => &true).
+func TestApplyRegistryLayerAgentPutty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dw   uint32
+		want bool
+	}{
+		{"zero disables", 0, false},
+		{"one enables", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			dw := tc.dw
+			applyRegistryLayer(cfg, registryLayer{AgentWindowsPutty: &dw})
+			if cfg.Agent.Windows.Putty == nil {
+				t.Fatalf("Putty = nil, want %v", tc.want)
+			}
+			if *cfg.Agent.Windows.Putty != tc.want {
+				t.Errorf("Putty = %v, want %v", *cfg.Agent.Windows.Putty, tc.want)
+			}
+		})
+	}
 }
 
 func TestReadRegistryAgentKeysOrdered(t *testing.T) {

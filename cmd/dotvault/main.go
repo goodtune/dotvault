@@ -1214,17 +1214,20 @@ const renewProgressTick = 400 * time.Millisecond
 // no interstitial ticking so captured logs stay on one tidy line.
 //
 // On failure the line ends with " failed: <err>" and the error is
-// returned for the caller to add its own follow-up detail. On Ctrl+C
-// (context cancellation) the error is returned without writing an outcome:
-// the SIGINT handler owns the newline and the exit, so we leave the
-// dangling line for it to terminate rather than racing a second write onto
-// it.
+// returned for the caller to add its own follow-up detail. On Ctrl+C the
+// select observes ctx cancellation directly and returns ctx.Err() at once
+// — without writing an outcome and without waiting for renew to unwind —
+// so the dots stop immediately and the SIGINT handler is left to own the
+// terminating newline and the exit rather than racing a second write onto
+// the dangling line.
 //
 // renew is injected (rather than taking the Vault client directly) so the
 // presentation stays decoupled from Vault plumbing and is unit-testable
-// with a fake. It must honour ctx; the wait blocks until it returns. The
-// done channel is buffered so the renew goroutine never leaks even if this
-// function has already returned on cancellation.
+// with a fake. It must honour ctx. The done channel is buffered so the
+// renew goroutine's send never blocks: if this function has already
+// returned on cancellation, the goroutine still runs until renew unwinds
+// (promptly, since renew honours ctx) and then exits cleanly rather than
+// blocking forever on an unread channel.
 func renewTokenWithProgress(ctx context.Context, renew func(context.Context) error, w io.Writer) error {
 	fmt.Fprint(w, "Vault token needs extending")
 
@@ -1243,13 +1246,19 @@ func renewTokenWithProgress(ctx context.Context, renew func(context.Context) err
 			select {
 			case err = <-done:
 				waiting = false
+			case <-ctx.Done():
+				return ctx.Err()
 			case <-ticker.C:
 				fmt.Fprint(w, ".")
 			}
 		}
 	} else {
 		fmt.Fprint(w, "...")
-		err = <-done
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	if err != nil {

@@ -36,7 +36,7 @@ make build         # build for current platform
 make build-all     # cross-compile linux/darwin (amd64/arm64) and windows (amd64)
 ```
 
-All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`).
+All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`). Release tags are `v`-prefixed (`v0.19.0`) for Go-module consumption, but `main.version` is the v-stripped semantic version (`0.19.0`): GoReleaser's `{{.Version}}` strips the prefix and the Makefile strips it via `sed`, so local and release builds agree. Consumers (the `version` command, `/api/v1/status`, the OTel `service.version` attribute, the tray tooltip, and the web UI header which prepends its own `v`) treat the value as v-stripped and must not add or assume a leading `v`.
 
 Windows ships two binaries from the same source — the PE subsystem flag is immutable post-link, so the only correct fix is to build twice:
 
@@ -92,6 +92,7 @@ internal/
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
+  tokenwatch/            Watches ~/.vault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
@@ -100,9 +101,10 @@ internal/
   web/                   Web UI server (Preact SPA), auth endpoints, REST API
   perms/                 File permission checks (Unix mode bits, Windows DACL)
   tray/                  Windows system-tray icon (no-op on other platforms)
+  agent/                 SSH agent: read-only ExtendedAgent backend + Unix-socket (Linux/macOS) and named-pipe (Windows) listeners
 test/integration/        Integration tests against real Vault
 packaging/windows/       ADMX Group Policy template
-packaging/linux/         systemd units (dotvault.service + token-watch path/service, shipped in RPM/DEB)
+packaging/linux/         systemd units (dotvault.service, shipped in RPM/DEB/APK)
 ```
 
 ## Configuration
@@ -125,6 +127,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
   Logs vs. slog: the OTel logs exporter is **not** a slog replacement. Operational logging continues to go through `log/slog` to stderr. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal — currently only `LogRegistryConfigManaged`, which surfaces "GPO config is active, file config is ignored" as a WARN record once per daemon/sync startup. Routing this through slog would print an INFO line on every CLI invocation against a GPO-managed Windows box, which is exactly the noise we wanted to eliminate.
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)
 - **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition
+- **`agent`** — SSH agent surface (default disabled). `enabled`, `unix.path` (default per-user runtime socket), `windows.pipe` (default `\\.\pipe\dotvault-agent`), and an ordered `keys[]` list of sources: `source: kv` (`path_prefix`, resolved under `kv/data/users/<you>/`) and `source: vault-ca` (`mount`, `role`, templated `principals`, `ttl`, `ephemeral_key`)
 
 ### Config Validation
 
@@ -134,6 +137,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - `target.format` must be one of: yaml, json, ini, toml, text, netrc
 - `web.listen` must resolve to a loopback address if web is enabled
 - Enrolment entries must have a non-empty engine field
+- When `agent.enabled`, at least one `agent.keys[]` source is required; each must be `kv` or `vault-ca`; a `vault-ca` source requires `mount` and `role`, and its `ttl` (if set) must parse as a positive duration
 
 ## CLI
 
@@ -279,7 +283,7 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 9. Background goroutine reloads config on each tick for enrolment changes only
 10. On Windows, install a system-tray icon (`internal/tray/`) with Exit and (when web is enabled) "View web UI" entries; the tray owns the main goroutine because the Win32 message pump must run on a locked OS thread, while the sync loop moves to a goroutine. On non-Windows the same call simply blocks on ctx.
 
-SIGHUP triggers an immediate `~/.vault-token` re-read via `LifecycleManager.Reload` — handy for picking up a token freshly written by `dotvault login` without waiting for the 5-minute lifecycle tick. The shipped `packaging/linux/dotvault-token-watch.path` unit drives this automatically: any change to `~/.vault-token` activates `dotvault-token-watch.service`, which runs `systemctl --user kill --signal=SIGHUP dotvault.service`. The systemd-native path is deliberate — it targets the unit's MainPID rather than scanning the process table for anything named `dotvault`, so a developer running `go run ./cmd/dotvault` or `dotvault sync` from a shell while the daemon also happens to be running won't have those side processes SIGHUP'd (their default disposition for SIGHUP is *terminate*).
+The daemon watches `~/.vault-token` for replacement and re-reads it immediately via `LifecycleManager.Reload` — handy for picking up a token freshly written by `dotvault login` without waiting for the 5-minute lifecycle tick. On Linux this uses inotify on the token file's parent directory (`internal/tokenwatch/`, watching the directory rather than the inode because atomic writers replace it via temp-file+rename); creation and write-completion events trigger a reload, deletes are ignored so the daemon keeps using its current in-memory token until a new one is written. On non-Linux platforms the watcher is a no-op. This replaces the previously shipped `dotvault-token-watch.path`/`.service` systemd units, which forwarded `~/.vault-token` changes to the daemon via SIGHUP out-of-process. SIGHUP still triggers the same re-read manually (`LifecycleManager.Reload`) on every platform where it is delivered (not Windows), e.g. `systemctl --user kill --signal=SIGHUP dotvault.service`, which targets the unit's MainPID rather than scanning the process table for anything named `dotvault`, so a developer running `go run ./cmd/dotvault` or `dotvault sync` from a shell while the daemon also happens to be running won't have those side processes SIGHUP'd (their default disposition for SIGHUP is *terminate*).
 
 Full config reload via SIGHUP is **not implemented**. The daemon must be fully restarted to pick up config changes (except enrolment changes, which are detected on the polling interval).
 
@@ -485,6 +489,18 @@ The Manager checks Vault for missing/incomplete secrets, then runs the Wizard fo
 
 Config changes to the enrolments section are detected on each polling tick without requiring a daemon restart.
 
+## SSH Agent
+
+`internal/agent/` exposes a read-only SSH agent backed by the live Vault token, served over a Unix domain socket (Linux/macOS) or a named pipe (Windows). Disabled by default (`agent.enabled: true`). The two platform listeners serve one shared, platform-neutral `Backend` that implements `golang.org/x/crypto/ssh/agent.ExtendedAgent`.
+
+- **Backend (`backend.go`).** `List` aggregates identities from every configured `Source` and caches the result briefly (default 8s) so repeated `ssh-add -l` doesn't hammer Vault. `Sign`/`SignWithFlags` route the requested key to the owning source and honour `rsa-sha2-256`/`rsa-sha2-512`. `Add`/`Remove`/`RemoveAll`/`Lock`/`Unlock`/`Signers` return `ErrReadOnly` — dotvault is one-way, so the agent is too. Concurrency-safe: each connection is serviced in its own goroutine. If the lifecycle manager reports a re-auth in progress, `Sign` blocks on a bounded wait (`WithReauthTimeout`, default 30s) via the `ReauthGate` interface (`*auth.LifecycleManager` satisfies it) rather than failing spuriously. The gate is stored in an `atomic.Value` (wrapped in a `gateHolder`) so the daemon's post-construction `SetReauthGate` never races a concurrent `Sign`.
+- **Sources (`agent.go` interface; `kv.go`, `vaultca.go`, `factory.go`).** A `Source` provides `Identities` and `Sign`. The **KV source** discovers keys under `kv/data/users/<you>/<path_prefix>` (the `public_key`/`private_key` schema the SSH enrolment engine writes), reads+parses+discards the private key per `Sign`; passphrase-protected keys are rejected (the agent can't prompt — enrol agent keys with `passphrase: unsafe`, since Vault is the at-rest protection). The **Vault-CA source** (ephemeral mode) generates an in-memory Ed25519 key at startup, mints a certificate via `<mount>/sign/<role>` (behind the `certSigner` interface so it's unit-testable without a live SSH CA), caches it until shortly before expiry (shared `defaultCertTTL` = 15m), and re-mints transparently on the next `List`/`Sign`. Principals are Go templates over `{{.vault_username}}`. A source that can't be constructed (unknown engine, non-ephemeral vault-ca) becomes an `errSource` that reports its reason through `Status` without aborting the daemon.
+- **Transport (`listener.go` + `listener_unix.go` / `listener_windows.go`).** Common `Serve(ctx)`/`Close` logic with platform-specific endpoint creation. `Serve` accepts in a loop, dispatches each connection to `agent.ServeAgent`, and treats post-`ServeAgent` `io.EOF` as a normal disconnect (debug log, not fatal). Context cancellation closes the endpoint and returns cleanly; `Close` is idempotent. **Endpoint permissions are a hard invariant** (the `0600`-equivalent): the Unix socket is bound then `chmod 0600` inside a `0700` dir (no process-global umask swap — that would race other daemon goroutines' file creation; the 0700 dir closes the brief window), with stale-socket removal that refuses to clobber a live instance ("already running"); the Windows pipe is created in byte mode with a protected-DACL SDDL (`D:P(A;;GA;;;OW)(A;;GA;;;SY)`) granting access only to the owning user and LocalSystem. dotvault never sets `SSH_AUTH_SOCK` or PuTTY registry values on the user's behalf.
+- **Service + lifecycle (`service.go`).** `agent.Service` bundles the backend and listener. The backend is constructed before auth (side-effect-free) so the web server can surface its status; the listener `Run`s only after the first successful Vault auth, supervises itself (restart-on-terminate after a short backoff), and stops on context cancellation. The backend persists across token refreshes without a listener restart. `Status(ctx)` returns listed identities, per-cert TTL, and per-source resolution errors — surfaced on `/api/v1/status` (web dashboard, parallel to per-rule sync state).
+- **Status as a client (`query.go`).** `dotvault status` does not stand up a backend. When `agent.enabled`, it dials the resolved endpoint via `QueryListening` (the platform-split `dialEndpoint`: `net.Dial("unix", …)` / `winio.DialPipeContext`) and runs `agent.NewClient(conn).List()` — the `ssh-add -l` equivalent — so it reports what the live daemon actually serves, including a cert's true remaining validity parsed from the advertised blob. It never creates the endpoint. A dial failure when the agent is enabled is surfaced as unexpected (daemon not running / not yet authenticated), not papered over with a config-derived view.
+
+Cert mode is the documented recommendation: the private key never lands on disk, rotation is automatic, and remote hosts trust only the CA public key (`TrustedUserCAKeys`). See `docs/guide/ssh-agent.md` for the user-facing write-up (client wiring, agent-forwarding caveat, passphrase-mode guidance). When the connectivity/auth shape changes, the source factory in `factory.go` is the wiring seam. The `agent` section round-trips through the Windows registry and `reg-export`/`reg-import` (see "Windows Registry / Group Policy"). The Vault-CA signing engine internals (advanced cache/re-mint timing, non-ephemeral keys) remain a follow-up work item.
+
 ## Web UI
 
 Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to enable). Loopback-only binding is a hard invariant — the daemon refuses to start if `web.listen` resolves to a non-loopback address.
@@ -520,11 +536,13 @@ Configurable markdown content via `web.login_text` and `web.secret_view_text` fi
 
 ## Windows Registry / Group Policy
 
-When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, Web, and Observability settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey.
+When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, the daemon loads all config from registry and ignores the YAML file. The `registryLayer` struct reads Vault, Sync, Web, Agent (scalar transport: `Enabled`, `UnixPath`, `WindowsPipe`), and Observability settings from typed subkeys (REG_SZ, REG_DWORD). Rules are subkeys under `Rules\{RuleName}` with an optional `OAuth` subkey. Enrolments are subkeys under `Enrolments\{Name}` with an optional `Settings` subkey.
+
+The `agent.keys[]` list is **ordered**, unlike the name-keyed rules/enrolments maps. It is stored under `Agent\Keys\{N}` where `{N}` is the zero-based list index (`Agent\Keys\0`, `\1`, …); both the live registry loader (`readRegistryAgentKeys`) and the regfile parser sort those subkey names numerically to rebuild the slice in order, and reject a non-integer subkey name as a hard error rather than silently reordering or dropping a key. `Principals` round-trips as a REG_MULTI_SZ (like OAuth `Scopes`); an explicit empty list is preserved as a non-nil empty slice.
 
 `Observability` carries `Enabled` (REG_DWORD), `Endpoint` / `Protocol` / `ExportInterval` (REG_SZ), and `Insecure` (REG_DWORD). `Headers` is deliberately **not** modelled in the registry layer — it carries OTLP bearer tokens, so it lives in the per-user `EnvironmentFile` (`OTEL_EXPORTER_OTLP_HEADERS`) where regular user-writable secrets belong. Without the Observability subkey wired up, a GPO-managed daemon would have `Observability.Enabled=false`, `observability.Init` would short-circuit, and `LogRegistryConfigManaged`'s WARN record would vanish into the no-op global logger — defeating the whole point of routing the registry-config notice through OTel rather than slog.
 
-ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for Vault, Sync, and Web settings (Observability keys are currently registry-only; admins can set them with `reg-import` or regedit).
+This means a Windows GPO deployment can configure rules, enrolments, the SSH agent, and the observability exporter end-to-end. `reg-export` / `reg-import` and the web `GET /api/v1/config/download` round-trip Vault, Sync, Web, Rules, Enrolments, and the `agent` section through both YAML and `.reg` forms; the Observability subkey is **not** yet emitted by `regfile.GenerateText`, so admins author those values directly (regedit, a hand-rolled `.reg` file pushed via Group Policy Preferences, or an `Observability\*` block added to a `reg-import`'d artefact). ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for Vault, Sync, and Web settings; Agent and Observability keys are not surfaced there. Extending `regfile.GenerateText` and the ADMX template to cover Observability is a tracked follow-up.
 
 ## File Permissions & Security
 
@@ -548,6 +566,8 @@ ADMX template at `packaging/windows/dotvault.admx` defines Group Policy UI for V
 | `github.com/cli/oauth` | GitHub OAuth device flow |
 | `github.com/pkg/browser` | Open browser |
 | `nhooyr.io/websocket` | WebSocket client (Vault Events API) |
+| `github.com/Microsoft/go-winio` | Windows named-pipe listener (SSH agent transport) |
+| `golang.org/x/crypto/ssh/agent` | SSH agent protocol server (read-only backend) |
 | `golang.org/x/term` | Secure terminal input |
 | `golang.org/x/sys` | OS-specific syscalls (Windows registry, etc.) |
 

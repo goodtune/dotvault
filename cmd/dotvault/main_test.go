@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,6 +97,63 @@ func TestStderrSupportsColour(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	if stderrSupportsColour() {
 		t.Error("stderrSupportsColour() with NO_COLOR set = true, want false")
+	}
+}
+
+// TestRenewTokenWithProgress exercises the single-line progress output of
+// the login-check renewal helper. Writing to a *bytes.Buffer (not
+// os.Stderr) forces the non-animated branch, so the output is
+// deterministic: prefix + static "..." ellipsis + outcome. The renew
+// function is injected, so no Vault is needed.
+func TestRenewTokenWithProgress(t *testing.T) {
+	tests := []struct {
+		name    string
+		ctx     func() (context.Context, context.CancelFunc)
+		renew   func(context.Context) error
+		wantErr bool
+		wantOut string
+	}{
+		{
+			name:    "success",
+			ctx:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+			renew:   func(context.Context) error { return nil },
+			wantErr: false,
+			wantOut: "Vault token needs extending... renewed.\n",
+		},
+		{
+			name:    "failure surfaces the error inline",
+			ctx:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
+			renew:   func(context.Context) error { return errors.New("permission denied") },
+			wantErr: true,
+			wantOut: "Vault token needs extending... failed: permission denied\n",
+		},
+		{
+			name: "cancellation writes no outcome",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel() // already cancelled — mimics the SIGINT handler
+				return ctx, cancel
+			},
+			renew:   func(context.Context) error { return context.Canceled },
+			wantErr: true,
+			// Only the prefix + ellipsis; the SIGINT handler owns the
+			// terminating newline, so no " renewed."/" failed:" suffix.
+			wantOut: "Vault token needs extending...",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			var buf bytes.Buffer
+			err := renewTokenWithProgress(ctx, tc.renew, &buf)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("renewTokenWithProgress() err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got := buf.String(); got != tc.wantOut {
+				t.Errorf("renewTokenWithProgress() output = %q, want %q", got, tc.wantOut)
+			}
+		})
 	}
 }
 

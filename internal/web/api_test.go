@@ -277,6 +277,49 @@ func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
 	}
 }
 
+// TestHandleConfigDownload_IncludesAgent verifies the effective-config builder
+// threads the agent block through to the download. buildEffectiveConfig
+// reassembles the config from per-section copies, so a section it forgets is
+// silently dropped — and re-importing the result would turn the agent off.
+// This pins the agent section into the round-trip, the same way the
+// observability test does for metrics.
+func TestHandleConfigDownload_IncludesAgent(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}
+	s.syncCfg = config.SyncConfig{RawInterval: "15m"}
+	s.agentCfg = config.AgentConfig{
+		Enabled: true,
+		Windows: config.AgentWindowsConfig{Pipe: `\\.\pipe\dotvault-agent`},
+		Keys: []config.AgentKeySource{
+			{Source: "kv", PathPrefix: "ssh/"},
+			{Source: "vault-ca", Mount: "ssh-client-signer", Role: "dotvault-user", Principals: []string{"{{.vault_username}}"}, TTL: "15m", EphemeralKey: true},
+		},
+	}
+	s.rules = []config.Rule{
+		{Name: "r", VaultKey: "r", Target: config.Target{Path: "/tmp/r", Format: "text"}},
+	}
+
+	req := httptest.NewRequest("GET", "/api/v1/config/download?format=yaml", nil)
+	w := httptest.NewRecorder()
+	s.handleConfigDownload(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"agent:",
+		"path_prefix: ssh/",
+		"mount: ssh-client-signer",
+		"role: dotvault-user",
+		"ephemeral_key: true",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("agent download missing %q; got:\n%s", want, body)
+		}
+	}
+}
+
 func TestHandleConfigDownload_YAML(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.vaultCfg = config.VaultConfig{Address: "https://vault.example.com:8200"}

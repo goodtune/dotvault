@@ -3,6 +3,7 @@ package regfile
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -44,6 +45,7 @@ func Parse(data []byte) (*config.Config, error) {
 	values := map[valueKey]regValue{}
 	rules := map[string]bool{}      // set of rule names seen
 	enrolments := map[string]bool{} // set of enrolment names seen
+	agentKeys := map[string]bool{}  // set of Agent\Keys index subkeys seen
 
 	var currentKey string
 	for i := 1; i < len(lines); i++ {
@@ -73,6 +75,9 @@ func Parse(data []byte) (*config.Config, error) {
 			if name, ok := childUnder(currentKey, rootKey+`\Enrolments`); ok && name != "" {
 				enrolments[name] = true
 			}
+			if name, ok := childUnder(currentKey, rootKey+`\Agent\Keys`); ok && name != "" {
+				agentKeys[name] = true
+			}
 			continue
 		}
 
@@ -96,7 +101,7 @@ func Parse(data []byte) (*config.Config, error) {
 	}
 
 	cfg := &config.Config{}
-	if err := applyValues(cfg, values, rules, enrolments); err != nil {
+	if err := applyValues(cfg, values, rules, enrolments, agentKeys); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -519,7 +524,7 @@ func childUnder(path, prefix string) (string, bool) {
 // applyValues populates cfg from the flat (key, name) -> value map produced
 // during parsing. Unknown values are ignored — the renderer is the source
 // of truth for the schema, so anything outside it is treated as opaque.
-func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[string]bool, enrolments map[string]bool) error {
+func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[string]bool, enrolments map[string]bool, agentKeys map[string]bool) error {
 	// Typed accessors so a known field with the wrong .reg type is a
 	// hard parse error instead of silently decoding to the zero value.
 	// We read against the schema produced by regfile.Generate*: every
@@ -609,6 +614,51 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 	if err := apply(&cfg.Web.Listen, webKey, "Listen"); err != nil {
 		return err
+	}
+
+	// Agent.
+	agentKey := rootKey + `\Agent`
+	if err := applyBool(&cfg.Agent.Enabled, agentKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Unix.Path, agentKey, "UnixPath"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Windows.Pipe, agentKey, "WindowsPipe"); err != nil {
+		return err
+	}
+	// Agent key sources. Each is a subkey under Agent\Keys named after its
+	// zero-based list index; sort numerically to recover the original order.
+	if len(agentKeys) > 0 {
+		ordered, err := sortAgentKeyNames(agentKeys)
+		if err != nil {
+			return err
+		}
+		for _, name := range ordered {
+			base := rootKey + `\Agent\Keys\` + name
+			ks := config.AgentKeySource{}
+			for _, fn := range []func() error{
+				func() error { return apply(&ks.Source, base, "Source") },
+				func() error { return apply(&ks.PathPrefix, base, "PathPrefix") },
+				func() error { return apply(&ks.Mount, base, "Mount") },
+				func() error { return apply(&ks.Role, base, "Role") },
+				func() error { return apply(&ks.TTL, base, "TTL") },
+				func() error { return applyBool(&ks.EphemeralKey, base, "EphemeralKey") },
+			} {
+				if err := fn(); err != nil {
+					return err
+				}
+			}
+			if v, ok, err := getMultiString(base, "Principals"); err != nil {
+				return err
+			} else if ok {
+				// utf16BytesToMultiString normalises the empty case to a
+				// non-nil []string{}, preserving the `principals: []`
+				// round-trip distinction from an absent key.
+				ks.Principals = v
+			}
+			cfg.Agent.Keys = append(cfg.Agent.Keys, ks)
+		}
 	}
 
 	// Rules.
@@ -740,6 +790,39 @@ func kindName(k regValueKind) string {
 	default:
 		return fmt.Sprintf("kind=%d", k)
 	}
+}
+
+// sortAgentKeyNames orders the Agent\Keys index subkey names numerically so
+// the rebuilt slice matches the YAML list order the exporter encoded. The
+// regfile renderer always names these subkeys after their zero-based list
+// index, so a non-integer name means the .reg was hand-edited or produced by
+// a different tool — fail loudly rather than guess an order or drop the entry.
+//
+// A twin of this lives in internal/config/registry_windows.go
+// (readRegistryAgentKeys, inline): the live registry loader applies the same
+// numeric-sort-with-reject discipline. The two can't share code (this package
+// is platform-neutral; that one is //go:build windows), and the duplication
+// mirrors how rule/enrolment enumeration is already split across the two
+// packages. Keep them in lockstep.
+func sortAgentKeyNames(names map[string]bool) ([]string, error) {
+	type idx struct {
+		name string
+		n    int
+	}
+	parsed := make([]idx, 0, len(names))
+	for name := range names {
+		n, err := strconv.Atoi(name)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("agent key subkey %q under %s\\Agent\\Keys is not a non-negative integer index", name, rootKey)
+		}
+		parsed = append(parsed, idx{name: name, n: n})
+	}
+	sort.Slice(parsed, func(i, j int) bool { return parsed[i].n < parsed[j].n })
+	out := make([]string, len(parsed))
+	for i, p := range parsed {
+		out[i] = p.name
+	}
+	return out, nil
 }
 
 func sortRulesByName(rules []config.Rule) {

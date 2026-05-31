@@ -83,28 +83,8 @@ nfpms:
         file_info:
           mode: 0644
         packager: rpm
-      - src: packaging/linux/dotvault-token-watch.path
-        dst: /usr/lib/systemd/user/dotvault-token-watch.path
-        file_info:
-          mode: 0644
-        packager: rpm
-      - src: packaging/linux/dotvault-token-watch.service
-        dst: /usr/lib/systemd/user/dotvault-token-watch.service
-        file_info:
-          mode: 0644
-        packager: rpm
       - src: packaging/linux/dotvault.service
         dst: /usr/lib/systemd/user/dotvault.service
-        file_info:
-          mode: 0644
-        packager: deb
-      - src: packaging/linux/dotvault-token-watch.path
-        dst: /usr/lib/systemd/user/dotvault-token-watch.path
-        file_info:
-          mode: 0644
-        packager: deb
-      - src: packaging/linux/dotvault-token-watch.service
-        dst: /usr/lib/systemd/user/dotvault-token-watch.service
         file_info:
           mode: 0644
         packager: deb
@@ -116,16 +96,6 @@ nfpms:
       # OpenRC-only hosts the file is just dormant.
       - src: packaging/linux/dotvault.service
         dst: /usr/lib/systemd/user/dotvault.service
-        file_info:
-          mode: 0644
-        packager: apk
-      - src: packaging/linux/dotvault-token-watch.path
-        dst: /usr/lib/systemd/user/dotvault-token-watch.path
-        file_info:
-          mode: 0644
-        packager: apk
-      - src: packaging/linux/dotvault-token-watch.service
-        dst: /usr/lib/systemd/user/dotvault-token-watch.service
         file_info:
           mode: 0644
         packager: apk

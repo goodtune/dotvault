@@ -266,3 +266,136 @@ func TestLoadFromRegistryNoKeys(t *testing.T) {
 		t.Error("expected nil config when no keys exist")
 	}
 }
+
+func TestApplyRegistryLayerAgent(t *testing.T) {
+	cfg := &Config{}
+	enabled := uint32(1)
+	layer := registryLayer{
+		AgentEnabled:     &enabled,
+		AgentUnixPath:    "/run/user/1000/dotvault/agent.sock",
+		AgentWindowsPipe: `\\.\pipe\dotvault-agent`,
+	}
+	applyRegistryLayer(cfg, layer)
+
+	if !cfg.Agent.Enabled {
+		t.Errorf("Agent.Enabled = false, want true")
+	}
+	if cfg.Agent.Unix.Path != "/run/user/1000/dotvault/agent.sock" {
+		t.Errorf("Agent.Unix.Path = %q", cfg.Agent.Unix.Path)
+	}
+	if cfg.Agent.Windows.Pipe != `\\.\pipe\dotvault-agent` {
+		t.Errorf("Agent.Windows.Pipe = %q", cfg.Agent.Windows.Pipe)
+	}
+}
+
+func TestReadRegistryAgentKeysOrdered(t *testing.T) {
+	t.Cleanup(func() {
+		for i := 0; i < 12; i++ {
+			registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent\Agent\Keys\`+itoaTest(i))
+		}
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent\Agent\Keys`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent\Agent`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent`)
+	})
+
+	// Create 12 index subkeys so numeric vs lexical ordering diverges
+	// ("10" < "2" lexically). Each key's Source encodes its index so we can
+	// assert the recovered order.
+	for i := 0; i < 12; i++ {
+		k, _, err := registry.CreateKey(
+			registry.CURRENT_USER,
+			`SOFTWARE\dotvault-test-agent\Agent\Keys\`+itoaTest(i),
+			registry.ALL_ACCESS,
+		)
+		if err != nil {
+			t.Fatalf("create key %d: %v", i, err)
+		}
+		if err := k.SetStringValue("Source", "src"+itoaTest(i)); err != nil {
+			t.Fatalf("set Source %d: %v", i, err)
+		}
+		k.Close()
+	}
+
+	// Give one key the full field set including a Principals REG_MULTI_SZ.
+	k0, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent\Agent\Keys\0`, registry.ALL_ACCESS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k0.SetStringValue("Source", "vault-ca")
+	k0.SetStringValue("Mount", "ssh-client-signer")
+	k0.SetStringValue("Role", "dotvault-user")
+	k0.SetStringValue("TTL", "15m")
+	k0.SetDWordValue("EphemeralKey", 1)
+	k0.SetStringsValue("Principals", []string{"{{.vault_username}}", "ops"})
+	k0.Close()
+
+	keys, err := readRegistryAgentKeys(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent`)
+	if err != nil {
+		t.Fatalf("readRegistryAgentKeys: %v", err)
+	}
+	if len(keys) != 12 {
+		t.Fatalf("len = %d, want 12", len(keys))
+	}
+	// Numeric order: index 1..11 keep their "src<i>" Source.
+	for i := 1; i < 12; i++ {
+		if keys[i].Source != "src"+itoaTest(i) {
+			t.Errorf("keys[%d].Source = %q, want %q", i, keys[i].Source, "src"+itoaTest(i))
+		}
+	}
+	// Index 0 carries the full vault-ca field set.
+	if keys[0].Source != "vault-ca" || keys[0].Mount != "ssh-client-signer" ||
+		keys[0].Role != "dotvault-user" || keys[0].TTL != "15m" || !keys[0].EphemeralKey {
+		t.Errorf("keys[0] = %+v", keys[0])
+	}
+	if len(keys[0].Principals) != 2 || keys[0].Principals[0] != "{{.vault_username}}" {
+		t.Errorf("keys[0].Principals = %v", keys[0].Principals)
+	}
+}
+
+func TestReadRegistryAgentKeysNotExist(t *testing.T) {
+	keys, err := readRegistryAgentKeys(registry.CURRENT_USER, `SOFTWARE\dotvault-nonexistent-agent`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if keys != nil {
+		t.Errorf("expected nil keys, got %v", keys)
+	}
+}
+
+func TestReadRegistryAgentKeysNonNumericRejected(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad\Agent\Keys\bogus`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad\Agent\Keys`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad\Agent`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad`)
+	})
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-agent-bad\Agent\Keys\bogus`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.SetStringValue("Source", "kv")
+	k.Close()
+
+	_, err = readRegistryAgentKeys(registry.CURRENT_USER, `SOFTWARE\dotvault-test-agent-bad`)
+	if err == nil {
+		t.Fatalf("expected an error for a non-integer key subkey name")
+	}
+}
+
+func itoaTest(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(b[pos:])
+}

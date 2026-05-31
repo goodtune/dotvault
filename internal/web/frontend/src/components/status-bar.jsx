@@ -44,7 +44,7 @@ export function StatusBar({ status, onSync, pendingEnrolments, hasEnrolments, on
     h('div', { class: 'status-left' },
       h('span', { class: 'app-title' },
         '.vault',
-        status?.version && h('span', { class: 'app-version' }, ' v' + status.version),
+        status?.version && h('span', { class: 'app-version' }, ' v' + String(status.version).replace(/^v/, '')),
       ),
       h('span', { class: `status-indicator ${authClass}` }, authStatus),
       safeVaultURL && h('a', {

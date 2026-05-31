@@ -46,6 +46,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeVault(cfg.Vault)
 	e.writeSync(cfg.Sync)
 	e.writeWeb(cfg.Web)
+	e.writeAgent(cfg.Agent)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
 
@@ -112,6 +113,51 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 	e.writeKey(rootKey + `\Web`)
 	e.writeBool("Enabled", w.Enabled)
 	e.writeString("Listen", w.Listen)
+	e.WriteString("\r\n")
+}
+
+// writeAgent emits the Agent section: the scalar Enabled / Unix / Windows
+// transport settings, plus an ordered Keys subtree. The keys list is
+// dynamically sized, so — like Rules and Enrolments — the Keys subtree is
+// deleted before re-creation so a key removed from YAML doesn't linger in the
+// registry on re-import. List order is preserved by naming each key subkey
+// after its zero-based index (`Keys\0`, `Keys\1`, …); the parser sorts those
+// names numerically to rebuild the slice.
+func (e *emitter) writeAgent(a config.AgentConfig) {
+	e.writeKey(rootKey + `\Agent`)
+	e.writeBool("Enabled", a.Enabled)
+	e.writeString("UnixPath", a.Unix.Path)
+	e.writeString("WindowsPipe", a.Windows.Pipe)
+	e.WriteString("\r\n")
+
+	// Always pre-delete the Keys subtree so removals round-trip. This is a
+	// no-op on a registry that never had it.
+	e.writeKeyDeletion(rootKey + `\Agent\Keys`)
+	if len(a.Keys) == 0 {
+		return
+	}
+	e.writeKey(rootKey + `\Agent\Keys`)
+	e.WriteString("\r\n")
+	for i, k := range a.Keys {
+		e.writeAgentKey(i, k)
+	}
+}
+
+func (e *emitter) writeAgentKey(index int, k config.AgentKeySource) {
+	keyPath := fmt.Sprintf(`%s\Agent\Keys\%d`, rootKey, index)
+	e.writeKey(keyPath)
+	e.writeString("Source", k.Source)
+	e.writeString("PathPrefix", k.PathPrefix)
+	e.writeString("Mount", k.Mount)
+	e.writeString("Role", k.Role)
+	e.writeString("TTL", k.TTL)
+	e.writeBool("EphemeralKey", k.EphemeralKey)
+	// Emit Principals whenever non-nil so an explicit empty list round-trips
+	// as an empty REG_MULTI_SZ rather than being silently dropped, matching
+	// the OAuth Scopes treatment.
+	if k.Principals != nil {
+		e.writeMultiString("Principals", k.Principals)
+	}
 	e.WriteString("\r\n")
 }
 

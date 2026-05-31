@@ -114,6 +114,8 @@ The block drives both signals (metrics and logs) against the same collector. For
 
 **Headers are intentionally not registry-managed.** They typically carry OTLP bearer tokens (Datadog / Grafana Cloud / etc.) — push them via `OTEL_EXPORTER_OTLP_HEADERS` from a machine-wide environment policy rather than committing them to the registry. Without the `Observability` keys, a GPO-managed daemon runs with telemetry disabled and the `LogRegistryConfigManaged` WARN record (which signals "this daemon is on GPO-managed config") is silently dropped.
 
+Note that `dotvault reg-import` does **not** currently emit an `Observability` subkey — the regfile renderer covers Vault / Sync / Web / Rules / Enrolments / Agent. Until that changes, author the `Observability` values directly (regedit, or a hand-rolled `.reg` file pushed via Group Policy Preferences > Registry) rather than relying on the round-trip.
+
 The `https_proxy` value (or its `http_proxy` alias) is optional. When unset, the engine consults the machine's IE / WinHTTP proxy configuration — including any deployed PAC script — once per outbound request. Set it explicitly here only when you want this enrolment pinned to a specific proxy regardless of the system-level policy.
 
 ## Example: deploying via GPO

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
@@ -26,6 +27,7 @@ import (
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
+	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
@@ -35,6 +37,13 @@ import (
 	"golang.org/x/term"
 )
 
+// version is injected at build time via -ldflags "-X main.version=...".
+// Release tags are v-prefixed (v0.19.0) for Go-module consumption, but this
+// value is the v-stripped semantic version (0.19.0): GoReleaser's {{.Version}}
+// strips it and the Makefile strips it via sed, so it stays consistent across
+// local and release builds. Every consumer (the version command, /api/v1/status,
+// the OTel service.version attribute, the tray tooltip) re-emits it verbatim and
+// must not assume or add a leading v.
 var version = "dev"
 
 var (
@@ -288,10 +297,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	emitConfigSourceLog(ctx, cfg, cfgPath)
 
 	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
-	// via the LifecycleManager (the bundled dotvault-token-watch.path unit
-	// drives this so a fresh token written by `dotvault login` is picked
-	// up within seconds, without waiting for the 5-minute tick). Full
-	// config reload on SIGHUP is still not implemented.
+	// via the LifecycleManager so a fresh token written by `dotvault
+	// login` is picked up within seconds, without waiting for the
+	// 5-minute tick. This is the manual counterpart to the in-process
+	// inotify watcher (internal/tokenwatch) wired in further down, which
+	// performs the same re-read automatically on token-file changes.
+	// Full config reload on SIGHUP is still not implemented.
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
@@ -352,22 +363,40 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
 
+	// Build the SSH agent backend if enabled. Construction is side-effect-free
+	// (no Vault calls — vault-ca ephemeral keys are generated in memory), so
+	// it is safe before authentication and lets the web server surface agent
+	// status. The transport listener itself is started only after the first
+	// successful Vault auth, below.
+	var agentSvc *agent.Service
+	if cfg.Agent.Enabled {
+		agentSvc, err = agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
+		if err != nil {
+			return fmt.Errorf("ssh agent: %w", err)
+		}
+	}
+
 	// Start web UI if enabled. We start it before authentication so it can
 	// serve the OIDC browser-based login flow.
 	var webServer *web.Server
 	if cfg.Web.Enabled {
-		webServer, err = web.NewServer(web.ServerConfig{
+		webCfg := web.ServerConfig{
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
 			ObsCfg:        cfg.Observability,
+			AgentCfg:      cfg.Agent,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
-		})
+		}
+		if agentSvc != nil {
+			webCfg.Agent = agentSvc.Backend
+		}
+		webServer, err = web.NewServer(webCfg)
 		if err != nil {
 			slog.Error("failed to create web server", "error", err)
 		} else {
@@ -441,6 +470,36 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
+
+	// Start the SSH agent listener now that we hold a Vault token. The gate is
+	// wired before the listener accepts connections so a Sign issued during a
+	// token refresh blocks briefly on the lifecycle manager instead of failing.
+	// Run supervises the listener (restart-on-terminate) until ctx is
+	// cancelled; the backend persists across token refreshes without a restart.
+	if agentSvc != nil {
+		agentSvc.Backend.SetReauthGate(lm)
+		go agentSvc.Run(ctx)
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint())
+	}
+
+	// Watch the token file for replacement and nudge the lifecycle
+	// manager to re-read it immediately. This is the in-process
+	// analogue of the old systemd `.path` unit (which SIGHUP'd the
+	// daemon on every ~/.vault-token change) and is complementary to
+	// the still-present SIGHUP handler. On Linux it uses inotify on the
+	// token file's parent directory; on other platforms it is a no-op
+	// that blocks until shutdown. Creation and update events trigger a
+	// reload; deletes are ignored so the daemon keeps using its current
+	// token until a new one is written.
+	go func() {
+		onTokenChange := func() {
+			slog.Debug("vault token file changed, re-reading")
+			lm.Reload()
+		}
+		if err := tokenwatch.Watch(ctx, tokenPath, onTokenChange); err != nil && ctx.Err() == nil {
+			slog.Warn("token-file watcher stopped", "error", err)
+		}
+	}()
 
 	// Start refresh manager for any enrolment whose engine rotates its own
 	// credentials (currently JFrog). Failures are logged and retried on the
@@ -751,7 +810,52 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printAgentStatus(ctx, cfg)
+
 	return nil
+}
+
+// printAgentStatus renders the SSH agent section of `dotvault status`. The
+// agent is only relevant when configured: if `agent.enabled` is false there is
+// nothing to show and we never touch the endpoint. When enabled, status acts as
+// an agent *client* — it dials the running daemon's socket / pipe and lists the
+// identities being served (the `ssh-add -l` equivalent), so the output reflects
+// what the daemon actually offers, including a minted certificate's true
+// remaining validity. status never creates the endpoint; a failure to connect
+// is therefore unexpected (the daemon isn't running, or hasn't authenticated
+// far enough to start the listener) and is reported as such.
+func printAgentStatus(ctx context.Context, cfg *config.Config) {
+	if !cfg.Agent.Enabled {
+		return
+	}
+	endpoint := agent.ResolveEndpoint(cfg.Agent)
+	fmt.Println("\nSSH Agent:")
+	fmt.Printf("  endpoint: %s\n", endpoint)
+
+	ids, err := agent.QueryListening(ctx, endpoint)
+	if err != nil {
+		fmt.Printf("  unreachable: %v\n", err)
+		fmt.Println("  (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)")
+		return
+	}
+	if len(ids) == 0 {
+		fmt.Println("  (no identities loaded)")
+		return
+	}
+	for _, id := range ids {
+		line := "  " + id.Fingerprint
+		if id.Comment != "" {
+			line += " " + id.Comment
+		}
+		if id.IsCert {
+			if id.ExpiresAt != "" {
+				line += fmt.Sprintf(" (cert, expires %s)", id.ExpiresAt)
+			} else {
+				line += " (cert)"
+			}
+		}
+		fmt.Println(line)
+	}
 }
 
 // runLogin implements `dotvault login` — always forces a fresh login via
@@ -1121,7 +1225,11 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 		return true, nil
 	}
 
-	if _, err := vc.RenewSelf(ctx, 0); err != nil {
+	renew := func(ctx context.Context) error {
+		_, err := vc.RenewSelf(ctx, 0)
+		return err
+	}
+	if err := renewTokenWithProgress(ctx, renew, os.Stderr); err != nil {
 		// Backstop for context.Canceled (the SIGINT handler cancels
 		// the outer context before os.Exit, but the race usually goes
 		// to os.Exit). If RenewSelf does happen to unwind first, exit
@@ -1130,13 +1238,90 @@ func handleValidToken(ctx context.Context, vc *vault.Client, secret *vaultapi.Se
 		if loginCheckCancelled(ctx, err) {
 			return true, err
 		}
-		fmt.Fprintf(os.Stderr, "vault token renewal failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "token is still valid but nearing expiry: %s remaining, expires %s\n",
 			ttl.Truncate(time.Second), absoluteExpiry(ttl))
 		return true, err
 	}
-	fmt.Fprintln(os.Stderr, "vault token renewed")
 	return true, nil
+}
+
+// renewProgressTick is the interval between progress dots emitted while a
+// token renewal is in flight. Small enough that a slow renewal feels
+// responsive, large enough that the dots read as a deliberate "working…"
+// animation rather than a stutter.
+const renewProgressTick = 400 * time.Millisecond
+
+// renewTokenWithProgress runs renew while keeping the user informed that
+// something is happening. login-check frequently runs at shell startup,
+// and a token renewal can block for a noticeable beat against a slow or
+// distant Vault — with no output the terminal looks hung (the user
+// reported exactly this). We print a prefix, emit a dot every
+// renewProgressTick while the renewal is in flight, and finish the line
+// with the outcome, all on a single line: a successful renewal reads as
+//
+//	Vault token needs extending... renewed.
+//
+// The dot animation is gated on w being the real stderr TTY; piped output
+// and test buffers get the prefix, a static ellipsis, and the outcome with
+// no interstitial ticking so captured logs stay on one tidy line.
+//
+// On failure the line ends with " failed: <err>" and the error is
+// returned for the caller to add its own follow-up detail. On Ctrl+C the
+// select observes ctx cancellation directly and returns ctx.Err() at once
+// — without writing an outcome and without waiting for renew to unwind —
+// so the dots stop immediately and the SIGINT handler is left to own the
+// terminating newline and the exit rather than racing a second write onto
+// the dangling line.
+//
+// renew is injected (rather than taking the Vault client directly) so the
+// presentation stays decoupled from Vault plumbing and is unit-testable
+// with a fake. It must honour ctx. The done channel is buffered so the
+// renew goroutine's send never blocks: if this function has already
+// returned on cancellation, the goroutine still runs until renew unwinds
+// (promptly, since renew honours ctx) and then exits cleanly rather than
+// blocking forever on an unread channel.
+func renewTokenWithProgress(ctx context.Context, renew func(context.Context) error, w io.Writer) error {
+	fmt.Fprint(w, "Vault token needs extending")
+
+	done := make(chan error, 1)
+	go func() { done <- renew(ctx) }()
+
+	var err error
+	if w == os.Stderr && term.IsTerminal(int(os.Stderr.Fd())) {
+		// Anchor the ellipsis with an immediate dot so even an
+		// instantaneous renewal reads coherently, then tick for as long
+		// as the renewal is in flight.
+		fmt.Fprint(w, ".")
+		ticker := time.NewTicker(renewProgressTick)
+		defer ticker.Stop()
+		for waiting := true; waiting; {
+			select {
+			case err = <-done:
+				waiting = false
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				fmt.Fprint(w, ".")
+			}
+		}
+	} else {
+		fmt.Fprint(w, "...")
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	if err != nil {
+		if loginCheckCancelled(ctx, err) {
+			return err
+		}
+		fmt.Fprintf(w, " failed: %v\n", err)
+		return err
+	}
+	fmt.Fprintln(w, " renewed.")
+	return nil
 }
 
 // loginCheckCancelled reports whether err is a context-cancellation.

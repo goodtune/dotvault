@@ -461,7 +461,11 @@ func rebindInstruments() {
 		"dotvault.sighup.received",
 		// Permanently zero on Windows (SIGHUP isn't delivered to
 		// processes there); on Linux and macOS each SIGHUP forces
-		// the LifecycleManager to re-read ~/.vault-token. Full
+		// the LifecycleManager to re-read ~/.vault-token. This counts
+		// only the manual SIGHUP path: on Linux the steady-state
+		// trigger is the in-process inotify watcher (internal/tokenwatch),
+		// whose re-reads are deliberately not metered here, so this
+		// counter undercounts total token re-reads on Linux. Full
 		// config reload still requires a daemon restart.
 		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate vault-token file re-read; full config reload still requires a daemon restart."),
 	)

@@ -8,9 +8,10 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 )
 
-// TestObservabilityRoundTrip confirms the scalar observability fields
-// survive a Generate -> Parse cycle. Headers are covered separately
-// because the renderer deliberately strips them.
+// TestObservabilityRoundTrip confirms the full observability block —
+// scalars and the Headers map — survives a Generate -> Parse cycle.
+// Conversion is lossless in every direction, so headers are emitted
+// verbatim (not stripped).
 func TestObservabilityRoundTrip(t *testing.T) {
 	src := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
@@ -20,6 +21,10 @@ func TestObservabilityRoundTrip(t *testing.T) {
 			Protocol:    "grpc",
 			Insecure:    true,
 			RawInterval: "30s",
+			Headers: map[string]string{
+				"Authorization":    "Bearer round-trip-token",
+				"X-Honeycomb-Team": "abc123",
+			},
 		},
 		Rules: []config.Rule{
 			{
@@ -39,17 +44,16 @@ func TestObservabilityRoundTrip(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	want := src.Observability
-	want.Headers = nil // stripped on export
-	if !reflect.DeepEqual(got.Observability, want) {
-		t.Errorf("Observability mismatch:\ngot:  %+v\nwant: %+v", got.Observability, want)
+	if !reflect.DeepEqual(got.Observability, src.Observability) {
+		t.Errorf("Observability mismatch:\ngot:  %+v\nwant: %+v", got.Observability, src.Observability)
 	}
 }
 
-// TestObservabilityHeadersStrippedOnExport verifies the renderer never
-// writes header values (they carry OTLP bearer tokens) and emits no
-// Observability\Headers subkey at all.
-func TestObservabilityHeadersStrippedOnExport(t *testing.T) {
+// TestObservabilityHeadersEmittedOnExport verifies the renderer writes
+// header values verbatim under an Observability\Headers subkey, and that a
+// header dropped from the source clears via the delete-before-recreate
+// stanza on re-import.
+func TestObservabilityHeadersEmittedOnExport(t *testing.T) {
 	src := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Observability: config.ObservabilityConfig{
@@ -57,7 +61,7 @@ func TestObservabilityHeadersStrippedOnExport(t *testing.T) {
 			Endpoint: "otel.example.com:4318",
 			Protocol: "http/protobuf",
 			Headers: map[string]string{
-				"authorization": "Bearer super-secret-token",
+				"authorization": "Bearer the-token",
 			},
 		},
 		Rules: []config.Rule{
@@ -73,25 +77,29 @@ func TestObservabilityHeadersStrippedOnExport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateText: %v", err)
 	}
-	if strings.Contains(text, "super-secret-token") {
-		t.Errorf("rendered .reg leaked the header token:\n%s", text)
+	if !strings.Contains(text, "Bearer the-token") {
+		t.Errorf("rendered .reg dropped the header value:\n%s", text)
 	}
-	if strings.Contains(text, `\Observability\Headers`) {
-		t.Errorf("rendered .reg emitted a Headers subkey; expected it to be stripped:\n%s", text)
+	if !strings.Contains(text, `[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Observability\Headers]`) {
+		t.Errorf("rendered .reg missing Headers subkey:\n%s", text)
+	}
+	// Idempotency: the subtree is deleted before recreation so removals clear.
+	if !strings.Contains(text, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Observability\Headers]`) {
+		t.Errorf("rendered .reg missing Headers deletion stanza:\n%s", text)
 	}
 
 	got, err := Parse([]byte(text))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got.Observability.Headers != nil {
-		t.Errorf("Headers should be nil after export round-trip, got %v", got.Observability.Headers)
+	if got.Observability.Headers["authorization"] != "Bearer the-token" {
+		t.Errorf("Headers[authorization] = %q after round-trip, want %q", got.Observability.Headers["authorization"], "Bearer the-token")
 	}
 }
 
 // TestObservabilityHeadersParsedWhenAuthored confirms that hand-authored /
-// GPO Observability\Headers values (which the renderer never emits) are
-// read back by the parser, preserving header-name case.
+// GPO Observability\Headers values are read back by the parser, preserving
+// header-name case and tolerating a lower-cased `headers` segment.
 func TestObservabilityHeadersParsedWhenAuthored(t *testing.T) {
 	const reg = "Windows Registry Editor Version 5.00\r\n\r\n" +
 		`[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\Observability]` + "\r\n" +

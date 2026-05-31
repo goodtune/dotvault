@@ -259,21 +259,16 @@ func TestHandleConfigDownload_IncludesObservability(t *testing.T) {
 	if !strings.Contains(body, "export_interval: 15s") {
 		t.Errorf("expected materialised export_interval `15s`; got:\n%s", body)
 	}
-	// observability.headers can carry bearer tokens — the download
-	// endpoint must NEVER leak them via the loopback API. The
-	// configured value above includes a fake bearer token plus a
-	// vendor-revealing key name; assert neither appears.
-	//
-	// `headers: {}` (an empty map) is allowed: the project's
-	// round-trip-clearing convention emits empty optional fields
-	// explicitly so a re-import can clear previously-set values.
-	// What we forbid is the populated form `authorization: …`
-	// appearing anywhere in the output.
-	if strings.Contains(body, "super-secret-token") {
-		t.Errorf("download leaked observability.headers value:\n%s", body)
+	// observability.headers (which may carry bearer tokens) round-trip
+	// verbatim: config conversion is lossless in every direction, so the
+	// download reflects the effective configuration including header
+	// values. Operators who want tokens kept out of a downloaded config
+	// set them via OTEL_EXPORTER_OTLP_HEADERS instead.
+	if !strings.Contains(body, "authorization:") {
+		t.Errorf("expected observability.headers key in download; got:\n%s", body)
 	}
-	if strings.Contains(body, "authorization:") {
-		t.Errorf("download exposed observability.headers vendor key:\n%s", body)
+	if !strings.Contains(body, "Bearer super-secret-token") {
+		t.Errorf("expected observability.headers value in download; got:\n%s", body)
 	}
 }
 

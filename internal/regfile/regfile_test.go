@@ -846,8 +846,14 @@ func TestHexLineWrapping(t *testing.T) {
 		t.Errorf("expected backslash continuation in wrapped hex value; got:\n%s", got)
 	}
 	// Now that wrapping accounts for the two-space continuation indent,
-	// no emitted line should exceed maxLineLen characters.
+	// no emitted *value* line should exceed maxLineLen characters. Key
+	// declaration lines (`[...]`) are exempt: the wrap budget governs hex
+	// value encoding only, and registry key paths can legitimately be
+	// longer (regedit.exe emits them unwrapped too).
 	for _, line := range strings.Split(got, "\r\n") {
+		if strings.HasPrefix(line, "[") {
+			continue
+		}
 		if len(line) > maxLineLen {
 			t.Errorf("line exceeds wrap limit (%d > %d): %q", len(line), maxLineLen, line)
 		}

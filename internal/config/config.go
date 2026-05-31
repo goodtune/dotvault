@@ -115,6 +115,16 @@ type Config struct {
 // top-level Observability field on Config keeps `omitempty` so
 // operators who don't use observability at all don't see a noisy
 // empty block in their downloads.
+//
+// Headers (which may hold OTLP bearer tokens) are emitted verbatim on
+// export. dotvault treats config conversion as lossless in every
+// direction — YAML <-> in-memory <-> .reg/registry — so no serialiser
+// strips them. The trade-off is deliberate: an exported config artefact
+// (the web download endpoint, a reg-export, a YAML round-trip) carries
+// the live header values. Operators who want to keep tokens out of
+// checked-in config should set them via OTEL_EXPORTER_OTLP_HEADERS in the
+// per-user EnvironmentFile and leave Headers empty; the SDK falls through
+// to those env vars when the field is unset.
 type ObservabilityConfig struct {
 	Enabled        bool              `yaml:"enabled"`
 	Endpoint       string            `yaml:"endpoint"`
@@ -123,26 +133,6 @@ type ObservabilityConfig struct {
 	Headers        map[string]string `yaml:"headers"`
 	RawInterval    string            `yaml:"export_interval"`
 	ExportInterval time.Duration     `yaml:"-"`
-}
-
-// MarshalYAML strips Headers before serialisation. Headers can
-// legitimately hold OTLP bearer tokens (Datadog / Grafana Cloud
-// etc. credentials); enforcing the strip at the yaml.Marshaler
-// layer means every export path — the web download endpoint, the
-// reg-export YAML form, future serialisers — is automatically
-// safe, instead of relying on each call site to remember to nil
-// out Headers itself. Round-tripping a config through YAML
-// therefore clears Headers, which is the intended security
-// posture: secrets belong in OTEL_EXPORTER_OTLP_HEADERS / the
-// per-user EnvironmentFile, not in checked-in config files.
-//
-// Uses an unnamed-struct shadow type so the override doesn't
-// recurse into itself the way `type Alias ObservabilityConfig`
-// returning Alias(c) would.
-func (c ObservabilityConfig) MarshalYAML() (interface{}, error) {
-	type shadow ObservabilityConfig
-	c.Headers = nil
-	return shadow(c), nil
 }
 
 // Enrolment declares a credential acquisition flow for a Vault KV key.

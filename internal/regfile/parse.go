@@ -665,11 +665,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		}
 	}
 	// Observability headers: every REG_SZ value directly under
-	// Observability\Headers. The renderer never emits these (they're
-	// credentials, stripped on export like MarshalYAML), so any present here
-	// were authored by hand / GPO. Header names are preserved verbatim — HTTP
-	// folds case, but a faithful round-trip keeps the authored form, unlike
-	// the lowercased enrolment Settings names.
+	// Observability\Headers. Conversion is lossless in every direction, so the
+	// renderer emits these verbatim and an admin may also author them by hand /
+	// GPO; either way we read them back. Header names are preserved verbatim —
+	// HTTP folds case, but a faithful round-trip keeps the authored form,
+	// unlike the lowercased enrolment Settings names.
 	headersKey := obsKey + `\Headers`
 	headers := map[string]string{}
 	for vk, v := range values {

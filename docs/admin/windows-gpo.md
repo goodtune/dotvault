@@ -25,7 +25,7 @@ This emits a canonical `Windows Registry Editor Version 5.00` file (UTF-16LE wit
 dotvault reg-export dotvault-policy.reg --output config.yaml
 ```
 
-Both commands round-trip the **entire** configuration without loss (the one deliberate exception is observability header values — see below), so the YAML and `.reg` forms are interchangeable. The web UI's Effective Configuration screen exposes the same conversion via download buttons.
+Both commands round-trip the **entire** configuration without loss — including observability header values (see the credential note below) — so the YAML and `.reg` forms are interchangeable. The web UI's Effective Configuration screen exposes the same conversion via download buttons.
 
 ## Registry schema
 

@@ -38,13 +38,11 @@ func TestKeysToStatusesUnparseableBlob(t *testing.T) {
 	}
 }
 
-var _ = ssh.FingerprintSHA256
-
-// TestQueryListeningRoundTrip stands up a real listener backed by a fake
-// source, then uses QueryListening (the dotvault status path) to list what the
-// "daemon" serves — proving status observes the live endpoint rather than
-// re-deriving from config. The cert identity's parsed expiry confirms the blob
-// round-trips its true validity.
+// TestQueryListeningRoundTrip stands up a real listener backed by fake sources,
+// then uses QueryListening (the dotvault status path) to list what the "daemon"
+// serves — proving status observes the live endpoint rather than re-deriving
+// from config. The cert identity's parsed expiry confirms the blob round-trips
+// its true validity from the wire.
 func TestQueryListeningRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "agent.sock")

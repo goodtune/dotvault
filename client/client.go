@@ -94,7 +94,7 @@ func WithIdentity(name string) Option {
 // reading secrets.
 //
 // Empty optional fields in cfg are filled with dotvault's defaults (KVMount
-// "kv", UserPrefix "users/", TokenFile ~/.vault-token), so a directly
+// "kv", UserPrefix "users/", TokenFile ~/.dotvault-token), so a directly
 // constructed Config behaves the same as one returned by LoadConfig.
 func New(cfg *Config, opts ...Option) (*Client, error) {
 	if cfg == nil {

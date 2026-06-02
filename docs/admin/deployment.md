@@ -120,7 +120,7 @@ Enable per-user once the package is installed:
 systemctl --user enable --now dotvault.service
 ```
 
-The daemon watches `~/.vault-token` itself (via inotify on Linux), so subsequent rewrites of the file (typically from an interactive `dotvault login` in another shell) trigger an immediate token re-read on the running daemon within seconds — no extra unit to enable. See [Config reload](#config-reload) for the full mechanism.
+The daemon watches `~/.dotvault-token` itself (via inotify on Linux), so subsequent rewrites of the file (typically from an interactive `dotvault login` in another shell) trigger an immediate token re-read on the running daemon within seconds — no extra unit to enable. See [Config reload](#config-reload) for the full mechanism.
 
 Or enable globally for every login session on the machine:
 
@@ -264,7 +264,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.enrol.attempts`       | counter   | `engine`, `outcome={completed,error}`                |
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
-| `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.vault-token` re-read |
+| `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read |
 
 ### Log records
 
@@ -282,7 +282,7 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 ## Security considerations
 
 - **File permissions** — all managed files are written with `0600`. dotvault warns if the config file is group or world writable.
-- **Token security** — `~/.vault-token` is written with `0600`. Secret values are never logged, even at debug level.
+- **Token security** — `~/.dotvault-token` is written with `0600`. Secret values are never logged, even at debug level. dotvault uses this dotvault-specific filename rather than Vault's default `~/.vault-token` so a concurrent `vault` CLI session cannot clobber the daemon's cached token. Releases before this used `~/.vault-token`; there is no migration, so after upgrading delete any stale `~/.vault-token` dotvault left behind (it is no longer read and lingers at `0600` until it expires).
 - **Atomic writes** — all file writes use temp file + rename to prevent partial writes.
 - **Web UI** — loopback only, CSRF-protected, strict Content Security Policy.
 - **Windows** — DACL-based permission checks via the Windows Security API.
@@ -292,7 +292,7 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 !!! note
     dotvault does **not** support full config reload via SIGHUP. The daemon must be fully restarted to pick up configuration changes (the exception is the `enrolments` section, which is re-read on each polling tick).
 
-    On Linux the daemon watches `~/.vault-token` directly with inotify and re-reads it the moment the file is created or replaced — so when an interactive `dotvault login` writes a fresh token, the running daemon picks it up within seconds instead of waiting for the next five-minute lifecycle tick. This is built into the daemon (`internal/tokenwatch`); there is no separate unit to enable, and it works regardless of how dotvault was started. Deletes are ignored — the daemon keeps using its current in-memory token until a replacement is written.
+    On Linux the daemon watches `~/.dotvault-token` directly with inotify and re-reads it the moment the file is created or replaced — so when an interactive `dotvault login` writes a fresh token, the running daemon picks it up within seconds instead of waiting for the next five-minute lifecycle tick. This is built into the daemon (`internal/tokenwatch`); there is no separate unit to enable, and it works regardless of how dotvault was started. Deletes are ignored — the daemon keeps using its current in-memory token until a replacement is written.
 
     Earlier releases shipped a `dotvault-token-watch.path` user unit that achieved the same nudge by SIGHUP-ing the daemon. It has been removed; the package upgrade deletes the unit files, but an enabled symlink left in `~/.config/systemd/user/` by a previous `systemctl --user enable` will persist and keep firing a (now redundant, but harmless) SIGHUP. After upgrading, clear it with `systemctl --user disable --now dotvault-token-watch.path`.
 

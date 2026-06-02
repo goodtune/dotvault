@@ -56,12 +56,16 @@ func LogDir() string {
 }
 
 // VaultTokenPath returns the path to the Vault token file.
+//
+// dotvault uses its own ~/.dotvault-token rather than Vault's default
+// ~/.vault-token so a user running the upstream `vault` CLI in another
+// context cannot clobber (or be clobbered by) the daemon's cached token.
 func VaultTokenPath() string {
 	switch runtime.GOOS {
 	case "windows":
-		return filepath.Join(os.Getenv("USERPROFILE"), ".vault-token")
+		return filepath.Join(os.Getenv("USERPROFILE"), ".dotvault-token")
 	default:
-		return filepath.Join(mustHomeDir(), ".vault-token")
+		return filepath.Join(mustHomeDir(), ".dotvault-token")
 	}
 }
 

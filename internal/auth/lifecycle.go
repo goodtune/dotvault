@@ -100,7 +100,7 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disa
 // Reload signals the lifecycle goroutine to perform an immediate
 // tryReload on the next scheduling pass — used by the SIGHUP handler
 // and by the in-process token-file watcher (internal/tokenwatch) so a
-// freshly-written ~/.vault-token is picked up without waiting for the
+// freshly-written ~/.dotvault-token is picked up without waiting for the
 // 5-minute lifecycle tick. Coalescing: concurrent or back-to-back
 // calls collapse into a single reload. Safe to call before or after
 // Start; calls made before Start are buffered and consumed by the

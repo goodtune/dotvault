@@ -92,7 +92,7 @@ review lens. The set mirrors the original council workflow.
 > Review the diff with a security lens. Cover: credential
 > handling (`token`, `password`, `headers` map, Vault tokens,
 > OAuth flows); file permissions (0600 invariant on managed
-> files, 0600 on `~/.vault-token`); CSRF / CSP on the web UI;
+> files, 0600 on `~/.dotvault-token`); CSRF / CSP on the web UI;
 > the loopback-only invariant for the web listener; secrets
 > appearing in slog output even at Debug level; registry /
 > DACL handling on Windows; template injection in

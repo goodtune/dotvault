@@ -97,9 +97,15 @@ func TestLogDir(t *testing.T) {
 func TestVaultTokenPath(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	path := VaultTokenPath()
-	want := filepath.Join(home, ".vault-token")
+	want := filepath.Join(home, ".dotvault-token")
 	if path != want {
 		t.Errorf("VaultTokenPath() = %q, want %q", path, want)
+	}
+	// The dotvault-specific filename must not collide with the Vault
+	// CLI's default ~/.vault-token — the whole point is that the two
+	// tools can coexist without clobbering each other's cached token.
+	if path == filepath.Join(home, ".vault-token") {
+		t.Errorf("VaultTokenPath() = %q collides with the Vault CLI default", path)
 	}
 }
 

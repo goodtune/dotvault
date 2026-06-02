@@ -282,7 +282,11 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 ## Security considerations
 
 - **File permissions** — all managed files are written with `0600`. dotvault warns if the config file is group or world writable.
-- **Token security** — `~/.dotvault-token` is written with `0600`. Secret values are never logged, even at debug level. dotvault uses this dotvault-specific filename rather than Vault's default `~/.vault-token` so a concurrent `vault` CLI session cannot clobber the daemon's cached token. Releases before this used `~/.vault-token`; there is no migration, so after upgrading delete any stale `~/.vault-token` dotvault left behind (it is no longer read and lingers at `0600` until it expires).
+- **Token security** — `~/.dotvault-token` is written with `0600`. Secret values are never logged, even at debug level. dotvault uses this dotvault-specific filename rather than Vault's default `~/.vault-token` so a concurrent `vault` CLI session cannot clobber the daemon's cached token.
+
+<!-- TRANSITIONAL: added in v0.20.0 for the ~/.vault-token -> ~/.dotvault-token move. Remove this admonition around v0.23.0 (≈3 minor releases) once upgrading installs are unlikely. -->
+!!! note "Transitional — upgrading from v0.19.0 or earlier"
+    Releases before v0.20.0 used Vault's default `~/.vault-token`. There is no migration: dotvault re-authenticates once on first start, and any token it previously wrote to `~/.vault-token` lingers at `0600` until it expires. If dotvault was the only writer of that file, delete it after upgrading. This note will be removed in a future release (around v0.23.0).
 - **Atomic writes** — all file writes use temp file + rename to prevent partial writes.
 - **Web UI** — loopback only, CSRF-protected, strict Content Security Policy.
 - **Windows** — DACL-based permission checks via the Windows Security API.

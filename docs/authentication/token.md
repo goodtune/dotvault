@@ -35,6 +35,10 @@ When the web UI is enabled with token auth, users can paste a Vault token into t
 
 dotvault writes tokens to `~/.dotvault-token` with `0600` permissions and warns if the file has different permissions. This mirrors the `0600` convention of the Vault CLI's own `~/.vault-token`, but uses a dotvault-specific filename so running the upstream `vault` CLI in another context cannot overwrite (or be overwritten by) the daemon's cached token.
 
+<!-- TRANSITIONAL: added in v0.20.0 for the ~/.vault-token -> ~/.dotvault-token move. Remove this section around v0.23.0 (≈3 minor releases) once upgrading installs are unlikely. -->
 ## Upgrading from earlier releases
 
-Earlier releases read and wrote the Vault default `~/.vault-token`. There is no migration: on first start after upgrading, dotvault looks for the new `~/.dotvault-token`, finds nothing, and re-authenticates once via the configured method. Any token dotvault previously wrote to `~/.vault-token` is left untouched — it is no longer used by dotvault and will sit on disk (at `0600`) until it expires server-side or you remove it. If dotvault was the only thing writing that file, delete it after upgrading to avoid leaving a stale credential around.
+!!! note "Transitional — applies only when upgrading from v0.19.0 or earlier"
+    This note covers the one-time move from Vault's default `~/.vault-token` to dotvault's own `~/.dotvault-token` and will be removed in a future release (around v0.23.0).
+
+    Earlier releases read and wrote the Vault default `~/.vault-token`. There is no migration: on first start after upgrading, dotvault looks for the new `~/.dotvault-token`, finds nothing, and re-authenticates once via the configured method. Any token dotvault previously wrote to `~/.vault-token` is left untouched — it is no longer used by dotvault and will sit on disk (at `0600`) until it expires server-side or you remove it. If dotvault was the only thing writing that file, delete it after upgrading to avoid leaving a stale credential around.

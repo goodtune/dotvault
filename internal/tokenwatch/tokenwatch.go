@@ -15,7 +15,7 @@
 //
 // This replaces the previously shipped systemd `.path` unit, which
 // achieved the same nudge out-of-process by SIGHUP-ing the daemon on
-// every change to ~/.dotvault-token. Doing it in-process drops two unit
+// every change to the token file. Doing it in-process drops two unit
 // files and works regardless of the service manager.
 //
 // On every other platform Watch is a no-op that blocks until ctx is

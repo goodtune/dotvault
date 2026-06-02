@@ -492,7 +492,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Watch the token file for replacement and nudge the lifecycle
 	// manager to re-read it immediately. This is the in-process
 	// analogue of the old systemd `.path` unit (which SIGHUP'd the
-	// daemon on every ~/.dotvault-token change) and is complementary to
+	// daemon on every token-file change) and is complementary to
 	// the still-present SIGHUP handler. On Linux it uses inotify on the
 	// token file's parent directory; on other platforms it is a no-op
 	// that blocks until shutdown. Creation and update events trigger a

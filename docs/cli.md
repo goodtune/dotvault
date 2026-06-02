@@ -117,7 +117,7 @@ project README and the Windows admin docs for details.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--config <path>` | *(system default)* | Override the config file path |
+| `--config <path>` | *(system default)* | Override the config file path. Refused when a system-wide config is present unless that config sets `bypass_system_config: true` (see the [Configuration Reference](configuration/config-reference.md#bypass_system_config)). |
 | `--log-level <level>` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--dry-run` | `false` | Show what would change without writing files |
 

@@ -84,6 +84,33 @@ func TestApplyRegistryLayerBooleans(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerBypassSystemConfig covers the top-level
+// BypassSystemConfig flag — read directly off the policy root key — which
+// gates whether a GPO-managed machine honours a --config command-line
+// override. The tri-state DWORD must map 1 -> true, 0 -> false, and absent
+// (nil) -> the false default.
+func TestApplyRegistryLayerBypassSystemConfig(t *testing.T) {
+	set := uint32(1)
+	cfg := &Config{}
+	applyRegistryLayer(cfg, registryLayer{BypassSystemConfig: &set})
+	if !cfg.BypassSystemConfig {
+		t.Error("BypassSystemConfig should be true when DWORD is 1")
+	}
+
+	clear := uint32(0)
+	cfg = &Config{BypassSystemConfig: true}
+	applyRegistryLayer(cfg, registryLayer{BypassSystemConfig: &clear})
+	if cfg.BypassSystemConfig {
+		t.Error("BypassSystemConfig should be false when DWORD is 0")
+	}
+
+	cfg = &Config{}
+	applyRegistryLayer(cfg, registryLayer{})
+	if cfg.BypassSystemConfig {
+		t.Error("BypassSystemConfig should default to false when the DWORD is absent")
+	}
+}
+
 // TestApplyRegistryLayerObservability covers the Observability subkey
 // that gates the OTel LoggerProvider wiring. Without these fields
 // populated from the registry, a GPO-managed daemon would have

@@ -82,7 +82,7 @@ enrolment flow from the terminal.`,
 		rootCmd.RunE = runDaemon
 	}
 
-	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path")
+	rootCmd.PersistentFlags().StringVar(&flagConfig, "config", "", "override system config path (refused when a system config is present unless it sets bypass_system_config: true)")
 	rootCmd.PersistentFlags().StringVar(&flagLogLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&flagLogFormat, "log-format", "auto", "log format (auto, text, json); auto picks text on TTY, json otherwise")
 	rootCmd.PersistentFlags().BoolVar(&flagDryRun, "dry-run", false, "show what would change without writing")
@@ -211,29 +211,51 @@ func newVersionCmd() *cobra.Command {
 	return cmd
 }
 
-// loadConfig resolves the system config path (honouring the --config
-// flag) and loads it. Returns the resolved path alongside the Config
-// so callers can use the same string for both the loaded config and
-// any subsequent reference (reload, log attribute, status output)
-// without re-running the resolver — paths.SystemConfigPath on Linux
-// consults XDG_CONFIG_DIRS via os.Stat, so two back-to-back calls
-// can disagree if the filesystem changes between them.
+// loadConfig loads the effective configuration and returns it alongside the
+// path it was loaded from, so callers can reuse the same string for the
+// loaded config and any subsequent reference (reload, log attribute, status
+// output). It applies the --config override policy via resolveConfigSource.
 func loadConfig() (*config.Config, string, error) {
-	path := configPath()
-	cfg, err := config.LoadSystem(path)
+	load, path, err := resolveConfigSource()
+	if err != nil {
+		return nil, path, err
+	}
+	cfg, err := load()
 	return cfg, path, err
 }
 
-// configPath resolves the system config file path, honouring the
-// --config override when set. Lower-level helper for loadConfig;
-// most call sites should use loadConfig's returned path instead of
-// invoking this directly, to keep the load path and subsequent
-// references in sync.
-func configPath() string {
-	if flagConfig != "" {
-		return flagConfig
+// resolveConfigSource decides where configuration is loaded from and returns
+// a loader closure plus the path it reads. Both the initial load and the
+// daemon's periodic enrolment reload call the returned closure, so they always
+// agree on the source — and on a single resolved path, since
+// paths.SystemConfigPath on Linux consults XDG_CONFIG_DIRS via os.Stat and two
+// back-to-back calls can disagree if the filesystem changes between them.
+//
+// Without --config the loader uses the normal system source (Windows GPO
+// registry, else the system YAML file). With --config the override is honoured
+// only when config.SystemConfigBypass allows it — i.e. there is no system-wide
+// config, or the system-wide config set bypass_system_config: true. Otherwise
+// the override is refused so a managed machine can't be pointed at an arbitrary
+// config from the command line.
+func resolveConfigSource() (func() (*config.Config, error), string, error) {
+	systemPath := paths.SystemConfigPath()
+	if flagConfig == "" {
+		return func() (*config.Config, error) { return config.LoadSystem(systemPath) }, systemPath, nil
 	}
-	return paths.SystemConfigPath()
+
+	allowed, err := config.SystemConfigBypass(systemPath)
+	if err != nil {
+		return nil, flagConfig, fmt.Errorf("check --config override policy: %w", err)
+	}
+	if !allowed {
+		return nil, flagConfig, fmt.Errorf(
+			"--config override is not permitted: a system-wide configuration is present and does not allow it; " +
+				"set bypass_system_config: true in the system config (or its Group Policy registry equivalent) to enable command-line overrides")
+	}
+	// Override allowed: load the file directly, deliberately bypassing the
+	// registry (config.Load, not config.LoadSystem) so the override actually
+	// takes effect on a GPO-managed machine that opted into the bypass.
+	return func() (*config.Config, error) { return config.Load(flagConfig) }, flagConfig, nil
 }
 
 // emitConfigSourceLog surfaces a WARN OTel log record when the
@@ -260,7 +282,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return runSync(cmd, args)
 	}
 
-	cfg, cfgPath, err := loadConfig()
+	loadCfg, cfgPath, err := resolveConfigSource()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -609,10 +635,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 
 		// Background goroutine: reload config on each tick and re-check enrolments.
-		// Reuses cfgPath captured at startup so the reload loop tracks the same
-		// file the daemon first loaded, even if the filesystem state that
-		// SystemConfigPath consults (XDG_CONFIG_DIRS on Linux) changes.
-		reloadPath := cfgPath
+		// Reuses the loadCfg closure captured at startup so the reload loop tracks
+		// the exact source the daemon first loaded — the same resolved system path
+		// (even if the filesystem state SystemConfigPath consults via
+		// XDG_CONFIG_DIRS on Linux changes) or the same --config override file,
+		// applying the bypass policy once at startup rather than re-deciding it
+		// every tick.
 		go func() {
 			ticker := time.NewTicker(cfg.Sync.Interval)
 			defer ticker.Stop()
@@ -622,7 +650,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					reloaded, err := config.LoadSystem(reloadPath)
+					reloaded, err := loadCfg()
 					if err != nil {
 						observability.RecordConfigReload(ctx, "error")
 						slog.Warn("config reload failed", "error", err)

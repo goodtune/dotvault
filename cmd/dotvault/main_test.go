@@ -11,7 +11,114 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/paths"
 )
+
+// minimalConfigYAML is a config body that passes config validation.
+const minimalConfigYAML = `vault:
+  address: "https://vault.example.com:8200"
+rules:
+  - name: r
+    vault_key: r
+    target:
+      path: "~/.dotvault/r"
+      format: text
+`
+
+// TestResolveConfigSourceOverridePolicy exercises the --config override gate:
+// when a system-wide config is present, the override is refused unless that
+// config sets bypass_system_config: true. The test stands up a fake system
+// config via XDG_CONFIG_DIRS (a Linux-only mechanism, so it is skipped
+// elsewhere) so paths.SystemConfigPath resolves to a file under our control.
+func TestResolveConfigSourceOverridePolicy(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("relies on XDG_CONFIG_DIRS to plant a system config; Linux-only")
+	}
+
+	origFlag := flagConfig
+	t.Cleanup(func() { flagConfig = origFlag })
+
+	planSystemConfig := func(t *testing.T, body string) {
+		t.Helper()
+		dir := t.TempDir()
+		cfgDir := filepath.Join(dir, "dotvault")
+		if err := os.MkdirAll(cfgDir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(body), 0644); err != nil {
+			t.Fatalf("write system config: %v", err)
+		}
+		t.Setenv("XDG_CONFIG_DIRS", dir)
+	}
+	writeOverride := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "override.yaml")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatalf("write override: %v", err)
+		}
+		return path
+	}
+
+	t.Run("refused when system config present without bypass", func(t *testing.T) {
+		planSystemConfig(t, minimalConfigYAML)
+		flagConfig = writeOverride(t, minimalConfigYAML)
+		if _, _, err := resolveConfigSource(); err == nil {
+			t.Fatal("expected --config override to be refused")
+		} else if !strings.Contains(err.Error(), "not permitted") {
+			t.Errorf("error = %v, want it to explain the override is not permitted", err)
+		}
+	})
+
+	t.Run("allowed when system config opts in", func(t *testing.T) {
+		planSystemConfig(t, minimalConfigYAML+"bypass_system_config: true\n")
+		override := writeOverride(t, minimalConfigYAML)
+		flagConfig = override
+
+		load, path, err := resolveConfigSource()
+		if err != nil {
+			t.Fatalf("resolveConfigSource: %v", err)
+		}
+		if path != override {
+			t.Errorf("path = %q, want override path %q", path, override)
+		}
+		cfg, err := load()
+		if err != nil {
+			t.Fatalf("load override: %v", err)
+		}
+		if cfg.Vault.Address != "https://vault.example.com:8200" {
+			t.Errorf("override config did not load: Vault.Address = %q", cfg.Vault.Address)
+		}
+	})
+
+	t.Run("allowed when no system config exists", func(t *testing.T) {
+		// Point XDG_CONFIG_DIRS at an empty dir so SystemConfigPath finds no
+		// per-XDG file and falls back to /etc/xdg/dotvault/config.yaml. If that
+		// fixed fallback happens to exist on this host, the "no system config"
+		// state is unreachable — skip rather than assert a false negative.
+		t.Setenv("XDG_CONFIG_DIRS", t.TempDir())
+		if _, err := os.Stat(paths.SystemConfigPath()); err == nil {
+			t.Skipf("system config %s exists on this host; cannot exercise the no-config path", paths.SystemConfigPath())
+		}
+		override := writeOverride(t, minimalConfigYAML)
+		flagConfig = override
+
+		load, path, err := resolveConfigSource()
+		if err != nil {
+			t.Fatalf("resolveConfigSource: %v", err)
+		}
+		if path != override {
+			t.Errorf("path = %q, want override path %q", path, override)
+		}
+		cfg, err := load()
+		if err != nil {
+			t.Fatalf("load override: %v", err)
+		}
+		if cfg.Vault.Address != "https://vault.example.com:8200" {
+			t.Errorf("override config did not load: Vault.Address = %q", cfg.Vault.Address)
+		}
+	})
+}
 
 func TestIsGUIBinary(t *testing.T) {
 	tests := []struct {

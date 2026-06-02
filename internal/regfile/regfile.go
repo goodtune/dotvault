@@ -40,8 +40,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e := &emitter{}
 	e.WriteString(header)
 
-	e.writeKey(rootKey)
-	e.WriteString("\r\n")
+	e.writeTopLevel(cfg)
 
 	e.writeVault(cfg.Vault)
 	e.writeSync(cfg.Sync)
@@ -83,6 +82,16 @@ func (e *emitter) writeKey(path string) {
 // determined dynamically by the YAML.
 func (e *emitter) writeKeyDeletion(path string) {
 	fmt.Fprintf(&e.b, "[-%s]\r\n\r\n", path)
+}
+
+// writeTopLevel emits the root policy key plus the values that live directly
+// under it (not inside a named subsection). Currently just BypassSystemConfig,
+// which gates whether a --config command-line override is honoured on a
+// machine carrying this policy.
+func (e *emitter) writeTopLevel(cfg *config.Config) {
+	e.writeKey(rootKey)
+	e.writeBool("BypassSystemConfig", cfg.BypassSystemConfig)
+	e.WriteString("\r\n")
 }
 
 func (e *emitter) writeVault(v config.VaultConfig) {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -477,8 +478,8 @@ func TestParseDuration(t *testing.T) {
 		{"1h30m", 90 * time.Minute, false},
 		{"45s", 45 * time.Second, false},
 		{"0d", 0, false},
-		{"-5d", 0, true},     // negative not allowed for Nd
-		{"1.5d", 0, true},     // stdlib rejects .5d as unknown unit
+		{"-5d", 0, true},  // negative not allowed for Nd
+		{"1.5d", 0, true}, // stdlib rejects .5d as unknown unit
 		{"bogus", 0, true},
 		{"", 0, true},
 		{"1w", 0, true}, // not supported
@@ -761,6 +762,96 @@ func TestValidateRejectsProgrammaticNegativeExportInterval(t *testing.T) {
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected error for programmatic negative ExportInterval")
 	}
+}
+
+func TestSystemConfigBypass(t *testing.T) {
+	const minimal = `
+vault:
+  address: "https://vault.example.com:8200"
+rules:
+  - name: r
+    vault_key: r
+    target:
+      path: "~/.dotvault/r"
+      format: text
+`
+
+	t.Run("no system config allows override", func(t *testing.T) {
+		// A path that does not exist stands in for "no system-wide config".
+		missing := filepath.Join(t.TempDir(), "does-not-exist.yaml")
+		allowed, err := SystemConfigBypass(missing)
+		if err != nil {
+			t.Fatalf("SystemConfigBypass: %v", err)
+		}
+		if !allowed {
+			t.Fatal("expected override to be allowed when no system config exists")
+		}
+	})
+
+	t.Run("system config without flag refuses override", func(t *testing.T) {
+		path := writeTemp(t, minimal)
+		allowed, err := SystemConfigBypass(path)
+		if err != nil {
+			t.Fatalf("SystemConfigBypass: %v", err)
+		}
+		if allowed {
+			t.Fatal("expected override to be refused when system config omits bypass_system_config")
+		}
+	})
+
+	t.Run("system config with flag allows override", func(t *testing.T) {
+		path := writeTemp(t, minimal+"bypass_system_config: true\n")
+		allowed, err := SystemConfigBypass(path)
+		if err != nil {
+			t.Fatalf("SystemConfigBypass: %v", err)
+		}
+		if !allowed {
+			t.Fatal("expected override to be allowed when system config sets bypass_system_config: true")
+		}
+	})
+
+	t.Run("explicit false refuses override", func(t *testing.T) {
+		path := writeTemp(t, minimal+"bypass_system_config: false\n")
+		allowed, err := SystemConfigBypass(path)
+		if err != nil {
+			t.Fatalf("SystemConfigBypass: %v", err)
+		}
+		if allowed {
+			t.Fatal("expected override to be refused when bypass_system_config is explicitly false")
+		}
+	})
+
+	t.Run("malformed system config errors", func(t *testing.T) {
+		path := writeTemp(t, "vault: [this is not a map\n")
+		if _, err := SystemConfigBypass(path); err == nil {
+			t.Fatal("expected an error for a malformed system config, got nil")
+		}
+	})
+
+	t.Run("group or world writable config refuses bypass", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Unix mode bits don't map to Windows DACL group/world-writable the same way")
+		}
+		// A writable system config could be tampered with by an
+		// unprivileged user, so even bypass_system_config: true must not be
+		// trusted from it. Fail closed.
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		if err := os.WriteFile(path, []byte(minimal+"bypass_system_config: true\n"), 0666); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		// os.WriteFile honours umask; force the world-writable bit explicitly.
+		if err := os.Chmod(path, 0666); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		allowed, err := SystemConfigBypass(path)
+		if err != nil {
+			t.Fatalf("SystemConfigBypass: %v", err)
+		}
+		if allowed {
+			t.Fatal("expected bypass to be refused for a group/world-writable system config")
+		}
+	})
 }
 
 func writeTemp(t *testing.T, content string) string {

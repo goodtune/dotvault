@@ -95,7 +95,25 @@ func TestLogDir(t *testing.T) {
 }
 
 func TestVaultTokenPath(t *testing.T) {
-	home, _ := os.UserHomeDir()
+	// Derive the expected home from the same OS-specific source
+	// VaultTokenPath uses (USERPROFILE on Windows, os.UserHomeDir
+	// elsewhere) so the two can't disagree, and skip cleanly when the
+	// home dir is unresolvable rather than asserting against a bare
+	// filename.
+	var home string
+	if runtime.GOOS == "windows" {
+		home = os.Getenv("USERPROFILE")
+	} else {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			t.Skipf("cannot resolve home dir: %v", err)
+		}
+		home = h
+	}
+	if home == "" {
+		t.Skip("home dir is empty; cannot validate token path")
+	}
+
 	path := VaultTokenPath()
 	want := filepath.Join(home, ".dotvault-token")
 	if path != want {

@@ -325,6 +325,9 @@ func stringifyStringMap(data map[string]any) map[string]string {
 	return out
 }
 
-// Compile-time check that the JFrog engine implements Refresher so the
-// refresh manager will route it through the rotation path.
-var _ Refresher = (*JFrogEngine)(nil)
+// Compile-time check that the JFrog and Databricks engines implement
+// Refresher so the refresh manager will route them through the rotation path.
+var (
+	_ Refresher = (*JFrogEngine)(nil)
+	_ Refresher = (*DatabricksEngine)(nil)
+)

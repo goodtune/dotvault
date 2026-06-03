@@ -129,6 +129,14 @@ enrolments:
       # Shorter-than-production TTL so the refresh cycle gets exercised
       # during normal dev-loop sessions (halfway point = 3 h).
       token_ttl: "6h"
+  databricks:
+    engine: databricks
+    settings:
+      # Databricks OAuth U2M (user-to-machine) login. There is no local
+      # Databricks to test against, so point this at a real workspace you can
+      # sign into, or comment the block out to skip it in the dev loop.
+      host: "https://dbc-00000000-0000.cloud.databricks.com"
+      # account_id: "<uuid>"   # set for account-level login instead
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the
   # user's enrolment path under a different field name. Re-evaluated on
   # every poll cycle by the WatchManager and, on Enterprise Vault, on

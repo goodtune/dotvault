@@ -129,10 +129,11 @@ type IO struct {
 var (
 	enginesMu sync.RWMutex
 	engines   = map[string]Engine{
-		"copy":   &CopyEngine{},
-		"github": &GitHubEngine{},
-		"jfrog":  &JFrogEngine{},
-		"ssh":    &SSHEngine{},
+		"copy":       &CopyEngine{},
+		"databricks": &DatabricksEngine{},
+		"github":     &GitHubEngine{},
+		"jfrog":      &JFrogEngine{},
+		"ssh":        &SSHEngine{},
 	}
 )
 

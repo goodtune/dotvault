@@ -388,12 +388,12 @@ Automated credential acquisition from external services (`internal/enrol/`). Enr
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
 
 Optional interfaces extend the contract for engines that need them:
 
 - `SettingsFielder.FieldsFromSettings(settings)` — engines whose written-field set depends on per-enrolment settings (currently the Copy engine, where the JSON template determines the keys). The manager and web runner use `EngineFields(engine, settings)` which falls back to `Fields()` when not implemented.
-- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog). Driven by `RefreshManager`.
+- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog and Databricks). Driven by `RefreshManager`.
 - `Watcher.WatchSources(settings, username) []WatchSource` — engines whose output is derived from upstream Vault data and must track source changes (currently Copy). Driven by `WatchManager`, which polls every sync interval and (on Enterprise Vault) reacts to source-write events within seconds.
 
 ### GitHub Engine Defaults
@@ -444,6 +444,30 @@ Vault schema (8 fields): `access_token`, `refresh_token`, `reference_token`, `ur
 `server_id` is deduced from the platform hostname (e.g. `mycompany.jfrog.io` → `mycompany`, IP addresses → `default-server`); `user` is extracted from the access-token JWT subject. Requires JFrog Artifactory 7.64.0 or newer on the remote side. `reference_token` additionally requires Access 7.38.4 or newer; older servers leave it empty.
 
 `reference_token` and `user` are written when available but are deliberately excluded from the engine's `Fields()` set, so `enrol.Manager.HasAllFields` does not reject enrolments on deployments that don't return them.
+
+### Databricks Engine
+
+Replicates the `databricks auth login` OAuth user-to-machine (U2M) flow: an authorization-code grant with PKCE against the workspace (or account) OAuth endpoints, caught by a localhost redirect listener. Databricks access tokens are short-lived (~1 hour), so the engine implements `Refresher` and dotvault owns the rotation — the rendered credential carries only the access token (the native CLI token cache is intentionally not written, so nothing races the sync-engine clobber). This is the same ownership model as JFrog.
+
+Required settings:
+- `host` — the Databricks workspace URL (https, scheme + host only, no path; e.g. `https://dbc-xxxx.cloud.databricks.com`). For account-level login, the accounts console URL. (This is the Databricks analogue of the JFrog engine's `url` setting.)
+
+Optional settings:
+- `account_id` — when set, the engine performs account-level login (`{host}/oidc/accounts/{account_id}/…`) instead of workspace login.
+- `client_id` — default `databricks-cli` (the CLI's public OAuth app). Override only for a custom registered OAuth app that also registers the `http://localhost:8020`–`8040` redirect range.
+- `scopes` — default `offline_access all-apis`. A custom list is honoured verbatim except `offline_access` is always ensured (it yields the refresh token dotvault rotates with).
+- `https_proxy` / `http_proxy` — same `internal/httpproxy.ClientFromSettings` contract as GitHub/JFrog; routes the OAuth + SCIM traffic.
+
+Flow (enrolment — runs once per user):
+1. GET `{host}/oidc/.well-known/oauth-authorization-server` (account-level inserts `/oidc/accounts/{account_id}`) to discover `authorization_endpoint` and `token_endpoint`.
+2. Bind a loopback redirect listener (prefer port 8020, walk up to 8040, matching the CLI). Generate a PKCE verifier + `S256` challenge and an anti-CSRF `state`.
+3. Open the browser to the authorization endpoint (`client_id=databricks-cli`, redirect URI, `response_type=code`, scopes, PKCE challenge). The user signs in; Databricks redirects back to the loopback with a `code`. The handler validates `state`.
+4. POST `token_endpoint` with `grant_type=authorization_code` + `code_verifier` (public client, params in the body) → access + refresh token + `expires_in`.
+5. Best-effort `GET /api/2.0/preview/scim/v2/Me` resolves the username (the access token is opaque to dotvault).
+
+Flow (refresh — periodic, driven by `RefreshManager`): every check interval, refresh past half-life via `grant_type=refresh_token`. Databricks may rotate the refresh token (adopted when returned, otherwise the existing one is kept). `401`/`403` is permanent revocation (`ErrRevoked` → wipe + re-enrol); other errors are transient.
+
+Vault schema: `access_token`, `refresh_token`, `host`, `issued_at` (RFC3339), `expires_at` (RFC3339), plus `user` (from SCIM `/Me`, written when available). `user` is deliberately excluded from `Fields()` so a transient SCIM failure doesn't mark an enrolment incomplete. The typical sync rule renders `~/.databrickscfg` (INI) with `host` + `token = {{ .access_token }}` — an OAuth access token is accepted wherever a PAT is, and dotvault keeps it fresh.
 
 ### SSH Engine
 

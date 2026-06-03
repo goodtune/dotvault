@@ -84,6 +84,55 @@ func TestParseTextRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBypassSystemConfigRoundTrip pins the top-level bypass_system_config flag
+// through both the .reg (render -> parse) and YAML (MarshalYAML -> load) paths.
+// The flag gates the --config command-line override, so a faithful round-trip
+// is load-bearing: a Group Policy admin must be able to flip it and have it
+// survive every conversion the daemon and tooling perform.
+func TestBypassSystemConfigRoundTrip(t *testing.T) {
+	src := validBaseConfig()
+	src.Sync = config.SyncConfig{RawInterval: "15m"}
+	src.BypassSystemConfig = true
+
+	// .reg render must emit the value directly under the root key, and the
+	// parser must read it back.
+	text, err := GenerateText(src)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(text, `"BypassSystemConfig"=dword:00000001`) {
+		t.Errorf("rendered .reg missing BypassSystemConfig dword:\n%s", text)
+	}
+	got, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !got.BypassSystemConfig {
+		t.Error("BypassSystemConfig did not survive .reg round-trip")
+	}
+
+	// YAML render must include the flag, and config.Load must read it back.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	if !strings.Contains(string(yamlBytes), "bypass_system_config: true") {
+		t.Errorf("MarshalYAML missing bypass_system_config: true:\n%s", yamlBytes)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if !loaded.BypassSystemConfig {
+		t.Error("BypassSystemConfig did not survive YAML round-trip")
+	}
+}
+
 // TestParseUTF16LE reads the canonical regedit.exe-style UTF-16LE-with-BOM
 // output and confirms the parser handles the encoding transparently.
 func TestParseUTF16LE(t *testing.T) {

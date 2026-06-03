@@ -123,6 +123,9 @@ func readRegistryObservabilityHeaders(root registry.Key, basePath string) (map[s
 
 // registryLayer holds the flat values read from a single registry hive.
 type registryLayer struct {
+	// Top-level (values directly under the policy root key).
+	BypassSystemConfig *uint32
+
 	// Vault
 	VaultAddress             string
 	VaultCACert              string
@@ -173,6 +176,9 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		return layer, false, err
 	}
 	defer key.Close()
+
+	// Top-level values live directly under the policy root key (no subkey).
+	layer.BypassSystemConfig = readRegDWORD(key, "BypassSystemConfig")
 
 	// Read Vault subkey.
 	vk, err := registry.OpenKey(root, registryPolicyPath+`\Vault`, registry.READ)
@@ -250,9 +256,15 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	return layer, true, nil
 }
 
-// applyRegistryLayer merges a registry layer into the config. Only non-zero
-// values are applied, allowing higher-priority layers to override selectively.
+// applyRegistryLayer merges a registry layer into the config. Only values that
+// are *present* in the layer are applied — non-empty strings and non-nil DWORD
+// pointers — so a higher-priority layer overrides selectively. Presence, not
+// non-zero-ness, gates the merge: a present boolean DWORD of 0 is applied and
+// forces the field false (e.g. an explicit BypassSystemConfig=0 clears it).
 func applyRegistryLayer(cfg *Config, layer registryLayer) {
+	if layer.BypassSystemConfig != nil {
+		cfg.BypassSystemConfig = *layer.BypassSystemConfig != 0
+	}
 	if layer.VaultAddress != "" {
 		cfg.Vault.Address = layer.VaultAddress
 	}

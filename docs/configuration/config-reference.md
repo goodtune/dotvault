@@ -14,8 +14,11 @@ You can override the config path with `--config`:
 dotvault run --config /path/to/config.yaml
 ```
 
-!!! warning "Windows Group Policy override"
-    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. The `--config` CLI flag is the only way to bypass this behaviour. See [Windows Group Policy](../admin/windows-gpo.md) for details.
+!!! warning "`--config` is gated by the system-wide configuration"
+    `--config` is honoured only when there is **no system-wide configuration**, or the system-wide configuration explicitly opts in with `bypass_system_config: true`. If a system config is present and does not set the flag, dotvault refuses the override and exits with an error rather than silently loading the command-line file. This is identical on every platform; the "system-wide configuration" is the Windows Group Policy registry policy when present, otherwise the system YAML file. See [`bypass_system_config`](#bypass_system_config) below.
+
+!!! warning "Windows Group Policy"
+    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. Pointing dotvault at a different file with `--config` requires `bypass_system_config: true` in that policy (the registry equivalent is a `BypassSystemConfig` REG_DWORD of `1` directly under the policy key). See [Windows Group Policy](../admin/windows-gpo.md) for details.
 
 ## Full example
 
@@ -72,6 +75,20 @@ enrolments:
         - read:org
         - gist
 ```
+
+## Top-level options
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bypass_system_config` | bool | `false` | Permit the `--config` command-line override on this machine (see below) |
+
+### `bypass_system_config`
+
+By default, when a system-wide configuration is present, the `--config` command-line flag is **refused** — a managed deployment (a Windows Group Policy registry policy, or a system config file shipped by configuration management) cannot be sidestepped from the command line. Setting `bypass_system_config: true` in the **system-wide** config re-enables the override on that machine.
+
+The intended workflow: an administrator normally pins the system config, but flips this flag when they need to trial a hand-edited config without un-deploying the policy. It only has an effect when set in the authoritative system config — setting it inside a file passed to `--config` is meaningless, because that file is only loaded once the override has already been allowed.
+
+The behaviour is identical on every platform. On Windows GPO the equivalent registry value is a `BypassSystemConfig` REG_DWORD of `1` directly under `HKLM\SOFTWARE\Policies\goodtune\dotvault`.
 
 ## Vault section
 

@@ -608,6 +608,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return nil
 	}
 
+	// Top-level values (directly under the policy root key).
+	if err := applyBool(&cfg.BypassSystemConfig, rootKey, "BypassSystemConfig"); err != nil {
+		return err
+	}
+
 	// Vault.
 	vaultKey := rootKey + `\Vault`
 	for _, fn := range []func() error{

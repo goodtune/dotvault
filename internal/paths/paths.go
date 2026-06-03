@@ -61,10 +61,10 @@ func LogDir() string {
 // ~/.vault-token so a user running the upstream `vault` CLI in another
 // context cannot clobber (or be clobbered by) the daemon's cached token.
 //
-// The home directory is resolved via os.UserHomeDir (mustHomeDir), which
-// reads %USERPROFILE% on Windows and $HOME elsewhere and panics if it
-// cannot be determined. Resolving an unset home as a panic — rather than
-// joining onto an empty string and silently yielding a CWD-relative
+// The home directory is resolved via os.UserHomeDir (mustHomeDir),
+// using the OS's home-directory convention, and panics if it cannot be
+// determined. Resolving an unset home as a panic — rather than joining
+// onto an empty string and silently yielding a CWD-relative
 // ".dotvault-token" — keeps a token from ever landing in the working
 // directory. The panic is part of this function's documented contract;
 // the client facade's DefaultTokenFile recovers it.

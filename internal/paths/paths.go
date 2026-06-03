@@ -60,13 +60,16 @@ func LogDir() string {
 // dotvault uses its own ~/.dotvault-token rather than Vault's default
 // ~/.vault-token so a user running the upstream `vault` CLI in another
 // context cannot clobber (or be clobbered by) the daemon's cached token.
+//
+// The home directory is resolved via os.UserHomeDir (mustHomeDir), which
+// reads %USERPROFILE% on Windows and $HOME elsewhere and panics if it
+// cannot be determined. Resolving an unset home as a panic — rather than
+// joining onto an empty string and silently yielding a CWD-relative
+// ".dotvault-token" — keeps a token from ever landing in the working
+// directory. The panic is part of this function's documented contract;
+// the client facade's DefaultTokenFile recovers it.
 func VaultTokenPath() string {
-	switch runtime.GOOS {
-	case "windows":
-		return filepath.Join(os.Getenv("USERPROFILE"), ".dotvault-token")
-	default:
-		return filepath.Join(mustHomeDir(), ".dotvault-token")
-	}
+	return filepath.Join(mustHomeDir(), ".dotvault-token")
 }
 
 // DefaultAgentSocket returns the per-user Unix domain socket path for the SSH

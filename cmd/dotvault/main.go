@@ -243,19 +243,32 @@ func resolveConfigSource() (func() (*config.Config, error), string, error) {
 		return func() (*config.Config, error) { return config.LoadSystem(systemPath) }, systemPath, nil
 	}
 
+	// Capture the override path in a local so the loader closure (reused by the
+	// daemon's reload loop) can never diverge from the resolved path if the
+	// global flagConfig is mutated later — by a subcommand, a test, or a future
+	// refactor.
+	override := flagConfig
+
 	allowed, err := config.SystemConfigBypass(systemPath)
 	if err != nil {
-		return nil, flagConfig, fmt.Errorf("check --config override policy: %w", err)
+		return nil, override, fmt.Errorf("check --config override policy: %w", err)
 	}
 	if !allowed {
-		return nil, flagConfig, fmt.Errorf(
-			"--config override is not permitted: a system-wide configuration is present and does not allow it; " +
-				"set bypass_system_config: true in the system config (or its Group Policy registry equivalent) to enable command-line overrides")
+		// SystemConfigBypass fails closed for more than just "not opted in":
+		// an opted-in system config that is group/world-writable (or whose
+		// permissions can't be verified) is also refused, so the message must
+		// not assume the flag is simply unset. SystemConfigBypass already
+		// slog.Warns the specific permission reason.
+		return nil, override, fmt.Errorf(
+			"--config override (%s) is refused: a system-wide configuration is present and does not permit it. "+
+				"Allow overrides on this machine by setting bypass_system_config: true in the system config "+
+				"(BypassSystemConfig=1 in its Group Policy registry equivalent); note an opted-in system config "+
+				"is still refused if it is group- or world-writable", override)
 	}
 	// Override allowed: load the file directly, deliberately bypassing the
 	// registry (config.Load, not config.LoadSystem) so the override actually
 	// takes effect on a GPO-managed machine that opted into the bypass.
-	return func() (*config.Config, error) { return config.Load(flagConfig) }, flagConfig, nil
+	return func() (*config.Config, error) { return config.Load(override) }, override, nil
 }
 
 // emitConfigSourceLog surfaces a WARN OTel log record when the

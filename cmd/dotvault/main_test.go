@@ -65,8 +65,8 @@ func TestResolveConfigSourceOverridePolicy(t *testing.T) {
 		flagConfig = writeOverride(t, minimalConfigYAML)
 		if _, _, err := resolveConfigSource(); err == nil {
 			t.Fatal("expected --config override to be refused")
-		} else if !strings.Contains(err.Error(), "not permitted") {
-			t.Errorf("error = %v, want it to explain the override is not permitted", err)
+		} else if !strings.Contains(err.Error(), "is refused") {
+			t.Errorf("error = %v, want it to explain the override is refused", err)
 		}
 	})
 
@@ -88,6 +88,14 @@ func TestResolveConfigSourceOverridePolicy(t *testing.T) {
 		}
 		if cfg.Vault.Address != "https://vault.example.com:8200" {
 			t.Errorf("override config did not load: Vault.Address = %q", cfg.Vault.Address)
+		}
+
+		// The loader closure must close over the resolved override path, not
+		// the mutable global: mutating flagConfig after resolution must not
+		// redirect a subsequent (reload-loop) load.
+		flagConfig = filepath.Join(t.TempDir(), "nonexistent.yaml")
+		if _, err := load(); err != nil {
+			t.Errorf("loader followed mutated flagConfig instead of the captured override path: %v", err)
 		}
 	})
 

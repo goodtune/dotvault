@@ -28,10 +28,11 @@ type Config struct {
 	Vault VaultConfig
 
 	// TokenFile is the path to the Vault token file consulted after
-	// VAULT_TOKEN. Empty means dotvault's platform default
-	// (~/.dotvault-token, %USERPROFILE%\.dotvault-token on Windows). dotvault
-	// does not expose this in its YAML today; it is here as a programmatic
-	// override point and defaults to the canonical location.
+	// VAULT_TOKEN. Empty means dotvault's platform default:
+	// .dotvault-token in the user's home directory (resolved via
+	// os.UserHomeDir). dotvault does not expose this in its YAML today;
+	// it is here as a programmatic override point and defaults to the
+	// canonical location.
 	TokenFile string
 }
 

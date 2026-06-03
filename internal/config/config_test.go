@@ -853,12 +853,18 @@ rules:
 		if err := os.Chmod(path, 0666); err != nil {
 			t.Fatalf("chmod: %v", err)
 		}
+		// A writable system config is a fail-closed *error* (not a plain
+		// not-allowed decision) so the CLI can explain the real cause rather
+		// than telling the user to set a flag that is already set.
 		allowed, err := SystemConfigBypass(path)
-		if err != nil {
-			t.Fatalf("SystemConfigBypass: %v", err)
+		if err == nil {
+			t.Fatal("expected an error for a group/world-writable system config")
 		}
 		if allowed {
-			t.Fatal("expected bypass to be refused for a group/world-writable system config")
+			t.Fatal("expected bypass to be refused (allowed=false) for a group/world-writable system config")
+		}
+		if !strings.Contains(err.Error(), "writable") {
+			t.Errorf("error = %v, want it to mention the writable permissions cause", err)
 		}
 	})
 }

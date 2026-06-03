@@ -254,16 +254,13 @@ func resolveConfigSource() (func() (*config.Config, error), string, error) {
 		return nil, override, fmt.Errorf("check --config override policy: %w", err)
 	}
 	if !allowed {
-		// SystemConfigBypass fails closed for more than just "not opted in":
-		// an opted-in system config that is group/world-writable (or whose
-		// permissions can't be verified) is also refused, so the message must
-		// not assume the flag is simply unset. SystemConfigBypass already
-		// slog.Warns the specific permission reason.
+		// SystemConfigBypass surfaces permission-related fail-closed reasons
+		// (writable / unverifiable system config) as errors handled above, so
+		// reaching here means the system config simply did not opt in.
 		return nil, override, fmt.Errorf(
 			"--config override (%s) is refused: a system-wide configuration is present and does not permit it. "+
 				"Allow overrides on this machine by setting bypass_system_config: true in the system config "+
-				"(BypassSystemConfig=1 in its Group Policy registry equivalent); note an opted-in system config "+
-				"is still refused if it is group- or world-writable", override)
+				"(BypassSystemConfig=1 in its Group Policy registry equivalent)", override)
 	}
 	// Override allowed: load the file directly, deliberately bypassing the
 	// registry (config.Load, not config.LoadSystem) so the override actually

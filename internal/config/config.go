@@ -367,18 +367,20 @@ func SystemConfigBypass(systemPath string) (bool, error) {
 	// The bypass flag relaxes a security control (it re-enables the --config
 	// override), so it can only be trusted from a file that an unprivileged
 	// user could not have tampered with. If the system config is group- or
-	// world-writable, refuse the bypass and warn loudly: an attacker who can
-	// write the file could otherwise flip the flag and point dotvault at their
-	// own config. (The daemon's own Load only warns about such permissions; we
-	// are stricter here because the decision being made is "may this config be
-	// overridden", not "load this config".) Fail closed on the perms check
-	// itself too — an indeterminate permission state must not grant the bypass.
+	// world-writable, refuse the bypass: an attacker who can write the file
+	// could otherwise flip the flag and point dotvault at their own config.
+	// (The daemon's own Load only warns about such permissions; we are stricter
+	// here because the decision being made is "may this config be overridden",
+	// not "load this config".) Both this case and an indeterminate permission
+	// check are surfaced as errors rather than a plain (false, nil): a refusal
+	// for a permission reason is not the same as "the config didn't opt in", so
+	// returning an error keeps the failure closed AND lets the CLI explain the
+	// real cause instead of misleadingly telling the user to set a flag that
+	// may already be set.
 	if insecure, checkErr := perms.IsGroupWorldWritable(systemPath); checkErr != nil {
-		slog.Warn("cannot verify system config permissions; refusing --config override", "path", systemPath, "error", checkErr)
-		return false, nil
+		return false, fmt.Errorf("cannot verify permissions of system config %s (refusing --config override): %w", systemPath, checkErr)
 	} else if insecure {
-		slog.Warn("system config is group or world writable; refusing --config override (bypass_system_config cannot be trusted from a tamperable file)", "path", systemPath)
-		return false, nil
+		return false, fmt.Errorf("system config %s is group or world writable; refusing --config override because bypass_system_config cannot be trusted from a tamperable file (tighten it to 0600/0644)", systemPath)
 	}
 
 	// Parse only enough to read the bypass flag. Deliberately skip

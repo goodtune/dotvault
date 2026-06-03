@@ -342,7 +342,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Windows box) or be lost to the no-op global logger.
 	emitConfigSourceLog(ctx, cfg, cfgPath)
 
-	// Handle signals. SIGHUP triggers an immediate ~/.vault-token re-read
+	// Handle signals. SIGHUP triggers an immediate ~/.dotvault-token re-read
 	// via the LifecycleManager so a fresh token written by `dotvault
 	// login` is picked up within seconds, without waiting for the
 	// 5-minute tick. This is the manual counterpart to the in-process
@@ -531,7 +531,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Watch the token file for replacement and nudge the lifecycle
 	// manager to re-read it immediately. This is the in-process
 	// analogue of the old systemd `.path` unit (which SIGHUP'd the
-	// daemon on every ~/.vault-token change) and is complementary to
+	// daemon on every token-file change) and is complementary to
 	// the still-present SIGHUP handler. On Linux it uses inotify on the
 	// token file's parent directory; on other platforms it is a no-op
 	// that blocks until shutdown. Creation and update events trigger a

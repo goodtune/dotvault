@@ -168,7 +168,7 @@ func pipeKeys(t *testing.T, b []byte) *os.File {
 // TestEnrolUnauthenticated_SubprocessRoundTrip exercises the "no
 // token, point at `dotvault login`" exit path end-to-end by invoking
 // the compiled binary with no VAULT_TOKEN and a HOME that contains no
-// .vault-token file. The auth check at the top of runEnrol must
+// .dotvault-token file. The auth check at the top of runEnrol must
 // short-circuit before any Vault round-trip and exit 1 with the
 // documented message. Done as a subprocess test because runEnrol
 // calls os.Exit directly and is not refactorable into an in-process
@@ -213,7 +213,7 @@ enrolments:
 
 	cmd := exec.Command(binPath, "--config", configPath, "enrol")
 	// Force "no token" — empty VAULT_TOKEN, HOME pointing at a fresh
-	// dir without a .vault-token file.
+	// dir without a .dotvault-token file.
 	cmd.Env = append(os.Environ(),
 		"VAULT_TOKEN=",
 		"HOME="+workDir,

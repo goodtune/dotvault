@@ -127,7 +127,7 @@ project README and the Windows admin docs for details.
 
 | Variable | Description |
 |----------|-------------|
-| `VAULT_TOKEN` | Vault token (takes precedence over `~/.vault-token`) |
+| `VAULT_TOKEN` | Vault token (takes precedence over `~/.dotvault-token`) |
 | `DOTVAULT_SUPPRESS_HOURS` | `dotvault login-check` suppression window in whole hours (default `6`). Zero, negative, or non-integer values cause `login-check` to exit `1`. |
 | `DOTVAULT_SUPPRESS_MARKER` | Override path for the `login-check` suppression marker. Primarily used by tests; the default location is `${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress`. |
 

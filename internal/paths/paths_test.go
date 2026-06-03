@@ -95,11 +95,28 @@ func TestLogDir(t *testing.T) {
 }
 
 func TestVaultTokenPath(t *testing.T) {
-	home, _ := os.UserHomeDir()
+	// Derive the expected home from os.UserHomeDir — the same source
+	// VaultTokenPath now uses on every platform (via mustHomeDir) — so
+	// the two can't disagree, and skip cleanly when the home dir is
+	// unresolvable rather than asserting against a bare filename.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("cannot resolve home dir: %v", err)
+	}
+	if home == "" {
+		t.Skip("home dir is empty; cannot validate token path")
+	}
+
 	path := VaultTokenPath()
-	want := filepath.Join(home, ".vault-token")
+	want := filepath.Join(home, ".dotvault-token")
 	if path != want {
 		t.Errorf("VaultTokenPath() = %q, want %q", path, want)
+	}
+	// The dotvault-specific filename must not collide with the Vault
+	// CLI's default ~/.vault-token — the whole point is that the two
+	// tools can coexist without clobbering each other's cached token.
+	if path == filepath.Join(home, ".vault-token") {
+		t.Errorf("VaultTokenPath() = %q collides with the Vault CLI default", path)
 	}
 }
 

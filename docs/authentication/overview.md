@@ -24,7 +24,7 @@ When running without the web UI, dotvault authenticates directly:
 
 - **OIDC** — opens a browser window and listens on a random localhost port for the callback
 - **LDAP** — prompts for a password in the terminal; handles MFA challenges inline
-- **Token** — reads from the `VAULT_TOKEN` environment variable or `~/.vault-token` file
+- **Token** — reads from the `VAULT_TOKEN` environment variable or `~/.dotvault-token` file
 
 ### Web UI mode
 
@@ -43,4 +43,4 @@ In web mode, re-authentication opens the browser to the web UI login page. In CL
 
 ## Token persistence
 
-Vault tokens are persisted to `~/.vault-token` with `0600` permissions. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `VAULT_TOKEN` environment variable takes precedence if set.
+Vault tokens are persisted to `~/.dotvault-token` with `0600` permissions — a dotvault-specific filename rather than Vault's default `~/.vault-token`, so a concurrent `vault` CLI session cannot clobber the daemon's cached token. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `VAULT_TOKEN` environment variable takes precedence if set.

@@ -23,15 +23,16 @@ import (
 //   - Constructed directly by a caller that already knows its connectivity
 //     (useful for tests, or callers wiring values from another source). New
 //     applies the same defaults LoadConfig would (KVMount "kv", UserPrefix
-//     "users/", TokenFile ~/.vault-token).
+//     "users/", TokenFile ~/.dotvault-token).
 type Config struct {
 	Vault VaultConfig
 
 	// TokenFile is the path to the Vault token file consulted after
-	// VAULT_TOKEN. Empty means dotvault's platform default
-	// (~/.vault-token, %USERPROFILE%\.vault-token on Windows). dotvault
-	// does not expose this in its YAML today; it is here as a programmatic
-	// override point and defaults to the canonical location.
+	// VAULT_TOKEN. Empty means dotvault's platform default:
+	// .dotvault-token in the user's home directory (resolved via
+	// os.UserHomeDir). dotvault does not expose this in its YAML today;
+	// it is here as a programmatic override point and defaults to the
+	// canonical location.
 	TokenFile string
 }
 
@@ -80,7 +81,7 @@ func DefaultConfigPath() string {
 }
 
 // DefaultTokenFile returns the platform-appropriate path to the Vault token
-// file dotvault reads and writes (~/.vault-token), or "" if the OS home
+// file dotvault reads and writes (~/.dotvault-token), or "" if the OS home
 // directory cannot be resolved.
 //
 // paths.VaultTokenPath panics (via mustHomeDir) when os.UserHomeDir fails —
@@ -88,7 +89,7 @@ func DefaultConfigPath() string {
 // recoverable environment condition. We therefore guard it and return ""
 // rather than fabricating a path. An empty token-file path is already
 // well-defined throughout the package: token resolution simply skips the file
-// and uses VAULT_TOKEN only. Returning "" (not a relative ".vault-token", which
+// and uses VAULT_TOKEN only. Returning "" (not a relative ".dotvault-token", which
 // would be cwd-dependent and could silently diverge from where the daemon
 // looks) keeps that contract honest; a caller that needs a specific location
 // sets Config.TokenFile explicitly.

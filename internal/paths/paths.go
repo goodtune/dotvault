@@ -56,13 +56,20 @@ func LogDir() string {
 }
 
 // VaultTokenPath returns the path to the Vault token file.
+//
+// dotvault uses its own ~/.dotvault-token rather than Vault's default
+// ~/.vault-token so a user running the upstream `vault` CLI in another
+// context cannot clobber (or be clobbered by) the daemon's cached token.
+//
+// The home directory is resolved via os.UserHomeDir (mustHomeDir),
+// using the OS's home-directory convention, and panics if it cannot be
+// determined. Resolving an unset home as a panic — rather than joining
+// onto an empty string and silently yielding a CWD-relative
+// ".dotvault-token" — keeps a token from ever landing in the working
+// directory. The panic is part of this function's documented contract;
+// the client facade's DefaultTokenFile recovers it.
 func VaultTokenPath() string {
-	switch runtime.GOOS {
-	case "windows":
-		return filepath.Join(os.Getenv("USERPROFILE"), ".vault-token")
-	default:
-		return filepath.Join(mustHomeDir(), ".vault-token")
-	}
+	return filepath.Join(mustHomeDir(), ".dotvault-token")
 }
 
 // DefaultAgentSocket returns the per-user Unix domain socket path for the SSH
@@ -140,6 +147,15 @@ func mustHomeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic(fmt.Sprintf("cannot determine home directory: %v", err))
+	}
+	// os.UserHomeDir only returns a value when the home env var is
+	// non-empty (an empty $HOME / %USERPROFILE% surfaces as an error
+	// above), so this should be unreachable. Guard it anyway: every
+	// caller joins onto the result, and an empty home would silently
+	// produce a CWD-relative path (e.g. a Vault token landing in the
+	// working directory) instead of failing loudly.
+	if home == "" {
+		panic("cannot determine home directory: resolved to an empty path")
 	}
 	return home
 }

@@ -148,5 +148,14 @@ func mustHomeDir() string {
 	if err != nil {
 		panic(fmt.Sprintf("cannot determine home directory: %v", err))
 	}
+	// os.UserHomeDir only returns a value when the home env var is
+	// non-empty (an empty $HOME / %USERPROFILE% surfaces as an error
+	// above), so this should be unreachable. Guard it anyway: every
+	// caller joins onto the result, and an empty home would silently
+	// produce a CWD-relative path (e.g. a Vault token landing in the
+	// working directory) instead of failing loudly.
+	if home == "" {
+		panic("cannot determine home directory: resolved to an empty path")
+	}
 	return home
 }

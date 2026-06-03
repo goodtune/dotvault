@@ -380,7 +380,7 @@ func SystemConfigBypass(systemPath string) (bool, error) {
 	if insecure, checkErr := perms.IsGroupWorldWritable(systemPath); checkErr != nil {
 		return false, fmt.Errorf("cannot verify permissions of system config %s (refusing --config override): %w", systemPath, checkErr)
 	} else if insecure {
-		return false, fmt.Errorf("system config %s is group or world writable; refusing --config override because bypass_system_config cannot be trusted from a tamperable file (tighten it to 0600/0644)", systemPath)
+		return false, fmt.Errorf("system config %s is group/world or otherwise non-owner writable; refusing --config override because bypass_system_config cannot be trusted from a tamperable file (restrict write access to the owner — e.g. mode 0600/0644 on Unix, or an owner-only ACL on Windows)", systemPath)
 	}
 
 	// Parse only enough to read the bypass flag. Deliberately skip

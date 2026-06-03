@@ -126,7 +126,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 
   Logs vs. slog: the OTel logs exporter is **not** a slog replacement. Operational logging continues to go through `log/slog` to stderr. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal — currently only `LogRegistryConfigManaged`, which surfaces "GPO config is active, file config is ignored" as a WARN record once per daemon/sync startup. Routing this through slog would print an INFO line on every CLI invocation against a GPO-managed Windows box, which is exactly the noise we wanted to eliminate.
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)
-- **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition
+- **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition. A key may use a single-level `group/name` form (e.g. `databricks/prod`) to organise related enrolments; the group becomes a nested Vault path segment (`users/<you>/databricks/prod`) and an expandable folder in the web UI. Exactly one level is allowed — more than one `/`, a leading/trailing `/`, an empty segment, or a backslash is rejected at config load (`validateEnrolmentKey`)
 - **`agent`** — SSH agent surface (default disabled). `enabled`, `unix.path` (default per-user runtime socket), `windows.pipe` (default `\\.\pipe\dotvault-agent`), `windows.putty` (default true; Windows-only `*bool` tri-state — when enabled, the daemon serves a *second* parallel listener on the Pageant-convention pipe `\\.\pipe\pageant.<user>.<hash>` so PuTTY-family clients auto-discover the agent; only takes effect when `agent.enabled`), and an ordered `keys[]` list of sources: `source: kv` (`path_prefix`, resolved under `kv/data/users/<you>/`) and `source: vault-ca` (`mount`, `role`, templated `principals`, `ttl`, `ephemeral_key`)
 
 ### Config Validation
@@ -137,6 +137,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - `target.format` must be one of: yaml, json, ini, toml, text, netrc
 - `web.listen` must resolve to a loopback address if web is enabled
 - Enrolment entries must have a non-empty engine field
+- Enrolment keys are flat (`gh`) or one-level grouped (`group/name`); at most one `/`, no empty segments, no backslash
 - When `agent.enabled`, at least one `agent.keys[]` source is required; each must be `kv` or `vault-ca`; a `vault-ca` source requires `mount` and `role`, and its `ttl` (if set) must parse as a positive duration
 
 ## CLI
@@ -385,6 +386,8 @@ Templates receive the Vault KV data map as dot context. The rendered output is p
 ## Enrolment
 
 Automated credential acquisition from external services (`internal/enrol/`). Enrolments are declared in config under a top-level `enrolments` map keyed by Vault KV path segment.
+
+Enrolment keys support one level of grouping (`group/name`, e.g. `databricks/prod`) so related enrolments cluster under a shared prefix. The key is treated as an opaque segment everywhere it flows: the Vault path nests naturally (`users/<you>/databricks/prod`); the web UI groups by the prefix-before-slash and renders an expandable folder (`internal/web/frontend/src/components/enrol-page.jsx`); the web API serves grouped keys through both a percent-encoded `{key}` segment and parallel `{group}/{name}` routes (`enrolKeyFromRequest`, `server.go`); and the Windows registry / `reg-import`/`reg-export` round-trip stores the key as one subkey literally named `databricks/prod` (a forward slash is legal in a registry key *name* — only backslash is the separator — so no nesting is introduced and the GPO-parity contract holds). `validateEnrolmentKey` (`internal/config/config.go`) enforces the one-level limit.
 
 ### Engine Interface
 

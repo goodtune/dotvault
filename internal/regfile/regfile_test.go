@@ -192,6 +192,50 @@ func TestGenerateEnrolments(t *testing.T) {
 	}
 }
 
+// TestGroupedEnrolmentKeyRoundTrip verifies that a one-level grouped enrolment
+// key ("databricks/prod") survives the .reg render → parse cycle. The forward
+// slash is legal inside a registry key *name* (only backslash is the path
+// separator), so the grouped key becomes a single Enrolments subkey named
+// "databricks/prod" and round-trips without any structural nesting — keeping
+// the GPO-parity contract intact for grouped enrolments.
+func TestGroupedEnrolmentKeyRoundTrip(t *testing.T) {
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{Name: "minimal", VaultKey: "minimal", Target: config.Target{Path: "~/.dotvault/minimal", Format: "text"}},
+		},
+		Enrolments: map[string]config.Enrolment{
+			"databricks/prod": {
+				Engine:   "databricks",
+				Settings: map[string]any{"host": "https://dbc-123.cloud.databricks.com"},
+			},
+		},
+	}
+
+	text, err := GenerateText(src)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(text, `\Enrolments\databricks/prod]`) {
+		t.Errorf("rendered .reg missing grouped enrolment subkey\n--- output ---\n%s", text)
+	}
+
+	got, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	e, ok := got.Enrolments["databricks/prod"]
+	if !ok {
+		t.Fatalf("grouped enrolment key did not round-trip; got %v", got.Enrolments)
+	}
+	if e.Engine != "databricks" {
+		t.Errorf("engine = %q, want databricks", e.Engine)
+	}
+	if e.Settings["host"] != "https://dbc-123.cloud.databricks.com" {
+		t.Errorf("host setting = %v, want the databricks host", e.Settings["host"])
+	}
+}
+
 func TestGenerateNestedMapSetting(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},

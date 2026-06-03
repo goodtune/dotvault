@@ -129,7 +129,10 @@ enrolments:
       # Shorter-than-production TTL so the refresh cycle gets exercised
       # during normal dev-loop sessions (halfway point = 3 h).
       token_ttl: "6h"
-  databricks:
+  # Grouped enrolment key: "group/name" nests under users/<you>/databricks/* in
+  # Vault and renders as an expandable "databricks" folder in the web UI. Add a
+  # second databricks/<name> entry to manage multiple workspaces side by side.
+  databricks/example:
     engine: databricks
     settings:
       # Databricks OAuth U2M (user-to-machine) login. There is no local

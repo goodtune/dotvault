@@ -327,6 +327,37 @@ body {
 
 .enrol-list { display: flex; flex-direction: column; gap: 12px; }
 
+/* One-level enrolment grouping ("folders"): a group/name key renders the
+   group as a collapsible header above its indented member cards. */
+.enrol-group {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  background: #fafafa;
+  overflow: hidden;
+}
+.enrol-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.enrol-group-header:hover { background: #f0f0f0; }
+.enrol-group-chevron { color: #888; font-size: 12px; width: 12px; }
+.enrol-group-name { font-size: 15px; font-weight: 600; color: #333; }
+.enrol-group-count { margin-left: auto; font-size: 13px; color: #888; }
+.enrol-group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px 28px;
+}
+
 .enrol-card {
   background: white;
   border: 1px solid #e0e0e0;

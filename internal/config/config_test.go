@@ -464,6 +464,104 @@ rules:
 	}
 }
 
+func TestValidateEnrolmentKey(t *testing.T) {
+	cases := []struct {
+		key     string
+		wantErr bool
+	}{
+		// Flat keys.
+		{"gh", false},
+		{"databricks", false},
+		// One-level grouped keys.
+		{"databricks/prod", false},
+		{"aws/account-a", false},
+		// Rejected: more than one level.
+		{"databricks/prod/extra", true},
+		{"a/b/c", true},
+		// Rejected: empty segment around the slash.
+		{"databricks/", true},
+		{"/prod", true},
+		{"a//b", true},
+		// Rejected: whitespace-only segment.
+		{"a/ ", true},
+		{" /a", true},
+		// Rejected: dot segments would yield a confusing path/label.
+		{".", true},
+		{"..", true},
+		{"databricks/..", true},
+		{"../prod", true},
+		// Rejected: backslash (Windows registry separator).
+		{`databricks\prod`, true},
+	}
+	for _, tc := range cases {
+		err := validateEnrolmentKey(tc.key)
+		if tc.wantErr && err == nil {
+			t.Errorf("validateEnrolmentKey(%q) = nil, want error", tc.key)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("validateEnrolmentKey(%q) unexpected error: %v", tc.key, err)
+		}
+	}
+}
+
+func TestLoadGroupedEnrolmentKey(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+
+enrolments:
+  databricks/prod:
+    engine: databricks
+    settings:
+      host: "https://dbc-123.cloud.databricks.com"
+  databricks/dev:
+    engine: databricks
+    settings:
+      host: "https://dbc-456.cloud.databricks.com"
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() with grouped enrolment keys errored: %v", err)
+	}
+	if _, ok := cfg.Enrolments["databricks/prod"]; !ok {
+		t.Errorf("grouped key databricks/prod not loaded; got %v", cfg.Enrolments)
+	}
+}
+
+func TestLoadInvalidGroupedEnrolmentKey(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  kv_mount: "kv"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+
+enrolments:
+  databricks/prod/extra:
+    engine: databricks
+    settings:
+      host: "https://dbc-123.cloud.databricks.com"
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() accepted a two-level enrolment key, want error")
+	}
+}
+
 func TestParseDuration(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -477,8 +575,8 @@ func TestParseDuration(t *testing.T) {
 		{"1h30m", 90 * time.Minute, false},
 		{"45s", 45 * time.Second, false},
 		{"0d", 0, false},
-		{"-5d", 0, true},     // negative not allowed for Nd
-		{"1.5d", 0, true},     // stdlib rejects .5d as unknown unit
+		{"-5d", 0, true},  // negative not allowed for Nd
+		{"1.5d", 0, true}, // stdlib rejects .5d as unknown unit
 		{"bogus", 0, true},
 		{"", 0, true},
 		{"1w", 0, true}, // not supported

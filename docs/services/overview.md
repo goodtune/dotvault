@@ -16,6 +16,27 @@ enrolments:
         - read:org
 ```
 
+## Grouping enrolments
+
+An enrolment key may use a single-level `group/name` form to organise related enrolments under a shared prefix — useful when one engine is used for several targets (multiple Databricks workspaces, multiple AWS accounts, several GitHub hosts):
+
+```yaml
+enrolments:
+  databricks/prod:
+    engine: databricks
+    settings: { host: "https://prod.cloud.databricks.com" }
+  databricks/dev:
+    engine: databricks
+    settings: { host: "https://dev.cloud.databricks.com" }
+  aws/account-a:
+    engine: copy
+    # …engine-specific settings…
+```
+
+The group segment becomes a nested Vault path segment (`users/<you>/databricks/prod`) and an expandable **folder** in the web UI's enrolment screen, with each `name` shown as a separate entry. Flat keys (`gh`, `jfrog`) stay top-level. The grouping is purely organisational — each entry is still an independent enrolment with its own settings, refresh cycle, and sync rule(s).
+
+Exactly **one** level of grouping is supported. A second slash (`a/b/c`), a leading/trailing slash, an empty segment, or a backslash is rejected at config load.
+
 ## Enrolment lifecycle
 
 1. On each sync cycle, dotvault checks Vault for missing or incomplete secrets for each enrolment

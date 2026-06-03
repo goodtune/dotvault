@@ -3,7 +3,12 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { startEnrolment, skipEnrolment, resetEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
 import { copyText } from '../clipboard.js';
 
-export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
+export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
+  // Header title: the leaf name when rendered inside a group folder, otherwise
+  // the engine's display name (preserving the single-enrolment look). The
+  // device-flow copy below still references the engine name (enrolment.name),
+  // e.g. "Enter this code on GitHub", which reads correctly regardless.
+  const title = displayName || enrolment.name;
   const [localStatus, setLocalStatus] = useState(enrolment.status);
   const [output, setOutput] = useState(enrolment.output || []);
   const [error, setError] = useState(enrolment.error || null);
@@ -165,7 +170,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       h('div', { class: 'enrol-card-header' },
         h('div', null,
           h('span', { class: 'enrol-check' }, '\u2713'),
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
         ),
         h('div', { class: 'enrol-card-actions' },
           h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
@@ -201,7 +206,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-skipped' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-badge' }, 'SKIPPED'),
         ),
         h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
@@ -213,7 +218,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-running' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-badge enrol-badge-running' }, 'RUNNING'),
         ),
       ),
@@ -269,7 +274,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-failed' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
         ),
         h('div', { class: 'enrol-card-actions' },
@@ -285,7 +290,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   return h('div', { class: 'enrol-card' },
     h('div', { class: 'enrol-card-header' },
       h('div', null,
-        h('strong', null, enrolment.name),
+        h('strong', null, title),
         h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
       ),
       h('div', { class: 'enrol-card-actions' },
@@ -301,7 +306,9 @@ function engineDescription(engine) {
   switch (engine) {
     case 'github': return 'OAuth token via device flow';
     case 'jfrog': return 'Refreshable access token via web login';
+    case 'databricks': return 'OAuth U2M token via browser login';
     case 'ssh': return 'Ed25519 key generation';
+    case 'copy': return 'Mirror an existing Vault secret';
     default: return engine;
   }
 }

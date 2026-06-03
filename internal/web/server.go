@@ -194,11 +194,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/enrol/prompt", s.handleEnrolPrompt)
 	s.mux.HandleFunc("POST /api/v1/enrol/secret", s.requireCSRF(s.handleEnrolSecret))
 
-	// Enrolment runner routes
+	// Enrolment runner routes. Flat keys use the single-segment {key} form;
+	// one-level grouped keys ("databricks/prod") are served either by the
+	// {key} form percent-encoded ("databricks%2Fprod", which Go unescapes into
+	// PathValue without splitting) or by the parallel two-segment {group}/{name}
+	// form. The segment counts don't collide, so both shapes resolve
+	// unambiguously — see enrolKeyFromRequest.
 	s.mux.HandleFunc("POST /api/v1/enrol/{key}/start", s.requireCSRF(s.handleEnrolStart))
 	s.mux.HandleFunc("POST /api/v1/enrol/{key}/skip", s.requireCSRF(s.handleEnrolSkip))
 	s.mux.HandleFunc("POST /api/v1/enrol/{key}/reset", s.requireCSRF(s.handleEnrolReset))
 	s.mux.HandleFunc("GET /api/v1/enrol/{key}/status", s.handleEnrolStatus)
+	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/start", s.requireCSRF(s.handleEnrolStart))
+	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/skip", s.requireCSRF(s.handleEnrolSkip))
+	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/reset", s.requireCSRF(s.handleEnrolReset))
+	s.mux.HandleFunc("GET /api/v1/enrol/{group}/{name}/status", s.handleEnrolStatus)
 	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
 
 	// Static SPA files

@@ -93,6 +93,52 @@ A `401` or `403` from the token endpoint is treated as permanent revocation: the
 | `expires_at` | RFC 3339 timestamp when the access token expires (`issued_at + expires_in`) |
 | `user` | Username from SCIM `/Me` (written when available; not required for completeness) |
 
+## Multiple workspaces
+
+To manage several Databricks workspaces (or accounts) for the same user, give each its own enrolment under a shared `databricks/` group. A one-level grouped key like `databricks/prod` nests under `users/<you>/databricks/prod` in Vault and renders as an expandable **databricks** folder in the web UI's enrolment screen, with each workspace as a separate, independently-refreshed entry:
+
+```yaml
+enrolments:
+  databricks/prod:
+    engine: databricks
+    settings:
+      host: "https://prod.cloud.databricks.com"
+  databricks/dev:
+    engine: databricks
+    settings:
+      host: "https://dev.cloud.databricks.com"
+```
+
+Because the INI handler merges per section, two sync rules can each own a named profile in the *same* `~/.databrickscfg`, so `databricks --profile prod …` and `databricks --profile dev …` both work and dotvault keeps each token fresh:
+
+```yaml
+rules:
+  - name: databricks-prod
+    vault_key: "databricks/prod"
+    target:
+      path: "~/.databrickscfg"
+      format: ini
+      template: |
+        [prod]
+        host  = {{ .host }}
+        token = {{ .access_token }}
+  - name: databricks-dev
+    vault_key: "databricks/dev"
+    target:
+      path: "~/.databrickscfg"
+      format: ini
+      template: |
+        [dev]
+        host  = {{ .host }}
+        token = {{ .access_token }}
+```
+
+The grouping is generic (see [Service Onboarding](overview.md#grouping-enrolments)) — the same `group/name` convention applies to any engine, e.g. multiple AWS accounts under an `aws/` group. Exactly one level of grouping is supported.
+
+## Why `~/.databrickscfg` and not `~/.databricks/token-cache.json`
+
+The native `databricks auth login` writes your tokens to `~/.databricks/token-cache.json` (a per-host map of access/refresh tokens) and keeps only non-secret metadata (`host`, `auth_type = databricks-cli`) in `~/.databrickscfg`. dotvault deliberately does **not** reproduce that token cache: if it wrote the refresh token where the CLI could see it, the CLI would run its own refresh when the ~1-hour access token expired and race dotvault's `RefreshManager` (a refresh rotates the refresh token, so whichever side refreshed first would invalidate the other). Instead dotvault owns the rotation and renders a static, read-only `token = <access token>` profile. Databricks accepts an OAuth access token anywhere it accepts a personal access token (both are `Authorization: Bearer …`), so the profile works and never goes stale.
+
 ## Requirements
 
 - OAuth U2M must be available on the workspace (it is enabled by default on current Databricks).

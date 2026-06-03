@@ -501,6 +501,9 @@ func (c *Config) validate() error {
 		if strings.TrimSpace(key) == "" {
 			return fmt.Errorf("enrolment key must not be empty or whitespace")
 		}
+		if err := validateEnrolmentKey(key); err != nil {
+			return fmt.Errorf("enrolments[%q]: %w", key, err)
+		}
 		if e.Engine == "" {
 			return fmt.Errorf("enrolments[%q].engine is required", key)
 		}
@@ -523,5 +526,40 @@ func (c *Config) validate() error {
 		}
 	}
 
+	return nil
+}
+
+// validateEnrolmentKey enforces the shape of an enrolment key. A key is either
+// a flat name ("gh") or a single-level group path ("databricks/prod") — the
+// group segment becomes a "folder" in the web UI and a nested Vault path
+// segment (users/<user>/databricks/prod). Exactly one level of grouping is
+// supported: more than one '/', a leading/trailing '/', or an empty segment is
+// rejected so the Vault path, the web routes, and the registry round-trip all
+// stay well-defined. A backslash is rejected outright because it is the Windows
+// registry path separator and would corrupt the GPO enrolment subtree.
+func validateEnrolmentKey(key string) error {
+	if strings.Contains(key, `\`) {
+		return fmt.Errorf("key must not contain a backslash")
+	}
+	var segments []string
+	switch strings.Count(key, "/") {
+	case 0:
+		segments = []string{key}
+	case 1:
+		group, name, _ := strings.Cut(key, "/")
+		segments = []string{group, name}
+	default:
+		return fmt.Errorf("key supports at most one '/' grouping level (got %q)", key)
+	}
+	for _, seg := range segments {
+		if strings.TrimSpace(seg) == "" {
+			return fmt.Errorf("key must not contain an empty segment (got %q)", key)
+		}
+		// "." / ".." would produce a confusing Vault path and folder label;
+		// reject them so a grouped key always maps to a concrete location.
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("key segment must not be %q (got %q)", seg, key)
+		}
+	}
 	return nil
 }

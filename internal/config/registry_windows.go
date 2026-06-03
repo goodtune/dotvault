@@ -256,8 +256,11 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	return layer, true, nil
 }
 
-// applyRegistryLayer merges a registry layer into the config. Only non-zero
-// values are applied, allowing higher-priority layers to override selectively.
+// applyRegistryLayer merges a registry layer into the config. Only values that
+// are *present* in the layer are applied — non-empty strings and non-nil DWORD
+// pointers — so a higher-priority layer overrides selectively. Presence, not
+// non-zero-ness, gates the merge: a present boolean DWORD of 0 is applied and
+// forces the field false (e.g. an explicit BypassSystemConfig=0 clears it).
 func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.BypassSystemConfig != nil {
 		cfg.BypassSystemConfig = *layer.BypassSystemConfig != 0

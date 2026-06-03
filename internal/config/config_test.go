@@ -765,6 +765,15 @@ func TestValidateRejectsProgrammaticNegativeExportInterval(t *testing.T) {
 }
 
 func TestSystemConfigBypass(t *testing.T) {
+	// SystemConfigBypass consults the GPO registry policy before the file, so
+	// on a managed Windows machine that already carries a dotvault policy the
+	// file-based subtests below would read the registry's answer instead of the
+	// planted file. loadFromRegistry is a no-op off Windows (managed=false), so
+	// this only ever skips on a Windows host with a live policy installed.
+	if _, managed, err := loadFromRegistry(); err == nil && managed {
+		t.Skip("a Windows Group Policy dotvault policy is present; file-based bypass subtests are environment-dependent")
+	}
+
 	const minimal = `
 vault:
   address: "https://vault.example.com:8200"

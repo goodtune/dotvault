@@ -60,7 +60,7 @@ If your deployment can't guarantee same-user, pass `client.WithIdentity("<name>"
 
 > **`Authenticate` and `Login` are interactive.** They can open a browser (OIDC) or block reading a password and MFA code from the terminal (LDAP). That is surprising inside a library call: **do not call them from a non-interactive service or daemon.** In those contexts use `AuthenticateCached` and surface `ErrLoginRequired` to the operator, or arrange for a token to be present some other way. LDAP `Login` without a TTY returns an error wrapping `ErrAuthFailed` rather than hanging.
 
-Token precedence, the token file location (`~/.dotvault-token`), and the login flow are all dotvault's — the client inherits them verbatim from the daemon's configuration rather than defining its own.
+Token precedence and the login flow match the daemon's exactly. The token file location (`~/.dotvault-token`) is dotvault's built-in default rather than a configured value — it isn't carried in the YAML/registry config; `New` fills an empty `Config.TokenFile` from `DefaultTokenFile()`. Set `Config.TokenFile` explicitly to override it.
 
 ## Error categories
 

@@ -119,23 +119,23 @@ func TestDefaultPaths(t *testing.T) {
 
 // TestDefaultTokenFile_HomeUnavailable verifies DefaultTokenFile recovers the
 // panic paths.VaultTokenPath raises when the home directory can't be resolved,
-// returning "" rather than crashing a consumer. Forcing that condition is
-// platform-dependent (empty $HOME makes os.UserHomeDir fail on Unix, but
-// Windows reads %USERPROFILE% and doesn't panic), so rather than assume, we
-// gate on whether os.UserHomeDir actually errors under the forced environment
-// and skip otherwise — keeping the test correct everywhere.
+// returning "" rather than crashing a consumer. VaultTokenPath routes through
+// os.UserHomeDir on every platform, so the home env var to clear differs by OS
+// (%USERPROFILE% on Windows, $HOME elsewhere). Some environments still resolve
+// a home dir even with that var empty, so we gate on whether os.UserHomeDir
+// actually errors under the forced environment and skip otherwise — keeping the
+// test correct everywhere.
 func TestDefaultTokenFile_HomeUnavailable(t *testing.T) {
+	homeEnv := "HOME"
 	if runtime.GOOS == "windows" {
-		// VaultTokenPath reads %USERPROFILE% directly (not os.UserHomeDir)
-		// and never panics, so there's no recover path to exercise here.
-		t.Skip("VaultTokenPath uses USERPROFILE on Windows; no panic path")
+		homeEnv = "USERPROFILE"
 	}
-	t.Setenv("HOME", "")
+	t.Setenv(homeEnv, "")
 	if _, err := os.UserHomeDir(); err == nil {
-		// Some environments still resolve a home dir with $HOME empty; the
+		// Some environments still resolve a home dir with the var empty; the
 		// panic (and thus the recover) can't be triggered, so skip rather
 		// than assert a condition that doesn't hold here.
-		t.Skip("home directory still resolvable with $HOME empty; can't exercise the recover path")
+		t.Skipf("home directory still resolvable with %s empty; can't exercise the recover path", homeEnv)
 	}
 	if got := DefaultTokenFile(); got != "" {
 		t.Fatalf("DefaultTokenFile() = %q, want \"\" when home is unresolvable", got)

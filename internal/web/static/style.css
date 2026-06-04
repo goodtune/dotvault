@@ -133,7 +133,7 @@ body {
 /* Expandable secret folders (a Vault path nested under the user prefix, e.g.
    "databricks/" holding databricks/prod, databricks/dev). */
 .key-folder { list-style: none; }
-.key-folder-header .key-chevron { font-size: 11px; color: #888; width: 11px; }
+.key-folder-header .key-chevron { margin-left: auto; font-size: 11px; color: #888; }
 .key-sublist { list-style: none; }
 .key-sublist .key-item { padding-left: 38px; }
 .key-subnote { padding: 8px 16px 8px 38px; font-size: 13px; color: #999; }

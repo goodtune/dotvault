@@ -159,6 +159,37 @@ func TestDatabricksEngine_Run_MissingHost(t *testing.T) {
 	}
 }
 
+func TestDatabricksHostFromSettings(t *testing.T) {
+	cases := []struct {
+		name     string
+		settings map[string]any
+		wantErr  string // substring; "" means expect success
+		want     string
+	}{
+		{"missing", map[string]any{}, "requires a 'host'", ""},
+		{"wrong type", map[string]any{"host": 8080}, "must be a string", ""},
+		{"empty string", map[string]any{"host": ""}, "non-empty 'host'", ""},
+		{"valid", map[string]any{"host": "https://dbc-1.cloud.databricks.com"}, "", "https://dbc-1.cloud.databricks.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := databricksHostFromSettings(tc.settings)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("host = %q, want %q", got, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // databricksTestServer builds an httptest TLS server that serves OIDC
 // discovery, the token endpoint, and the SCIM /Me endpoint. A TLS server is
 // used (not plain HTTP) because the engine requires an https host; srv.Client()
@@ -431,11 +462,14 @@ func TestDatabricksDiscover_AccountLevel(t *testing.T) {
 // TestDatabricksEngine_Run_WebModeEmitsURL pins the engine↔web-card contract.
 // The web enrol runner builds enrol.IO with no Browser opener, so Run takes its
 // io.Browser == nil branch and must write a parseable "Please open <https URL>
-// in your browser." line to io.Out. The web enrolment card keys its clickable
-// redirect card off exactly that URL (the first whitespace-delimited token after
-// "Please open "), so a reworded line would silently degrade the browser
-// experience to a raw-output dump. The callback is intentionally not driven; a
-// short login timeout lets Run return after it has emitted the URL.
+// in your browser." line to io.Out. The web enrolment card's redirect card
+// extracts the auth URL by scanning the engine output for an https:// token (a
+// /(https?:\/\/\S+)/ match, trailing punctuation stripped), so the line must
+// carry a real, whole URL or the card silently degrades to a raw-output dump.
+// This test asserts such a URL is emitted; it locates it via the "Please open "
+// marker for simplicity, which lands on the same token the card's regex would.
+// The callback is intentionally not driven; a short login timeout lets Run
+// return after it has emitted the URL.
 func TestDatabricksEngine_Run_WebModeEmitsURL(t *testing.T) {
 	srv := databricksTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("token endpoint must not be called when login never completes")
@@ -460,8 +494,8 @@ func TestDatabricksEngine_Run_WebModeEmitsURL(t *testing.T) {
 	if idx == -1 {
 		t.Fatalf("web-mode output missing the %q line:\n%s", marker, s)
 	}
-	// Mirror the frontend's \S+ extraction: the URL is the first
-	// whitespace-delimited token after the marker.
+	// The card's /(https?:\/\/\S+)/ regex would match this same token; here the
+	// first whitespace-delimited field after the marker is that URL.
 	fields := strings.Fields(s[idx+len(marker):])
 	if len(fields) == 0 {
 		t.Fatalf("no URL token after %q:\n%s", marker, s)

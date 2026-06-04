@@ -522,8 +522,18 @@ func databricksDefaultListen() (net.Listener, string, error) {
 
 // databricksHostFromSettings reads and normalizes the required `host` setting.
 func databricksHostFromSettings(settings map[string]any) (string, error) {
-	raw, _ := settings["host"].(string)
-	host, err := normalizeDatabricksHost(raw)
+	raw, ok := settings["host"]
+	if !ok {
+		return "", fmt.Errorf("databricks enrolment requires a 'host' setting (your workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com)")
+	}
+	// Type-check explicitly so a mis-typed host (e.g. an unquoted YAML number or
+	// bool) reports a clear error instead of silently coercing to "" and looking
+	// like a missing setting — matching account_id / scopes below.
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("databricks host must be a string, got %T", raw)
+	}
+	host, err := normalizeDatabricksHost(s)
 	if err != nil {
 		return "", err
 	}

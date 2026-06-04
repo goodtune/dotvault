@@ -866,6 +866,28 @@ func TestHandleSecrets_ListKeys(t *testing.T) {
 	}
 }
 
+func TestHandleSecrets_RejectsPathTraversal(t *testing.T) {
+	// A path that tries to escape the user's KV prefix must be refused before
+	// any Vault call, regardless of how Vault would treat the segments.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("vault must not be called for an invalid path: %s", r.URL.Path)
+	})
+	s := testServerWithVault(t, handler)
+
+	for _, p := range []string{
+		"/api/v1/secrets/../../other-user/gh",
+		"/api/v1/secrets/databricks/../../escape",
+		"/api/v1/secrets//etc/passwd",
+	} {
+		req := httptest.NewRequest("GET", p, nil)
+		w := httptest.NewRecorder()
+		s.handleSecrets(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body = %s", p, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestHandleSecrets_ReadSecret(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

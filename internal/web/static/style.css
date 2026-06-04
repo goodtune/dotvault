@@ -130,6 +130,15 @@ body {
 .key-icon { font-size: 16px; }
 .key-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Expandable secret folders (a Vault path nested under the user prefix, e.g.
+   "databricks/" holding databricks/prod, databricks/dev). */
+.key-folder { list-style: none; }
+.key-folder-header .key-chevron { font-size: 11px; color: #888; width: 11px; }
+.key-sublist { list-style: none; }
+.key-sublist .key-item { padding-left: 38px; }
+.key-subnote { padding: 8px 16px 8px 38px; font-size: 13px; color: #999; }
+.key-suberror { color: #c5221f; }
+
 .secret-panel {
   flex: 1;
   padding: 24px;

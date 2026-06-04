@@ -508,6 +508,22 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request) {
 	secretPath := strings.TrimPrefix(r.URL.Path, "/api/v1/secrets/")
 	reveal := r.URL.Query().Get("reveal") == "true"
 
+	// Defence in depth: the path is always meant to be relative to this user's
+	// KV prefix (users/<username>/). Reject an absolute path or any ".."
+	// segment so a crafted request can't walk outside that prefix — even though
+	// Vault treats logical path segments literally and wouldn't collapse "..",
+	// keeping the constraint explicit avoids relying on that as a guarantee.
+	if strings.HasPrefix(secretPath, "/") {
+		writeError(w, "invalid secret path", http.StatusBadRequest)
+		return
+	}
+	for _, seg := range strings.Split(secretPath, "/") {
+		if seg == ".." {
+			writeError(w, "invalid secret path", http.StatusBadRequest)
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 

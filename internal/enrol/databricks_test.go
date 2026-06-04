@@ -1,6 +1,7 @@
 package enrol
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -424,6 +425,57 @@ func TestDatabricksDiscover_AccountLevel(t *testing.T) {
 	}
 	if gotPath != "/oidc/accounts/acc-123/.well-known/oauth-authorization-server" {
 		t.Errorf("discovery path = %q, want account-level path", gotPath)
+	}
+}
+
+// TestDatabricksEngine_Run_WebModeEmitsURL pins the engine↔web-card contract.
+// The web enrol runner builds enrol.IO with no Browser opener, so Run takes its
+// io.Browser == nil branch and must write a parseable "Please open <https URL>
+// in your browser." line to io.Out. The web enrolment card keys its clickable
+// redirect card off exactly that URL (the first whitespace-delimited token after
+// "Please open "), so a reworded line would silently degrade the browser
+// experience to a raw-output dump. The callback is intentionally not driven; a
+// short login timeout lets Run return after it has emitted the URL.
+func TestDatabricksEngine_Run_WebModeEmitsURL(t *testing.T) {
+	srv := databricksTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("token endpoint must not be called when login never completes")
+	})
+
+	io := newTestIO()
+	io.Browser = nil // web mode: the daemon never opens a server-side browser.
+	out := io.Out.(*bytes.Buffer)
+
+	e := &DatabricksEngine{
+		httpClient:   srv.Client(),
+		listen:       ephemeralListen(t),
+		loginTimeout: 100 * time.Millisecond,
+	}
+	if _, err := e.Run(context.Background(), map[string]any{"host": srv.URL}, io); err == nil {
+		t.Fatal("expected a login timeout (callback never driven), got nil")
+	}
+
+	const marker = "Please open "
+	s := out.String()
+	idx := strings.Index(s, marker)
+	if idx == -1 {
+		t.Fatalf("web-mode output missing the %q line:\n%s", marker, s)
+	}
+	// Mirror the frontend's \S+ extraction: the URL is the first
+	// whitespace-delimited token after the marker.
+	fields := strings.Fields(s[idx+len(marker):])
+	if len(fields) == 0 {
+		t.Fatalf("no URL token after %q:\n%s", marker, s)
+	}
+	authURL := fields[0]
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("emitted auth URL does not parse: %v (%q)", err, authURL)
+	}
+	if u.Scheme != "https" {
+		t.Errorf("auth URL scheme = %q, want https (frontend regex requires http/https)", u.Scheme)
+	}
+	if u.Query().Get("code_challenge") == "" {
+		t.Errorf("auth URL missing PKCE challenge: %q", authURL)
 	}
 }
 

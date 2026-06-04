@@ -158,10 +158,18 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
   }
 
   const hasDeviceFlow = Boolean(deviceCode && verificationURL);
+  // A pure browser-redirect flow (e.g. databricks OAuth U2M): the engine emits
+  // an authorization URL but no user code — the browser redirects back to a
+  // loopback listener automatically. We render a clickable "Open" card (the
+  // same shape as the device-flow card, minus the code) instead of dumping the
+  // raw URL into an output block.
+  const hasRedirectFlow = Boolean(verificationURL && !deviceCode);
   // Once the engine has moved past "waiting for authentication" into a
-  // server-to-server exchange (e.g. jfrog's mint step), the code is no
-  // longer actionable — collapse the code UI and show just the progress.
+  // server-to-server exchange (e.g. jfrog's mint step, databricks' code
+  // exchange), the code/link is no longer actionable — collapse the action UI
+  // and show just the progress.
   const codeNoLongerActionable = Boolean(progressLine && /minting/i.test(progressLine));
+  const redirectNoLongerActionable = Boolean(progressLine && /exchang|minting/i.test(progressLine));
   const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
@@ -245,8 +253,27 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
         h('p', { class: 'enrol-device-label' }, `\u2713 Signed in to ${enrolment.name}`),
         h('p', { class: 'enrol-device-waiting' }, progressLine),
       ),
+      // Active browser-redirect step (e.g. databricks) \u2014 open the service in a
+      // new tab; the engine's loopback listener catches the redirect.
+      hasRedirectFlow && !promptLabel && !redirectNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `Sign in to ${enrolment.name} to continue:`),
+        h('div', { class: 'enrol-device-actions' },
+          h('a', {
+            class: 'enrol-btn-primary',
+            href: verificationURL,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+          }, `Open ${enrolment.name} \u2192`),
+        ),
+        h('p', { class: 'enrol-device-waiting' }, progressLine || 'Waiting for authentication\u2026'),
+      ),
+      // Post-redirect exchange step \u2014 the link is spent, show just progress.
+      hasRedirectFlow && !promptLabel && redirectNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `\u2713 Signed in to ${enrolment.name}`),
+        h('p', { class: 'enrol-device-waiting' }, progressLine),
+      ),
       // Passphrase prompt (ssh).
-      promptLabel && !hasDeviceFlow && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
+      promptLabel && !hasDeviceFlow && !hasRedirectFlow && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
         h('label', { class: 'enrol-prompt-label', htmlFor: 'enrol-secret' }, promptLabel),
         h('input', {
           type: 'password',
@@ -261,11 +288,16 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
           h('button', { type: 'submit', class: 'enrol-btn-primary' }, 'Submit'),
         ),
       ),
-      // Fallback for engines that don't match the device-flow or prompt
-      // shapes — show whatever the engine has emitted so the user isn't
+      // Fallback for engines that don't match the device-flow, redirect, or
+      // prompt shapes — show whatever the engine has emitted so the user isn't
       // left staring at a silent spinner.
-      !hasDeviceFlow && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
+      !hasDeviceFlow && !hasRedirectFlow && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
         output.map((line, i) => h('div', { key: i }, line)),
+      ),
+      // Brief gap between RUNNING and the first recognised output line (one
+      // ~2s poll): keep a live hint on screen rather than a bare spinner.
+      !hasDeviceFlow && !hasRedirectFlow && !promptLabel && output.length === 0 && h('p', { class: 'enrol-device-waiting' },
+        progressLine || 'Starting…',
       ),
     );
   }

@@ -27,8 +27,9 @@ const (
 	// The Databricks CLI's OAuth app registers the loopback redirect with a
 	// preferred port of 8020 and walks upward to 8040 until it finds a free
 	// one (credentials/u2m: defaultPort=8020, maxPortFallback=8040). The
-	// redirect URI advertised to Databricks is http://localhost:<bound-port>;
-	// the path is not significant.
+	// redirect URI advertised to Databricks is http://127.0.0.1:<bound-port>
+	// (an explicit loopback literal, never "localhost", to avoid the dual-stack
+	// bind-vs-connect mismatch); the path is not significant.
 	databricksRedirectPortLo = 8020
 	databricksRedirectPortHi = 8040
 

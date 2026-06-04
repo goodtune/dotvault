@@ -71,6 +71,8 @@ enrolments:
 ✓ databricks (Databricks) — credentials acquired
 ```
 
+In the web UI the same flow renders as a card with a clickable **Open Databricks →** button (the daemon does not open a browser on your behalf in web mode); clicking it signs you in and the card advances to "Waiting for authentication…" and then "Enrolled successfully" on its own.
+
 ## How the refresh cycle works
 
 After enrolment, the daemon's `RefreshManager` checks every 5 minutes whether the Databricks secret has crossed its half-life (`now >= issued_at + (expires_at - issued_at) / 2`; the half-life of a one-hour token is ~30 minutes). When it has:

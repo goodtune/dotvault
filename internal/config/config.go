@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -100,6 +101,18 @@ type Config struct {
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
+
+	// BypassSystemConfig, when set in the system-wide configuration (the
+	// YAML at paths.SystemConfigPath(), or the Windows Group Policy
+	// registry), permits this machine to honour a --config command-line
+	// override instead of the system config. Default false: with a
+	// system-wide config present and this flag unset, --config is refused.
+	// The intent is that an admin normally pins the system config but can
+	// flip this flag to trial a hand-edited config without un-deploying the
+	// policy. Enforcement lives in cmd/dotvault (resolveConfigSource +
+	// SystemConfigBypass); the value itself is just data and behaves the
+	// same on every platform.
+	BypassSystemConfig bool `yaml:"bypass_system_config"`
 
 	// Managed is set by LoadSystem when the config originated from the
 	// Windows Registry (Group Policy) rather than the YAML file. The
@@ -312,6 +325,73 @@ func LoadSystem(path string) (*Config, error) {
 		return cfg, nil
 	}
 	return Load(path)
+}
+
+// SystemConfigBypass reports whether the system-wide configuration permits a
+// command-line --config override to replace it.
+//
+// The rule is identical on every platform: a --config override is allowed
+// when there is no system-wide configuration at all, or when the system-wide
+// configuration explicitly opts in via `bypass_system_config: true`. A
+// machine carrying a system config that does not set the flag refuses the
+// override, so a managed deployment (Windows Group Policy, or a system config
+// file shipped by configuration management) cannot be sidestepped from the
+// command line.
+//
+// "System-wide configuration" means the Windows GPO registry policy when
+// present — it wins exactly as LoadSystem treats it — otherwise the YAML file
+// at systemPath. systemPath should be paths.SystemConfigPath().
+//
+// Returns true when no system-wide config exists; otherwise returns the
+// bypass flag read from whichever source is authoritative. A registry read
+// error, or a system config file that exists but cannot be read or parsed,
+// is surfaced as an error rather than silently allowing the override.
+func SystemConfigBypass(systemPath string) (bool, error) {
+	cfg, managed, err := loadFromRegistry()
+	if err != nil {
+		return false, fmt.Errorf("read registry config: %w", err)
+	}
+	if managed {
+		return cfg.BypassSystemConfig, nil
+	}
+
+	data, err := os.ReadFile(systemPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No system-wide config — the override is unrestricted.
+			return true, nil
+		}
+		return false, fmt.Errorf("read system config %s: %w", systemPath, err)
+	}
+
+	// The bypass flag relaxes a security control (it re-enables the --config
+	// override), so it can only be trusted from a file that an unprivileged
+	// user could not have tampered with. If the system config is group- or
+	// world-writable, refuse the bypass: an attacker who can write the file
+	// could otherwise flip the flag and point dotvault at their own config.
+	// (The daemon's own Load only warns about such permissions; we are stricter
+	// here because the decision being made is "may this config be overridden",
+	// not "load this config".) Both this case and an indeterminate permission
+	// check are surfaced as errors rather than a plain (false, nil): a refusal
+	// for a permission reason is not the same as "the config didn't opt in", so
+	// returning an error keeps the failure closed AND lets the CLI explain the
+	// real cause instead of misleadingly telling the user to set a flag that
+	// may already be set.
+	if insecure, checkErr := perms.IsGroupWorldWritable(systemPath); checkErr != nil {
+		return false, fmt.Errorf("cannot verify permissions of system config %s (refusing --config override): %w", systemPath, checkErr)
+	} else if insecure {
+		return false, fmt.Errorf("system config %s is group/world or otherwise non-owner writable; refusing --config override because bypass_system_config cannot be trusted from a tamperable file (restrict write access to the owner — e.g. mode 0600/0644 on Unix, or an owner-only ACL on Windows)", systemPath)
+	}
+
+	// Parse only enough to read the bypass flag. Deliberately skip
+	// validate(): an unrelated validation problem in the system config must
+	// not mask the override decision, and a syntactically broken file is
+	// surfaced as a parse error rather than silently allowing the bypass.
+	var c Config
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return false, fmt.Errorf("parse system config %s: %w", systemPath, err)
+	}
+	return c.BypassSystemConfig, nil
 }
 
 // Load reads and validates a config file at the given path.

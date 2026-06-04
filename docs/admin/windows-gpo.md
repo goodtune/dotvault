@@ -6,8 +6,8 @@ On Windows, dotvault can be fully configured via Group Policy using the Windows 
 
 When HKLM registry keys exist at `SOFTWARE\Policies\goodtune\dotvault`, dotvault loads **all** configuration from the registry and ignores the YAML config file entirely. Only machine-level policy (HKLM) is read — HKCU is intentionally skipped because it is user-writable and therefore cannot be trusted for enforced configuration.
 
-!!! important "The `--config` flag always wins"
-    If a user invokes dotvault with `--config path/to/config.yaml`, the specified file is used regardless of whether registry keys exist. This is useful for development and troubleshooting but means the user can bypass the managed configuration. In environments where strict enforcement is required, restrict access to the dotvault binary's command-line options.
+!!! important "The `--config` flag is blocked under Group Policy by default"
+    When a policy is present, dotvault **refuses** a `--config path/to/config.yaml` override and exits with an error — a managed machine cannot be pointed at an arbitrary config from the command line. To allow the override (for development or troubleshooting on a specific machine), set a `BypassSystemConfig` REG_DWORD of `1` directly under `SOFTWARE\Policies\goodtune\dotvault` (the `bypass_system_config: true` YAML equivalent). With the flag set, an invocation with `--config` loads the named file and ignores the registry; without it, `--config` is rejected. The flag is part of the policy, so it stays under the administrator's control rather than the user's.
 
 ## Authoring the registry values
 
@@ -30,6 +30,12 @@ Both commands round-trip the **entire** configuration without loss — including
 ## Registry schema
 
 Every YAML field has a registry equivalent. The tables below give the value names; `reg-import` writes exactly these, and the live loader reads exactly these.
+
+### Top-level settings (policy root key)
+
+| Registry value | Type | Description |
+|---------------|------|-------------|
+| `BypassSystemConfig` | REG_DWORD | Allow the `--config` command-line override on this machine (0/1; default 0). Lives directly under the policy root key, not in a subkey. |
 
 ### Vault settings (`Vault\` subkey)
 
@@ -149,8 +155,10 @@ To dump the effective policy back to YAML for review:
 dotvault reg-export dotvault-policy.reg
 ```
 
-To test with a YAML config file instead (bypassing the registry):
+To test with a YAML config file instead (bypassing the registry), the policy must first opt in by setting `BypassSystemConfig` to `1` under the policy root key. Once it is set:
 
 ```powershell
 dotvault status --config C:\path\to\test-config.yaml
 ```
+
+Without `BypassSystemConfig`, that command exits with an error explaining the override is not permitted.

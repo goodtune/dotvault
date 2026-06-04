@@ -95,7 +95,7 @@ Place the config file at:
 Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the registry.
 
 !!! warning "Registry takes precedence"
-    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. The only way to bypass this is the `--config` CLI flag, which always takes precedence.
+    On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodtune\dotvault`, dotvault loads all configuration from the registry and **ignores the YAML file entirely**. The `--config` CLI flag is **refused** while a policy is present unless that policy opts in with a `BypassSystemConfig` REG_DWORD of `1` (the `bypass_system_config: true` equivalent); see [Windows Group Policy](windows-gpo.md).
 
 ## Running as a user service
 

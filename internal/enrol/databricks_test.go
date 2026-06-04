@@ -511,6 +511,56 @@ func TestDatabricksDefaultListen(t *testing.T) {
 	}
 }
 
+// TestDatabricksEngine_Run_DuplicateCallback guards the non-blocking send in the
+// redirect handler. io.Browser is invoked synchronously before Run waits on the
+// result channel, so a second callback request (a browser refresh/retry, or any
+// process hitting the loopback port) must be answered without blocking the
+// handler goroutine — otherwise the second request would wedge on a full channel
+// and deadlock the flow. Firing the callback twice and still completing proves
+// only the first result is taken and the duplicate is dropped cleanly.
+func TestDatabricksEngine_Run_DuplicateCallback(t *testing.T) {
+	srv := databricksTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(databricksTokenResp{
+			AccessToken:  "access-1",
+			RefreshToken: "refresh-1",
+			TokenType:    "Bearer",
+			ExpiresIn:    3600,
+		})
+	})
+
+	io := newTestIO()
+	io.Browser = func(rawAuthURL string) error {
+		u, err := url.Parse(rawAuthURL)
+		if err != nil {
+			return err
+		}
+		q := u.Query()
+		cb := q.Get("redirect_uri") + "/?code=auth-code-1&state=" + url.QueryEscape(q.Get("state"))
+		// Hit the callback twice; the duplicate must not block.
+		for i := 0; i < 2; i++ {
+			resp, err := http.Get(cb)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+		}
+		return nil
+	}
+
+	e := &DatabricksEngine{
+		httpClient: srv.Client(),
+		now:        func() time.Time { return time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC) },
+		listen:     ephemeralListen(t),
+	}
+	creds, err := e.Run(context.Background(), map[string]any{"host": srv.URL}, io)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if creds["access_token"] != "access-1" {
+		t.Errorf("access_token = %q, want access-1", creds["access_token"])
+	}
+}
+
 func TestDatabricksEngine_Run_StateMismatch(t *testing.T) {
 	srv := databricksTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("token endpoint must not be called on a state mismatch")

@@ -166,28 +166,41 @@ func (e *DatabricksEngine) Run(ctx context.Context, settings map[string]any, io 
 		err  error
 	}
 	resultCh := make(chan callbackResult, 1)
+	// reply writes the browser-facing message and hands the result back over
+	// the channel with a non-blocking send: only the first callback wins, and a
+	// duplicate request (a browser refresh/retry, or any other process hitting
+	// the loopback port) is answered but its result dropped — so the handler
+	// goroutine never blocks on a full channel and server2.Shutdown never hangs
+	// waiting on a wedged connection.
+	reply := func(w http.ResponseWriter, msg string, res callbackResult) {
+		fmt.Fprint(w, msg)
+		select {
+		case resultCh <- res:
+		default:
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if errParam := q.Get("error"); errParam != "" {
 			desc := q.Get("error_description")
-			fmt.Fprint(w, "Authentication failed. You can close this window.")
-			resultCh <- callbackResult{err: fmt.Errorf("databricks authorization error: %s %s", errParam, desc)}
+			reply(w, "Authentication failed. You can close this window.",
+				callbackResult{err: fmt.Errorf("databricks authorization error: %s %s", errParam, desc)})
 			return
 		}
 		if got := q.Get("state"); got != state {
-			fmt.Fprint(w, "Authentication failed. You can close this window.")
-			resultCh <- callbackResult{err: fmt.Errorf("databricks callback state mismatch")}
+			reply(w, "Authentication failed. You can close this window.",
+				callbackResult{err: fmt.Errorf("databricks callback state mismatch")})
 			return
 		}
 		code := q.Get("code")
 		if code == "" {
-			fmt.Fprint(w, "Authentication failed. You can close this window.")
-			resultCh <- callbackResult{err: fmt.Errorf("databricks callback missing authorization code")}
+			reply(w, "Authentication failed. You can close this window.",
+				callbackResult{err: fmt.Errorf("databricks callback missing authorization code")})
 			return
 		}
-		fmt.Fprint(w, "Authentication successful! You can close this window and return to dotvault.")
-		resultCh <- callbackResult{code: code}
+		reply(w, "Authentication successful! You can close this window and return to dotvault.",
+			callbackResult{code: code})
 	})
 	server2 := &http.Server{Handler: mux}
 	go server2.Serve(listener)

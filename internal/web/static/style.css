@@ -133,6 +133,18 @@ body {
 /* Expandable secret folders (a Vault path nested under the user prefix, e.g.
    "databricks/" holding databricks/prod, databricks/dev). */
 .key-folder { list-style: none; }
+/* The folder header is a <button> for keyboard operability; strip the UA button
+   chrome so it reads as a sidebar row (layout comes from .key-item). */
+.key-folder-header {
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid #f0f0f0;
+  font-family: inherit;
+  font-size: 14px;
+  color: inherit;
+  text-align: left;
+}
 .key-folder-header .key-chevron { margin-left: auto; font-size: 11px; color: #888; }
 .key-sublist { list-style: none; }
 .key-sublist .key-item { padding-left: 38px; }

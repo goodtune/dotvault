@@ -69,7 +69,8 @@ function SecretFolder({ folder, name, selected, onSelect }) {
   }
 
   return h('li', { class: 'key-folder' },
-    h('div', {
+    h('button', {
+      type: 'button',
       class: 'key-item key-folder-header',
       onClick: toggle,
       'aria-expanded': String(expanded),

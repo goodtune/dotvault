@@ -10,7 +10,9 @@ import { completeEnrolments } from '../api.js';
 // key) clusters a group's members together.
 function buildEnrolTree(enrolments) {
   const tree = [];
-  const groupIndex = {};
+  // Map (not a plain object) so a group name like "__proto__" or "constructor"
+  // is treated as an ordinary string key rather than hitting Object.prototype.
+  const groupIndex = new Map();
   for (const e of enrolments) {
     const slash = e.key.indexOf('/');
     if (slash === -1) {
@@ -19,11 +21,11 @@ function buildEnrolTree(enrolments) {
     }
     const groupName = e.key.slice(0, slash);
     const leaf = e.key.slice(slash + 1);
-    if (groupIndex[groupName] === undefined) {
-      groupIndex[groupName] = tree.length;
+    if (!groupIndex.has(groupName)) {
+      groupIndex.set(groupName, tree.length);
       tree.push({ type: 'group', name: groupName, items: [] });
     }
-    tree[groupIndex[groupName]].items.push({ enrolment: e, leaf });
+    tree[groupIndex.get(groupName)].items.push({ enrolment: e, leaf });
   }
   return tree;
 }

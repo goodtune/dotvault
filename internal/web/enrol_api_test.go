@@ -75,7 +75,9 @@ func TestHandleEnrolStatus_GroupedKey(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
 	}
 	var info map[string]any
-	json.NewDecoder(w.Body).Decode(&info)
+	if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
 	if info["key"] != "databricks/prod" {
 		t.Errorf("key = %v, want databricks/prod", info["key"])
 	}
@@ -106,7 +108,9 @@ func TestEnrolRouting_GroupedKey(t *testing.T) {
 			t.Fatalf("%s: status = %d, want 200; body = %s", path, w.Code, w.Body.String())
 		}
 		var info map[string]any
-		json.NewDecoder(w.Body).Decode(&info)
+		if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+			t.Fatalf("%s: decode response: %v", path, err)
+		}
 		if info["key"] != "databricks/prod" {
 			t.Errorf("%s: key = %v, want databricks/prod", path, info["key"])
 		}

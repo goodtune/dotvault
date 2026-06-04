@@ -30,9 +30,20 @@ function SecretNode({ entry, prefix, selected, onSelect }) {
   const path = prefix + entry;
 
   if (!isFolder) {
+    const activate = () => onSelect(path);
     return h('li', {
       class: `key-item ${path === selected ? 'selected' : ''}`,
-      onClick: () => onSelect(path),
+      role: 'button',
+      tabIndex: 0,
+      onClick: activate,
+      onKeyDown: (e) => {
+        // Make the row keyboard-operable (tab stop + Enter/Space), matching the
+        // folder headers which are real <button>s.
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          activate();
+        }
+      },
     },
       h('span', { class: 'key-icon' }, '\u{1F511}'),
       h('span', { class: 'key-name' }, name),

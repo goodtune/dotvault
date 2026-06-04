@@ -56,6 +56,7 @@ function SecretFolder({ folder, name, selected, onSelect }) {
     // secret added under the folder after expansion appears on next reload.
     if (next && children === null && !loading) {
       setLoading(true);
+      setError(null); // clear any prior failure so a retry doesn't show a stale error beside "Loading…"
       try {
         const data = await listSecrets(folder);
         setChildren(data.keys || []);

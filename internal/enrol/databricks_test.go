@@ -479,6 +479,38 @@ func TestDatabricksEngine_Run_WebModeEmitsURL(t *testing.T) {
 	}
 }
 
+// TestDatabricksDefaultListen pins the redirect_uri host contract that broke the
+// real flow. The public databricks-cli OAuth app registers only
+// http://localhost:<port> (8020-8040), so the advertised redirect_uri must use
+// the "localhost" host — a 127.0.0.1 literal is rejected as an unregistered
+// redirect_uri — even though the listener binds the concrete IPv4 loopback.
+func TestDatabricksDefaultListen(t *testing.T) {
+	ln, redirectURI, err := databricksDefaultListen()
+	if err != nil {
+		t.Skipf("no free port in 8020-8040: %v", err)
+	}
+	defer ln.Close()
+
+	if !strings.HasPrefix(redirectURI, "http://localhost:") {
+		t.Errorf("redirect_uri = %q, want http://localhost:<port> (databricks-cli registers the localhost host, not 127.0.0.1)", redirectURI)
+	}
+	host, lp, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("listener addr %q: %v", ln.Addr(), err)
+	}
+	if host != "127.0.0.1" {
+		t.Errorf("listener bound %q, want 127.0.0.1 (concrete loopback, reachable via the browser's localhost fallback)", host)
+	}
+	// The advertised port must match the bound port so the callback lands.
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("redirect_uri %q does not parse: %v", redirectURI, err)
+	}
+	if u.Port() != lp {
+		t.Errorf("redirect_uri port %s != listener port %s", u.Port(), lp)
+	}
+}
+
 func TestDatabricksEngine_Run_StateMismatch(t *testing.T) {
 	srv := databricksTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("token endpoint must not be called on a state mismatch")

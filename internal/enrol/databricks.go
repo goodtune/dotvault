@@ -24,12 +24,13 @@ const (
 	databricksDefaultClientID = "databricks-cli"
 
 	// databricksRedirectPortLo/Hi bound the localhost callback port range.
-	// The Databricks CLI's OAuth app registers the loopback redirect with a
-	// preferred port of 8020 and walks upward to 8040 until it finds a free
-	// one (credentials/u2m: defaultPort=8020, maxPortFallback=8040). The
-	// redirect URI advertised to Databricks is http://127.0.0.1:<bound-port>
-	// (an explicit loopback literal, never "localhost", to avoid the dual-stack
-	// bind-vs-connect mismatch); the path is not significant.
+	// The public `databricks-cli` OAuth app registers http://localhost:<port>
+	// for a preferred port of 8020, walking upward to 8040 until it finds a
+	// free one (credentials/u2m: defaultPort=8020, maxPortFallback=8040). The
+	// redirect URI advertised to Databricks must be http://localhost:<bound-port>
+	// to match that registration (an explicit 127.0.0.1 literal is rejected as
+	// an unregistered redirect_uri); the path is not significant. See
+	// databricksDefaultListen for why the listener still binds 127.0.0.1.
 	databricksRedirectPortLo = 8020
 	databricksRedirectPortHi = 8040
 
@@ -477,15 +478,20 @@ func databricksFetchUser(ctx context.Context, client *http.Client, host, accessT
 }
 
 // databricksDefaultListen binds the first free port in the 8020..8040 range on
-// the IPv4 loopback and returns the listener plus the http://127.0.0.1:<port>
+// the IPv4 loopback and returns the listener plus the http://localhost:<port>
 // redirect URI to advertise. Matches the Databricks CLI's port-walk behaviour.
 //
-// 127.0.0.1 is used explicitly rather than "localhost" so the bind family and
-// the family the browser dials are guaranteed to agree: on a dual-stack host
-// where the hosts file lists ::1 first, "localhost" can bind only one family
-// while the browser dereferences the other, refusing the callback connection
-// and hanging the flow until timeout. An explicit loopback IP removes the
-// resolver from the loop; Databricks registers the loopback-IP redirect form.
+// The advertised redirect_uri MUST use the "localhost" host, not "127.0.0.1":
+// the public `databricks-cli` OAuth app only registers http://localhost:<port>
+// (8020-8040), and Databricks rejects an authorize request whose redirect_uri
+// isn't an exact registered match ("redirect_uri ... not registered"). The
+// listener itself binds the concrete IPv4 loopback rather than the "localhost"
+// name on purpose: net.Listen("tcp", "localhost:p") resolves to a single
+// family, so on a dual-stack host it can bind only ::1 while the browser dials
+// 127.0.0.1 (or vice versa) and the callback never arrives. Binding 127.0.0.1
+// keeps the port-walk concrete and reachable; the browser's Happy-Eyeballs dial
+// of "localhost" falls back to 127.0.0.1 when ::1 refuses, so bind and dial
+// still meet.
 func databricksDefaultListen() (net.Listener, string, error) {
 	var lastErr error
 	for port := databricksRedirectPortLo; port <= databricksRedirectPortHi; port++ {
@@ -495,7 +501,7 @@ func databricksDefaultListen() (net.Listener, string, error) {
 			lastErr = err
 			continue
 		}
-		return l, fmt.Sprintf("http://127.0.0.1:%d", port), nil
+		return l, fmt.Sprintf("http://localhost:%d", port), nil
 	}
 	return nil, "", fmt.Errorf("no free port in range %d-%d for the OAuth redirect listener: %w",
 		databricksRedirectPortLo, databricksRedirectPortHi, lastErr)

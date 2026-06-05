@@ -3,7 +3,12 @@ import { useState, useEffect, useRef } from 'preact/hooks';
 import { startEnrolment, skipEnrolment, resetEnrolment, getEnrolmentStatus, getEnrolPrompt, submitEnrolSecret } from '../api.js';
 import { copyText } from '../clipboard.js';
 
-export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
+export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
+  // Header title: the leaf name when rendered inside a group folder, otherwise
+  // the engine's display name (preserving the single-enrolment look). The
+  // device-flow copy below still references the engine name (enrolment.name),
+  // e.g. "Enter this code on GitHub", which reads correctly regardless.
+  const title = displayName || enrolment.name;
   const [localStatus, setLocalStatus] = useState(enrolment.status);
   const [output, setOutput] = useState(enrolment.output || []);
   const [error, setError] = useState(enrolment.error || null);
@@ -153,10 +158,18 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   }
 
   const hasDeviceFlow = Boolean(deviceCode && verificationURL);
+  // A pure browser-redirect flow (e.g. databricks OAuth U2M): the engine emits
+  // an authorization URL but no user code — the browser redirects back to a
+  // loopback listener automatically. We render a clickable "Open" card (the
+  // same shape as the device-flow card, minus the code) instead of dumping the
+  // raw URL into an output block.
+  const hasRedirectFlow = Boolean(verificationURL && !deviceCode);
   // Once the engine has moved past "waiting for authentication" into a
-  // server-to-server exchange (e.g. jfrog's mint step), the code is no
-  // longer actionable — collapse the code UI and show just the progress.
+  // server-to-server exchange (e.g. jfrog's mint step, databricks' code
+  // exchange), the code/link is no longer actionable — collapse the action UI
+  // and show just the progress.
   const codeNoLongerActionable = Boolean(progressLine && /minting/i.test(progressLine));
+  const redirectNoLongerActionable = Boolean(progressLine && /exchang|minting/i.test(progressLine));
   const startDisabled = anyRunning && localStatus !== 'running';
 
   if (localStatus === 'complete') {
@@ -165,7 +178,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
       h('div', { class: 'enrol-card-header' },
         h('div', null,
           h('span', { class: 'enrol-check' }, '\u2713'),
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
         ),
         h('div', { class: 'enrol-card-actions' },
           h('span', { class: 'enrol-status-text enrol-status-complete' }, 'Enrolled successfully'),
@@ -201,7 +214,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-skipped' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-badge' }, 'SKIPPED'),
         ),
         h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
@@ -213,7 +226,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-running' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-badge enrol-badge-running' }, 'RUNNING'),
         ),
       ),
@@ -240,8 +253,27 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
         h('p', { class: 'enrol-device-label' }, `\u2713 Signed in to ${enrolment.name}`),
         h('p', { class: 'enrol-device-waiting' }, progressLine),
       ),
+      // Active browser-redirect step (e.g. databricks) \u2014 open the service in a
+      // new tab; the engine's loopback listener catches the redirect.
+      hasRedirectFlow && !promptLabel && !redirectNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `Sign in to ${enrolment.name} to continue:`),
+        h('div', { class: 'enrol-device-actions' },
+          h('a', {
+            class: 'enrol-btn-primary',
+            href: verificationURL,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+          }, `Open ${enrolment.name} \u2192`),
+        ),
+        h('p', { class: 'enrol-device-waiting' }, progressLine || 'Waiting for authentication\u2026'),
+      ),
+      // Post-redirect exchange step \u2014 the link is spent, show just progress.
+      hasRedirectFlow && !promptLabel && redirectNoLongerActionable && h('div', { class: 'enrol-device-flow' },
+        h('p', { class: 'enrol-device-label' }, `\u2713 Signed in to ${enrolment.name}`),
+        h('p', { class: 'enrol-device-waiting' }, progressLine),
+      ),
       // Passphrase prompt (ssh).
-      promptLabel && !hasDeviceFlow && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
+      promptLabel && !hasDeviceFlow && !hasRedirectFlow && h('form', { class: 'enrol-prompt-form', onSubmit: handleSecretSubmit },
         h('label', { class: 'enrol-prompt-label', htmlFor: 'enrol-secret' }, promptLabel),
         h('input', {
           type: 'password',
@@ -256,11 +288,16 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
           h('button', { type: 'submit', class: 'enrol-btn-primary' }, 'Submit'),
         ),
       ),
-      // Fallback for engines that don't match the device-flow or prompt
-      // shapes — show whatever the engine has emitted so the user isn't
+      // Fallback for engines that don't match the device-flow, redirect, or
+      // prompt shapes — show whatever the engine has emitted so the user isn't
       // left staring at a silent spinner.
-      !hasDeviceFlow && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
+      !hasDeviceFlow && !hasRedirectFlow && !promptLabel && output.length > 0 && h('div', { class: 'enrol-output' },
         output.map((line, i) => h('div', { key: i }, line)),
+      ),
+      // Brief gap between RUNNING and the first recognised output line (one
+      // ~2s poll): keep a live hint on screen rather than a bare spinner.
+      !hasDeviceFlow && !hasRedirectFlow && !promptLabel && output.length === 0 && h('p', { class: 'enrol-device-waiting' },
+        progressLine || 'Starting…',
       ),
     );
   }
@@ -269,7 +306,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
     return h('div', { class: 'enrol-card enrol-failed' },
       h('div', { class: 'enrol-card-header' },
         h('div', null,
-          h('strong', null, enrolment.name),
+          h('strong', null, title),
           h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
         ),
         h('div', { class: 'enrol-card-actions' },
@@ -285,7 +322,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning }) {
   return h('div', { class: 'enrol-card' },
     h('div', { class: 'enrol-card-header' },
       h('div', null,
-        h('strong', null, enrolment.name),
+        h('strong', null, title),
         h('span', { class: 'enrol-engine-desc' }, engineDescription(enrolment.engine)),
       ),
       h('div', { class: 'enrol-card-actions' },
@@ -301,7 +338,9 @@ function engineDescription(engine) {
   switch (engine) {
     case 'github': return 'OAuth token via device flow';
     case 'jfrog': return 'Refreshable access token via web login';
+    case 'databricks': return 'OAuth U2M token via browser login';
     case 'ssh': return 'Ed25519 key generation';
+    case 'copy': return 'Mirror an existing Vault secret';
     default: return engine;
   }
 }

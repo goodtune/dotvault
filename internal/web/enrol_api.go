@@ -13,11 +13,25 @@ func (s *Server) requireEnrolAuth(w http.ResponseWriter) bool {
 	return true
 }
 
+// enrolKeyFromRequest reconstructs the enrolment key from the request path,
+// supporting both flat keys (served by /enrol/{key}/...) and one-level grouped
+// keys. A grouped key arrives in one of two equivalent shapes: percent-encoded
+// in a single segment ("databricks%2Fprod", which Go unescapes into PathValue
+// without splitting) or as two literal segments served by the parallel
+// /enrol/{group}/{name}/... routes. Either way the result is "group/name",
+// exactly how the key appears in config and in the Vault path.
+func enrolKeyFromRequest(r *http.Request) string {
+	if g := r.PathValue("group"); g != "" {
+		return g + "/" + r.PathValue("name")
+	}
+	return r.PathValue("key")
+}
+
 func (s *Server) handleEnrolStart(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return
 	}
-	key := r.PathValue("key")
+	key := enrolKeyFromRequest(r)
 
 	runner := s.getEnrolRunner()
 	if runner == nil {
@@ -58,7 +72,7 @@ func (s *Server) handleEnrolSkip(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return
 	}
-	key := r.PathValue("key")
+	key := enrolKeyFromRequest(r)
 
 	runner := s.getEnrolRunner()
 	if runner == nil {
@@ -83,7 +97,7 @@ func (s *Server) handleEnrolStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return
 	}
-	key := r.PathValue("key")
+	key := enrolKeyFromRequest(r)
 
 	runner := s.getEnrolRunner()
 	if runner == nil {
@@ -104,7 +118,7 @@ func (s *Server) handleEnrolReset(w http.ResponseWriter, r *http.Request) {
 	if !s.requireEnrolAuth(w) {
 		return
 	}
-	key := r.PathValue("key")
+	key := enrolKeyFromRequest(r)
 
 	runner := s.getEnrolRunner()
 	if runner == nil {

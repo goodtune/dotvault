@@ -130,6 +130,27 @@ body {
 .key-icon { font-size: 16px; }
 .key-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Expandable secret folders (a Vault path nested under the user prefix, e.g.
+   "databricks/" holding databricks/prod, databricks/dev). */
+.key-folder { list-style: none; }
+/* The folder header is a <button> for keyboard operability; strip the UA button
+   chrome so it reads as a sidebar row (layout comes from .key-item). */
+.key-folder-header {
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid #f0f0f0;
+  font-family: inherit;
+  font-size: 14px;
+  color: inherit;
+  text-align: left;
+}
+.key-folder-header .key-chevron { margin-left: auto; font-size: 11px; color: #888; }
+.key-sublist { list-style: none; }
+.key-sublist .key-item { padding-left: 38px; }
+.key-subnote { padding: 8px 16px 8px 38px; font-size: 13px; color: #999; }
+.key-suberror { color: #c5221f; }
+
 .secret-panel {
   flex: 1;
   padding: 24px;
@@ -326,6 +347,37 @@ body {
 .enrol-subheading { font-size: 14px; color: #888; margin-bottom: 24px; }
 
 .enrol-list { display: flex; flex-direction: column; gap: 12px; }
+
+/* One-level enrolment grouping ("folders"): a group/name key renders the
+   group as a collapsible header above its indented member cards. */
+.enrol-group {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  background: #fafafa;
+  overflow: hidden;
+}
+.enrol-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 16px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.enrol-group-header:hover { background: #f0f0f0; }
+.enrol-group-chevron { color: #888; font-size: 12px; width: 12px; }
+.enrol-group-name { font-size: 15px; font-weight: 600; color: #333; }
+.enrol-group-count { margin-left: auto; font-size: 13px; color: #888; }
+.enrol-group-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px 28px;
+}
 
 .enrol-card {
   background: white;

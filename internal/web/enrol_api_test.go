@@ -39,6 +39,84 @@ func TestHandleEnrolStart(t *testing.T) {
 	}
 }
 
+func TestEnrolKeyFromRequest(t *testing.T) {
+	// Flat key via the single {key} segment.
+	r := httptest.NewRequest("GET", "/api/v1/enrol/gh/status", nil)
+	r.SetPathValue("key", "gh")
+	if got := enrolKeyFromRequest(r); got != "gh" {
+		t.Errorf("flat key = %q, want gh", got)
+	}
+	// Grouped key via the two {group}/{name} segments.
+	r = httptest.NewRequest("GET", "/api/v1/enrol/databricks/prod/status", nil)
+	r.SetPathValue("group", "databricks")
+	r.SetPathValue("name", "prod")
+	if got := enrolKeyFromRequest(r); got != "databricks/prod" {
+		t.Errorf("grouped key = %q, want databricks/prod", got)
+	}
+}
+
+func TestHandleEnrolStatus_GroupedKey(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
+		"databricks/prod": {Engine: "mock"},
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/enrol/databricks/prod/status", nil)
+	req.SetPathValue("group", "databricks")
+	req.SetPathValue("name", "prod")
+	w := httptest.NewRecorder()
+
+	s.handleEnrolStatus(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var info map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if info["key"] != "databricks/prod" {
+		t.Errorf("key = %v, want databricks/prod", info["key"])
+	}
+}
+
+// TestEnrolRouting_GroupedKey exercises the real mux to prove a grouped key
+// resolves through both URL shapes the frontend and CLI might produce: the
+// percent-encoded single segment ("databricks%2Fprod") and the two literal
+// segments ("databricks/prod"). Status is a GET, so no CSRF token is needed.
+func TestEnrolRouting_GroupedKey(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.enrolRunner = NewEnrolmentRunner(map[string]config.Enrolment{
+		"databricks/prod": {Engine: "mock"},
+	})
+	s.registerRoutes()
+
+	for _, path := range []string{
+		"/api/v1/enrol/databricks%2Fprod/status",
+		"/api/v1/enrol/databricks/prod/status",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		s.mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200; body = %s", path, w.Code, w.Body.String())
+		}
+		var info map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&info); err != nil {
+			t.Fatalf("%s: decode response: %v", path, err)
+		}
+		if info["key"] != "databricks/prod" {
+			t.Errorf("%s: key = %v, want databricks/prod", path, info["key"])
+		}
+	}
+}
+
 func TestHandleEnrolStart_NotFound(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
 	s.enrolRunner = NewEnrolmentRunner(nil)

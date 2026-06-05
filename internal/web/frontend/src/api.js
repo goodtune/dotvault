@@ -31,14 +31,23 @@ export async function getConfig() {
   return fetchJSON('/api/v1/config');
 }
 
+// encodeSecretPath percent-encodes each path segment but preserves the "/"
+// separators — and any trailing slash, which the server uses to distinguish a
+// folder list from a secret read — so a key name with URL-special characters
+// can't mis-route the request.
+function encodeSecretPath(path) {
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
 export async function listSecrets(path = '') {
-  return fetchJSON(`/api/v1/secrets/${path}`);
+  return fetchJSON(`/api/v1/secrets/${encodeSecretPath(path)}`);
 }
 
 export async function getSecret(path, reveal = false) {
+  const encoded = encodeSecretPath(path);
   const url = reveal
-    ? `/api/v1/secrets/${path}?reveal=true`
-    : `/api/v1/secrets/${path}`;
+    ? `/api/v1/secrets/${encoded}?reveal=true`
+    : `/api/v1/secrets/${encoded}`;
   return fetchJSON(url);
 }
 

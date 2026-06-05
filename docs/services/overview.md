@@ -16,6 +16,27 @@ enrolments:
         - read:org
 ```
 
+## Grouping enrolments
+
+An enrolment key may use a single-level `group/name` form to organise related enrolments under a shared prefix — useful when one engine is used for several targets (multiple Databricks workspaces, multiple AWS accounts, several GitHub hosts):
+
+```yaml
+enrolments:
+  databricks/prod:
+    engine: databricks
+    settings: { host: "https://prod.cloud.databricks.com" }
+  databricks/dev:
+    engine: databricks
+    settings: { host: "https://dev.cloud.databricks.com" }
+  aws/account-a:
+    engine: copy
+    # …engine-specific settings…
+```
+
+The group segment becomes a nested Vault path segment (`users/<you>/databricks/prod`) and an expandable **folder** in the web UI's enrolment screen, with each `name` shown as a separate entry. Flat keys (`gh`, `jfrog`) stay top-level. The grouping is purely organisational — each entry is still an independent enrolment with its own settings, refresh cycle, and sync rule(s).
+
+Exactly **one** level of grouping is supported. A second slash (`a/b/c`), a leading/trailing slash, an empty segment, or a backslash is rejected at config load.
+
 ## Enrolment lifecycle
 
 1. On each sync cycle, dotvault checks Vault for missing or incomplete secrets for each enrolment
@@ -35,6 +56,7 @@ Enrolment configuration changes are detected on each polling tick without requir
 |--------|---------|-----------|
 | `github` | GitHub / GitHub Enterprise | OAuth device flow |
 | `jfrog` | JFrog Platform / Artifactory | Browser-based web login + token rotation |
+| `databricks` | Databricks workspace / account | OAuth U2M (authorization code + PKCE) + token rotation |
 | `ssh` | SSH key generation | Ed25519 key pair |
 | `copy` | Mirror an existing Vault KVv2 secret | Non-interactive; template-driven copy with periodic re-evaluation |
 
@@ -42,6 +64,7 @@ See the individual engine pages for details:
 
 - [GitHub CLI](github.md)
 - [JFrog Platform](jfrog.md)
+- [Databricks](databricks.md)
 - [SSH Keys](ssh.md)
 - [Copy](copy.md)
 
@@ -56,7 +79,7 @@ Engines implement a simple interface:
 Engines that need extra behaviour layer it on through optional interfaces the manager probes for at run time:
 
 - **`SettingsFielder`** — for engines whose written-field set is determined by per-enrolment settings rather than being static (used by `copy`, where the JSON template decides the keys)
-- **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog`); driven by the daemon's `RefreshManager`
+- **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog` and `databricks`); driven by the daemon's `RefreshManager`
 - **`Watcher`** — for engines whose output is derived from upstream Vault data and must track source changes (used by `copy`); driven by the daemon's `WatchManager`, which polls on every sync interval and reacts to `kv-v2/data-write` events on Vault Enterprise
 
 This means new engines can be added to support additional services without changes to the core enrolment system.

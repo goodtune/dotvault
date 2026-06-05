@@ -278,6 +278,59 @@ func TestReadRegistryEnrolmentsMultiple(t *testing.T) {
 	}
 }
 
+// TestReadRegistryEnrolmentsGroupedKey verifies the LIVE registry loader reads
+// back a one-level grouped enrolment key ("databricks/prod") intact. The
+// forward slash is a legal character in a Win32 registry key NAME (only
+// backslash is the path separator), so the grouped key is stored as a single
+// subkey literally named "databricks/prod"; ReadSubKeyNames returns it verbatim
+// and readSingleEnrolment reopens it by that name. This is the platform half of
+// the round-trip the regfile test covers — together they keep the GPO-parity
+// contract honest for grouped keys.
+func TestReadRegistryEnrolmentsGroupedKey(t *testing.T) {
+	const base = `SOFTWARE\dotvault-test-grouped`
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Enrolments\databricks/prod\Settings`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Enrolments\databricks/prod`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Enrolments`)
+		registry.DeleteKey(registry.CURRENT_USER, base)
+	})
+
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\Enrolments\databricks/prod`, registry.ALL_ACCESS)
+	if err != nil {
+		t.Fatalf("create grouped key: %v", err)
+	}
+	if err := k.SetStringValue("Engine", "databricks"); err != nil {
+		k.Close()
+		t.Fatalf("set Engine: %v", err)
+	}
+	k.Close()
+
+	settings, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\Enrolments\databricks/prod\Settings`, registry.ALL_ACCESS)
+	if err != nil {
+		t.Fatalf("create Settings: %v", err)
+	}
+	if err := settings.SetStringValue("Host", "https://dbc-123.cloud.databricks.com"); err != nil {
+		settings.Close()
+		t.Fatalf("set Host: %v", err)
+	}
+	settings.Close()
+
+	enrolments, err := readRegistryEnrolments(registry.CURRENT_USER, base)
+	if err != nil {
+		t.Fatalf("readRegistryEnrolments() error: %v", err)
+	}
+	e, ok := enrolments["databricks/prod"]
+	if !ok {
+		t.Fatalf("grouped key not read back; got %v", enrolments)
+	}
+	if e.Engine != "databricks" {
+		t.Errorf("Engine = %q, want databricks", e.Engine)
+	}
+	if e.Settings["host"] != "https://dbc-123.cloud.databricks.com" {
+		t.Errorf("host = %v, want the databricks host", e.Settings["host"])
+	}
+}
+
 func TestLoadFromRegistryNoKeys(t *testing.T) {
 	// When no GPO keys exist, loadFromRegistry should return false.
 	cfg, managed, err := loadFromRegistry()

@@ -127,7 +127,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 
   Logs vs. slog: the OTel logs exporter is **not** a slog replacement. Operational logging continues to go through `log/slog` to stderr. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal — currently only `LogRegistryConfigManaged`, which surfaces "GPO config is active, file config is ignored" as a WARN record once per daemon/sync startup. Routing this through slog would print an INFO line on every CLI invocation against a GPO-managed Windows box, which is exactly the noise we wanted to eliminate.
 - **`rules`** — array of sync rules (name, vault_key, target.path, target.format, target.template, target.merge)
-- **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition
+- **`enrolments`** — map of Vault KV path segment to engine config for credential acquisition. A key may use a single-level `group/name` form (e.g. `databricks/prod`) to organise related enrolments; the group becomes a nested Vault path segment (`users/<you>/databricks/prod`) and an expandable folder in the web UI. Exactly one level is allowed — more than one `/`, a leading/trailing `/`, an empty segment, or a backslash is rejected at config load (`validateEnrolmentKey`)
 - **`agent`** — SSH agent surface (default disabled). `enabled`, `unix.path` (default per-user runtime socket), `windows.pipe` (default `\\.\pipe\dotvault-agent`), `windows.putty` (default true; Windows-only `*bool` tri-state — when enabled, the daemon serves a *second* parallel listener on the Pageant-convention pipe `\\.\pipe\pageant.<user>.<hash>` so PuTTY-family clients auto-discover the agent; only takes effect when `agent.enabled`), and an ordered `keys[]` list of sources: `source: kv` (`path_prefix`, resolved under `kv/data/users/<you>/`) and `source: vault-ca` (`mount`, `role`, templated `principals`, `ttl`, `ephemeral_key`)
 
 ### Config Validation
@@ -138,6 +138,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - `target.format` must be one of: yaml, json, ini, toml, text, netrc
 - `web.listen` must resolve to a loopback address if web is enabled
 - Enrolment entries must have a non-empty engine field
+- Enrolment keys are flat (`gh`) or one-level grouped (`group/name`); at most one `/`, no empty segments, no backslash
 - When `agent.enabled`, at least one `agent.keys[]` source is required; each must be `kv` or `vault-ca`; a `vault-ca` source requires `mount` and `role`, and its `ttl` (if set) must parse as a positive duration
 
 ## CLI
@@ -387,14 +388,16 @@ Templates receive the Vault KV data map as dot context. The rendered output is p
 
 Automated credential acquisition from external services (`internal/enrol/`). Enrolments are declared in config under a top-level `enrolments` map keyed by Vault KV path segment.
 
+Enrolment keys support one level of grouping (`group/name`, e.g. `databricks/prod`) so related enrolments cluster under a shared prefix. The key is treated as an opaque segment everywhere it flows: the Vault path nests naturally (`users/<you>/databricks/prod`); the web UI groups by the prefix-before-slash and renders an expandable folder (`internal/web/frontend/src/components/enrol-page.jsx`); the web API serves grouped keys through both a percent-encoded `{key}` segment and parallel `{group}/{name}` routes (`enrolKeyFromRequest`, `server.go`); and the Windows registry / `reg-import`/`reg-export` round-trip stores the key as one subkey literally named `databricks/prod` (a forward slash is legal in a registry key *name* — only backslash is the separator — so no nesting is introduced and the GPO-parity contract holds). `validateEnrolmentKey` (`internal/config/config.go`) enforces the one-level limit.
+
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
 
 Optional interfaces extend the contract for engines that need them:
 
 - `SettingsFielder.FieldsFromSettings(settings)` — engines whose written-field set depends on per-enrolment settings (currently the Copy engine, where the JSON template determines the keys). The manager and web runner use `EngineFields(engine, settings)` which falls back to `Fields()` when not implemented.
-- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog). Driven by `RefreshManager`.
+- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog and Databricks). Driven by `RefreshManager`.
 - `Watcher.WatchSources(settings, username) []WatchSource` — engines whose output is derived from upstream Vault data and must track source changes (currently Copy). Driven by `WatchManager`, which polls every sync interval and (on Enterprise Vault) reacts to source-write events within seconds.
 
 ### GitHub Engine Defaults
@@ -446,6 +449,30 @@ Vault schema (8 fields): `access_token`, `refresh_token`, `reference_token`, `ur
 
 `reference_token` and `user` are written when available but are deliberately excluded from the engine's `Fields()` set, so `enrol.Manager.HasAllFields` does not reject enrolments on deployments that don't return them.
 
+### Databricks Engine
+
+Replicates the `databricks auth login` OAuth user-to-machine (U2M) flow: an authorization-code grant with PKCE against the workspace (or account) OAuth endpoints, caught by a localhost redirect listener. Databricks access tokens are short-lived (~1 hour), so the engine implements `Refresher` and dotvault owns the rotation — the rendered credential carries only the access token (the native CLI token cache is intentionally not written, so nothing races the sync-engine clobber). This is the same ownership model as JFrog.
+
+Required settings:
+- `host` — the Databricks workspace URL (https, scheme + host only, no path; e.g. `https://dbc-xxxx.cloud.databricks.com`). For account-level login, the accounts console URL. (This is the Databricks analogue of the JFrog engine's `url` setting.)
+
+Optional settings:
+- `account_id` — when set, the engine performs account-level login (`{host}/oidc/accounts/{account_id}/…`) instead of workspace login.
+- `client_id` — default `databricks-cli` (the CLI's public OAuth app). Override only for a custom registered OAuth app that also registers the `http://localhost:8020`–`8040` redirect range.
+- `scopes` — default `offline_access all-apis`. A custom list is honoured verbatim except `offline_access` is always ensured (it yields the refresh token dotvault rotates with).
+- `https_proxy` / `http_proxy` — same `internal/httpproxy.ClientFromSettings` contract as GitHub/JFrog; routes the OAuth + SCIM traffic.
+
+Flow (enrolment — runs once per user):
+1. GET `{host}/oidc/.well-known/oauth-authorization-server` (account-level inserts `/oidc/accounts/{account_id}`) to discover `authorization_endpoint` and `token_endpoint`.
+2. Bind a loopback redirect listener (prefer port 8020, walk up to 8040, matching the CLI). Generate a PKCE verifier + `S256` challenge and an anti-CSRF `state`.
+3. Open the browser to the authorization endpoint (`client_id=databricks-cli`, redirect URI, `response_type=code`, scopes, PKCE challenge). The user signs in; Databricks redirects back to the loopback with a `code`. The handler validates `state`.
+4. POST `token_endpoint` with `grant_type=authorization_code` + `code_verifier` (public client, params in the body) → access + refresh token + `expires_in`.
+5. Best-effort `GET /api/2.0/preview/scim/v2/Me` resolves the username (the access token is opaque to dotvault).
+
+Flow (refresh — periodic, driven by `RefreshManager`): every check interval, refresh past half-life via `grant_type=refresh_token`. Databricks may rotate the refresh token (adopted when returned, otherwise the existing one is kept). `401`/`403` is permanent revocation (`ErrRevoked` → wipe + re-enrol); other errors are transient.
+
+Vault schema: `access_token`, `refresh_token`, `host`, `issued_at` (RFC3339), `expires_at` (RFC3339), plus `user` (from SCIM `/Me`, written when available). `user` is deliberately excluded from `Fields()` so a transient SCIM failure doesn't mark an enrolment incomplete. The typical sync rule renders `~/.databrickscfg` (INI) with `host` + `token = {{ .access_token }}` — an OAuth access token is accepted wherever a PAT is, and dotvault keeps it fresh.
+
 ### SSH Engine
 
 Generates Ed25519 key pairs in OpenSSH format. Returns `{"public_key": "<ssh-ed25519 ...>", "private_key": "<PEM>"}`. The public key comment is `{username}@dotvault`.
@@ -489,6 +516,15 @@ Periodic refresh:
 The Manager checks Vault for missing/incomplete secrets, then runs the Wizard for any pending enrolments. The Wizard runs engines sequentially with terminal progress display and best-effort clipboard support (pbcopy/xclip/clip.exe). On success, credentials are written to Vault KVv2, and the sync engine is triggered.
 
 Config changes to the enrolments section are detected on each polling tick without requiring a daemon restart.
+
+### Browser-based enrolment in the web UI
+
+Several engines drive an interactive browser login (GitHub device flow, JFrog web login, Databricks OAuth U2M). These present an **actionable URL** to the user and then block on a result — a poll (GitHub/JFrog) or a loopback redirect listener (Databricks). The contract that makes these render correctly in the web UI, and the bug class to avoid:
+
+- The web enrol runner (`internal/web/enrol_runner.go`) deliberately builds `enrol.IO` **without** a `Browser` opener (unlike the CLI paths in `cmd/dotvault/`, which set `Browser: browser.OpenURL`). The daemon must not pop a browser on a possibly-headless host, and the loopback web UI is the user's actual surface — so each engine's `io.Browser == nil` branch fires and it writes the login URL to `io.Out` rather than opening anything server-side.
+- The enrolment card (`internal/web/frontend/src/components/enrol-card.jsx`) parses the engine's line-oriented output and renders one of: a **device-code card** when a `! First, copy your one-time code: X` line **and** an `https://` URL are present (GitHub/JFrog); a **redirect card** when only an `https://` URL is present with no code (Databricks); a **passphrase prompt** (ssh); or a raw-output fallback. Both the device-code and redirect cards expose a real **clickable "Open <service> →" anchor** — a genuine user gesture, so it isn't swallowed by pop-up blockers the way a programmatic `window.open` would be. The user clicks it, authenticates, and the card flips to the progress/complete state as the engine's output advances.
+- **The failure mode this guards against:** a browser-login engine whose output the card doesn't recognise falls through to the raw-output branch and the user just sees the bare URL dumped into a code block with nothing to click — a "terminal flow in the browser". This was fixed for GitHub/JFrog (the device-code card) and then again for Databricks (the redirect card, which exists precisely because a pure authorization-code+PKCE flow has no user code to key the device-code card on).
+- **When adding a new browser-driven engine,** emit the actionable URL to `io.Out` in a form the card already recognises (a line containing an `https://` URL, plus the `! First, copy your one-time code: X` line if and only if there is a user code), and attempt `io.Browser` only inside the non-nil branch. If the new flow has a genuinely new shape, add a matching branch to `enrol-card.jsx` rather than letting it land in the raw-output fallback. Verify the web experience, not just the CLI — the CLI path opens a real browser via `io.Browser` and can mask a missing web card.
 
 ## SSH Agent
 

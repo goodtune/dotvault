@@ -38,12 +38,19 @@ WINDOWS_VERSION_STAMP := cmd/dotvault/.version-stamp
 
 # VS_VERSIONINFO FixedFileInfo requires four 16-bit integers, so split the
 # semver core off the (possibly "-N-gSHA-dirty") describe string and fall back
-# to 0.0.0 for an untagged build. The full descriptive VERSION still lands in
-# the string FileVersion/ProductVersion fields.
+# to 0.0.0 for an untagged build.
 WINDOWS_VERSION_PARTS := $(shell printf '%s' "$(VERSION)" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || printf '0.0.0')
 WINDOWS_VER_MAJOR := $(word 1,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
 WINDOWS_VER_MINOR := $(word 2,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
 WINDOWS_VER_PATCH := $(word 3,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
+
+# The full descriptive VERSION lands in the string FileVersion/ProductVersion
+# fields. goversioninfo parses that string even though we pass the numeric block
+# explicitly, so an untagged/shallow clone whose describe is a bare hash (no
+# leading x.y.z) triggers a "could not be parsed" warning. Prefix such a value
+# with 0.0.0- to silence the noise while keeping the hash visible in the Details
+# tab; a value already starting with a semver core is used verbatim.
+WINDOWS_VERSION_STRING := $(shell printf '%s' "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && printf '%s' "$(VERSION)" || printf '0.0.0-%s' "$(VERSION)")
 
 .PHONY: test
 test:
@@ -78,7 +85,7 @@ build-windows-amd64-gui: $(WINDOWS_SYSO)
 
 $(WINDOWS_SYSO): assets/dotvault.ico assets/versioninfo.json $(WINDOWS_VERSION_STAMP)
 	go tool goversioninfo -64 -icon assets/dotvault.ico \
-		-file-version "$(VERSION)" -product-version "$(VERSION)" \
+		-file-version "$(WINDOWS_VERSION_STRING)" -product-version "$(WINDOWS_VERSION_STRING)" \
 		-ver-major $(WINDOWS_VER_MAJOR) -ver-minor $(WINDOWS_VER_MINOR) -ver-patch $(WINDOWS_VER_PATCH) -ver-build 0 \
 		-product-ver-major $(WINDOWS_VER_MAJOR) -product-ver-minor $(WINDOWS_VER_MINOR) -product-ver-patch $(WINDOWS_VER_PATCH) -product-ver-build 0 \
 		-o $@ assets/versioninfo.json

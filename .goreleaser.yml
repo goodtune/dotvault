@@ -3,10 +3,19 @@ version: 2
 before:
   hooks:
     - sh -c "cd internal/web/frontend && npm ci && npm run build"
-    # Embed the Windows .exe icon. rsrc emits a COFF object (.syso) that
-    # the Go linker picks up automatically for windows_amd64 targets and
-    # ignores everywhere else, so generating it unconditionally is safe.
-    - go tool rsrc -arch amd64 -ico assets/dotvault.ico -o cmd/dotvault/rsrc_windows_amd64.syso
+    # Embed the Windows .exe icon AND version metadata. goversioninfo emits a
+    # COFF object (.syso) carrying the icon plus a VS_VERSIONINFO resource
+    # (Explorer Details tab: File/Product version, Company, Description). The
+    # Go linker picks it up automatically for windows_amd64 targets and ignores
+    # it everywhere else, so generating it unconditionally is safe. {{.Version}}
+    # is the v-stripped tag; {{.Major}}/{{.Minor}}/{{.Patch}} feed the numeric
+    # FixedFileInfo fields, which require integers.
+    - >-
+      sh -c "go tool goversioninfo -64 -icon assets/dotvault.ico
+      -file-version '{{.Version}}' -product-version '{{.Version}}'
+      -ver-major {{.Major}} -ver-minor {{.Minor}} -ver-patch {{.Patch}} -ver-build 0
+      -product-ver-major {{.Major}} -product-ver-minor {{.Minor}} -product-ver-patch {{.Patch}} -product-ver-build 0
+      -o cmd/dotvault/rsrc_windows_amd64.syso assets/versioninfo.json"
 
 builds:
   - id: dotvault

@@ -50,6 +50,7 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
 	github.com/hashicorp/hcl v1.0.1-vault-7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/josephspurrier/goversioninfo v1.7.0 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
@@ -66,4 +67,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-tool github.com/akavel/rsrc
+tool github.com/josephspurrier/goversioninfo/cmd/goversioninfo

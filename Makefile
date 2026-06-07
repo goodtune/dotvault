@@ -12,12 +12,29 @@ LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 # The PE subsystem flag is immutable post-link, so we build twice.
 WINDOWS_GUI_LDFLAGS := -ldflags "-s -w -H=windowsgui -X main.version=$(VERSION)"
 
-# Windows .exe icon: rsrc emits a COFF object (*.syso) into cmd/dotvault/.
-# Go's build picks it up automatically for Windows targets thanks to the
-# _windows_amd64 suffix and ignores it for other platforms. The file is
-# regenerated from assets/dotvault.ico whenever the icon changes; .syso
+# Windows .exe resources: goversioninfo emits a COFF object (*.syso) into
+# cmd/dotvault/ carrying both the application icon and a VS_VERSIONINFO
+# resource (the latter populates Explorer's Details tab — File version,
+# Product version, Company, Description). Go's build picks the .syso up
+# automatically for Windows targets thanks to the _windows_amd64 suffix and
+# ignores it for other platforms. The file is regenerated whenever the icon,
+# the static metadata (assets/versioninfo.json), or the version changes; .syso
 # is a build artefact and excluded from version control.
-WINDOWS_ICON_SYSO := cmd/dotvault/rsrc_windows_amd64.syso
+#
+# Both Windows binaries are built from cmd/dotvault, so the Go linker embeds
+# this single .syso into each — dotvault.exe and dotvaultw.exe therefore carry
+# identical version metadata (the point of the exercise) and share the static
+# OriginalFilename string.
+WINDOWS_SYSO := cmd/dotvault/rsrc_windows_amd64.syso
+
+# VS_VERSIONINFO FixedFileInfo requires four 16-bit integers, so split the
+# semver core off the (possibly "-N-gSHA-dirty") describe string and fall back
+# to 0.0.0 for an untagged build. The full descriptive VERSION still lands in
+# the string FileVersion/ProductVersion fields.
+WINDOWS_VERSION_PARTS := $(shell printf '%s' "$(VERSION)" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || printf '0.0.0')
+WINDOWS_VER_MAJOR := $(word 1,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
+WINDOWS_VER_MINOR := $(word 2,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
+WINDOWS_VER_PATCH := $(word 3,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
 
 .PHONY: test
 test:
@@ -44,15 +61,19 @@ build-darwin-arm64:
 
 build-windows-amd64: build-windows-amd64-cli build-windows-amd64-gui
 
-build-windows-amd64-cli: $(WINDOWS_ICON_SYSO)
+build-windows-amd64-cli: $(WINDOWS_SYSO)
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o dist/dotvault-windows-amd64.exe ./cmd/dotvault
 
-build-windows-amd64-gui: $(WINDOWS_ICON_SYSO)
+build-windows-amd64-gui: $(WINDOWS_SYSO)
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(WINDOWS_GUI_LDFLAGS) -o dist/dotvaultw-windows-amd64.exe ./cmd/dotvault
 
-$(WINDOWS_ICON_SYSO): assets/dotvault.ico
-	go tool rsrc -arch amd64 -ico $< -o $@
+$(WINDOWS_SYSO): assets/dotvault.ico assets/versioninfo.json
+	go tool goversioninfo -64 -icon assets/dotvault.ico \
+		-file-version "$(VERSION)" -product-version "$(VERSION)" \
+		-ver-major $(WINDOWS_VER_MAJOR) -ver-minor $(WINDOWS_VER_MINOR) -ver-patch $(WINDOWS_VER_PATCH) -ver-build 0 \
+		-product-ver-major $(WINDOWS_VER_MAJOR) -product-ver-minor $(WINDOWS_VER_MINOR) -product-ver-patch $(WINDOWS_VER_PATCH) -product-ver-build 0 \
+		-o $@ assets/versioninfo.json
 
 .PHONY: clean
 clean:
-	rm -rf dist/ $(WINDOWS_ICON_SYSO)
+	rm -rf dist/ $(WINDOWS_SYSO)

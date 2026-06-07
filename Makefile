@@ -27,6 +27,15 @@ WINDOWS_GUI_LDFLAGS := -ldflags "-s -w -H=windowsgui -X main.version=$(VERSION)"
 # OriginalFilename string.
 WINDOWS_SYSO := cmd/dotvault/rsrc_windows_amd64.syso
 
+# The version is injected from VERSION (not stored in the .ico/.json), so it
+# must be a prerequisite of the .syso or a VERSION change (new commit/tag) with
+# an unchanged icon and JSON would leave a stale resource embedding the wrong
+# version. VERSION isn't a file, so this stamp stands in for it: the recipe runs
+# every invocation (FORCE) but only rewrites the file — advancing its mtime —
+# when the recorded version actually differs, so the .syso regenerates exactly
+# when VERSION changes and not on every build.
+WINDOWS_VERSION_STAMP := cmd/dotvault/.version-stamp
+
 # VS_VERSIONINFO FixedFileInfo requires four 16-bit integers, so split the
 # semver core off the (possibly "-N-gSHA-dirty") describe string and fall back
 # to 0.0.0 for an untagged build. The full descriptive VERSION still lands in
@@ -67,13 +76,23 @@ build-windows-amd64-cli: $(WINDOWS_SYSO)
 build-windows-amd64-gui: $(WINDOWS_SYSO)
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(WINDOWS_GUI_LDFLAGS) -o dist/dotvaultw-windows-amd64.exe ./cmd/dotvault
 
-$(WINDOWS_SYSO): assets/dotvault.ico assets/versioninfo.json
+$(WINDOWS_SYSO): assets/dotvault.ico assets/versioninfo.json $(WINDOWS_VERSION_STAMP)
 	go tool goversioninfo -64 -icon assets/dotvault.ico \
 		-file-version "$(VERSION)" -product-version "$(VERSION)" \
 		-ver-major $(WINDOWS_VER_MAJOR) -ver-minor $(WINDOWS_VER_MINOR) -ver-patch $(WINDOWS_VER_PATCH) -ver-build 0 \
 		-product-ver-major $(WINDOWS_VER_MAJOR) -product-ver-minor $(WINDOWS_VER_MINOR) -product-ver-patch $(WINDOWS_VER_PATCH) -product-ver-build 0 \
 		-o $@ assets/versioninfo.json
 
+# Rewrite the stamp only when the recorded VERSION differs, so its mtime (and
+# thus the .syso) advances exactly on a version change. Depends on FORCE so the
+# comparison runs every time; the file is real (not .PHONY) so its timestamp is
+# a meaningful prerequisite.
+$(WINDOWS_VERSION_STAMP): FORCE
+	@printf '%s' '$(VERSION)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(VERSION)' > $@
+
+.PHONY: FORCE
+FORCE:
+
 .PHONY: clean
 clean:
-	rm -rf dist/ $(WINDOWS_SYSO)
+	rm -rf dist/ $(WINDOWS_SYSO) $(WINDOWS_VERSION_STAMP)

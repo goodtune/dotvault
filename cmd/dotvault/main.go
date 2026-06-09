@@ -1781,8 +1781,17 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 		previous := vc.Token()
 		vc.SetToken(fileToken)
 		if _, lookupErr := vc.LookupSelf(ctx); lookupErr != nil {
-			slog.Warn("token file present but candidate is invalid; continuing to wait", "error", lookupErr)
 			vc.SetToken(previous)
+			// A cancelled parent ctx (clean shutdown) can race the wake /
+			// ticker select arms below and land here with a
+			// context.Canceled lookup error — select picks a ready case at
+			// random, so ctx.Done() isn't guaranteed to win. That's
+			// shutdown, not a bad token, so suppress the misleading
+			// "candidate is invalid" warning; the next loop iteration
+			// observes ctx.Done() and returns.
+			if ctx.Err() == nil {
+				slog.Warn("token file present but candidate is invalid; continuing to wait", "error", lookupErr)
+			}
 			return false
 		}
 		return true

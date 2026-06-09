@@ -485,7 +485,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file")
 			if !waitForHeadlessToken(ctx, vc, tokenPath) {
-				return ctx.Err() // ctx cancelled before any usable token arrived
+				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
+				// stop) before any usable token arrived. Return nil, not
+				// ctx.Err(): rootCmd.Execute maps a non-nil error to
+				// exit(1), which would make systemd record a clean stop as
+				// a failure. This preserves the pre-change exit-0-on-shutdown
+				// behaviour of this branch.
+				slog.Info("shutting down before a vault token was written")
+				return nil
 			}
 			slog.Info("picked up vault token written by external facility; continuing startup")
 		} else {

@@ -278,7 +278,7 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 1. Load config (file or registry)
 2. Create Vault client, attempt token reuse (VAULT_TOKEN env or `~/.dotvault-token`)
 3. Start web UI if enabled (before auth, so it can serve browser-based login)
-4. Authenticate if needed: web mode routes all auth through the SPA; CLI mode uses method-specific flows (OIDC browser, LDAP terminal prompt, token file)
+4. Authenticate if needed: web mode routes all auth through the SPA; CLI mode uses method-specific flows (OIDC browser, LDAP terminal prompt, token file). A non-interactive host with neither a web UI nor a TTY does not give up — it registers a synchronous token-file watch and idles until an external facility (e.g. a login profile running `dotvault login`) writes a usable token, then resumes startup. The watch is registered before the no-token decision so a token written during startup cannot be missed; this replaced the previous behaviour where a headless daemon idled until shutdown and required a restart to pick up a token (`waitForHeadlessToken`, `cmd/dotvault/main.go`).
 5. Start token lifecycle manager (renews at 75% TTL, exponential backoff 1s-5m on failure)
 6. Start RefreshManager (rotates expiring credentials for `Refresher` engines, e.g. JFrog) and WatchManager (re-mirrors upstream sources for `Watcher` engines, e.g. Copy)
 7. Run enrolment check (wizard if any credentials missing in Vault)

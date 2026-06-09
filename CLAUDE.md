@@ -86,6 +86,7 @@ cmd/dotvault/main.go     CLI entry point (Cobra)
 client/                  Public, importable Go API (facade over internal/{config,auth,vault}) — see "Public client API"
 internal/
   config/                Config loading: YAML file + Windows Registry (GPO)
+  regfile/               .reg ⇄ YAML conversion (reg-import/reg-export, web config download)
   paths/                 OS-specific path resolution
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)

@@ -35,18 +35,33 @@ const watchMask = unix.IN_CLOSE_WRITE | unix.IN_MOVED_TO | unix.IN_CREATE
 // is not latency-sensitive to that degree.
 const pollTimeoutMs = 100
 
-// Watch monitors the parent directory of path and calls onChange when a
-// file with path's basename is created or updated. It blocks until ctx
-// is cancelled — returning ctx.Err() — or returns a non-nil error if
-// the inotify machinery could not be set up or read. onChange runs on
-// the watch goroutine, so keep it cheap; the daemon passes
-// LifecycleManager.Reload, a non-blocking channel nudge.
+// Watcher holds a live inotify subscription to the token file's parent
+// directory. Splitting registration (New) from the read loop (Run) lets
+// the daemon make InotifyAddWatch synchronous — completing before any
+// "no token, idle" decision — so a token written in the gap between
+// registration and the loop starting is queued by the kernel and
+// delivered once Run begins, rather than being lost (inotify only
+// delivers events that occur after InotifyAddWatch returns).
+type Watcher struct {
+	fd       int
+	name     string
+	onChange func()
+}
+
+// New registers an inotify watch on the parent directory of path and
+// returns a Watcher ready to Run. Registration is synchronous: on
+// return the kernel is already queuing events for path's basename, so a
+// caller that issues a reconciling read after New (to catch a token
+// that predates the watch) plus Run (to catch everything after) cannot
+// miss a write. onChange runs on the Run goroutine, so keep it cheap;
+// the daemon passes LifecycleManager.Reload, a non-blocking channel
+// nudge.
 //
 // The directory rather than the file is watched because atomic writers
 // replace the inode; a file-level watch would survive only until the
 // first rotation. Watching the directory and filtering events by name
 // keeps the subscription alive across arbitrarily many replacements.
-func Watch(ctx context.Context, path string, onChange func()) error {
+func New(path string, onChange func()) (*Watcher, error) {
 	dir := filepath.Dir(path)
 	name := filepath.Base(path)
 
@@ -55,19 +70,28 @@ func Watch(ctx context.Context, path string, onChange func()) error {
 	// forever in Read.
 	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer unix.Close(fd)
 
 	if _, err := unix.InotifyAddWatch(fd, dir, watchMask); err != nil {
-		return err
+		unix.Close(fd)
+		return nil, err
 	}
 
+	return &Watcher{fd: fd, name: name, onChange: onChange}, nil
+}
+
+// Run blocks reading the inotify fd registered by New, calling onChange
+// whenever an event names the watched file. It returns when ctx is
+// cancelled — yielding ctx.Err() — or on an unrecoverable read error.
+// Run does not close the fd; call Close (typically via defer) to release
+// it.
+func (w *Watcher) Run(ctx context.Context) error {
 	// Generous relative to the 272-byte worst-case single event
 	// (SizeofInotifyEvent + NAME_MAX + 1); inotify never returns a
 	// partial event, so a buffer this size holds several at once.
 	var buf [4096]byte
-	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	pfd := []unix.PollFd{{Fd: int32(w.fd), Events: unix.POLLIN}}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -85,7 +109,7 @@ func Watch(ctx context.Context, path string, onChange func()) error {
 			continue
 		}
 
-		nread, err := unix.Read(fd, buf[:])
+		nread, err := unix.Read(w.fd, buf[:])
 		if err != nil {
 			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
 				continue
@@ -93,10 +117,28 @@ func Watch(ctx context.Context, path string, onChange func()) error {
 			return err
 		}
 
-		if nameMatched(buf[:nread], name) {
-			onChange()
+		if nameMatched(buf[:nread], w.name) {
+			w.onChange()
 		}
 	}
+}
+
+// Close releases the inotify fd. It is safe to call after Run returns.
+func (w *Watcher) Close() error {
+	return unix.Close(w.fd)
+}
+
+// Watch is a thin wrapper that registers a Watcher, runs it, and closes
+// it — preserving the original one-shot API for existing callers and
+// tests. New callers that need registration to complete before a
+// no-token decision should use New/Run/Close directly.
+func Watch(ctx context.Context, path string, onChange func()) error {
+	w, err := New(path, onChange)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	return w.Run(ctx)
 }
 
 // nameMatched reports whether any inotify event in buf names the watched

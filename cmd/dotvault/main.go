@@ -477,12 +477,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		} else if !isInteractive() {
 			// Headless: no web UI to drive auth and no terminal to prompt
 			// on. Don't crash and don't spam the logs trying to read from
-			// a closed stdin — stay up so an external interactive facility
-			// (e.g. a login profile that runs `dotvault sync`) can write
-			// the token, and a daemon restart will pick it up.
-			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); daemon will idle until shutdown")
-			<-ctx.Done()
-			return nil
+			// a closed stdin — register a token-file watch and idle until
+			// an external interactive facility (e.g. a login profile that
+			// runs `dotvault login`) writes a usable token, then fall
+			// through into normal startup. The watch is registered
+			// synchronously before the first read so a token written
+			// during startup cannot be missed.
+			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file")
+			if !waitForHeadlessToken(ctx, vc, tokenPath) {
+				return ctx.Err() // ctx cancelled before any usable token arrived
+			}
+			slog.Info("picked up vault token written by external facility; continuing startup")
 		} else {
 			// Traditional auth flow (OIDC with ephemeral listener, LDAP
 			// prompt, or token file).
@@ -534,15 +539,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// that blocks until shutdown. Creation and update events trigger a
 	// reload; deletes are ignored so the daemon keeps using its current
 	// token until a new one is written.
-	go func() {
-		onTokenChange := func() {
-			slog.Debug("vault token file changed, re-reading")
-			lm.Reload()
-		}
-		if err := tokenwatch.Watch(ctx, tokenPath, onTokenChange); err != nil && ctx.Err() == nil {
-			slog.Warn("token-file watcher stopped", "error", err)
-		}
-	}()
+	onTokenChange := func() {
+		slog.Debug("vault token file changed, re-reading")
+		lm.Reload()
+	}
+	if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
+		slog.Warn("token-file watcher unavailable; relying on periodic re-read", "error", err)
+	} else {
+		onTokenChange() // reconcile a token that appeared during startup
+		go func() {
+			defer tw.Close()
+			if err := tw.Run(ctx); err != nil && ctx.Err() == nil {
+				slog.Warn("token-file watcher stopped", "error", err)
+			}
+		}()
+	}
 
 	// Start refresh manager for any enrolment whose engine rotates its own
 	// credentials (currently JFrog). Failures are logged and retried on the
@@ -1710,6 +1721,86 @@ func stderrSupportsColour() bool {
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// waitForHeadlessToken blocks until a usable Vault token is written to
+// tokenPath (by an external facility such as a login profile running
+// `dotvault login`) or ctx is cancelled. Returns true once a token from
+// the file validates against Vault and is set on vc; false if ctx is
+// cancelled first. The watch is registered synchronously before the first
+// read so a token written during startup cannot be missed.
+func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string) bool {
+	// The watcher goroutine below can outlive a *successful* return: a token
+	// arrives while the parent ctx is still live, so cancellation can't be
+	// what stops it. Give it a child context we cancel on the way out, and
+	// make closing the inotify fd the goroutine's own responsibility (defer
+	// inside the goroutine). Closing the fd here, from the parent, while Run
+	// is still blocked in Poll/Read would be a use-after-close and risk the
+	// fd number being reused by a later open while the orphaned goroutine
+	// still reads it.
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+
+	wake := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+
+	if tw, err := tokenwatch.New(tokenPath, notify); err != nil {
+		slog.Warn("token-file watcher unavailable; polling for a token instead", "error", err)
+	} else {
+		go func() {
+			defer tw.Close()
+			if err := tw.Run(watchCtx); err != nil && watchCtx.Err() == nil {
+				slog.Warn("token-file watcher stopped while waiting for token", "error", err)
+			}
+		}()
+	}
+
+	// This runs before the lifecycle manager, SSH agent, refresh/watch
+	// managers and sync loop start (all further down runDaemon), and only
+	// in the non-web branch — so vc has no other concurrent user here. The
+	// brief window where an unvalidated candidate token is live on the
+	// client (SetToken → LookupSelf → restore-on-failure) is therefore
+	// single-threaded and matches LifecycleManager.tryReload's pattern.
+	tryPromote := func() bool {
+		fileToken, _ := auth.ReadTokenFile(tokenPath)
+		if fileToken == "" || fileToken == vc.Token() {
+			return false
+		}
+		previous := vc.Token()
+		vc.SetToken(fileToken)
+		if _, lookupErr := vc.LookupSelf(ctx); lookupErr != nil {
+			slog.Warn("token file present but candidate is invalid; continuing to wait", "error", lookupErr)
+			vc.SetToken(previous)
+			return false
+		}
+		return true
+	}
+
+	if tryPromote() {
+		return true
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-wake:
+			if tryPromote() {
+				return true
+			}
+		case <-ticker.C:
+			if tryPromote() {
+				return true
+			}
+		}
+	}
 }
 
 // initObservability builds an observability.Provider from the loaded

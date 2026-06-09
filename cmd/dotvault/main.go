@@ -1773,8 +1773,23 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 	// brief window where an unvalidated candidate token is live on the
 	// client (SetToken → LookupSelf → restore-on-failure) is therefore
 	// single-threaded and matches LifecycleManager.tryReload's pattern.
+	var lastReadErrMsg string
 	tryPromote := func() bool {
-		fileToken, _ := auth.ReadTokenFile(tokenPath)
+		fileToken, readErr := auth.ReadTokenFile(tokenPath)
+		if readErr != nil {
+			// ReadTokenFile returns ("", nil) for a missing file, so a
+			// non-nil error means the file exists but is unreadable (bad
+			// permissions, IO error) — actionable, unlike the normal
+			// "not written yet" state. De-duplicate so a persistent fault
+			// doesn't warn on every 10s tick; re-log only when the error
+			// first appears or its text changes.
+			if msg := readErr.Error(); msg != lastReadErrMsg {
+				slog.Warn("cannot read vault token file; will keep waiting", "error", readErr, "path", tokenPath)
+				lastReadErrMsg = msg
+			}
+			return false
+		}
+		lastReadErrMsg = ""
 		if fileToken == "" || fileToken == vc.Token() {
 			return false
 		}

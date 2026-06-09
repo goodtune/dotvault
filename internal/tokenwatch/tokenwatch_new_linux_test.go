@@ -33,8 +33,14 @@ func TestNew_RegistersBeforeReturn(t *testing.T) {
 	writeTokenAtomically(t, tokenPath, "written-before-run")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = w.Run(ctx) }()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); _ = w.Run(ctx) }()
+	// Stop Run and wait for it to return before the deferred w.Close()
+	// fires. Closing the inotify fd while Run is still blocked in
+	// Poll/Read is the use-after-close this PR fixes in production, and
+	// would make the test racy. Defers run LIFO, so this runs before the
+	// w.Close() deferred above.
+	defer func() { cancel(); <-runDone }()
 
 	select {
 	case <-ch:
@@ -103,8 +109,11 @@ func TestNew_ReconcilingReadPattern(t *testing.T) {
 	defer w.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = w.Run(ctx) }()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); _ = w.Run(ctx) }()
+	// Wait for Run to return before the deferred w.Close() fires — same
+	// use-after-close avoidance as TestNew_RegistersBeforeReturn.
+	defer func() { cancel(); <-runDone }()
 
 	// No write happens after the watch is live, so no event must fire —
 	// the pre-existing file is invisible to inotify, which is exactly

@@ -25,6 +25,7 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
+	"github.com/goodtune/dotvault/internal/remoteconfig"
 	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
@@ -211,17 +212,101 @@ func newVersionCmd() *cobra.Command {
 	return cmd
 }
 
-// loadConfig loads the effective configuration and returns it alongside the
-// path it was loaded from, so callers can reuse the same string for the
-// loaded config and any subsequent reference (reload, log attribute, status
-// output). It applies the --config override policy via resolveConfigSource.
+// loadConfig loads the effective configuration — the local base merged with
+// the remote overlay when remote_config is configured — and returns it
+// alongside the path it was loaded from, so callers can reuse the same string
+// for the loaded config and any subsequent reference (reload, log attribute,
+// status output). It applies the --config override policy via
+// resolveConfigSource.
 func loadConfig() (*config.Config, string, error) {
+	cfg, path, _, err := loadConfigRemote()
+	return cfg, path, err
+}
+
+// loadConfigRemote is loadConfig with the remote-fetch status function
+// exposed, for callers that surface the overlay state (dotvault status).
+// The status func returns nil until a remote URL is configured and a fetch
+// has been attempted.
+func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, error) {
+	load, path, err := resolveConfigSource()
+	if err != nil {
+		return nil, path, nil, err
+	}
+	merged, status := withRemote(load)
+	cfg, err := merged()
+	return cfg, path, status, err
+}
+
+// loadConfigLocalOnly loads and validates the local base configuration
+// without ever touching the network, even when remote_config is set. Used by
+// login and login-check: both consume only the local-only vault section, and
+// login-check runs in shell-startup paths where a remote fetch's latency
+// budget is unacceptable.
+func loadConfigLocalOnly() (*config.Config, string, error) {
 	load, path, err := resolveConfigSource()
 	if err != nil {
 		return nil, path, err
 	}
 	cfg, err := load()
-	return cfg, path, err
+	if err != nil {
+		return nil, path, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, path, fmt.Errorf("validate config: %w", err)
+	}
+	return cfg, path, nil
+}
+
+// withRemote wraps a raw config loader with the remote-config overlay
+// pipeline: parse base → fetch the remote partial (ETag-cached, fail-open) →
+// merge → validate the merged result. When no remote URL is configured the
+// wrapper just validates the base, so every subcommand funnels through one
+// validation path.
+//
+// One Fetcher persists across loader calls (the daemon's reload loop reuses
+// the closure every tick) so the conditional-GET state survives; it is
+// rebuilt only if the base's remote_config section itself changes. Fetch
+// failures never abort the load — the fetcher resolves down its fail-open
+// ladder (fresh → cache → base-only) — but local misconfiguration surfaced
+// by remoteconfig.New (unreadable ca_cert) is a hard error.
+func withRemote(load func() (*config.Config, error)) (func() (*config.Config, error), func() *remoteconfig.Status) {
+	var fetcher atomic.Pointer[remoteconfig.Fetcher]
+
+	loader := func() (*config.Config, error) {
+		cfg, err := load()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.RemoteConfig.URL != "" {
+			f := fetcher.Load()
+			if f == nil || !reflect.DeepEqual(f.Config(), cfg.RemoteConfig) {
+				nf, ferr := remoteconfig.New(cfg.RemoteConfig, version)
+				if ferr != nil {
+					return nil, fmt.Errorf("remote config: %w", ferr)
+				}
+				fetcher.Store(nf)
+				f = nf
+			}
+			partial, ferr := f.Fetch(context.Background())
+			if ferr != nil {
+				return nil, fmt.Errorf("remote config: %w", ferr)
+			}
+			config.ApplyPartial(cfg, partial)
+		}
+		if err := cfg.Validate(); err != nil {
+			return nil, fmt.Errorf("validate config: %w", err)
+		}
+		return cfg, nil
+	}
+	status := func() *remoteconfig.Status {
+		f := fetcher.Load()
+		if f == nil {
+			return nil
+		}
+		s := f.Status()
+		return &s
+	}
+	return loader, status
 }
 
 // resolveConfigSource decides where configuration is loaded from and returns
@@ -230,6 +315,11 @@ func loadConfig() (*config.Config, string, error) {
 // agree on the source — and on a single resolved path, since
 // paths.SystemConfigPath on Linux consults XDG_CONFIG_DIRS via os.Stat and two
 // back-to-back calls can disagree if the filesystem changes between them.
+//
+// The returned loader parses but does NOT validate (LoadSystemRaw/LoadRaw):
+// validation belongs to the merged result, after the remote overlay is
+// applied. Callers wrap the loader via withRemote (or validate explicitly,
+// as loadConfigLocalOnly does) rather than consuming it directly.
 //
 // Without --config the loader uses the normal system source (Windows GPO
 // registry, else the system YAML file). With --config the override is honoured
@@ -240,7 +330,7 @@ func loadConfig() (*config.Config, string, error) {
 func resolveConfigSource() (func() (*config.Config, error), string, error) {
 	systemPath := paths.SystemConfigPath()
 	if flagConfig == "" {
-		return func() (*config.Config, error) { return config.LoadSystem(systemPath) }, systemPath, nil
+		return func() (*config.Config, error) { return config.LoadSystemRaw(systemPath) }, systemPath, nil
 	}
 
 	// Capture the override path in a local so the loader closure (reused by the
@@ -263,9 +353,9 @@ func resolveConfigSource() (func() (*config.Config, error), string, error) {
 				"(BypassSystemConfig=1 in its Group Policy registry equivalent)", override)
 	}
 	// Override allowed: load the file directly, deliberately bypassing the
-	// registry (config.Load, not config.LoadSystem) so the override actually
+	// registry (LoadRaw, not LoadSystemRaw) so the override actually
 	// takes effect on a GPO-managed machine that opted into the bypass.
-	return func() (*config.Config, error) { return config.Load(override) }, override, nil
+	return func() (*config.Config, error) { return config.LoadRaw(override) }, override, nil
 }
 
 // emitConfigSourceLog surfaces a WARN OTel log record when the
@@ -292,13 +382,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return runSync(cmd, args)
 	}
 
-	loadCfg, cfgPath, err := resolveConfigSource()
+	loadBase, cfgPath, err := resolveConfigSource()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// loadCfg is the loader the daemon holds for its lifetime: the reload
+	// loop re-runs it every tick, and the remote overlay (conditional GET +
+	// merge) lives inside it so reloads converge on the remote state.
+	loadCfg, remoteStatus := withRemote(loadBase)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+	if rs := remoteStatus(); rs != nil {
+		slog.Info("remote config overlay active",
+			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -826,7 +924,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 func runStatus(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, _, err := loadConfig()
+	cfg, _, remoteStatus, err := loadConfigRemote()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -873,9 +971,36 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printRemoteConfigStatus(remoteStatus)
+
 	printAgentStatus(ctx, cfg)
 
 	return nil
+}
+
+// printRemoteConfigStatus renders the remote-config section of `dotvault
+// status`. Only relevant when a remote URL is configured: the status func
+// returns nil otherwise and nothing is printed.
+func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
+	if remoteStatus == nil {
+		return
+	}
+	rs := remoteStatus()
+	if rs == nil {
+		return
+	}
+	fmt.Println("\nRemote Config:")
+	fmt.Printf("  url:    %s\n", rs.URL)
+	fmt.Printf("  source: %s\n", rs.Source)
+	if rs.ETag != "" {
+		fmt.Printf("  etag:   %s\n", rs.ETag)
+	}
+	if !rs.LastSuccess.IsZero() {
+		fmt.Printf("  last success: %s\n", rs.LastSuccess.Format("2006-01-02 15:04:05"))
+	}
+	if rs.LastError != "" {
+		fmt.Printf("  last error:   %s\n", rs.LastError)
+	}
 }
 
 // printAgentStatus renders the SSH agent section of `dotvault status`. The
@@ -929,7 +1054,9 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 func runLogin(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, _, err := loadConfig()
+	// Local-only: login consumes just the vault section (always local) and
+	// must not pay for a remote fetch.
+	cfg, _, err := loadConfigLocalOnly()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -1107,7 +1234,10 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	cfg, _, err := loadConfig()
+	// Local-only: login-check runs from shell-startup profiles where a
+	// remote fetch's latency is unacceptable, and it consumes just the
+	// vault section (always local).
+	cfg, _, err := loadConfigLocalOnly()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

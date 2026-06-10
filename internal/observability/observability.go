@@ -414,6 +414,7 @@ var (
 	enrolAttempts   metric.Int64Counter
 	webRequests     metric.Int64Counter
 	configReloads   metric.Int64Counter
+	remoteFetches   metric.Int64Counter
 	sighupAttempts  metric.Int64Counter
 )
 
@@ -467,6 +468,10 @@ func rebindInstruments() {
 	configReloads, _ = meter.Int64Counter(
 		"dotvault.config.reloads",
 		metric.WithDescription("Configuration reload attempts and outcomes"),
+	)
+	remoteFetches, _ = meter.Int64Counter(
+		"dotvault.remoteconfig.fetches",
+		metric.WithDescription("Remote configuration fetch attempts by outcome"),
 	)
 	sighupAttempts, _ = meter.Int64Counter(
 		"dotvault.sighup.received",
@@ -589,6 +594,20 @@ func RecordWebRequest(ctx context.Context, route string, statusClass string) {
 func RecordConfigReload(ctx context.Context, outcome string) {
 	instrMu.RLock()
 	c := configReloads
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// RecordRemoteConfigFetch records a remote-config fetch attempt and where
+// the document resolved from. Outcomes: "fresh" (200), "not_modified" (304
+// validating the cache), "cache_fallback" (fetch failed, last-known-good
+// used), "base_only" (fetch failed, no usable cache).
+func RecordRemoteConfigFetch(ctx context.Context, outcome string) {
+	instrMu.RLock()
+	c := remoteFetches
 	instrMu.RUnlock()
 	if c == nil {
 		return

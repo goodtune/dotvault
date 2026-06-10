@@ -99,6 +99,7 @@ type Config struct {
 	Web           WebConfig            `yaml:"web"`
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
+	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
 
@@ -313,18 +314,36 @@ var validFormats = map[string]bool{
 // either spam stdout on every CLI invocation under GPO or vanish into
 // the no-op logger that exists before observability.Init runs.
 func LoadSystem(path string) (*Config, error) {
+	cfg, err := LoadSystemRaw(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.validate(); err != nil {
+		if cfg.Managed {
+			return nil, fmt.Errorf("validate registry config: %w", err)
+		}
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
+	return cfg, nil
+}
+
+// LoadSystemRaw is LoadSystem without the final validation pass: it resolves
+// the platform-appropriate source (registry vs YAML file, with Managed set
+// exactly as LoadSystem does) and parses it, but leaves validation to the
+// caller. The remote-config overlay needs this seam: a base that declares
+// remote_config may legitimately fail full validation on its own (e.g. zero
+// rules), so the loader parses the base, merges the fetched overlay, then
+// runs Validate on the merged result.
+func LoadSystemRaw(path string) (*Config, error) {
 	cfg, managed, err := loadFromRegistry()
 	if err != nil {
 		return nil, fmt.Errorf("read registry config: %w", err)
 	}
 	if managed {
-		if err := cfg.validate(); err != nil {
-			return nil, fmt.Errorf("validate registry config: %w", err)
-		}
 		cfg.Managed = true
 		return cfg, nil
 	}
-	return Load(path)
+	return LoadRaw(path)
 }
 
 // SystemConfigBypass reports whether the system-wide configuration permits a
@@ -396,6 +415,22 @@ func SystemConfigBypass(systemPath string) (bool, error) {
 
 // Load reads and validates a config file at the given path.
 func Load(path string) (*Config, error) {
+	cfg, err := LoadRaw(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("validate config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// LoadRaw reads and parses a config file without validating it (the
+// group/world-writable permission warning is still emitted). See
+// LoadSystemRaw for why the parse/validate seam exists.
+func LoadRaw(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -411,11 +446,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("validate config: %w", err)
-	}
-
 	return &cfg, nil
+}
+
+// Validate validates the configuration and applies defaults in place. It is
+// the exported counterpart of the validation Load/LoadSystem run internally,
+// for callers that assemble a Config from raw parts — the remote-config
+// overlay parses the base via LoadRaw/LoadSystemRaw, merges the fetched
+// Partial, then validates the merged result here.
+func (c *Config) Validate() error {
+	return c.validate()
 }
 
 func (c *Config) validate() error {
@@ -550,62 +590,98 @@ func (c *Config) validate() error {
 		}
 	}
 
-	// Rules validation
+	// Remote-config validation (URL shape, refresh interval, header
+	// hygiene). Runs unconditionally — the header character checks apply
+	// even when the overlay is disabled, mirroring the observability
+	// headers treatment above.
+	if err := c.RemoteConfig.validate(); err != nil {
+		return err
+	}
+
+	// Rules validation. A config carrying a remote overlay may legitimately
+	// have zero local rules — the remote document supplies them — so the
+	// hard requirement only applies when no remote URL is configured. The
+	// merged config (base ⊕ remote) passes through here too: zero rules
+	// after the merge is a warning rather than an error, letting the daemon
+	// start, idle, and converge when the remote service serves rules.
 	if len(c.Rules) == 0 {
-		return fmt.Errorf("at least one rule is required")
+		if c.RemoteConfig.URL == "" {
+			return fmt.Errorf("at least one rule is required")
+		}
+		slog.Warn("no sync rules configured; expecting rules from the remote config service", "url", c.RemoteConfig.URL)
 	}
 
 	seen := make(map[string]bool)
 	for i, r := range c.Rules {
-		if r.Name == "" {
-			return fmt.Errorf("rules[%d].name is required", i)
-		}
-		if seen[r.Name] {
-			return fmt.Errorf("duplicate rule name %q", r.Name)
-		}
-		seen[r.Name] = true
-
-		if r.VaultKey == "" {
-			return fmt.Errorf("rules[%d] (%s): vault_key is required", i, r.Name)
-		}
-		if r.Target.Path == "" {
-			return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
-		}
-		if !validFormats[r.Target.Format] {
-			return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
+		if err := validateRule(i, r, seen); err != nil {
+			return err
 		}
 	}
 
 	// Enrolments validation
 	for key, e := range c.Enrolments {
-		if strings.TrimSpace(key) == "" {
-			return fmt.Errorf("enrolment key must not be empty or whitespace")
-		}
-		if err := validateEnrolmentKey(key); err != nil {
-			return fmt.Errorf("enrolments[%q]: %w", key, err)
-		}
-		if e.Engine == "" {
-			return fmt.Errorf("enrolments[%q].engine is required", key)
-		}
-
-		// Engine-agnostic validation of token_ttl if present: must parse
-		// as a duration and be no smaller than the 10-minute floor so
-		// engines that refresh don't thrash the upstream API.
-		if raw, ok := e.Settings["token_ttl"]; ok {
-			s, ok := raw.(string)
-			if !ok {
-				return fmt.Errorf("enrolments[%q].settings.token_ttl must be a string, got %T", key, raw)
-			}
-			d, err := ParseDuration(s)
-			if err != nil {
-				return fmt.Errorf("enrolments[%q].settings.token_ttl %q: %w", key, s, err)
-			}
-			if d < 10*time.Minute {
-				return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
-			}
+		if err := validateEnrolment(key, e); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// validateRule checks a single rule's required fields and name uniqueness
+// (seen accumulates names across the containing slice). Shared by the full
+// config validation and (*Partial).Validate so the two paths cannot drift.
+func validateRule(i int, r Rule, seen map[string]bool) error {
+	if r.Name == "" {
+		return fmt.Errorf("rules[%d].name is required", i)
+	}
+	if seen[r.Name] {
+		return fmt.Errorf("duplicate rule name %q", r.Name)
+	}
+	seen[r.Name] = true
+
+	if r.VaultKey == "" {
+		return fmt.Errorf("rules[%d] (%s): vault_key is required", i, r.Name)
+	}
+	if r.Target.Path == "" {
+		return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
+	}
+	if !validFormats[r.Target.Format] {
+		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
+	}
+	return nil
+}
+
+// validateEnrolment checks one enrolment entry: key shape, engine presence,
+// and engine-agnostic settings. Shared by the full config validation and
+// (*Partial).Validate so the two paths cannot drift.
+func validateEnrolment(key string, e Enrolment) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("enrolment key must not be empty or whitespace")
+	}
+	if err := validateEnrolmentKey(key); err != nil {
+		return fmt.Errorf("enrolments[%q]: %w", key, err)
+	}
+	if e.Engine == "" {
+		return fmt.Errorf("enrolments[%q].engine is required", key)
+	}
+
+	// Engine-agnostic validation of token_ttl if present: must parse
+	// as a duration and be no smaller than the 10-minute floor so
+	// engines that refresh don't thrash the upstream API.
+	if raw, ok := e.Settings["token_ttl"]; ok {
+		s, ok := raw.(string)
+		if !ok {
+			return fmt.Errorf("enrolments[%q].settings.token_ttl must be a string, got %T", key, raw)
+		}
+		d, err := ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("enrolments[%q].settings.token_ttl %q: %w", key, s, err)
+		}
+		if d < 10*time.Minute {
+			return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
+		}
+	}
 	return nil
 }
 

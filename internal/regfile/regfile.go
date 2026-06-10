@@ -46,6 +46,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeSync(cfg.Sync)
 	e.writeWeb(cfg.Web)
 	e.writeObservability(cfg.Observability)
+	e.writeRemoteConfig(cfg.RemoteConfig)
 	e.writeAgent(cfg.Agent)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -168,6 +169,41 @@ func (e *emitter) writeObservability(o config.ObservabilityConfig) {
 	sort.Strings(names)
 	for _, n := range names {
 		e.writeString(n, o.Headers[n])
+	}
+	e.WriteString("\r\n")
+}
+
+// writeRemoteConfig emits the RemoteConfig section: the scalar fields, then
+// the Headers map as a dedicated subkey, following the Observability\Headers
+// pattern exactly — the dynamic subtree is deleted before re-creation so a
+// header removed from the source clears on re-import. Unlike observability
+// headers these values are not credentials (they are client-asserted
+// dimension labels like X-Dotvault-Env), but they share the same
+// verbatim-name, lossless round-trip contract.
+func (e *emitter) writeRemoteConfig(r config.RemoteConfig) {
+	e.writeKey(rootKey + `\RemoteConfig`)
+	e.writeString("URL", r.URL)
+	// Emit RawRefreshInterval as the user wrote it (matching writeSync); the
+	// value name mirrors the YAML key (refresh_interval) capitalised for the
+	// registry.
+	e.writeString("RefreshInterval", r.RawRefreshInterval)
+	e.writeString("CACert", r.CACert)
+	e.WriteString("\r\n")
+
+	// Always pre-delete the Headers subtree so removals round-trip. No-op on
+	// a registry that never had it.
+	e.writeKeyDeletion(rootKey + `\RemoteConfig\Headers`)
+	if len(r.Headers) == 0 {
+		return
+	}
+	e.writeKey(rootKey + `\RemoteConfig\Headers`)
+	names := make([]string, 0, len(r.Headers))
+	for n := range r.Headers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		e.writeString(n, r.Headers[n])
 	}
 	e.WriteString("\r\n")
 }

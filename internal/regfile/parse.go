@@ -460,6 +460,7 @@ var canonicalSegments = map[string]string{
 	"sync":          "Sync",
 	"web":           "Web",
 	"observability": "Observability",
+	"remoteconfig":  "RemoteConfig",
 	"rules":         "Rules",
 	"enrolments":    "Enrolments",
 	"oauth":         "OAuth",
@@ -496,12 +497,14 @@ func canonicalizeKeyPath(path string) string {
 			parts[rootDepth+2] = c
 		}
 	}
-	// Observability\Headers is the one fixed segment at rootDepth+1 (a
-	// position otherwise reserved for user-defined rule/enrolment names,
-	// which we never fold). Canonicalise it only when its parent is the
-	// Observability section so a hand-authored .reg using `headers` in any
-	// case still matches the exact-string lookups in applyValues.
-	if len(parts) > rootDepth+1 && parts[rootDepth] == "Observability" &&
+	// Observability\Headers and RemoteConfig\Headers are the fixed segments
+	// at rootDepth+1 (a position otherwise reserved for user-defined
+	// rule/enrolment names, which we never fold). Canonicalise only when the
+	// parent is one of those sections so a hand-authored .reg using
+	// `headers` in any case still matches the exact-string lookups in
+	// applyValues.
+	if len(parts) > rootDepth+1 &&
+		(parts[rootDepth] == "Observability" || parts[rootDepth] == "RemoteConfig") &&
 		strings.EqualFold(parts[rootDepth+1], "Headers") {
 		parts[rootDepth+1] = "Headers"
 	}
@@ -688,6 +691,34 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 	if len(headers) > 0 {
 		cfg.Observability.Headers = headers
+	}
+
+	// RemoteConfig. Scalar fields mirror the renderer; Headers live in a
+	// dedicated subkey with the same dynamic-map contract as
+	// Observability\Headers.
+	remoteKey := rootKey + `\RemoteConfig`
+	for _, fn := range []func() error{
+		func() error { return apply(&cfg.RemoteConfig.URL, remoteKey, "URL") },
+		func() error { return apply(&cfg.RemoteConfig.RawRefreshInterval, remoteKey, "RefreshInterval") },
+		func() error { return apply(&cfg.RemoteConfig.CACert, remoteKey, "CACert") },
+	} {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	remoteHeadersKey := remoteKey + `\Headers`
+	remoteHeaders := map[string]string{}
+	for vk, v := range values {
+		if vk.key != remoteHeadersKey {
+			continue
+		}
+		if v.kind != rvSZ {
+			return fmt.Errorf("registry value %s\\%s has unsupported type %s for a remote-config header (only REG_SZ is supported)", remoteHeadersKey, vk.name, kindName(v.kind))
+		}
+		remoteHeaders[vk.name] = v.str
+	}
+	if len(remoteHeaders) > 0 {
+		cfg.RemoteConfig.Headers = remoteHeaders
 	}
 
 	// Agent.

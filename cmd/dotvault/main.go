@@ -309,6 +309,109 @@ func withRemote(load func() (*config.Config, error)) (func() (*config.Config, er
 	return loader, status
 }
 
+// refreshDeps carries the running subsystems the daemon's config-refresh
+// loop fans changes out to. web and enrolManager are optional: web is nil
+// outside web mode, enrolManager is nil outside CLI-interactive mode.
+type refreshDeps struct {
+	load     func() (*config.Config, error)
+	interval time.Duration
+	// trackSyncTicks is set when the refresh cadence defaulted to
+	// sync.interval (no explicit remote_config.refresh_interval); the loop
+	// then follows a remotely-changed sync interval instead of staying
+	// pinned to the startup value.
+	trackSyncTicks bool
+	initial        *config.Config
+	engine         *sync.Engine
+	refreshManager *enrol.RefreshManager
+	watchManager   *enrol.WatchManager
+	web            *web.Server
+	enrolManager   *enrol.Manager
+}
+
+// runConfigRefresh re-runs the daemon's config loader on a fixed tick — the
+// loader performs the remote overlay's conditional GET internally, so an
+// unchanged remote document costs one cheap 304 — and applies dynamic-section
+// changes to the running daemon: enrolments fan out to the enrolment manager
+// (CLI), the refresh/watch managers, and the web enrolment runner; rules and
+// the sync interval go to the sync engine and the web server's snapshots.
+// Static sections (vault, web, agent, observability) are exclusively local
+// and still require a restart, as documented.
+func runConfigRefresh(ctx context.Context, d refreshDeps) {
+	ticker := time.NewTicker(d.interval)
+	defer ticker.Stop()
+
+	lastEnrolments := d.initial.Enrolments
+	lastRules := d.initial.Rules
+	lastInterval := d.initial.Sync.Interval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reloaded, err := d.load()
+			if err != nil {
+				observability.RecordConfigReload(ctx, "error")
+				slog.Warn("config reload failed", "error", err)
+				continue
+			}
+
+			changed := false
+
+			if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+				// All-or-nothing: when the web runner is busy with a
+				// running enrolment the whole enrolment update is
+				// deferred (lastEnrolments stays put), so the next tick
+				// retries every consumer together rather than leaving
+				// the managers and the web runner disagreeing.
+				if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
+					slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
+				} else {
+					changed = true
+					slog.Info("enrolments config changed, re-checking")
+					if d.enrolManager != nil {
+						d.enrolManager.UpdateConfig(reloaded.Enrolments)
+					}
+					d.refreshManager.UpdateConfig(reloaded.Enrolments)
+					d.watchManager.UpdateConfig(reloaded.Enrolments)
+					lastEnrolments = reloaded.Enrolments
+				}
+			}
+
+			rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
+			intervalChanged := reloaded.Sync.Interval != lastInterval
+			if rulesChanged || intervalChanged {
+				changed = true
+				d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
+				if d.web != nil {
+					d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
+				}
+				if intervalChanged && d.trackSyncTicks {
+					ticker.Reset(reloaded.Sync.Interval)
+				}
+				lastRules = reloaded.Rules
+				lastInterval = reloaded.Sync.Interval
+			}
+
+			if changed {
+				observability.RecordConfigReload(ctx, "applied")
+			} else {
+				observability.RecordConfigReload(ctx, "no_change")
+			}
+
+			// CLI mode keeps its historical behaviour: re-check enrolments
+			// every tick and trigger a sync when something newly enrolled.
+			if d.enrolManager != nil {
+				if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
+					slog.Warn("enrolment check failed", "error", err)
+				} else if ok {
+					d.engine.TriggerSync()
+				}
+			}
+		}
+	}
+}
+
 // resolveConfigSource decides where configuration is loaded from and returns
 // a loader closure plus the path it reads. Both the initial load and the
 // daemon's periodic enrolment reload call the returned closure, so they always
@@ -527,6 +630,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			SyncCfg:       cfg.Sync,
 			ObsCfg:        obsCfgForWeb,
 			AgentCfg:      cfg.Agent,
+			RemoteCfg:     cfg.RemoteConfig,
+			RemoteStatus:  remoteStatus,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
@@ -705,6 +810,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// enrolMgr drives the terminal wizard and exists only in CLI-interactive
+	// mode; the refresh loop below treats it as optional.
+	var enrolMgr *enrol.Manager
 	if webServer != nil {
 		// Web mode: let the frontend drive enrolments.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
@@ -724,9 +832,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// Headless CLI mode: no web UI, no terminal. Skip the enrolment
 		// wizard entirely — engines that prompt would either fail or hang
 		// without a TTY. The RefreshManager started above continues to
-		// rotate already-enrolled credentials, but enrolment/config
-		// changes are not reloaded in this path and require a daemon
-		// restart to take effect.
+		// rotate already-enrolled credentials, and the config-refresh loop
+		// below still propagates rule/enrolment changes to the sync engine
+		// and refresh/watch managers; only the interactive wizard is
+		// unavailable in this mode.
 		if len(cfg.Enrolments) > 0 {
 			slog.Info("skipping enrolment wizard: stdin is not a terminal and web UI is not running")
 		}
@@ -751,7 +860,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				return string(pass), nil
 			},
 		}
-		enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+		enrolMgr = enrol.NewManager(enrol.ManagerConfig{
 			Enrolments: cfg.Enrolments,
 			KVMount:    cfg.Vault.KVMount,
 			UserPrefix: cfg.Vault.UserPrefix + username + "/",
@@ -759,48 +868,29 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		if _, err := enrolMgr.CheckAll(ctx); err != nil {
 			slog.Warn("enrolment check failed", "error", err)
 		}
-
-		// Background goroutine: reload config on each tick and re-check enrolments.
-		// Reuses the loadCfg closure captured at startup so the reload loop tracks
-		// the exact source the daemon first loaded — the same resolved system path
-		// (even if the filesystem state SystemConfigPath consults via
-		// XDG_CONFIG_DIRS on Linux changes) or the same --config override file,
-		// applying the bypass policy once at startup rather than re-deciding it
-		// every tick.
-		go func() {
-			ticker := time.NewTicker(cfg.Sync.Interval)
-			defer ticker.Stop()
-			lastEnrolments := cfg.Enrolments
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					reloaded, err := loadCfg()
-					if err != nil {
-						observability.RecordConfigReload(ctx, "error")
-						slog.Warn("config reload failed", "error", err)
-						continue
-					}
-					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-						observability.RecordConfigReload(ctx, "applied")
-						slog.Info("enrolments config changed, re-checking")
-						enrolMgr.UpdateConfig(reloaded.Enrolments)
-						rm.UpdateConfig(reloaded.Enrolments)
-						wm.UpdateConfig(reloaded.Enrolments)
-						lastEnrolments = reloaded.Enrolments
-					} else {
-						observability.RecordConfigReload(ctx, "no_change")
-					}
-					if ok, err := enrolMgr.CheckAll(ctx); err != nil {
-						slog.Warn("enrolment check failed", "error", err)
-					} else if ok {
-						engine.TriggerSync()
-					}
-				}
-			}
-		}()
 	}
+
+	// Config refresh loop — runs in every daemon mode (web, headless, CLI).
+	// Reuses the loadCfg closure captured at startup so each tick tracks the
+	// exact source the daemon first loaded (same resolved system path, same
+	// --config override, bypass policy decided once) and re-runs the remote
+	// overlay's conditional GET, then fans dynamic-section changes out to the
+	// running subsystems.
+	refreshInterval := cfg.Sync.Interval
+	if cfg.RemoteConfig.RefreshInterval > 0 {
+		refreshInterval = cfg.RemoteConfig.RefreshInterval
+	}
+	go runConfigRefresh(ctx, refreshDeps{
+		load:           loadCfg,
+		interval:       refreshInterval,
+		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
+		initial:        cfg,
+		engine:         engine,
+		refreshManager: rm,
+		watchManager:   wm,
+		web:            webServer,
+		enrolManager:   enrolMgr,
+	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 

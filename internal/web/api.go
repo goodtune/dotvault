@@ -78,6 +78,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["agent"] = s.agentStatus.Status(ctx)
 	}
 
+	// Remote-config overlay state (url, source, etag, last attempt/success,
+	// last error), parallel to the per-rule sync state. Config is not
+	// secret, so this is served unauthenticated like the rule state.
+	if s.remoteStatus != nil {
+		if rs := s.remoteStatus(); rs != nil {
+			status["remote_config"] = rs
+		}
+	}
+
 	writeJSON(w, status)
 }
 
@@ -92,8 +101,9 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		OAuthProvider string `json:"oauth_provider,omitempty"`
 	}
 
-	rules := make([]ruleResponse, len(s.rules))
-	for i, r := range s.rules {
+	current := s.getRules()
+	rules := make([]ruleResponse, len(current))
+	for i, r := range current {
 		rules[i] = ruleResponse{
 			Name:        r.Name,
 			Description: r.Description,
@@ -147,8 +157,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		Status     string         `json:"status,omitempty"`
 	}
 
-	rules := make([]ruleView, len(s.rules))
-	for i, rule := range s.rules {
+	currentRules := s.getRules()
+	rules := make([]ruleView, len(currentRules))
+	for i, rule := range currentRules {
 		rules[i] = ruleView{
 			Name:        rule.Name,
 			Description: rule.Description,
@@ -199,9 +210,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		enrolments = append(enrolments, ev)
 	}
 
-	syncInterval := s.syncCfg.RawInterval
-	if syncInterval == "" && s.syncCfg.Interval > 0 {
-		syncInterval = formatDuration(s.syncCfg.Interval)
+	currentSync := s.getSyncCfg()
+	syncInterval := currentSync.RawInterval
+	if syncInterval == "" && currentSync.Interval > 0 {
+		syncInterval = formatDuration(currentSync.Interval)
 	}
 
 	web := map[string]any{
@@ -232,6 +244,27 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"web":        web,
 		"rules":      rules,
 		"enrolments": enrolments,
+	}
+
+	// Remote-config overlay summary. The redacted view exposes the header
+	// *names* only — values are operator-defined dimension labels and flow
+	// through the lossless download endpoint instead, mirroring how
+	// observability headers are handled.
+	if s.remoteCfg.URL != "" {
+		rc := map[string]any{
+			"url":              s.remoteCfg.URL,
+			"refresh_interval": s.remoteCfg.RawRefreshInterval,
+			"has_ca_cert":      s.remoteCfg.CACert != "",
+		}
+		if len(s.remoteCfg.Headers) > 0 {
+			names := make([]string, 0, len(s.remoteCfg.Headers))
+			for k := range s.remoteCfg.Headers {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			rc["header_names"] = names
+		}
+		resp["remote_config"] = rc
 	}
 	writeJSON(w, resp)
 }
@@ -464,12 +497,11 @@ func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 // daemon is using 15m. Materialise RawInterval from Interval whenever
 // it's empty so the download reflects the effective configuration.
 func (s *Server) buildEffectiveConfig() *config.Config {
-	rules := make([]config.Rule, len(s.rules))
-	copy(rules, s.rules)
+	rules := s.getRules()
 
 	enrolments := s.getEnrolments()
 
-	syncCfg := s.syncCfg
+	syncCfg := s.getSyncCfg()
 	if syncCfg.RawInterval == "" && syncCfg.Interval > 0 {
 		syncCfg.RawInterval = formatDuration(syncCfg.Interval)
 	}
@@ -498,6 +530,7 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		Web:           s.cfg,
 		Observability: obsCfg,
 		Agent:         s.agentCfg,
+		RemoteConfig:  s.remoteCfg,
 		Rules:         rules,
 		Enrolments:    enrolments,
 	}

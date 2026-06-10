@@ -19,26 +19,36 @@ import (
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/remoteconfig"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // Server is the web UI HTTP server.
 type Server struct {
-	cfg                config.WebConfig
-	vaultCfg           config.VaultConfig
-	syncCfg            config.SyncConfig
-	obsCfg             config.ObservabilityConfig
-	vault              *vault.Client
-	engine             *internalsync.Engine
-	agentStatus        agentStatusProvider
-	agentCfg           config.AgentConfig
-	csrf               *CSRFStore
-	oauth              *OAuthManager
-	login              *auth.LoginTracker
-	mux                *http.ServeMux
-	server             *http.Server
+	cfg         config.WebConfig
+	vaultCfg    config.VaultConfig
+	obsCfg      config.ObservabilityConfig
+	vault       *vault.Client
+	engine      *internalsync.Engine
+	agentStatus agentStatusProvider
+	agentCfg    config.AgentConfig
+	// remoteCfg is the local-only remote_config section, retained so the
+	// config-download endpoint round-trips it; remoteStatus (nil-safe)
+	// reports the overlay's last fetch outcome for /api/v1/status.
+	remoteCfg    config.RemoteConfig
+	remoteStatus func() *remoteconfig.Status
+	csrf         *CSRFStore
+	oauth        *OAuthManager
+	login        *auth.LoginTracker
+	mux          *http.ServeMux
+	server       *http.Server
+	// rulesMu guards rules and syncCfg, which the daemon's config-refresh
+	// loop swaps at runtime via UpdateDynamicConfig while request handlers
+	// read them.
+	rulesMu            sync.RWMutex
 	rules              []config.Rule
+	syncCfg            config.SyncConfig
 	enrolments         map[string]config.Enrolment
 	kvMount            string
 	userPrefix         string
@@ -96,7 +106,14 @@ type ServerConfig struct {
 	// config-download endpoint re-emits, so it round-trips through the same
 	// YAML/.reg renderers as every other section even when the daemon loaded
 	// its config from a Windows GPO.
-	AgentCfg      config.AgentConfig
+	AgentCfg config.AgentConfig
+	// RemoteCfg is the local-only remote_config section, retained for the
+	// config-download round-trip (like AgentCfg).
+	RemoteCfg config.RemoteConfig
+	// RemoteStatus, when non-nil, reports the remote-config overlay's last
+	// fetch outcome; surfaced on /api/v1/status alongside the per-rule sync
+	// state. It may return nil before the first fetch.
+	RemoteStatus  func() *remoteconfig.Status
 	Username      string
 	TokenFilePath string
 	Version       string
@@ -126,6 +143,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		engine:             sc.Engine,
 		agentStatus:        sc.Agent,
 		agentCfg:           sc.AgentCfg,
+		remoteCfg:          sc.RemoteCfg,
+		remoteStatus:       sc.RemoteStatus,
 		csrf:               NewCSRFStore(),
 		oauth:              NewOAuthManager(),
 		login:              auth.NewLoginTracker(sc.Vault),
@@ -698,6 +717,49 @@ func (s *Server) getEnrolRunner() *EnrolmentRunner {
 	s.enrolRunnerMu.RLock()
 	defer s.enrolRunnerMu.RUnlock()
 	return s.enrolRunner
+}
+
+// getRules returns a copy of the current rules slice, safe for concurrent
+// use against the daemon's runtime config refresh.
+func (s *Server) getRules() []config.Rule {
+	s.rulesMu.RLock()
+	defer s.rulesMu.RUnlock()
+	out := make([]config.Rule, len(s.rules))
+	copy(out, s.rules)
+	return out
+}
+
+// getSyncCfg returns the current sync section under the same lock as rules.
+func (s *Server) getSyncCfg() config.SyncConfig {
+	s.rulesMu.RLock()
+	defer s.rulesMu.RUnlock()
+	return s.syncCfg
+}
+
+// UpdateDynamicConfig swaps the rule and sync sections the web server serves.
+// Called by the daemon's config-refresh loop when the remote overlay (or an
+// edited local config) changes them at runtime, so the dashboard, the rules
+// API, and the Effective Configuration download all reflect the live state.
+func (s *Server) UpdateDynamicConfig(rules []config.Rule, syncCfg config.SyncConfig) {
+	s.rulesMu.Lock()
+	defer s.rulesMu.Unlock()
+	s.rules = append([]config.Rule(nil), rules...)
+	s.syncCfg = syncCfg
+}
+
+// UpdateEnrolments swaps the web enrolment runner for a changed enrolments
+// map at runtime. It refuses (returning false) while an enrolment is
+// mid-run, because InitEnrolments replaces the runner wholesale and would
+// orphan the running engine's progress — the caller retries on its next
+// refresh tick. The check-then-swap is not atomic with a concurrent start,
+// but the refresh cadence makes that window academic and the consequence is
+// a re-runnable enrolment, not corruption.
+func (s *Server) UpdateEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) bool {
+	if runner := s.getEnrolRunner(); runner != nil && runner.AnyRunning() {
+		return false
+	}
+	s.InitEnrolments(ctx, enrolments)
+	return true
 }
 
 // getEnrolments returns a shallow copy of the configured enrolments map,

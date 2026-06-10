@@ -62,7 +62,7 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 
 	// Find the rule
 	var found bool
-	for _, rule := range s.rules {
+	for _, rule := range s.getRules() {
 		if rule.Name == ruleName && rule.OAuth != nil {
 			found = true
 

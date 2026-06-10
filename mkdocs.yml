@@ -55,6 +55,7 @@ nav:
       - Config File Reference: configuration/config-reference.md
       - Sync Rules: configuration/sync-rules.md
       - Templates: configuration/templates.md
+      - Remote Configuration: configuration/remote-config.md
   - Authentication:
       - Overview: authentication/overview.md
       - OIDC & SSO: authentication/oidc.md

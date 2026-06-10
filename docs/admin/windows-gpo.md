@@ -82,6 +82,17 @@ The block drives both signals (metrics and logs) against the same collector. For
 !!! warning "Observability headers carry credentials"
     OTLP `headers` typically hold bearer tokens (Datadog / Grafana Cloud / Honeycomb, etc.). Config conversion is lossless in every direction, so `reg-export` and `reg-import` **do** round-trip header values verbatim (each as a REG_SZ value under `Observability\Headers`) — which means a generated `.reg` artefact contains the live tokens. Treat it as a secret: store it at restricted permissions and don't check it in. If you would rather keep tokens out of the policy hive and out of any exported artefact, leave `headers` empty and set them via the per-user `EnvironmentFile` (`OTEL_EXPORTER_OTLP_HEADERS`) instead — the SDK falls through to those env vars.
 
+### Remote configuration (`RemoteConfig\` subkey)
+
+| Registry value | Type | Description |
+|---------------|------|-------------|
+| `RemoteConfig\URL` | REG_SZ | Remote configuration endpoint (`https` required except loopback hosts) |
+| `RemoteConfig\RefreshInterval` | REG_SZ | Re-fetch cadence (e.g. `15m`; default: the sync interval; floor `1m`) |
+| `RemoteConfig\CACert` | REG_SZ | Path to a CA bundle pinning the service's TLS certificate |
+| `RemoteConfig\Headers\<name>` | REG_SZ | Extra dimension header sent with every fetch (e.g. `X-Dotvault-Env`) |
+
+When `URL` is set, the registry-delivered policy becomes the *base* configuration and the daemon merges the remotely fetched dynamic sections (rules, enrolments, sync) on top — see [Remote Configuration](../configuration/remote-config.md). A GPO base may deliberately carry zero rules when the remote service supplies them all. Unlike observability headers, these values are non-secret dimension labels; like every section, they round-trip losslessly through `reg-export` / `reg-import`.
+
 ### Rules (`Rules\{RuleName}` subkeys)
 
 Each rule is a subkey under `Rules\{RuleName}`:

@@ -127,6 +127,10 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
 
+## Remote config section
+
+See [Remote Configuration](remote-config.md) for details. When `remote_config.url` is set, the local file/registry config becomes a base that is overlaid with dynamic sections (`rules`, `enrolments`, `sync`) fetched from a `dotvault-config` service.
+
 ## Rules section
 
 See [Sync Rules](sync-rules.md) for details.
@@ -140,7 +144,7 @@ See [Service Onboarding](../services/overview.md) for details.
 dotvault validates the configuration on startup and exits with an error if:
 
 - `vault.address` is missing
-- No rules are defined
+- No rules are defined (waived when `remote_config.url` is set — the remote document may supply them)
 - Rule names are not unique
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`
 - `web.listen` resolves to a non-loopback address (when web is enabled)

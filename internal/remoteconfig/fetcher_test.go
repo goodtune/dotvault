@@ -345,6 +345,39 @@ func TestFetchStaticSectionRejectedFallsBack(t *testing.T) {
 	}
 }
 
+// TestFetchSucceedsWhenCacheWriteFails pins the fail-open contract on the
+// cache itself: an unwritable cache location degrades durability (no
+// last-known-good for later), never the current fetch.
+func TestFetchSucceedsWhenCacheWriteFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(testDoc))
+	}))
+	defer srv.Close()
+
+	// The cache path's parent is a regular file, so MkdirAll inside
+	// writeCache fails deterministically on every platform.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	f, err := New(config.RemoteConfig{URL: srv.URL}, "test-version",
+		WithCachePath(filepath.Join(blocker, "remote-config.json")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	p, err := f.Fetch(t.Context())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if p == nil || len(p.Rules) != 1 {
+		t.Fatalf("expected fetched document despite cache-write failure, got %+v", p)
+	}
+	if st := f.Status(); st.Source != "remote" || st.LastError != "" {
+		t.Errorf("status = %+v, want clean remote fetch", st)
+	}
+}
+
 func TestNewRejectsUnreadableCACert(t *testing.T) {
 	_, err := New(config.RemoteConfig{
 		URL:    "https://config.example.com",

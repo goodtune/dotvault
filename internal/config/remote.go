@@ -80,10 +80,14 @@ func (r *RemoteConfig) validate() error {
 		}
 	}
 
-	// Parsed even when URL is empty so a typo'd interval doesn't hide until
-	// the overlay is enabled — but only *applied* when a URL is configured:
-	// without one the overlay is inactive and must not influence the
-	// daemon's refresh cadence.
+	// RefreshInterval is derived state: recompute it from scratch on every
+	// validation so a struct validated more than once can never carry a
+	// stale value (e.g. URL cleared between validations). The raw string is
+	// parsed even when URL is empty so a typo'd interval doesn't hide until
+	// the overlay is enabled — but the parsed value is only *applied* when a
+	// URL is configured: an inactive overlay must not influence the daemon's
+	// refresh cadence.
+	r.RefreshInterval = 0
 	if r.RawRefreshInterval != "" {
 		d, err := ParseDuration(r.RawRefreshInterval)
 		if err != nil {

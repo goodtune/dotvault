@@ -226,13 +226,15 @@ func loadConfig() (*config.Config, string, error) {
 // loadConfigRemote is loadConfig with the remote-fetch status function
 // exposed, for callers that surface the overlay state (dotvault status).
 // The status func returns nil until a remote URL is configured and a fetch
-// has been attempted.
+// has been attempted. One-shot commands have no long-lived context to thread
+// through, so the fetch runs under context.Background() bounded by the
+// fetcher's own HTTP timeout.
 func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, error) {
 	load, path, err := resolveConfigSource()
 	if err != nil {
 		return nil, path, nil, err
 	}
-	merged, status := withRemote(load)
+	merged, status := withRemote(context.Background(), load)
 	cfg, err := merged()
 	return cfg, path, status, err
 }
@@ -263,13 +265,18 @@ func loadConfigLocalOnly() (*config.Config, string, error) {
 // wrapper just validates the base, so every subcommand funnels through one
 // validation path.
 //
+// ctx bounds the fetches issued by the returned loader: the daemon passes
+// its lifetime context so an in-flight fetch is cancelled on shutdown
+// instead of running out the HTTP timeout; one-shot commands pass
+// context.Background().
+//
 // One Fetcher persists across loader calls (the daemon's reload loop reuses
 // the closure every tick) so the conditional-GET state survives; it is
 // rebuilt only if the base's remote_config section itself changes. Fetch
 // failures never abort the load — the fetcher resolves down its fail-open
 // ladder (fresh → cache → base-only) — but local misconfiguration surfaced
 // by remoteconfig.New (unreadable ca_cert) is a hard error.
-func withRemote(load func() (*config.Config, error)) (func() (*config.Config, error), func() *remoteconfig.Status) {
+func withRemote(ctx context.Context, load func() (*config.Config, error)) (func() (*config.Config, error), func() *remoteconfig.Status) {
 	var fetcher atomic.Pointer[remoteconfig.Fetcher]
 
 	loader := func() (*config.Config, error) {
@@ -287,7 +294,7 @@ func withRemote(load func() (*config.Config, error)) (func() (*config.Config, er
 				fetcher.Store(nf)
 				f = nf
 			}
-			partial, ferr := f.Fetch(context.Background())
+			partial, ferr := f.Fetch(ctx)
 			if ferr != nil {
 				return nil, fmt.Errorf("remote config: %w", ferr)
 			}
@@ -485,6 +492,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return runSync(cmd, args)
 	}
 
+	// The daemon's lifetime context is created before the config loader so
+	// the remote overlay's fetches (initial load and every refresh tick) are
+	// cancelled on shutdown rather than running out the HTTP timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	loadBase, cfgPath, err := resolveConfigSource()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -492,7 +505,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// loadCfg is the loader the daemon holds for its lifetime: the reload
 	// loop re-runs it every tick, and the remote overlay (conditional GET +
 	// merge) lives inside it so reloads converge on the remote state.
-	loadCfg, remoteStatus := withRemote(loadBase)
+	loadCfg, remoteStatus := withRemote(ctx, loadBase)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -501,9 +514,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Info("remote config overlay active",
 			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start the systemd watchdog loop as early as possible. The loop
 	// is a no-op outside systemd and when WATCHDOG_USEC/NOTIFY_SOCKET

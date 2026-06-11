@@ -44,7 +44,7 @@ enrolments:
 		}, nil
 	}
 
-	merged, status := withRemote(baseLoader)
+	merged, status := withRemote(t.Context(), baseLoader)
 	cfg, err := merged()
 	if err != nil {
 		t.Fatalf("merged loader: %v", err)
@@ -70,7 +70,7 @@ func TestWithRemoteNoURLFailsClosed(t *testing.T) {
 			Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		}, nil
 	}
-	merged, status := withRemote(baseLoader)
+	merged, status := withRemote(t.Context(), baseLoader)
 	if _, err := merged(); err == nil {
 		t.Fatal("zero rules without a remote URL must fail validation")
 	}
@@ -95,7 +95,7 @@ func TestWithRemoteUnreachableServiceDegradesToBase(t *testing.T) {
 			RemoteConfig: config.RemoteConfig{URL: url},
 		}, nil
 	}
-	merged, status := withRemote(baseLoader)
+	merged, status := withRemote(t.Context(), baseLoader)
 	cfg, err := merged()
 	if err != nil {
 		t.Fatalf("merged loader with unreachable remote: %v", err)

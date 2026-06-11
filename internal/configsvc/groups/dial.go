@@ -32,6 +32,12 @@ func NewDialer(rawURL string, startTLS bool, caCert string) (*Dialer, error) {
 	if u.Scheme != "ldap" && u.Scheme != "ldaps" {
 		return nil, fmt.Errorf("ldap: url scheme must be ldap or ldaps, got %q", u.Scheme)
 	}
+	if u.Scheme == "ldaps" && startTLS {
+		// StartTLS upgrades a plaintext connection; ldaps is already TLS.
+		// Attempting the upgrade on an encrypted session fails confusingly
+		// at runtime, so refuse the combination at config time.
+		return nil, fmt.Errorf("ldap: start_tls cannot be combined with an ldaps:// url (the connection is already TLS)")
+	}
 
 	var tlsCfg *tls.Config
 	if u.Scheme == "ldaps" || startTLS {

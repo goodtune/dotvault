@@ -148,12 +148,15 @@ func (c *csrfStore) consume(token string) bool {
 	return c.now().Before(exp)
 }
 
-// randomToken returns 32 random bytes hex-encoded. rand.Read never fails on
-// supported platforms (it aborts the program rather than returning weak
-// randomness).
+// randomToken returns 32 random bytes hex-encoded. A session or CSRF token
+// minted from weak randomness would be guessable, so a randomness failure is
+// unrecoverable — panic rather than continue. (Modern Go aborts inside
+// rand.Read anyway; the explicit check makes the contract visible.)
 func randomToken() string {
 	var b [32]byte
-	rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("configsvc: crypto/rand failed: " + err.Error())
+	}
 	return hex.EncodeToString(b[:])
 }
 

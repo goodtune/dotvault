@@ -26,6 +26,7 @@ func TestNewLDAPValidation(t *testing.T) {
 		{"filter without placeholder", func(c *LDAPConfig) { c.Filter = "(objectClass=groupOfNames)" }, "%s"},
 		{"both password forms", func(c *LDAPConfig) { c.BindPassword = "x"; c.BindPasswordFile = "/run/secret" }, "mutually exclusive"},
 		{"missing ca_cert file", func(c *LDAPConfig) { c.CACert = "/nonexistent/ca.pem" }, "ca_cert"},
+		{"starttls with ldaps", func(c *LDAPConfig) { c.StartTLS = true }, "start_tls cannot be combined"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

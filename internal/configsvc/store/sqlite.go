@@ -12,8 +12,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// sqliteStore is the development/test backend: two tables matching the
-// design spec, layers(key, doc, updated_at) and groups(username, groups).
+// sqliteStore is the development/test backend: layers(key, doc, updated_at)
+// and groups(username, groups) per the design spec, plus
+// service_accounts(name, doc) for the admin surface.
 type sqliteStore struct {
 	db *sql.DB
 }

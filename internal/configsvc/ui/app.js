@@ -5,6 +5,13 @@
 
 const $ = (id) => document.getElementById(id);
 
+// Identity segments (usernames, account names) and layer-key segments may
+// legally contain spaces and other URL-reserved characters, so every value
+// interpolated into an API path is percent-encoded. Layer keys keep their
+// single "/" as a real separator; everything else is one opaque segment.
+const encSegment = encodeURIComponent;
+const encKey = (key) => key.split("/").map(encodeURIComponent).join("/");
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
   if (res.status === 401) {
@@ -117,7 +124,7 @@ async function openLayer(key, fresh = false) {
     $("layer-edit-doc").value = "";
     return;
   }
-  const res = await api(`/v1/admin/layers/${key}`);
+  const res = await api(`/v1/admin/layers/${encKey(key)}`);
   $("layer-edit-doc").value = res.ok ? await res.text() : "";
 }
 
@@ -130,7 +137,7 @@ $("layer-edit-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   setError("layer-error", "");
   const key = e.target.dataset.key;
-  const res = await mutate(`/v1/admin/layers/${key}`, {
+  const res = await mutate(`/v1/admin/layers/${encKey(key)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/yaml" },
     body: $("layer-edit-doc").value,
@@ -145,7 +152,7 @@ $("layer-edit-form").addEventListener("submit", async (e) => {
 $("layer-delete").addEventListener("click", async () => {
   const key = $("layer-edit-form").dataset.key;
   if (!confirm(`Delete layer ${key}?`)) return;
-  const res = await mutate(`/v1/admin/layers/${key}`, { method: "DELETE" });
+  const res = await mutate(`/v1/admin/layers/${encKey(key)}`, { method: "DELETE" });
   if (!res.ok) {
     setError("layer-error", await errorText(res));
     return;
@@ -163,7 +170,7 @@ async function loadGroups() {
   const rows = $("groups-rows");
   rows.replaceChildren();
   for (const user of users) {
-    const detail = await api(`/v1/admin/groups/${user}`);
+    const detail = await api(`/v1/admin/groups/${encSegment(user)}`);
     const { groups } = await detail.json();
     const tr = document.createElement("tr");
 
@@ -185,7 +192,7 @@ async function loadGroups() {
     del.className = "danger";
     del.addEventListener("click", async () => {
       if (!confirm(`Delete membership entry for ${user}?`)) return;
-      const dres = await mutate(`/v1/admin/groups/${user}`, { method: "DELETE" });
+      const dres = await mutate(`/v1/admin/groups/${encSegment(user)}`, { method: "DELETE" });
       if (!dres.ok) setError("groups-error", await errorText(dres));
       await loadGroups();
     });
@@ -201,7 +208,7 @@ $("groups-form").addEventListener("submit", async (e) => {
   setError("groups-error", "");
   const user = $("groups-user").value.trim();
   const groups = $("groups-list").value.split(",").map((g) => g.trim()).filter(Boolean);
-  const res = await mutate(`/v1/admin/groups/${user}`, {
+  const res = await mutate(`/v1/admin/groups/${encSegment(user)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ groups }),
@@ -224,7 +231,7 @@ async function loadServiceAccounts() {
   const rows = $("sa-rows");
   rows.replaceChildren();
   for (const name of names) {
-    const detail = await api(`/v1/admin/service-accounts/${name}`);
+    const detail = await api(`/v1/admin/service-accounts/${encSegment(name)}`);
     const sa = await detail.json();
     const tr = document.createElement("tr");
 
@@ -239,7 +246,7 @@ async function loadServiceAccounts() {
     const toggle = document.createElement("button");
     toggle.textContent = sa.disabled ? "Enable" : "Disable";
     toggle.addEventListener("click", async () => {
-      const tres = await mutate(`/v1/admin/service-accounts/${sa.name}`, {
+      const tres = await mutate(`/v1/admin/service-accounts/${encSegment(sa.name)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ description: sa.description || "", disabled: !sa.disabled }),
@@ -252,7 +259,7 @@ async function loadServiceAccounts() {
     del.className = "danger";
     del.addEventListener("click", async () => {
       if (!confirm(`Delete service account ${sa.name}?`)) return;
-      const dres = await mutate(`/v1/admin/service-accounts/${sa.name}`, { method: "DELETE" });
+      const dres = await mutate(`/v1/admin/service-accounts/${encSegment(sa.name)}`, { method: "DELETE" });
       if (!dres.ok) setError("sa-error", await errorText(dres));
       await loadServiceAccounts();
     });
@@ -267,7 +274,7 @@ $("sa-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   setError("sa-error", "");
   const name = $("sa-name").value.trim();
-  const res = await mutate(`/v1/admin/service-accounts/${name}`, {
+  const res = await mutate(`/v1/admin/service-accounts/${encSegment(name)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ description: $("sa-description").value, disabled: false }),

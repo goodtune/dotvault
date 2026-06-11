@@ -117,6 +117,29 @@ func TestSeedRejectsUnknownSubdir(t *testing.T) {
 	}
 }
 
+func TestSeedRejectsMalformedGroupsFile(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{"scalar membership", "alice: 5\n"},
+		{"list document", "- alice\n- bob\n"},
+		{"unparseable", ":\n  - [\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "groups.yaml"), []byte(tt.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			st := newTestStore(t)
+			if _, err := Seed(context.Background(), st, dir); err == nil || !strings.Contains(err.Error(), "groups.yaml") {
+				t.Fatalf("Seed error = %v, want complaint about groups.yaml", err)
+			}
+		})
+	}
+}
+
 func TestSeedMissingDirectory(t *testing.T) {
 	st := newTestStore(t)
 	if _, err := Seed(context.Background(), st, filepath.Join(t.TempDir(), "nope")); err == nil {

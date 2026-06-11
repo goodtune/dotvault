@@ -52,12 +52,27 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "X-Dotvault-OS and X-Dotvault-User headers are required", http.StatusBadRequest)
 		return
 	}
+	if !ValidIdentitySegment(osName) || !ValidIdentitySegment(user) {
+		http.Error(w, "X-Dotvault-OS and X-Dotvault-User must not contain path separators, \"..\", or control characters", http.StatusBadRequest)
+		return
+	}
 
 	memberOf, err := s.resolver.Groups(ctx, user)
 	if err != nil {
 		slog.Error("group resolution failed", "user", user, "error", err)
 		http.Error(w, "group resolution failed", http.StatusInternalServerError)
 		return
+	}
+	// Group names come from the resolver (operator-controlled store or
+	// directory), but an LDAP cn is still external input by the time it
+	// becomes a Vault path segment — same traversal rule applies. This is
+	// the operator's data, so it is a 500 to fix, not a client 400.
+	for _, g := range memberOf {
+		if !ValidIdentitySegment(g) {
+			slog.Error("group resolution produced an unusable group name", "user", user, "group", g)
+			http.Error(w, fmt.Sprintf("group %q is not a valid layer key segment", g), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	doc, etag, err := s.composer.Compose(ctx, LayerKeys(osName, user, memberOf))

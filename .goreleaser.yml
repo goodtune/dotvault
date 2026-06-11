@@ -88,6 +88,11 @@ archives:
 
 nfpms:
   - id: dotvault
+    # Without this filter nfpm packages every build, which would pull the
+    # dotvault-config service binary into the client RPM/DEB/APK. The
+    # service ships only via its own archive.
+    ids:
+      - dotvault
     package_name: dotvault
     vendor: goodtune
     homepage: https://github.com/goodtune/dotvault

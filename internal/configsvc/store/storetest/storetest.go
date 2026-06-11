@@ -6,6 +6,7 @@ package storetest
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -85,6 +86,33 @@ func Run(t *testing.T, st store.Store) {
 		keys, _ = st.ListLayers(ctx, "os/")
 		if want := []string{"os/linux"}; !reflect.DeepEqual(keys, want) {
 			t.Fatalf("ListLayers(os/) after delete = %v, want %v", keys, want)
+		}
+	})
+
+	t.Run("layer key fidelity", func(t *testing.T) {
+		// Keys are opaque to the driver: spaces (Windows account names) and
+		// mixed case must round-trip exactly, and lookups must be exact
+		// matches.
+		keys := []string{"user/Alice Smith", "user/alice smith", "user/MixedCase"}
+		for i, key := range keys {
+			doc := []byte(fmt.Sprintf("sync:\n  interval: %dm\n", i+1))
+			if err := st.PutLayer(ctx, key, doc); err != nil {
+				t.Fatalf("PutLayer %q: %v", key, err)
+			}
+		}
+		for i, key := range keys {
+			got, ok, err := st.GetLayer(ctx, key)
+			if err != nil || !ok {
+				t.Fatalf("GetLayer %q = ok=%v err=%v, want present", key, ok, err)
+			}
+			if want := fmt.Sprintf("sync:\n  interval: %dm\n", i+1); string(got) != want {
+				t.Fatalf("GetLayer %q = %q, want %q (exact-match lookup)", key, got, want)
+			}
+		}
+		for _, key := range keys {
+			if err := st.DeleteLayer(ctx, key); err != nil {
+				t.Fatalf("DeleteLayer %q: %v", key, err)
+			}
 		}
 	})
 

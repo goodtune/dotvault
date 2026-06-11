@@ -3,6 +3,7 @@ package groups
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -94,6 +95,49 @@ func TestCachedCopyIsolation(t *testing.T) {
 	second, _ := c.Groups(ctx, "alice")
 	if want := []string{"a", "b"}; !reflect.DeepEqual(second, want) {
 		t.Fatalf("cache entry mutated through returned slice: %v", second)
+	}
+}
+
+func TestCachedBoundsEntries(t *testing.T) {
+	inner := &countingResolver{entries: map[string][]string{}}
+	c := NewCached(inner, time.Minute).(*cached)
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	for i := 0; i < maxCacheEntries; i++ {
+		if _, err := c.Groups(ctx, fmt.Sprintf("user-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// All entries still live: the next insert resets the map rather than
+	// growing past the cap.
+	if _, err := c.Groups(ctx, "one-more"); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	live := len(c.entries)
+	c.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("entries after overflow with live cache = %d, want 1 (map reset)", live)
+	}
+
+	// Refill, then expire everything: the next insert sweeps instead.
+	for i := 0; i < maxCacheEntries-1; i++ {
+		if _, err := c.Groups(ctx, fmt.Sprintf("second-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := c.Groups(ctx, "after-expiry"); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	live = len(c.entries)
+	c.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("entries after sweep = %d, want 1", live)
 	}
 }
 

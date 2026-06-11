@@ -112,6 +112,11 @@ func newServeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the configuration service",
+		Long: `Run the HTTP service: GET /v1/config composes the partial configuration
+document for the identity asserted in the X-Dotvault-OS / X-Dotvault-User
+headers, with ETag/If-None-Match revalidation; /healthz and /readyz serve
+liveness and storage-gated readiness probes. TLS is terminated by the
+operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			setupLogging()
 			cfg, err := loadConfig()
@@ -146,6 +151,9 @@ func newServeCmd() *cobra.Command {
 				Addr:              cfg.Listen,
 				Handler:           configsvc.NewServer(st, resolver).Handler(),
 				ReadHeaderTimeout: 10 * time.Second,
+				ReadTimeout:       30 * time.Second,
+				WriteTimeout:      30 * time.Second,
+				IdleTimeout:       2 * time.Minute,
 			}
 
 			errCh := make(chan error, 1)
@@ -189,8 +197,8 @@ func newSeedCmd() *cobra.Command {
 		Long: `Walk a layer directory (global.yaml, os/*.yaml, group/*.yaml, user/*.yaml,
 and an optional groups.yaml with static membership), validate every document,
 and write the result to the configured storage backend. Nothing is written
-unless everything validates, so a CI job can publish a git-managed layer tree
-atomically on merge.`,
+unless everything validates, so a CI job publishing a git-managed layer tree
+on merge can never half-apply an invalid tree.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			setupLogging()
 			cfg, err := loadConfig()
@@ -236,9 +244,6 @@ stdout and the ETag to stderr. Group membership comes from the configured
 resolver unless --groups overrides it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			setupLogging()
-			if user == "" {
-				return fmt.Errorf("--user is required")
-			}
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
@@ -275,6 +280,7 @@ resolver unless --groups overrides it.`,
 	cmd.Flags().StringVar(&osName, "os", runtime.GOOS, "X-Dotvault-OS dimension")
 	cmd.Flags().StringVar(&user, "user", "", "X-Dotvault-User dimension")
 	cmd.Flags().StringSliceVar(&groupList, "groups", nil, "override group membership (skips the resolver)")
+	cmd.MarkFlagRequired("user")
 	return cmd
 }
 

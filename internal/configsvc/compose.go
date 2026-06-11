@@ -20,11 +20,33 @@ import (
 	"github.com/goodtune/dotvault/internal/configsvc/store"
 )
 
+// ValidIdentitySegment reports whether a value is safe to embed as one
+// segment of a layer key. The OS and user dimensions arrive as
+// client-asserted headers on an unauthenticated endpoint, and the Vault
+// store builds read paths with path.Join — which collapses ".." — so an
+// unvalidated value like "../../users/alice/gh" would escape the service's
+// layers/ namespace and probe arbitrary KVv2 paths reachable by the service
+// token. Rejected: empty values, path separators, "..", and control
+// characters. Anything else (spaces, unicode) is allowed — Windows account
+// names legitimately contain spaces, and none of that enables traversal.
+func ValidIdentitySegment(s string) bool {
+	if s == "" || strings.Contains(s, "/") || strings.Contains(s, `\`) || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // LayerKeys returns the canonical composition order for a request identity:
 // global → os/<os> → group/<g> (each, sorted) → user/<user>. Groups are
 // sorted for determinism — the composed bytes must be stable so the ETag is
 // stable. The OS value is lowercased; header values are client-asserted and
-// arrive in whatever case the client chose.
+// arrive in whatever case the client chose. Callers are responsible for
+// rejecting segments that fail ValidIdentitySegment before composing.
 func LayerKeys(osName, user string, groups []string) []string {
 	keys := make([]string, 0, len(groups)+3)
 	keys = append(keys, "global", "os/"+strings.ToLower(osName))

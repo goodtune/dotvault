@@ -27,10 +27,12 @@ type SeedSummary struct {
 // backend on merge. The layout is global.yaml, os/<os>.yaml,
 // group/<g>.yaml, user/<u>.yaml, plus an optional groups.yaml carrying
 // static membership (user → group list). Everything is validated before
-// any write, so an invalid layer aborts the whole publish rather than
-// leaving the store half-updated. Stray YAML files and unknown
-// subdirectories are errors — a typo'd directory silently not being served
-// is the failure mode this guards against.
+// any write, so an invalid layer aborts the whole publish with nothing
+// written. (A backend failure mid-publish can still leave earlier writes
+// applied — re-running the seed converges, since writes are idempotent
+// puts.) Stray YAML files and unknown subdirectories are errors — a typo'd
+// directory silently not being served is the failure mode this guards
+// against.
 func Seed(ctx context.Context, st store.Store, dir string) (*SeedSummary, error) {
 	layers, membership, err := loadSeedDir(dir)
 	if err != nil {
@@ -97,7 +99,7 @@ func loadSeedDir(dir string) ([]seedLayer, map[string][]string, error) {
 		if !isYAML(name) {
 			continue
 		}
-		switch strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml") {
+		switch trimYAMLExt(name) {
 		case "global":
 			l, err := loadLayerFile(full, "global")
 			if err != nil {
@@ -145,7 +147,7 @@ func loadSeedSubdir(dir, prefix string) ([]seedLayer, error) {
 		if !isYAML(name) {
 			continue
 		}
-		key := prefix + "/" + strings.TrimSuffix(strings.TrimSuffix(name, ".yaml"), ".yml")
+		key := prefix + "/" + trimYAMLExt(name)
 		l, err := loadLayerFile(full, key)
 		if err != nil {
 			return nil, err
@@ -173,8 +175,16 @@ func loadLayerFile(path, key string) (seedLayer, error) {
 	return seedLayer{key: key, doc: raw}, nil
 }
 
+// isYAML matches the extension case-insensitively so a Global.YAML on a
+// case-insensitive filesystem is recognised (and then caught by the
+// stray-file guard) rather than silently skipped.
 func isYAML(name string) bool {
-	return strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".yaml" || ext == ".yml"
+}
+
+func trimYAMLExt(name string) string {
+	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
 func hasYAML(dir string) bool {

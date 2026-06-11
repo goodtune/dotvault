@@ -175,6 +175,80 @@ func TestConfigResolverFailureIs500(t *testing.T) {
 	}
 }
 
+// TestConfigRejectsTraversalIdentity covers the unauthenticated-endpoint
+// hardening: client-asserted identity values must never reach layer-key
+// construction with path separators or "..", because the Vault store builds
+// read paths with path.Join (which collapses "..").
+func TestConfigRejectsTraversalIdentity(t *testing.T) {
+	_, ts := newTestServer(t)
+	tests := []map[string]string{
+		{"X-Dotvault-OS": "linux", "X-Dotvault-User": "../global"},
+		{"X-Dotvault-OS": "linux", "X-Dotvault-User": "../../users/alice/gh"},
+		{"X-Dotvault-OS": "linux", "X-Dotvault-User": `DOMAIN\alice`},
+		{"X-Dotvault-OS": "os/../..", "X-Dotvault-User": "alice"},
+		// Control characters are rejected too, but Go's HTTP client (and
+		// server) refuse to transport them, so that case lives in the
+		// ValidIdentitySegment unit test rather than here.
+	}
+	for _, headers := range tests {
+		if resp := get(t, ts.URL+"/v1/config", headers); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET with headers %v = %d, want 400", headers, resp.StatusCode)
+		}
+	}
+	// A space is legitimate (Windows account names) and must pass.
+	resp := get(t, ts.URL+"/v1/config", map[string]string{
+		"X-Dotvault-OS": "windows", "X-Dotvault-User": "Alice Smith",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET with spaced username = %d, want 200", resp.StatusCode)
+	}
+}
+
+// resolvedGroups serves a fixed membership regardless of user.
+type resolvedGroups []string
+
+func (r resolvedGroups) Groups(context.Context, string) ([]string, error) {
+	return r, nil
+}
+
+func TestConfigRejectsTraversalGroupName(t *testing.T) {
+	st := newTestStore(t)
+	ts := httptest.NewServer(NewServer(st, resolvedGroups{"../escape"}).Handler())
+	t.Cleanup(ts.Close)
+	resp := get(t, ts.URL+"/v1/config", identityHeaders)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("GET with traversal group name = %d, want 500 (operator data problem)", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "../escape") {
+		t.Fatalf("500 body %q does not name the bad group", body)
+	}
+}
+
+// failingStore wraps a Store with a GetLayer that always fails, exercising
+// the non-LayerError compose failure branch.
+type failingStore struct {
+	store.Store
+}
+
+func (failingStore) GetLayer(context.Context, string) ([]byte, bool, error) {
+	return nil, false, errors.New("backend down")
+}
+
+func TestConfigStoreFailureIs500WithoutLayerBody(t *testing.T) {
+	st := newTestStore(t)
+	ts := httptest.NewServer(NewServer(failingStore{st}, groups.NewStatic(st)).Handler())
+	t.Cleanup(ts.Close)
+	resp := get(t, ts.URL+"/v1/config", identityHeaders)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("GET with failing store = %d, want 500", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "compose failed") {
+		t.Fatalf("500 body = %q, want the generic compose failure", body)
+	}
+}
+
 func TestHealthAndReadiness(t *testing.T) {
 	st, ts := newTestServer(t)
 	if resp := get(t, ts.URL+"/healthz", nil); resp.StatusCode != http.StatusOK {

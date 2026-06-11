@@ -103,7 +103,7 @@ layers/
 dotvault-config seed --config configsvc.yaml --dir layers/
 ```
 
-Every document is validated **before any write** — the same parse and validation the daemon applies, including the rejection of static sections (`vault`, `web`, `agent`, `observability`, …) that must never be delivered remotely. An invalid layer aborts the whole publish, so the store is never left half-updated. Stray files and unrecognised subdirectories are errors, catching the typo'd `os.yaml` that would otherwise silently not be served.
+Every document is validated **before any write** — the same parse and validation the daemon applies, including the rejection of static sections (`vault`, `web`, `agent`, `observability`, …) that must never be delivered remotely. An invalid layer aborts the whole publish with nothing written; writes are idempotent puts, so re-running a publish interrupted by a backend failure converges. Stray files and unrecognised subdirectories are errors, catching the typo'd `os.yaml` that would otherwise silently not be served.
 
 This gives you config-as-code: keep the layer tree in a git repository, review changes as pull requests, and have CI run `seed` against the production backend on merge.
 

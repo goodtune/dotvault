@@ -44,6 +44,32 @@ func composePartial(t *testing.T, st store.Store, keys []string) (*config.Partia
 	return p, etag
 }
 
+func TestValidIdentitySegment(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"alice", true},
+		{"Alice Smith", true}, // Windows account names may contain spaces
+		{"linux", true},
+		{"dev.team-1_x", true},
+		{"", false},
+		{"../global", false},
+		{"a/b", false},
+		{`DOMAIN\alice`, false},
+		{"..", false},
+		{"a..b", false}, // conservatively rejected
+		{"a\nb", false},
+		{"a\x00b", false},
+		{"a\x7fb", false},
+	}
+	for _, tt := range tests {
+		if got := ValidIdentitySegment(tt.in); got != tt.want {
+			t.Errorf("ValidIdentitySegment(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestLayerKeys(t *testing.T) {
 	got := LayerKeys("Linux", "alice", []string{"sydney", "auckland", "newyork"})
 	want := []string{"global", "os/linux", "group/auckland", "group/newyork", "group/sydney", "user/alice"}

@@ -23,6 +23,7 @@ import (
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
 	"github.com/goodtune/dotvault/internal/observability"
+	"github.com/goodtune/dotvault/internal/passwd"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/sdnotify"
@@ -989,6 +990,14 @@ Behaviour:
     the marker's mtime is within DOTVAULT_SUPPRESS_HOURS (default 6),
     the command exits silently. A future mtime is treated as stale so
     clock skew or backup restores cannot lock suppression on.
+  - With --no-passwd, exit 0 immediately when the current user has an
+    entry in /etc/passwd. In fleets where human accounts come from a
+    directory service, a passwd entry means a local machine account
+    with no Vault credentials to check — a fleet-wide profile.d script
+    can pass this flag unconditionally and stay silent for local
+    accounts. The file is parsed directly (getent would merge all NSS
+    sources and hide the distinction). Ignored with a warning on
+    Windows; a read failure warns and continues with the normal check.
   - Otherwise: if the cached token is valid and still within the first
     half of its creation TTL, exit clean. Past halfway, attempt
     renewal; if renewal fails but the token is still valid, warn with
@@ -1008,6 +1017,7 @@ genuine internal errors.`,
 		RunE: runLoginCheck,
 	}
 	cmd.Flags().Bool("quiet", false, "suppress the explanation printed before triggering an interactive login")
+	cmd.Flags().Bool("no-passwd", false, "exit immediately when the current user has a local /etc/passwd entry (ignored on Windows)")
 	return cmd
 }
 
@@ -1019,6 +1029,7 @@ genuine internal errors.`,
 // contract.
 func runLoginCheck(cmd *cobra.Command, args []string) error {
 	quiet, _ := cmd.Flags().GetBool("quiet")
+	noPasswd, _ := cmd.Flags().GetBool("no-passwd")
 
 	// Catch SIGINT before any other work so a Ctrl+C arriving during
 	// setup (env parse, marker stat, term.GetState) cannot fall through
@@ -1069,6 +1080,27 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 			slog.Warn("failed to refresh login-check suppression marker", "error", rerr, "path", markerPath)
 		}
 	}()
+
+	// --no-passwd: a user with a local passwd entry is a machine
+	// account in a directory-service fleet — nothing to check, no
+	// prompt to raise. Runs after the marker-refresh defer is armed so
+	// the early exit also silences the next window of shells (they stop
+	// at the freshness check without re-parsing the file). Read or
+	// lookup failures fail open into the normal flow: the exit-0
+	// contract reserves non-zero for genuine internal errors, and a
+	// directory user must not be locked out by a broken local file.
+	if noPasswd {
+		if runtime.GOOS == "windows" {
+			slog.Warn("--no-passwd is not supported on Windows; ignoring")
+		} else if username, uerr := paths.Username(); uerr != nil {
+			slog.Warn("--no-passwd: cannot resolve current user; continuing with login check", "error", uerr)
+		} else if found, perr := passwd.ContainsUser(passwd.Path(), username); perr != nil {
+			slog.Warn("--no-passwd: cannot read passwd file; continuing with login check", "error", perr)
+		} else if found {
+			slog.Debug("user has a local passwd entry; skipping login check", "user", username)
+			return nil
+		}
+	}
 
 	// Capture the terminal state now so the SIGINT handler can restore
 	// it even if mgr.Login is mid-prompt (term.ReadPassword puts the

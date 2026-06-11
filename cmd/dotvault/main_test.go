@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -291,6 +292,111 @@ func TestLoginCheckQuietFlagRegistered(t *testing.T) {
 	if flag.DefValue != "false" {
 		t.Errorf("--quiet flag default = %q, want false", flag.DefValue)
 	}
+}
+
+// TestLoginCheckNoPasswdFlagRegistered locks in the --no-passwd flag
+// wiring on the login-check command, for the same reason as the --quiet
+// assertion above: fleet profile.d scripts pass it unconditionally, so
+// renaming or dropping it would break every deployed wrapper at shell
+// startup.
+func TestLoginCheckNoPasswdFlagRegistered(t *testing.T) {
+	cmd := newLoginCheckCmd()
+	flag := cmd.Flags().Lookup("no-passwd")
+	if flag == nil {
+		t.Fatal("--no-passwd flag not registered on login-check command")
+	}
+	if flag.Value.Type() != "bool" {
+		t.Errorf("--no-passwd flag type = %q, want bool", flag.Value.Type())
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--no-passwd flag default = %q, want false", flag.DefValue)
+	}
+}
+
+// TestLoginCheckNoPasswd_Subprocess exercises the --no-passwd early
+// exit end-to-end. Both cases run with a deliberately missing --config:
+// when the current user appears in the (overridden) passwd file the
+// command must exit 0 silently *before* config load is ever reached;
+// when the user is absent it must fall through to the normal flow and
+// fail at config load like any other invocation.
+func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess test")
+	}
+	if runtime.GOOS == "windows" {
+		// --no-passwd is ignored on Windows; the flag-registration test
+		// above covers the wiring there.
+		t.Skip("subprocess test exercises POSIX passwd semantics")
+	}
+
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "dotvault")
+	build := exec.Command("go", "build", "-o", binPath, ".")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatalf("go build: %v", err)
+	}
+
+	u, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
+	workDir := t.TempDir()
+	missingConfig := filepath.Join(workDir, "does-not-exist.yaml")
+	baseEnv := append(os.Environ(), "DOTVAULT_SUPPRESS_HOURS=6")
+
+	t.Run("local user exits silently before config load", func(t *testing.T) {
+		passwdFile := filepath.Join(workDir, "passwd-with-user")
+		entry := u.Username + ":x:1000:1000::/home/" + u.Username + ":/bin/bash\n"
+		if err := os.WriteFile(passwdFile, []byte(entry), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		markerPath := filepath.Join(workDir, "marker-local")
+
+		check := exec.Command(binPath, "--config", missingConfig, "login-check", "--no-passwd")
+		check.Env = append(baseEnv,
+			"DOTVAULT_SUPPRESS_MARKER="+markerPath,
+			"DOTVAULT_PASSWD_FILE="+passwdFile,
+		)
+		check.Stdin = nil
+		out, err := check.CombinedOutput()
+		if err != nil {
+			t.Fatalf("expected silent exit 0 for local user: %v\noutput:\n%s", err, out)
+		}
+		if len(out) != 0 {
+			t.Errorf("expected no output, got: %q", out)
+		}
+		// The early exit happens past the freshness check, so the
+		// marker contract applies: subsequent shells in the window must
+		// be silenced without re-parsing the passwd file.
+		if _, err := os.Stat(markerPath); err != nil {
+			t.Errorf("marker not refreshed on --no-passwd early exit: %v", err)
+		}
+	})
+
+	t.Run("directory user falls through to normal flow", func(t *testing.T) {
+		// The fixture entry is derived from the real username so it can
+		// never collide with whoever runs the tests (root in CI, a
+		// developer locally).
+		passwdFile := filepath.Join(workDir, "passwd-without-user")
+		entry := "not-" + u.Username + ":x:0:0::/root:/bin/bash\n"
+		if err := os.WriteFile(passwdFile, []byte(entry), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		markerPath := filepath.Join(workDir, "marker-directory")
+
+		check := exec.Command(binPath, "--config", missingConfig, "login-check", "--no-passwd")
+		check.Env = append(baseEnv,
+			"DOTVAULT_SUPPRESS_MARKER="+markerPath,
+			"DOTVAULT_PASSWD_FILE="+passwdFile,
+		)
+		check.Stdin = nil
+		out, err := check.CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected config-load failure when user absent from passwd file, got exit 0\noutput:\n%s", out)
+		}
+	})
 }
 
 // TestLoginCheckSuppression_SubprocessRoundTrip exercises the spec's

@@ -1,0 +1,3 @@
+# Deliberately invalid: a static section must never appear in a layer.
+vault:
+  address: https://evil.example.com

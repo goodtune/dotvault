@@ -34,6 +34,7 @@ Do **not** mention the pre-push review in PR descriptions. Running `/precommit-r
 make test          # run all tests
 make build         # build for current platform
 make build-all     # cross-compile linux/darwin (amd64/arm64) and windows (amd64)
+make build-config  # build the dotvault-config service binary for current platform
 ```
 
 All builds use `CGO_ENABLED=0` for static binaries. Version is injected via ldflags (`-X main.version=...`). Release tags are `v`-prefixed (`v0.19.0`) for Go-module consumption, but `main.version` is the v-stripped semantic version (`0.19.0`): GoReleaser's `{{.Version}}` strips the prefix and the Makefile strips it via `sed`, so local and release builds agree. Consumers (the `version` command, `/api/v1/status`, the OTel `service.version` attribute, the tray tooltip, and the web UI header which prepends its own `v`) treat the value as v-stripped and must not add or assume a leading `v`.
@@ -72,17 +73,27 @@ The vault-init container seeds sample secrets, enables OIDC auth via Dex, and ex
 
 `config.dev.yaml` points at the local Vault (`http://127.0.0.1:8200`), enables the web UI on port 9000, and configures all available enrolment engines. When adding a new enrolment engine, add a corresponding entry to `config.dev.yaml` under the `enrolments` section so the dev config exercises all available engines.
 
+The remote-configuration overlay is exercised by a third, optional process — the dotvault-config service with the sqlite store and the fixtures under `dev/remote-layers/`:
+
+```sh
+go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote-layers
+```
+
+`config.dev.yaml` carries `remote_config.url: http://127.0.0.1:9100/v1/config` (loopback, so plain HTTP is allowed); when the service isn't running the daemon fails open onto the base config with a warning, so the block stays enabled. Add your OS username to `dev/remote-layers/groups.yaml` to see group layers in your composed document.
+
 ### Claude Code Desktop
 
-`.claude/launch.json` defines both services as Preview configurations so Claude Code Desktop can start them automatically, connect to the running web UI, and auto-verify changes. The two configurations mirror the manual steps above:
+`.claude/launch.json` defines the services as Preview configurations so Claude Code Desktop can start them automatically, connect to the running web UI, and auto-verify changes. The configurations mirror the manual steps above:
 
 - **`vault-dex`** — `docker compose up` (port 8200)
+- **`dotvault-config`** — `go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote-layers` (port 9100)
 - **`dotvault`** — `go run ./cmd/dotvault run --config config.dev.yaml` (port 9000)
 
 ## Architecture
 
 ```
 cmd/dotvault/main.go     CLI entry point (Cobra)
+cmd/dotvault-config/     Remote-configuration service binary (serve/seed/compose/version) — see "The dotvault-config service"
 client/                  Public, importable Go API (facade over internal/{config,auth,vault}) — see "Public client API"
 internal/
   config/                Config loading: YAML file + Windows Registry (GPO)
@@ -90,6 +101,7 @@ internal/
   paths/                 OS-specific path resolution
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   remoteconfig/          Remote config overlay: ETag-conditional fetcher, last-known-good cache, fail-open ladder
+  configsvc/             dotvault-config service: layer composition, HTTP API, seeding; store/ (sqlite + Vault KVv2) and groups/ (static + LDAP) backends
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
@@ -584,6 +596,18 @@ The `agent.keys[]` list is **ordered**, unlike the name-keyed rules/enrolments m
 
 This means a Windows GPO deployment can configure rules, enrolments, the SSH agent, and the observability exporter end-to-end, and `reg-export` / `reg-import` (plus the web `GET /api/v1/config/download`) round-trip every section through both the YAML and `.reg` forms. dotvault does **not** ship an ADMX administrative template and there is no plan to — it was never adequately tested and has been removed entirely. Admins author the registry values directly (e.g. via `reg-import` from a YAML config); the registry surface is the supported Group Policy integration.
 
+## The dotvault-config service
+
+`cmd/dotvault-config` is the server side of the `remote_config` overlay (design: `docs/superpowers/specs/2026-06-10-remote-config-design.md`; user docs: `docs/services/dotvault-config.md`). It composes layer documents — `config.Partial`s stored under canonical keys — in fixed order `global → os/<os> → group/<g> (sorted) → user/<user>`, folding with `config.MergePartial` so the service composes exactly the way clients merge. The composed YAML is deterministic (yaml.v3 sorts map keys; groups are sorted) so the `ETag` (quoted sha256 of the bytes) is stable and an unchanged document costs a `304`. Missing layers skip silently; a present-but-invalid layer is a 500 naming the layer key (`configsvc.LayerError`), never a silently dropped layer.
+
+Cobra commands: `serve` (HTTP service; `--seed <dir>` dev convenience), `seed` (publish a layer directory — `global.yaml`, `os/*.yaml`, `group/*.yaml`, `user/*.yaml`, optional `groups.yaml` static membership — validating everything via `ParsePartial` + `Validate` before any write; stray files and unknown subdirectories are errors), `compose` (offline composition for debugging; `--groups` bypasses the resolver), `version`. The service config (`--config`, see `configsvc.dev.yaml`) is strict-parsed: unknown keys are a hard error.
+
+HTTP API: `GET /v1/config` (requires `X-Dotvault-OS` + `X-Dotvault-User`, 400 otherwise; OS lowercased; `If-None-Match` → 304; else 200 with `Content-Type: application/yaml`, `ETag`, `Cache-Control: no-cache`), `GET /healthz`, `GET /readyz` (gated on storage `Ping`). No client auth — configuration is non-secret and the dimension headers are spoofable by design, so **layers must never contain secrets**. No loopback-binding invariant (unlike the daemon's web UI): TLS is the operator's ingress or the service's own `tls.cert_file`/`key_file` listener config.
+
+Storage (`internal/configsvc/store`): the `Store` interface behind an `Open(ctx, driver, dsn)` / `OpenVault(ctx, cfg)` factory pair. SQLite (`modernc.org/sqlite`, pure Go — CGO stays off) for dev/tests with tables `layers(key, doc, updated_at)` and `groups(username, groups)`; Vault KVv2 for production with the document as a single `doc` field at `<mount>/data/<path>/layers/<key>` and membership at `<path>/groups/<user>`, auth `token` (falls back to `VAULT_TOKEN`) or `kubernetes` (service-account JWT **re-read from disk on every login** so projected-token rotation needs no restart; re-login on 403). Built directly on `github.com/hashicorp/vault/api` — the daemon's `internal/vault` is deliberately not reused. The driver-neutral conformance suite lives in `store/storetest` (run by the sqlite unit tests and the Vault driver's `test/integration` test); a new driver must pass it.
+
+Group resolution (`internal/configsvc/groups`): `Resolver` interface behind a TTL cache (`NewCached`; successful lookups including empty memberships are cached, errors are not). `static` reads membership from the store; `ldap` (`github.com/go-ldap/ldap/v3`) dials per lookup, substitutes the **escaped** username into the configured `%s` filter, and collects the name attribute (default `cn`). An unknown user resolves to no groups — composing global+os is valid.
+
 ## File Permissions & Security
 
 - Managed files (all sync rule targets): written at 0600
@@ -610,6 +634,8 @@ This means a Windows GPO deployment can configure rules, enrolments, the SSH age
 | `golang.org/x/crypto/ssh/agent` | SSH agent protocol server (read-only backend) |
 | `golang.org/x/term` | Secure terminal input |
 | `golang.org/x/sys` | OS-specific syscalls (Windows registry, etc.) |
+| `modernc.org/sqlite` | dotvault-config dev/test store (pure Go, no CGO) |
+| `github.com/go-ldap/ldap/v3` | dotvault-config LDAP group resolver |
 
 All pure Go. No CGO dependencies.
 

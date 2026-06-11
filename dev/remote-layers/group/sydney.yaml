@@ -1,0 +1,14 @@
+# A region layer: members of the "sydney" group (see groups.yaml) get an
+# extra enrolment mirroring the shared sample secret under a second name.
+enrolments:
+  sydney-sample:
+    engine: copy
+    settings:
+      from:
+        mount: kv
+        path: apps/sample/keys/{{.user}}
+      format: json
+      template: |
+        {
+          "token": "{{ .data.key }}"
+        }

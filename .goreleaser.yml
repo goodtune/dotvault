@@ -44,6 +44,20 @@ builds:
       - -s -w -H=windowsgui -X main.version={{.Version}}
     targets:
       - windows_amd64
+  # The dotvault-config remote-configuration service. A deployable server
+  # component, so linux + darwin only — no Windows service binary in v1.
+  - id: dotvault-config
+    main: ./cmd/dotvault-config
+    binary: dotvault-config
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - darwin_amd64
+      - darwin_arm64
 
 archives:
   - allow_different_binary_count: true
@@ -56,6 +70,18 @@ archives:
     ids:
       - dotvault
       - dotvaultw
+    files:
+      - README.md
+      - LICENSE
+  # The service ships in its own archive so client and server downloads stay
+  # independent; the explicit name_template keeps the artefact named after
+  # the binary rather than the project.
+  - id: dotvault-config
+    ids:
+      - dotvault-config
+    name_template: "dotvault-config_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
     files:
       - README.md
       - LICENSE

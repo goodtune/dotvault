@@ -10,3 +10,5 @@ cmd/dotvault/*.syso
 # Records the VERSION the .syso was built against so a version change forces
 # regeneration; build artefact written by the Makefile.
 cmd/dotvault/.version-stamp
+# SQLite database for the dev dotvault-config service (configsvc.dev.yaml).
+dev/configsvc.db

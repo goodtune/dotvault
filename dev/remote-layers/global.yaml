@@ -1,0 +1,11 @@
+# Served to every client. Layers on a fleet-wide rule that renders the
+# copy-engine "sample" enrolment (seeded by vault-init and mirrored by the
+# `sample` enrolment in config.dev.yaml) into a file — so the remote overlay
+# is observable end to end in the dev loop without extra setup.
+rules:
+  - name: remote-sample
+    vault_key: sample
+    target:
+      path: "~/tmp/remote-sample.txt"
+      format: text
+      template: "{{ .token }}"

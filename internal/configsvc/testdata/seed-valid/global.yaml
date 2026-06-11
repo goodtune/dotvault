@@ -1,0 +1,7 @@
+rules:
+  - name: fleet-wide
+    vault_key: sample
+    target:
+      path: ~/fleet.txt
+      format: text
+      template: "{{ .token }}"

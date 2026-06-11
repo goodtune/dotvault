@@ -1,0 +1,6 @@
+rules:
+  - name: fine
+    vault_key: sample
+    target:
+      path: ~/fine.txt
+      format: text

@@ -1,0 +1,7 @@
+# Static group membership for the dev resolver (user → groups). Add your own
+# OS username to see the group layers in your composed document, e.g.
+#
+#   <your-username>: [sydney]
+#
+alice: [sydney, newyork]
+bob: [sydney]

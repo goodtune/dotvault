@@ -1,0 +1,17 @@
+# Development configuration for the dotvault-config service. Pairs with the
+# fixtures under dev/remote-layers/ and the remote_config block in
+# config.dev.yaml:
+#
+#   go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote-layers
+#
+# The sqlite store keeps CGO off and needs no infrastructure; production
+# deployments use the vault driver instead (see docs/services/dotvault-config.md).
+listen: "127.0.0.1:9100"
+
+store:
+  driver: sqlite
+  dsn: "dev/configsvc.db"
+
+groups:
+  source: static
+  ttl: "1m"

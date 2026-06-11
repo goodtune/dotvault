@@ -398,6 +398,13 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected config-load failure when user absent from passwd file, got exit 0\noutput:\n%s", out)
 		}
+		// A bare non-zero exit could come from anywhere (including a
+		// future bug in the --no-passwd check itself); requiring the
+		// config-load error message proves the flow fell through past
+		// the passwd lookup into the normal startup path.
+		if !strings.Contains(string(out), "load config") {
+			t.Errorf("expected failure at config load, got different error:\n%s", out)
+		}
 	})
 }
 

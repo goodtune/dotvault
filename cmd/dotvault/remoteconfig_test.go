@@ -113,6 +113,44 @@ func TestWithRemoteInvalidSectionRejectedBeforeFetch(t *testing.T) {
 	}
 }
 
+// TestWithRemoteClearsFetcherWhenURLRemoved pins reload semantics: a base
+// reload that clears remote_config.url drops the fetcher, so the status
+// surfaces stop reporting a stale overlay block and a later re-enable starts
+// from fresh conditional-GET state.
+func TestWithRemoteClearsFetcherWhenURLRemoved(t *testing.T) {
+	isolateCacheDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("rules: []\n"))
+	}))
+	defer srv.Close()
+
+	remoteURL := srv.URL
+	baseLoader := func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: remoteURL},
+		}, nil
+	}
+	merged, status := withRemote(t.Context(), baseLoader)
+	if _, err := merged(); err != nil {
+		t.Fatalf("merged loader: %v", err)
+	}
+	if status() == nil {
+		t.Fatal("expected status while the overlay is enabled")
+	}
+
+	// Simulate the operator removing the overlay from the local base. The
+	// base now has zero rules and no URL, so the load fails validation —
+	// but the fetcher must still be dropped.
+	remoteURL = ""
+	if _, err := merged(); err == nil {
+		t.Fatal("expected validation failure for zero rules without a URL")
+	}
+	if rs := status(); rs != nil {
+		t.Errorf("status = %+v after the overlay was removed, want nil", rs)
+	}
+}
+
 // TestWithRemoteUnreachableServiceDegradesToBase pins the fail-open ladder at
 // the loader level: remote configured but down, no cache ⇒ the base loads
 // (zero rules is a warning, not an error) so the daemon can start and

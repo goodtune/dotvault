@@ -284,7 +284,12 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 		if err != nil {
 			return nil, err
 		}
-		if cfg.RemoteConfig.URL != "" {
+		if cfg.RemoteConfig.URL == "" {
+			// A reload that cleared the overlay also drops the fetcher:
+			// status reporting stops (the web status block disappears) and
+			// a later re-enable starts from fresh conditional-GET state.
+			fetcher.Store(nil)
+		} else {
 			// Enforce the section's trust-boundary rules (https unless
 			// loopback, no userinfo, header hygiene) BEFORE any network
 			// I/O. The base is deliberately loaded raw, and full validation

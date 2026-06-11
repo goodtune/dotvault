@@ -66,6 +66,22 @@ dotvault login-check [flags]
   `DOTVAULT_SUPPRESS_HOURS` (default `6`), the command exits silently.
   A future mtime is treated as stale so clock skew or backup restores
   cannot lock suppression on indefinitely.
+- Pass `--no-passwd` to exit `0` immediately when the current user has
+  an entry in `/etc/passwd`. In corporate fleets where human accounts
+  come from a directory service (SSSD, LDAP, AD), a passwd entry means
+  a local machine account with no Vault credentials to check — a
+  fleet-wide `profile.d` script can pass the flag unconditionally and
+  login-check stays silent for local accounts. The file is parsed
+  directly rather than via `getent`, which merges every NSS source and
+  cannot say which source an entry came from. The flag is ignored with
+  a warning on Windows; a passwd read failure warns and falls through
+  to the normal check (fail open — a directory user must not be locked
+  out by a broken local file). The early exit refreshes the suppression
+  marker, so subsequent shells in the window stop at the freshness
+  check without re-parsing the file. The heuristic is Linux-targeted:
+  on macOS local accounts live in Open Directory rather than
+  `/etc/passwd`, so the flag never matches a human account there and
+  safely degrades to the normal check.
 - Otherwise: if the cached token is valid and still within the first
   half of its creation TTL, exit clean. Past halfway, attempt renewal;
   if renewal fails but the token is still valid, warn with the
@@ -130,6 +146,7 @@ project README and the Windows admin docs for details.
 | `DOTVAULT_TOKEN` | Vault token (takes precedence over `~/.dotvault-token`). Earlier releases honoured the standard `VAULT_TOKEN` variable; it is now deliberately ignored — it belongs to the `vault` CLI and must not leak into dotvault's session. See the [upgrade note](authentication/token.md#upgrading-from-earlier-releases). |
 | `DOTVAULT_SUPPRESS_HOURS` | `dotvault login-check` suppression window in whole hours (default `6`). Zero, negative, or non-integer values cause `login-check` to exit `1`. |
 | `DOTVAULT_SUPPRESS_MARKER` | Override path for the `login-check` suppression marker. Primarily used by tests; the default location is `${XDG_STATE_HOME:-$HOME/.local/state}/dotvault/login-check-suppress`. |
+| `DOTVAULT_PASSWD_FILE` | Override path for the passwd file consulted by `login-check --no-passwd`. Primarily used by tests; defaults to `/etc/passwd`. |
 
 ## Logging
 

@@ -54,9 +54,12 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("create vault client: %w", err)
 	}
 
-	if cfg.Token != "" {
-		client.SetToken(cfg.Token)
-	}
+	// vaultapi.NewClient silently adopts VAULT_TOKEN from the environment.
+	// dotvault's token resolution honours DOTVAULT_TOKEN instead (so a
+	// concurrent `vault` CLI session's environment never leaks into the
+	// daemon or any external consumer of the client facade), so the token
+	// is set unconditionally — an empty cfg.Token clears the SDK's pickup.
+	client.SetToken(cfg.Token)
 
 	return &Client{raw: client}, nil
 }

@@ -276,7 +276,7 @@ Logging uses `log/slog` — text format when stderr is a TTY, JSON otherwise. Al
 ## Daemon Lifecycle
 
 1. Load config (file or registry)
-2. Create Vault client, attempt token reuse (VAULT_TOKEN env or `~/.dotvault-token`)
+2. Create Vault client, attempt token reuse (DOTVAULT_TOKEN env or `~/.dotvault-token`)
 3. Start web UI if enabled (before auth, so it can serve browser-based login)
 4. Authenticate if needed: web mode routes all auth through the SPA; CLI mode uses method-specific flows (OIDC browser, LDAP terminal prompt, token file). A non-interactive host with neither a web UI nor a TTY does not give up — it registers a synchronous token-file watch and idles until an external facility (e.g. a login profile running `dotvault login`) writes a usable token, then resumes startup. The watch is registered before the no-token decision so a token written during startup cannot be missed; this replaced the previous behaviour where a headless daemon idled until shutdown and required a restart to pick up a token (`waitForHeadlessToken`, `cmd/dotvault/main.go`).
 5. Start token lifecycle manager (renews at 75% TTL, exponential backoff 1s-5m on failure)
@@ -296,7 +296,7 @@ Full config reload via SIGHUP is **not implemented**. The daemon must be fully r
 
 - **OIDC** — Requests auth URL from Vault, opens browser, listens on random localhost port for callback, exchanges code for Vault token
 - **LDAP** — Prompts for password; supports MFA (Duo push and TOTP) via the LoginTracker async state machine
-- **Token** — Reads from VAULT_TOKEN env var or `~/.dotvault-token`
+- **Token** — Reads from DOTVAULT_TOKEN env var or `~/.dotvault-token`. The upstream `VAULT_TOKEN` variable is deliberately ignored everywhere — including the Vault SDK's automatic pickup, which `internal/vault.NewClient` neutralises by setting the token unconditionally — so a concurrent `vault` CLI session's environment never leaks into the daemon or external `client/` consumers
 
 ### LoginTracker
 
@@ -308,7 +308,7 @@ Async login state machine (`internal/auth/login.go`) shared by CLI and web paths
 On detecting an invalid/expired token (403 Forbidden or TTL=0 + concrete
 `expire_time`) the manager runs a recovery sequence:
 
-1. Re-read the token file (and `VAULT_TOKEN` env). If a different value
+1. Re-read the token file (and `DOTVAULT_TOKEN` env). If a different value
    is present and `LookupSelf` succeeds with it, swap the in-memory token
    on the Vault client, clear the needs-reauth flag, and return to the
    normal 5-minute check cadence. This lets a parallel `dotvault login`

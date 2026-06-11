@@ -47,7 +47,7 @@ func (m *Manager) Login(ctx context.Context) error {
 	case "ldap":
 		return m.authenticateLDAP(ctx)
 	case "token":
-		return fmt.Errorf("auth method 'token' requires a valid token in %s or VAULT_TOKEN env", m.TokenFilePath)
+		return fmt.Errorf("auth method 'token' requires a valid token in %s or DOTVAULT_TOKEN env", m.TokenFilePath)
 	default:
 		return fmt.Errorf("unsupported auth method: %q", m.AuthMethod)
 	}

@@ -167,7 +167,7 @@ func pipeKeys(t *testing.T, b []byte) *os.File {
 
 // TestEnrolUnauthenticated_SubprocessRoundTrip exercises the "no
 // token, point at `dotvault login`" exit path end-to-end by invoking
-// the compiled binary with no VAULT_TOKEN and a HOME that contains no
+// the compiled binary with no DOTVAULT_TOKEN and a HOME that contains no
 // .dotvault-token file. The auth check at the top of runEnrol must
 // short-circuit before any Vault round-trip and exit 1 with the
 // documented message. Done as a subprocess test because runEnrol
@@ -212,10 +212,12 @@ enrolments:
 	}
 
 	cmd := exec.Command(binPath, "--config", configPath, "enrol")
-	// Force "no token" — empty VAULT_TOKEN, HOME pointing at a fresh
-	// dir without a .dotvault-token file.
+	// Force "no token" — empty DOTVAULT_TOKEN, HOME pointing at a fresh
+	// dir without a .dotvault-token file. VAULT_TOKEN is set to prove it
+	// is ignored end-to-end (including the Vault SDK's own pickup).
 	cmd.Env = append(os.Environ(),
-		"VAULT_TOKEN=",
+		"DOTVAULT_TOKEN=",
+		"VAULT_TOKEN=should-be-ignored",
 		"HOME="+workDir,
 	)
 	out, err := cmd.CombinedOutput()
@@ -278,7 +280,7 @@ func TestEnrolTransientVaultError_SubprocessRoundTrip(t *testing.T) {
 	// Provide a token so the auth check moves past the "no token"
 	// branch and exercises LookupSelf against our fake server.
 	cmd.Env = append(os.Environ(),
-		"VAULT_TOKEN=fake-token-for-test",
+		"DOTVAULT_TOKEN=fake-token-for-test",
 		"HOME="+workDir,
 	)
 	out, err := cmd.CombinedOutput()

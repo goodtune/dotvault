@@ -28,13 +28,17 @@ func ReadTokenFile(path string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// ReadTokenEnv reads the Vault token from VAULT_TOKEN environment variable.
+// ReadTokenEnv reads the Vault token from the DOTVAULT_TOKEN environment
+// variable. VAULT_TOKEN is deliberately ignored — it belongs to the `vault`
+// CLI, and honouring it would let an unrelated shell session's token leak
+// into the daemon (the Vault SDK's own VAULT_TOKEN pickup is likewise
+// neutralised in internal/vault.NewClient).
 func ReadTokenEnv() string {
-	return os.Getenv("VAULT_TOKEN")
+	return os.Getenv("DOTVAULT_TOKEN")
 }
 
-// ResolveToken returns a Vault token, checking VAULT_TOKEN env var first,
-// then the token file. Returns empty string if neither is set.
+// ResolveToken returns a Vault token, checking the DOTVAULT_TOKEN env var
+// first, then the token file. Returns empty string if neither is set.
 func ResolveToken(tokenFilePath string) string {
 	if token := ReadTokenEnv(); token != "" {
 		return token

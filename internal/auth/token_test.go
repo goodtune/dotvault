@@ -31,10 +31,18 @@ func TestReadTokenFromFileMissing(t *testing.T) {
 }
 
 func TestReadTokenFromEnv(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "env-token-value")
+	t.Setenv("DOTVAULT_TOKEN", "env-token-value")
 	token := ReadTokenEnv()
 	if token != "env-token-value" {
 		t.Errorf("token = %q, want %q", token, "env-token-value")
+	}
+}
+
+func TestReadTokenEnvIgnoresVaultToken(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	t.Setenv("VAULT_TOKEN", "vault-cli-token")
+	if token := ReadTokenEnv(); token != "" {
+		t.Errorf("token = %q, want empty — VAULT_TOKEN must be ignored", token)
 	}
 }
 
@@ -61,6 +69,11 @@ func TestWriteTokenFile(t *testing.T) {
 }
 
 func TestResolveToken(t *testing.T) {
+	// Hermetic: clear both variables so an outer shell/CI environment
+	// can't satisfy (or break) the pre-override assertions below.
+	t.Setenv("DOTVAULT_TOKEN", "")
+	t.Setenv("VAULT_TOKEN", "")
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".vault-token")
 
@@ -77,8 +90,15 @@ func TestResolveToken(t *testing.T) {
 		t.Errorf("token = %q, want %q", token, "file-token")
 	}
 
-	// Env takes precedence
-	t.Setenv("VAULT_TOKEN", "env-token")
+	// VAULT_TOKEN is ignored — the file token still wins
+	t.Setenv("VAULT_TOKEN", "vault-cli-token")
+	token = ResolveToken(path)
+	if token != "file-token" {
+		t.Errorf("token = %q, want %q (VAULT_TOKEN must be ignored)", token, "file-token")
+	}
+
+	// DOTVAULT_TOKEN takes precedence
+	t.Setenv("DOTVAULT_TOKEN", "env-token")
 	token = ResolveToken(path)
 	if token != "env-token" {
 		t.Errorf("token = %q, want %q (env should take precedence)", token, "env-token")

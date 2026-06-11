@@ -53,6 +53,31 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
+// TestNewClient_IgnoresVaultTokenEnv guards against the Vault SDK's
+// automatic VAULT_TOKEN pickup (vaultapi.NewClient adopts it silently).
+// dotvault honours DOTVAULT_TOKEN via internal/auth's token resolution,
+// so a VAULT_TOKEN belonging to a concurrent `vault` CLI session must
+// never leak onto a freshly constructed client.
+func TestNewClient_IgnoresVaultTokenEnv(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "vault-cli-token")
+
+	c, err := NewClient(Config{Address: "http://127.0.0.1:8200"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if got := c.Token(); got != "" {
+		t.Errorf("token = %q, want empty — VAULT_TOKEN must not leak in via the SDK", got)
+	}
+
+	c, err = NewClient(Config{Address: "http://127.0.0.1:8200", Token: "explicit"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if got := c.Token(); got != "explicit" {
+		t.Errorf("token = %q, want %q — explicit token must win over VAULT_TOKEN", got, "explicit")
+	}
+}
+
 func TestReadKVv2(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

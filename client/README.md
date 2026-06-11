@@ -22,7 +22,7 @@ if err != nil { /* fail closed */ }
 cli, err := client.New(cfg)
 if err != nil { /* fail closed */ }
 
-// VAULT_TOKEN env → token file → interactive login (OIDC browser / LDAP prompt).
+// DOTVAULT_TOKEN env → token file → interactive login (OIDC browser / LDAP prompt).
 // Authenticate logs in when no cached token works, so it returns ErrUnreachable
 // or ErrAuthFailed — not ErrLoginRequired (that's AuthenticateCached's outcome).
 if err := cli.Authenticate(ctx); err != nil {
@@ -54,13 +54,13 @@ If your deployment can't guarantee same-user, pass `client.WithIdentity("<name>"
 
 | Method | Behaviour | Use when |
 | --- | --- | --- |
-| `Authenticate(ctx)` | `VAULT_TOKEN` → token file → interactive login. Short-circuits with `ErrUnreachable` (no prompt) if Vault is down. | Normal startup where a human is present. |
+| `Authenticate(ctx)` | `DOTVAULT_TOKEN` → token file → interactive login. Short-circuits with `ErrUnreachable` (no prompt) if Vault is down. | Normal startup where a human is present. |
 | `AuthenticateCached(ctx)` | env → file only. Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
 | `Login(ctx)` | Unconditional fresh login (ignores cached token). Equivalent to `dotvault login`. | Forcing re-auth. |
 
 > **`Authenticate` and `Login` are interactive.** They can open a browser (OIDC) or block reading a password and MFA code from the terminal (LDAP). That is surprising inside a library call: **do not call them from a non-interactive service or daemon.** In those contexts use `AuthenticateCached` and surface `ErrLoginRequired` to the operator, or arrange for a token to be present some other way. LDAP `Login` without a TTY returns an error wrapping `ErrAuthFailed` rather than hanging.
 
-Token precedence and the login flow match the daemon's exactly. The token file location (`~/.dotvault-token`) is dotvault's built-in default rather than a configured value — it isn't carried in the YAML/registry config; `New` fills an empty `Config.TokenFile` from `DefaultTokenFile()`. Set `Config.TokenFile` explicitly to override it.
+Token precedence and the login flow match the daemon's exactly. `VAULT_TOKEN` is deliberately ignored — including the Vault SDK's own automatic pickup, which the underlying client construction neutralises — so a concurrent `vault` CLI session's environment never leaks in; use `DOTVAULT_TOKEN` to supply a token via the environment. The token file location (`~/.dotvault-token`) is dotvault's built-in default rather than a configured value — it isn't carried in the YAML/registry config; `New` fills an empty `Config.TokenFile` from `DefaultTokenFile()`. Set `Config.TokenFile` explicitly to override it.
 
 ## Error categories
 
@@ -91,4 +91,4 @@ The package ships `client.Reader`, a narrow interface covering the read side (`I
 
 Authentication is intentionally left out of `Reader`: it has side effects (token-file writes, browser/terminal interaction) that belong in `main`, not in the unit under test. Construct and authenticate a real `*client.Client` at startup; pass it (as a `Reader`) into the code that reads.
 
-One caveat: `Authenticate`/`AuthenticateCached` read process environment (`VAULT_TOKEN`, `VAULT_NAMESPACE`), so tests that exercise the real client must use `t.Setenv` and can't run with `t.Parallel()`. The `Reader` fake sidesteps this entirely.
+One caveat: `Authenticate`/`AuthenticateCached` read process environment (`DOTVAULT_TOKEN`, `VAULT_NAMESPACE`), so tests that exercise the real client must use `t.Setenv` and can't run with `t.Parallel()`. The `Reader` fake sidesteps this entirely.

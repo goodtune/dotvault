@@ -25,6 +25,7 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
+	"github.com/goodtune/dotvault/internal/remoteconfig"
 	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
@@ -211,17 +212,239 @@ func newVersionCmd() *cobra.Command {
 	return cmd
 }
 
-// loadConfig loads the effective configuration and returns it alongside the
-// path it was loaded from, so callers can reuse the same string for the
-// loaded config and any subsequent reference (reload, log attribute, status
-// output). It applies the --config override policy via resolveConfigSource.
+// loadConfig loads the effective configuration — the local base merged with
+// the remote overlay when remote_config is configured — and returns it
+// alongside the path it was loaded from, so callers can reuse the same string
+// for the loaded config and any subsequent reference (reload, log attribute,
+// status output). It applies the --config override policy via
+// resolveConfigSource.
 func loadConfig() (*config.Config, string, error) {
+	cfg, path, _, err := loadConfigRemote()
+	return cfg, path, err
+}
+
+// loadConfigRemote is loadConfig with the remote-fetch status function
+// exposed, for callers that surface the overlay state (dotvault status).
+// The status func returns nil until a remote URL is configured and a fetch
+// has been attempted. One-shot commands have no long-lived context to thread
+// through, so the fetch runs under context.Background() bounded by the
+// fetcher's own HTTP timeout.
+func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, error) {
+	load, path, err := resolveConfigSource()
+	if err != nil {
+		return nil, path, nil, err
+	}
+	merged, status := withRemote(context.Background(), load)
+	cfg, err := merged()
+	return cfg, path, status, err
+}
+
+// wrapValidateErr wraps a validation failure with the source-attributing
+// prefix the pre-overlay LoadSystem used: registry-managed (GPO) configs say
+// "validate registry config" so Windows troubleshooting keeps pointing at
+// the right surface.
+func wrapValidateErr(cfg *config.Config, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cfg.Managed {
+		return fmt.Errorf("validate registry config: %w", err)
+	}
+	return fmt.Errorf("validate config: %w", err)
+}
+
+// loadConfigLocalOnly loads and validates the local base configuration
+// without ever touching the network, even when remote_config is set. Used by
+// login and login-check: both consume only the local-only vault section, and
+// login-check runs in shell-startup paths where a remote fetch's latency
+// budget is unacceptable.
+func loadConfigLocalOnly() (*config.Config, string, error) {
 	load, path, err := resolveConfigSource()
 	if err != nil {
 		return nil, path, err
 	}
 	cfg, err := load()
-	return cfg, path, err
+	if err != nil {
+		return nil, path, err
+	}
+	if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
+		return nil, path, err
+	}
+	return cfg, path, nil
+}
+
+// withRemote wraps a raw config loader with the remote-config overlay
+// pipeline: parse base → fetch the remote partial (ETag-cached, fail-open) →
+// merge → validate the merged result. When no remote URL is configured the
+// wrapper just validates the base, so every subcommand funnels through one
+// validation path.
+//
+// ctx bounds the fetches issued by the returned loader: the daemon passes
+// its lifetime context so an in-flight fetch is cancelled on shutdown
+// instead of running out the HTTP timeout; one-shot commands pass
+// context.Background().
+//
+// One Fetcher persists across loader calls (the daemon's reload loop reuses
+// the closure every tick) so the conditional-GET state survives; it is
+// rebuilt only if the base's remote_config section itself changes. Fetch
+// failures never abort the load — the fetcher resolves down its fail-open
+// ladder (fresh → cache → base-only) — but local misconfiguration surfaced
+// by remoteconfig.New (unreadable ca_cert) is a hard error.
+func withRemote(ctx context.Context, load func() (*config.Config, error)) (func() (*config.Config, error), func() *remoteconfig.Status) {
+	var fetcher atomic.Pointer[remoteconfig.Fetcher]
+
+	loader := func() (*config.Config, error) {
+		cfg, err := load()
+		if err != nil {
+			return nil, err
+		}
+		if cfg.RemoteConfig.URL == "" {
+			// A reload that cleared the overlay also drops the fetcher:
+			// status reporting stops (the web status block disappears) and
+			// a later re-enable starts from fresh conditional-GET state.
+			fetcher.Store(nil)
+		} else {
+			// Enforce the section's trust-boundary rules (https unless
+			// loopback, no userinfo, header hygiene) BEFORE any network
+			// I/O. The base is deliberately loaded raw, and full validation
+			// only runs after the merge — without this gate a misconfigured
+			// remote_config block would trigger a fetch the validator was
+			// about to reject.
+			if err := cfg.RemoteConfig.Validate(); err != nil {
+				return nil, wrapValidateErr(cfg, err)
+			}
+			f := fetcher.Load()
+			if f == nil || !reflect.DeepEqual(f.Config(), cfg.RemoteConfig) {
+				nf, ferr := remoteconfig.New(cfg.RemoteConfig, version)
+				if ferr != nil {
+					return nil, fmt.Errorf("remote config: %w", ferr)
+				}
+				fetcher.Store(nf)
+				f = nf
+			}
+			partial, ferr := f.Fetch(ctx)
+			if ferr != nil {
+				return nil, fmt.Errorf("remote config: %w", ferr)
+			}
+			config.ApplyPartial(cfg, partial)
+		}
+		if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
+	status := func() *remoteconfig.Status {
+		f := fetcher.Load()
+		if f == nil {
+			return nil
+		}
+		s := f.Status()
+		return &s
+	}
+	return loader, status
+}
+
+// refreshDeps carries the running subsystems the daemon's config-refresh
+// loop fans changes out to. web and enrolManager are optional: web is nil
+// outside web mode, enrolManager is nil outside CLI-interactive mode.
+type refreshDeps struct {
+	load     func() (*config.Config, error)
+	interval time.Duration
+	// trackSyncTicks is set when the refresh cadence defaulted to
+	// sync.interval (no explicit remote_config.refresh_interval); the loop
+	// then follows a remotely-changed sync interval instead of staying
+	// pinned to the startup value.
+	trackSyncTicks bool
+	initial        *config.Config
+	engine         *sync.Engine
+	refreshManager *enrol.RefreshManager
+	watchManager   *enrol.WatchManager
+	web            *web.Server
+	enrolManager   *enrol.Manager
+}
+
+// runConfigRefresh re-runs the daemon's config loader on a fixed tick — the
+// loader performs the remote overlay's conditional GET internally, so an
+// unchanged remote document costs one cheap 304 — and applies dynamic-section
+// changes to the running daemon: enrolments fan out to the enrolment manager
+// (CLI), the refresh/watch managers, and the web enrolment runner; rules and
+// the sync interval go to the sync engine and the web server's snapshots.
+// Static sections (vault, web, agent, observability) are exclusively local
+// and still require a restart, as documented.
+func runConfigRefresh(ctx context.Context, d refreshDeps) {
+	ticker := time.NewTicker(d.interval)
+	defer ticker.Stop()
+
+	lastEnrolments := d.initial.Enrolments
+	lastRules := d.initial.Rules
+	lastInterval := d.initial.Sync.Interval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reloaded, err := d.load()
+			if err != nil {
+				observability.RecordConfigReload(ctx, "error")
+				slog.Warn("config reload failed", "error", err)
+				continue
+			}
+
+			changed := false
+
+			if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+				// All-or-nothing: when the web runner is busy with a
+				// running enrolment the whole enrolment update is
+				// deferred (lastEnrolments stays put), so the next tick
+				// retries every consumer together rather than leaving
+				// the managers and the web runner disagreeing.
+				if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
+					slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
+				} else {
+					changed = true
+					slog.Info("enrolments config changed, re-checking")
+					if d.enrolManager != nil {
+						d.enrolManager.UpdateConfig(reloaded.Enrolments)
+					}
+					d.refreshManager.UpdateConfig(reloaded.Enrolments)
+					d.watchManager.UpdateConfig(reloaded.Enrolments)
+					lastEnrolments = reloaded.Enrolments
+				}
+			}
+
+			rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
+			intervalChanged := reloaded.Sync.Interval != lastInterval
+			if rulesChanged || intervalChanged {
+				changed = true
+				d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
+				if d.web != nil {
+					d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
+				}
+				if intervalChanged && d.trackSyncTicks {
+					ticker.Reset(reloaded.Sync.Interval)
+				}
+				lastRules = reloaded.Rules
+				lastInterval = reloaded.Sync.Interval
+			}
+
+			if changed {
+				observability.RecordConfigReload(ctx, "applied")
+			} else {
+				observability.RecordConfigReload(ctx, "no_change")
+			}
+
+			// CLI mode keeps its historical behaviour: re-check enrolments
+			// every tick and trigger a sync when something newly enrolled.
+			if d.enrolManager != nil {
+				if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
+					slog.Warn("enrolment check failed", "error", err)
+				} else if ok {
+					d.engine.TriggerSync()
+				}
+			}
+		}
+	}
 }
 
 // resolveConfigSource decides where configuration is loaded from and returns
@@ -230,6 +453,11 @@ func loadConfig() (*config.Config, string, error) {
 // agree on the source — and on a single resolved path, since
 // paths.SystemConfigPath on Linux consults XDG_CONFIG_DIRS via os.Stat and two
 // back-to-back calls can disagree if the filesystem changes between them.
+//
+// The returned loader parses but does NOT validate (LoadSystemRaw/LoadRaw):
+// validation belongs to the merged result, after the remote overlay is
+// applied. Callers wrap the loader via withRemote (or validate explicitly,
+// as loadConfigLocalOnly does) rather than consuming it directly.
 //
 // Without --config the loader uses the normal system source (Windows GPO
 // registry, else the system YAML file). With --config the override is honoured
@@ -240,7 +468,7 @@ func loadConfig() (*config.Config, string, error) {
 func resolveConfigSource() (func() (*config.Config, error), string, error) {
 	systemPath := paths.SystemConfigPath()
 	if flagConfig == "" {
-		return func() (*config.Config, error) { return config.LoadSystem(systemPath) }, systemPath, nil
+		return func() (*config.Config, error) { return config.LoadSystemRaw(systemPath) }, systemPath, nil
 	}
 
 	// Capture the override path in a local so the loader closure (reused by the
@@ -263,9 +491,9 @@ func resolveConfigSource() (func() (*config.Config, error), string, error) {
 				"(BypassSystemConfig=1 in its Group Policy registry equivalent)", override)
 	}
 	// Override allowed: load the file directly, deliberately bypassing the
-	// registry (config.Load, not config.LoadSystem) so the override actually
+	// registry (LoadRaw, not LoadSystemRaw) so the override actually
 	// takes effect on a GPO-managed machine that opted into the bypass.
-	return func() (*config.Config, error) { return config.Load(override) }, override, nil
+	return func() (*config.Config, error) { return config.LoadRaw(override) }, override, nil
 }
 
 // emitConfigSourceLog surfaces a WARN OTel log record when the
@@ -292,17 +520,28 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		return runSync(cmd, args)
 	}
 
-	loadCfg, cfgPath, err := resolveConfigSource()
+	// The daemon's lifetime context is created before the config loader so
+	// the remote overlay's fetches (initial load and every refresh tick) are
+	// cancelled on shutdown rather than running out the HTTP timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	loadBase, cfgPath, err := resolveConfigSource()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// loadCfg is the loader the daemon holds for its lifetime: the reload
+	// loop re-runs it every tick, and the remote overlay (conditional GET +
+	// merge) lives inside it so reloads converge on the remote state.
+	loadCfg, remoteStatus := withRemote(ctx, loadBase)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	if rs := remoteStatus(); rs != nil {
+		slog.Info("remote config overlay active",
+			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)
+	}
 
 	// Start the systemd watchdog loop as early as possible. The loop
 	// is a no-op outside systemd and when WATCHDOG_USEC/NOTIFY_SOCKET
@@ -429,6 +668,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			SyncCfg:       cfg.Sync,
 			ObsCfg:        obsCfgForWeb,
 			AgentCfg:      cfg.Agent,
+			RemoteCfg:     cfg.RemoteConfig,
+			RemoteStatus:  remoteStatus,
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
@@ -607,6 +848,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// enrolMgr drives the terminal wizard and exists only in CLI-interactive
+	// mode; the refresh loop below treats it as optional.
+	var enrolMgr *enrol.Manager
 	if webServer != nil {
 		// Web mode: let the frontend drive enrolments.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
@@ -626,9 +870,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// Headless CLI mode: no web UI, no terminal. Skip the enrolment
 		// wizard entirely — engines that prompt would either fail or hang
 		// without a TTY. The RefreshManager started above continues to
-		// rotate already-enrolled credentials, but enrolment/config
-		// changes are not reloaded in this path and require a daemon
-		// restart to take effect.
+		// rotate already-enrolled credentials, and the config-refresh loop
+		// below still propagates rule/enrolment changes to the sync engine
+		// and refresh/watch managers; only the interactive wizard is
+		// unavailable in this mode.
 		if len(cfg.Enrolments) > 0 {
 			slog.Info("skipping enrolment wizard: stdin is not a terminal and web UI is not running")
 		}
@@ -653,7 +898,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				return string(pass), nil
 			},
 		}
-		enrolMgr := enrol.NewManager(enrol.ManagerConfig{
+		enrolMgr = enrol.NewManager(enrol.ManagerConfig{
 			Enrolments: cfg.Enrolments,
 			KVMount:    cfg.Vault.KVMount,
 			UserPrefix: cfg.Vault.UserPrefix + username + "/",
@@ -661,48 +906,29 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		if _, err := enrolMgr.CheckAll(ctx); err != nil {
 			slog.Warn("enrolment check failed", "error", err)
 		}
-
-		// Background goroutine: reload config on each tick and re-check enrolments.
-		// Reuses the loadCfg closure captured at startup so the reload loop tracks
-		// the exact source the daemon first loaded — the same resolved system path
-		// (even if the filesystem state SystemConfigPath consults via
-		// XDG_CONFIG_DIRS on Linux changes) or the same --config override file,
-		// applying the bypass policy once at startup rather than re-deciding it
-		// every tick.
-		go func() {
-			ticker := time.NewTicker(cfg.Sync.Interval)
-			defer ticker.Stop()
-			lastEnrolments := cfg.Enrolments
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					reloaded, err := loadCfg()
-					if err != nil {
-						observability.RecordConfigReload(ctx, "error")
-						slog.Warn("config reload failed", "error", err)
-						continue
-					}
-					if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-						observability.RecordConfigReload(ctx, "applied")
-						slog.Info("enrolments config changed, re-checking")
-						enrolMgr.UpdateConfig(reloaded.Enrolments)
-						rm.UpdateConfig(reloaded.Enrolments)
-						wm.UpdateConfig(reloaded.Enrolments)
-						lastEnrolments = reloaded.Enrolments
-					} else {
-						observability.RecordConfigReload(ctx, "no_change")
-					}
-					if ok, err := enrolMgr.CheckAll(ctx); err != nil {
-						slog.Warn("enrolment check failed", "error", err)
-					} else if ok {
-						engine.TriggerSync()
-					}
-				}
-			}
-		}()
 	}
+
+	// Config refresh loop — runs in every daemon mode (web, headless, CLI).
+	// Reuses the loadCfg closure captured at startup so each tick tracks the
+	// exact source the daemon first loaded (same resolved system path, same
+	// --config override, bypass policy decided once) and re-runs the remote
+	// overlay's conditional GET, then fans dynamic-section changes out to the
+	// running subsystems.
+	refreshInterval := cfg.Sync.Interval
+	if cfg.RemoteConfig.RefreshInterval > 0 {
+		refreshInterval = cfg.RemoteConfig.RefreshInterval
+	}
+	go runConfigRefresh(ctx, refreshDeps{
+		load:           loadCfg,
+		interval:       refreshInterval,
+		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
+		initial:        cfg,
+		engine:         engine,
+		refreshManager: rm,
+		watchManager:   wm,
+		web:            webServer,
+		enrolManager:   enrolMgr,
+	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
 
@@ -826,7 +1052,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 func runStatus(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, _, err := loadConfig()
+	cfg, _, remoteStatus, err := loadConfigRemote()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -873,9 +1099,39 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printRemoteConfigStatus(remoteStatus)
+
 	printAgentStatus(ctx, cfg)
 
 	return nil
+}
+
+// printRemoteConfigStatus renders the remote-config section of `dotvault
+// status`. Only relevant when a remote URL is configured: the status func
+// returns nil otherwise and nothing is printed.
+func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
+	if remoteStatus == nil {
+		return
+	}
+	rs := remoteStatus()
+	if rs == nil {
+		return
+	}
+	fmt.Println("\nRemote Config:")
+	fmt.Printf("  url:    %s\n", rs.URL)
+	fmt.Printf("  source: %s\n", rs.Source)
+	if rs.ETag != "" {
+		fmt.Printf("  etag:   %s\n", rs.ETag)
+	}
+	if !rs.LastSuccess.IsZero() {
+		fmt.Printf("  last success: %s\n", rs.LastSuccess.Format("2006-01-02 15:04:05"))
+	}
+	if !rs.CachedAt.IsZero() {
+		fmt.Printf("  cached at:    %s\n", rs.CachedAt.Format("2006-01-02 15:04:05"))
+	}
+	if rs.LastError != "" {
+		fmt.Printf("  last error:   %s\n", rs.LastError)
+	}
 }
 
 // printAgentStatus renders the SSH agent section of `dotvault status`. The
@@ -929,7 +1185,9 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 func runLogin(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
-	cfg, _, err := loadConfig()
+	// Local-only: login consumes just the vault section (always local) and
+	// must not pay for a remote fetch.
+	cfg, _, err := loadConfigLocalOnly()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -1107,7 +1365,10 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	cfg, _, err := loadConfig()
+	// Local-only: login-check runs from shell-startup profiles where a
+	// remote fetch's latency is unacceptable, and it consumes just the
+	// vault section (always local).
+	cfg, _, err := loadConfigLocalOnly()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

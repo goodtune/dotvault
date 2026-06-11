@@ -227,6 +227,23 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 	return info, nil
 }
 
+// AnyRunning reports whether any enrolment is currently executing. The
+// daemon's config-refresh loop checks it before swapping the runner for a
+// changed enrolments map, so a mid-run engine is never orphaned.
+func (r *EnrolmentRunner) AnyRunning() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.states {
+		s.mu.Lock()
+		running := s.status == "running"
+		s.mu.Unlock()
+		if running {
+			return true
+		}
+	}
+	return false
+}
+
 // HasPending returns true if any enrolment is pending, running, or failed.
 func (r *EnrolmentRunner) HasPending() bool {
 	r.mu.RLock()

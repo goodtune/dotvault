@@ -113,6 +113,23 @@ func (s *StateStore) Set(name string, rs RuleState) {
 	s.state.Rules[name] = rs
 }
 
+// Prune removes state entries for rules not present in keep, returning the
+// number removed. Used when the rule set changes at runtime (remote config
+// refresh) so state.json doesn't accumulate orphaned entries for rules that
+// no longer exist. The caller is responsible for Save.
+func (s *StateStore) Prune(keep map[string]bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for name := range s.state.Rules {
+		if !keep[name] {
+			delete(s.state.Rules, name)
+			removed++
+		}
+	}
+	return removed
+}
+
 // Rules returns a copy of all rule states.
 func (s *StateStore) Rules() map[string]RuleState {
 	s.mu.Lock()

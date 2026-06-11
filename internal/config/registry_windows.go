@@ -74,6 +74,16 @@ func loadFromRegistry() (*Config, bool, error) {
 		cfg.Observability.Headers = headers
 	}
 
+	// Read remote-config dimension headers (same dynamic key/value map
+	// shape as observability headers, under RemoteConfig\Headers).
+	remoteHeaders, err := readRegistryRemoteConfigHeaders(registry.LOCAL_MACHINE, registryPolicyPath)
+	if err != nil {
+		return nil, true, fmt.Errorf("read registry remote-config headers: %w", err)
+	}
+	if len(remoteHeaders) > 0 {
+		cfg.RemoteConfig.Headers = remoteHeaders
+	}
+
 	return cfg, true, nil
 }
 
@@ -89,19 +99,34 @@ func loadFromRegistry() (*Config, bool, error) {
 // this loader reads them back; an admin can also author them directly via
 // Group Policy.
 func readRegistryObservabilityHeaders(root registry.Key, basePath string) (map[string]string, error) {
-	headersPath := basePath + `\Observability\Headers`
+	return readRegistryHeaderMap(root, basePath+`\Observability\Headers`)
+}
+
+// readRegistryRemoteConfigHeaders reads the remote-config dimension header
+// map from RemoteConfig\Headers under the given basePath. Unlike
+// observability headers these are not credentials — they are client-asserted
+// dimension labels (e.g. X-Dotvault-Env) — but they follow the same
+// verbatim-name, lossless round-trip contract.
+func readRegistryRemoteConfigHeaders(root registry.Key, basePath string) (map[string]string, error) {
+	return readRegistryHeaderMap(root, basePath+`\RemoteConfig\Headers`)
+}
+
+// readRegistryHeaderMap reads a dynamic header map: every REG_SZ value
+// directly under headersPath, keyed by value name. Returns (nil, nil) when
+// the key does not exist or holds no values.
+func readRegistryHeaderMap(root registry.Key, headersPath string) (map[string]string, error) {
 	key, err := registry.OpenKey(root, headersPath, registry.READ)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("open Observability\\Headers key at %s: %w", headersPath, err)
+		return nil, fmt.Errorf("open headers key at %s: %w", headersPath, err)
 	}
 	defer key.Close()
 
 	info, err := key.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat Observability\\Headers key: %w", err)
+		return nil, fmt.Errorf("stat headers key %s: %w", headersPath, err)
 	}
 	if info.ValueCount == 0 {
 		return nil, nil
@@ -109,7 +134,7 @@ func readRegistryObservabilityHeaders(root registry.Key, basePath string) (map[s
 
 	names, err := key.ReadValueNames(int(info.ValueCount))
 	if err != nil {
-		return nil, fmt.Errorf("read Observability\\Headers value names: %w", err)
+		return nil, fmt.Errorf("read header value names at %s: %w", headersPath, err)
 	}
 
 	headers := make(map[string]string, len(names))
@@ -160,6 +185,12 @@ type registryLayer struct {
 	AgentUnixPath     string
 	AgentWindowsPipe  string
 	AgentWindowsPutty *uint32
+
+	// RemoteConfig (scalar fields; the Headers map is read separately by
+	// readRegistryRemoteConfigHeaders).
+	RemoteConfigURL             string
+	RemoteConfigRefreshInterval string
+	RemoteConfigCACert          string
 }
 
 // readRegistryLayer reads dotvault policy values from the given root key.
@@ -253,6 +284,19 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
 	}
 
+	// Read RemoteConfig subkey (scalar fields only; Headers is a nested
+	// key/value map read separately by readRegistryRemoteConfigHeaders).
+	rk, err := registry.OpenKey(root, registryPolicyPath+`\RemoteConfig`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open RemoteConfig policy key: %w", err)
+	}
+	if err == nil {
+		defer rk.Close()
+		layer.RemoteConfigURL, _ = readRegString(rk, "URL")
+		layer.RemoteConfigRefreshInterval, _ = readRegString(rk, "RefreshInterval")
+		layer.RemoteConfigCACert, _ = readRegString(rk, "CACert")
+	}
+
 	return layer, true, nil
 }
 
@@ -334,6 +378,15 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.AgentWindowsPutty != nil {
 		b := *layer.AgentWindowsPutty != 0
 		cfg.Agent.Windows.Putty = &b
+	}
+	if layer.RemoteConfigURL != "" {
+		cfg.RemoteConfig.URL = layer.RemoteConfigURL
+	}
+	if layer.RemoteConfigRefreshInterval != "" {
+		cfg.RemoteConfig.RawRefreshInterval = layer.RemoteConfigRefreshInterval
+	}
+	if layer.RemoteConfigCACert != "" {
+		cfg.RemoteConfig.CACert = layer.RemoteConfigCACert
 	}
 }
 

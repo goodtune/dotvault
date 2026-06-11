@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -25,8 +26,11 @@ type Engine struct {
 	username  string
 	state     *StateStore
 	triggerCh chan struct{}
-	mu        sync.Mutex
-	DryRun    bool
+	// cfgCh nudges the run loop after UpdateConfig changes the sync
+	// interval, so the ticker is reset without waiting out the old period.
+	cfgCh  chan struct{}
+	mu     sync.Mutex
+	DryRun bool
 }
 
 // NewEngine creates a new sync engine.
@@ -40,6 +44,7 @@ func NewEngine(cfg *config.Config, vc *vault.Client, username, statePath string)
 		username:  username,
 		state:     store,
 		triggerCh: make(chan struct{}, 1),
+		cfgCh:     make(chan struct{}, 1),
 	}
 }
 
@@ -49,6 +54,58 @@ func (e *Engine) TriggerSync() {
 	case e.triggerCh <- struct{}{}:
 	default:
 	}
+}
+
+// UpdateConfig swaps the engine's dynamic configuration at runtime: the rule
+// set and the poll interval. Called by the daemon's config-refresh loop when
+// the remote overlay (or an edited local config) changes them. No-op when
+// nothing changed. On a rule change, state entries for removed rules are
+// pruned (so state.json converges with the rule set) and an immediate sync is
+// triggered; on an interval change the run loop's ticker is reset.
+func (e *Engine) UpdateConfig(rules []config.Rule, interval time.Duration) {
+	e.mu.Lock()
+	rulesChanged := !reflect.DeepEqual(e.cfg.Rules, rules)
+	intervalChanged := interval > 0 && interval != e.cfg.Sync.Interval
+	if rulesChanged {
+		e.cfg.Rules = append([]config.Rule(nil), rules...)
+	}
+	if intervalChanged {
+		e.cfg.Sync.Interval = interval
+	}
+	e.mu.Unlock()
+
+	if !rulesChanged && !intervalChanged {
+		return
+	}
+	slog.Info("sync engine configuration updated",
+		"rules", len(rules), "interval", interval,
+		"rules_changed", rulesChanged, "interval_changed", intervalChanged)
+
+	if rulesChanged {
+		keep := make(map[string]bool, len(rules))
+		for _, r := range rules {
+			keep[r.Name] = true
+		}
+		if removed := e.state.Prune(keep); removed > 0 {
+			if err := e.state.Save(); err != nil {
+				slog.Warn("failed to save state after pruning removed rules", "error", err)
+			}
+		}
+		e.TriggerSync()
+	}
+	if intervalChanged {
+		select {
+		case e.cfgCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// currentInterval reads the poll interval under the engine mutex.
+func (e *Engine) currentInterval() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.Sync.Interval
 }
 
 // RunOnce executes a single sync cycle across all rules.
@@ -161,7 +218,7 @@ func (e *Engine) runLoopAfterInitial(ctx context.Context) error {
 	reconnectDelay := 1 * time.Second
 	const maxReconnectDelay = 5 * time.Minute
 
-	ticker := time.NewTicker(e.cfg.Sync.Interval)
+	ticker := time.NewTicker(e.currentInterval())
 	defer ticker.Stop()
 
 	for {
@@ -172,6 +229,12 @@ func (e *Engine) runLoopAfterInitial(ctx context.Context) error {
 		case <-ticker.C:
 			slog.Debug("poll sync cycle")
 			e.RunOnce(ctx)
+
+		case <-e.cfgCh:
+			// UpdateConfig changed the poll interval — restart the ticker
+			// so the new cadence applies now, not after the old period.
+			ticker.Reset(e.currentInterval())
+			slog.Debug("sync poll interval updated", "interval", e.currentInterval())
 
 		case <-e.triggerCh:
 			slog.Info("manual sync triggered")

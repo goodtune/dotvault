@@ -27,8 +27,8 @@ type LifecycleManager struct {
 
 	// Token file path. When the current in-memory token becomes invalid,
 	// the manager will first read this file directly (and only then fall
-	// back to VAULT_TOKEN) before signalling re-auth. The file-first
-	// precedence is deliberate: VAULT_TOKEN cannot be updated from
+	// back to DOTVAULT_TOKEN) before signalling re-auth. The file-first
+	// precedence is deliberate: DOTVAULT_TOKEN cannot be updated from
 	// another shell, so if the env value is itself the broken token the
 	// daemon was started with, env-first ordering would loop on the
 	// same stale value. Empty means no reload attempt is made.
@@ -115,7 +115,7 @@ func (lm *LifecycleManager) Reload() {
 
 // SetTokenFilePath wires a token file path so that on detection of an
 // invalid/expired token the manager will attempt to reload (and re-validate)
-// the token from disk or VAULT_TOKEN before declaring re-auth necessary.
+// the token from disk or DOTVAULT_TOKEN before declaring re-auth necessary.
 // This lets an external facility (e.g. a tty session running `dotvault login`)
 // recover a running daemon without a restart.
 func (lm *LifecycleManager) SetTokenFilePath(p string) {
@@ -249,16 +249,16 @@ func (lm *LifecycleManager) clearReauth() {
 	lm.needsReauth.Store(false)
 }
 
-// tryReload re-reads the token file (and VAULT_TOKEN env) and, if a
+// tryReload re-reads the token file (and DOTVAULT_TOKEN env) and, if a
 // different value is present, swaps it onto the Vault client and
 // validates with LookupSelf. Returns true iff one of the candidates
 // produced a working token. On failure the previous (broken) token is
 // restored so the caller's error-handling path sees the same state it
 // would have without a reload.
 //
-// Candidate ordering: the token file is consulted before VAULT_TOKEN
+// Candidate ordering: the token file is consulted before DOTVAULT_TOKEN
 // because the env variable cannot be mutated by an external
-// `dotvault login` running in another shell — if VAULT_TOKEN itself is
+// `dotvault login` running in another shell — if DOTVAULT_TOKEN itself is
 // the expired token the daemon was started with, ResolveToken's
 // env-first policy would keep selecting it and never see a fresh
 // value on disk. Reading the file first sidesteps that loop.

@@ -110,7 +110,7 @@ func newTestClient(t *testing.T, fv *fakeVault) *Client {
 	c, err := New(&Config{
 		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token"},
 		// Point the token file somewhere empty by default; tests that want a
-		// cached token set VAULT_TOKEN or override.
+		// cached token set DOTVAULT_TOKEN or override.
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
 	if err != nil {
@@ -158,7 +158,7 @@ func TestUserPrefixNormalised(t *testing.T) {
 }
 
 func TestAuthenticateCached_NoToken(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
 
@@ -169,7 +169,7 @@ func TestAuthenticateCached_NoToken(t *testing.T) {
 }
 
 func TestAuthenticateCached_NoTokenEmptyFilePath(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 	fv := newFakeVault(t)
 	c, err := New(&Config{Vault: VaultConfig{Address: fv.srv.URL}, TokenFile: ""})
 	if err != nil {
@@ -193,7 +193,7 @@ func TestAuthenticateCached_NoTokenEmptyFilePath(t *testing.T) {
 }
 
 func TestAuthenticateCached_EnvToken(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
 
@@ -206,7 +206,7 @@ func TestAuthenticateCached_EnvToken(t *testing.T) {
 }
 
 func TestAuthenticateCached_FileToken(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 	fv := newFakeVault(t)
 	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
 	if err := os.WriteFile(tokenFile, []byte("file-token\n"), 0600); err != nil {
@@ -225,7 +225,7 @@ func TestAuthenticateCached_FileToken(t *testing.T) {
 }
 
 func TestAuthenticateCached_InvalidToken(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "stale")
+	t.Setenv("DOTVAULT_TOKEN", "stale")
 	fv := newFakeVault(t)
 	fv.tokenValid = false
 	c := newTestClient(t, fv)
@@ -237,7 +237,7 @@ func TestAuthenticateCached_InvalidToken(t *testing.T) {
 }
 
 func TestAuthenticateCached_Unreachable(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "tok")
+	t.Setenv("DOTVAULT_TOKEN", "tok")
 	fv := newFakeVault(t)
 	fv.unreachable = true
 	c := newTestClient(t, fv)
@@ -249,7 +249,7 @@ func TestAuthenticateCached_Unreachable(t *testing.T) {
 }
 
 func TestAuthenticate_UnreachableDoesNotLogin(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "tok")
+	t.Setenv("DOTVAULT_TOKEN", "tok")
 	fv := newFakeVault(t)
 	fv.unreachable = true
 	c := newTestClient(t, fv)
@@ -263,7 +263,7 @@ func TestAuthenticate_UnreachableDoesNotLogin(t *testing.T) {
 }
 
 func TestAuthenticate_NoTokenUnreachableDoesNotLogin(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 	fv := newFakeVault(t)
 	fv.unreachable = true
 	c := newTestClient(t, fv)
@@ -279,7 +279,7 @@ func TestAuthenticate_NoTokenUnreachableDoesNotLogin(t *testing.T) {
 }
 
 func TestAuthenticate_NoTokenReachableProceedsToLogin(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv) // AuthMethod "token"
 
@@ -294,7 +294,7 @@ func TestAuthenticate_NoTokenReachableProceedsToLogin(t *testing.T) {
 }
 
 func TestReadKVField(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	fv.secrets["kv/users/tester/gh"] = map[string]any{"oauth_token": "ghp_abc", "user": "tester"}
 	c := newTestClient(t, fv)
@@ -321,7 +321,7 @@ func TestReadKVField(t *testing.T) {
 }
 
 func TestReadKVField_Unreachable(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
 	if err := c.AuthenticateCached(context.Background()); err != nil {
@@ -336,7 +336,7 @@ func TestReadKVField_Unreachable(t *testing.T) {
 }
 
 func TestReadUserSecret(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
 	if err := c.AuthenticateCached(context.Background()); err != nil {
@@ -356,7 +356,7 @@ func TestReadUserSecret(t *testing.T) {
 }
 
 func TestWithIdentity(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c, err := New(&Config{
 		Vault:     VaultConfig{Address: fv.srv.URL},
@@ -409,7 +409,7 @@ func TestWithIdentity_EmptyFallsBack(t *testing.T) {
 }
 
 func TestReadKVField_Denied(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	c := newTestClient(t, fv)
 	if err := c.AuthenticateCached(context.Background()); err != nil {
@@ -425,7 +425,7 @@ func TestReadKVField_Denied(t *testing.T) {
 }
 
 func TestReadKVField_NonStringStringified(t *testing.T) {
-	t.Setenv("VAULT_TOKEN", "good-token")
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
 	fv := newFakeVault(t)
 	fv.secrets["kv/users/tester/meta"] = map[string]any{"count": 42, "on": true}
 	c := newTestClient(t, fv)

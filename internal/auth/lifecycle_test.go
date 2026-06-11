@@ -461,7 +461,7 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 
 // TestLifecycleManager_ReloadPrefersFileOverStaleEnv guards against a
 // regression where ResolveToken's env-first policy would re-select the
-// stale VAULT_TOKEN value the daemon was originally started with and
+// stale DOTVAULT_TOKEN value the daemon was originally started with and
 // never observe a fresh token written to disk by an external
 // `dotvault login`. The recovery path must read the file first.
 func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
@@ -486,10 +486,10 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// VAULT_TOKEN is the same stale value the daemon is currently
+	// DOTVAULT_TOKEN is the same stale value the daemon is currently
 	// holding — the process environment can't be updated from another
 	// shell, so the file must take precedence during recovery.
-	t.Setenv("VAULT_TOKEN", "stale-token")
+	t.Setenv("DOTVAULT_TOKEN", "stale-token")
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")

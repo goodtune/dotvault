@@ -28,7 +28,7 @@ type Config struct {
 	Vault VaultConfig
 
 	// TokenFile is the path to the Vault token file consulted after
-	// VAULT_TOKEN. Empty means dotvault's platform default:
+	// DOTVAULT_TOKEN. Empty means dotvault's platform default:
 	// .dotvault-token in the user's home directory (resolved via
 	// os.UserHomeDir). dotvault does not expose this in its YAML today;
 	// it is here as a programmatic override point and defaults to the
@@ -89,7 +89,7 @@ func DefaultConfigPath() string {
 // recoverable environment condition. We therefore guard it and return ""
 // rather than fabricating a path. An empty token-file path is already
 // well-defined throughout the package: token resolution simply skips the file
-// and uses VAULT_TOKEN only. Returning "" (not a relative ".dotvault-token", which
+// and uses DOTVAULT_TOKEN only. Returning "" (not a relative ".dotvault-token", which
 // would be cwd-dependent and could silently diverge from where the daemon
 // looks) keeps that contract honest; a caller that needs a specific location
 // sets Config.TokenFile explicitly.

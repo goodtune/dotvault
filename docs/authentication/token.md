@@ -14,8 +14,10 @@ vault:
 
 dotvault checks for a token in this order:
 
-1. **`VAULT_TOKEN` environment variable** — takes highest precedence
+1. **`DOTVAULT_TOKEN` environment variable** — takes highest precedence
 2. **`~/.dotvault-token` file** — dotvault's own token file
+
+The standard `VAULT_TOKEN` environment variable is **deliberately ignored** — including the Vault SDK's automatic pickup of it. It belongs to the upstream `vault` CLI, and honouring it would let an unrelated shell session's token silently leak into the daemon (the same isolation rationale as the dotvault-specific token filename below).
 
 ## Use cases
 

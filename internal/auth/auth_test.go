@@ -43,7 +43,7 @@ func TestManagerAuthenticate_ExistingToken(t *testing.T) {
 
 func TestManagerAuthenticate_EnvToken(t *testing.T) {
 	skipIfNoVault(t)
-	t.Setenv("VAULT_TOKEN", "dev-root-token")
+	t.Setenv("DOTVAULT_TOKEN", "dev-root-token")
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")
@@ -63,7 +63,7 @@ func TestManagerAuthenticate_EnvToken(t *testing.T) {
 
 func TestManagerAuthenticate_NoToken(t *testing.T) {
 	skipIfNoVault(t)
-	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("DOTVAULT_TOKEN", "")
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")

@@ -7,8 +7,9 @@
 // dotvault remains the single source of truth for:
 //
 //   - connectivity (Vault address, TLS, CA),
-//   - token-resolution order (VAULT_TOKEN env → token file → interactive
-//     login),
+//   - token-resolution order (DOTVAULT_TOKEN env → token file → interactive
+//     login; VAULT_TOKEN is deliberately ignored — it belongs to the `vault`
+//     CLI and must not leak into dotvault's session),
 //   - the login flow itself (OIDC browser, LDAP with MFA),
 //   - the convention mapping an authenticated user to a
 //     kv/users/<user>/... path.
@@ -125,7 +126,7 @@ func New(cfg *Config, opts ...Option) (*Client, error) {
 // Authenticate makes the Client hold a usable Vault token, following
 // dotvault's precedence:
 //
-//  1. VAULT_TOKEN environment variable,
+//  1. DOTVAULT_TOKEN environment variable,
 //  2. the configured token file,
 //  3. if neither yields a token Vault accepts, the configured fresh-auth flow
 //     (OIDC browser / LDAP terminal prompt — the same path as `dotvault
@@ -168,7 +169,7 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	return c.Login(ctx)
 }
 
-// AuthenticateCached resolves a token from VAULT_TOKEN then the token file and
+// AuthenticateCached resolves a token from DOTVAULT_TOKEN then the token file and
 // validates it with a LookupSelf, but never initiates an interactive login.
 // It returns nil if a cached token is usable, an error wrapping
 // ErrLoginRequired if no usable token is present (missing, expired, or
@@ -181,10 +182,10 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	token := auth.ResolveToken(c.cfg.TokenFile)
 	if token == "" {
 		if c.cfg.TokenFile == "" {
-			return fmt.Errorf("%w: no VAULT_TOKEN set and no token file configured",
+			return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
 				ErrLoginRequired)
 		}
-		return fmt.Errorf("%w: no VAULT_TOKEN and no token at %s",
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
 			ErrLoginRequired, c.cfg.TokenFile)
 	}
 	c.vc.SetToken(token)

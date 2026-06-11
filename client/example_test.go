@@ -25,7 +25,7 @@ func Example() {
 		log.Fatalf("build client: %v", err)
 	}
 
-	// Authenticate: VAULT_TOKEN → token file → interactive login.
+	// Authenticate: DOTVAULT_TOKEN → token file → interactive login.
 	if err := cli.Authenticate(ctx); err != nil {
 		switch {
 		case errors.Is(err, client.ErrUnreachable):

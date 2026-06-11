@@ -42,7 +42,7 @@ import (
 // Vault interaction, outside the sentinel taxonomy below.
 var (
 	// ErrLoginRequired indicates no usable cached token was found — neither
-	// VAULT_TOKEN nor the token file yielded a token that LookupSelf accepts.
+	// DOTVAULT_TOKEN nor the token file yielded a token that LookupSelf accepts.
 	// It is returned by AuthenticateCached (which never prompts). Authenticate
 	// does not return it: on a reachable Vault it consumes this condition and
 	// proceeds to an interactive Login instead.

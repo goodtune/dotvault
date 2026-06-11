@@ -69,6 +69,11 @@ func TestWriteTokenFile(t *testing.T) {
 }
 
 func TestResolveToken(t *testing.T) {
+	// Hermetic: clear both variables so an outer shell/CI environment
+	// can't satisfy (or break) the pre-override assertions below.
+	t.Setenv("DOTVAULT_TOKEN", "")
+	t.Setenv("VAULT_TOKEN", "")
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".vault-token")
 

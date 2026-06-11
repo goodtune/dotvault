@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -337,9 +336,12 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 		t.Fatalf("go build: %v", err)
 	}
 
-	u, err := user.Current()
+	// Resolve the username exactly as production does (paths.Username
+	// strips any DOMAIN\ prefix) so the fixture entry always matches
+	// what login-check looks up.
+	username, err := paths.Username()
 	if err != nil {
-		t.Fatalf("user.Current: %v", err)
+		t.Fatalf("paths.Username: %v", err)
 	}
 
 	workDir := t.TempDir()
@@ -348,7 +350,7 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 
 	t.Run("local user exits silently before config load", func(t *testing.T) {
 		passwdFile := filepath.Join(workDir, "passwd-with-user")
-		entry := u.Username + ":x:1000:1000::/home/" + u.Username + ":/bin/bash\n"
+		entry := username + ":x:1000:1000::/home/" + username + ":/bin/bash\n"
 		if err := os.WriteFile(passwdFile, []byte(entry), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -380,7 +382,7 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 		// never collide with whoever runs the tests (root in CI, a
 		// developer locally).
 		passwdFile := filepath.Join(workDir, "passwd-without-user")
-		entry := "not-" + u.Username + ":x:0:0::/root:/bin/bash\n"
+		entry := "not-" + username + ":x:0:0::/root:/bin/bash\n"
 		if err := os.WriteFile(passwdFile, []byte(entry), 0o644); err != nil {
 			t.Fatal(err)
 		}

@@ -27,9 +27,11 @@ import (
 )
 
 const (
-	// DefaultPath is the local account database on every Unix-like
-	// platform dotvault targets. The Windows caller never reaches this
-	// package (the flag is ignored there).
+	// DefaultPath is the local account database on Linux. On macOS the
+	// file holds only system and single-user-mode entries (see the
+	// package doc), so the lookup never matches a human account there.
+	// The Windows caller never reaches this package (the flag is
+	// ignored there).
 	DefaultPath = "/etc/passwd"
 
 	envPath = "DOTVAULT_PASSWD_FILE"

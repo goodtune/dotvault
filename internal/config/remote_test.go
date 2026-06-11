@@ -127,3 +127,17 @@ func TestRemoteConfigRefreshIntervalSet(t *testing.T) {
 		t.Errorf("RefreshInterval = %v, want 5m", rc.RefreshInterval)
 	}
 }
+
+// TestRemoteConfigRefreshIntervalNotAppliedWithoutURL pins that an interval
+// in an otherwise-disabled section is validated (typos surface) but never
+// applied — the overlay must not influence the daemon's refresh cadence
+// while no URL is configured.
+func TestRemoteConfigRefreshIntervalNotAppliedWithoutURL(t *testing.T) {
+	rc := RemoteConfig{RawRefreshInterval: "5m"}
+	if err := rc.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if rc.RefreshInterval != 0 {
+		t.Errorf("RefreshInterval = %v, want 0 when no URL is configured", rc.RefreshInterval)
+	}
+}

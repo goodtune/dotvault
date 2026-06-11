@@ -67,8 +67,13 @@ type Fetcher struct {
 	identity  string
 	cachePath string
 
-	mu     sync.Mutex
-	status Status
+	// fetchMu serialises in-flight fetches (held across the network
+	// round-trip and cache I/O). statusMu guards only the status snapshot
+	// and is never held across I/O, so Status() — served on the web
+	// /api/v1/status path — never blocks behind a slow fetch.
+	fetchMu  sync.Mutex
+	statusMu sync.Mutex
+	status   Status
 }
 
 // Option customises a Fetcher.
@@ -156,11 +161,19 @@ func (f *Fetcher) Config() config.RemoteConfig {
 	return f.rc
 }
 
-// Status returns a snapshot of the most recent fetch outcome.
+// Status returns a snapshot of the most recent fetch outcome. It never
+// blocks behind an in-flight fetch.
 func (f *Fetcher) Status() Status {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.statusMu.Lock()
+	defer f.statusMu.Unlock()
 	return f.status
+}
+
+// setStatus applies a mutation to the status snapshot under statusMu.
+func (f *Fetcher) setStatus(update func(*Status)) {
+	f.statusMu.Lock()
+	defer f.statusMu.Unlock()
+	update(&f.status)
 }
 
 // Fetch retrieves the partial document, resolving failure down the fail-open
@@ -169,11 +182,11 @@ func (f *Fetcher) Status() Status {
 // fail-closed modes and is always nil today; outcomes are recorded in Status,
 // the logs, and the dotvault.remoteconfig.fetches counter.
 func (f *Fetcher) Fetch(ctx context.Context) (*config.Partial, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.fetchMu.Lock()
+	defer f.fetchMu.Unlock()
 
 	now := time.Now()
-	f.status.LastAttempt = now
+	f.setStatus(func(s *Status) { s.LastAttempt = now })
 
 	cached, err := readCache(f.cachePath, f.identity)
 	if err != nil {
@@ -248,22 +261,26 @@ func (f *Fetcher) Fetch(ctx context.Context) (*config.Partial, error) {
 }
 
 func (f *Fetcher) recordSuccess(now time.Time, source, etag string) {
-	f.status.Source = source
-	f.status.ETag = etag
-	f.status.LastSuccess = now
-	f.status.LastError = ""
+	f.setStatus(func(s *Status) {
+		s.Source = source
+		s.ETag = etag
+		s.LastSuccess = now
+		s.LastError = ""
+	})
 }
 
 // fallback resolves a failed fetch down the ladder: cached last-known-good,
 // else nothing. It always returns a nil error — the overlay fails open and
 // the daemon retries on its next refresh tick.
 func (f *Fetcher) fallback(ctx context.Context, cached *envelope, now time.Time, cause error) (*config.Partial, error) {
-	f.status.LastError = cause.Error()
 	if cached != nil {
 		p, perr := config.ParsePartial([]byte(cached.Body))
 		if perr == nil {
-			f.status.Source = "cache"
-			f.status.ETag = cached.ETag
+			f.setStatus(func(s *Status) {
+				s.LastError = cause.Error()
+				s.Source = "cache"
+				s.ETag = cached.ETag
+			})
 			slog.Warn("remote config: fetch failed; using cached document",
 				"url", f.rc.URL, "fetched_at", cached.FetchedAt, "error", cause)
 			observability.RecordRemoteConfigFetch(ctx, "cache_fallback")
@@ -271,8 +288,11 @@ func (f *Fetcher) fallback(ctx context.Context, cached *envelope, now time.Time,
 		}
 		slog.Warn("remote config: cached document unusable", "path", f.cachePath, "error", perr)
 	}
-	f.status.Source = "none"
-	f.status.ETag = ""
+	f.setStatus(func(s *Status) {
+		s.LastError = cause.Error()
+		s.Source = "none"
+		s.ETag = ""
+	})
 	slog.Warn("remote config: fetch failed and no usable cache; continuing with local base config only",
 		"url", f.rc.URL, "error", cause)
 	observability.RecordRemoteConfigFetch(ctx, "base_only")

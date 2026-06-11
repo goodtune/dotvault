@@ -30,7 +30,9 @@ type RemoteConfig struct {
 
 	// RawRefreshInterval is how often a running daemon re-fetches the
 	// document, as a duration string ("Nd" day shorthand accepted). Empty
-	// defaults to the sync interval. Floor 1m.
+	// defaults to the sync interval. Floor 1m. The parsed RefreshInterval
+	// is populated only when URL is set — an inactive overlay never
+	// influences the daemon's refresh cadence.
 	RawRefreshInterval string        `yaml:"refresh_interval"`
 	RefreshInterval    time.Duration `yaml:"-"`
 
@@ -79,7 +81,9 @@ func (r *RemoteConfig) validate() error {
 	}
 
 	// Parsed even when URL is empty so a typo'd interval doesn't hide until
-	// the overlay is enabled.
+	// the overlay is enabled — but only *applied* when a URL is configured:
+	// without one the overlay is inactive and must not influence the
+	// daemon's refresh cadence.
 	if r.RawRefreshInterval != "" {
 		d, err := ParseDuration(r.RawRefreshInterval)
 		if err != nil {
@@ -88,7 +92,9 @@ func (r *RemoteConfig) validate() error {
 		if d < time.Minute {
 			return fmt.Errorf("remote_config.refresh_interval %q is below the 1m minimum", r.RawRefreshInterval)
 		}
-		r.RefreshInterval = d
+		if r.URL != "" {
+			r.RefreshInterval = d
+		}
 	}
 
 	// Same defence-in-depth as observability.headers: reject CR/LF/NUL (and

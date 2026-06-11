@@ -1,6 +1,7 @@
 package remoteconfig
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,7 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -342,6 +345,47 @@ func TestFetchStaticSectionRejectedFallsBack(t *testing.T) {
 	st := f.Status()
 	if st.Source != "cache" || !strings.Contains(st.LastError, "local-only") {
 		t.Errorf("status = %+v", st)
+	}
+}
+
+// TestStatusDoesNotBlockDuringFetch pins the split-mutex contract: Status()
+// is served on the web /api/v1/status path and must return promptly while a
+// fetch is blocked on the network.
+func TestStatusDoesNotBlockDuringFetch(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.Write([]byte(testDoc))
+	}))
+	defer srv.Close()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) }) // unblock the handler before srv.Close
+
+	f := newTestFetcher(t, config.RemoteConfig{URL: srv.URL})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.Fetch(context.Background())
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetch never reached the server")
+	}
+
+	begin := time.Now()
+	_ = f.Status()
+	if elapsed := time.Since(begin); elapsed > 500*time.Millisecond {
+		t.Errorf("Status blocked %v behind an in-flight fetch", elapsed)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	<-done
+	if st := f.Status(); st.Source != "remote" {
+		t.Errorf("Source = %q after release, want remote", st.Source)
 	}
 }
 

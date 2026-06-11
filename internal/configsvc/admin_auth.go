@@ -27,9 +27,10 @@ const (
 const sessionCookieName = "dotvault_config_session"
 
 // maxSessions bounds the in-memory session map; at the cap, expired entries
-// are swept and the oldest entries make way. Sessions are deliberately
-// in-memory only — a service restart logs admins out, which is fine for an
-// operator tool.
+// are swept and — if every session is still live — the map is dropped
+// wholesale, logging everyone out rather than growing without bound.
+// Sessions are deliberately in-memory only — a service restart logs admins
+// out, which is fine for an operator tool.
 const maxSessions = 1000
 
 type session struct {
@@ -154,4 +155,56 @@ func randomToken() string {
 	var b [32]byte
 	rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// loginLimiter throttles login attempts per client address: the service has
+// no loopback invariant, so without it /v1/admin/auth/login is an
+// unthrottled online password-guessing oracle against the directory. A
+// fixed window is deliberately primitive — it bounds the guess rate; it is
+// not a lockout policy.
+const (
+	loginWindow     = time.Minute
+	loginLimit      = 10
+	maxLoginBuckets = 4096
+)
+
+type loginBucket struct {
+	count int
+	reset time.Time
+}
+
+type loginLimiter struct {
+	now func() time.Time
+
+	mu      sync.Mutex
+	buckets map[string]loginBucket
+}
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{now: time.Now, buckets: make(map[string]loginBucket)}
+}
+
+// allow records an attempt from addr and reports whether it is within the
+// window's budget.
+func (l *loginLimiter) allow(addr string) bool {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[addr]
+	if !ok || now.After(b.reset) {
+		if len(l.buckets) >= maxLoginBuckets {
+			for k, v := range l.buckets {
+				if now.After(v.reset) {
+					delete(l.buckets, k)
+				}
+			}
+			if len(l.buckets) >= maxLoginBuckets {
+				l.buckets = make(map[string]loginBucket)
+			}
+		}
+		b = loginBucket{reset: now.Add(loginWindow)}
+	}
+	b.count++
+	l.buckets[addr] = b
+	return b.count <= loginLimit
 }

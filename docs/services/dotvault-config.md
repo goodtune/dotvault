@@ -133,7 +133,7 @@ admin:
 
 ### Human admins
 
-`POST /v1/admin/auth/login` binds against the directory **as the user** (DN template or search-then-bind) and then requires membership of `admin.group`, resolved through the same groups resolver that drives layer composition — admins are declared in the same membership source as everything else. Sessions are cookies (HttpOnly, SameSite=Strict, Secure over TLS); mutating requests need a one-time CSRF token from `GET /v1/admin/csrf` in the `X-CSRF-Token` header.
+`POST /v1/admin/auth/login` binds against the directory **as the user** (DN template or search-then-bind) and then requires membership of `admin.group`, resolved through the same groups resolver that drives layer composition — admins are declared in the same membership source as everything else. Login attempts are rate-limited per client address. Sessions are cookies (HttpOnly, SameSite=Strict, Secure over TLS or behind an `X-Forwarded-Proto: https` ingress); mutating requests need a one-time CSRF token from `GET /v1/admin/csrf` in the `X-CSRF-Token` header.
 
 ### Service accounts
 

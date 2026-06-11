@@ -18,6 +18,9 @@
 # Requires the dev Vault from `docker compose up -d` and the vault CLI.
 # Re-run any time; issuing is idempotent and certificates are just replaced.
 set -eu
+# Private keys land in $DIR — create everything owner-only from the start
+# rather than chmod-ing after the write.
+umask 077
 
 ACCOUNT="${1:-terraform}"
 DIR="$(dirname "$0")/pki"
@@ -50,12 +53,21 @@ vault write dotvault-config-pki/roles/listener \
   alt_names="localhost" client_flag=false server_flag=true \
   key_type=ec key_bits=256 max_ttl=720h ttl=720h >/dev/null
 
+# Pull one string field out of `vault write -format=json` output. The JSON
+# is pretty-printed one field per line and PEM values contain no quotes, so
+# cutting on '"' is exact; awk does the \n unescaping (sed's replacement-side
+# \n is a GNU extension — BSD/macOS sed would emit a literal "n").
+field() {
+  grep "\"$2\":" "$1" | head -n 1 | cut -d'"' -f4 | awk '{gsub(/\\n/, "\n"); print}'
+}
+
 issue() {
   role="$1" cn="$2" prefix="$3"; shift 3
-  out=$(vault write -format=json "dotvault-config-pki/issue/$role" common_name="$cn" "$@")
-  printf '%s' "$out" | grep -o '"certificate": "[^"]*"' | head -1 | sed 's/.*: "//; s/"$//' | sed 's/\\n/\n/g' >"$DIR/$prefix.pem"
-  printf '%s' "$out" | grep -o '"private_key": "[^"]*"' | head -1 | sed 's/.*: "//; s/"$//' | sed 's/\\n/\n/g' >"$DIR/$prefix-key.pem"
-  chmod 600 "$DIR/$prefix-key.pem"
+  out="$DIR/.issue.json"
+  vault write -format=json "dotvault-config-pki/issue/$role" common_name="$cn" "$@" >"$out"
+  field "$out" certificate >"$DIR/$prefix.pem"
+  field "$out" private_key >"$DIR/$prefix-key.pem"
+  rm -f "$out"
 }
 
 issue listener localhost server ip_sans="127.0.0.1"
@@ -69,8 +81,10 @@ Minted into $DIR:
 
 Next:
   1. Uncomment the admin.mtls block in configsvc.dev.yaml and restart serve.
-  2. Register the account (sign in to /admin/ or use the API):
-       curl -sX PUT --cert $DIR/$ACCOUNT.pem --key $DIR/$ACCOUNT-key.pem \\
-         --cacert $DIR/ca.pem https://127.0.0.1:9101/v1/admin/whoami
-     (403 until a signed-in admin creates service account "$ACCOUNT").
+  2. Register service account "$ACCOUNT" (sign in to /admin/ as a human
+     admin, or PUT /v1/admin/service-accounts/$ACCOUNT).
+  3. Verify the certificate path:
+       curl -s --cert $DIR/$ACCOUNT.pem --key $DIR/$ACCOUNT-key.pem \\
+         --cacert $DIR/ca.pem https://localhost:9101/v1/admin/whoami
+     (403 until step 2 registers the account, then your identity JSON).
 EOF

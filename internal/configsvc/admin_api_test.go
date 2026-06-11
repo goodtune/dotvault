@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -151,18 +152,140 @@ func TestAdminAuthentication(t *testing.T) {
 		t.Fatalf("whoami = %+v", identity)
 	}
 
-	// Logout invalidates the session.
+	// Capture the raw session cookie before logout so we can prove
+	// *server-side* invalidation: the MaxAge=-1 response makes the jar drop
+	// the cookie anyway, so a jar-based request would 401 even if the
+	// server kept the session alive.
+	tsURL, _ := url.Parse(ts.URL)
+	var rawSession string
+	for _, c := range client.Jar.Cookies(tsURL) {
+		if c.Name == sessionCookieName {
+			rawSession = c.Value
+		}
+	}
+	if rawSession == "" {
+		t.Fatal("no session cookie in jar after login")
+	}
+
 	resp = adminDo(t, ts, client, http.MethodPost, "/v1/admin/auth/logout", "", "")
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("logout = %d, want 204", resp.StatusCode)
 	}
-	after, err := client.Get(ts.URL + "/v1/admin/whoami")
+
+	replay, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/admin/whoami", nil)
+	replay.AddCookie(&http.Cookie{Name: sessionCookieName, Value: rawSession})
+	after, err := http.DefaultClient.Do(replay)
 	if err != nil {
 		t.Fatal(err)
 	}
 	after.Body.Close()
 	if after.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("whoami after logout = %d, want 401", after.StatusCode)
+		t.Fatalf("whoami with replayed pre-logout cookie = %d, want 401 (session must be invalidated server-side)", after.StatusCode)
+	}
+}
+
+func TestSessionExpiry(t *testing.T) {
+	s := newSessionStore(time.Hour)
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
+
+	id := s.create(Identity{Name: "alice", Kind: identityKindUser})
+	if _, ok := s.get(id); !ok {
+		t.Fatal("fresh session not found")
+	}
+	now = now.Add(2 * time.Hour)
+	if _, ok := s.get(id); ok {
+		t.Fatal("expired session still valid")
+	}
+}
+
+func TestSessionStoreBounded(t *testing.T) {
+	s := newSessionStore(time.Hour)
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
+
+	for i := 0; i < maxSessions; i++ {
+		s.create(Identity{Name: "user", Kind: identityKindUser})
+	}
+	// All live: the next create resets rather than growing past the cap.
+	s.create(Identity{Name: "user", Kind: identityKindUser})
+	s.mu.Lock()
+	live := len(s.sessions)
+	s.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("sessions after overflow = %d, want 1 (map reset)", live)
+	}
+
+	// Refill, expire everything, then one more: the sweep path keeps the
+	// new session only.
+	for i := 0; i < maxSessions-1; i++ {
+		s.create(Identity{Name: "user", Kind: identityKindUser})
+	}
+	now = now.Add(2 * time.Hour)
+	s.create(Identity{Name: "late", Kind: identityKindUser})
+	s.mu.Lock()
+	live = len(s.sessions)
+	s.mu.Unlock()
+	if live != 1 {
+		t.Fatalf("sessions after sweep = %d, want 1", live)
+	}
+}
+
+func TestLoginRateLimited(t *testing.T) {
+	_, ts, client := newAdminClient(t)
+	// Burn the per-address budget with bad credentials; the next attempt is
+	// refused before the authenticator runs, even with the right password.
+	for i := 0; i < loginLimit; i++ {
+		if resp := login(t, ts, client, "alice", "wrong"); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d, want 401", i+1, resp.StatusCode)
+		}
+	}
+	if resp := login(t, ts, client, "alice", "s3cret"); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("attempt past the limit = %d, want 429", resp.StatusCode)
+	}
+}
+
+func TestLoginLimiterWindowReset(t *testing.T) {
+	l := newLoginLimiter()
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < loginLimit; i++ {
+		if !l.allow("10.0.0.1") {
+			t.Fatalf("attempt %d within budget refused", i+1)
+		}
+	}
+	if l.allow("10.0.0.1") {
+		t.Fatal("attempt past the budget allowed")
+	}
+	// A different address has its own budget.
+	if !l.allow("10.0.0.2") {
+		t.Fatal("independent address throttled")
+	}
+	// The window expires and the budget resets.
+	now = now.Add(2 * loginWindow)
+	if !l.allow("10.0.0.1") {
+		t.Fatal("attempt after window reset refused")
+	}
+}
+
+func TestCSRFTokenExpiry(t *testing.T) {
+	c := newCSRFStore()
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	token := c.issue()
+	now = now.Add(csrfTokenTTL + time.Minute)
+	if c.consume(token) {
+		t.Fatal("expired CSRF token accepted")
+	}
+	// And a fresh one still works exactly once.
+	token = c.issue()
+	if !c.consume(token) {
+		t.Fatal("fresh CSRF token rejected")
+	}
+	if c.consume(token) {
+		t.Fatal("CSRF token accepted twice")
 	}
 }
 
@@ -240,11 +363,28 @@ func TestAdminLayerCRUD(t *testing.T) {
 			t.Fatalf("PUT layer key %q = %d, want 400", key, resp.StatusCode)
 		}
 	}
-	// A ".." segment never reaches the handler — net/http cleans the path
-	// during routing, so it falls off the route tree entirely. ValidLayerKey
-	// still rejects it (covered in its unit test) for non-HTTP callers.
-	if resp := adminDo(t, ts, client, http.MethodPut, "/v1/admin/layers/user/..", "application/yaml", "sync:\n  interval: 5m\n"); resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("PUT layer key user/.. = %d, want 404 (path cleaned before routing)", resp.StatusCode)
+	// A literal ".." never reaches the PUT handler: the mux 301s to the
+	// cleaned path, the client replays it as a GET of the collapsed key,
+	// and the GET handler's validation rejects that. Either way: no write.
+	if resp := adminDo(t, ts, client, http.MethodPut, "/v1/admin/layers/user/..", "application/yaml", "sync:\n  interval: 5m\n"); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT layer key user/.. = %d, want 400 after clean-path redirect", resp.StatusCode)
+	}
+	// Percent-encoded traversal DOES survive routing (PathValue decodes
+	// after matching), so the handler-level validation is load-bearing —
+	// on GET and DELETE too, where the Vault store's path.Join would
+	// otherwise collapse the ".." into an escape from the layers/ subtree.
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		resp := adminDo(t, ts, client, method, "/v1/admin/layers/group/%2E%2E%2Fescape", "application/yaml", "sync:\n  interval: 5m\n")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s encoded-traversal layer key = %d, want 400", method, resp.StatusCode)
+		}
+	}
+	for _, path := range []string{"/v1/admin/groups/%2E%2E%2Fescape", "/v1/admin/service-accounts/%2E%2E%2Fescape"} {
+		for _, method := range []string{http.MethodGet, http.MethodDelete} {
+			if resp := adminDo(t, ts, client, method, path, "", ""); resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("%s %s = %d, want 400", method, path, resp.StatusCode)
+			}
+		}
 	}
 
 	if resp := adminDo(t, ts, client, http.MethodDelete, "/v1/admin/layers/group/sydney", "", ""); resp.StatusCode != http.StatusNoContent {

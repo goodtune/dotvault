@@ -1,6 +1,8 @@
 package groups
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -64,5 +66,21 @@ func TestLDAPDefaultAttribute(t *testing.T) {
 	}
 	if got := r.(*ldapResolver).cfg.Attribute; got != "cn" {
 		t.Fatalf("default attribute = %q, want cn", got)
+	}
+}
+
+func TestReadBindPassword(t *testing.T) {
+	if got, err := ReadBindPassword("literal", ""); err != nil || got != "literal" {
+		t.Fatalf("literal = %q, %v", got, err)
+	}
+	path := filepath.Join(t.TempDir(), "pass")
+	if err := os.WriteFile(path, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadBindPassword("", path); err != nil || got != "from-file" {
+		t.Fatalf("file = %q, %v (trailing newline must be trimmed)", got, err)
+	}
+	if _, err := ReadBindPassword("", filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Fatal("missing password file accepted")
 	}
 }

@@ -72,7 +72,8 @@ type AdminMTLSConfig struct {
 	KeyFile  string `yaml:"key_file"`
 }
 
-func (m AdminMTLSConfig) enabled() bool { return m.Listen != "" }
+// Enabled reports whether the service-account listener is configured.
+func (m AdminMTLSConfig) Enabled() bool { return m.Listen != "" }
 
 // TLSConfig is the optional listener certificate pair.
 type TLSConfig struct {
@@ -216,7 +217,7 @@ func (c *Config) validate() error {
 	if c.Admin.Enabled {
 		ldapLogin := c.Admin.LDAP.URL != "" || c.Admin.LDAP.UserDNTemplate != "" ||
 			c.Admin.LDAP.UserSearchBaseDN != "" || c.Admin.LDAP.UserSearchFilter != ""
-		if !ldapLogin && !c.Admin.MTLS.enabled() {
+		if !ldapLogin && !c.Admin.MTLS.Enabled() {
 			return fmt.Errorf("admin: enabled but neither ldap login nor an mtls listener is configured")
 		}
 		if ldapLogin {
@@ -227,7 +228,7 @@ func (c *Config) validate() error {
 				return err
 			}
 		}
-		if c.Admin.MTLS.enabled() {
+		if c.Admin.MTLS.Enabled() {
 			m := c.Admin.MTLS
 			if m.CACert == "" || m.CertFile == "" || m.KeyFile == "" {
 				return fmt.Errorf("admin.mtls requires ca_cert, cert_file, and key_file")

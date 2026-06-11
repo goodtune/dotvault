@@ -83,7 +83,7 @@ func (r *ldapResolver) Groups(ctx context.Context, user string) ([]string, error
 	}
 
 	if r.cfg.BindDN != "" {
-		password, err := readBindPassword(r.cfg.BindPassword, r.cfg.BindPasswordFile)
+		password, err := ReadBindPassword(r.cfg.BindPassword, r.cfg.BindPasswordFile)
 		if err != nil {
 			return nil, fmt.Errorf("ldap: %w", err)
 		}
@@ -110,9 +110,10 @@ func (r *ldapResolver) Groups(ctx context.Context, user string) ([]string, error
 	return groups, nil
 }
 
-// readBindPassword resolves the service bind credential, re-reading a
-// password file on every call so a rotated secret needs no restart.
-func readBindPassword(literal, file string) (string, error) {
+// ReadBindPassword resolves a service bind credential from either a literal
+// or a password file, re-reading the file on every call so a rotated secret
+// needs no restart. Shared with the admin API's LDAP authenticator.
+func ReadBindPassword(literal, file string) (string, error) {
 	if file == "" {
 		return literal, nil
 	}

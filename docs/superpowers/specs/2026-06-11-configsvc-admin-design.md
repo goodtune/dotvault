@@ -19,7 +19,7 @@ Two principal kinds, deliberately asymmetric:
 
 The login handler binds *as the user* against the directory in `admin.ldap` — either a `user_dn_template` (`uid=%s,ou=people,…`, username DN-escaped) or a search-then-bind (`bind_dn` service credential, `user_search_base_dn` + `user_search_filter`, exactly one entry required). An empty username or password is rejected before any network I/O: an LDAP bind with a DN and no password is an *anonymous* bind that many servers accept — the classic login bypass.
 
-Group membership for the admin check goes through the **configured groups resolver** (static or LDAP), not a separate lookup: admins are declared in the same membership source that drives layer composition. All authentication failures collapse into one "invalid username or password" sentinel so the endpoint cannot be used to enumerate users; a directory outage is a distinguishable 502.
+Group membership for the admin check goes through the **configured groups resolver** (static or LDAP), not a separate lookup: admins are declared in the same membership source that drives layer composition. All authentication failures collapse into one "invalid username or password" sentinel so the endpoint cannot be used to enumerate users; a directory outage is a distinguishable 502. Login attempts are rate-limited per client address (a fixed window, deliberately primitive — it bounds the online guessing rate against the directory; it is not a lockout policy).
 
 Sessions are random 32-byte IDs in an in-memory store (TTL `admin.session_ttl`, default 12h, capacity-bounded) — a restart logs admins out, which is acceptable for an operator tool. The cookie is HttpOnly + SameSite=Strict, Secure over TLS. Mutating session-authenticated requests require a one-time CSRF token (`GET /v1/admin/csrf`, `X-CSRF-Token` header), mirroring the daemon's web UI.
 
@@ -72,4 +72,4 @@ A dependency-free static page (HTML + vanilla JS, `embed.FS`, served at `/admin/
 
 ## Future work
 
-Login rate limiting; layer-write optimistic concurrency (If-Match on a content ETag); per-identity authorisation scopes (read-only admins, per-axis writers); the Terraform provider itself (separate repository, consuming this API); SPIFFE-style URI SANs as an alternative identity binding.
+Layer-write optimistic concurrency (If-Match on a content ETag); per-identity authorisation scopes (read-only admins, per-axis writers); account-lockout policy beyond the per-address login rate limit; the Terraform provider itself (separate repository, consuming this API); SPIFFE-style URI SANs as an alternative identity binding.

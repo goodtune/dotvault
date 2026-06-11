@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ type adminState struct {
 	group         string
 	sessions      *sessionStore
 	csrf          *csrfStore
+	logins        *loginLimiter
 	authenticator PasswordAuthenticator // nil when ldap login is not configured
 	now           func() time.Time
 }
@@ -37,6 +39,7 @@ func (s *Server) EnableAdmin(cfg AdminConfig, authenticator PasswordAuthenticato
 		group:         cfg.Group,
 		sessions:      newSessionStore(cfg.SessionTTL),
 		csrf:          newCSRFStore(),
+		logins:        newLoginLimiter(),
 		authenticator: authenticator,
 		now:           time.Now,
 	}
@@ -72,11 +75,25 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	s.registerAdminUI(mux)
 }
 
+// errNoCredentials means the request carried nothing to authenticate with
+// (no client certificate, no live session) — a 401.
+var errNoCredentials = errors.New("no credentials presented")
+
+// deniedError marks credentials that were presented and affirmatively
+// rejected (unregistered CN, disabled account) — a 403. Distinct from
+// backend failures, which must surface as 5xx: an automation client (e.g. a
+// Terraform provider) treats 403 as "my credential is invalid" and gives
+// up, which is exactly wrong during a storage outage.
+type deniedError struct {
+	reason string
+}
+
+func (e *deniedError) Error() string { return e.reason }
+
 // identify resolves the request's authenticated identity: a verified client
 // certificate (only possible on the mTLS listener, whose TLS config demands
-// one) wins, else a session cookie. The boolean reports whether an identity
-// was established.
-func (s *Server) identify(r *http.Request) (Identity, bool, error) {
+// one) wins, else a session cookie.
+func (s *Server) identify(r *http.Request) (Identity, error) {
 	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 {
 		// The TLS layer has already verified the chain against the pinned
 		// CA, the validity window, and the clientAuth EKU. What remains is
@@ -84,42 +101,56 @@ func (s *Server) identify(r *http.Request) (Identity, bool, error) {
 		// CN names the service account, and disabling the account revokes
 		// access immediately regardless of certificate lifetime.
 		name := r.TLS.VerifiedChains[0][0].Subject.CommonName
-		if name == "" {
-			return Identity{}, false, fmt.Errorf("client certificate has no common name")
+		if !ValidIdentitySegment(name) {
+			// Also covers the empty CN. A CN with path separators or ".."
+			// implies an over-permissive PKI role (allow_any_name) — refuse
+			// it before the name can touch a store path.
+			return Identity{}, &deniedError{reason: fmt.Sprintf("client certificate CN %q is not a valid service account name", name)}
 		}
 		sa, ok, err := s.store.GetServiceAccount(r.Context(), name)
 		if err != nil {
-			return Identity{}, false, err
+			return Identity{}, fmt.Errorf("service account lookup: %w", err)
 		}
 		if !ok {
-			return Identity{}, false, fmt.Errorf("client certificate CN %q is not a registered service account", name)
+			return Identity{}, &deniedError{reason: fmt.Sprintf("client certificate CN %q is not a registered service account", name)}
 		}
 		if sa.Disabled {
-			return Identity{}, false, fmt.Errorf("service account %q is disabled", name)
+			return Identity{}, &deniedError{reason: fmt.Sprintf("service account %q is disabled", name)}
 		}
-		return Identity{Name: name, Kind: identityKindServiceAccount}, true, nil
+		return Identity{Name: name, Kind: identityKindServiceAccount}, nil
 	}
 
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
-		return Identity{}, false, nil
+		return Identity{}, errNoCredentials
 	}
 	identity, ok := s.admin.sessions.get(cookie.Value)
-	return identity, ok, nil
+	if !ok {
+		// A stale or unknown session cookie is "please log in again", not
+		// an affirmative denial.
+		return Identity{}, errNoCredentials
+	}
+	return identity, nil
 }
 
 // requireAdmin gates a handler on an authenticated admin identity, applying
 // CSRF to session-authenticated mutating requests.
 func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, Identity)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		identity, ok, err := s.identify(r)
-		if err != nil {
+		identity, err := s.identify(r)
+		var denied *deniedError
+		switch {
+		case err == nil:
+		case errors.Is(err, errNoCredentials):
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		case errors.As(err, &denied):
 			slog.Warn("admin: authentication rejected", "path", r.URL.Path, "error", err)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
-		}
-		if !ok {
-			http.Error(w, "authentication required", http.StatusUnauthorized)
+		default:
+			slog.Error("admin: authentication backend failure", "path", r.URL.Path, "error", err)
+			http.Error(w, "authentication backend unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if identity.Kind == identityKindUser && r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -149,6 +180,15 @@ func audit(action string, identity Identity, attrs ...any) {
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	if s.admin.authenticator == nil {
 		http.Error(w, "password login is not configured", http.StatusNotFound)
+		return
+	}
+	addr := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		addr = host
+	}
+	if !s.admin.logins.allow(addr) {
+		slog.Warn("admin: login rate limit exceeded", "addr", addr)
+		http.Error(w, "too many login attempts; try again shortly", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
@@ -196,7 +236,9 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		// Secure when the connection is TLS here, or at the documented
+		// TLS-terminating ingress in front of us.
+		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
 	})
 	slog.Info("admin: login", "user", username)
 	writeJSON(w, http.StatusOK, identity)
@@ -242,7 +284,15 @@ func (s *Server) handleAdminLayerList(w http.ResponseWriter, r *http.Request, _ 
 }
 
 func (s *Server) handleAdminLayerGet(w http.ResponseWriter, r *http.Request, _ Identity) {
+	// Every handler that feeds a path value into the store validates it,
+	// not just PUT: ServeMux percent-decodes path values, so "..%2F.." in
+	// the URL arrives here as a traversal the Vault store's path.Join
+	// would collapse.
 	key := r.PathValue("key")
+	if err := ValidLayerKey(key); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	doc, ok, err := s.store.GetLayer(r.Context(), key)
 	if err != nil {
 		slog.Error("admin: get layer failed", "key", key, "error", err)
@@ -295,6 +345,10 @@ func (s *Server) handleAdminLayerPut(w http.ResponseWriter, r *http.Request, ide
 
 func (s *Server) handleAdminLayerDelete(w http.ResponseWriter, r *http.Request, identity Identity) {
 	key := r.PathValue("key")
+	if err := ValidLayerKey(key); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := s.store.DeleteLayer(r.Context(), key); err != nil {
 		slog.Error("admin: delete layer failed", "key", key, "error", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
@@ -321,6 +375,10 @@ func (s *Server) handleAdminGroupsList(w http.ResponseWriter, r *http.Request, _
 
 func (s *Server) handleAdminGroupsGet(w http.ResponseWriter, r *http.Request, _ Identity) {
 	user := r.PathValue("user")
+	if !ValidIdentitySegment(user) {
+		http.Error(w, "invalid username", http.StatusBadRequest)
+		return
+	}
 	memberOf, ok, err := s.store.GetGroups(r.Context(), user)
 	if err != nil {
 		slog.Error("admin: get groups failed", "user", user, "error", err)
@@ -367,6 +425,10 @@ func (s *Server) handleAdminGroupsPut(w http.ResponseWriter, r *http.Request, id
 
 func (s *Server) handleAdminGroupsDelete(w http.ResponseWriter, r *http.Request, identity Identity) {
 	user := r.PathValue("user")
+	if !ValidIdentitySegment(user) {
+		http.Error(w, "invalid username", http.StatusBadRequest)
+		return
+	}
 	if err := s.store.DeleteGroups(r.Context(), user); err != nil {
 		slog.Error("admin: delete groups failed", "user", user, "error", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
@@ -393,6 +455,10 @@ func (s *Server) handleAdminSAList(w http.ResponseWriter, r *http.Request, _ Ide
 
 func (s *Server) handleAdminSAGet(w http.ResponseWriter, r *http.Request, _ Identity) {
 	name := r.PathValue("name")
+	if !ValidIdentitySegment(name) {
+		http.Error(w, "invalid service account name", http.StatusBadRequest)
+		return
+	}
 	sa, ok, err := s.store.GetServiceAccount(r.Context(), name)
 	if err != nil {
 		slog.Error("admin: get service account failed", "name", name, "error", err)
@@ -444,11 +510,18 @@ func (s *Server) handleAdminSAPut(w http.ResponseWriter, r *http.Request, identi
 		return
 	}
 	audit("put service account", identity, "name", name, "disabled", sa.Disabled)
+	// 200 with the stored object rather than the 204 the other PUTs return:
+	// the server augments the representation (timestamps), so the caller
+	// needs the response body to know what was actually stored.
 	writeJSON(w, http.StatusOK, sa)
 }
 
 func (s *Server) handleAdminSADelete(w http.ResponseWriter, r *http.Request, identity Identity) {
 	name := r.PathValue("name")
+	if !ValidIdentitySegment(name) {
+		http.Error(w, "invalid service account name", http.StatusBadRequest)
+		return
+	}
 	if err := s.store.DeleteServiceAccount(r.Context(), name); err != nil {
 		slog.Error("admin: delete service account failed", "name", name, "error", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
@@ -490,8 +563,10 @@ func (s *Server) handleAdminPreview(w http.ResponseWriter, r *http.Request, _ Id
 		var err error
 		memberOf, err = s.resolver.Groups(r.Context(), user)
 		if err != nil {
+			// 502 like the login path: the resolver is an upstream
+			// dependency, not a server bug.
 			slog.Error("admin: preview group resolution failed", "user", user, "error", err)
-			http.Error(w, "group resolution failed", http.StatusInternalServerError)
+			http.Error(w, "group resolution failed", http.StatusBadGateway)
 			return
 		}
 	}

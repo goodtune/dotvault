@@ -168,11 +168,26 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 				}
 			}
 
-			var servers []*http.Server
-			errCh := make(chan error, 2)
-
+			// Prepare every listener before starting any, so a
+			// misconfigured mTLS block fails the command cleanly rather
+			// than leaving the main listener goroutine running.
 			server := newHTTPServer(cfg.Listen)
-			servers = append(servers, server)
+			var mtlsServer *http.Server
+			if cfg.Admin.Enabled && cfg.Admin.MTLS.Enabled() {
+				tlsCfg, err := configsvc.MTLSServerConfig(cfg.Admin.MTLS)
+				if err != nil {
+					return err
+				}
+				mtlsServer = newHTTPServer(cfg.Admin.MTLS.Listen)
+				mtlsServer.TLSConfig = tlsCfg
+			}
+
+			servers := []*http.Server{server}
+			if mtlsServer != nil {
+				servers = append(servers, mtlsServer)
+			}
+			errCh := make(chan error, len(servers))
+
 			go func() {
 				slog.Info("dotvault-config listening", "addr", cfg.Listen,
 					"tls", cfg.TLS.Enabled(), "store", cfg.Store.Driver,
@@ -184,15 +199,7 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 					errCh <- server.ListenAndServe()
 				}
 			}()
-
-			if cfg.Admin.Enabled && cfg.Admin.MTLS.Listen != "" {
-				tlsCfg, err := configsvc.MTLSServerConfig(cfg.Admin.MTLS)
-				if err != nil {
-					return err
-				}
-				mtlsServer := newHTTPServer(cfg.Admin.MTLS.Listen)
-				mtlsServer.TLSConfig = tlsCfg
-				servers = append(servers, mtlsServer)
+			if mtlsServer != nil {
 				go func() {
 					slog.Info("dotvault-config mTLS listener for service accounts", "addr", cfg.Admin.MTLS.Listen)
 					errCh <- mtlsServer.ListenAndServeTLS(cfg.Admin.MTLS.CertFile, cfg.Admin.MTLS.KeyFile)
@@ -205,15 +212,21 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 			case <-ctx.Done():
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
+				// Shut down every listener even when one errors, then
+				// drain all goroutines so none outlive the command.
+				var firstErr error
 				for _, srv := range servers {
-					if err := srv.Shutdown(shutdownCtx); err != nil {
-						return err
+					if err := srv.Shutdown(shutdownCtx); err != nil && firstErr == nil {
+						firstErr = err
 					}
 				}
 				for range servers {
-					if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
-						return err
+					if err := <-errCh; !errors.Is(err, http.ErrServerClosed) && firstErr == nil {
+						firstErr = err
 					}
+				}
+				if firstErr != nil {
+					return firstErr
 				}
 				slog.Info("dotvault-config stopped")
 				return nil

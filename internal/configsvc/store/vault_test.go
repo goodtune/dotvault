@@ -1,4 +1,4 @@
-package store
+package store_test
 
 import (
 	"context"
@@ -11,12 +11,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/configsvc/store"
+	"github.com/goodtune/dotvault/internal/configsvc/store/storetest"
 )
 
-// fakeVault is a minimal Vault façade for exercising the driver's auth
-// lifecycle without a real server: kubernetes logins mint sequential tokens,
-// and a configurable set of tokens is answered with 403 so the re-login +
-// retry path runs.
+// fakeVault is a minimal KVv2 façade for exercising the driver without a
+// real server: kubernetes logins mint sequential tokens, a configurable set
+// of tokens is answered with 403 so the re-login + retry path runs, and
+// enough of the data/metadata surface (read, write, list, metadata delete)
+// is implemented to pass the store conformance suite.
 type fakeVault struct {
 	t *testing.T
 
@@ -26,7 +30,9 @@ type fakeVault struct {
 	tokensIssued  []string
 	deniedTokens  map[string]bool
 	leaseDuration int
-	docs          map[string]string // data path → doc field
+	// secrets maps logical *data* paths (e.g.
+	// "secret/data/base/layers/global") to their field maps.
+	secrets map[string]map[string]any
 }
 
 func newFakeVault(t *testing.T) (*fakeVault, *httptest.Server) {
@@ -34,7 +40,7 @@ func newFakeVault(t *testing.T) (*fakeVault, *httptest.Server) {
 		t:             t,
 		deniedTokens:  map[string]bool{},
 		leaseDuration: 3600,
-		docs:          map[string]string{},
+		secrets:       map[string]map[string]any{},
 	}
 	ts := httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(ts.Close)
@@ -75,21 +81,72 @@ func (f *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logical := strings.TrimPrefix(r.URL.Path, "/v1/")
+	isList := r.Method == "LIST" || (r.Method == http.MethodGet && r.URL.Query().Get("list") == "true")
 	switch {
 	case r.URL.Path == "/v1/auth/token/lookup-self":
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": token}})
-	case strings.HasPrefix(r.URL.Path, "/v1/") && r.Method == http.MethodGet:
-		doc, ok := f.docs[strings.TrimPrefix(r.URL.Path, "/v1/")]
+
+	case isList:
+		// LIST on a metadata path: synthesize direct children, folders
+		// carrying a trailing slash.
+		prefix := strings.Replace(logical, "/metadata/", "/data/", 1)
+		prefix = strings.TrimSuffix(prefix, "/") + "/"
+		seen := map[string]bool{}
+		var keys []any
+		for p := range f.secrets {
+			if !strings.HasPrefix(p, prefix) {
+				continue
+			}
+			rest := strings.TrimPrefix(p, prefix)
+			if i := strings.Index(rest, "/"); i >= 0 {
+				rest = rest[:i+1]
+			}
+			if !seen[rest] {
+				seen[rest] = true
+				keys = append(keys, rest)
+			}
+		}
+		if len(keys) == 0 {
+			http.Error(w, `{"errors":[]}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": keys}})
+
+	case r.Method == http.MethodGet && strings.Contains(logical, "/data/"):
+		fields, ok := f.secrets[logical]
 		if !ok {
 			http.Error(w, `{"errors":[]}`, http.StatusNotFound)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"data": map[string]any{"doc": doc}},
+			"data": map[string]any{"data": fields},
 		})
+
+	case (r.Method == http.MethodPut || r.Method == http.MethodPost) && strings.Contains(logical, "/data/"):
+		var body struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		f.secrets[logical] = body.Data
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"version": 1}})
+
+	case r.Method == http.MethodDelete && strings.Contains(logical, "/metadata/"):
+		delete(f.secrets, strings.Replace(logical, "/metadata/", "/data/", 1))
+		w.WriteHeader(http.StatusNoContent)
+
 	default:
 		http.Error(w, `{"errors":["unhandled"]}`, http.StatusNotFound)
 	}
+}
+
+func (f *fakeVault) putDoc(path, doc string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets[path] = map[string]any{"doc": doc}
 }
 
 func writeJWT(t *testing.T, dir, content string) string {
@@ -101,12 +158,31 @@ func writeJWT(t *testing.T, dir, content string) string {
 	return path
 }
 
+// TestVaultStoreConformance runs the driver-neutral suite against the fake —
+// the same suite the sqlite driver passes and the integration test runs
+// against a real Vault.
+func TestVaultStoreConformance(t *testing.T) {
+	_, ts := newFakeVault(t)
+	st, err := store.OpenVault(context.Background(), store.VaultStoreConfig{
+		Address: ts.URL,
+		Mount:   "secret",
+		Path:    "base",
+		Auth:    "token",
+		Token:   "unit-token",
+	})
+	if err != nil {
+		t.Fatalf("OpenVault: %v", err)
+	}
+	defer st.Close()
+	storetest.Run(t, st)
+}
+
 func TestVaultStoreKubernetesReloginOn403(t *testing.T) {
 	fake, ts := newFakeVault(t)
 	jwtPath := writeJWT(t, t.TempDir(), "jwt-one")
 
 	ctx := context.Background()
-	st, err := OpenVault(ctx, VaultStoreConfig{
+	st, err := store.OpenVault(ctx, store.VaultStoreConfig{
 		Address:    ts.URL,
 		Mount:      "secret",
 		Path:       "dotvault-config",
@@ -124,11 +200,11 @@ func TestVaultStoreKubernetesReloginOn403(t *testing.T) {
 	if fake.jwtsSeen[0] != "jwt-one" {
 		t.Fatalf("login JWT = %q, want the (trimmed) file content", fake.jwtsSeen[0])
 	}
-	fake.docs["secret/data/dotvault-config/layers/global"] = "rules: []\n"
 	// Revoke the first token: the next read must re-login and retry. The
 	// rotated JWT file must be re-read for that login.
 	fake.deniedTokens["k8s-token-1"] = true
 	fake.mu.Unlock()
+	fake.putDoc("secret/data/dotvault-config/layers/global", "rules: []\n")
 	writeJWT(t, filepath.Dir(jwtPath), "jwt-two")
 
 	doc, ok, err := st.GetLayer(ctx, "global")
@@ -154,7 +230,7 @@ func TestVaultStoreKubernetesProactiveRelogin(t *testing.T) {
 	jwtPath := writeJWT(t, t.TempDir(), "jwt")
 
 	ctx := context.Background()
-	st, err := OpenVault(ctx, VaultStoreConfig{
+	st, err := store.OpenVault(ctx, store.VaultStoreConfig{
 		Address:    ts.URL,
 		Auth:       "kubernetes",
 		K8sRole:    "svc",
@@ -178,7 +254,7 @@ func TestVaultStoreKubernetesPermanent403(t *testing.T) {
 	jwtPath := writeJWT(t, t.TempDir(), "jwt")
 
 	ctx := context.Background()
-	st, err := OpenVault(ctx, VaultStoreConfig{
+	st, err := store.OpenVault(ctx, store.VaultStoreConfig{
 		Address:    ts.URL,
 		Auth:       "kubernetes",
 		K8sRole:    "svc",
@@ -207,7 +283,7 @@ func TestVaultStoreKubernetesPermanent403(t *testing.T) {
 
 func TestVaultStoreKubernetesMissingJWT(t *testing.T) {
 	_, ts := newFakeVault(t)
-	_, err := OpenVault(context.Background(), VaultStoreConfig{
+	_, err := store.OpenVault(context.Background(), store.VaultStoreConfig{
 		Address:    ts.URL,
 		Auth:       "kubernetes",
 		K8sRole:    "svc",
@@ -219,11 +295,10 @@ func TestVaultStoreKubernetesMissingJWT(t *testing.T) {
 }
 
 func TestVaultStoreTokenEnvFallback(t *testing.T) {
-	fake, ts := newFakeVault(t)
-	_ = fake
+	_, ts := newFakeVault(t)
 
 	t.Setenv("VAULT_TOKEN", "env-token")
-	st, err := OpenVault(context.Background(), VaultStoreConfig{
+	st, err := store.OpenVault(context.Background(), store.VaultStoreConfig{
 		Address: ts.URL,
 		Auth:    "token",
 	})
@@ -235,7 +310,7 @@ func TestVaultStoreTokenEnvFallback(t *testing.T) {
 	}
 
 	t.Setenv("VAULT_TOKEN", "")
-	if _, err := OpenVault(context.Background(), VaultStoreConfig{Address: ts.URL}); err == nil {
+	if _, err := store.OpenVault(context.Background(), store.VaultStoreConfig{Address: ts.URL}); err == nil {
 		t.Fatal("OpenVault with no token anywhere succeeded, want error")
 	}
 }

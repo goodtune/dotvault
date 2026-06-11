@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -78,6 +77,14 @@ func (c AdminLDAPConfig) validate() error {
 	return nil
 }
 
+// ldapConn is the slice of *ldap.Conn the authenticator uses — an interface
+// so the search-then-bind DN resolution is unit-testable without a live
+// directory.
+type ldapConn interface {
+	Bind(username, password string) error
+	Search(req *ldap.SearchRequest) (*ldap.SearchResult, error)
+}
+
 type ldapAuthenticator struct {
 	cfg    AdminLDAPConfig
 	dialer *groups.Dialer
@@ -125,15 +132,15 @@ func (a *ldapAuthenticator) Authenticate(ctx context.Context, username, password
 	return nil
 }
 
-func (a *ldapAuthenticator) resolveUserDN(conn *ldap.Conn, username string) (string, error) {
+func (a *ldapAuthenticator) resolveUserDN(conn ldapConn, username string) (string, error) {
 	if a.cfg.UserDNTemplate != "" {
 		return strings.ReplaceAll(a.cfg.UserDNTemplate, "%s", ldap.EscapeDN(username)), nil
 	}
 
 	if a.cfg.BindDN != "" {
-		password, err := readAdminBindPassword(a.cfg.BindPassword, a.cfg.BindPasswordFile)
+		password, err := groups.ReadBindPassword(a.cfg.BindPassword, a.cfg.BindPasswordFile)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("admin.ldap: %w", err)
 		}
 		if err := conn.Bind(a.cfg.BindDN, password); err != nil {
 			return "", fmt.Errorf("ldap service bind as %s: %w", a.cfg.BindDN, err)
@@ -153,15 +160,4 @@ func (a *ldapAuthenticator) resolveUserDN(conn *ldap.Conn, username string) (str
 		return "", ErrBadCredentials
 	}
 	return res.Entries[0].DN, nil
-}
-
-func readAdminBindPassword(literal, file string) (string, error) {
-	if file == "" {
-		return literal, nil
-	}
-	raw, err := os.ReadFile(file)
-	if err != nil {
-		return "", fmt.Errorf("read admin.ldap.bind_password_file: %w", err)
-	}
-	return strings.TrimRight(string(raw), "\r\n"), nil
 }

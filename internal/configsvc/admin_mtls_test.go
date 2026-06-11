@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -215,6 +216,48 @@ func TestMTLSRejectsAtHandshake(t *testing.T) {
 	server := ca.issueClient(t, "ci", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 	if _, err := clientWith(ts, &server).Get(ts.URL + "/v1/admin/whoami"); err == nil {
 		t.Fatal("certificate without clientAuth EKU succeeded, want handshake failure")
+	}
+}
+
+// brokenSAStore fails service-account lookups, simulating a storage outage
+// during certificate authentication.
+type brokenSAStore struct {
+	store.Store
+}
+
+func (brokenSAStore) GetServiceAccount(context.Context, string) (*store.ServiceAccount, bool, error) {
+	return nil, false, errors.New("backend down")
+}
+
+func TestMTLSStoreOutageIs503NotForbidden(t *testing.T) {
+	ca := newTestCA(t, "svc CA")
+	st := newTestStore(t)
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, ca.pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg, err := MTLSServerConfig(AdminMTLSConfig{CACert: caPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewServer(brokenSAStore{st}, groups.NewStatic(st))
+	svc.EnableAdmin(AdminConfig{Group: adminGroup, SessionTTL: time.Hour}, nil)
+	ts := httptest.NewUnstartedServer(svc.Handler())
+	ts.TLS = tlsCfg
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+
+	cert := ca.issueClient(t, "ci", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	resp, err := clientWith(ts, &cert).Get(ts.URL + "/v1/admin/whoami")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	// A storage outage must not read as "credential revoked" to an
+	// automation client — 503, never 403.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("whoami during store outage = %d, want 503", resp.StatusCode)
 	}
 }
 

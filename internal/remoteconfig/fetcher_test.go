@@ -169,6 +169,23 @@ func TestFetchServerErrorFallsBackToCache(t *testing.T) {
 	if st.Source != "cache" || st.ETag != `"v1"` || st.LastError == "" {
 		t.Errorf("status after fallback = %+v", st)
 	}
+	// LastSuccess records remote contact (the seed fetch) and is not faked
+	// by the fallback; CachedAt carries the served document's age instead.
+	if st.LastSuccess.IsZero() {
+		t.Error("LastSuccess from the seed fetch should persist across a fallback")
+	}
+	if st.CachedAt.IsZero() {
+		t.Error("CachedAt not set on cache fallback")
+	}
+
+	// Recovery clears the cache marker again.
+	fail = false
+	if _, err := f.Fetch(t.Context()); err != nil {
+		t.Fatalf("recovery fetch: %v", err)
+	}
+	if st := f.Status(); st.Source != "remote" || !st.CachedAt.IsZero() || st.LastError != "" {
+		t.Errorf("status after recovery = %+v", st)
+	}
 }
 
 func TestFetchUnreachableNoCacheReturnsNil(t *testing.T) {

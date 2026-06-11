@@ -285,6 +285,15 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 			return nil, err
 		}
 		if cfg.RemoteConfig.URL != "" {
+			// Enforce the section's trust-boundary rules (https unless
+			// loopback, no userinfo, header hygiene) BEFORE any network
+			// I/O. The base is deliberately loaded raw, and full validation
+			// only runs after the merge — without this gate a misconfigured
+			// remote_config block would trigger a fetch the validator was
+			// about to reject.
+			if err := cfg.RemoteConfig.Validate(); err != nil {
+				return nil, fmt.Errorf("validate config: %w", err)
+			}
 			f := fetcher.Load()
 			if f == nil || !reflect.DeepEqual(f.Config(), cfg.RemoteConfig) {
 				nf, ferr := remoteconfig.New(cfg.RemoteConfig, version)
@@ -1097,6 +1106,9 @@ func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
 	}
 	if !rs.LastSuccess.IsZero() {
 		fmt.Printf("  last success: %s\n", rs.LastSuccess.Format("2006-01-02 15:04:05"))
+	}
+	if !rs.CachedAt.IsZero() {
+		fmt.Printf("  cached at:    %s\n", rs.CachedAt.Format("2006-01-02 15:04:05"))
 	}
 	if rs.LastError != "" {
 		fmt.Printf("  last error:   %s\n", rs.LastError)

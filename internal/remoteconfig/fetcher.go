@@ -46,13 +46,20 @@ const fetchTimeout = 10 * time.Second
 const cacheFileName = "remote-config.json"
 
 // Status describes the fetcher's most recent attempt, for `dotvault status`
-// and the web UI's /api/v1/status.
+// and the web UI's /api/v1/status. LastSuccess records the last successful
+// *contact with the remote service* (a 200, or a 304 revalidating the
+// cache) — deliberately not set by a cache fallback, so "unreachable since
+// X" stays observable. When the document came from the cache, CachedAt
+// carries the time the served body was originally fetched, answering "how
+// stale is the config I'm running" directly (including after a process
+// restart, where LastSuccess is legitimately zero).
 type Status struct {
 	URL         string    `json:"url"`
 	Source      string    `json:"source"` // "remote", "cache", or "none"
 	ETag        string    `json:"etag,omitempty"`
 	LastAttempt time.Time `json:"last_attempt"`
 	LastSuccess time.Time `json:"last_success"`
+	CachedAt    time.Time `json:"cached_at,omitzero"`
 	LastError   string    `json:"last_error,omitempty"`
 }
 
@@ -265,6 +272,7 @@ func (f *Fetcher) recordSuccess(now time.Time, source, etag string) {
 		s.Source = source
 		s.ETag = etag
 		s.LastSuccess = now
+		s.CachedAt = time.Time{}
 		s.LastError = ""
 	})
 }
@@ -280,6 +288,7 @@ func (f *Fetcher) fallback(ctx context.Context, cached *envelope, now time.Time,
 				s.LastError = cause.Error()
 				s.Source = "cache"
 				s.ETag = cached.ETag
+				s.CachedAt = cached.FetchedAt
 			})
 			slog.Warn("remote config: fetch failed; using cached document",
 				"url", f.rc.URL, "fetched_at", cached.FetchedAt, "error", cause)
@@ -292,6 +301,7 @@ func (f *Fetcher) fallback(ctx context.Context, cached *envelope, now time.Time,
 		s.LastError = cause.Error()
 		s.Source = "none"
 		s.ETag = ""
+		s.CachedAt = time.Time{}
 	})
 	slog.Warn("remote config: fetch failed and no usable cache; continuing with local base config only",
 		"url", f.rc.URL, "error", cause)

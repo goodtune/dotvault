@@ -59,6 +59,15 @@ var reservedRemoteHeaders = []string{
 	"X-Dotvault-Version",
 }
 
+// Validate validates the section in place — an exported wrapper over the
+// internal check so the config loader can enforce the trust-boundary rules
+// (https-unless-loopback, no userinfo, header hygiene) *before* any network
+// I/O, ahead of full-config validation. Idempotent: derived fields are
+// recomputed from scratch on every call.
+func (r *RemoteConfig) Validate() error {
+	return r.validate()
+}
+
 func (r *RemoteConfig) validate() error {
 	if r.URL != "" {
 		u, err := url.Parse(r.URL)

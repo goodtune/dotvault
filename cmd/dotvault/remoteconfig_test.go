@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -76,6 +78,38 @@ func TestWithRemoteNoURLFailsClosed(t *testing.T) {
 	}
 	if rs := status(); rs != nil {
 		t.Errorf("status = %+v, want nil when no URL is configured", rs)
+	}
+}
+
+// TestWithRemoteInvalidSectionRejectedBeforeFetch pins the trust-boundary
+// ordering: the base is loaded raw, so the remote_config section's own
+// validation must run before any network I/O — a section the validator is
+// about to reject (here: userinfo in the URL) must produce zero requests.
+func TestWithRemoteInvalidSectionRejectedBeforeFetch(t *testing.T) {
+	isolateCacheDir(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Write([]byte("rules: []\n"))
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse test URL: %v", err)
+	}
+	baseLoader := func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: "http://user:pass@" + u.Host + "/v1/config"},
+		}, nil
+	}
+	merged, _ := withRemote(t.Context(), baseLoader)
+	if _, err := merged(); err == nil {
+		t.Fatal("expected validation error for a userinfo URL")
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("fetch happened before validation: %d request(s)", n)
 	}
 }
 

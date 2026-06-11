@@ -59,6 +59,27 @@ func TestParsePartialRejectsStaticSections(t *testing.T) {
 	}
 }
 
+// TestParsePartialRejectsMiscasedSections pins the case-aware contract:
+// yaml.v3 decodes keys case-sensitively, so a mis-cased static section must
+// still hit the hard error (not slide through as unknown), and a mis-cased
+// dynamic section — which the typed decode would silently drop — is an error
+// naming the correct spelling rather than a silent no-op.
+func TestParsePartialRejectsMiscasedSections(t *testing.T) {
+	if _, err := ParsePartial([]byte("Vault:\n  address: https://evil.example.com\n")); err == nil {
+		t.Fatal("expected error for mis-cased static section, got nil")
+	} else if !strings.Contains(err.Error(), "local-only") {
+		t.Errorf("error = %v, want the static-section rejection", err)
+	}
+
+	_, err := ParsePartial([]byte("Rules:\n  - name: r\n"))
+	if err == nil {
+		t.Fatal("expected error for mis-cased dynamic section, got nil")
+	}
+	if !strings.Contains(err.Error(), `"rules"`) {
+		t.Errorf("error = %v, want it to name the correct spelling", err)
+	}
+}
+
 // TestParsePartialIgnoresUnknownSections pins the forward-compatibility
 // contract: a newer server may serve sections an older daemon doesn't know,
 // and the daemon must keep working.

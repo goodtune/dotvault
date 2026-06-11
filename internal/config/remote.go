@@ -78,6 +78,12 @@ func (r *RemoteConfig) validate() error {
 		if u.Host == "" {
 			return fmt.Errorf("remote_config.url %q: missing host", r.URL)
 		}
+		// The service is unauthenticated by design, so userinfo has no
+		// legitimate use — and the URL surfaces verbatim in logs and on
+		// the status endpoints, so pasted credentials would leak.
+		if u.User != nil {
+			return fmt.Errorf("remote_config.url must not contain userinfo: the service is unauthenticated and the URL appears in logs and status output")
+		}
 	}
 
 	// RefreshInterval is derived state: recompute it from scratch on every

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -46,24 +47,34 @@ var partialDynamicSections = map[string]bool{
 // ParsePartial parses a partial configuration document, enforcing the wire
 // contract: static sections are a hard error; unknown sections are ignored
 // with a warning (forward compatibility — a newer server may serve sections
-// an older daemon doesn't know about). The result is NOT validated; callers
-// either run (*Partial).Validate (the service, at layer write/serve time) or
-// merge into a Config and validate the merged result (the client).
+// an older daemon doesn't know about). Section matching is case-aware:
+// yaml.v3 decodes keys case-sensitively, so a mis-cased known section
+// ("Rules:") would be silently dropped by the typed decode — that is a hard
+// error naming the correct spelling, and the static-section ban matches
+// case-insensitively so "Vault:" can't slip past as merely unknown. The
+// result is NOT validated; callers either run (*Partial).Validate (the
+// service, at layer write/serve time) or merge into a Config and validate
+// the merged result (the client).
 func ParsePartial(data []byte) (*Partial, error) {
 	var probe map[string]any
 	if err := yaml.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("parse partial config: %w", err)
 	}
-	for _, key := range partialStaticSections {
-		if _, ok := probe[key]; ok {
-			return nil, fmt.Errorf("partial config: section %q is local-only and must not appear in a remote document", key)
-		}
-	}
 	var unknown []string
 	for key := range probe {
-		if !partialDynamicSections[key] {
-			unknown = append(unknown, key)
+		lower := strings.ToLower(key)
+		for _, static := range partialStaticSections {
+			if lower == static {
+				return nil, fmt.Errorf("partial config: section %q is local-only and must not appear in a remote document", key)
+			}
 		}
+		if partialDynamicSections[lower] {
+			if key != lower {
+				return nil, fmt.Errorf("partial config: section %q must be spelled %q — YAML keys are case-sensitive and a mis-cased section would be silently ignored", key, lower)
+			}
+			continue
+		}
+		unknown = append(unknown, key)
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)

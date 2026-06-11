@@ -44,6 +44,11 @@ func TestRemoteConfigValidate(t *testing.T) {
 			wantErr: "missing host",
 		},
 		{
+			name:    "userinfo rejected",
+			rc:      RemoteConfig{URL: "https://user:pass@config.example.com/v1/config"},
+			wantErr: "userinfo",
+		},
+		{
 			name: "refresh interval parsed",
 			rc:   RemoteConfig{URL: "https://config.example.com", RawRefreshInterval: "5m"},
 		},

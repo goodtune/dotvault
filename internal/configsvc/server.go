@@ -19,6 +19,7 @@ type Server struct {
 	store    store.Store
 	composer *Composer
 	resolver groups.Resolver
+	admin    *adminState // nil unless EnableAdmin was called
 }
 
 // NewServer builds a Server over the given backends.
@@ -32,7 +33,8 @@ func NewServer(st store.Store, resolver groups.Resolver) *Server {
 
 // Handler returns the service routes: GET /v1/config (the composed partial
 // document), GET /healthz (liveness), GET /readyz (readiness, gated on
-// storage Ping).
+// storage Ping), and — when EnableAdmin was called — the /v1/admin API and
+// the /admin/ web UI.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/config", s.handleConfig)
@@ -41,6 +43,9 @@ func (s *Server) Handler() http.Handler {
 		fmt.Fprintln(w, "ok")
 	})
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	if s.admin != nil {
+		s.registerAdminRoutes(mux)
+	}
 	return mux
 }
 

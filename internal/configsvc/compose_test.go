@@ -70,6 +70,32 @@ func TestValidIdentitySegment(t *testing.T) {
 	}
 }
 
+func TestValidLayerKey(t *testing.T) {
+	tests := []struct {
+		key string
+		ok  bool
+	}{
+		{"global", true},
+		{"os/linux", true},
+		{"group/sydney", true},
+		{"user/Alice Smith", true},
+		{"os/Linux", false}, // would never be served: composition lowercases
+		{"global/extra", false},
+		{"nonsense", false},
+		{"team/sydney", false},
+		{"user/..", false},
+		{"user/", false},
+		{"", false},
+		{"os/a/b", false},
+	}
+	for _, tt := range tests {
+		err := ValidLayerKey(tt.key)
+		if (err == nil) != tt.ok {
+			t.Errorf("ValidLayerKey(%q) = %v, want ok=%v", tt.key, err, tt.ok)
+		}
+	}
+}
+
 func TestLayerKeys(t *testing.T) {
 	got := LayerKeys("Linux", "alice", []string{"sydney", "auckland", "newyork"})
 	want := []string{"global", "os/linux", "group/auckland", "group/newyork", "group/sydney", "user/alice"}

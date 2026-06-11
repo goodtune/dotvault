@@ -10,14 +10,29 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
-// Store persists configuration layers and static group membership. Layer
-// keys are the canonical composition keys ("global", "os/linux",
-// "group/sydney", "user/alice") and are treated as opaque strings by the
-// drivers. Layer documents are stored as raw bytes — validation is the
-// caller's concern (the seed path validates before writing; the compose path
-// validates on read so a corrupt layer surfaces as an error naming the key).
+// ServiceAccount is a local, non-human identity defined in the storage layer
+// itself — the automation principal the admin API authenticates via mTLS
+// (the client certificate's CN must equal Name). Disabled accounts are
+// rejected at authentication regardless of certificate validity, which is
+// the immediate-revocation lever for Vault-minted short-lived certs.
+type ServiceAccount struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Disabled    bool      `json:"disabled,omitempty"`
+	CreatedAt   time.Time `json:"created_at,omitzero"`
+	UpdatedAt   time.Time `json:"updated_at,omitzero"`
+}
+
+// Store persists configuration layers, static group membership, and service
+// accounts. Layer keys are the canonical composition keys ("global",
+// "os/linux", "group/sydney", "user/alice") and are treated as opaque
+// strings by the drivers. Layer documents are stored as raw bytes —
+// validation is the caller's concern (the seed and admin-API paths validate
+// before writing; the compose path validates on read so a corrupt layer
+// surfaces as an error naming the key).
 type Store interface {
 	// GetLayer returns the document stored under key. The boolean reports
 	// presence: a missing layer is (nil, false, nil), never an error.
@@ -41,6 +56,30 @@ type Store interface {
 	// PutGroups records the static group membership for user, replacing
 	// any existing entry. An empty (non-nil) list is a valid membership.
 	PutGroups(ctx context.Context, user string, groups []string) error
+
+	// DeleteGroups removes the static membership entry for user. Deleting
+	// a missing entry is a no-op.
+	DeleteGroups(ctx context.Context, user string) error
+
+	// ListGroupUsers returns the usernames that have a static membership
+	// entry, sorted lexicographically.
+	ListGroupUsers(ctx context.Context) ([]string, error)
+
+	// GetServiceAccount returns the named service account. The boolean
+	// reports presence: an unknown account is (nil, false, nil).
+	GetServiceAccount(ctx context.Context, name string) (*ServiceAccount, bool, error)
+
+	// PutServiceAccount stores the account under sa.Name, replacing any
+	// existing entry.
+	PutServiceAccount(ctx context.Context, sa *ServiceAccount) error
+
+	// DeleteServiceAccount removes the account. Deleting a missing account
+	// is a no-op.
+	DeleteServiceAccount(ctx context.Context, name string) error
+
+	// ListServiceAccounts returns the stored account names, sorted
+	// lexicographically.
+	ListServiceAccounts(ctx context.Context) ([]string, error)
 
 	// Ping verifies the backend is reachable and usable; it gates the
 	// service's /readyz probe.

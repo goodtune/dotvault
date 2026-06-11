@@ -107,6 +107,73 @@ Every document is validated **before any write** — the same parse and validati
 
 This gives you config-as-code: keep the layer tree in a git repository, review changes as pull requests, and have CI run `seed` against the production backend on merge.
 
+## Administration
+
+With `admin.enabled: true` the service exposes a management API under `/v1/admin/` and a web UI at `/admin/`, covering every axis: layers (all four kinds), static group membership, and service accounts. The UI is a thin shell over the API — anything it can do, an automation client (e.g. a Terraform provider) can do against the same routes.
+
+```yaml
+admin:
+  enabled: true
+  group: dotvault-admins       # admins must hold this group (via the groups resolver)
+  session_ttl: "12h"
+  ldap:                        # human username/password login
+    url: ldaps://ldap.example.com
+    user_dn_template: "uid=%s,ou=people,dc=example,dc=com"
+    # or search-then-bind:
+    # bind_dn: cn=svc,ou=services,dc=example,dc=com
+    # bind_password_file: /run/secrets/ldap-password
+    # user_search_base_dn: ou=people,dc=example,dc=com
+    # user_search_filter: "(uid=%s)"
+  mtls:                        # service-account listener (mTLS only)
+    listen: "0.0.0.0:9101"
+    ca_cert: /etc/dotvault-config/svc-ca.pem
+    cert_file: /etc/dotvault-config/tls.crt
+    key_file: /etc/dotvault-config/tls.key
+```
+
+### Human admins
+
+`POST /v1/admin/auth/login` binds against the directory **as the user** (DN template or search-then-bind) and then requires membership of `admin.group`, resolved through the same groups resolver that drives layer composition — admins are declared in the same membership source as everything else. Sessions are cookies (HttpOnly, SameSite=Strict, Secure over TLS); mutating requests need a one-time CSRF token from `GET /v1/admin/csrf` in the `X-CSRF-Token` header.
+
+### Service accounts
+
+Service accounts are local identities defined in the storage layer — not directory users — for automation such as CI publishing or a Terraform provider. They have **no password**: the only way to authenticate as one is a mutual-TLS client certificate on the dedicated `admin.mtls.listen` listener, and the expectation is that **Vault mints the certificates** via a dedicated PKI secrets engine.
+
+What makes "only authorized certificates" hold:
+
+- the listener trusts **only** `admin.mtls.ca_cert` — point it at a PKI intermediate dedicated to dotvault-config service accounts, never a general corporate CA, so the Vault role's issuance policy *is* the access policy (and Vault's audit log is the issuance trail);
+- the certificate's CN must name a **registered, enabled** service account — disabling or deleting the account in the admin API revokes access immediately, regardless of certificate lifetime;
+- keep certificates **short-lived** (Vault role `max_ttl` ≤ 72h) instead of running CRL/OCSP infrastructure;
+- the `clientAuth` EKU is enforced during the handshake, so a server certificate from the same CA cannot be replayed as a client credential.
+
+A suitable Vault role looks like:
+
+```sh
+vault secrets enable -path=dotvault-config-pki pki
+vault write dotvault-config-pki/roles/service-account \
+  allow_any_name=false allow_bare_domains=true allow_subdomains=false \
+  enforce_hostnames=false allowed_domains="terraform,ci-publisher" \
+  client_flag=true server_flag=false max_ttl=72h ttl=24h
+```
+
+and a client authenticates with `curl --cert sa.pem --key sa-key.pem --cacert service-ca.pem https://config.example.com:9101/v1/admin/...`.
+
+### Management API
+
+| Route | Behaviour |
+|-------|-----------|
+| `POST /v1/admin/auth/login`, `POST /v1/admin/auth/logout`, `GET /v1/admin/csrf`, `GET /v1/admin/whoami` | session lifecycle and caller identity |
+| `GET /v1/admin/layers?prefix=` · `GET/PUT/DELETE /v1/admin/layers/{key}` | layer CRUD; PUT validates with the daemon's own parser and returns the validation error as the 400 body |
+| `GET /v1/admin/groups` · `GET/PUT/DELETE /v1/admin/groups/{user}` | static membership CRUD (`{"groups": [...]}`) |
+| `GET /v1/admin/service-accounts` · `GET/PUT/DELETE /v1/admin/service-accounts/{name}` | service-account CRUD; PUT is an upsert preserving `created_at` |
+| `GET /v1/admin/preview?os=&user=&groups=` | the composed document an identity would receive (`groups` overrides the resolver) |
+
+Every `PUT` is an idempotent upsert and every mutation is audit-logged with the acting identity — the contract a configuration-as-code Terraform provider builds on directly.
+
+### Dev loop
+
+`docker compose --profile ldap up -d` starts a tiny glauth directory (sign in to `http://127.0.0.1:9100/admin/` as `admin`/`password`; `bob`/`password` exercises the not-an-admin 403). `dev/mint-svc-cert.sh` provisions the service-account PKI from the dev Vault into `dev/pki/` — enable the `admin.mtls` block in `configsvc.dev.yaml` afterwards to exercise the certificate path end to end.
+
 ## Debugging a composition
 
 `compose` renders what a given identity would receive, offline:

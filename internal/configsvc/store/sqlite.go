@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS layers (
 CREATE TABLE IF NOT EXISTS groups (
 	username TEXT PRIMARY KEY,
 	groups   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS service_accounts (
+	name TEXT PRIMARY KEY,
+	doc  TEXT NOT NULL
 );`
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
@@ -137,6 +141,80 @@ func (s *sqliteStore) PutGroups(ctx context.Context, user string, groups []strin
 		return fmt.Errorf("put groups for %q: %w", user, err)
 	}
 	return nil
+}
+
+func (s *sqliteStore) DeleteGroups(ctx context.Context, user string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM groups WHERE username = ?`, user); err != nil {
+		return fmt.Errorf("delete groups for %q: %w", user, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListGroupUsers(ctx context.Context) ([]string, error) {
+	return s.listColumn(ctx, `SELECT username FROM groups ORDER BY username`, "list group users")
+}
+
+func (s *sqliteStore) GetServiceAccount(ctx context.Context, name string) (*ServiceAccount, bool, error) {
+	var raw string
+	err := s.db.QueryRowContext(ctx, `SELECT doc FROM service_accounts WHERE name = ?`, name).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("get service account %q: %w", name, err)
+	}
+	var sa ServiceAccount
+	if err := json.Unmarshal([]byte(raw), &sa); err != nil {
+		return nil, false, fmt.Errorf("decode service account %q: %w", name, err)
+	}
+	return &sa, true, nil
+}
+
+func (s *sqliteStore) PutServiceAccount(ctx context.Context, sa *ServiceAccount) error {
+	raw, err := json.Marshal(sa)
+	if err != nil {
+		return fmt.Errorf("encode service account %q: %w", sa.Name, err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO service_accounts (name, doc) VALUES (?, ?)
+		 ON CONFLICT(name) DO UPDATE SET doc = excluded.doc`,
+		sa.Name, string(raw))
+	if err != nil {
+		return fmt.Errorf("put service account %q: %w", sa.Name, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteServiceAccount(ctx context.Context, name string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM service_accounts WHERE name = ?`, name); err != nil {
+		return fmt.Errorf("delete service account %q: %w", name, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListServiceAccounts(ctx context.Context) ([]string, error) {
+	return s.listColumn(ctx, `SELECT name FROM service_accounts ORDER BY name`, "list service accounts")
+}
+
+// listColumn collects a single-string-column query result.
+func (s *sqliteStore) listColumn(ctx context.Context, query, what string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	return out, nil
 }
 
 func (s *sqliteStore) Ping(ctx context.Context) error {

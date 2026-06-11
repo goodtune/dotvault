@@ -2,10 +2,7 @@ package groups
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -44,8 +41,8 @@ type LDAPConfig struct {
 }
 
 type ldapResolver struct {
-	cfg LDAPConfig
-	tls *tls.Config
+	cfg    LDAPConfig
+	dialer *Dialer
 }
 
 // NewLDAP validates cfg and returns the directory-backed Resolver. Each
@@ -53,15 +50,9 @@ type ldapResolver struct {
 // directory load proportional to distinct users per TTL window, and a
 // connection pool is not worth its failure modes at this request rate.
 func NewLDAP(cfg LDAPConfig) (Resolver, error) {
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("ldap resolver: url is required")
-	}
-	u, err := url.Parse(cfg.URL)
+	dialer, err := NewDialer(cfg.URL, cfg.StartTLS, cfg.CACert)
 	if err != nil {
-		return nil, fmt.Errorf("ldap resolver: parse url: %w", err)
-	}
-	if u.Scheme != "ldap" && u.Scheme != "ldaps" {
-		return nil, fmt.Errorf("ldap resolver: url scheme must be ldap or ldaps, got %q", u.Scheme)
+		return nil, fmt.Errorf("ldap resolver: %w", err)
 	}
 	if cfg.BaseDN == "" {
 		return nil, fmt.Errorf("ldap resolver: base_dn is required")
@@ -75,27 +66,11 @@ func NewLDAP(cfg LDAPConfig) (Resolver, error) {
 	if cfg.Attribute == "" {
 		cfg.Attribute = "cn"
 	}
-
-	var tlsCfg *tls.Config
-	if u.Scheme == "ldaps" || cfg.StartTLS {
-		tlsCfg = &tls.Config{ServerName: u.Hostname()}
-		if cfg.CACert != "" {
-			pem, err := os.ReadFile(cfg.CACert)
-			if err != nil {
-				return nil, fmt.Errorf("ldap resolver: read ca_cert: %w", err)
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				return nil, fmt.Errorf("ldap resolver: ca_cert %s: no certificates found", cfg.CACert)
-			}
-			tlsCfg.RootCAs = pool
-		}
-	}
-	return &ldapResolver{cfg: cfg, tls: tlsCfg}, nil
+	return &ldapResolver{cfg: cfg, dialer: dialer}, nil
 }
 
 func (r *ldapResolver) Groups(ctx context.Context, user string) ([]string, error) {
-	conn, err := r.dial()
+	conn, err := r.dialer.Dial()
 	if err != nil {
 		return nil, fmt.Errorf("ldap: %w", err)
 	}
@@ -108,7 +83,7 @@ func (r *ldapResolver) Groups(ctx context.Context, user string) ([]string, error
 	}
 
 	if r.cfg.BindDN != "" {
-		password, err := r.bindPassword()
+		password, err := readBindPassword(r.cfg.BindPassword, r.cfg.BindPasswordFile)
 		if err != nil {
 			return nil, fmt.Errorf("ldap: %w", err)
 		}
@@ -135,29 +110,13 @@ func (r *ldapResolver) Groups(ctx context.Context, user string) ([]string, error
 	return groups, nil
 }
 
-func (r *ldapResolver) dial() (*ldap.Conn, error) {
-	var opts []ldap.DialOpt
-	if r.tls != nil && !r.cfg.StartTLS {
-		opts = append(opts, ldap.DialWithTLSConfig(r.tls))
+// readBindPassword resolves the service bind credential, re-reading a
+// password file on every call so a rotated secret needs no restart.
+func readBindPassword(literal, file string) (string, error) {
+	if file == "" {
+		return literal, nil
 	}
-	conn, err := ldap.DialURL(r.cfg.URL, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", r.cfg.URL, err)
-	}
-	if r.cfg.StartTLS {
-		if err := conn.StartTLS(r.tls); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("starttls: %w", err)
-		}
-	}
-	return conn, nil
-}
-
-func (r *ldapResolver) bindPassword() (string, error) {
-	if r.cfg.BindPasswordFile == "" {
-		return r.cfg.BindPassword, nil
-	}
-	raw, err := os.ReadFile(r.cfg.BindPasswordFile)
+	raw, err := os.ReadFile(file)
 	if err != nil {
 		return "", fmt.Errorf("read bind_password_file: %w", err)
 	}

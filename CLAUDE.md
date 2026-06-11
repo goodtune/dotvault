@@ -81,6 +81,8 @@ go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote
 
 `config.dev.yaml` carries `remote_config.url: http://127.0.0.1:9100/v1/config` (loopback, so plain HTTP is allowed); when the service isn't running the daemon fails open onto the base config with a warning, so the block stays enabled. Add your OS username to `dev/remote-layers/groups.yaml` to see group layers in your composed document.
 
+The service's admin UI lives at `http://127.0.0.1:9100/admin/`. Human login needs the glauth dev directory (`docker compose --profile ldap up -d`; admin/password). The service-account mTLS path is exercised by running `dev/mint-svc-cert.sh` (mints a dedicated PKI from the dev Vault into `dev/pki/`) and enabling the `admin.mtls` block in `configsvc.dev.yaml`.
+
 ### Claude Code Desktop
 
 `.claude/launch.json` defines the services as Preview configurations so Claude Code Desktop can start them automatically, connect to the running web UI, and auto-verify changes. The configurations mirror the manual steps above:
@@ -101,7 +103,7 @@ internal/
   paths/                 OS-specific path resolution
   vault/                 Vault client wrapper, KVv2 operations, Events API (WebSocket)
   remoteconfig/          Remote config overlay: ETag-conditional fetcher, last-known-good cache, fail-open ladder
-  configsvc/             dotvault-config service: layer composition, HTTP API, seeding; store/ (sqlite + Vault KVv2) and groups/ (static + LDAP) backends
+  configsvc/             dotvault-config service: layer composition, HTTP API, seeding, admin API + embedded UI (ui/); store/ (sqlite + Vault KVv2) and groups/ (static + LDAP) backends
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
   observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
@@ -606,7 +608,9 @@ HTTP API: `GET /v1/config` (requires `X-Dotvault-OS` + `X-Dotvault-User`, 400 ot
 
 Storage (`internal/configsvc/store`): the `Store` interface behind an `Open(ctx, driver, dsn)` / `OpenVault(ctx, cfg)` factory pair. SQLite (`modernc.org/sqlite`, pure Go — CGO stays off) for dev/tests with tables `layers(key, doc, updated_at)` and `groups(username, groups)`; Vault KVv2 for production with the document as a single `doc` field at `<mount>/data/<path>/layers/<key>` and membership at `<path>/groups/<user>`, auth `token` (falls back to `VAULT_TOKEN`) or `kubernetes` (service-account JWT **re-read from disk on every login** so projected-token rotation needs no restart; re-login on 403). Built directly on `github.com/hashicorp/vault/api` — the daemon's `internal/vault` is deliberately not reused. The driver-neutral conformance suite lives in `store/storetest` (run by the sqlite unit tests and the Vault driver's `test/integration` test); a new driver must pass it.
 
-Group resolution (`internal/configsvc/groups`): `Resolver` interface behind a TTL cache (`NewCached`; successful lookups including empty memberships are cached, errors are not). `static` reads membership from the store; `ldap` (`github.com/go-ldap/ldap/v3`) dials per lookup, substitutes the **escaped** username into the configured `%s` filter, and collects the name attribute (default `cn`). An unknown user resolves to no groups — composing global+os is valid.
+Group resolution (`internal/configsvc/groups`): `Resolver` interface behind a TTL cache (`NewCached`; successful lookups including empty memberships are cached, errors are not). `static` reads membership from the store; `ldap` (`github.com/go-ldap/ldap/v3`) dials per lookup (via the shared `groups.Dialer`), substitutes the **escaped** username into the configured `%s` filter, and collects the name attribute (default `cn`). An unknown user resolves to no groups — composing global+os is valid.
+
+Administration (design: `docs/superpowers/specs/2026-06-11-configsvc-admin-design.md`): when `admin.enabled`, the service additionally serves a JSON management API under `/v1/admin/` (layers, static group membership, service accounts, whoami, compose preview — all CRUD; every PUT is an idempotent upsert and layer PUTs run the same `ValidLayerKey` + `ParsePartial` + `Validate` gate as seed) and an embedded dependency-free web UI at `/admin/` (`internal/configsvc/ui/`, plain HTML+JS via `embed.FS` — deliberately no second npm workspace; the UI is a thin shell over the API so a Terraform provider consumes the identical routes). Two principal kinds: **human admins** authenticate by LDAP bind (`admin.ldap`, DN template or search-then-bind; empty password rejected pre-network because a DN+empty-password bind is an anonymous bind many directories accept) and must hold `admin.group` resolved through the *configured groups resolver*; sessions are in-memory cookies (HttpOnly/SameSite=Strict, one-time CSRF tokens on mutations). **Service accounts** are local store-defined identities with no password — mTLS only, on the separate `admin.mtls.listen` listener (`RequireAndVerifyClientCert`, browsers never see a cert prompt, CSRF-exempt). The mTLS trust model: `ca_cert` pins a dedicated Vault PKI intermediate (issuance policy = access policy), the leaf CN must match a registered **enabled** service account (disable = instant revocation), short Vault-minted TTLs replace CRL/OCSP, and Go's verifier enforces the clientAuth EKU. Dev loop: `docker compose --profile ldap up -d` (glauth, `dev/glauth.cfg`, admin/password) + `dev/mint-svc-cert.sh` (mints the service-account PKI from the dev Vault into `dev/pki/`).
 
 ## File Permissions & Security
 

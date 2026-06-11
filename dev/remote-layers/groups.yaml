@@ -3,5 +3,10 @@
 #
 #   <your-username>: [sydney]
 #
+# "dotvault-admins" is the admin group required by the configsvc.dev.yaml
+# admin block: the glauth dev user "admin" holds it (sign in to /admin/ with
+# admin/password), while "bob" deliberately does not (bob/password exercises
+# the 403 path).
 alice: [sydney, newyork]
 bob: [sydney]
+admin: [dotvault-admins]

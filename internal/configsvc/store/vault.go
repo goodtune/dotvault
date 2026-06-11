@@ -57,6 +57,10 @@ const layerDocField = "doc"
 // groupsField is the single KVv2 field carrying a JSON-encoded group list.
 const groupsField = "groups"
 
+// serviceAccountDocField is the single KVv2 field carrying a JSON-encoded
+// ServiceAccount.
+const serviceAccountDocField = "doc"
+
 type vaultStore struct {
 	client *api.Client
 	cfg    VaultStoreConfig
@@ -191,6 +195,18 @@ func (s *vaultStore) layerMetaPath(key string) string {
 
 func (s *vaultStore) groupsDataPath(user string) string {
 	return path.Join(s.cfg.Mount, "data", s.cfg.Path, "groups", user)
+}
+
+func (s *vaultStore) groupsMetaPath(user string) string {
+	return path.Join(s.cfg.Mount, "metadata", s.cfg.Path, "groups", user)
+}
+
+func (s *vaultStore) serviceAccountDataPath(name string) string {
+	return path.Join(s.cfg.Mount, "data", s.cfg.Path, "service-accounts", name)
+}
+
+func (s *vaultStore) serviceAccountMetaPath(name string) string {
+	return path.Join(s.cfg.Mount, "metadata", s.cfg.Path, "service-accounts", name)
 }
 
 // readField reads a single string field from a KVv2 secret. A missing
@@ -342,6 +358,74 @@ func (s *vaultStore) PutGroups(ctx context.Context, user string, groups []string
 		return fmt.Errorf("put groups for %q: %w", user, err)
 	}
 	return nil
+}
+
+func (s *vaultStore) DeleteGroups(ctx context.Context, user string) error {
+	err := s.do(ctx, func() error {
+		_, err := s.client.Logical().DeleteWithContext(ctx, s.groupsMetaPath(user))
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("delete groups for %q: %w", user, err)
+	}
+	return nil
+}
+
+func (s *vaultStore) ListGroupUsers(ctx context.Context) ([]string, error) {
+	base := path.Join(s.cfg.Mount, "metadata", s.cfg.Path, "groups")
+	var users []string
+	if err := s.listRecursive(ctx, base, "", &users); err != nil {
+		return nil, fmt.Errorf("list group users: %w", err)
+	}
+	sort.Strings(users)
+	return users, nil
+}
+
+func (s *vaultStore) GetServiceAccount(ctx context.Context, name string) (*ServiceAccount, bool, error) {
+	value, found, err := s.readField(ctx, s.serviceAccountDataPath(name), serviceAccountDocField)
+	if err != nil {
+		return nil, false, fmt.Errorf("get service account %q: %w", name, err)
+	}
+	if !found {
+		return nil, false, nil
+	}
+	var sa ServiceAccount
+	if err := json.Unmarshal([]byte(value), &sa); err != nil {
+		return nil, false, fmt.Errorf("decode service account %q: %w", name, err)
+	}
+	return &sa, true, nil
+}
+
+func (s *vaultStore) PutServiceAccount(ctx context.Context, sa *ServiceAccount) error {
+	raw, err := json.Marshal(sa)
+	if err != nil {
+		return fmt.Errorf("encode service account %q: %w", sa.Name, err)
+	}
+	if err := s.writeField(ctx, s.serviceAccountDataPath(sa.Name), serviceAccountDocField, string(raw)); err != nil {
+		return fmt.Errorf("put service account %q: %w", sa.Name, err)
+	}
+	return nil
+}
+
+func (s *vaultStore) DeleteServiceAccount(ctx context.Context, name string) error {
+	err := s.do(ctx, func() error {
+		_, err := s.client.Logical().DeleteWithContext(ctx, s.serviceAccountMetaPath(name))
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("delete service account %q: %w", name, err)
+	}
+	return nil
+}
+
+func (s *vaultStore) ListServiceAccounts(ctx context.Context) ([]string, error) {
+	base := path.Join(s.cfg.Mount, "metadata", s.cfg.Path, "service-accounts")
+	var names []string
+	if err := s.listRecursive(ctx, base, "", &names); err != nil {
+		return nil, fmt.Errorf("list service accounts: %w", err)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (s *vaultStore) Ping(ctx context.Context) error {

@@ -12,3 +12,5 @@ cmd/dotvault/*.syso
 cmd/dotvault/.version-stamp
 # SQLite database for the dev dotvault-config service (configsvc.dev.yaml).
 dev/configsvc.db
+# Dev service-account PKI minted from the dev Vault by dev/mint-svc-cert.sh.
+dev/pki/

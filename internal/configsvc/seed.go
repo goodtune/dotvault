@@ -148,6 +148,9 @@ func loadSeedSubdir(dir, prefix string) ([]seedLayer, error) {
 			continue
 		}
 		key := prefix + "/" + trimYAMLExt(name)
+		if err := ValidLayerKey(key); err != nil {
+			return nil, fmt.Errorf("%s: %w", full, err)
+		}
 		l, err := loadLayerFile(full, key)
 		if err != nil {
 			return nil, err

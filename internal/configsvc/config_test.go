@@ -56,6 +56,13 @@ func TestLoadConfigErrors(t *testing.T) {
 		{"bad ttl", "store: {driver: sqlite, dsn: ':memory:'}\ngroups: {ttl: soon}\n", "groups.ttl"},
 		{"tls half configured", "store: {driver: sqlite, dsn: ':memory:'}\ntls: {cert_file: /a.pem}\n", "both cert_file and key_file"},
 		{"unknown key", "store: {driver: sqlite, dsn: ':memory:'}\nlisten_addr: :9100\n", "listen_addr"},
+		{"admin without any login path", "store: {driver: sqlite, dsn: ':memory:'}\nadmin: {enabled: true, group: admins}\n", "neither ldap login nor an mtls listener"},
+		{"admin ldap without group", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  ldap: {url: ldap://x, user_dn_template: 'uid=%s,dc=x'}\n", "admin.group is required"},
+		{"admin ldap without dn strategy", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  group: admins\n  ldap: {url: ldap://x}\n", "user_dn_template or user_search"},
+		{"admin ldap both dn strategies", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  group: admins\n  ldap: {url: ldap://x, user_dn_template: 'uid=%s,dc=x', user_search_base_dn: dc=x, user_search_filter: '(uid=%s)'}\n", "mutually exclusive"},
+		{"admin ldap template without placeholder", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  group: admins\n  ldap: {url: ldap://x, user_dn_template: 'uid=alice,dc=x'}\n", "%s"},
+		{"admin mtls incomplete", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  mtls: {listen: ':9101'}\n", "ca_cert, cert_file, and key_file"},
+		{"admin bad session ttl", "store: {driver: sqlite, dsn: ':memory:'}\nadmin:\n  enabled: true\n  session_ttl: never\n  mtls: {listen: ':9101', ca_cert: /a, cert_file: /b, key_file: /c}\n", "admin.session_ttl"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

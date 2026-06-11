@@ -30,7 +30,49 @@ type Config struct {
 	TLS    TLSConfig    `yaml:"tls"`
 	Store  StoreConfig  `yaml:"store"`
 	Groups GroupsConfig `yaml:"groups"`
+	// Admin enables the management API and web UI (see AdminConfig).
+	Admin AdminConfig `yaml:"admin"`
 }
+
+// AdminConfig configures the management surface: the /v1/admin API and the
+// embedded web UI at /admin/. Disabled by default — without it the service
+// is read-only over HTTP and writes happen via `seed` or direct store
+// access, exactly as before.
+type AdminConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Group is the membership (resolved through the configured groups
+	// resolver) a human admin must hold. Required when enabled and the
+	// LDAP login is configured.
+	Group string `yaml:"group"`
+	// RawSessionTTL is the admin session lifetime. Default "12h".
+	RawSessionTTL string        `yaml:"session_ttl"`
+	SessionTTL    time.Duration `yaml:"-"`
+	// LDAP configures human username/password login. Omit to disable
+	// password login entirely (service accounts only).
+	LDAP AdminLDAPConfig `yaml:"ldap"`
+	// MTLS configures the service-account listener. Omit to disable
+	// certificate login entirely (human admins only).
+	MTLS AdminMTLSConfig `yaml:"mtls"`
+}
+
+// AdminMTLSConfig is the separate mutual-TLS listener for service accounts.
+// It is a second listener (rather than optional client certs on the main
+// one) so browsers talking to the UI are never prompted for a certificate
+// and the automation trust domain stays cleanly separated.
+type AdminMTLSConfig struct {
+	// Listen is the mTLS listener address. Empty disables the listener.
+	Listen string `yaml:"listen"`
+	// CACert is the ONLY trust anchor for client certificates — pin this
+	// to a dedicated CA (a Vault PKI intermediate minted for this purpose,
+	// not a general corporate CA), so certificate issuance policy IS the
+	// access policy.
+	CACert string `yaml:"ca_cert"`
+	// CertFile/KeyFile are the listener's own server certificate.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
+func (m AdminMTLSConfig) enabled() bool { return m.Listen != "" }
 
 // TLSConfig is the optional listener certificate pair.
 type TLSConfig struct {
@@ -169,6 +211,40 @@ func (c *Config) validate() error {
 			return fmt.Errorf("groups.ttl must not be negative")
 		}
 		c.Groups.TTL = ttl
+	}
+
+	if c.Admin.Enabled {
+		ldapLogin := c.Admin.LDAP.URL != "" || c.Admin.LDAP.UserDNTemplate != "" ||
+			c.Admin.LDAP.UserSearchBaseDN != "" || c.Admin.LDAP.UserSearchFilter != ""
+		if !ldapLogin && !c.Admin.MTLS.enabled() {
+			return fmt.Errorf("admin: enabled but neither ldap login nor an mtls listener is configured")
+		}
+		if ldapLogin {
+			if c.Admin.Group == "" {
+				return fmt.Errorf("admin.group is required when ldap login is configured")
+			}
+			if err := c.Admin.LDAP.validate(); err != nil {
+				return err
+			}
+		}
+		if c.Admin.MTLS.enabled() {
+			m := c.Admin.MTLS
+			if m.CACert == "" || m.CertFile == "" || m.KeyFile == "" {
+				return fmt.Errorf("admin.mtls requires ca_cert, cert_file, and key_file")
+			}
+		}
+		if c.Admin.RawSessionTTL == "" {
+			c.Admin.SessionTTL = 12 * time.Hour
+		} else {
+			ttl, err := config.ParseDuration(c.Admin.RawSessionTTL)
+			if err != nil {
+				return fmt.Errorf("admin.session_ttl %q: %w", c.Admin.RawSessionTTL, err)
+			}
+			if ttl <= 0 {
+				return fmt.Errorf("admin.session_ttl must be positive")
+			}
+			c.Admin.SessionTTL = ttl
+		}
 	}
 	return nil
 }

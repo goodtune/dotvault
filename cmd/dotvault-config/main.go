@@ -147,20 +147,37 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 				return err
 			}
 
-			server := &http.Server{
-				Addr:              cfg.Listen,
-				Handler:           configsvc.NewServer(st, resolver).Handler(),
-				ReadHeaderTimeout: 10 * time.Second,
-				ReadTimeout:       30 * time.Second,
-				WriteTimeout:      30 * time.Second,
-				IdleTimeout:       2 * time.Minute,
+			svc := configsvc.NewServer(st, resolver)
+			if cfg.Admin.Enabled {
+				authenticator, err := configsvc.NewAdminAuthenticator(cfg.Admin)
+				if err != nil {
+					return err
+				}
+				svc.EnableAdmin(cfg.Admin, authenticator)
+			}
+			handler := svc.Handler()
+
+			newHTTPServer := func(addr string) *http.Server {
+				return &http.Server{
+					Addr:              addr,
+					Handler:           handler,
+					ReadHeaderTimeout: 10 * time.Second,
+					ReadTimeout:       30 * time.Second,
+					WriteTimeout:      30 * time.Second,
+					IdleTimeout:       2 * time.Minute,
+				}
 			}
 
-			errCh := make(chan error, 1)
+			var servers []*http.Server
+			errCh := make(chan error, 2)
+
+			server := newHTTPServer(cfg.Listen)
+			servers = append(servers, server)
 			go func() {
 				slog.Info("dotvault-config listening", "addr", cfg.Listen,
 					"tls", cfg.TLS.Enabled(), "store", cfg.Store.Driver,
-					"groups", cfg.Groups.Source, "version", version)
+					"groups", cfg.Groups.Source, "admin", cfg.Admin.Enabled,
+					"version", version)
 				if cfg.TLS.Enabled() {
 					errCh <- server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 				} else {
@@ -168,17 +185,35 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 				}
 			}()
 
+			if cfg.Admin.Enabled && cfg.Admin.MTLS.Listen != "" {
+				tlsCfg, err := configsvc.MTLSServerConfig(cfg.Admin.MTLS)
+				if err != nil {
+					return err
+				}
+				mtlsServer := newHTTPServer(cfg.Admin.MTLS.Listen)
+				mtlsServer.TLSConfig = tlsCfg
+				servers = append(servers, mtlsServer)
+				go func() {
+					slog.Info("dotvault-config mTLS listener for service accounts", "addr", cfg.Admin.MTLS.Listen)
+					errCh <- mtlsServer.ListenAndServeTLS(cfg.Admin.MTLS.CertFile, cfg.Admin.MTLS.KeyFile)
+				}()
+			}
+
 			select {
 			case err := <-errCh:
 				return err
 			case <-ctx.Done():
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := server.Shutdown(shutdownCtx); err != nil {
-					return err
+				for _, srv := range servers {
+					if err := srv.Shutdown(shutdownCtx); err != nil {
+						return err
+					}
 				}
-				if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
-					return err
+				for range servers {
+					if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+						return err
+					}
 				}
 				slog.Info("dotvault-config stopped")
 				return nil

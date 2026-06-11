@@ -15,3 +15,23 @@ store:
 groups:
   source: static
   ttl: "1m"
+
+# Management API + web UI at http://127.0.0.1:9100/admin/. Human login binds
+# against the glauth dev directory (`docker compose --profile ldap up -d`;
+# admin/password is in the dotvault-admins group via dev/remote-layers/
+# groups.yaml, bob/password is not). When glauth isn't running, login
+# reports the backend unavailable; the rest of the service is unaffected.
+admin:
+  enabled: true
+  group: dotvault-admins
+  ldap:
+    url: "ldap://127.0.0.1:3893"
+    user_dn_template: "cn=%s,ou=users,dc=example,dc=com"
+  # Service-account (mTLS) listener. Run dev/mint-svc-cert.sh first — it
+  # uses the dev Vault's PKI engine to mint the CA and certificates into
+  # dev/pki/ — then uncomment:
+  # mtls:
+  #   listen: "127.0.0.1:9101"
+  #   ca_cert: "dev/pki/ca.pem"
+  #   cert_file: "dev/pki/server.pem"
+  #   key_file: "dev/pki/server-key.pem"

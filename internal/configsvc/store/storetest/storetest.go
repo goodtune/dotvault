@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/configsvc/store"
 )
@@ -116,6 +117,68 @@ func Run(t *testing.T, st store.Store) {
 		}
 	})
 
+	t.Run("service accounts", func(t *testing.T) {
+		if _, ok, err := st.GetServiceAccount(ctx, "ci"); err != nil || ok {
+			t.Fatalf("GetServiceAccount on empty store = ok=%v err=%v, want absent", ok, err)
+		}
+		if names, err := st.ListServiceAccounts(ctx); err != nil || len(names) != 0 {
+			t.Fatalf("ListServiceAccounts on empty store = %v, %v", names, err)
+		}
+
+		created := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+		sa := &store.ServiceAccount{
+			Name:        "ci",
+			Description: "terraform pipeline",
+			CreatedAt:   created,
+			UpdatedAt:   created,
+		}
+		if err := st.PutServiceAccount(ctx, sa); err != nil {
+			t.Fatalf("PutServiceAccount: %v", err)
+		}
+		if err := st.PutServiceAccount(ctx, &store.ServiceAccount{Name: "backup", CreatedAt: created, UpdatedAt: created}); err != nil {
+			t.Fatalf("PutServiceAccount: %v", err)
+		}
+
+		got, ok, err := st.GetServiceAccount(ctx, "ci")
+		if err != nil || !ok {
+			t.Fatalf("GetServiceAccount = ok=%v err=%v, want present", ok, err)
+		}
+		if !reflect.DeepEqual(got, sa) {
+			t.Fatalf("GetServiceAccount = %+v, want %+v", got, sa)
+		}
+
+		// Upsert replaces wholesale; the disabled flag round-trips (it is
+		// the immediate-revocation lever for mTLS auth).
+		sa.Disabled = true
+		sa.UpdatedAt = created.Add(time.Hour)
+		if err := st.PutServiceAccount(ctx, sa); err != nil {
+			t.Fatalf("PutServiceAccount (update): %v", err)
+		}
+		got, _, _ = st.GetServiceAccount(ctx, "ci")
+		if !got.Disabled || !got.UpdatedAt.Equal(created.Add(time.Hour)) {
+			t.Fatalf("GetServiceAccount after update = %+v", got)
+		}
+
+		names, err := st.ListServiceAccounts(ctx)
+		if err != nil {
+			t.Fatalf("ListServiceAccounts: %v", err)
+		}
+		if want := []string{"backup", "ci"}; !reflect.DeepEqual(names, want) {
+			t.Fatalf("ListServiceAccounts = %v, want %v", names, want)
+		}
+
+		if err := st.DeleteServiceAccount(ctx, "backup"); err != nil {
+			t.Fatalf("DeleteServiceAccount: %v", err)
+		}
+		if err := st.DeleteServiceAccount(ctx, "backup"); err != nil {
+			t.Fatalf("DeleteServiceAccount (missing): %v", err)
+		}
+		names, _ = st.ListServiceAccounts(ctx)
+		if want := []string{"ci"}; !reflect.DeepEqual(names, want) {
+			t.Fatalf("ListServiceAccounts after delete = %v, want %v", names, want)
+		}
+	})
+
 	t.Run("groups", func(t *testing.T) {
 		if _, ok, err := st.GetGroups(ctx, "nobody"); err != nil || ok {
 			t.Fatalf("GetGroups for unknown user = ok=%v err=%v, want absent", ok, err)
@@ -143,6 +206,32 @@ func Run(t *testing.T, st store.Store) {
 		}
 		if len(got) != 0 {
 			t.Fatalf("GetGroups after empty put = %v, want empty", got)
+		}
+
+		// Enumeration and deletion of membership entries (the admin API's
+		// groups screen is built on these).
+		if err := st.PutGroups(ctx, "zed", []string{"ops"}); err != nil {
+			t.Fatalf("PutGroups: %v", err)
+		}
+		users, err := st.ListGroupUsers(ctx)
+		if err != nil {
+			t.Fatalf("ListGroupUsers: %v", err)
+		}
+		if want := []string{"alice", "zed"}; !reflect.DeepEqual(users, want) {
+			t.Fatalf("ListGroupUsers = %v, want %v", users, want)
+		}
+		if err := st.DeleteGroups(ctx, "zed"); err != nil {
+			t.Fatalf("DeleteGroups: %v", err)
+		}
+		if err := st.DeleteGroups(ctx, "zed"); err != nil {
+			t.Fatalf("DeleteGroups (missing): %v", err)
+		}
+		if _, ok, _ := st.GetGroups(ctx, "zed"); ok {
+			t.Fatal("GetGroups after delete reports present")
+		}
+		users, _ = st.ListGroupUsers(ctx)
+		if want := []string{"alice"}; !reflect.DeepEqual(users, want) {
+			t.Fatalf("ListGroupUsers after delete = %v, want %v", users, want)
 		}
 	})
 }

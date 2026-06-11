@@ -239,6 +239,20 @@ func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, er
 	return cfg, path, status, err
 }
 
+// wrapValidateErr wraps a validation failure with the source-attributing
+// prefix the pre-overlay LoadSystem used: registry-managed (GPO) configs say
+// "validate registry config" so Windows troubleshooting keeps pointing at
+// the right surface.
+func wrapValidateErr(cfg *config.Config, err error) error {
+	if err == nil {
+		return nil
+	}
+	if cfg.Managed {
+		return fmt.Errorf("validate registry config: %w", err)
+	}
+	return fmt.Errorf("validate config: %w", err)
+}
+
 // loadConfigLocalOnly loads and validates the local base configuration
 // without ever touching the network, even when remote_config is set. Used by
 // login and login-check: both consume only the local-only vault section, and
@@ -253,8 +267,8 @@ func loadConfigLocalOnly() (*config.Config, string, error) {
 	if err != nil {
 		return nil, path, err
 	}
-	if err := cfg.Validate(); err != nil {
-		return nil, path, fmt.Errorf("validate config: %w", err)
+	if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
+		return nil, path, err
 	}
 	return cfg, path, nil
 }
@@ -297,7 +311,7 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 			// remote_config block would trigger a fetch the validator was
 			// about to reject.
 			if err := cfg.RemoteConfig.Validate(); err != nil {
-				return nil, fmt.Errorf("validate config: %w", err)
+				return nil, wrapValidateErr(cfg, err)
 			}
 			f := fetcher.Load()
 			if f == nil || !reflect.DeepEqual(f.Config(), cfg.RemoteConfig) {
@@ -314,8 +328,8 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 			}
 			config.ApplyPartial(cfg, partial)
 		}
-		if err := cfg.Validate(); err != nil {
-			return nil, fmt.Errorf("validate config: %w", err)
+		if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
+			return nil, err
 		}
 		return cfg, nil
 	}

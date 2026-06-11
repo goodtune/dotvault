@@ -783,6 +783,10 @@ func (s *Server) getEnrolments() map[string]config.Enrolment {
 func (s *Server) InitEnrolments(ctx context.Context, enrolments map[string]config.Enrolment) {
 	if len(enrolments) == 0 {
 		s.enrolRunnerMu.Lock()
+		// Drop any previous runner too: a runtime update that removes every
+		// enrolment must not leave the old runner's states visible on
+		// /api/v1/status and the enrolment page.
+		s.enrolRunner = nil
 		s.enrolments = enrolments
 		s.enrolRunnerMu.Unlock()
 		return

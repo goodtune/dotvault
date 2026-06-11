@@ -100,3 +100,24 @@ func TestUpdateEnrolmentsRefusedWhileRunning(t *testing.T) {
 		t.Errorf("enrolments = %+v, want the updated map", s.getEnrolments())
 	}
 }
+
+// TestUpdateEnrolmentsToEmptyClearsRunner pins the empty-set transition: a
+// runtime update that removes every enrolment also drops the runner, so the
+// status surfaces stop reporting states for enrolments that no longer exist.
+func TestUpdateEnrolmentsToEmptyClearsRunner(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	s.InitEnrolments(context.Background(), map[string]config.Enrolment{"gh": {Engine: "github"}})
+	if s.getEnrolRunner() == nil {
+		t.Fatal("expected a runner after InitEnrolments")
+	}
+
+	if !s.UpdateEnrolments(context.Background(), nil) {
+		t.Fatal("UpdateEnrolments to empty set refused")
+	}
+	if s.getEnrolRunner() != nil {
+		t.Error("stale runner survived removal of all enrolments")
+	}
+	if len(s.getEnrolments()) != 0 {
+		t.Errorf("enrolments = %+v, want empty", s.getEnrolments())
+	}
+}

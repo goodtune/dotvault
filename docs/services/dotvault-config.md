@@ -6,17 +6,37 @@ The service ships as its own binary (`dotvault-config`, linux and darwin) in eve
 
 ## How composition works
 
-Configuration layers are [partial config documents](../configuration/remote-config.md#what-the-service-can-and-cannot-deliver) — `rules`, `enrolments`, and `sync` only — stored under canonical keys and folded in a fixed order:
+Configuration layers are [partial config documents](../configuration/remote-config.md#what-the-service-can-and-cannot-deliver) — `rules`, `enrolments`, and `sync` only. A layer is addressable by any combination of four **dimensions**, each fed by a client-asserted request value:
+
+| Dimension | Source |
+|-----------|--------|
+| `os` | `X-Dotvault-OS` (lowercased) |
+| `group` | the groups resolver applied to the user — multi-valued |
+| `device` | `X-Dotvault-Hostname` (lowercased; optional) |
+| `user` | `X-Dotvault-User` |
+
+A layer composes whenever **all** of its dimensions match the request; matching layers are purely additive. Layer keys name the combination (the *kind*, in canonical `+`-joined spelling) followed by one value per dimension:
 
 ```
-global  →  os/<os>  →  group/<g> (each, sorted)  →  user/<user>
+global
+os/linux
+group/sydney
+os+group/windows/sydney
+os+group+user/windows/sydney/gary
 ```
 
-Later layers win: a same-named rule replaces the earlier one wholesale (keeping its position), an enrolment entry replaces by map key, and a non-empty `sync.interval` overrides. This is the *same merge* the client applies onto its local base — the service and the client share one merge implementation, so what you compose is exactly what merges.
+Which combinations are considered — and in what precedence — is the operator's explicit, ordered declaration:
 
-Missing layers are skipped silently: an unknown user composes to `global` + `os/<os>`, which is valid. A present-but-invalid layer is **never** silently dropped — the request fails with a `500` naming the layer key, because serving a silently wrong composition would be worse than failing.
+```yaml
+composition:
+  order: [global, os, group, device, user, os+group, os+user, group+user, os+group+user]
+```
 
-Group order is sorted for determinism: the composed bytes are stable, so the document's `ETag` (a sha256 of the bytes) is stable, and unchanged configs cost a single `304` round-trip.
+The declared order **is** the merge order: later layers win (a same-named rule replaces the earlier one wholesale, an enrolment entry replaces by map key, a non-empty `sync.interval` overrides — the *same merge* the client applies onto its local base). There are no implicit specificity rules, and a combination not in the list is never looked up and never served. Omitting the block keeps the default `[global, os, group, user]`, which is byte-identical to the original fixed sequence. A kind containing `group` expands once per group (sorted) at its position, so a user in two groups receives the additive union; a kind referencing a dimension the request didn't supply (e.g. `device` from a client that sends no hostname) is skipped.
+
+Missing layers skip silently: an unknown user composes to whatever else matches, which is valid. A present-but-invalid layer is **never** silently dropped — the request fails with a `500` naming the layer key, because serving a silently wrong composition would be worse than failing. Everything about the expansion is deterministic, so the composed bytes — and the document's `ETag` (a sha256 of the bytes) — are stable, and unchanged configs cost a single `304` round-trip.
+
+Layer writes are gated on the declared order: the admin API answers `422` and `seed` refuses the publish for a layer whose kind is not listed, so configuration that would never be served fails loudly at publish time instead of sitting silently dead in the store.
 
 ## HTTP API
 
@@ -95,8 +115,11 @@ layers/
 ├── group/
 │   ├── sydney.yaml
 │   └── newyork.yaml
-└── user/
-    └── alice.yaml
+├── user/
+│   └── alice.yaml
+└── os+group/            # combination kinds nest one level per dimension
+    └── windows/
+        └── sydney.yaml  → layer key os+group/windows/sydney
 ```
 
 ```sh
@@ -166,7 +189,7 @@ and a client authenticates with `curl --cert sa.pem --key sa-key.pem --cacert se
 | `GET /v1/admin/layers?prefix=` · `GET/PUT/DELETE /v1/admin/layers/{key}` | layer CRUD; PUT validates with the daemon's own parser and returns the validation error as the 400 body |
 | `GET /v1/admin/groups` · `GET/PUT/DELETE /v1/admin/groups/{user}` | static membership CRUD (`{"groups": [...]}`) |
 | `GET /v1/admin/service-accounts` · `GET/PUT/DELETE /v1/admin/service-accounts/{name}` | service-account CRUD; PUT is an upsert preserving `created_at` |
-| `GET /v1/admin/preview?os=&user=&groups=` | the composed document an identity would receive (`groups` overrides the resolver) |
+| `GET /v1/admin/preview?os=&user=&groups=&device=` | the composed document an identity would receive (`groups` overrides the resolver; `device` is optional) |
 
 Every `PUT` is an idempotent upsert and every mutation is audit-logged with the acting identity — the contract a configuration-as-code Terraform provider builds on directly.
 
@@ -180,10 +203,10 @@ Every `PUT` is an idempotent upsert and every mutation is audit-logged with the 
 
 ```sh
 dotvault-config compose --config configsvc.yaml --os linux --user alice
-dotvault-config compose --config configsvc.yaml --os linux --user alice --groups sydney,newyork
+dotvault-config compose --config configsvc.yaml --os linux --user alice --groups sydney,newyork --device laptop-7
 ```
 
-The document goes to stdout; the layer order and ETag go to stderr. `--groups` overrides the resolver, which is useful for answering "what *would* she get if she were in this group" without touching the directory.
+The document goes to stdout; the layer order and ETag go to stderr. `--groups` overrides the resolver, which is useful for answering "what *would* she get if she were in this group" without touching the directory; `--device` feeds the optional device dimension.
 
 ## Local development
 

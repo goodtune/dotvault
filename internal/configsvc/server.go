@@ -16,19 +16,38 @@ import (
 // deployable network service; configuration is not secret, and TLS (the
 // operator's ingress or the service's own listener) provides integrity.
 type Server struct {
-	store    store.Store
-	composer *Composer
-	resolver groups.Resolver
-	admin    *adminState // nil unless EnableAdmin was called
+	store       store.Store
+	composer    *Composer
+	resolver    groups.Resolver
+	composition *Composition
+	admin       *adminState // nil unless EnableAdmin was called
+}
+
+// ServerOption customises a Server.
+type ServerOption func(*Server)
+
+// WithComposition replaces the default layer order with an explicit one
+// (config: composition.order).
+func WithComposition(c *Composition) ServerOption {
+	return func(s *Server) {
+		if c != nil {
+			s.composition = c
+		}
+	}
 }
 
 // NewServer builds a Server over the given backends.
-func NewServer(st store.Store, resolver groups.Resolver) *Server {
-	return &Server{
-		store:    st,
-		composer: &Composer{Store: st},
-		resolver: resolver,
+func NewServer(st store.Store, resolver groups.Resolver, opts ...ServerOption) *Server {
+	s := &Server{
+		store:       st,
+		composer:    &Composer{Store: st},
+		resolver:    resolver,
+		composition: DefaultComposition(),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler returns the service routes: GET /v1/config (the composed partial
@@ -57,8 +76,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "X-Dotvault-OS and X-Dotvault-User headers are required", http.StatusBadRequest)
 		return
 	}
-	if !ValidIdentitySegment(osName) || !ValidIdentitySegment(user) {
-		http.Error(w, "X-Dotvault-OS and X-Dotvault-User must not contain path separators, \"..\", or control characters", http.StatusBadRequest)
+	// The device dimension rides the hostname header the client already
+	// sends; it is optional (kinds referencing it simply skip when absent),
+	// but a present value plays by the same traversal rules as the rest.
+	device := strings.TrimSpace(r.Header.Get("X-Dotvault-Hostname"))
+	if !ValidIdentitySegment(osName) || !ValidIdentitySegment(user) || (device != "" && !ValidIdentitySegment(device)) {
+		http.Error(w, "X-Dotvault-OS, X-Dotvault-User, and X-Dotvault-Hostname must not contain path separators, \"..\", or control characters", http.StatusBadRequest)
 		return
 	}
 
@@ -80,7 +103,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	doc, etag, err := s.composer.Compose(ctx, LayerKeys(osName, user, memberOf))
+	doc, etag, err := s.composer.Compose(ctx, s.composition.Keys(RequestDims{
+		OS:     osName,
+		User:   user,
+		Device: device,
+		Groups: memberOf,
+	}))
 	if err != nil {
 		slog.Error("compose failed", "os", osName, "user", user, "groups", memberOf, "error", err)
 		var le *LayerError

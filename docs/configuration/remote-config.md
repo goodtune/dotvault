@@ -45,7 +45,7 @@ Every fetch sends client-asserted dimension headers. Configuration is **not secr
 | `X-Dotvault-OS` | `windows`, `linux`, or `darwin` |
 | `X-Dotvault-User` | the OS account name (`DOMAIN\` prefix stripped) — the same identity dotvault syncs under |
 | `X-Dotvault-Arch` | e.g. `amd64`, `arm64` |
-| `X-Dotvault-Hostname` | the machine hostname |
+| `X-Dotvault-Hostname` | the machine hostname — feeds the service's optional `device` composition dimension |
 | `X-Dotvault-Version` | the dotvault build version |
 | *(configured extras)* | from `remote_config.headers` |
 

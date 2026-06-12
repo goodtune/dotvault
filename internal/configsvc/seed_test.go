@@ -13,7 +13,7 @@ func TestSeedValidFixture(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	summary, err := Seed(ctx, st, filepath.Join("testdata", "seed-valid"))
+	summary, err := Seed(ctx, st, filepath.Join("testdata", "seed-valid"), nil)
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestSeedInvalidLayerWritesNothing(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	_, err := Seed(ctx, st, filepath.Join("testdata", "seed-invalid"))
+	_, err := Seed(ctx, st, filepath.Join("testdata", "seed-invalid"), nil)
 	if err == nil {
 		t.Fatal("Seed with invalid fixture succeeded, want error")
 	}
@@ -98,7 +98,7 @@ func TestSeedRejectsStrayFiles(t *testing.T) {
 	write("global.yaml", "sync:\n  interval: 5m\n")
 	write("globl.yaml", "sync:\n  interval: 5m\n") // typo'd filename
 	st := newTestStore(t)
-	if _, err := Seed(context.Background(), st, dir); err == nil || !strings.Contains(err.Error(), "globl.yaml") {
+	if _, err := Seed(context.Background(), st, dir, nil); err == nil || !strings.Contains(err.Error(), "globl.yaml") {
 		t.Fatalf("Seed error = %v, want complaint about globl.yaml", err)
 	}
 }
@@ -112,7 +112,7 @@ func TestSeedRejectsUnknownSubdir(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := newTestStore(t)
-	if _, err := Seed(context.Background(), st, dir); err == nil || !strings.Contains(err.Error(), "oss") {
+	if _, err := Seed(context.Background(), st, dir, nil); err == nil || !strings.Contains(err.Error(), "oss") {
 		t.Fatalf("Seed error = %v, want complaint about the oss/ directory", err)
 	}
 }
@@ -133,7 +133,7 @@ func TestSeedRejectsMalformedGroupsFile(t *testing.T) {
 				t.Fatal(err)
 			}
 			st := newTestStore(t)
-			if _, err := Seed(context.Background(), st, dir); err == nil || !strings.Contains(err.Error(), "groups.yaml") {
+			if _, err := Seed(context.Background(), st, dir, nil); err == nil || !strings.Contains(err.Error(), "groups.yaml") {
 				t.Fatalf("Seed error = %v, want complaint about groups.yaml", err)
 			}
 		})
@@ -142,7 +142,7 @@ func TestSeedRejectsMalformedGroupsFile(t *testing.T) {
 
 func TestSeedMissingDirectory(t *testing.T) {
 	st := newTestStore(t)
-	if _, err := Seed(context.Background(), st, filepath.Join(t.TempDir(), "nope")); err == nil {
+	if _, err := Seed(context.Background(), st, filepath.Join(t.TempDir(), "nope"), nil); err == nil {
 		t.Fatal("Seed of missing directory succeeded, want error")
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -41,48 +40,12 @@ func ValidIdentitySegment(s string) bool {
 	return true
 }
 
-// ValidLayerKey checks that key is a canonical layer key the composer can
-// ever serve: "global", or one of os/<os>, group/<g>, user/<u> with a valid
-// identity segment. The os segment must additionally be lowercase, because
-// composition lowercases the client's OS header — an uppercase os layer
-// would be stored and never served.
-func ValidLayerKey(key string) error {
-	if key == "global" {
-		return nil
-	}
-	kind, rest, ok := strings.Cut(key, "/")
-	if !ok {
-		return fmt.Errorf("layer key %q: want \"global\" or os/<os>, group/<group>, user/<user>", key)
-	}
-	switch kind {
-	case "os", "group", "user":
-	default:
-		return fmt.Errorf("layer key %q: unknown kind %q (want os, group, or user)", key, kind)
-	}
-	if !ValidIdentitySegment(rest) {
-		return fmt.Errorf("layer key %q: segment %q must be non-empty and free of path separators, \"..\", and control characters", key, rest)
-	}
-	if kind == "os" && rest != strings.ToLower(rest) {
-		return fmt.Errorf("layer key %q: the os segment must be lowercase (composition lowercases the client's OS header, so %q would never be served)", key, rest)
-	}
-	return nil
-}
-
-// LayerKeys returns the canonical composition order for a request identity:
-// global → os/<os> → group/<g> (each, sorted) → user/<user>. Groups are
-// sorted for determinism — the composed bytes must be stable so the ETag is
-// stable. The OS value is lowercased; header values are client-asserted and
-// arrive in whatever case the client chose. Callers are responsible for
-// rejecting segments that fail ValidIdentitySegment before composing.
+// LayerKeys returns the composition keys for a request identity under the
+// DEFAULT order (global → os → group/<g> sorted → user) — the fixed
+// sequence used when the service config declares no composition.order.
+// Callers with a configured Composition use its Keys method directly.
 func LayerKeys(osName, user string, groups []string) []string {
-	keys := make([]string, 0, len(groups)+3)
-	keys = append(keys, "global", "os/"+strings.ToLower(osName))
-	sorted := append([]string(nil), groups...)
-	sort.Strings(sorted)
-	for _, g := range sorted {
-		keys = append(keys, "group/"+g)
-	}
-	return append(keys, "user/"+user)
+	return DefaultComposition().Keys(RequestDims{OS: osName, User: user, Groups: groups})
 }
 
 // LayerError marks a present-but-unusable layer. The key is surfaced in the

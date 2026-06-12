@@ -16,6 +16,14 @@ groups:
   source: static
   ttl: "1m"
 
+# Explicit, ordered list of the dimension combinations the service composes.
+# Each entry is "global", a dimension (os, group, device, user), or a
+# "+"-joined combination in canonical spelling. The declared order IS the
+# precedence (later wins) and a combination not listed is never looked up or
+# served. Omit the block to keep the default [global, os, group, user].
+composition:
+  order: [global, os, group, device, user, os+group, os+user, group+user, os+group+user]
+
 # Management API + web UI at http://127.0.0.1:9100/admin/. Human login binds
 # against the glauth dev directory (`docker compose --profile ldap up -d`;
 # admin/password is in the dotvault-admins group via dev/remote-layers/

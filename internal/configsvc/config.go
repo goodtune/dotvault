@@ -30,8 +30,36 @@ type Config struct {
 	TLS    TLSConfig    `yaml:"tls"`
 	Store  StoreConfig  `yaml:"store"`
 	Groups GroupsConfig `yaml:"groups"`
+	// Composition optionally replaces the default layer order
+	// (global → os → group → user) with an explicit, ordered list of
+	// dimension combinations (see CompositionConfig).
+	Composition CompositionConfig `yaml:"composition"`
 	// Admin enables the management API and web UI (see AdminConfig).
 	Admin AdminConfig `yaml:"admin"`
+
+	// composition is the parsed order, materialised by validate.
+	composition *Composition
+}
+
+// CompositionConfig declares which dimension combinations the service
+// composes and in what order. Each entry is "global", a single dimension
+// (os, group, device, user), or a "+"-joined combination in canonical
+// spelling (os+group, os+group+user, …). The list is authoritative: a
+// combination not listed is never looked up and never served, and the
+// declared order IS the precedence — there are no implicit specificity
+// rules. Omitting the block keeps the original fixed sequence, so existing
+// deployments are unaffected.
+type CompositionConfig struct {
+	Order []string `yaml:"order"`
+}
+
+// CompositionOrder returns the parsed composition (the default when the
+// config declares none). Only valid after LoadConfig.
+func (c *Config) CompositionOrder() *Composition {
+	if c.composition == nil {
+		return DefaultComposition()
+	}
+	return c.composition
 }
 
 // AdminConfig configures the management surface: the /v1/admin API and the
@@ -199,6 +227,14 @@ func (c *Config) validate() error {
 		}
 	default:
 		return fmt.Errorf("groups.source must be static or ldap, got %q", c.Groups.Source)
+	}
+
+	if len(c.Composition.Order) > 0 {
+		comp, err := ParseCompositionOrder(c.Composition.Order)
+		if err != nil {
+			return err
+		}
+		c.composition = comp
 	}
 
 	if c.Groups.RawTTL == "" {

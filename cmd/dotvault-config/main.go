@@ -134,7 +134,7 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 			defer st.Close()
 
 			if seedDir != "" {
-				summary, err := configsvc.Seed(ctx, st, seedDir)
+				summary, err := configsvc.Seed(ctx, st, seedDir, cfg.CompositionOrder())
 				if err != nil {
 					return fmt.Errorf("seed %s: %w", seedDir, err)
 				}
@@ -147,7 +147,7 @@ operator's ingress unless tls.cert_file / tls.key_file are configured.`,
 				return err
 			}
 
-			svc := configsvc.NewServer(st, resolver)
+			svc := configsvc.NewServer(st, resolver, configsvc.WithComposition(cfg.CompositionOrder()))
 			if cfg.Admin.Enabled {
 				authenticator, err := configsvc.NewAdminAuthenticator(cfg.Admin)
 				if err != nil {
@@ -259,7 +259,7 @@ on merge can never half-apply an invalid tree.`,
 			}
 			defer st.Close()
 
-			summary, err := configsvc.Seed(cmd.Context(), st, dir)
+			summary, err := configsvc.Seed(cmd.Context(), st, dir, cfg.CompositionOrder())
 			if err != nil {
 				return err
 			}
@@ -282,6 +282,7 @@ func newComposeCmd() *cobra.Command {
 	var (
 		osName    string
 		user      string
+		device    string
 		groupList []string
 	)
 	cmd := &cobra.Command{
@@ -289,7 +290,9 @@ func newComposeCmd() *cobra.Command {
 		Short: "Compose a document offline for debugging",
 		Long: `Compose the document a client identity would receive, printing the YAML to
 stdout and the ETag to stderr. Group membership comes from the configured
-resolver unless --groups overrides it.`,
+resolver unless --groups overrides it; --device feeds the optional device
+dimension. The configured composition.order (or the default) decides which
+layer combinations are looked up and in what precedence.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			setupLogging()
 			cfg, err := loadConfig()
@@ -314,7 +317,12 @@ resolver unless --groups overrides it.`,
 				}
 			}
 
-			keys := configsvc.LayerKeys(osName, user, memberOf)
+			keys := cfg.CompositionOrder().Keys(configsvc.RequestDims{
+				OS:     osName,
+				User:   user,
+				Device: device,
+				Groups: memberOf,
+			})
 			composer := &configsvc.Composer{Store: st}
 			doc, etag, err := composer.Compose(cmd.Context(), keys)
 			if err != nil {
@@ -327,6 +335,7 @@ resolver unless --groups overrides it.`,
 	}
 	cmd.Flags().StringVar(&osName, "os", runtime.GOOS, "X-Dotvault-OS dimension")
 	cmd.Flags().StringVar(&user, "user", "", "X-Dotvault-User dimension")
+	cmd.Flags().StringVar(&device, "device", "", "X-Dotvault-Hostname (device) dimension")
 	cmd.Flags().StringSliceVar(&groupList, "groups", nil, "override group membership (skips the resolver)")
 	cmd.MarkFlagRequired("user")
 	return cmd

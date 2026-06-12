@@ -299,6 +299,8 @@ $("preview-form").addEventListener("submit", async (e) => {
     os: $("preview-os").value.trim(),
     user: $("preview-user").value.trim(),
   });
+  const device = $("preview-device").value.trim();
+  if (device) params.set("device", device);
   const groups = $("preview-groups").value.trim();
   if (groups) params.set("groups", groups);
   const res = await api(`/v1/admin/preview?${params}`);

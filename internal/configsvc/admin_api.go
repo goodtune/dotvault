@@ -313,6 +313,15 @@ func (s *Server) handleAdminLayerPut(w http.ResponseWriter, r *http.Request, ide
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Refuse kinds outside the configured composition order: such a layer
+	// would never be looked up, so accepting the write would silently
+	// publish dead configuration. GET/DELETE deliberately stay
+	// grammar-only, so an operator can inspect and clean up layers left
+	// behind after shrinking the order.
+	if err := s.composition.AllowsKey(key); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	doc, err := io.ReadAll(io.LimitReader(r.Body, maxAdminBodyBytes+1))
 	if err != nil {
 		http.Error(w, "read request body", http.StatusBadRequest)
@@ -536,13 +545,19 @@ func (s *Server) handleAdminSADelete(w http.ResponseWriter, r *http.Request, ide
 // handleAdminPreview composes the document a client identity would receive —
 // the `compose` CLI command as an API, for the UI's preview screen and for
 // CI assertions. Explicit ?groups= (comma-separated; present-but-empty means
-// "no groups") bypasses the resolver.
+// "no groups") bypasses the resolver; ?device= feeds the optional device
+// dimension.
 func (s *Server) handleAdminPreview(w http.ResponseWriter, r *http.Request, _ Identity) {
 	q := r.URL.Query()
 	osName := strings.TrimSpace(q.Get("os"))
 	user := strings.TrimSpace(q.Get("user"))
+	device := strings.TrimSpace(q.Get("device"))
 	if !ValidIdentitySegment(osName) || !ValidIdentitySegment(user) {
 		http.Error(w, "os and user query parameters are required and must be valid identity segments", http.StatusBadRequest)
+		return
+	}
+	if device != "" && !ValidIdentitySegment(device) {
+		http.Error(w, "device must be a valid identity segment", http.StatusBadRequest)
 		return
 	}
 
@@ -571,7 +586,12 @@ func (s *Server) handleAdminPreview(w http.ResponseWriter, r *http.Request, _ Id
 		}
 	}
 
-	doc, etag, err := s.composer.Compose(r.Context(), LayerKeys(osName, user, memberOf))
+	doc, etag, err := s.composer.Compose(r.Context(), s.composition.Keys(RequestDims{
+		OS:     osName,
+		User:   user,
+		Device: device,
+		Groups: memberOf,
+	}))
 	if err != nil {
 		var le *LayerError
 		if errors.As(err, &le) {

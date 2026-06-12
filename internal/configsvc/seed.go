@@ -24,17 +24,29 @@ type SeedSummary struct {
 
 // Seed publishes a directory of layer YAMLs into the store — the
 // config-as-code path: layers live in a git repository and CI seeds the
-// backend on merge. The layout is global.yaml, os/<os>.yaml,
-// group/<g>.yaml, user/<u>.yaml, plus an optional groups.yaml carrying
-// static membership (user → group list). Everything is validated before
-// any write, so an invalid layer aborts the whole publish with nothing
-// written. (A backend failure mid-publish can still leave earlier writes
-// applied — re-running the seed converges, since writes are idempotent
-// puts.) Stray YAML files and unknown subdirectories are errors — a typo'd
-// directory silently not being served is the failure mode this guards
-// against.
-func Seed(ctx context.Context, st store.Store, dir string) (*SeedSummary, error) {
-	layers, membership, err := loadSeedDir(dir)
+// backend on merge. The layout mirrors the layer-key grammar: global.yaml,
+// an optional groups.yaml (static membership, user → group list), and one
+// directory per kind, nested one level per dimension value:
+//
+//	global.yaml
+//	groups.yaml
+//	os/linux.yaml                 → os/linux
+//	group/sydney.yaml             → group/sydney
+//	os+group/linux/sydney.yaml    → os+group/linux/sydney
+//
+// Every document is validated before any write — including that each
+// layer's kind appears in the composition order, so a layer that would
+// never be served is refused at publish time. An invalid layer aborts the
+// whole publish with nothing written. (A backend failure mid-publish can
+// still leave earlier writes applied — re-running the seed converges, since
+// writes are idempotent puts.) Stray YAML files and unknown directories are
+// errors — a typo'd directory silently not being served is the failure mode
+// this guards against.
+func Seed(ctx context.Context, st store.Store, dir string, comp *Composition) (*SeedSummary, error) {
+	if comp == nil {
+		comp = DefaultComposition()
+	}
+	layers, membership, err := loadSeedDir(dir, comp)
 	if err != nil {
 		return nil, err
 	}
@@ -65,13 +77,10 @@ type seedLayer struct {
 	doc []byte
 }
 
-// seedSubdirs maps the recognised layer subdirectories to their key prefix.
-var seedSubdirs = map[string]bool{"os": true, "group": true, "user": true}
-
 // loadSeedDir reads and validates the whole seed directory without writing
 // anything. Layers come back in deterministic order: global first, then the
 // remaining keys sorted.
-func loadSeedDir(dir string) ([]seedLayer, map[string][]string, error) {
+func loadSeedDir(dir string, comp *Composition) ([]seedLayer, map[string][]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read seed directory: %w", err)
@@ -83,13 +92,14 @@ func loadSeedDir(dir string) ([]seedLayer, map[string][]string, error) {
 		name := entry.Name()
 		full := filepath.Join(dir, name)
 		if entry.IsDir() {
-			if !seedSubdirs[name] {
-				if hasYAML(full) {
-					return nil, nil, fmt.Errorf("unexpected directory %s: layer subdirectories are os/, group/, and user/", full)
+			kind, kerr := ParseKind(name)
+			if kerr != nil || len(kind) == 0 {
+				if hasYAMLDeep(full) {
+					return nil, nil, fmt.Errorf("unexpected directory %s: layer directories are named after a kind (os, group, device, user, or a canonical combination like os+group)", full)
 				}
 				continue
 			}
-			sub, err := loadSeedSubdir(full, name)
+			sub, err := loadKindLevel(full, kind, comp, nil)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -101,6 +111,9 @@ func loadSeedDir(dir string) ([]seedLayer, map[string][]string, error) {
 		}
 		switch trimYAMLExt(name) {
 		case "global":
+			if err := comp.AllowsKey("global"); err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", full, err)
+			}
 			l, err := loadLayerFile(full, "global")
 			if err != nil {
 				return nil, nil, err
@@ -129,26 +142,48 @@ func loadSeedDir(dir string) ([]seedLayer, map[string][]string, error) {
 	return layers, membership, nil
 }
 
-func loadSeedSubdir(dir, prefix string) ([]seedLayer, error) {
+// loadKindLevel walks one value level of a kind directory: intermediate
+// levels hold one directory per dimension value, and the final level holds
+// <value>.yaml files. A layer file at the wrong depth is an error, never
+// silently skipped.
+func loadKindLevel(dir string, kind Kind, comp *Composition, values []string) ([]seedLayer, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", dir, err)
 	}
+	last := len(values) == len(kind)-1
 	var layers []seedLayer
 	for _, entry := range entries {
 		name := entry.Name()
 		full := filepath.Join(dir, name)
 		if entry.IsDir() {
-			if hasYAML(full) {
-				return nil, fmt.Errorf("unexpected nested directory %s: layer keys are one level deep", full)
+			if last {
+				if hasYAMLDeep(full) {
+					return nil, fmt.Errorf("unexpected directory %s: kind %q takes %d value level(s)", full, kind.String(), len(kind))
+				}
+				continue
 			}
+			// Copy before extending: append on the shared slice would let
+			// sibling iterations scribble over each other's backing array.
+			next := append(append([]string{}, values...), name)
+			sub, err := loadKindLevel(full, kind, comp, next)
+			if err != nil {
+				return nil, err
+			}
+			layers = append(layers, sub...)
 			continue
 		}
 		if !isYAML(name) {
 			continue
 		}
-		key := prefix + "/" + trimYAMLExt(name)
+		if !last {
+			return nil, fmt.Errorf("unexpected file %s: kind %q expects %d value level(s), so layer files belong %d directory level(s) deeper", full, kind.String(), len(kind), len(kind)-1-len(values))
+		}
+		key := kind.String() + "/" + strings.Join(append(values, trimYAMLExt(name)), "/")
 		if err := ValidLayerKey(key); err != nil {
+			return nil, fmt.Errorf("%s: %w", full, err)
+		}
+		if err := comp.AllowsKey(key); err != nil {
 			return nil, fmt.Errorf("%s: %w", full, err)
 		}
 		l, err := loadLayerFile(full, key)
@@ -190,13 +225,20 @@ func trimYAMLExt(name string) string {
 	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
-func hasYAML(dir string) bool {
+// hasYAMLDeep reports whether any YAML file exists under dir, at any depth.
+func hasYAMLDeep(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() && isYAML(entry.Name()) {
+		if entry.IsDir() {
+			if hasYAMLDeep(filepath.Join(dir, entry.Name())) {
+				return true
+			}
+			continue
+		}
+		if isYAML(entry.Name()) {
 			return true
 		}
 	}

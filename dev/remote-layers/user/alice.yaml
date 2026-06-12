@@ -1,0 +1,5 @@
+# A per-user layer: the most specific layer wins, so alice syncs faster than
+# the fleet. Copy this file to user/<your-username>.yaml to see a user layer
+# in your own composed document.
+sync:
+  interval: 5m

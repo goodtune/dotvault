@@ -1,0 +1,9 @@
+# Replaces the global rule wholesale for linux clients (merge is by rule
+# name), demonstrating OS-layer precedence over global.
+rules:
+  - name: remote-sample
+    vault_key: sample
+    target:
+      path: "~/tmp/remote-sample.txt"
+      format: text
+      template: "linux: {{ .token }}"

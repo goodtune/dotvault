@@ -10,6 +10,16 @@ web:
   enabled: true
   listen: "127.0.0.1:9000"
 
+# Remote configuration overlay served by the local dotvault-config service:
+#
+#   go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote-layers
+#
+# Loopback host, so plain HTTP is allowed. The overlay fails open — when the
+# service isn't running the daemon logs a warning and continues on this base
+# config alone, so leaving the block enabled costs nothing.
+remote_config:
+  url: "http://127.0.0.1:9100/v1/config"
+
 # Observability is opt-in. Uncomment and point at a local OTel
 # collector to exercise the metric exporter end-to-end. The Endpoint
 # field accepts a host:port for gRPC (default) or a full URL for

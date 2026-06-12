@@ -1,0 +1,11 @@
+# A combination layer: composes only for requests matching BOTH os=linux
+# and group membership sydney, at the os+group position of the
+# composition.order in configsvc.dev.yaml — after the single-dimension
+# layers, so it overrides the os/linux rule for Sydney's linux machines.
+rules:
+  - name: remote-sample
+    vault_key: sample
+    target:
+      path: "~/tmp/remote-sample.txt"
+      format: text
+      template: "linux+sydney: {{ .token }}"

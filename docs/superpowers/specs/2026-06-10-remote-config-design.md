@@ -132,6 +132,8 @@ A small Go HTTP service in this repo: `cmd/dotvault-config` (Cobra: `serve`, `se
 
 ### Layers and composition
 
+> **Superseded note (2026-06-12):** the fixed composition order described here became the *default* of a configurable model — layers are now addressable by any dimension combination under an operator-declared `composition.order`; see `2026-06-12-multi-dimension-composition.md`.
+
 Layer documents are Partials stored under canonical keys, composed in fixed order with `MergePartial`:
 
 ```

@@ -136,6 +136,18 @@ services:
   # engine. Activated by `docker compose --profile jfrog up -d`. Plain `up`
   # skips both. Artifactory 7.78+ no longer supports the embedded Derby DB,
   # so Postgres is required even for single-node dev use.
+  # Tiny LDAP server for exercising the dotvault-config admin login
+  # (username/password bind). Opt-in: `docker compose --profile ldap up -d`.
+  # Users are defined in dev/glauth.cfg; the dev admin is admin/password.
+  glauth:
+    image: glauth/glauth:v2.3.2
+    container_name: dotvault-glauth
+    profiles: ["ldap"]
+    ports:
+      - "127.0.0.1:3893:3893"
+    volumes:
+      - ./dev/glauth.cfg:/app/config/config.cfg:ro
+
   artifactory-db:
     image: postgres:16-alpine
     container_name: dotvault-artifactory-db

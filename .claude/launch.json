@@ -8,6 +8,12 @@
       "port": 8200
     },
     {
+      "name": "dotvault-config",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/dotvault-config", "serve", "--config", "configsvc.dev.yaml", "--seed", "dev/remote-layers"],
+      "port": 9100
+    },
+    {
       "name": "dotvault",
       "runtimeExecutable": "go",
       "runtimeArgs": ["run", "./cmd/dotvault", "run", "--config", "config.dev.yaml"],

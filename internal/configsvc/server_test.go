@@ -3,6 +3,7 @@ package configsvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -209,6 +210,24 @@ type resolvedGroups []string
 
 func (r resolvedGroups) Groups(context.Context, string) ([]string, error) {
 	return r, nil
+}
+
+func TestConfigGroupCountCap(t *testing.T) {
+	st := newTestStore(t)
+	many := make(resolvedGroups, maxCompositionGroups+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("g%03d", i)
+	}
+	ts := httptest.NewServer(NewServer(st, many).Handler())
+	t.Cleanup(ts.Close)
+	resp := get(t, ts.URL+"/v1/config", identityHeaders)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("GET with %d groups = %d, want 500 (operator must scope the resolver)", len(many), resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "composition cap") {
+		t.Fatalf("500 body = %q, want the cap explanation", body)
+	}
 }
 
 func TestConfigRejectsTraversalGroupName(t *testing.T) {

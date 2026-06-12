@@ -229,7 +229,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("groups.source must be static or ldap, got %q", c.Groups.Source)
 	}
 
-	if len(c.Composition.Order) > 0 {
+	// nil means the block is absent (default order applies); an explicit
+	// empty list is an error from ParseCompositionOrder — an operator who
+	// wrote `order: []` intended to restrict, and silently serving the
+	// default instead would be the opposite of "no surprises".
+	if c.Composition.Order != nil {
 		comp, err := ParseCompositionOrder(c.Composition.Order)
 		if err != nil {
 			return err

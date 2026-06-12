@@ -179,7 +179,9 @@ func loadKindLevel(dir string, kind Kind, comp *Composition, values []string) ([
 		if !last {
 			return nil, fmt.Errorf("unexpected file %s: kind %q expects %d value level(s), so layer files belong %d directory level(s) deeper", full, kind.String(), len(kind), len(kind)-1-len(values))
 		}
-		key := kind.String() + "/" + strings.Join(append(values, trimYAMLExt(name)), "/")
+		// Same copy-before-extending discipline as the directory branch.
+		keySegs := append(append([]string{}, values...), trimYAMLExt(name))
+		key := kind.String() + "/" + strings.Join(keySegs, "/")
 		if err := ValidLayerKey(key); err != nil {
 			return nil, fmt.Errorf("%s: %w", full, err)
 		}

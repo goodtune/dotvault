@@ -12,7 +12,7 @@ Configuration layers are [partial config documents](../configuration/remote-conf
 |-----------|--------|
 | `os` | `X-Dotvault-OS` (lowercased) |
 | `group` | the groups resolver applied to the user — multi-valued |
-| `device` | `X-Dotvault-Hostname` (lowercased; optional) |
+| `device` | `X-Dotvault-Hostname`, normalised to the lowercased first DNS label (optional) — `LAPTOP-7` and `laptop-7.local` both key as `laptop-7`, so the same machine matches across platforms |
 | `user` | `X-Dotvault-User` |
 
 A layer composes whenever **all** of its dimensions match the request; matching layers are purely additive. Layer keys name the combination (the *kind*, in canonical `+`-joined spelling) followed by one value per dimension:
@@ -99,7 +99,7 @@ The service authenticates only to its storage backend; it never holds user crede
 - **`static`** — membership maps stored in the backend (published from a `groups.yaml`, see seeding below). Right for dev, tests, and small fleets.
 - **`ldap`** — the directory-driven case. Each lookup binds (optionally) and searches `base_dn` with `filter`, substituting the **escaped** username for `%s`; each matching entry contributes its `attribute` value (default `cn`) as a group name. Use `bind_password_file` rather than `bind_password` so the secret stays out of the config file; the file is re-read on every lookup.
 
-Both resolvers sit behind a TTL cache (`groups.ttl`) so a burst of requests for one user costs one directory lookup. An unknown user resolves to *no groups*, not an error.
+Both resolvers sit behind a TTL cache (`groups.ttl`) so a burst of requests for one user costs one directory lookup. An unknown user resolves to *no groups*, not an error. A user resolving to more than 64 groups fails the request — every group multiplies the store reads of every group-bearing combination, so an over-broad directory filter should be scoped rather than silently amplified.
 
 ## Seeding: layers as code
 

@@ -14,7 +14,7 @@ A fixed vocabulary, each mapping to a client-asserted request value:
 |-----------|--------|-------|
 | `os` | `X-Dotvault-OS` | lowercased; mandatory identity |
 | `group` | groups resolver applied to the user | multi-valued |
-| `device` | `X-Dotvault-Hostname` | lowercased; optional — the client already sends it, so no client change |
+| `device` | `X-Dotvault-Hostname` | normalised to the lowercased first DNS label (`LAPTOP-7` and `laptop-7.local` → `laptop-7`, since the same machine reports differently per platform); optional — the client already sends it, so no client change |
 | `user` | `X-Dotvault-User` | mandatory identity |
 
 A kind referencing a dimension with no value for the request (e.g. `device` from an older client that sends no hostname) contributes nothing and is skipped. A kind containing `group` expands once per group, sorted, all at that entry's position — a user in two groups receives the additive union, exactly as before.
@@ -33,7 +33,7 @@ os+group/windows/sydney
 os+group+user/windows/sydney/gary
 ```
 
-Values are identity segments (no path separators, no `..`, no control characters); `os` and `device` values must be lowercase because composition lowercases the client's value — an uppercase segment would be stored and never served.
+Values are identity segments (no path separators, no `..`, no control characters); `os` and `device` values must be lowercase, and `device` values must be the short hostname (no dots), because composition normalises the client's value — a segment that can never match would be stored and never served, so the grammar rejects it with the usable value named.
 
 ## Configuration
 

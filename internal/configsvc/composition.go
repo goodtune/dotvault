@@ -46,6 +46,9 @@ func ParseKind(s string) (Kind, error) {
 	if s == "global" {
 		return Kind{}, nil
 	}
+	if s == "" {
+		return nil, fmt.Errorf("kind must not be empty (want \"global\", a dimension, or a \"+\"-joined combination)")
+	}
 	parts := strings.Split(s, "+")
 	kind := make(Kind, 0, len(parts))
 	for _, p := range parts {
@@ -152,6 +155,20 @@ func (c *Composition) AllowsKey(key string) error {
 	return fmt.Errorf("layer key %q: kind %q is not in the configured composition order (%s) and would never be served", key, want, strings.Join(c.Kinds(), " → "))
 }
 
+// NormalizeDevice canonicalises a hostname into the device dimension value:
+// lowercased and cut at the first dot. The same machine reports differently
+// per platform — Windows an uppercase NetBIOS name (LAPTOP-7), macOS
+// typically name.local, Linux usually the short name — and the first label,
+// lowercased, is the value that is stable across all three, so that is what
+// device layers are keyed on.
+func NormalizeDevice(hostname string) string {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	if i := strings.IndexByte(hostname, '.'); i >= 0 {
+		hostname = hostname[:i]
+	}
+	return hostname
+}
+
 // RequestDims carries one request's dimension values. OS and User are the
 // mandatory identity; Device is optional (older clients may not send a
 // hostname) — kinds referencing a dimension with no value are skipped.
@@ -173,7 +190,7 @@ func (c *Composition) Keys(dims RequestDims) []string {
 	values := map[Dimension][]string{
 		DimOS:     valueList(strings.ToLower(dims.OS)),
 		DimUser:   valueList(dims.User),
-		DimDevice: valueList(strings.ToLower(dims.Device)),
+		DimDevice: valueList(NormalizeDevice(dims.Device)),
 		DimGroup:  append([]string(nil), dims.Groups...),
 	}
 	sort.Strings(values[DimGroup])
@@ -195,39 +212,33 @@ func valueList(v string) []string {
 // appendKindKeys appends every key the kind yields for the given dimension
 // values: the cross product of each dimension's values, varying the last
 // dimension fastest. Only group is multi-valued today, but the expansion is
-// written generically.
+// written generically. A kind referencing a dimension with no value cannot
+// match the request and contributes nothing, regardless of where in the
+// kind the empty dimension sits.
 func appendKindKeys(keys []string, kind Kind, values map[Dimension][]string) []string {
 	if len(kind) == 0 {
 		return append(keys, "global")
 	}
+	for _, d := range kind {
+		if len(values[d]) == 0 {
+			return keys
+		}
+	}
 	segments := make([]string, 0, len(kind)+1)
 	segments = append(segments, kind.String())
 	var expand func(i int) // appends one key per combination of values[kind[i:]]
-	complete := true
 	expand = func(i int) {
 		if i == len(kind) {
 			keys = append(keys, strings.Join(segments, "/"))
 			return
 		}
-		vs := values[kind[i]]
-		if len(vs) == 0 {
-			complete = false
-			return
-		}
-		for _, v := range vs {
+		for _, v := range values[kind[i]] {
 			segments = append(segments, v)
 			expand(i + 1)
 			segments = segments[:len(segments)-1]
 		}
 	}
-	before := len(keys)
 	expand(0)
-	if !complete {
-		// A dimension had no value: the kind cannot match this request at
-		// all, so drop any partial expansion (only possible when a later
-		// dimension is empty while an earlier multi-valued one is not).
-		keys = keys[:before]
-	}
 	return keys
 }
 
@@ -256,6 +267,9 @@ func SplitLayerKey(key string) (Kind, []string, error) {
 		}
 		if (kind[i] == DimOS || kind[i] == DimDevice) && v != strings.ToLower(v) {
 			return nil, nil, fmt.Errorf("layer key %q: the %s segment must be lowercase (composition lowercases the client's value, so %q would never be served)", key, kind[i], v)
+		}
+		if kind[i] == DimDevice && strings.ContainsRune(v, '.') {
+			return nil, nil, fmt.Errorf("layer key %q: device values are keyed on the short hostname — the first DNS label — so %q would never be served (use %q)", key, v, NormalizeDevice(v))
 		}
 	}
 	return kind, values, nil

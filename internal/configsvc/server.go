@@ -91,16 +91,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "group resolution failed", http.StatusInternalServerError)
 		return
 	}
-	// Group names come from the resolver (operator-controlled store or
-	// directory), but an LDAP cn is still external input by the time it
-	// becomes a Vault path segment — same traversal rule applies. This is
-	// the operator's data, so it is a 500 to fix, not a client 400.
-	for _, g := range memberOf {
-		if !ValidIdentitySegment(g) {
-			slog.Error("group resolution produced an unusable group name", "user", user, "group", g)
-			http.Error(w, fmt.Sprintf("group %q is not a valid layer key segment", g), http.StatusInternalServerError)
-			return
-		}
+	if err := checkResolvedGroups(user, memberOf); err != nil {
+		slog.Error("group resolution unusable", "user", user, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	doc, etag, err := s.composer.Compose(ctx, s.composition.Keys(RequestDims{
@@ -141,6 +135,32 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "ok")
+}
+
+// maxCompositionGroups caps how many resolver-returned groups feed
+// composition. Every group multiplies the store reads of every
+// group-bearing kind in the order, so an over-broad directory filter would
+// turn one spoofable-identity request into thousands of backend reads. The
+// cap fails loudly (the operator must scope the resolver filter) rather
+// than truncating, because serving a silently shrunken composition would be
+// wrong config, not degraded service.
+const maxCompositionGroups = 64
+
+// checkResolvedGroups validates resolver output before it becomes store-key
+// segments: group names come from the operator's store or directory, but an
+// LDAP cn is still external input by the time it reaches a Vault path —
+// the same traversal rule applies. These are operator-data problems, so the
+// callers answer 500, not a client 4xx.
+func checkResolvedGroups(user string, memberOf []string) error {
+	if len(memberOf) > maxCompositionGroups {
+		return fmt.Errorf("user %q resolves to %d groups, above the composition cap of %d — scope the groups resolver filter", user, len(memberOf), maxCompositionGroups)
+	}
+	for _, g := range memberOf {
+		if !ValidIdentitySegment(g) {
+			return fmt.Errorf("group %q is not a valid layer key segment", g)
+		}
+	}
+	return nil
 }
 
 // ifNoneMatchHit reports whether the If-None-Match header matches the

@@ -584,6 +584,13 @@ func (s *Server) handleAdminPreview(w http.ResponseWriter, r *http.Request, _ Id
 			http.Error(w, "group resolution failed", http.StatusBadGateway)
 			return
 		}
+		// Same gate as handleConfig: resolver-returned names are still
+		// external input by the time they become store-key segments.
+		if err := checkResolvedGroups(user, memberOf); err != nil {
+			slog.Error("admin: preview groups unusable", "user", user, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	doc, etag, err := s.composer.Compose(r.Context(), s.composition.Keys(RequestDims{

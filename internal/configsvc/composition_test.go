@@ -36,7 +36,7 @@ func TestParseKind(t *testing.T) {
 		{"os+os", "repeated"},
 		{"region", "unknown dimension"},
 		{"os+region", "unknown dimension"},
-		{"", "unknown dimension"},
+		{"", "must not be empty"},
 	}
 	for _, tt := range tests {
 		kind, err := ParseKind(tt.in)
@@ -129,6 +129,36 @@ func TestCompositionKeysExpansion(t *testing.T) {
 	}
 }
 
+func TestNormalizeDevice(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"LAPTOP-7", "laptop-7"},       // Windows NetBIOS convention
+		{"laptop-7.local", "laptop-7"}, // macOS default
+		{"laptop-7.corp.example", "laptop-7"},
+		{"laptop-7", "laptop-7"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := NormalizeDevice(tt.in); got != tt.want {
+			t.Errorf("NormalizeDevice(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestCompositionKeysEmptyLaterDimension(t *testing.T) {
+	// An EARLIER dimension is multi-valued while a LATER one is empty: the
+	// kind must contribute nothing — no partial keys may leak out of the
+	// expansion.
+	comp, err := ParseCompositionOrder([]string{"group+device", "group"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := comp.Keys(RequestDims{OS: "linux", User: "gary", Groups: []string{"sydney", "auckland"}})
+	want := []string{"group/auckland", "group/sydney"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Keys() with empty later dimension = %v, want %v (no group+device keys)", got, want)
+	}
+}
+
 func TestCompositionDeclaredOrderIsPrecedence(t *testing.T) {
 	// user listed BEFORE global: the global layer must override the user
 	// layer, because the declared order is the merge order — no implicit
@@ -205,6 +235,10 @@ func TestValidLayerKeyCombinations(t *testing.T) {
 		{"os+group/linux/../escape", false},    // traversal in a value
 		{"os+region/linux/apac", false},        // unknown dimension
 		{"global/extra", false},                // global takes no values
+		{"", false},                            // empty key
+		{"os+group//sydney", false},            // empty value segment
+		{"os/linux/", false},                   // trailing slash = empty value
+		{"device/laptop-7.local", false},       // device keys use the short hostname
 	}
 	for _, tt := range tests {
 		err := ValidLayerKey(tt.key)
@@ -337,7 +371,12 @@ func TestSeedCombinationLayers(t *testing.T) {
 		}
 	}
 	write("global.yaml", "sync:\n  interval: 60m\n")
+	// Sibling branches at both value levels, so the walker's slice-copy
+	// discipline is exercised: a shared backing array would cross-pollute
+	// the keys.
 	write("os+group/linux/sydney.yaml", "sync:\n  interval: 5m\n")
+	write("os+group/linux/newyork.yaml", "sync:\n  interval: 6m\n")
+	write("os+group/windows/sydney.yaml", "sync:\n  interval: 7m\n")
 	write("os+group+user/linux/sydney/gary.yaml", "sync:\n  interval: 1m\n")
 
 	comp, err := ParseCompositionOrder([]string{"global", "os+group", "os+group+user"})
@@ -351,7 +390,13 @@ func TestSeedCombinationLayers(t *testing.T) {
 	}
 	// Write order is global first, then lexicographic — '+' sorts before
 	// '/', so os+group+user precedes os+group. Only determinism matters.
-	want := []string{"global", "os+group+user/linux/sydney/gary", "os+group/linux/sydney"}
+	want := []string{
+		"global",
+		"os+group+user/linux/sydney/gary",
+		"os+group/linux/newyork",
+		"os+group/linux/sydney",
+		"os+group/windows/sydney",
+	}
 	if !reflect.DeepEqual(summary.Layers, want) {
 		t.Fatalf("seeded layers = %v, want %v", summary.Layers, want)
 	}
@@ -424,5 +469,11 @@ composition:
 	// Invalid entries fail the load.
 	if _, err := LoadConfig(writeConfig(t, "store: {driver: sqlite, dsn: ':memory:'}\ncomposition:\n  order: [group+os]\n")); err == nil || !strings.Contains(err.Error(), "canonical order") {
 		t.Fatalf("LoadConfig with non-canonical kind = %v, want error", err)
+	}
+
+	// An EXPLICIT empty list is an error, not a silent fall-through to the
+	// default — the operator who wrote it intended to restrict.
+	if _, err := LoadConfig(writeConfig(t, "store: {driver: sqlite, dsn: ':memory:'}\ncomposition:\n  order: []\n")); err == nil || !strings.Contains(err.Error(), "at least one entry") {
+		t.Fatalf("LoadConfig with explicit empty order = %v, want at-least-one-entry error", err)
 	}
 }

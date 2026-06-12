@@ -54,7 +54,7 @@ All admin routes exist only when `admin.enabled`. JSON unless noted; every mutat
 | `GET/PUT/DELETE /v1/admin/groups/{user}` | membership CRUD (`{"groups": […]}`) |
 | `GET /v1/admin/service-accounts` | list account names |
 | `GET/PUT/DELETE /v1/admin/service-accounts/{name}` | account CRUD; PUT is an upsert that preserves `created_at` |
-| `GET /v1/admin/preview?os=&user=&groups=` | the composed document for an identity (`groups` overrides the resolver) — the `compose` CLI as an API |
+| `GET /v1/admin/preview?os=&user=&groups=&device=` | the composed document for an identity (`groups` overrides the resolver; `device` added by the 2026-06-12 multi-dimension spec) — the `compose` CLI as an API |
 
 Layer writes pass exactly the validation gate the seed path uses, so an invalid document is refused at write time with the daemon's own error text rather than surfacing later as a composition 500. `PUT` everywhere is idempotent upsert — the shape a Terraform provider wants (`Create`/`Update` collapse onto `PUT`, `Read` onto `GET`, `Delete` onto `DELETE`, drift detection onto byte comparison of the YAML).
 

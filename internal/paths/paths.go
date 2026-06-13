@@ -84,6 +84,30 @@ func DefaultAgentSocket() string {
 	return filepath.Join(CacheDir(), "agent.sock")
 }
 
+// DefaultUpstreamAgentSocket returns the per-user Unix domain socket path used
+// when an `agent` key source leaves its socket unset: the systemd user
+// ssh-agent convention $XDG_RUNTIME_DIR/ssh-agent.socket, keeping the default
+// in the same XDG runtime directory dotvault's own agent socket lives in.
+// Returns "" when XDG_RUNTIME_DIR is unset (typical on macOS), so the caller
+// can require an explicit path there rather than resolving a bare relative
+// name.
+func DefaultUpstreamAgentSocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "ssh-agent.socket")
+	}
+	return ""
+}
+
+// UID returns the current user's numeric UID as a string (the SID on Windows),
+// for substitution into agent-endpoint templates.
+func UID() (string, error) {
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("get current user: %w", err)
+	}
+	return u.Uid, nil
+}
+
 // Username returns the current OS username with any domain prefix stripped.
 func Username() (string, error) {
 	u, err := user.Current()

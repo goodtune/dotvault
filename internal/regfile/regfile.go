@@ -249,6 +249,8 @@ func (e *emitter) writeAgentKey(index int, k config.AgentKeySource) {
 	e.writeString("Mount", k.Mount)
 	e.writeString("Role", k.Role)
 	e.writeString("TTL", k.TTL)
+	e.writeString("Socket", k.Socket)
+	e.writeString("Pipe", k.Pipe)
 	e.writeBool("EphemeralKey", k.EphemeralKey)
 	// Emit Principals whenever non-nil so an explicit empty list round-trips
 	// as an empty REG_MULTI_SZ rather than being silently dropped, matching

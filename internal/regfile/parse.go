@@ -751,6 +751,8 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 				func() error { return apply(&ks.Mount, base, "Mount") },
 				func() error { return apply(&ks.Role, base, "Role") },
 				func() error { return apply(&ks.TTL, base, "TTL") },
+				func() error { return apply(&ks.Socket, base, "Socket") },
+				func() error { return apply(&ks.Pipe, base, "Pipe") },
 				func() error { return applyBool(&ks.EphemeralKey, base, "EphemeralKey") },
 			} {
 				if err := fn(); err != nil {

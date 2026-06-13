@@ -8,9 +8,10 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 )
 
-// agentConfigFixture is a representative AgentConfig exercising both source
+// agentConfigFixture is a representative AgentConfig exercising all three source
 // kinds, an empty transport path (Unix) alongside a set one (Windows pipe), a
-// templated principal list, and the ttl / ephemeral_key fields.
+// templated principal list, the ttl / ephemeral_key fields, and an upstream
+// agent source carrying both a templated socket and a pipe.
 func agentConfigFixture() config.AgentConfig {
 	return config.AgentConfig{
 		Enabled: true,
@@ -25,6 +26,11 @@ func agentConfigFixture() config.AgentConfig {
 				Principals:   []string{"{{.vault_username}}", "ops"},
 				TTL:          "15m",
 				EphemeralKey: true,
+			},
+			{
+				Source: "agent",
+				Socket: "/run/user/{{.uid}}/ssh-agent.socket",
+				Pipe:   `\\.\pipe\openssh-ssh-agent`,
 			},
 		},
 	}

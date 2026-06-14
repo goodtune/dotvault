@@ -2,7 +2,7 @@
 
 The locally provisioned configuration (the YAML file, or the Windows registry under Group Policy) can act as a **base** that is overlaid with a partial configuration document fetched over HTTPS from a `dotvault-config` service. This lets a fleet operator deliver dynamic, personalised configuration — per-user, per-OS, and per-group rules and enrolments — without touching the locally managed base.
 
-The full design, including the service side, lives in the repository spec at `docs/superpowers/specs/2026-06-10-remote-config-design.md`.
+The server side — layer storage, composition, group resolution, and seeding — is documented in [dotvault-config Service](../services/dotvault-config.md). The full design lives in the repository spec at `docs/superpowers/specs/2026-06-10-remote-config-design.md`.
 
 ## Enabling the overlay
 
@@ -45,7 +45,7 @@ Every fetch sends client-asserted dimension headers. Configuration is **not secr
 | `X-Dotvault-OS` | `windows`, `linux`, or `darwin` |
 | `X-Dotvault-User` | the OS account name (`DOMAIN\` prefix stripped) — the same identity dotvault syncs under |
 | `X-Dotvault-Arch` | e.g. `amd64`, `arm64` |
-| `X-Dotvault-Hostname` | the machine hostname |
+| `X-Dotvault-Hostname` | the machine hostname — feeds the service's optional `device` composition dimension |
 | `X-Dotvault-Version` | the dotvault build version |
 | *(configured extras)* | from `remote_config.headers` |
 

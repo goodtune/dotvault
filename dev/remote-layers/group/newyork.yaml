@@ -1,0 +1,13 @@
+# A second region layer; a user in both groups receives the additive union.
+enrolments:
+  newyork-sample:
+    engine: copy
+    settings:
+      from:
+        mount: kv
+        path: apps/sample/keys/{{.user}}
+      format: json
+      template: |
+        {
+          "token": "{{ .data.key }}"
+        }

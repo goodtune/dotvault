@@ -1,0 +1,12 @@
+# Static group membership for the dev resolver (user → groups). Add your own
+# OS username to see the group layers in your composed document, e.g.
+#
+#   <your-username>: [sydney]
+#
+# "dotvault-admins" is the admin group required by the configsvc.dev.yaml
+# admin block: the glauth dev user "admin" holds it (sign in to /admin/ with
+# admin/password), while "bob" deliberately does not (bob/password exercises
+# the 403 path).
+alice: [sydney, newyork]
+bob: [sydney]
+admin: [dotvault-admins]

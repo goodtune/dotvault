@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dotvault-config admin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>dotvault-config</h1>
+    <nav id="nav" hidden>
+      <a href="#layers">Layers</a>
+      <a href="#groups">Groups</a>
+      <a href="#service-accounts">Service accounts</a>
+      <a href="#preview">Preview</a>
+      <span id="whoami"></span>
+      <button id="logout" type="button">Log out</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="login-view" hidden>
+      <h2>Sign in</h2>
+      <form id="login-form">
+        <label>Username <input id="login-username" autocomplete="username" required></label>
+        <label>Password <input id="login-password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p class="error" id="login-error" hidden></p>
+      <p class="hint">Service accounts authenticate with a client certificate on the mTLS listener and do not use this form.</p>
+    </section>
+
+    <section id="layers-view" hidden>
+      <h2>Layers</h2>
+      <div class="columns">
+        <div>
+          <ul id="layer-list" class="picker"></ul>
+          <form id="layer-new-form" class="inline">
+            <input id="layer-new-key" placeholder="e.g. group/sydney" required>
+            <button type="submit">New layer</button>
+          </form>
+        </div>
+        <div>
+          <form id="layer-edit-form" hidden>
+            <h3 id="layer-edit-key"></h3>
+            <textarea id="layer-edit-doc" rows="20" spellcheck="false"></textarea>
+            <div class="actions">
+              <button type="submit">Save</button>
+              <button type="button" id="layer-delete" class="danger">Delete</button>
+            </div>
+            <p class="error" id="layer-error" hidden></p>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section id="groups-view" hidden>
+      <h2>Static group membership</h2>
+      <table>
+        <thead><tr><th>User</th><th>Groups</th><th></th></tr></thead>
+        <tbody id="groups-rows"></tbody>
+      </table>
+      <form id="groups-form" class="inline">
+        <input id="groups-user" placeholder="username" required>
+        <input id="groups-list" placeholder="comma-separated groups">
+        <button type="submit">Save membership</button>
+      </form>
+      <p class="error" id="groups-error" hidden></p>
+    </section>
+
+    <section id="sa-view" hidden>
+      <h2>Service accounts</h2>
+      <p class="hint">Service accounts authenticate to the admin API with an mTLS client certificate whose CN equals the account name, issued by the pinned CA (typically a dedicated Vault PKI role). Disabling an account revokes access immediately.</p>
+      <table>
+        <thead><tr><th>Name</th><th>Description</th><th>Status</th><th></th></tr></thead>
+        <tbody id="sa-rows"></tbody>
+      </table>
+      <form id="sa-form" class="inline">
+        <input id="sa-name" placeholder="account name" required>
+        <input id="sa-description" placeholder="description">
+        <button type="submit">Create</button>
+      </form>
+      <p class="error" id="sa-error" hidden></p>
+    </section>
+
+    <section id="preview-view" hidden>
+      <h2>Compose preview</h2>
+      <form id="preview-form" class="inline">
+        <input id="preview-os" placeholder="os (e.g. linux)" required>
+        <input id="preview-user" placeholder="user" required>
+        <input id="preview-device" placeholder="device (optional)">
+        <input id="preview-groups" placeholder="groups (optional, comma-separated)">
+        <button type="submit">Compose</button>
+      </form>
+      <p class="hint">Leave groups empty to use the configured resolver; provide a value to override.</p>
+      <p id="preview-etag" class="hint"></p>
+      <pre id="preview-doc"></pre>
+      <p class="error" id="preview-error" hidden></p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

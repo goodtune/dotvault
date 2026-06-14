@@ -1,0 +1,8 @@
+# The darwin counterpart of os/linux.yaml.
+rules:
+  - name: remote-sample
+    vault_key: sample
+    target:
+      path: "~/tmp/remote-sample.txt"
+      format: text
+      template: "darwin: {{ .token }}"

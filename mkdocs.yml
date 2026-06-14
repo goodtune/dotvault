@@ -74,4 +74,5 @@ nav:
   - Admin Guide:
       - Deployment: admin/deployment.md
       - Windows Group Policy: admin/windows-gpo.md
+      - Remote Config Service: services/dotvault-config.md
   - CLI Reference: cli.md

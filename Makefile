@@ -60,6 +60,15 @@ test:
 build:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o dist/dotvault ./cmd/dotvault
 
+# The dotvault-config service binary, host platform only — cross-compiled
+# release artefacts (linux + darwin; no Windows service binary in v1) come
+# from GoReleaser, so build-all deliberately doesn't include it. Pure Go
+# throughout — the sqlite store driver is modernc.org/sqlite — so CGO stays
+# off here too.
+.PHONY: build-config
+build-config:
+	CGO_ENABLED=0 go build $(LDFLAGS) -o dist/dotvault-config ./cmd/dotvault-config
+
 .PHONY: build-all
 build-all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64
 

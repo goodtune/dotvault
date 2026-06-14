@@ -1,0 +1,45 @@
+# Development configuration for the dotvault-config service. Pairs with the
+# fixtures under dev/remote-layers/ and the remote_config block in
+# config.dev.yaml:
+#
+#   go run ./cmd/dotvault-config serve --config configsvc.dev.yaml --seed dev/remote-layers
+#
+# The sqlite store keeps CGO off and needs no infrastructure; production
+# deployments use the vault driver instead (see docs/services/dotvault-config.md).
+listen: "127.0.0.1:9100"
+
+store:
+  driver: sqlite
+  dsn: "dev/configsvc.db"
+
+groups:
+  source: static
+  ttl: "1m"
+
+# Explicit, ordered list of the dimension combinations the service composes.
+# Each entry is "global", a dimension (os, group, device, user), or a
+# "+"-joined combination in canonical spelling. The declared order IS the
+# precedence (later wins) and a combination not listed is never looked up or
+# served. Omit the block to keep the default [global, os, group, user].
+composition:
+  order: [global, os, group, device, user, os+group, os+user, group+user, os+group+user]
+
+# Management API + web UI at http://127.0.0.1:9100/admin/. Human login binds
+# against the glauth dev directory (`docker compose --profile ldap up -d`;
+# admin/password is in the dotvault-admins group via dev/remote-layers/
+# groups.yaml, bob/password is not). When glauth isn't running, login
+# reports the backend unavailable; the rest of the service is unaffected.
+admin:
+  enabled: true
+  group: dotvault-admins
+  ldap:
+    url: "ldap://127.0.0.1:3893"
+    user_dn_template: "cn=%s,ou=users,dc=example,dc=com"
+  # Service-account (mTLS) listener. Run dev/mint-svc-cert.sh first — it
+  # uses the dev Vault's PKI engine to mint the CA and certificates into
+  # dev/pki/ — then uncomment:
+  # mtls:
+  #   listen: "127.0.0.1:9101"
+  #   ca_cert: "dev/pki/ca.pem"
+  #   cert_file: "dev/pki/server.pem"
+  #   key_file: "dev/pki/server-key.pem"

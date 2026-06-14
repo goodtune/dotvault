@@ -1,0 +1,13 @@
+# Served to every client. Layers on a fleet-wide rule that renders the
+# copy-engine "sample" enrolment (config.dev.yaml) into a file. Note the
+# upstream source secret is seeded by vault-init for its demo user only
+# (kv/apps/sample/keys/<user> — see docker-compose.yaml), so seed your own
+# username there to watch the rule render end to end; the rule itself shows
+# up in the merged config regardless.
+rules:
+  - name: remote-sample
+    vault_key: sample
+    target:
+      path: "~/tmp/remote-sample.txt"
+      format: text
+      template: "{{ .token }}"

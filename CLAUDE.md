@@ -106,6 +106,7 @@ internal/
   configsvc/             dotvault-config service: layer composition, HTTP API, seeding, admin API + embedded UI (ui/); store/ (sqlite + Vault KVv2) and groups/ (static + LDAP) backends
   auth/                  Auth orchestration (OIDC, LDAP with MFA, token)
   loginsuppress/         login-check suppression marker (path/window/freshness/refresh)
+  passwd/                /etc/passwd parsing for login-check --no-passwd (local vs directory account)
   observability/         OTel metrics + logs SDK wiring, package-level instrument helpers
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
   tokenwatch/            Watches ~/.dotvault-token for replacement (inotify on Linux); no-op elsewhere
@@ -198,6 +199,23 @@ startup.
   tests). The path matches the previous shell-managed location, so
   existing suppression state survives the rollout without migration.
   Logic lives in `internal/loginsuppress/`.
+- `--no-passwd` exits 0 immediately when the current user has an entry
+  in `/etc/passwd` — in directory-service fleets a passwd entry means a
+  local machine account with no Vault credentials, so a fleet-wide
+  profile.d script can pass the flag unconditionally. The file is
+  parsed directly (`internal/passwd/`), never via getent/NSS, because
+  merged-source lookups cannot say which source an entry came from.
+  NIS/compat `+`/`-` splice lines are skipped (they reference directory
+  sources, not local accounts). Ignored with a WARN log on Windows. A
+  passwd read failure warns and falls through to the normal check (fail
+  open; exit 1 stays reserved for genuine internal errors). The check
+  runs after the suppression-marker freshness check and refreshes the
+  marker on early exit, so subsequent shells in the window stop at the
+  marker without re-reading the file. The heuristic is Linux-targeted:
+  macOS keeps local accounts in Open Directory, so the lookup never
+  matches a human there and the flag degrades to a no-op (falls through
+  to the normal check — it cannot wrongly skip auth). Test override:
+  `DOTVAULT_PASSWD_FILE`.
 - If a cached token is valid and still within the first half of its
   creation TTL, exit clean.
 - If the cached token is valid but past the halfway mark, attempt renewal.

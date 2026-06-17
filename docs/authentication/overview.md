@@ -1,6 +1,6 @@
 # Authentication Overview
 
-dotvault supports five methods for authenticating to HashiCorp Vault:
+dotvault supports four methods for authenticating to HashiCorp Vault:
 
 | Method | Best for | How it works |
 |--------|----------|-------------|
@@ -8,17 +8,16 @@ dotvault supports five methods for authenticating to HashiCorp Vault:
 | [LDAP](ldap-mfa.md) | Environments with LDAP/AD and MFA | Terminal prompt for password + optional MFA |
 | [Token](token.md) | Automation, CI/CD, development | Uses a pre-existing Vault token |
 | [mTLS](mtls.md) | Long-lived unattended auth | A TLS client certificate authenticates; LDAP/OIDC is a one-time bootstrap |
-| [mTLS+TPM](mtls.md) | Hardware-bound unattended auth | As mTLS, but the private key is sealed in the TPM |
 
 Set the method in your config file:
 
 ```yaml
 vault:
   address: "https://vault.example.com:8200"
-  auth_method: "oidc"    # or "ldap", "token", "mtls", "mtls+tpm"
+  auth_method: "oidc"    # or "ldap", "token", "mtls"
 ```
 
-Any of these methods can additionally seal its cached token at rest under the machine's TPM — append a `+tpm` suffix (`oidc+tpm`, `ldap+tpm`, `mtls+tpm`). See [TPM-Backed Protection](tpm.md) for what it does, when to use it, and the per-platform requirements.
+Any of these methods can additionally seal its cached token at rest under the machine's TPM — append a `+tpm` suffix (`oidc+tpm`, `ldap+tpm`, `mtls+tpm`). `+tpm` is a modifier, not a separate method: the login flow is unchanged, only how the token rests on disk. (For `mtls+tpm` the certificate's private key is sealed too.) See [TPM-Backed Protection](tpm.md) for what it does, when to use it, and the per-platform requirements.
 
 ## Authentication flow
 

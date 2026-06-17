@@ -706,7 +706,25 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if webServer != nil {
+		if cfg.Vault.AuthMethod == "mtls" || cfg.Vault.AuthMethod == "mtls+tpm" {
+			// Certificate auth: the steady state (load credential → cert
+			// login) needs no human and works headlessly, so it takes
+			// precedence over the web/TTY branching. Only first-run bootstrap
+			// needs a TTY (or the configured BYO cert); the flow surfaces a
+			// clear error if neither is available.
+			mgr := &auth.Manager{
+				VaultClient:   vc,
+				TokenFilePath: tokenPath,
+				AuthMethod:    cfg.Vault.AuthMethod,
+				AuthMount:     cfg.Vault.AuthMount,
+				AuthRole:      cfg.Vault.AuthRole,
+				Username:      username,
+				MTLS:          mtlsParams(cfg, username),
+			}
+			if err := mgr.Authenticate(ctx); err != nil {
+				return fmt.Errorf("authenticate: %w", err)
+			}
+		} else if webServer != nil {
 			// All auth methods go through the web UI when enabled.
 			url := webServer.URL()
 			slog.Info("opening browser for authentication", "url", url)
@@ -747,6 +765,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:     cfg.Vault.AuthMount,
 				AuthRole:      cfg.Vault.AuthRole,
 				Username:      username,
+				MTLS:          mtlsParams(cfg, username),
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -767,6 +786,39 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
+
+	// For the cert auth methods, run a periodic re-issuance check. The
+	// lifecycle manager renews the *token*, but a Vault PKI *certificate*
+	// cannot be renewed — it must be re-minted before expiry. Without this, a
+	// long-running daemon whose token keeps renewing never re-enters the cert
+	// flow, and the certificate could sail through its reissue_before window
+	// and expire. The check is cheap (a file stat + window comparison) and
+	// only mints when due, using the current operational token.
+	if mtlsP := mtlsParams(cfg, username); mtlsP != nil {
+		reissueMgr := &auth.Manager{
+			VaultClient:   vc,
+			TokenFilePath: tokenPath,
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Username:      username,
+			MTLS:          mtlsP,
+		}
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := reissueMgr.ReissueIfDue(ctx); err != nil {
+						slog.Warn("mtls certificate re-issuance check failed", "error", err)
+					}
+				}
+			}
+		}()
+	}
 
 	// Start the SSH agent listener now that we hold a Vault token. The gate is
 	// wired before the listener accepts connections so a Sign issued during a
@@ -1214,6 +1266,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		Username:      username,
+		MTLS:          mtlsParams(cfg, username),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1497,6 +1550,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		Username:      username,
+		MTLS:          mtlsParams(cfg, username),
 	}
 	if !quiet {
 		printLoginNotice(os.Stderr, loginReason)
@@ -1729,6 +1783,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		Username:      username,
+		MTLS:          mtlsParams(cfg, username),
 	}
 
 	if err := mgr.Authenticate(ctx); err != nil {
@@ -2019,6 +2074,40 @@ func stderrSupportsColour() bool {
 
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
+// mtlsParams builds the cert-auth parameters for the auth.Manager. It returns
+// nil unless auth_method is "mtls" or "mtls+tpm", so the LDAP/OIDC/token paths
+// are unaffected. StorageDir defaults to {cache_dir}/mtls.
+func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
+	if cfg.Vault.AuthMethod != "mtls" && cfg.Vault.AuthMethod != "mtls+tpm" {
+		return nil
+	}
+	m := cfg.Vault.MTLS
+	storageDir := m.StorageDir
+	if storageDir == "" {
+		storageDir = filepath.Join(paths.CacheDir(), "mtls")
+	}
+	return &auth.MTLSParams{
+		VaultAddress:    cfg.Vault.Address,
+		CACert:          cfg.Vault.CACert,
+		TLSSkipVerify:   cfg.Vault.TLSSkipVerify,
+		Method:          cfg.Vault.AuthMethod,
+		BootstrapMethod: m.BootstrapMethod,
+		BootstrapMount:  m.BootstrapMount,
+		CertMount:       m.CertMount,
+		CertRole:        m.CertRole,
+		PKIMount:        m.PKIMount,
+		PKIRole:         m.PKIRole,
+		KeyType:         m.KeyType,
+		CommonName:      m.CommonName,
+		TTL:             m.TTL,
+		ReissueBefore:   m.ReissueBeforeDur,
+		SealToPCRs:      m.SealToPCRs,
+		StorageDir:      storageDir,
+		BYOCert:         m.BYO.Cert,
+		BYOKey:          m.BYO.Key,
+	}
+}
+
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }

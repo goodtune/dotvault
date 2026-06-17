@@ -634,6 +634,29 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		}
 	}
 
+	// Vault\MTLS (cert auth), with BYO paths nested under Vault\MTLS\BYO.
+	mtlsKey := vaultKey + `\MTLS`
+	for _, fn := range []func() error{
+		func() error { return apply(&cfg.Vault.MTLS.BootstrapMethod, mtlsKey, "BootstrapMethod") },
+		func() error { return apply(&cfg.Vault.MTLS.BootstrapMount, mtlsKey, "BootstrapMount") },
+		func() error { return apply(&cfg.Vault.MTLS.CertMount, mtlsKey, "CertMount") },
+		func() error { return apply(&cfg.Vault.MTLS.CertRole, mtlsKey, "CertRole") },
+		func() error { return apply(&cfg.Vault.MTLS.PKIMount, mtlsKey, "PKIMount") },
+		func() error { return apply(&cfg.Vault.MTLS.PKIRole, mtlsKey, "PKIRole") },
+		func() error { return apply(&cfg.Vault.MTLS.KeyType, mtlsKey, "KeyType") },
+		func() error { return apply(&cfg.Vault.MTLS.CommonName, mtlsKey, "CommonName") },
+		func() error { return apply(&cfg.Vault.MTLS.TTL, mtlsKey, "TTL") },
+		func() error { return apply(&cfg.Vault.MTLS.ReissueBefore, mtlsKey, "ReissueBefore") },
+		func() error { return apply(&cfg.Vault.MTLS.StorageDir, mtlsKey, "StorageDir") },
+		func() error { return applyBool(&cfg.Vault.MTLS.SealToPCRs, mtlsKey, "SealToPCRs") },
+		func() error { return apply(&cfg.Vault.MTLS.BYO.Cert, mtlsKey+`\BYO`, "Cert") },
+		func() error { return apply(&cfg.Vault.MTLS.BYO.Key, mtlsKey+`\BYO`, "Key") },
+	} {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+
 	// Sync.
 	if err := apply(&cfg.Sync.RawInterval, rootKey+`\Sync`, "Interval"); err != nil {
 		return err

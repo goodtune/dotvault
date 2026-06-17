@@ -11,6 +11,9 @@ vault:
   auth_mount: "ldap"       # optional, defaults to the method name
 ```
 
+!!! tip "Seal the cached token under the TPM"
+    Use `auth_method: "ldap+tpm"` to seal the cached Vault token at rest under the machine's TPM. The LDAP/MFA login flow is unchanged — only how the token rests on disk differs. See [TPM-Backed Protection](tpm.md).
+
 ## How it works
 
 ### CLI mode

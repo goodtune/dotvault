@@ -1,20 +1,23 @@
 # Authentication Overview
 
-dotvault supports three methods for authenticating to HashiCorp Vault:
+dotvault supports four methods for authenticating to HashiCorp Vault:
 
 | Method | Best for | How it works |
 |--------|----------|-------------|
 | [OIDC](oidc.md) | Desktop users with SSO | Opens a browser for identity provider login |
 | [LDAP](ldap-mfa.md) | Environments with LDAP/AD and MFA | Terminal prompt for password + optional MFA |
 | [Token](token.md) | Automation, CI/CD, development | Uses a pre-existing Vault token |
+| [mTLS](mtls.md) | Long-lived unattended auth | A TLS client certificate authenticates; LDAP/OIDC is a one-time bootstrap |
 
 Set the method in your config file:
 
 ```yaml
 vault:
   address: "https://vault.example.com:8200"
-  auth_method: "oidc"    # or "ldap" or "token"
+  auth_method: "oidc"    # or "ldap", "token", "mtls"
 ```
+
+Any of these methods can additionally seal its cached token at rest under the machine's TPM — append a `+tpm` suffix (`oidc+tpm`, `ldap+tpm`, `mtls+tpm`). `+tpm` is a modifier, not a separate method: the login flow is unchanged, only how the token rests on disk. (For `mtls+tpm` the certificate's private key is sealed too.) See [TPM-Backed Protection](tpm.md) for what it does, when to use it, and the per-platform requirements.
 
 ## Authentication flow
 
@@ -44,3 +47,5 @@ In web mode, re-authentication opens the browser to the web UI login page. In CL
 ## Token persistence
 
 Vault tokens are persisted to `~/.dotvault-token` with `0600` permissions — a dotvault-specific filename rather than Vault's default `~/.vault-token`, so a concurrent `vault` CLI session cannot clobber the daemon's cached token. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `DOTVAULT_TOKEN` environment variable takes precedence if set; the upstream `VAULT_TOKEN` variable is deliberately ignored for the same isolation reason as the filename.
+
+When the auth method carries the `+tpm` suffix, the token file holds a TPM-sealed envelope instead of the plaintext token. The file is self-describing, so reuse-on-restart and the public `client` library unseal it transparently — no extra configuration on the reader side. The `DOTVAULT_TOKEN` environment variable is always plaintext (an environment value cannot be sealed), so the seal protects the on-disk file only.

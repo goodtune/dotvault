@@ -104,7 +104,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	token := loginSecret.Auth.ClientToken
 	s.vault.SetToken(token)
 
-	if err := auth.WriteTokenFile(s.tokenFilePath, token, auth.SealTokenAtRest(s.authMethod)); err != nil {
+	if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
 		slog.Warn("failed to write token file", "error", err)
 	}
 
@@ -173,7 +173,7 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 	// If authenticated, consume the token server-side.
 	if status.State == "authenticated" && status.Token != "" {
 		s.vault.SetToken(status.Token)
-		if err := auth.WriteTokenFile(s.tokenFilePath, status.Token, auth.SealTokenAtRest(s.authMethod)); err != nil {
+		if err := auth.WriteTokenFile(s.tokenFilePath, status.Token, s.sealToken); err != nil {
 			slog.Warn("failed to write token file", "error", err)
 		}
 		s.login.Clear(sessionID)
@@ -245,7 +245,7 @@ func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := auth.WriteTokenFile(s.tokenFilePath, req.Token, auth.SealTokenAtRest(s.authMethod)); err != nil {
+	if err := auth.WriteTokenFile(s.tokenFilePath, req.Token, s.sealToken); err != nil {
 		slog.Warn("failed to write token file", "error", err)
 	}
 

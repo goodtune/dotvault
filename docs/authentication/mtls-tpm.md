@@ -60,6 +60,26 @@ If you already hold a certificate and key signed by the CA that Vault's cert aut
 
 > **Implementation note.** The TPM backend seals the private scalar and unseals it into process memory to sign; the at-rest protection and machine/boot binding are the security properties it provides. A fully TPM-resident signing key, where the scalar never leaves the chip, is planned follow-up work.
 
+## TPM-sealed token
+
+The `+tpm` suffix is a **general modifier**, not exclusive to mTLS. Append it to a token-minting method — `oidc+tpm`, `ldap+tpm`, or `mtls+tpm` — to seal the cached Vault token in `~/.dotvault-token` under the TPM. The login flow for the base method is unchanged; only how the resulting token rests on disk differs. (The bare `token` method consumes a token you supply and never writes the file itself, so `token+tpm` has nothing to seal — it will still transparently read a sealed file.)
+
+For `mtls+tpm` this is *additive*: the certificate's private key was already sealed, and now the operational token is too, so **nothing sensitive sits on disk in plaintext**. For `oidc+tpm` / `ldap+tpm`, sealing the token is the only use of the TPM — a convenient way to harden the at-rest token without adopting certificate auth.
+
+```yaml
+vault:
+  address: https://vault.example.com:8200
+  auth_method: oidc+tpm          # normal OIDC login; the cached token is TPM-sealed
+```
+
+How it behaves:
+
+- **Self-describing file.** A sealed token file carries a `$dotvault-tpm-sealed$v1$` marker and a sealed, base64 body. dotvault detects the marker on read and unseals automatically; a plaintext file is read verbatim. Nothing keys off the auth method to *read* a token, which is why the daemon, `dotvault status`/`enrol`, the token-file watcher, and the embeddable `client` library all consume a sealed token with no extra wiring.
+- **Free migration.** Turning the suffix on does not require clearing an existing plaintext token — the next login replaces it with a sealed one; turning it off is equally seamless.
+- **No silent plaintext fallback.** A `+tpm` method on a host with no working TPM fails fast at login with a clear error rather than writing a plaintext token. (`mtls+tpm` additionally needs the TPM for its key, and fails for that reason too.)
+- **Env var stays plaintext.** `DOTVAULT_TOKEN` cannot be sealed (it is an environment value); the seal protects the on-disk file only.
+- **SRK-bound, not PCR-bound.** Unlike the certificate key's optional `seal_to_pcrs`, the token is bound only to the chip, never to the boot state — the token is short-lived and re-derivable, so a firmware update should not strand it. A sealed token copied to another machine (or surviving a TPM clear) simply fails to unseal and triggers a normal re-authentication.
+
 ## What your Vault admin must set up
 
 This is a Vault configuration exercise, not a dotvault setting:

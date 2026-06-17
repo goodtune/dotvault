@@ -69,7 +69,7 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 				token := status.Token
 				lt.Clear(sessionID)
 				m.VaultClient.SetToken(token)
-				if err := WriteTokenFile(m.TokenFilePath, token); err != nil {
+				if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 					slog.Warn("failed to write token file", "error", err)
 				}
 				slog.Info("LDAP authentication successful")

@@ -323,7 +323,7 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 	}
 	token := certClient.Token()
 	m.VaultClient.SetToken(token)
-	if err := WriteTokenFile(m.TokenFilePath, token); err != nil {
+	if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 		slog.Warn("failed to write token file", "error", err)
 	}
 	slog.Info("mtls authentication successful", "method", m.MTLS.Method, "serial", cred.Serial,

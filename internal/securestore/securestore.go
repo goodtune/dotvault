@@ -84,6 +84,68 @@ type Storage interface {
 	Close() error
 }
 
+// DataSealer is an optional capability for hardware backends that can seal an
+// arbitrary small blob (e.g. a Vault token) under the same hardware root of
+// trust that protects a key. The "file" backend deliberately does NOT
+// implement it: sealing data under a software key kept on the same disk gives
+// no at-rest protection, so data sealing is a hardware-only (TPM) feature.
+type DataSealer interface {
+	// SealData seals data and returns an opaque handle. The handle is
+	// machine-bound: it can only be unsealed by UnsealData on the originating
+	// chip.
+	SealData(data []byte) ([]byte, error)
+	// UnsealData reverses SealData.
+	UnsealData(handle []byte) ([]byte, error)
+}
+
+// SealData seals data under the platform hardware backend (TPM on
+// Linux/Windows), opening and closing the device around the operation. It
+// returns ErrUnsupported on a host with no hardware backend — callers MUST
+// treat that as a hard error and never fall back to storing data in plaintext.
+// The sealed blob is machine-bound: only UnsealData on the originating chip
+// can recover it.
+func SealData(data []byte) ([]byte, error) {
+	store, err := Open("tpm")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	sealer, ok := store.(DataSealer)
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return sealer.SealData(data)
+}
+
+// UnsealData reverses SealData, opening and closing the hardware backend
+// around the operation. ErrUnsupported (no hardware) or an unseal error
+// (wrong machine, cleared TPM) are both surfaced to the caller.
+func UnsealData(handle []byte) ([]byte, error) {
+	store, err := Open("tpm")
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	sealer, ok := store.(DataSealer)
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return sealer.UnsealData(handle)
+}
+
+// HardwareAvailable reports whether the platform hardware backend can be
+// opened on this host (nil) or why it cannot (ErrUnsupported, wrapped). It is
+// a cheap preflight used to fail a "+tpm" auth method fast and clearly when no
+// TPM is present, rather than authenticating and then silently failing to
+// persist the sealed token.
+func HardwareAvailable() error {
+	store, err := Open("tpm")
+	if err != nil {
+		return err
+	}
+	return store.Close()
+}
+
 // Open returns a backend for the given mode: "file" or "tpm". "tpm" maps to
 // the platform hardware backend (TPM on Linux/Windows) and returns
 // ErrUnsupported where no hardware backend is built.

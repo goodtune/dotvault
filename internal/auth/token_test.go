@@ -50,7 +50,7 @@ func TestWriteTokenFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".vault-token")
 
-	err := WriteTokenFile(path, "new-token-value")
+	err := WriteTokenFile(path, "new-token-value", false)
 	if err != nil {
 		t.Fatalf("WriteTokenFile: %v", err)
 	}

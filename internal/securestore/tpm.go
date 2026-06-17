@@ -90,21 +90,25 @@ func (t *tpmStorage) Import(key crypto.PrivateKey, sealToPCRs bool) (crypto.Sign
 }
 
 func (t *tpmStorage) Load(handle []byte) (crypto.Signer, error) {
-	var sb pb.SealedBytes
-	if err := proto.Unmarshal(handle, &sb); err != nil {
-		return nil, fmt.Errorf("securestore: unmarshal sealed handle: %w", err)
-	}
-	srk, err := client.StorageRootKeyECC(t.rw)
+	scalar, err := t.unsealBytes(handle)
 	if err != nil {
-		return nil, fmt.Errorf("securestore: load SRK: %w", err)
-	}
-	defer srk.Close()
-
-	scalar, err := srk.Unseal(&sb, client.UnsealOpts{})
-	if err != nil {
-		return nil, fmt.Errorf("securestore: TPM unseal failed (wrong machine, or boot state changed since sealing): %w", err)
+		return nil, err
 	}
 	return scalarToKey(scalar)
+}
+
+// SealData seals an arbitrary blob (e.g. a Vault token) under the SRK. It is
+// SRK-bound only — never PCR-bound — because the token is ephemeral and
+// re-derivable, so binding it to the boot state would needlessly strand it
+// across a firmware update. The machine binding (useless off the originating
+// chip) is the property that matters here.
+func (t *tpmStorage) SealData(data []byte) ([]byte, error) {
+	return t.sealBytes(data, false)
+}
+
+// UnsealData reverses SealData.
+func (t *tpmStorage) UnsealData(handle []byte) ([]byte, error) {
+	return t.unsealBytes(handle)
 }
 
 func (t *tpmStorage) Close() error {
@@ -120,18 +124,25 @@ func (t *tpmStorage) seal(key *ecdsa.PrivateKey, sealToPCRs bool) ([]byte, error
 	if key.Curve != elliptic.P256() {
 		return nil, errors.New("securestore: the TPM backend requires an EC P-256 key")
 	}
+	scalar := key.D.FillBytes(make([]byte, 32))
+	return t.sealBytes(scalar, sealToPCRs)
+}
+
+// sealBytes seals an arbitrary blob under the SRK (optionally PCR-bound) and
+// returns the marshalled SealedBytes proto as the handle. It is the shared
+// path behind both EC-scalar sealing (seal) and data sealing (SealData).
+func (t *tpmStorage) sealBytes(data []byte, sealToPCRs bool) ([]byte, error) {
 	srk, err := client.StorageRootKeyECC(t.rw)
 	if err != nil {
 		return nil, fmt.Errorf("securestore: load SRK: %w", err)
 	}
 	defer srk.Close()
 
-	scalar := key.D.FillBytes(make([]byte, 32))
 	opts := client.SealOpts{}
 	if sealToPCRs {
 		opts.Current = pcrSelection
 	}
-	sealed, err := srk.Seal(scalar, opts)
+	sealed, err := srk.Seal(data, opts)
 	if err != nil {
 		return nil, fmt.Errorf("securestore: TPM seal failed: %w", err)
 	}
@@ -140,6 +151,25 @@ func (t *tpmStorage) seal(key *ecdsa.PrivateKey, sealToPCRs bool) ([]byte, error
 		return nil, fmt.Errorf("securestore: marshal sealed bytes: %w", err)
 	}
 	return handle, nil
+}
+
+// unsealBytes reverses sealBytes, returning the original blob.
+func (t *tpmStorage) unsealBytes(handle []byte) ([]byte, error) {
+	var sb pb.SealedBytes
+	if err := proto.Unmarshal(handle, &sb); err != nil {
+		return nil, fmt.Errorf("securestore: unmarshal sealed handle: %w", err)
+	}
+	srk, err := client.StorageRootKeyECC(t.rw)
+	if err != nil {
+		return nil, fmt.Errorf("securestore: load SRK: %w", err)
+	}
+	defer srk.Close()
+
+	data, err := srk.Unseal(&sb, client.UnsealOpts{})
+	if err != nil {
+		return nil, fmt.Errorf("securestore: TPM unseal failed (wrong machine, or boot state changed since sealing): %w", err)
+	}
+	return data, nil
 }
 
 // scalarToKey reconstructs an EC P-256 private key from its 32-byte scalar.

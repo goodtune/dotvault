@@ -18,6 +18,10 @@ vault:
   auth_method: "oidc"    # or "ldap", "token", "mtls", "mtls+tpm"
 ```
 
+### TPM-sealed token (`+tpm` suffix)
+
+Append `+tpm` to a token-minting method — `oidc+tpm`, `ldap+tpm`, or `mtls+tpm` — to seal the cached token in `~/.dotvault-token` under the machine's TPM. The login flow is otherwise unchanged; only how the token rests on disk differs. (The bare `token` method has no token of its own to seal, so `token+tpm` has no sealing effect.) See [mTLS / mTLS+TPM](mtls-tpm.md#tpm-sealed-token) for the full behaviour, including the no-plaintext-fallback contract and the requirement for a working TPM.
+
 ## Authentication flow
 
 ### CLI mode
@@ -46,3 +50,5 @@ In web mode, re-authentication opens the browser to the web UI login page. In CL
 ## Token persistence
 
 Vault tokens are persisted to `~/.dotvault-token` with `0600` permissions — a dotvault-specific filename rather than Vault's default `~/.vault-token`, so a concurrent `vault` CLI session cannot clobber the daemon's cached token. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `DOTVAULT_TOKEN` environment variable takes precedence if set; the upstream `VAULT_TOKEN` variable is deliberately ignored for the same isolation reason as the filename.
+
+When the auth method carries the `+tpm` suffix, the token file holds a TPM-sealed envelope instead of the plaintext token. The file is self-describing, so reuse-on-restart and the public `client` library unseal it transparently — no extra configuration on the reader side. The `DOTVAULT_TOKEN` environment variable is always plaintext (an environment value cannot be sealed), so the seal protects the on-disk file only.

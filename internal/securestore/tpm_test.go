@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"testing"
+
+	"github.com/google/go-tpm/legacy/tpm2"
 )
 
 // TestScalarKeyRoundTrip exercises the pure-Go scalar (de)serialisation the TPM
@@ -49,5 +51,38 @@ func TestScalarKeyRejectsOutOfRange(t *testing.T) {
 	// Zero scalar is invalid.
 	if _, err := scalarToKey(make([]byte, 32)); err == nil {
 		t.Error("expected error for zero scalar")
+	}
+}
+
+// PCR7 (Secure Boot) is claimed by BitLocker on Windows, so the seal_to_pcrs
+// binding must drop it there to avoid coupling our credential to BitLocker's
+// re-seal cycle; other platforms keep it.
+func TestPCRSelectionFor(t *testing.T) {
+	cases := map[string][]int{
+		"windows": {0, 2, 4},
+		"linux":   {0, 2, 4, 7},
+		"darwin":  {0, 2, 4, 7},
+	}
+	for goos, want := range cases {
+		got := pcrSelectionFor(goos)
+		if got.Hash != tpm2.AlgSHA256 {
+			t.Errorf("%s: hash = %v, want SHA256", goos, got.Hash)
+		}
+		if len(got.PCRs) != len(want) {
+			t.Fatalf("%s: PCRs = %v, want %v", goos, got.PCRs, want)
+		}
+		for i := range want {
+			if got.PCRs[i] != want[i] {
+				t.Errorf("%s: PCRs = %v, want %v", goos, got.PCRs, want)
+				break
+			}
+		}
+		if goos == "windows" {
+			for _, p := range got.PCRs {
+				if p == 7 {
+					t.Errorf("windows PCR selection must exclude PCR7 (BitLocker), got %v", got.PCRs)
+				}
+			}
+		}
 	}
 }

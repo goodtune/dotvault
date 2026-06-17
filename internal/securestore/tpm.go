@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"runtime"
 
 	"github.com/google/go-tpm-tools/client"
 	pb "github.com/google/go-tpm-tools/proto/tpm"
@@ -18,11 +19,47 @@ import (
 )
 
 // pcrSelection is the set of PCRs the key is bound to when seal_to_pcrs is
-// enabled. PCRs 0/2/4/7 cover firmware, option ROMs, the boot manager, and
-// Secure Boot state — a firmware or boot-config change after sealing causes
-// the unseal to fail, which the cert-auth flow surfaces as a recoverable
-// error that offers the bootstrap fallback.
-var pcrSelection = tpm2.PCRSelection{Hash: tpm2.AlgSHA256, PCRs: []int{0, 2, 4, 7}}
+// enabled. PCRs 0/2/4 cover firmware, option ROMs, and the boot manager — a
+// firmware or boot-config change after sealing causes the unseal to fail,
+// which the cert-auth flow surfaces as a recoverable error that offers the
+// bootstrap fallback.
+//
+// PCR7 (Secure Boot state) is included on Linux but deliberately EXCLUDED on
+// Windows: there, BitLocker claims PCR7 for its own VMK binding, and any
+// Secure Boot / firmware change that makes BitLocker re-seal would also break
+// our unseal. Dropping PCR7 on Windows keeps the boot-state binding meaningful
+// (0/2/4 still move on a tampered boot) without coupling our credential's
+// availability to BitLocker's re-seal cycle. The token seal never uses PCRs at
+// all (SealData passes sealToPCRs=false); this selection only applies to the
+// opt-in mtls+tpm cert-key seal_to_pcrs path.
+var pcrSelection = pcrSelectionFor(runtime.GOOS)
+
+// pcrSelectionFor returns the PCR set for the given GOOS, excluding PCR7 on
+// Windows per the rationale above. Split out as a pure function so the
+// Windows-exclusion branch is unit-testable on a non-Windows CI runner.
+func pcrSelectionFor(goos string) tpm2.PCRSelection {
+	pcrs := []int{0, 2, 4, 7}
+	if goos == "windows" {
+		pcrs = []int{0, 2, 4}
+	}
+	return tpm2.PCRSelection{Hash: tpm2.AlgSHA256, PCRs: pcrs}
+}
+
+// loadSRK derives the Storage Root Key as a *transient* primary in the owner
+// hierarchy (TPM2_CreatePrimary), instead of client.StorageRootKey*, which
+// persists the key to a reserved handle via TPM2_EvictControl. EvictControl is
+// an owner-hierarchy operation that Windows TBS blocks for standard-user
+// processes (0x80280400), so the persisting variant fails on a perfectly
+// healthy and accessible Windows TPM. A primary key is deterministic — the
+// same template under the same hierarchy seed on the same chip always derives
+// the same key — so recreating it transiently on every operation costs nothing
+// and still unseals any blob previously sealed under the persistent SRK of the
+// same (ECC) template. The returned key owns an open transient handle; callers
+// MUST Close() it (which FlushContexts the handle, freeing the TPM's limited
+// transient object slots).
+func loadSRK(rw io.ReadWriter) (*client.Key, error) {
+	return client.NewKey(rw, tpm2.HandleOwner, client.SRKTemplateECC())
+}
 
 // tpmStorage seals the EC P-256 private scalar under the TPM Storage Root
 // Key. Only EC keys are supported: a TPM sealed-data object's sensitive area
@@ -46,7 +83,7 @@ func openHardware() (Storage, error) {
 	}
 	// Verify we can load the SRK before declaring the backend usable, so a
 	// present-but-broken TPM surfaces at Open rather than first use.
-	srk, err := client.StorageRootKeyECC(rw)
+	srk, err := loadSRK(rw)
 	if err != nil {
 		rw.Close()
 		return nil, fmt.Errorf("%w: load storage root key: %v", ErrUnsupported, err)
@@ -132,7 +169,7 @@ func (t *tpmStorage) seal(key *ecdsa.PrivateKey, sealToPCRs bool) ([]byte, error
 // returns the marshalled SealedBytes proto as the handle. It is the shared
 // path behind both EC-scalar sealing (seal) and data sealing (SealData).
 func (t *tpmStorage) sealBytes(data []byte, sealToPCRs bool) ([]byte, error) {
-	srk, err := client.StorageRootKeyECC(t.rw)
+	srk, err := loadSRK(t.rw)
 	if err != nil {
 		return nil, fmt.Errorf("securestore: load SRK: %w", err)
 	}
@@ -159,7 +196,7 @@ func (t *tpmStorage) unsealBytes(handle []byte) ([]byte, error) {
 	if err := proto.Unmarshal(handle, &sb); err != nil {
 		return nil, fmt.Errorf("securestore: unmarshal sealed handle: %w", err)
 	}
-	srk, err := client.StorageRootKeyECC(t.rw)
+	srk, err := loadSRK(t.rw)
 	if err != nil {
 		return nil, fmt.Errorf("securestore: load SRK: %w", err)
 	}

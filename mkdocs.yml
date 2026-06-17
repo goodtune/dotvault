@@ -61,7 +61,8 @@ nav:
       - OIDC & SSO: authentication/oidc.md
       - LDAP & MFA: authentication/ldap-mfa.md
       - Token Auth: authentication/token.md
-      - Certificate (mTLS / TPM): authentication/mtls-tpm.md
+      - Certificate (mTLS): authentication/mtls.md
+      - TPM-Backed Protection: authentication/tpm.md
   - Vault Setup:
       - KV Engine & Policies: vault/policies.md
   - Service Onboarding:

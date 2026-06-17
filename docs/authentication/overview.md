@@ -7,8 +7,8 @@ dotvault supports five methods for authenticating to HashiCorp Vault:
 | [OIDC](oidc.md) | Desktop users with SSO | Opens a browser for identity provider login |
 | [LDAP](ldap-mfa.md) | Environments with LDAP/AD and MFA | Terminal prompt for password + optional MFA |
 | [Token](token.md) | Automation, CI/CD, development | Uses a pre-existing Vault token |
-| [mTLS](mtls-tpm.md) | Long-lived unattended auth | A TLS client certificate authenticates; LDAP/OIDC is a one-time bootstrap |
-| [mTLS+TPM](mtls-tpm.md) | Hardware-bound unattended auth | As mTLS, but the private key is sealed in the TPM |
+| [mTLS](mtls.md) | Long-lived unattended auth | A TLS client certificate authenticates; LDAP/OIDC is a one-time bootstrap |
+| [mTLS+TPM](mtls.md) | Hardware-bound unattended auth | As mTLS, but the private key is sealed in the TPM |
 
 Set the method in your config file:
 
@@ -18,9 +18,7 @@ vault:
   auth_method: "oidc"    # or "ldap", "token", "mtls", "mtls+tpm"
 ```
 
-### TPM-sealed token (`+tpm` suffix)
-
-Append `+tpm` to a token-minting method — `oidc+tpm`, `ldap+tpm`, or `mtls+tpm` — to seal the cached token in `~/.dotvault-token` under the machine's TPM. The login flow is otherwise unchanged; only how the token rests on disk differs. (The bare `token` method has no token of its own to seal, so `token+tpm` has no sealing effect.) See [mTLS / mTLS+TPM](mtls-tpm.md#tpm-sealed-token) for the full behaviour, including the no-plaintext-fallback contract and the requirement for a working TPM.
+Any of these methods can additionally seal its cached token at rest under the machine's TPM — append a `+tpm` suffix (`oidc+tpm`, `ldap+tpm`, `mtls+tpm`). See [TPM-Backed Protection](tpm.md) for what it does, when to use it, and the per-platform requirements.
 
 ## Authentication flow
 

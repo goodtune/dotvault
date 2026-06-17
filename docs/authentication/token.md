@@ -10,6 +10,9 @@ vault:
   auth_method: "token"
 ```
 
+!!! note "The `+tpm` suffix has no effect here"
+    Sealing applies to the token file dotvault *writes*, but the `token` method only *reads* a token you supply — so `token+tpm` seals nothing. dotvault will still transparently read and unseal a TPM-sealed file written by another method. See [TPM-Backed Protection](tpm.md).
+
 ## Token sources
 
 dotvault checks for a token in this order:

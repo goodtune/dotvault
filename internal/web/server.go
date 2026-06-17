@@ -46,14 +46,23 @@ type Server struct {
 	// rulesMu guards rules and syncCfg, which the daemon's config-refresh
 	// loop swaps at runtime via UpdateDynamicConfig while request handlers
 	// read them.
-	rulesMu            sync.RWMutex
-	rules              []config.Rule
-	syncCfg            config.SyncConfig
-	enrolments         map[string]config.Enrolment
-	kvMount            string
-	userPrefix         string
-	username           string
-	authMethod         string
+	rulesMu    sync.RWMutex
+	rules      []config.Rule
+	syncCfg    config.SyncConfig
+	enrolments map[string]config.Enrolment
+	kvMount    string
+	userPrefix string
+	username   string
+	// authMethod is the base login method ("oidc"/"ldap"/"token"/"mtls"),
+	// with any "+tpm" suffix already stripped. The web SPA dispatches its
+	// login form on this exact value, so the wire format must carry a single
+	// meaning — see NewServer. The orthogonal "should the token be sealed?"
+	// decision lives in sealToken.
+	authMethod string
+	// sealToken records whether the configured auth method requested TPM
+	// token-sealing (the "+tpm" suffix), preserved here because authMethod has
+	// the suffix stripped for the SPA.
+	sealToken          bool
 	authMount          string
 	authRole           string
 	tokenFilePath      string
@@ -153,7 +162,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		kvMount:            sc.VaultCfg.KVMount,
 		userPrefix:         sc.VaultCfg.UserPrefix,
 		username:           sc.Username,
-		authMethod:         sc.VaultCfg.AuthMethod,
+		authMethod:         auth.BaseMethod(sc.VaultCfg.AuthMethod),
+		sealToken:          auth.SealTokenAtRest(sc.VaultCfg.AuthMethod),
 		authMount:          sc.VaultCfg.AuthMount,
 		authRole:           sc.VaultCfg.AuthRole,
 		tokenFilePath:      sc.TokenFilePath,

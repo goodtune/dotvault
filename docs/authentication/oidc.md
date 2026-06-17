@@ -12,6 +12,9 @@ vault:
   auth_role: "default"     # optional, Vault role to request
 ```
 
+!!! tip "Seal the cached token under the TPM"
+    Use `auth_method: "oidc+tpm"` to seal the cached Vault token at rest under the machine's TPM. The OIDC login flow is unchanged — only how the token rests on disk differs. See [TPM-Backed Protection](tpm.md).
+
 ## How it works
 
 1. dotvault requests an authentication URL from Vault's OIDC auth method

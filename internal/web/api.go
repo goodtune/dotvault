@@ -228,10 +228,14 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{
 		"vault": map[string]any{
-			"address":               s.vaultCfg.Address,
-			"kv_mount":              s.kvMount,
-			"user_prefix":           s.userPrefix,
-			"auth_method":           s.authMethod,
+			"address":     s.vaultCfg.Address,
+			"kv_mount":    s.kvMount,
+			"user_prefix": s.userPrefix,
+			// The effective-config view shows the raw configured method
+			// (including any "+tpm" suffix) so it matches the lossless
+			// config-download and honestly reflects token-sealing. Only the
+			// SPA login dispatch on /api/v1/status needs the base form.
+			"auth_method":           s.vaultCfg.AuthMethod,
 			"auth_mount":            s.authMount,
 			"auth_role":             s.authRole,
 			"tls_skip_verify":       s.vaultCfg.TLSSkipVerify,

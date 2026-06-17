@@ -129,22 +129,78 @@ func TestHandleStatus_VaultFieldsHiddenWhenUnauthenticated(t *testing.T) {
 	}
 }
 
+// The /api/v1/status auth_method must carry the *base* method, with any
+// "+tpm" sealing suffix stripped, because the web SPA dispatches its login
+// form on an exact-string match (login-page.jsx). A raw "ldap+tpm" would fall
+// through to "Unknown auth method" and break the login page. Normalisation
+// happens in NewServer, so this exercises that boundary rather than poking the
+// field directly.
 func TestHandleStatus_AuthMethod(t *testing.T) {
-	s := testServer(t)
-	s.authMethod = "ldap"
-
-	req := httptest.NewRequest("GET", "/api/v1/status", nil)
-	w := httptest.NewRecorder()
-	s.handleStatus(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("status = %d, want 200", w.Code)
+	cases := []struct {
+		configured    string
+		wantWire      string
+		wantSealToken bool
+	}{
+		{"ldap", "ldap", false},
+		{"oidc", "oidc", false},
+		{"ldap+tpm", "ldap", true},
+		{"oidc+tpm", "oidc", true},
+		{"mtls+tpm", "mtls", true},
 	}
+	for _, tc := range cases {
+		t.Run(tc.configured, func(t *testing.T) {
+			s, err := NewServer(ServerConfig{
+				WebCfg:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:8200"},
+				VaultCfg: config.VaultConfig{AuthMethod: tc.configured},
+			})
+			if err != nil {
+				t.Fatalf("NewServer: %v", err)
+			}
+			if s.authMethod != tc.wantWire {
+				t.Errorf("s.authMethod = %q, want %q (the +tpm suffix must be stripped for the SPA)", s.authMethod, tc.wantWire)
+			}
+			if s.sealToken != tc.wantSealToken {
+				t.Errorf("s.sealToken = %v, want %v (sealing must still be honoured)", s.sealToken, tc.wantSealToken)
+			}
 
+			req := httptest.NewRequest("GET", "/api/v1/status", nil)
+			w := httptest.NewRecorder()
+			s.handleStatus(w, req)
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			var resp map[string]any
+			json.NewDecoder(w.Body).Decode(&resp)
+			if resp["auth_method"] != tc.wantWire {
+				t.Errorf("wire auth_method = %v, want %q", resp["auth_method"], tc.wantWire)
+			}
+		})
+	}
+}
+
+// The Effective Configuration view (/api/v1/config) must show the RAW
+// configured auth_method including any "+tpm" suffix, so it agrees with the
+// lossless config-download and honestly reflects that token-sealing is on.
+// This is the opposite of /api/v1/status, which strips the suffix for the SPA
+// login dispatch — the two endpoints deliberately differ.
+func TestHandleConfig_AuthMethodRaw(t *testing.T) {
+	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
+	// Mirror what NewServer produces for a "ldap+tpm" config: the base on the
+	// status field, the raw value retained in vaultCfg.
+	s.authMethod = "ldap"
+	s.vaultCfg.AuthMethod = "ldap+tpm"
+
+	req := httptest.NewRequest("GET", "/api/v1/config", nil)
+	w := httptest.NewRecorder()
+	s.handleConfig(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
 	var resp map[string]any
 	json.NewDecoder(w.Body).Decode(&resp)
-	if resp["auth_method"] != "ldap" {
-		t.Errorf("auth_method = %v, want %q", resp["auth_method"], "ldap")
+	vault, _ := resp["vault"].(map[string]any)
+	if vault["auth_method"] != "ldap+tpm" {
+		t.Errorf("config view auth_method = %v, want %q (raw, matching the download)", vault["auth_method"], "ldap+tpm")
 	}
 }
 

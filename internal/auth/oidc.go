@@ -100,7 +100,7 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 		token := loginSecret.Auth.ClientToken
 		m.VaultClient.SetToken(token)
 
-		if err := WriteTokenFile(m.TokenFilePath, token); err != nil {
+		if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 			slog.Warn("failed to write token file", "error", err)
 		}
 

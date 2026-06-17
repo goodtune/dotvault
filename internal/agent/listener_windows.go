@@ -4,8 +4,6 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"unsafe"
@@ -69,11 +67,12 @@ func (l *Listener) platformCleanup() {}
 //
 // where <username> is the bare OS account (no domain) and <hash> is the hex
 // SHA-256 of the CryptProtectMemory(CROSS_PROCESS)-obfuscated window-class
-// string "Pageant". This mirrors PuTTY's agent_named_pipe_name() /
-// capi_obfuscate_string(); the obfuscation key is per-boot, so the suffix
-// must be recomputed at runtime and cannot be hard-coded. See
-// https://github.com/ndbeals/winssh-pageant/issues/1 for the reverse-engineered
-// algorithm this reproduces.
+// string "Pageant", fed to SHA-256 through PuTTY's length-prefixed put_string
+// encoding (see pageantSuffixHash). This mirrors PuTTY's
+// agent_named_pipe_name() / capi_obfuscate_string(); the obfuscation key is
+// per-boot, so the suffix must be recomputed at runtime and cannot be
+// hard-coded. See https://github.com/ndbeals/winssh-pageant/issues/1 for the
+// reverse-engineered algorithm this reproduces.
 const (
 	pageantPipeFormat = `\\.\pipe\pageant.%s.%s`
 	// pageantClassName is PuTTY's Pageant window class — the string hashed
@@ -109,8 +108,9 @@ func pageantPipeName() (string, error) {
 
 // capiObfuscateString reproduces PuTTY's capi_obfuscate_string: pad the input
 // (plus its NUL terminator) up to a CryptProtectMemory block boundary,
-// in-place CROSS_PROCESS-obfuscate it, then return the hex SHA-256 of the
-// obfuscated bytes.
+// in-place CROSS_PROCESS-obfuscate it, then hash the obfuscated buffer via
+// pageantSuffixHash (PuTTY's length-prefixed put_string encoding) and return
+// the hex digest.
 func capiObfuscateString(realname string) (string, error) {
 	cryptlen := len(realname) + 1
 	cryptlen += cryptProtectMemoryBlockSize - 1
@@ -132,6 +132,5 @@ func capiObfuscateString(realname string) (string, error) {
 		return "", fmt.Errorf("pageant pipe: CryptProtectMemory failed: %w", callErr)
 	}
 
-	hash := sha256.Sum256(cryptdata)
-	return hex.EncodeToString(hash[:]), nil
+	return pageantSuffixHash(cryptdata), nil
 }

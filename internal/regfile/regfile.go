@@ -43,6 +43,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeTopLevel(cfg)
 
 	e.writeVault(cfg.Vault)
+	e.writeMTLS(cfg.Vault.MTLS)
 	e.writeSync(cfg.Sync)
 	e.writeWeb(cfg.Web)
 	e.writeObservability(cfg.Observability)
@@ -106,6 +107,34 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("UserPrefix", v.UserPrefix)
 	e.writeBool("DisableTokenRenewal", v.DisableTokenRenewal)
 	e.writeBool("TLSSkipVerify", v.TLSSkipVerify)
+	e.WriteString("\r\n")
+}
+
+// writeMTLS emits the cert-auth (mtls / mtls+tpm) settings under a dedicated
+// Vault\MTLS subkey, with the bring-your-own paths nested under Vault\MTLS\BYO.
+// Scalars are always emitted (empty as "") so a re-import clears stale values,
+// matching the Web/Observability idempotency pattern.
+func (e *emitter) writeMTLS(m config.MTLSConfig) {
+	mtlsKey := rootKey + `\Vault\MTLS`
+	e.writeKey(mtlsKey)
+	e.writeString("BootstrapMethod", m.BootstrapMethod)
+	e.writeString("BootstrapMount", m.BootstrapMount)
+	e.writeString("CertMount", m.CertMount)
+	e.writeString("CertRole", m.CertRole)
+	e.writeString("PKIMount", m.PKIMount)
+	e.writeString("PKIRole", m.PKIRole)
+	e.writeString("KeyType", m.KeyType)
+	e.writeString("CommonName", m.CommonName)
+	e.writeString("TTL", m.TTL)
+	e.writeString("ReissueBefore", m.ReissueBefore)
+	e.writeString("StorageDir", m.StorageDir)
+	e.writeBool("SealToPCRs", m.SealToPCRs)
+	e.WriteString("\r\n")
+
+	byoKey := mtlsKey + `\BYO`
+	e.writeKey(byoKey)
+	e.writeString("Cert", m.BYO.Cert)
+	e.writeString("Key", m.BYO.Key)
 	e.WriteString("\r\n")
 }
 

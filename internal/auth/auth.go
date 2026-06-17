@@ -12,10 +12,12 @@ import (
 type Manager struct {
 	VaultClient   *vault.Client
 	TokenFilePath string
-	AuthMethod    string // "oidc", "ldap", "token"
+	AuthMethod    string // "oidc", "ldap", "token", "mtls", "mtls+tpm"
 	AuthMount     string // auth mount path
 	AuthRole      string // optional role
 	Username      string
+	// MTLS is required when AuthMethod is "mtls" or "mtls+tpm".
+	MTLS *MTLSParams
 }
 
 // Authenticate attempts to authenticate with Vault.
@@ -46,6 +48,8 @@ func (m *Manager) Login(ctx context.Context) error {
 		return m.authenticateOIDC(ctx)
 	case "ldap":
 		return m.authenticateLDAP(ctx)
+	case "mtls", "mtls+tpm":
+		return m.authenticateMTLS(ctx)
 	case "token":
 		return fmt.Errorf("auth method 'token' requires a valid token in %s or DOTVAULT_TOKEN env", m.TokenFilePath)
 	default:

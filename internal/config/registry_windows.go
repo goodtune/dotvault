@@ -162,6 +162,22 @@ type registryLayer struct {
 	VaultAuthMount           string
 	VaultDisableTokenRenewal *uint32
 
+	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
+	MTLSBootstrapMethod string
+	MTLSBootstrapMount  string
+	MTLSCertMount       string
+	MTLSCertRole        string
+	MTLSPKIMount        string
+	MTLSPKIRole         string
+	MTLSKeyType         string
+	MTLSCommonName      string
+	MTLSTTL             string
+	MTLSReissueBefore   string
+	MTLSStorageDir      string
+	MTLSSealToPCRs      *uint32
+	MTLSBYOCert         string
+	MTLSBYOKey          string
+
 	// Sync
 	SyncInterval string
 
@@ -227,6 +243,36 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultAuthRole, _ = readRegString(vk, "AuthRole")
 		layer.VaultAuthMount, _ = readRegString(vk, "AuthMount")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
+	}
+
+	// Read Vault\MTLS subkey (cert auth) and its nested BYO subkey.
+	mk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Vault\\MTLS policy key: %w", err)
+	}
+	if err == nil {
+		defer mk.Close()
+		layer.MTLSBootstrapMethod, _ = readRegString(mk, "BootstrapMethod")
+		layer.MTLSBootstrapMount, _ = readRegString(mk, "BootstrapMount")
+		layer.MTLSCertMount, _ = readRegString(mk, "CertMount")
+		layer.MTLSCertRole, _ = readRegString(mk, "CertRole")
+		layer.MTLSPKIMount, _ = readRegString(mk, "PKIMount")
+		layer.MTLSPKIRole, _ = readRegString(mk, "PKIRole")
+		layer.MTLSKeyType, _ = readRegString(mk, "KeyType")
+		layer.MTLSCommonName, _ = readRegString(mk, "CommonName")
+		layer.MTLSTTL, _ = readRegString(mk, "TTL")
+		layer.MTLSReissueBefore, _ = readRegString(mk, "ReissueBefore")
+		layer.MTLSStorageDir, _ = readRegString(mk, "StorageDir")
+		layer.MTLSSealToPCRs = readRegDWORD(mk, "SealToPCRs")
+	}
+	bk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS\BYO`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Vault\\MTLS\\BYO policy key: %w", err)
+	}
+	if err == nil {
+		defer bk.Close()
+		layer.MTLSBYOCert, _ = readRegString(bk, "Cert")
+		layer.MTLSBYOKey, _ = readRegString(bk, "Key")
 	}
 
 	// Read Sync subkey.
@@ -335,6 +381,48 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.VaultDisableTokenRenewal != nil {
 		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
+	}
+	if layer.MTLSBootstrapMethod != "" {
+		cfg.Vault.MTLS.BootstrapMethod = layer.MTLSBootstrapMethod
+	}
+	if layer.MTLSBootstrapMount != "" {
+		cfg.Vault.MTLS.BootstrapMount = layer.MTLSBootstrapMount
+	}
+	if layer.MTLSCertMount != "" {
+		cfg.Vault.MTLS.CertMount = layer.MTLSCertMount
+	}
+	if layer.MTLSCertRole != "" {
+		cfg.Vault.MTLS.CertRole = layer.MTLSCertRole
+	}
+	if layer.MTLSPKIMount != "" {
+		cfg.Vault.MTLS.PKIMount = layer.MTLSPKIMount
+	}
+	if layer.MTLSPKIRole != "" {
+		cfg.Vault.MTLS.PKIRole = layer.MTLSPKIRole
+	}
+	if layer.MTLSKeyType != "" {
+		cfg.Vault.MTLS.KeyType = layer.MTLSKeyType
+	}
+	if layer.MTLSCommonName != "" {
+		cfg.Vault.MTLS.CommonName = layer.MTLSCommonName
+	}
+	if layer.MTLSTTL != "" {
+		cfg.Vault.MTLS.TTL = layer.MTLSTTL
+	}
+	if layer.MTLSReissueBefore != "" {
+		cfg.Vault.MTLS.ReissueBefore = layer.MTLSReissueBefore
+	}
+	if layer.MTLSStorageDir != "" {
+		cfg.Vault.MTLS.StorageDir = layer.MTLSStorageDir
+	}
+	if layer.MTLSSealToPCRs != nil {
+		cfg.Vault.MTLS.SealToPCRs = *layer.MTLSSealToPCRs != 0
+	}
+	if layer.MTLSBYOCert != "" {
+		cfg.Vault.MTLS.BYO.Cert = layer.MTLSBYOCert
+	}
+	if layer.MTLSBYOKey != "" {
+		cfg.Vault.MTLS.BYO.Key = layer.MTLSBYOKey
 	}
 	if layer.SyncInterval != "" {
 		cfg.Sync.RawInterval = layer.SyncInterval

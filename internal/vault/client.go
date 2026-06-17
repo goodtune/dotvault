@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,11 @@ type Config struct {
 	Token         string
 	CACert        string
 	TLSSkipVerify bool
+	// ClientCert, when non-nil, is presented during the TLS handshake. It is
+	// used by the cert auth method (mtls / mtls+tpm): the certificate's
+	// private key may be a hardware-backed crypto.Signer, so GetClientCertificate
+	// invokes it lazily per handshake rather than holding key bytes.
+	ClientCert *tls.Certificate
 }
 
 // Secret represents a KVv2 secret with its data and version metadata.
@@ -46,6 +52,20 @@ func NewClient(cfg Config) (*Client, error) {
 		tlsCfg := &vaultapi.TLSConfig{Insecure: true}
 		if err := vaultCfg.ConfigureTLS(tlsCfg); err != nil {
 			return nil, fmt.Errorf("configure TLS skip verify: %w", err)
+		}
+	}
+
+	if cfg.ClientCert != nil {
+		transport, ok := vaultCfg.HttpClient.Transport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("configure client certificate: unexpected transport %T", vaultCfg.HttpClient.Transport)
+		}
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		cert := cfg.ClientCert
+		transport.TLSClientConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return cert, nil
 		}
 	}
 

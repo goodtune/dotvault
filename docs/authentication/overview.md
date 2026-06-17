@@ -1,19 +1,21 @@
 # Authentication Overview
 
-dotvault supports three methods for authenticating to HashiCorp Vault:
+dotvault supports five methods for authenticating to HashiCorp Vault:
 
 | Method | Best for | How it works |
 |--------|----------|-------------|
 | [OIDC](oidc.md) | Desktop users with SSO | Opens a browser for identity provider login |
 | [LDAP](ldap-mfa.md) | Environments with LDAP/AD and MFA | Terminal prompt for password + optional MFA |
 | [Token](token.md) | Automation, CI/CD, development | Uses a pre-existing Vault token |
+| [mTLS](mtls-tpm.md) | Long-lived unattended auth | A TLS client certificate authenticates; LDAP/OIDC is a one-time bootstrap |
+| [mTLS+TPM](mtls-tpm.md) | Hardware-bound unattended auth | As mTLS, but the private key is sealed in the TPM |
 
 Set the method in your config file:
 
 ```yaml
 vault:
   address: "https://vault.example.com:8200"
-  auth_method: "oidc"    # or "ldap" or "token"
+  auth_method: "oidc"    # or "ldap", "token", "mtls", "mtls+tpm"
 ```
 
 ## Authentication flow

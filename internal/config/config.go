@@ -85,6 +85,14 @@ const (
 	DefaultKVMount    = "kv"
 	DefaultUserPrefix = "users/"
 
+	// mTLS / cert-auth defaults applied by validate() when auth_method is
+	// "mtls" or "mtls+tpm".
+	DefaultCertMount      = "cert"
+	DefaultPKIMount       = "pki"
+	DefaultMTLSKeyType    = "ec"
+	DefaultMTLSCommonName = "{{.user}}"
+	DefaultReissueBefore  = 168 * time.Hour // 7d
+
 	// DefaultAgentPipe is the Windows named pipe the SSH agent listens on
 	// when agent.windows.pipe is unset. dotvault claims its own pipe rather
 	// than the well-known \\.\pipe\openssh-ssh-agent so it never contends
@@ -175,6 +183,57 @@ type VaultConfig struct {
 	AuthRole            string `yaml:"auth_role"`
 	AuthMount           string `yaml:"auth_mount"`
 	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
+	// MTLS configures the cert auth methods. It is consulted only when
+	// AuthMethod is "mtls" or "mtls+tpm".
+	MTLS MTLSConfig `yaml:"mtls"`
+}
+
+// MTLSConfig configures certificate-based Vault authentication (the "mtls" and
+// "mtls+tpm" auth methods). A TLS client certificate authenticates instead of
+// a human credential; LDAP/OIDC is demoted to a one-time bootstrap that mints
+// the first certificate via the Vault PKI engine.
+type MTLSConfig struct {
+	// BootstrapMethod is the human-credential method used only to mint the
+	// first certificate ("ldap" or "oidc"). Default "oidc".
+	BootstrapMethod string `yaml:"bootstrap_method"`
+	// BootstrapMount overrides the auth mount for the bootstrap login.
+	// Default: the method name (the same default the bootstrap flow applies).
+	BootstrapMount string `yaml:"bootstrap_mount"`
+	// CertMount is the Vault cert auth mount. Default "cert".
+	CertMount string `yaml:"cert_mount"`
+	// CertRole is the cert auth role name presented at login. Required.
+	CertRole string `yaml:"cert_role"`
+	// PKIMount is the PKI secrets engine used to issue/sign. Default "pki".
+	PKIMount string `yaml:"pki_mount"`
+	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
+	PKIRole string `yaml:"pki_role"`
+	// KeyType is "ec" (P-256) or "rsa" (2048). Default "ec". The mtls+tpm
+	// backend supports "ec" only.
+	KeyType string `yaml:"key_type"`
+	// CommonName is a Go template (over {{.user}}) for the certificate CN.
+	// Default "{{.user}}".
+	CommonName string `yaml:"common_name"`
+	// TTL is an optional client-side TTL hint passed to issue/sign; the PKI
+	// role's TTL remains authoritative.
+	TTL string `yaml:"ttl"`
+	// ReissueBefore is how long before expiry to rotate the certificate.
+	// Default 168h (7d).
+	ReissueBefore    string        `yaml:"reissue_before"`
+	ReissueBeforeDur time.Duration `yaml:"-"`
+	// SealToPCRs binds the TPM unseal to the current boot (PCR) state.
+	// mtls+tpm only.
+	SealToPCRs bool `yaml:"seal_to_pcrs"`
+	// StorageDir holds the credential envelope. Default {cache_dir}/mtls.
+	StorageDir string `yaml:"storage_dir"`
+	// BYO supplies an existing certificate, skipping bootstrap.
+	BYO MTLSBYO `yaml:"byo"`
+}
+
+// MTLSBYO points at an existing certificate and key on disk (the bring-your-own
+// seeding path). Both must be set together, or neither.
+type MTLSBYO struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
 }
 
 // SyncConfig holds sync settings.
@@ -458,6 +517,79 @@ func (c *Config) Validate() error {
 	return c.validate()
 }
 
+// validateMTLS validates and defaults the vault.mtls block. It is a no-op
+// unless auth_method is "mtls" or "mtls+tpm".
+func (c *Config) validateMTLS() error {
+	method := c.Vault.AuthMethod
+	if method != "mtls" && method != "mtls+tpm" {
+		return nil
+	}
+	m := &c.Vault.MTLS
+
+	if m.BootstrapMethod == "" {
+		m.BootstrapMethod = "oidc"
+	}
+	switch m.BootstrapMethod {
+	case "ldap", "oidc":
+	default:
+		return fmt.Errorf("vault.mtls.bootstrap_method %q: must be ldap or oidc", m.BootstrapMethod)
+	}
+
+	if m.CertMount == "" {
+		m.CertMount = DefaultCertMount
+	}
+	if m.CertRole == "" {
+		return fmt.Errorf("vault.mtls.cert_role is required for auth_method %q", method)
+	}
+	if m.PKIMount == "" {
+		m.PKIMount = DefaultPKIMount
+	}
+	if m.KeyType == "" {
+		m.KeyType = DefaultMTLSKeyType
+	}
+	switch m.KeyType {
+	case "ec":
+	case "rsa":
+		if method == "mtls+tpm" {
+			return fmt.Errorf("vault.mtls.key_type rsa is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only)")
+		}
+	default:
+		return fmt.Errorf("vault.mtls.key_type %q: must be ec or rsa", m.KeyType)
+	}
+	if m.CommonName == "" {
+		m.CommonName = DefaultMTLSCommonName
+	}
+
+	// BYO is both-or-neither.
+	if (m.BYO.Cert == "") != (m.BYO.Key == "") {
+		return fmt.Errorf("vault.mtls.byo: cert and key must be set together")
+	}
+	// PKI role is required whenever issuance might run (i.e. no BYO cert).
+	if m.BYO.Cert == "" && m.PKIRole == "" {
+		return fmt.Errorf("vault.mtls.pki_role is required unless a BYO certificate is supplied")
+	}
+
+	if m.ReissueBefore == "" {
+		m.ReissueBeforeDur = DefaultReissueBefore
+	} else {
+		d, err := ParseDuration(m.ReissueBefore)
+		if err != nil {
+			return fmt.Errorf("vault.mtls.reissue_before %q: %w", m.ReissueBefore, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("vault.mtls.reissue_before %q: must be positive", m.ReissueBefore)
+		}
+		m.ReissueBeforeDur = d
+	}
+
+	if m.TTL != "" {
+		if _, err := ParseDuration(m.TTL); err != nil {
+			return fmt.Errorf("vault.mtls.ttl %q: %w", m.TTL, err)
+		}
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	// Vault address required
 	if c.Vault.Address == "" {
@@ -475,6 +607,11 @@ func (c *Config) validate() error {
 		c.Vault.UserPrefix = DefaultUserPrefix
 	} else {
 		c.Vault.UserPrefix = strings.TrimRight(c.Vault.UserPrefix, "/") + "/"
+	}
+
+	// mTLS / cert-auth validation and defaulting, gated on the auth method.
+	if err := c.validateMTLS(); err != nil {
+		return err
 	}
 
 	// Parse sync interval

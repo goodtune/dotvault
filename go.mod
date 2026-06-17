@@ -5,6 +5,8 @@ go 1.25.6
 require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/cli/oauth v1.2.2
+	github.com/google/go-tpm v0.9.6
+	github.com/google/go-tpm-tools v0.4.9
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
 	github.com/mattn/go-ieproxy v0.0.12
@@ -23,12 +25,14 @@ require (
 	golang.org/x/crypto v0.53.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.44.0
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/ini.v1 v1.67.3
 	gopkg.in/yaml.v3 v3.0.1
 	nhooyr.io/websocket v1.8.17
 )
 
 require (
+	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260522213940-e5c6d01a3007 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -38,6 +42,11 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/go-configfs-tsm v0.3.3-0.20240919001351-b4b5b84fdcbc // indirect
+	github.com/google/go-eventlog v0.0.3-0.20260416001248-6807b85eecf0 // indirect
+	github.com/google/go-sev-guest v0.14.0 // indirect
+	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
+	github.com/google/logger v1.1.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -58,13 +67,13 @@ require (
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 )
 
 tool github.com/josephspurrier/goversioninfo/cmd/goversioninfo

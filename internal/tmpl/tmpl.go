@@ -19,7 +19,7 @@ func Render(name, tmplStr string, data map[string]any) (string, error) {
 // RenderWithUsername is Render with the {{ username }} function bound to the
 // supplied identity. The sync engine passes the OS account the secrets are
 // laid out under (kv/users/<username>/...), so a rule template can build paths
-// like /home/{{ username }}/.ssh/agent.sock without the username having to be
+// like /home/{{ username }}/.ssh/dotvault.sock without the username having to be
 // a field in the Vault secret.
 func RenderWithUsername(name, tmplStr string, data map[string]any, username string) (string, error) {
 	return render(name, tmplStr, data, username)

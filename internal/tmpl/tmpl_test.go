@@ -110,11 +110,11 @@ func TestRenderUsernameFunction(t *testing.T) {
 	// RenderWithUsername binds {{ username }} to the supplied identity, so a
 	// rule template can build paths from the OS account without the username
 	// being a field in the secret.
-	got, err := RenderWithUsername("ssh", `RemoteForward /home/{{ username }}/.ssh/agent.sock`, map[string]any{}, "gary")
+	got, err := RenderWithUsername("ssh", `RemoteForward /home/{{ username }}/.ssh/dotvault.sock`, map[string]any{}, "gary")
 	if err != nil {
 		t.Fatalf("RenderWithUsername: %v", err)
 	}
-	if want := `RemoteForward /home/gary/.ssh/agent.sock`; got != want {
+	if want := `RemoteForward /home/gary/.ssh/dotvault.sock`; got != want {
 		t.Errorf("RenderWithUsername() = %q, want %q", got, want)
 	}
 

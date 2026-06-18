@@ -197,7 +197,7 @@ func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
 // ruleRenderHash skip gate: with the Vault secret and the on-disk file both
 // unchanged, editing only the rule's template must still re-render and rewrite
 // the file. Before the rule-hash gate this skipped forever (version + checksum
-// both matched), which is the agent-forward "{{ username }} edit never applies"
+// both matched), which is the ssh_config forward "{{ username }} edit never applies"
 // bug this fixes.
 func TestEngine_RunOnceReappliesOnTemplateChange(t *testing.T) {
 	skipIfNoVault(t)
@@ -275,7 +275,7 @@ func TestEngine_RunOnceKeylessRule(t *testing.T) {
 			Target: config.Target{
 				Path:     sshPath,
 				Format:   "ssh_config",
-				Template: "Host *\n    User {{ username }}\n    RemoteForward /home/{{ username }}/.ssh/agent.sock " + forward + "\n",
+				Template: "Host *\n    User {{ username }}\n    RemoteForward /home/{{ username }}/.ssh/dotvault.sock " + forward + "\n",
 			},
 		}
 	}
@@ -283,7 +283,7 @@ func TestEngine_RunOnceKeylessRule(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
 		Sync:  config.SyncConfig{Interval: time.Hour},
-		Rules: []config.Rule{mkRule("localhost:22")},
+		Rules: []config.Rule{mkRule("127.0.0.1:8200")},
 	}
 
 	// nil Vault client: a keyless rule must never dereference it.
@@ -299,7 +299,7 @@ func TestEngine_RunOnceKeylessRule(t *testing.T) {
 	if !strings.Contains(string(first), "User goodtune") {
 		t.Errorf("username not resolved in keyless rule:\n%s", first)
 	}
-	if !strings.Contains(string(first), "/home/goodtune/.ssh/agent.sock localhost:22") {
+	if !strings.Contains(string(first), "/home/goodtune/.ssh/dotvault.sock 127.0.0.1:8200") {
 		t.Errorf("forward not written from {{ username }}:\n%s", first)
 	}
 
@@ -316,7 +316,7 @@ func TestEngine_RunOnceKeylessRule(t *testing.T) {
 
 	// Editing only the template must re-apply, even though there is no secret
 	// version to compare — the rule hash carries it.
-	engine.UpdateConfig([]config.Rule{mkRule("localhost:2222")}, 0)
+	engine.UpdateConfig([]config.Rule{mkRule("127.0.0.1:8201")}, 0)
 	if err := engine.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce (keyless, template changed): %v", err)
 	}
@@ -324,10 +324,10 @@ func TestEngine_RunOnceKeylessRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after template change: %v", err)
 	}
-	if !strings.Contains(string(second), "agent.sock localhost:2222") {
+	if !strings.Contains(string(second), "dotvault.sock 127.0.0.1:8201") {
 		t.Errorf("keyless template change not re-applied:\n%s", second)
 	}
-	if strings.Contains(string(second), "localhost:22\n") {
+	if strings.Contains(string(second), "127.0.0.1:8200\n") {
 		t.Errorf("old forward target lingering after re-sync:\n%s", second)
 	}
 }

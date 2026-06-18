@@ -26,7 +26,7 @@ The `default` function follows the [Sprig](https://masterminds.github.io/sprig/)
 The `username` function returns the OS account dotvault runs as — the same identity the `kv/users/<username>/…` path layout is built from (`DOMAIN\` prefix stripped on Windows). It is a function, not a field, so it is always available regardless of the secret's contents and never collides with a secret field that happens to be named `user`. Use it to build per-user filesystem paths without storing the username in Vault:
 
 ```
-RemoteForward /home/{{ username }}/.ssh/agent.sock localhost:22
+RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
 ```
 
 ## Examples by format
@@ -242,23 +242,23 @@ Text format uses full replacement — the entire file content is overwritten. Th
 
 ### ssh_config
 
-Surgically manage directives in `~/.ssh/config`. The motivating case is a predictable, agent-forwarding socket on a Linux host that forwards agent requests back to a Windows instance:
+Surgically manage directives in `~/.ssh/config`. The motivating case is exposing the local dotvault (Vault) endpoint on a remote host through a stable, per-user unix socket — one half of a dotvault-to-dotvault information-sharing setup. A `RemoteForward` creates the remote socket and forwards it back to `127.0.0.1:8200` on the originating machine:
 
 ```yaml
 rules:
-  - name: ssh-agent-forward
+  - name: dotvault-forward
     target:
       path: "~/.ssh/config"
       format: ssh_config
       template: |
         Host *
             User {{ username }}
-            RemoteForward /home/{{ username }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+            RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
 ```
 
 This rule has **no `vault_key`** — an ssh_config has no Vault-backed secrets, so the rule is *keyless*: dotvault never contacts Vault for it and renders the template with an empty data context. The path-building username comes from the `username` function (the OS account dotvault runs as), which resolves regardless because it is a template function, not a context field. dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because `{{ username }}` is stable across syncs, the `RemoteForward` listen path stays constant and the directive updates in place instead of accumulating duplicates. (A rule *may* still set `vault_key` if its template needs secret fields — `vault_key` is simply optional. See [Sync rules → keyless rules](sync-rules.md#rules-without-a-vault-key).)
 
-> **Keep a forward's listen path stable.** A `RemoteForward` is identified for merge by its listen spec (the first argument, `/home/{{ username }}/.ssh/windows.sock` here). If that path ever renders differently from the line already in the file, dotvault sees a *new* forward, appends it, and leaves the old one behind — so a forward whose listen path you change is added rather than rewritten, and you remove the stale line by hand once. This is why the path uses the stable `{{ username }}` function: a template that previously rendered the path with a different (or empty) value will not match and will orphan. See [Sync rules → ssh_config](sync-rules.md#ssh_config) for the full discriminator semantics.
+> **Keep a forward's listen path stable.** A `RemoteForward` is identified for merge by its listen spec (the first argument, `/home/{{ username }}/.ssh/dotvault.sock` here). If that path ever renders differently from the line already in the file, dotvault sees a *new* forward, appends it, and leaves the old one behind — so a forward whose listen path you change is added rather than rewritten, and you remove the stale line by hand once. This is why the path uses the stable `{{ username }}` function: a template that previously rendered the path with a different (or empty) value will not match and will orphan. See [Sync rules → ssh_config](sync-rules.md#ssh_config) for the full discriminator semantics.
 
 The `ssh_config` format is **template-only** — there is no raw-data fallback, so the `template` field is required (see below).
 

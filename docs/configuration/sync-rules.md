@@ -30,14 +30,14 @@ rules:
 
 ```yaml
 rules:
-  - name: ssh-agent-forward
+  - name: dotvault-forward
     target:
       path: "~/.ssh/config"
       format: ssh_config
       template: |
         Host *
             User {{ username }}
-            RemoteForward /home/{{ username }}/.ssh/agent.sock \\.\pipe\dotvault-ssh-agent
+            RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
 ```
 
 Because the rule has no `vault_key`, the `{{ .field }}` dot context is empty — a template that references a secret field would render `<no value>`. The [`username` function](templates.md#template-functions) still resolves, because it is a template function rather than a context field, so per-user paths work without any Vault data. A keyless rule therefore **must** carry a `target.template`: without secret data and without a template there is nothing to write, and config load rejects it.
@@ -85,15 +85,15 @@ Most keywords are single-valued — a second occurrence replaces the first. Keyw
 
 > **The discriminator is the directive's identity — keep it stable.** For a repeatable keyword, the discriminator (a forward's listen spec, an `IdentityFile` path, a `SetEnv` variable name) is what decides *update-in-place* versus *add-a-new-line*. This is deliberate: it lets dotvault's managed forwards coexist with ones you hand-add. The trade-off is that **changing the discriminator itself cannot be expressed as a rewrite.** If a sync renders a `RemoteForward` whose listen spec differs from one already in the section — even by a single character — dotvault treats it as a *new* forward, appends it, and leaves the old line orphaned (it has no way to know the two are "the same" forward with a changed path). The fix is the same as for any unmanaged content dotvault didn't write: remove the stale line by hand once. To avoid it, design the template so the discriminator never changes — interpolate only the *target* of a forward, not its listen spec, and where the listen path must contain the username use the stable `{{ username }}` function (a path that was previously rendered with an empty or different value will not match and will orphan). The same applies to the other repeatable keywords: re-pointing an `IdentityFile` to a new path, or renaming a `SetEnv` variable, adds rather than replaces.
 
-The motivating use case is a predictable, agent-forwarding SSH socket. A template such as:
+The motivating use case is a predictable `RemoteForward` that exposes the local dotvault (Vault) endpoint on a remote host through a stable per-user socket — one half of a dotvault-to-dotvault information-sharing setup. A template such as:
 
 ```
 Host *
     User {{ username }}
-    RemoteForward /home/{{ username }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+    RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
 ```
 
-keeps the `User` and the `RemoteForward` listen path stable across syncs (the `username` function resolves to the OS account dotvault runs as), so the agent forward is updated in place rather than duplicated each cycle. See [Templates](templates.md#template-functions) for the `username` function.
+keeps the `User` and the `RemoteForward` listen path stable across syncs (the `username` function resolves to the OS account dotvault runs as), so the forward is updated in place rather than duplicated each cycle. See [Templates](templates.md#template-functions) for the `username` function.
 
 > **Ordering note.** ssh_config takes the *first* obtained value for each parameter. Directives placed in the global section (no `Host` block) sit at the top of the file and therefore win over any host-specific value below them — keep that in mind when choosing whether a template targets the global section or a specific `Host`/`Match` block.
 

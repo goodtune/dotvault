@@ -148,13 +148,13 @@ func TestGenerateMultilineTemplate(t *testing.T) {
 
 // TestSSHConfigRuleRoundTrip proves the ssh_config format has full Windows
 // registry parity: a rule whose target format is "ssh_config" with a multi-line
-// template (the agent-forward use case) survives both the .reg render → parse
+// template (the dotvault-forward use case) survives both the .reg render → parse
 // cycle (the multi-line template routing through hex(1) like any other) and the
 // .reg → YAML → config.Load pipeline (so the format string is accepted by the
 // validator on both surfaces).
 func TestSSHConfigRuleRoundTrip(t *testing.T) {
 	const template = "Host *\n    User {{ username }}\n" +
-		"    RemoteForward /home/{{ username }}/.ssh/windows.sock \\\\.\\pipe\\dotvault-ssh-agent\n"
+		"    RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200\n"
 	src := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Rules: []config.Rule{
@@ -225,7 +225,7 @@ func TestKeylessRuleRoundTrip(t *testing.T) {
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Rules: []config.Rule{
 			{
-				Name: "ssh-agent-forward", // no VaultKey
+				Name: "dotvault-forward", // no VaultKey
 				Target: config.Target{
 					Path:     "~/.ssh/config",
 					Format:   "ssh_config",

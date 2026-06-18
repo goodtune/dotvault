@@ -72,7 +72,7 @@ func TestSSHConfig_RoundTripVerbatim(t *testing.T) {
 }
 
 // TestSSHConfig_GlobalExample exercises the motivating use case: a template with
-// no Host block injects directives into the implicit global section. The agent
+// no Host block injects directives into the implicit global section. The
 // forward and User land at the top of the file, below an existing header
 // comment, and nothing else is disturbed.
 func TestSSHConfig_GlobalExample(t *testing.T) {
@@ -81,13 +81,13 @@ Host example
     User bob
 `
 	incoming := "User alice\n" +
-		`RemoteForward /home/alice/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent` + "\n"
+		`RemoteForward /home/alice/.ssh/dotvault.sock 127.0.0.1:8200` + "\n"
 
 	got := mergeRender(t, existing, incoming)
 
 	want := `# my ssh config
 User alice
-RemoteForward /home/alice/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+RemoteForward /home/alice/.ssh/dotvault.sock 127.0.0.1:8200
 Host example
     User bob
 `
@@ -96,7 +96,7 @@ Host example
 	}
 }
 
-// TestSSHConfig_GlobalRemoteForwardUpdateByUsername reproduces the agent-forward
+// TestSSHConfig_GlobalRemoteForwardUpdateByUsername reproduces the forward
 // update reported against {{ username }}: an existing global-section directive
 // whose RemoteForward listen spec embeds the username keeps that listen spec
 // stable across a template change (both interpolate the same username), so only
@@ -166,19 +166,19 @@ func TestSSHConfig_UpdateInPlace(t *testing.T) {
 // updates the target rather than appending a duplicate.
 func TestSSHConfig_RemoteForwardReplaceByListen(t *testing.T) {
 	existing := "Host tunnel\n" +
-		"    RemoteForward /home/alice/.ssh/agent.sock /old/target.sock\n"
+		"    RemoteForward /home/alice/.ssh/dotvault.sock 127.0.0.1:9000\n"
 	incoming := "Host tunnel\n" +
-		`    RemoteForward /home/alice/.ssh/agent.sock \\.\pipe\dotvault-ssh-agent` + "\n"
+		"    RemoteForward /home/alice/.ssh/dotvault.sock 127.0.0.1:8200\n"
 
 	got := mergeRender(t, existing, incoming)
 
 	if n := strings.Count(got, "RemoteForward"); n != 1 {
 		t.Errorf("expected forward replaced in place (1 line), got %d:\n%s", n, got)
 	}
-	if strings.Contains(got, "/old/target.sock") {
+	if strings.Contains(got, "127.0.0.1:9000") {
 		t.Errorf("old forward target lingering:\n%s", got)
 	}
-	if !strings.Contains(got, `\\.\pipe\dotvault-ssh-agent`) {
+	if !strings.Contains(got, "127.0.0.1:8200") {
 		t.Errorf("new forward target missing:\n%s", got)
 	}
 }

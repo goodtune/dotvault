@@ -527,6 +527,80 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	}
 }
 
+// TestLifecycleManager_ReloadFromSocket verifies that when the in-memory token
+// goes invalid and no fresh token is on disk or in the environment, the
+// recovery path borrows a live token from a peer dotvault over the configured
+// Unix socket (dotvault-to-dotvault sharing) instead of forcing a re-auth.
+func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
+	// Hermetic: with no token file and no env token, the socket must be the
+	// sole reload candidate. Clear any ambient DOTVAULT_TOKEN so a developer's
+	// or CI's exported value can't sneak in as a candidate.
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	var currentValid atomic.Value
+	currentValid.Store("peer-token") // server only accepts the peer's token now
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		expected := currentValid.Load().(string)
+		if r.Header.Get("X-Vault-Token") == expected {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          json.Number("3600"),
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	// The peer daemon serves its live token over the socket.
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
+	})
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	// No token file and no DOTVAULT_TOKEN: the socket is the only candidate.
+	lm.SetTokenSocket(sock)
+
+	var onReauthFired atomic.Bool
+	lm.SetOnReauth(func() { onReauthFired.Store(true) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	deadline := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "peer-token" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := vc.Token(); got != "peer-token" {
+		t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() = true after successful socket reload")
+	}
+}
+
 // TestLifecycleManager_ReloadPicksUpFreshToken verifies that Reload()
 // triggers an immediate tryReload pass on the lifecycle goroutine —
 // the SIGHUP / tokenwatch entry point. The test uses a

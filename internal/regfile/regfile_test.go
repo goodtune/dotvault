@@ -763,6 +763,7 @@ func TestEmptyStringEmittedExplicitly(t *testing.T) {
 		`"AuthMount"=""`,
 		`"AuthRole"=""`,
 		`"CACert"=""`,
+		`"TokenSocket"=""`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in output (clearing semantics):\n%s", want, got)

@@ -22,6 +22,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 			AuthMethod:          "oidc",
 			KVMount:             "kv",
 			UserPrefix:          "users/",
+			TokenSocket:         "~/.ssh/dotvault.sock",
 			DisableTokenRenewal: true,
 		},
 		Sync: config.SyncConfig{RawInterval: "30m"},

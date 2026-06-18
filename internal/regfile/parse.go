@@ -626,6 +626,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.CACert, vaultKey, "CACert") },
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
+		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
 		func() error { return applyBool(&cfg.Vault.DisableTokenRenewal, vaultKey, "DisableTokenRenewal") },
 		func() error { return applyBool(&cfg.Vault.TLSSkipVerify, vaultKey, "TLSSkipVerify") },
 	} {

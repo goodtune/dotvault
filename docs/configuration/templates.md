@@ -247,7 +247,6 @@ Surgically manage directives in `~/.ssh/config`. The motivating case is a predic
 ```yaml
 rules:
   - name: ssh-agent-forward
-    vault_key: "ssh"
     target:
       path: "~/.ssh/config"
       format: ssh_config
@@ -257,7 +256,7 @@ rules:
             RemoteForward /home/{{ username }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
 ```
 
-The path-building username here comes from the `username` function (the OS account dotvault runs as), not from a secret field — so the `ssh` secret only needs to exist to trigger the rule; its contents aren't referenced. dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because `{{ username }}` is stable across syncs, the `RemoteForward` listen path stays constant and the directive updates in place instead of accumulating duplicates.
+This rule has **no `vault_key`** — an ssh_config has no Vault-backed secrets, so the rule is *keyless*: dotvault never contacts Vault for it and renders the template with an empty data context. The path-building username comes from the `username` function (the OS account dotvault runs as), which resolves regardless because it is a template function, not a context field. dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because `{{ username }}` is stable across syncs, the `RemoteForward` listen path stays constant and the directive updates in place instead of accumulating duplicates. (A rule *may* still set `vault_key` if its template needs secret fields — `vault_key` is simply optional. See [Sync rules → keyless rules](sync-rules.md#rules-without-a-vault-key).)
 
 > **Keep a forward's listen path stable.** A `RemoteForward` is identified for merge by its listen spec (the first argument, `/home/{{ username }}/.ssh/windows.sock` here). If that path ever renders differently from the line already in the file, dotvault sees a *new* forward, appends it, and leaves the old one behind — so a forward whose listen path you change is added rather than rewritten, and you remove the stale line by hand once. This is why the path uses the stable `{{ username }}` function: a template that previously rendered the path with a different (or empty) value will not match and will orphan. See [Sync rules → ssh_config](sync-rules.md#ssh_config) for the full discriminator semantics.
 

@@ -214,6 +214,65 @@ func TestSSHConfigRuleRoundTrip(t *testing.T) {
 	}
 }
 
+// TestKeylessRuleRoundTrip covers a rule with no vault_key (an empty VaultKey):
+// it must survive the .reg render → parse cycle (VaultKey emitted as "" and read
+// back empty, not dropped or defaulted) and the .reg → YAML → config.Load
+// pipeline (the validator accepting a keyless rule because it carries a
+// template). This is the registry-parity guarantee for the keyless feature.
+func TestKeylessRuleRoundTrip(t *testing.T) {
+	const template = "Host *\n    User {{ username }}\n"
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name: "ssh-agent-forward", // no VaultKey
+				Target: config.Target{
+					Path:     "~/.ssh/config",
+					Format:   "ssh_config",
+					Template: template,
+				},
+			},
+		},
+	}
+
+	text := mustGenerate(t, src)
+	if !strings.Contains(text, "\"VaultKey\"=\"\"\r\n") {
+		t.Errorf("keyless rule should emit VaultKey as \"\"\n--- output ---\n%s", text)
+	}
+
+	parsed, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(parsed.Rules))
+	}
+	if parsed.Rules[0].VaultKey != "" {
+		t.Errorf("VaultKey = %q, want empty (keyless)", parsed.Rules[0].VaultKey)
+	}
+	if parsed.Rules[0].Target.Template != template {
+		t.Errorf("Template round-trip mismatch: %q", parsed.Rules[0].Target.Template)
+	}
+
+	// The YAML path (reg-export → config.Load) accepts the keyless rule.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load rejected keyless rule: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].VaultKey != "" {
+		t.Errorf("keyless rule not preserved through YAML load: %+v", loaded.Rules)
+	}
+}
+
 func TestGenerateEnrolments(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},

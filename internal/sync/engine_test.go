@@ -258,6 +258,80 @@ func TestEngine_RunOnceReappliesOnTemplateChange(t *testing.T) {
 	}
 }
 
+// TestEngine_RunOnceKeylessRule exercises a rule with no vault_key: it manages
+// a file built purely from {{ username }} and literals, never contacts Vault
+// (so a nil Vault client is fine), and still resolves the username. It then
+// confirms the keyless skip path (unchanged file is not rewritten) and that a
+// template edit re-applies via the rule-hash gate without a secret version to
+// lean on.
+func TestEngine_RunOnceKeylessRule(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "config")
+	statePath := filepath.Join(dir, "state.json")
+
+	mkRule := func(forward string) config.Rule {
+		return config.Rule{
+			Name: "ssh", // no VaultKey
+			Target: config.Target{
+				Path:     sshPath,
+				Format:   "ssh_config",
+				Template: "Host *\n    User {{ username }}\n    RemoteForward /home/{{ username }}/.ssh/agent.sock " + forward + "\n",
+			},
+		}
+	}
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{mkRule("localhost:22")},
+	}
+
+	// nil Vault client: a keyless rule must never dereference it.
+	engine := NewEngine(cfg, nil, "goodtune", statePath)
+
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce (keyless): %v", err)
+	}
+	first, err := os.ReadFile(sshPath)
+	if err != nil {
+		t.Fatalf("read after first sync: %v", err)
+	}
+	if !strings.Contains(string(first), "User goodtune") {
+		t.Errorf("username not resolved in keyless rule:\n%s", first)
+	}
+	if !strings.Contains(string(first), "/home/goodtune/.ssh/agent.sock localhost:22") {
+		t.Errorf("forward not written from {{ username }}:\n%s", first)
+	}
+
+	// Second run with no change must skip — the file is not rewritten.
+	info1, _ := os.Stat(sshPath)
+	time.Sleep(20 * time.Millisecond)
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce (keyless, unchanged): %v", err)
+	}
+	info2, _ := os.Stat(sshPath)
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Error("keyless rule rewrote an unchanged file (skip gate not firing without a vault version)")
+	}
+
+	// Editing only the template must re-apply, even though there is no secret
+	// version to compare — the rule hash carries it.
+	engine.UpdateConfig([]config.Rule{mkRule("localhost:2222")}, 0)
+	if err := engine.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce (keyless, template changed): %v", err)
+	}
+	second, err := os.ReadFile(sshPath)
+	if err != nil {
+		t.Fatalf("read after template change: %v", err)
+	}
+	if !strings.Contains(string(second), "agent.sock localhost:2222") {
+		t.Errorf("keyless template change not re-applied:\n%s", second)
+	}
+	if strings.Contains(string(second), "localhost:22\n") {
+		t.Errorf("old forward target lingering after re-sync:\n%s", second)
+	}
+}
+
 func TestEngine_RunOnceResyncAfterFileDeleted(t *testing.T) {
 	skipIfNoVault(t)
 

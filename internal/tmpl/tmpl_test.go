@@ -139,6 +139,21 @@ func TestRenderUsernameFunction(t *testing.T) {
 	}
 }
 
+// TestRenderWithUsername_EmptyContext pins the keyless-rule contract: a rule
+// with no vault_key renders against an empty data context, where {{ username }}
+// (a function) still resolves but a reference to a would-be secret field
+// degrades to Go's <no value> sentinel rather than erroring. This is what lets
+// a keyless ssh_config template build per-user paths with no Vault data.
+func TestRenderWithUsername_EmptyContext(t *testing.T) {
+	got, err := RenderWithUsername("keyless", `User {{ username }} field={{ .secret_field }}`, map[string]any{}, "goodtune")
+	if err != nil {
+		t.Fatalf("RenderWithUsername (empty context): %v", err)
+	}
+	if want := "User goodtune field=<no value>"; got != want {
+		t.Errorf("empty-context render = %q, want %q", got, want)
+	}
+}
+
 func TestRenderEnvFunction(t *testing.T) {
 	t.Setenv("DOTVAULT_TEST_VAR", "test-value")
 

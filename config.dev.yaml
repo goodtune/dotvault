@@ -107,6 +107,19 @@ rules:
           "version": "6"
         }
 
+  # Keyless rule: no vault_key, so it never reads Vault. It manages an
+  # ssh_config file built purely from the {{ username }} function and
+  # literals — the agent-forwarding socket use case. A keyless rule must
+  # carry a template (there is no secret data to fall back on).
+  - name: ssh-agent-forward
+    target:
+      path: "~/tmp/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/agent.sock localhost:22
+
 enrolments:
   gh:
     engine: github

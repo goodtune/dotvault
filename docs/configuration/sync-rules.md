@@ -19,18 +19,38 @@ rules:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | yes | Unique rule identifier, used in status output and state tracking |
-| `vault_key` | yes | Secret key under the user's Vault path |
+| `vault_key` | no | Secret key under the user's Vault path. Omit it for a [keyless rule](#rules-without-a-vault-key) that manages a file with no Vault content |
 | `target.path` | yes | Local file path (`~` is expanded to the user's home directory) |
 | `target.format` | yes | Output format: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, or `ssh_config` |
-| `target.template` | no | Go template to reshape secret data before writing |
+| `target.template` | conditional | Go template to reshape secret data before writing. Required when `vault_key` is omitted (a keyless rule has no secret data to fall back on) |
+
+## Rules without a Vault key
+
+`vault_key` is optional. A rule that omits it is **keyless**: dotvault never contacts Vault for that rule, renders its template with an empty data context, and writes the result like any other rule. This is the natural shape for a file that has no secrets in it at all — the motivating case is an `~/.ssh/config` whose only dynamic part is the OS username:
+
+```yaml
+rules:
+  - name: ssh-agent-forward
+    target:
+      path: "~/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/agent.sock \\.\pipe\dotvault-ssh-agent
+```
+
+Because the rule has no `vault_key`, the `{{ .field }}` dot context is empty — a template that references a secret field would render `<no value>`. The [`username` function](templates.md#template-functions) still resolves, because it is a template function rather than a context field, so per-user paths work without any Vault data. A keyless rule therefore **must** carry a `target.template`: without secret data and without a template there is nothing to write, and config load rejects it.
+
+Everything else about a rule is identical whether or not it has a key: the same formats and surgical merges apply, the same skip logic runs (a keyless rule has no secret version, so its render fingerprint and the on-disk file checksum decide when to re-sync), and the section round-trips through YAML, `.reg`, and the Windows registry unchanged. Add a `vault_key` back the moment a template needs secret fields — the two modes are the same rule type.
 
 ## How sync works
 
 For each rule, on every sync cycle:
 
-1. **Read** the secret from Vault at `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
-2. **Skip** if the Vault secret version is unchanged AND the target file checksum is unchanged
-3. **Render** the template (if present) with the Vault data map as the dot context
+1. **Read** the secret from Vault at `{kv_mount}/data/{user_prefix}{username}/{vault_key}` (skipped for a [keyless rule](#rules-without-a-vault-key), which uses an empty data context)
+2. **Skip** if the rule's render-affecting definition is unchanged AND the target file checksum is unchanged AND (for a keyed rule) the Vault secret version is unchanged
+3. **Render** the template (if present) with the Vault data map as the dot context (empty for a keyless rule; `{{ username }}` still resolves)
 4. **Parse** the rendered output through the format handler
 5. **Read** the existing target file (a missing file is treated as empty, not an error)
 6. **Merge** the incoming data into the existing file content

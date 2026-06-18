@@ -399,7 +399,7 @@ All handlers implement the `FileHandler` interface (Read, Merge, Write). Handler
 | TOML | Custom parser (no external dep) | Recursive merge like JSON; supports tables, inline tables, dotted keys |
 | Text | Plain string | Full replacement (no merge) — for private keys, certificates |
 | Netrc | `github.com/jdx/go-netrc` | Per-entry merge by machine name; default entry skipped |
-| ssh_config | Custom parser (no external dep) | Surgical directive-level merge within each Host/Match section; comments and unmanaged directives preserved verbatim. Template-only (no raw-data path) |
+| ssh_config | Custom parser (no external dep) | Surgical directive-level merge within each Host/Match section; comments and unmanaged directives preserved verbatim. Template-only (no raw-data path). Repeatable keywords (forwards, `IdentityFile`, `SetEnv`, …) merge by a discriminator drawn from the first argument, so the discriminator *is* the directive's identity: changing it renders a new line (old one orphaned), not a rewrite — a deliberate coexistence trade-off, documented in `docs/configuration/sync-rules.md` |
 
 The `merge` field exists in rule config but is not dispatched on. Each handler always uses its native merge strategy, which is the only sensible strategy for that format.
 

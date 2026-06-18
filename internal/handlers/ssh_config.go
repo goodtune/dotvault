@@ -279,6 +279,15 @@ func findDirective(b *sshBlock, key string) *sshLine {
 //     "SetEnv FOO=old" is replaced by "SetEnv FOO=new";
 //   - every other multi-valued keyword keys on its first whitespace-delimited
 //     argument (a forward's listen spec, an IdentityFile's path, etc.).
+//
+// Consequence (documented in docs/configuration/sync-rules.md): because the
+// discriminator IS the identity, a render that changes the discriminator itself
+// (e.g. a RemoteForward whose listen spec moves) is a *new* directive — it is
+// appended and the old line is left orphaned, not rewritten. This coexistence
+// is intentional (managed and hand-added forwards live side by side); a rewrite
+// of the discriminator is not expressible and is a deliberate non-goal. Keep the
+// discriminator stable in templates (interpolate the forward target, not its
+// listen spec; use the stable {{ username }} for username-bearing paths).
 func directiveKey(l *sshLine) string {
 	kw := strings.ToLower(l.keyword)
 	if !multiValued[kw] {

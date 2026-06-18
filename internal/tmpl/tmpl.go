@@ -10,9 +10,32 @@ import (
 )
 
 // Render parses and executes a Go template with custom functions.
-// The data map is the dot context.
+// The data map is the dot context. The {{ username }} function returns the
+// empty string; use RenderWithUsername to make a real identity available.
 func Render(name, tmplStr string, data map[string]any) (string, error) {
-	t, err := template.New(name).Funcs(funcMap).Parse(tmplStr)
+	return render(name, tmplStr, data, "")
+}
+
+// RenderWithUsername is Render with the {{ username }} function bound to the
+// supplied identity. The sync engine passes the OS account the secrets are
+// laid out under (kv/users/<username>/...), so a rule template can build paths
+// like /home/{{ username }}/.ssh/agent.sock without the username having to be
+// a field in the Vault secret.
+func RenderWithUsername(name, tmplStr string, data map[string]any, username string) (string, error) {
+	return render(name, tmplStr, data, username)
+}
+
+func render(name, tmplStr string, data map[string]any, username string) (string, error) {
+	funcs := template.FuncMap{
+		"env":          envFunc,
+		"base64encode": base64EncodeFunc,
+		"base64decode": base64DecodeFunc,
+		"default":      defaultFunc,
+		"quote":        quoteFunc,
+		"username":     func() string { return username },
+	}
+
+	t, err := template.New(name).Funcs(funcs).Parse(tmplStr)
 	if err != nil {
 		return "", fmt.Errorf("parse template %s: %w", name, err)
 	}
@@ -23,14 +46,6 @@ func Render(name, tmplStr string, data map[string]any) (string, error) {
 	}
 
 	return buf.String(), nil
-}
-
-var funcMap = template.FuncMap{
-	"env":          envFunc,
-	"base64encode": base64EncodeFunc,
-	"base64decode": base64DecodeFunc,
-	"default":      defaultFunc,
-	"quote":        quoteFunc,
 }
 
 func envFunc(key string) string {

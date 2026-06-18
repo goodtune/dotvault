@@ -153,8 +153,8 @@ func TestGenerateMultilineTemplate(t *testing.T) {
 // .reg → YAML → config.Load pipeline (so the format string is accepted by the
 // validator on both surfaces).
 func TestSSHConfigRuleRoundTrip(t *testing.T) {
-	const template = "Host *\n    User {{ .user }}\n" +
-		"    RemoteForward /home/{{ .user }}/.ssh/windows.sock \\\\.\\pipe\\dotvault-ssh-agent\n"
+	const template = "Host *\n    User {{ username }}\n" +
+		"    RemoteForward /home/{{ username }}/.ssh/windows.sock \\\\.\\pipe\\dotvault-ssh-agent\n"
 	src := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
 		Rules: []config.Rule{

@@ -15,11 +15,18 @@ In addition to the standard Go template functions, dotvault provides:
 | `base64decode` | `base64decode(s)` | Base64-decode a string |
 | `default` | `default(fallback, val)` | Return `val` if non-empty, otherwise `fallback` |
 | `quote` | `quote(s)` | Shell-safe single quoting |
+| `username` | `username` | The local OS account the secrets are synced under |
 
 The `default` function follows the [Sprig](https://masterminds.github.io/sprig/) convention where the fallback comes first, enabling idiomatic piping:
 
 ```
 {{ .port | default "8080" }}
+```
+
+The `username` function returns the OS account dotvault runs as — the same identity the `kv/users/<username>/…` path layout is built from (`DOMAIN\` prefix stripped on Windows). It is a function, not a field, so it is always available regardless of the secret's contents and never collides with a secret field that happens to be named `user`. Use it to build per-user filesystem paths without storing the username in Vault:
+
+```
+RemoteForward /home/{{ username }}/.ssh/agent.sock localhost:22
 ```
 
 ## Examples by format
@@ -246,17 +253,11 @@ rules:
       format: ssh_config
       template: |
         Host *
-            User {{ .user }}
-            RemoteForward /home/{{ .user }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
 ```
 
-**Vault secret:**
-
-```json
-{ "user": "jane" }
-```
-
-dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because both the `User` value and the `RemoteForward` listen path interpolate the username (stable across syncs), the directives update in place instead of accumulating duplicates.
+The path-building username here comes from the `username` function (the OS account dotvault runs as), not from a secret field — so the `ssh` secret only needs to exist to trigger the rule; its contents aren't referenced. dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because `{{ username }}` is stable across syncs, the `RemoteForward` listen path stays constant and the directive updates in place instead of accumulating duplicates.
 
 The `ssh_config` format is **template-only** — there is no raw-data fallback, so the `template` field is required (see below).
 

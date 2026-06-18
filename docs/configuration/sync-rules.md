@@ -67,11 +67,11 @@ The motivating use case is a predictable, agent-forwarding SSH socket. A templat
 
 ```
 Host *
-    User {{ .user }}
-    RemoteForward /home/{{ .user }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+    User {{ username }}
+    RemoteForward /home/{{ username }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
 ```
 
-keeps the `User` and the `RemoteForward` listen path stable across syncs (both interpolate the username), so the agent forward is updated in place rather than duplicated each cycle.
+keeps the `User` and the `RemoteForward` listen path stable across syncs (the `username` function resolves to the OS account dotvault runs as), so the agent forward is updated in place rather than duplicated each cycle. See [Templates](templates.md#template-functions) for the `username` function.
 
 > **Ordering note.** ssh_config takes the *first* obtained value for each parameter. Directives placed in the global section (no `Host` block) sit at the top of the file and therefore win over any host-specific value below them — keep that in mind when choosing whether a template targets the global section or a specific `Host`/`Match` block.
 

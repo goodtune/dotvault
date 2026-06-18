@@ -403,7 +403,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// Render template if present
 	var incomingData any
 	if rule.Target.Template != "" {
-		rendered, err := tmpl.Render(rule.Name, rule.Target.Template, secret.Data)
+		rendered, err := tmpl.RenderWithUsername(rule.Name, rule.Target.Template, secret.Data, e.username)
 		if err != nil {
 			return fmt.Errorf("render template: %w", err)
 		}

@@ -349,12 +349,13 @@ type Target struct {
 }
 
 var validFormats = map[string]bool{
-	"yaml":  true,
-	"json":  true,
-	"ini":   true,
-	"toml":  true,
-	"text":  true,
-	"netrc": true,
+	"yaml":       true,
+	"json":       true,
+	"ini":        true,
+	"toml":       true,
+	"text":       true,
+	"netrc":      true,
+	"ssh_config": true,
 }
 
 // LoadSystem loads configuration using the platform-appropriate source.
@@ -784,7 +785,7 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 		return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
 	}
 	if !validFormats[r.Target.Format] {
-		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
+		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
 	}
 	return nil
 }

@@ -99,7 +99,7 @@ internal/
   tokenwatch/            Watches ~/.dotvault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
   sync/                  Hybrid event+poll sync engine, state store
-  handlers/              File format handlers (yaml, json, ini, toml, text, netrc)
+  handlers/              File format handlers (yaml, json, ini, toml, text, netrc, ssh_config)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
   enrol/                 Credential acquisition via OAuth device flow
   web/                   Web UI server (Preact SPA), auth endpoints, REST API
@@ -140,7 +140,7 @@ On Windows, if Group Policy registry keys exist at `HKLM\SOFTWARE\Policies\goodt
 - `vault.address` is required
 - At least one rule is required
 - Rule names must be unique
-- `target.format` must be one of: yaml, json, ini, toml, text, netrc
+- `target.format` must be one of: yaml, json, ini, toml, text, netrc, ssh_config
 - `web.listen` must resolve to a loopback address if web is enabled
 - Enrolment entries must have a non-empty engine field
 - Enrolment keys are flat (`gh`) or one-level grouped (`group/name`); at most one `/`, no empty segments, no backslash
@@ -399,6 +399,7 @@ All handlers implement the `FileHandler` interface (Read, Merge, Write). Handler
 | TOML | Custom parser (no external dep) | Recursive merge like JSON; supports tables, inline tables, dotted keys |
 | Text | Plain string | Full replacement (no merge) — for private keys, certificates |
 | Netrc | `github.com/jdx/go-netrc` | Per-entry merge by machine name; default entry skipped |
+| ssh_config | Custom parser (no external dep) | Surgical directive-level merge within each Host/Match section; comments and unmanaged directives preserved verbatim. Template-only (no raw-data path) |
 
 The `merge` field exists in rule config but is not dispatched on. Each handler always uses its native merge strategy, which is the only sensible strategy for that format.
 

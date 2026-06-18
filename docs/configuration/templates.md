@@ -233,6 +233,33 @@ rules:
 
 Text format uses full replacement — the entire file content is overwritten. This is appropriate for opaque blobs like private keys and certificates where merging is not meaningful.
 
+### ssh_config
+
+Surgically manage directives in `~/.ssh/config`. The motivating case is a predictable, agent-forwarding socket on a Linux host that forwards agent requests back to a Windows instance:
+
+```yaml
+rules:
+  - name: ssh-agent-forward
+    vault_key: "ssh"
+    target:
+      path: "~/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ .user }}
+            RemoteForward /home/{{ .user }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+```
+
+**Vault secret:**
+
+```json
+{ "user": "jane" }
+```
+
+dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because both the `User` value and the `RemoteForward` listen path interpolate the username (stable across syncs), the directives update in place instead of accumulating duplicates.
+
+The `ssh_config` format is **template-only** — there is no raw-data fallback, so the `template` field is required (see below).
+
 ## Templates without the template field
 
 If no `template` is specified, dotvault passes the raw Vault KV data map to the format handler. For YAML and JSON, this means all fields from the Vault secret are written to the file:
@@ -247,6 +274,8 @@ rules:
 ```
 
 If the Vault secret at `kv/data/users/jane/myapp` contains `{"api_key": "xxx", "db_pass": "yyy"}`, the resulting file would have both fields merged into it.
+
+The `ssh_config` format is the exception: it has no raw-data path (there is no sensible mapping from arbitrary key/value pairs to ssh directives), so a rule using it must always supply a `template`. Omitting it produces a clear error at sync time.
 
 ## Tips
 

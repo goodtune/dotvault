@@ -21,7 +21,7 @@ rules:
 | `name` | yes | Unique rule identifier, used in status output and state tracking |
 | `vault_key` | yes | Secret key under the user's Vault path |
 | `target.path` | yes | Local file path (`~` is expanded to the user's home directory) |
-| `target.format` | yes | Output format: `yaml`, `json`, `ini`, `toml`, `text`, or `netrc` |
+| `target.format` | yes | Output format: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, or `ssh_config` |
 | `target.template` | no | Go template to reshape secret data before writing |
 
 ## How sync works
@@ -51,8 +51,29 @@ Each format has a merge strategy appropriate to its structure:
 | **TOML** | Recursive merge; supports tables, inline tables, and dotted keys |
 | **Text** | Full replacement (no merge) — for private keys, certificates, etc. |
 | **Netrc** | Per-entry merge by machine name; the default entry is skipped |
+| **ssh_config** | Surgical directive-level merge within each `Host`/`Match` section; comments, blank lines, and unmanaged directives are preserved verbatim |
 
-The key insight is that for structured formats (YAML, JSON, INI, TOML, netrc), dotvault only touches the keys it manages. A user's other settings in the same file are preserved.
+The key insight is that for structured formats (YAML, JSON, INI, TOML, netrc, ssh_config), dotvault only touches the keys it manages. A user's other settings in the same file are preserved.
+
+### ssh_config
+
+The `ssh_config` format manages an OpenSSH client configuration file (typically `~/.ssh/config`) as documented in `ssh_config(5)`. It is **template-only** — there is no natural mapping from raw Vault key/value pairs to ssh directives, so a rule using this format must supply a `target.template` (a rule without one fails at sync time with a clear error).
+
+The merge is surgical at the directive level. Directives are grouped into the sections introduced by `Host` and `Match` lines (directives before the first such line form an implicit *global* section that applies to every host). Sections are matched by their criteria line (`Host *`, `Match host *.internal user deploy`, …), and within a matched section dotvault updates only the directives the template names, leaving every comment, blank line, and unmanaged directive exactly where it was. A section the template introduces but the file lacks is appended whole.
+
+Most keywords are single-valued — a second occurrence replaces the first. Keywords that legitimately repeat (`IdentityFile`, `CertificateFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `SendEnv`, `SetEnv`, `Include`, `PermitRemoteOpen`) accumulate instead: each entry is keyed by a discriminator drawn from its arguments — the listen spec for a forward, the path for an `IdentityFile`, the variable name for a `SetEnv` — so re-syncing the same logical entry updates it in place while distinct entries coexist.
+
+The motivating use case is a predictable, agent-forwarding SSH socket. A template such as:
+
+```
+Host *
+    User {{ .user }}
+    RemoteForward /home/{{ .user }}/.ssh/windows.sock \\.\pipe\dotvault-ssh-agent
+```
+
+keeps the `User` and the `RemoteForward` listen path stable across syncs (both interpolate the username), so the agent forward is updated in place rather than duplicated each cycle.
+
+> **Ordering note.** ssh_config takes the *first* obtained value for each parameter. Directives placed in the global section (no `Host` block) sit at the top of the file and therefore win over any host-specific value below them — keep that in mind when choosing whether a template targets the global section or a specific `Host`/`Match` block.
 
 ## File permissions
 

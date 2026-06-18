@@ -40,6 +40,8 @@ func HandlerFor(format string) (FileHandler, error) {
 		return &TextHandler{}, nil
 	case "netrc":
 		return &NetrcHandler{}, nil
+	case "ssh_config":
+		return &SSHConfigHandler{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported format: %q", format)
 	}

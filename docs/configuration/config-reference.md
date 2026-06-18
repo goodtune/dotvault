@@ -146,6 +146,6 @@ dotvault validates the configuration on startup and exits with an error if:
 - `vault.address` is missing
 - No rules are defined (waived when `remote_config.url` is set — the remote document may supply them)
 - Rule names are not unique
-- A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`
+- A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
 - `web.listen` resolves to a non-loopback address (when web is enabled)
 - An enrolment entry has an empty `engine` field

@@ -14,7 +14,7 @@ If you distribute system-level configuration to a fleet of machines — via NixO
 
 - **Surgical merging** — secrets are merged into existing files, not templated over the top of them
 - **Multiple auth methods** — OIDC (browser-based SSO), LDAP with MFA, or direct token
-- **Six output formats** — YAML, JSON, INI, TOML, text, and netrc with format-appropriate merge strategies
+- **Seven output formats** — YAML, JSON, INI, TOML, text, netrc, and ssh_config with format-appropriate merge strategies
 - **Go templates** — reshape secret data before writing, with helpers for encoding and defaults
 - **Daemon or one-shot** — runs as a long-lived service with automatic token refresh, or a single sync cycle
 - **Web UI** — optional local dashboard for login, status, and secret inspection

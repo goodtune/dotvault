@@ -373,19 +373,19 @@ Hybrid event-driven + polling model (`internal/sync/`):
 
 Per-rule sync logic:
 1. Read secret from Vault at `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
-2. Skip if vault version unchanged AND file checksum unchanged
+2. Skip only if vault version unchanged AND the rule's render-affecting definition is unchanged AND file checksum unchanged. The rule fingerprint (`ruleRenderHash`: vault key + target path/format/template/merge, length-prefixed) is stored in state and is what makes a template edit re-apply on an otherwise-unchanged secret — without it, editing only `target.template` would skip forever because neither the secret version nor the on-disk file moved. Empty `rule_hash` in state written by an older version forces a one-time reconciling re-sync on upgrade.
 3. Render template (if present) with Vault data map as dot context
 4. Parse rendered output through handler to get incoming structured data
 5. Read existing file via handler (missing file is empty state, not error; missing parent dir created at 0755)
 6. Merge incoming into existing via handler
 7. Write atomically (temp file + rename)
-8. Update state (version, timestamp, checksum)
+8. Update state (version, timestamp, checksum, rule hash)
 
 Per-rule isolation: one rule failing does not block others.
 
 ### State Store
 
-Persists to `{cache_dir}/state.json`. Per-rule: vault version, last synced timestamp, SHA-256 file checksum. Atomic writes via temp file + rename.
+Persists to `{cache_dir}/state.json`. Per-rule: vault version, last synced timestamp, SHA-256 file checksum, and `rule_hash` (the render-affecting rule fingerprint that gates re-sync on a template edit). Atomic writes via temp file + rename.
 
 ## File Format Handlers
 

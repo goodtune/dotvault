@@ -96,9 +96,37 @@ Host example
 	}
 }
 
-// TestSSHConfig_UpdateInPlace updates single-valued directives within a named
-// Host block and confirms surrounding directives, an indented comment, and the
-// block's indentation style are all preserved.
+// TestSSHConfig_GlobalRemoteForwardUpdateByUsername reproduces the agent-forward
+// update reported against {{ username }}: an existing global-section directive
+// whose RemoteForward listen spec embeds the username keeps that listen spec
+// stable across a template change (both interpolate the same username), so only
+// the forward target is rewritten in place — no duplicate line, and User is left
+// alone. The incoming text is what the sync engine produces after
+// RenderWithUsername binds {{ username }} to "goodtune"; the handler never sees
+// the template, only its rendered output.
+func TestSSHConfig_GlobalRemoteForwardUpdateByUsername(t *testing.T) {
+	existing := "User goodtune\n" +
+		"RemoteForward /home/goodtune/.ssh/dotvault.sock oldhost:9000\n"
+	// Template `User {{ username }}` / `RemoteForward /home/{{ username }}/...`
+	// after rendering {{ username }} -> goodtune.
+	incoming := "User goodtune\n" +
+		"RemoteForward /home/goodtune/.ssh/dotvault.sock newhost:9001\n"
+
+	got := mergeRender(t, existing, incoming)
+
+	want := "User goodtune\n" +
+		"RemoteForward /home/goodtune/.ssh/dotvault.sock newhost:9001\n"
+	if got != want {
+		t.Errorf("merge mismatch:\n--- want ---\n%q\n--- got ---\n%q", want, got)
+	}
+	if n := strings.Count(got, "RemoteForward"); n != 1 {
+		t.Errorf("expected exactly one RemoteForward (update in place, not duplicate), got %d:\n%s", n, got)
+	}
+}
+
+// TestSSHConfig_UpdateInPlace updates a single-valued directive within an
+// existing Host block and confirms surrounding directives, an indented comment,
+// and the block's indentation style are all preserved.
 func TestSSHConfig_UpdateInPlace(t *testing.T) {
 	existing, err := os.ReadFile("testdata/existing.ssh_config")
 	if err != nil {

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -371,10 +372,13 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return fmt.Errorf("expand target path: %w", err)
 	}
 
-	// Check version and target file — skip only if vault secret is unchanged
-	// AND the target file still matches what we last wrote.
+	// Check version, rule definition, and target file — skip only if the vault
+	// secret is unchanged, the rule's render-affecting definition is unchanged
+	// (so an edited template re-applies even on an untouched secret), AND the
+	// target file still matches what we last wrote.
 	currentState := e.state.Get(rule.Name)
-	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
+	ruleHash := ruleRenderHash(rule)
+	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 && currentState.RuleHash == ruleHash {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {
 			// Even when content is unchanged, enforce 0600 permissions.
@@ -484,6 +488,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		VaultVersion: secret.Version,
 		LastSynced:   time.Now(),
 		FileChecksum: newChecksum,
+		RuleHash:     ruleHash,
 	})
 	if err := e.state.Save(); err != nil {
 		log.Warn("failed to save state", "error", err)
@@ -491,6 +496,28 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 	log.Info("synced secret to file", "path", targetPath, "version", secret.Version)
 	return nil
+}
+
+// ruleRenderHash fingerprints the fields of a rule that determine its rendered,
+// merged output: the vault key it reads and the target's path, format,
+// template, and merge strategy. It is stored in RuleState so the skip gate can
+// tell a render-affecting edit (most commonly a changed template) apart from an
+// untouched rule even when the secret version and on-disk file are unchanged —
+// the scenario where a template change would otherwise never re-apply. Each
+// field is length-prefixed so distinct field boundaries cannot alias (e.g. a
+// path ending where the next field begins).
+func ruleRenderHash(rule config.Rule) string {
+	h := sha256.New()
+	for _, s := range []string{
+		rule.VaultKey,
+		rule.Target.Path,
+		rule.Target.Format,
+		rule.Target.Template,
+		rule.Target.Merge,
+	} {
+		fmt.Fprintf(h, "%d:%s", len(s), s)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // convertToNetrcVaultData converts raw Vault JSON data to NetrcVaultData.

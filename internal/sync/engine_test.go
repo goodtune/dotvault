@@ -193,6 +193,71 @@ func TestEngine_RunOnceSkipsUnchanged(t *testing.T) {
 	}
 }
 
+// TestEngine_RunOnceReappliesOnTemplateChange is the end-to-end guard for the
+// ruleRenderHash skip gate: with the Vault secret and the on-disk file both
+// unchanged, editing only the rule's template must still re-render and rewrite
+// the file. Before the rule-hash gate this skipped forever (version + checksum
+// both matched), which is the agent-forward "{{ username }} edit never applies"
+// bug this fixes.
+func TestEngine_RunOnceReappliesOnTemplateChange(t *testing.T) {
+	skipIfNoVault(t)
+
+	vc := testVaultClient(t)
+	seedVaultData(t, vc)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	mkRule := func(host string) config.Rule {
+		return config.Rule{
+			Name:     "gh",
+			VaultKey: "gh",
+			Target: config.Target{
+				Path:     ghPath,
+				Format:   "yaml",
+				Template: "github.com:\n  oauth_token: \"{{.token}}\"\n  host: " + host,
+				Merge:    "deep",
+			},
+		}
+	}
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{mkRule("oldhost")},
+	}
+
+	engine := NewEngine(cfg, vc, "testuser", statePath)
+
+	// First run writes the old template output.
+	engine.RunOnce(context.Background())
+	first, err := os.ReadFile(ghPath)
+	if err != nil {
+		t.Fatalf("read after first sync: %v", err)
+	}
+	if !strings.Contains(string(first), "host: oldhost") {
+		t.Fatalf("first sync missing old host:\n%s", first)
+	}
+
+	// Swap only the template — the Vault secret is untouched, and the file is
+	// exactly what we last wrote, so the only thing that changed is the rule
+	// definition (and thus its render hash).
+	engine.UpdateConfig([]config.Rule{mkRule("newhost")}, 0)
+
+	engine.RunOnce(context.Background())
+	second, err := os.ReadFile(ghPath)
+	if err != nil {
+		t.Fatalf("read after second sync: %v", err)
+	}
+	if !strings.Contains(string(second), "host: newhost") {
+		t.Errorf("template change not re-applied (skip gate still firing):\n%s", second)
+	}
+	if strings.Contains(string(second), "host: oldhost") {
+		t.Errorf("old template output lingering after re-sync:\n%s", second)
+	}
+}
+
 func TestEngine_RunOnceResyncAfterFileDeleted(t *testing.T) {
 	skipIfNoVault(t)
 
@@ -377,9 +442,9 @@ func TestEngine_RunLoopAfterInitialSyncHook(t *testing.T) {
 	defer cancel()
 
 	var (
-		hookCalls          int
-		fileExistedAtHook  bool
-		mtimeAtHook        time.Time
+		hookCalls         int
+		fileExistedAtHook bool
+		mtimeAtHook       time.Time
 	)
 	if err := engine.RunLoop(ctx, AfterInitialSync(func() {
 		hookCalls++

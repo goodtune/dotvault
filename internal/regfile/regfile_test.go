@@ -3,6 +3,7 @@ package regfile
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -142,6 +143,133 @@ func TestGenerateMultilineTemplate(t *testing.T) {
 	// Newline (0x0A) should appear in the hex bytes.
 	if !strings.Contains(got, "0a,00") {
 		t.Errorf("expected UTF-16LE LF byte (0a,00); got:\n%s", got)
+	}
+}
+
+// TestSSHConfigRuleRoundTrip proves the ssh_config format has full Windows
+// registry parity: a rule whose target format is "ssh_config" with a multi-line
+// template (the dotvault-forward use case) survives both the .reg render → parse
+// cycle (the multi-line template routing through hex(1) like any other) and the
+// .reg → YAML → config.Load pipeline (so the format string is accepted by the
+// validator on both surfaces).
+func TestSSHConfigRuleRoundTrip(t *testing.T) {
+	const template = "Host *\n    User {{ username }}\n" +
+		"    RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200\n"
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "ssh",
+				VaultKey: "ssh",
+				Target: config.Target{
+					Path:     "~/.ssh/config",
+					Format:   "ssh_config",
+					Template: template,
+				},
+			},
+		},
+	}
+
+	// .reg render carries the format verbatim and emits the multi-line
+	// template as hex(1).
+	text := mustGenerate(t, src)
+	if !strings.Contains(text, "\"TargetFormat\"=\"ssh_config\"\r\n") {
+		t.Errorf("rendered .reg missing ssh_config format\n--- output ---\n%s", text)
+	}
+	if !strings.Contains(text, "\"TargetTemplate\"=hex(1):") {
+		t.Errorf("multi-line ssh_config template should be hex(1)\n--- output ---\n%s", text)
+	}
+
+	// .reg parse reconstructs the rule with the format and template intact.
+	parsed, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(parsed.Rules))
+	}
+	if parsed.Rules[0].Target.Format != "ssh_config" {
+		t.Errorf("Format = %q, want ssh_config", parsed.Rules[0].Target.Format)
+	}
+	if parsed.Rules[0].Target.Template != template {
+		t.Errorf("Template round-trip mismatch.\n--- want ---\n%q\n--- got ---\n%q", template, parsed.Rules[0].Target.Template)
+	}
+
+	// The YAML path (reg-export → config.Load) accepts the format too.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load rejected ssh_config rule: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].Target.Format != "ssh_config" {
+		t.Errorf("ssh_config rule not preserved through YAML load: %+v", loaded.Rules)
+	}
+}
+
+// TestKeylessRuleRoundTrip covers a rule with no vault_key (an empty VaultKey):
+// it must survive the .reg render → parse cycle (VaultKey emitted as "" and read
+// back empty, not dropped or defaulted) and the .reg → YAML → config.Load
+// pipeline (the validator accepting a keyless rule because it carries a
+// template). This is the registry-parity guarantee for the keyless feature.
+func TestKeylessRuleRoundTrip(t *testing.T) {
+	const template = "Host *\n    User {{ username }}\n"
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name: "dotvault-forward", // no VaultKey
+				Target: config.Target{
+					Path:     "~/.ssh/config",
+					Format:   "ssh_config",
+					Template: template,
+				},
+			},
+		},
+	}
+
+	text := mustGenerate(t, src)
+	if !strings.Contains(text, "\"VaultKey\"=\"\"\r\n") {
+		t.Errorf("keyless rule should emit VaultKey as \"\"\n--- output ---\n%s", text)
+	}
+
+	parsed, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(parsed.Rules))
+	}
+	if parsed.Rules[0].VaultKey != "" {
+		t.Errorf("VaultKey = %q, want empty (keyless)", parsed.Rules[0].VaultKey)
+	}
+	if parsed.Rules[0].Target.Template != template {
+		t.Errorf("Template round-trip mismatch: %q", parsed.Rules[0].Target.Template)
+	}
+
+	// The YAML path (reg-export → config.Load) accepts the keyless rule.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load rejected keyless rule: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].VaultKey != "" {
+		t.Errorf("keyless rule not preserved through YAML load: %+v", loaded.Rules)
 	}
 }
 

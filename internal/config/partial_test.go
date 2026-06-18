@@ -134,9 +134,13 @@ func TestPartialValidate(t *testing.T) {
 			wantErr: "duplicate rule name",
 		},
 		{
-			name:    "missing vault_key",
+			name:    "keyless rule without template",
 			partial: Partial{Rules: []Rule{{Name: "a", Target: Target{Path: "p", Format: "text"}}}},
-			wantErr: "vault_key is required",
+			wantErr: "must supply target.template",
+		},
+		{
+			name:    "keyless rule with template is valid",
+			partial: Partial{Rules: []Rule{{Name: "a", Target: Target{Path: "p", Format: "ssh_config", Template: "Host *\n    User {{ username }}\n"}}}},
 		},
 		{
 			name:    "invalid format",

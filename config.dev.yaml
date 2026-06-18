@@ -107,6 +107,21 @@ rules:
           "version": "6"
         }
 
+  # Keyless rule: no vault_key, so it never reads Vault. It manages an
+  # ssh_config file built purely from the {{ username }} function and
+  # literals. The example exposes the local dotvault (Vault) endpoint on a
+  # remote host via a stable per-user socket — a dotvault-to-dotvault sharing
+  # setup. A keyless rule must carry a template (there is no secret data to
+  # fall back on).
+  - name: dotvault-forward
+    target:
+      path: "~/tmp/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
+
 enrolments:
   gh:
     engine: github

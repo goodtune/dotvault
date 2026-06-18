@@ -23,7 +23,7 @@ On desktop environments it can run a local web service. If the current session i
 ## Features
 
 - **Multiple auth methods** — OIDC (browser-based), LDAP with MFA (Duo push, TOTP), or token-based authentication, with automatic token renewal and re-auth on expiry
-- **Six file formats** — Write secrets as YAML, JSON, INI, TOML, or netrc with format-native merges that preserve existing keys not managed by `dotvault`, plus a plain-text format for full-file content such as private keys and certificates
+- **Seven file formats** — Write secrets as YAML, JSON, INI, TOML, netrc, or ssh_config with format-native merges that preserve existing keys not managed by `dotvault`, plus a plain-text format for full-file content such as private keys and certificates
 - **Go templates** — Optionally reshape secret data before writing, with helpers like `env`, `base64encode`, `default`, and `quote`
 - **Hybrid event + poll sync** — Subscribes to the Vault Events API on Enterprise for sub-second reaction to changes; falls back transparently to polling on Community Vault
 - **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
@@ -118,7 +118,7 @@ Each rule maps a Vault secret to a local file:
 | `name` | Unique rule identifier |
 | `vault_key` | Key in Vault (e.g. `gh` resolves to `kv/data/users/<you>/gh`) |
 | `target.path` | Local file path (supports `~`) |
-| `target.format` | One of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc` |
+| `target.format` | One of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config` |
 | `target.template` | Optional Go template for formatting |
 
 Managed files are written atomically at `0600`.

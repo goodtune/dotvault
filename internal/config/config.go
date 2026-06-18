@@ -349,12 +349,13 @@ type Target struct {
 }
 
 var validFormats = map[string]bool{
-	"yaml":  true,
-	"json":  true,
-	"ini":   true,
-	"toml":  true,
-	"text":  true,
-	"netrc": true,
+	"yaml":       true,
+	"json":       true,
+	"ini":        true,
+	"toml":       true,
+	"text":       true,
+	"netrc":      true,
+	"ssh_config": true,
 }
 
 // LoadSystem loads configuration using the platform-appropriate source.
@@ -777,14 +778,18 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	}
 	seen[r.Name] = true
 
-	if r.VaultKey == "" {
-		return fmt.Errorf("rules[%d] (%s): vault_key is required", i, r.Name)
+	// vault_key is optional: a rule may manage a file with no Vault-backed
+	// content (e.g. an ssh_config built purely from {{ username }} and
+	// literals). Such a keyless rule renders with an empty data context, so it
+	// must carry a template — there is no secret data to fall back on.
+	if r.VaultKey == "" && r.Target.Template == "" {
+		return fmt.Errorf("rules[%d] (%s): a rule without vault_key must supply target.template (no secret data to write otherwise)", i, r.Name)
 	}
 	if r.Target.Path == "" {
 		return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
 	}
 	if !validFormats[r.Target.Format] {
-		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
+		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
 	}
 	return nil
 }

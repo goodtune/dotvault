@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -354,15 +355,25 @@ func (e *Engine) syncRuleByPath(ctx context.Context, path string) {
 func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	log := slog.With("rule", rule.Name)
 
-	// Read secret from Vault
-	secretPath := e.cfg.Vault.UserPrefix + e.username + "/" + rule.VaultKey
-	secret, err := e.vault.ReadKVv2(ctx, e.cfg.Vault.KVMount, secretPath)
-	if err != nil {
-		return fmt.Errorf("read vault secret: %w", err)
-	}
-	if secret == nil {
-		log.Warn("secret not found in vault", "path", secretPath)
-		return nil
+	// Read the secret only when the rule names a vault key. A keyless rule
+	// (e.g. an ssh_config file built purely from {{ username }} and literals)
+	// manages a file with no Vault-backed content: it renders with an empty
+	// data context and never contacts Vault. The username function still works
+	// in either case, because it is a template function, not a context field.
+	secretData := map[string]any{}
+	secretVersion := 0
+	if rule.VaultKey != "" {
+		secretPath := e.cfg.Vault.UserPrefix + e.username + "/" + rule.VaultKey
+		secret, err := e.vault.ReadKVv2(ctx, e.cfg.Vault.KVMount, secretPath)
+		if err != nil {
+			return fmt.Errorf("read vault secret: %w", err)
+		}
+		if secret == nil {
+			log.Warn("secret not found in vault", "path", secretPath)
+			return nil
+		}
+		secretData = secret.Data
+		secretVersion = secret.Version
 	}
 
 	// Resolve target path
@@ -371,10 +382,17 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 		return fmt.Errorf("expand target path: %w", err)
 	}
 
-	// Check version and target file — skip only if vault secret is unchanged
-	// AND the target file still matches what we last wrote.
+	// Check version, rule definition, and target file — skip only if the vault
+	// secret is unchanged, the rule's render-affecting definition is unchanged
+	// (so an edited template re-applies even on an untouched secret), AND the
+	// target file still matches what we last wrote. A keyless rule has no secret
+	// version, so the rule fingerprint plus the file checksum carry the whole
+	// skip decision for it (a never-synced rule has an empty stored RuleHash,
+	// which cannot match the non-empty computed hash, forcing the first sync).
 	currentState := e.state.Get(rule.Name)
-	if secret.Version == currentState.VaultVersion && currentState.VaultVersion > 0 {
+	ruleHash := ruleRenderHash(rule)
+	versionUnchanged := rule.VaultKey == "" || (secretVersion == currentState.VaultVersion && currentState.VaultVersion > 0)
+	if versionUnchanged && currentState.RuleHash == ruleHash {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {
 			// Even when content is unchanged, enforce 0600 permissions.
@@ -403,7 +421,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// Render template if present
 	var incomingData any
 	if rule.Target.Template != "" {
-		rendered, err := tmpl.Render(rule.Name, rule.Target.Template, secret.Data)
+		rendered, err := tmpl.RenderWithUsername(rule.Name, rule.Target.Template, secretData, e.username)
 		if err != nil {
 			return fmt.Errorf("render template: %w", err)
 		}
@@ -418,18 +436,19 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 			return fmt.Errorf("parse rendered template: %w", err)
 		}
 	} else {
-		// No template — use vault data directly
+		// No template — use vault data directly. (A keyless rule is required to
+		// have a template, so secretData here is always a real secret's data.)
 		// For netrc format, convert raw vault data to NetrcVaultData
 		if rule.Target.Format == "netrc" {
-			incomingData = convertToNetrcVaultData(secret.Data)
+			incomingData = convertToNetrcVaultData(secretData)
 		} else if rule.Target.Format == "text" {
-			textData, err := convertToTextData(secret.Data)
+			textData, err := convertToTextData(secretData)
 			if err != nil {
 				return fmt.Errorf("convert vault data to text: %w", err)
 			}
 			incomingData = textData
 		} else {
-			incomingData = secret.Data
+			incomingData = secretData
 		}
 	}
 
@@ -461,7 +480,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 	// Write (or log what would be written in dry-run mode)
 	if e.DryRun {
-		log.Info("dry-run: would write file", "path", targetPath, "version", secret.Version, "permissions", fmt.Sprintf("%04o", perm))
+		log.Info("dry-run: would write file", "path", targetPath, "version", secretVersion, "permissions", fmt.Sprintf("%04o", perm))
 		return nil
 	}
 
@@ -481,16 +500,39 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// Update state
 	newChecksum, _ := FileChecksum(targetPath)
 	e.state.Set(rule.Name, RuleState{
-		VaultVersion: secret.Version,
+		VaultVersion: secretVersion,
 		LastSynced:   time.Now(),
 		FileChecksum: newChecksum,
+		RuleHash:     ruleHash,
 	})
 	if err := e.state.Save(); err != nil {
 		log.Warn("failed to save state", "error", err)
 	}
 
-	log.Info("synced secret to file", "path", targetPath, "version", secret.Version)
+	log.Info("synced file", "path", targetPath, "version", secretVersion)
 	return nil
+}
+
+// ruleRenderHash fingerprints the fields of a rule that determine its rendered,
+// merged output: the vault key it reads and the target's path, format,
+// template, and merge strategy. It is stored in RuleState so the skip gate can
+// tell a render-affecting edit (most commonly a changed template) apart from an
+// untouched rule even when the secret version and on-disk file are unchanged —
+// the scenario where a template change would otherwise never re-apply. Each
+// field is length-prefixed so distinct field boundaries cannot alias (e.g. a
+// path ending where the next field begins).
+func ruleRenderHash(rule config.Rule) string {
+	h := sha256.New()
+	for _, s := range []string{
+		rule.VaultKey,
+		rule.Target.Path,
+		rule.Target.Format,
+		rule.Target.Template,
+		rule.Target.Merge,
+	} {
+		fmt.Fprintf(h, "%d:%s", len(s), s)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // convertToNetrcVaultData converts raw Vault JSON data to NetrcVaultData.

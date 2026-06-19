@@ -52,9 +52,41 @@ WINDOWS_VER_PATCH := $(word 3,$(subst ., ,$(WINDOWS_VERSION_PARTS)))
 # tab; a value already starting with a semver core is used verbatim.
 WINDOWS_VERSION_STRING := $(shell printf '%s' "$(VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && printf '%s' "$(VERSION)" || printf '0.0.0-%s' "$(VERSION)")
 
+# Python bindings (python/). The cgo c-shared bridge is the one place dotvault
+# builds with CGO_ENABLED=1 — it has to, c-shared requires cgo — and it is a
+# separate artefact, so the main binaries above stay CGO_ENABLED=0. The output
+# filename carries the platform's shared-library extension; ctypes loads it by
+# the _dotvault.* glob regardless.
+PY_GOOS := $(shell go env GOOS)
+ifeq ($(PY_GOOS),windows)
+PY_LIB := _dotvault.dll
+else ifeq ($(PY_GOOS),darwin)
+PY_LIB := _dotvault.dylib
+else
+PY_LIB := _dotvault.so
+endif
+
 .PHONY: test
 test:
 	go test ./...
+
+# Build the native bridge into the Python package directory for local use
+# (pytest, editable installs). The .h header go emits alongside it is not
+# needed at runtime and is removed so it never lands in a wheel.
+.PHONY: python-lib
+python-lib:
+	CGO_ENABLED=1 go build -buildmode=c-shared -o python/src/dotvault/$(PY_LIB) ./python/bridge
+	rm -f python/src/dotvault/_dotvault.h
+
+.PHONY: python-test
+python-test: python-lib
+	cd python && python3 -m pytest tests/ -q
+
+# Build a platform wheel. setup.py rebuilds the bridge as part of the build, so
+# this works from a clean tree; python-lib is not a prerequisite.
+.PHONY: python-wheel
+python-wheel:
+	cd python && python3 -m build --wheel
 
 .PHONY: build
 build:
@@ -103,3 +135,5 @@ FORCE:
 .PHONY: clean
 clean:
 	rm -rf dist/ $(WINDOWS_SYSO) $(WINDOWS_VERSION_STAMP)
+	rm -rf python/build python/dist python/src/dotvault.egg-info
+	rm -f python/src/dotvault/_dotvault.*

@@ -10,3 +10,11 @@ cmd/dotvault/*.syso
 # Records the VERSION the .syso was built against so a version change forces
 # regeneration; build artefact written by the Makefile.
 cmd/dotvault/.version-stamp
+# Python bindings build artefacts. The cgo c-shared library and header are
+# emitted by `go build -buildmode=c-shared` (see python/setup.py / the
+# python-lib Make target); the rest are standard setuptools/pytest output.
+python/src/dotvault/_dotvault.*
+python/build/
+python/src/dotvault.egg-info/
+python/.pytest_cache/
+__pycache__/

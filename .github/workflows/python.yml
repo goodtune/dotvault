@@ -1,0 +1,86 @@
+name: Python bindings
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "python/**"
+      - "client/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/python.yml"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build native bridge
+        run: make python-lib
+
+      - name: Run Go bridge tests
+        run: go test -race ./python/bridge/...
+
+      - name: Run Python tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          cd python && python -m pytest tests/ -q
+
+  wheels:
+    name: Wheel (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is arm64; macos-13 is the last Intel runner. Linux wheels
+        # built here are tagged for the runner's platform (not manylinux);
+        # producing manylinux-compliant wheels is a follow-up if/when these are
+        # published to PyPI.
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # setup.py compiles the cgo c-shared bridge as part of the wheel build, so
+      # `python -m build` from a full checkout produces a self-contained
+      # platform wheel with the native library embedded.
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          cd python && python -m build --wheel
+
+      - name: Smoke-test the built wheel
+        shell: bash
+        run: |
+          python -m pip install python/dist/*.whl
+          python -c "import dotvault; print(dotvault.default_config_path())"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotvault-wheel-${{ matrix.os }}
+          path: python/dist/*.whl

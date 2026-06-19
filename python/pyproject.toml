@@ -1,0 +1,40 @@
+[build-system]
+# >=77 so the PEP 639 SPDX `license` string below is validated rather than
+# treated as a legacy free-form value. Build isolation installs this fresh.
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dotvault"
+version = "0.0.0"
+description = "Python bindings for the dotvault public client API (read per-user Vault secrets dotvault enrols)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "dotvault authors" }]
+keywords = ["vault", "secrets", "dotvault", "hashicorp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/goodtune/dotvault"
+Repository = "https://github.com/goodtune/dotvault"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+# ext-module presence is forced in setup.py (BinaryDistribution) so the wheel
+# is tagged for the platform/arch of the embedded native library rather than
+# being a pure py3-none-any wheel that would be installed on the wrong ABI.
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dotvault = ["_dotvault.*", "py.typed"]

@@ -718,6 +718,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMethod:    cfg.Vault.AuthMethod,
 				AuthMount:     cfg.Vault.AuthMount,
 				AuthRole:      cfg.Vault.AuthRole,
+				TokenSocket:   cfg.Vault.TokenSocket,
 				Username:      username,
 				MTLS:          mtlsParams(cfg, username),
 			}
@@ -764,6 +765,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMethod:    cfg.Vault.AuthMethod,
 				AuthMount:     cfg.Vault.AuthMount,
 				AuthRole:      cfg.Vault.AuthRole,
+				TokenSocket:   cfg.Vault.TokenSocket,
 				Username:      username,
 				MTLS:          mtlsParams(cfg, username),
 			}
@@ -781,6 +783,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// stale "logged-in" view.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
 	lm.SetTokenFilePath(tokenPath)
+	lm.SetTokenSocket(cfg.Vault.TokenSocket)
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
 	}
@@ -801,6 +804,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			AuthMethod:    cfg.Vault.AuthMethod,
 			AuthMount:     cfg.Vault.AuthMount,
 			AuthRole:      cfg.Vault.AuthRole,
+			TokenSocket:   cfg.Vault.TokenSocket,
 			Username:      username,
 			MTLS:          mtlsP,
 		}
@@ -1265,6 +1269,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMethod:    cfg.Vault.AuthMethod,
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
+		TokenSocket:   cfg.Vault.TokenSocket,
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}
@@ -1549,6 +1554,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMethod:    cfg.Vault.AuthMethod,
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
+		TokenSocket:   cfg.Vault.TokenSocket,
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}
@@ -1782,6 +1788,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMethod:    cfg.Vault.AuthMethod,
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
+		TokenSocket:   cfg.Vault.TokenSocket,
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}

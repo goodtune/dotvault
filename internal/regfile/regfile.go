@@ -105,6 +105,7 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("CACert", v.CACert)
 	e.writeString("KVMount", v.KVMount)
 	e.writeString("UserPrefix", v.UserPrefix)
+	e.writeString("TokenSocket", v.TokenSocket)
 	e.writeBool("DisableTokenRenewal", v.DisableTokenRenewal)
 	e.writeBool("TLSSkipVerify", v.TLSSkipVerify)
 	e.WriteString("\r\n")

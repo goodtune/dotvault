@@ -161,6 +161,7 @@ type registryLayer struct {
 	VaultAuthRole            string
 	VaultAuthMount           string
 	VaultDisableTokenRenewal *uint32
+	VaultTokenSocket         string
 
 	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
 	MTLSBootstrapMethod string
@@ -243,6 +244,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultAuthRole, _ = readRegString(vk, "AuthRole")
 		layer.VaultAuthMount, _ = readRegString(vk, "AuthMount")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
+		layer.VaultTokenSocket, _ = readRegString(vk, "TokenSocket")
 	}
 
 	// Read Vault\MTLS subkey (cert auth) and its nested BYO subkey.
@@ -381,6 +383,9 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.VaultDisableTokenRenewal != nil {
 		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
+	}
+	if layer.VaultTokenSocket != "" {
+		cfg.Vault.TokenSocket = layer.VaultTokenSocket
 	}
 	if layer.MTLSBootstrapMethod != "" {
 		cfg.Vault.MTLS.BootstrapMethod = layer.MTLSBootstrapMethod

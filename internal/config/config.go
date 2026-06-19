@@ -183,6 +183,22 @@ type VaultConfig struct {
 	AuthRole            string `yaml:"auth_role"`
 	AuthMount           string `yaml:"auth_mount"`
 	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
+	// TokenSocket is an optional path to a Unix-domain socket served by a
+	// peer dotvault daemon's web API. When set, dotvault tries to borrow a
+	// live Vault token from the peer via `GET http://localhost/api/v1/token`
+	// over this socket — the equivalent of
+	// `curl --unix-socket <path> http://localhost/api/v1/token` — before
+	// falling back to its own authentication. The borrow runs where dotvault
+	// would otherwise authenticate interactively: on a fresh login (Manager
+	// .Login, after Authenticate finds no usable cached token) and on the
+	// lifecycle recovery path after a cached token goes invalid; a healthy
+	// RenewSelf renewal does not borrow. This is the dotvault-to-dotvault
+	// token-sharing seam: a machine with no interactive login facility (no
+	// browser, no TTY) borrows the token from a peer that has one, reached
+	// over an SSH RemoteForward'd socket. A leading ~ is expanded to the
+	// user's home. A missing or stale socket is ignored — the normal auth
+	// flow proceeds — so the field is purely additive and needs no validation.
+	TokenSocket string `yaml:"token_socket"`
 	// MTLS configures the cert auth methods. It is consulted only when
 	// AuthMethod is "mtls" or "mtls+tpm".
 	MTLS MTLSConfig `yaml:"mtls"`

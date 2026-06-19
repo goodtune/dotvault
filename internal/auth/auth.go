@@ -25,6 +25,12 @@ type Manager struct {
 	AuthMount  string // auth mount path
 	AuthRole   string // optional role
 	Username   string
+	// TokenSocket is an optional path to a peer dotvault's web-API Unix
+	// socket. When set, Login first tries to borrow a live token from the
+	// peer (dotvault-to-dotvault sharing) before running the configured
+	// interactive flow. A missing or stale socket is ignored. See
+	// FetchTokenFromSocket.
+	TokenSocket string
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
 }
@@ -52,6 +58,28 @@ func (m *Manager) Authenticate(ctx context.Context) error {
 // attempting to reuse an existing token. Used by `dotvault login` and as
 // the fallback path inside Authenticate.
 func (m *Manager) Login(ctx context.Context) error {
+	// Peer-socket token borrow. Before running an interactive flow, try to
+	// fetch a live token from a peer dotvault over the configured Unix socket
+	// (dotvault-to-dotvault sharing). This runs ahead of the TPM preflight and
+	// the method switch so a host that can borrow never needs a browser, a TTY,
+	// or a TPM. Best-effort: a missing/stale socket or an unusable token falls
+	// through to the configured auth method exactly as before. The borrowed
+	// token is held in memory only (not written to the token file), so the peer
+	// stays the single owner and we re-borrow on the next login rather than
+	// caching a copy that could go stale — and the "+tpm" sealing question
+	// never arises for it.
+	if m.TokenSocket != "" {
+		if token, _ := FetchTokenFromSocket(ctx, m.TokenSocket); token != "" {
+			m.VaultClient.SetToken(token)
+			if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
+				slog.Info("using vault token borrowed from peer socket", "socket", m.TokenSocket)
+				return nil
+			}
+			slog.Warn("token from peer socket is not usable, proceeding to configured auth flow")
+			m.VaultClient.SetToken("")
+		}
+	}
+
 	base := BaseMethod(m.AuthMethod)
 
 	// Preflight: a "+tpm" method on a host with no TPM must fail fast and

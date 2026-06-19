@@ -102,8 +102,35 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `user_prefix` | string | `users/` | Prefix for per-user secret paths (trailing slash enforced) |
 | `ca_cert` | string | — | Path to CA certificate for TLS verification |
 | `tls_skip_verify` | bool | `false` | Skip TLS certificate verification (development only) |
+| `disable_token_renewal` | bool | `false` | Never call `RenewSelf`; TTL expiry still triggers re-auth |
+| `token_socket` | string | — | Optional path to a peer dotvault's web-API Unix socket to borrow a token from (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
+
+### `token_socket` — dotvault-to-dotvault token sharing
+
+When `token_socket` points at a Unix-domain socket served by another dotvault daemon's web API, dotvault tries to **borrow a live Vault token from that peer** before falling back to its own authentication. The borrow is attempted exactly where dotvault would otherwise authenticate interactively: on a **fresh login** (`dotvault login`, or daemon/CLI startup when no cached token is usable — a still-valid cached token short-circuits first and never reaches the borrow), and on the lifecycle manager's **recovery path** after a cached token has gone invalid. A healthy token that is merely being renewed at 75% TTL (`RenewSelf`) does **not** trigger a borrow. It is the programmatic equivalent of:
+
+```sh
+curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/token
+```
+
+The intended deployment: a workstation (e.g. Windows) runs dotvault with the [web UI](#web-section) enabled and authenticates interactively. You then SSH **from the workstation to** a second machine (e.g. a Linux dev box or server), and the SSH `RemoteForward` exposes the workstation daemon's loopback HTTP listener as a Unix socket **created on the remote (devbox) side**:
+
+```
+# ~/.ssh/config on the workstation, where `ssh devbox` runs
+Host devbox
+    # Creates /home/me/.ssh/dotvault.sock ON devbox, forwarding to the
+    # workstation's web UI at 127.0.0.1:9000.
+    RemoteForward /home/me/.ssh/dotvault.sock 127.0.0.1:9000
+```
+
+The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows the workstation's token instead of needing its own browser or TTY to authenticate. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
+
+The borrow is **best-effort and never fatal**: if the socket path is empty, the socket file is missing, the socket is stale (left over from a dead SSH session, no listener), the peer is reachable but holds no token, or the response is malformed, dotvault silently carries on with its normal auth flow. A leading `~` is expanded to the user's home directory. The borrowed token is held in memory only — it is not written to the local token file, so the peer remains the single owner and the remote re-borrows on its next login or recovery rather than caching a copy that could go stale.
+
+!!! warning "The socket grants the token to anyone who can connect"
+    Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it. dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
 
 For example, with defaults and username `jane`, the rule `vault_key: "gh"` reads from `kv/data/users/jane/gh`.
 

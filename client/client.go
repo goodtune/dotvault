@@ -240,6 +240,7 @@ func (c *Client) manager() *auth.Manager {
 		AuthMethod:    c.cfg.Vault.AuthMethod,
 		AuthMount:     c.cfg.Vault.AuthMount,
 		AuthRole:      c.cfg.Vault.AuthRole,
+		TokenSocket:   c.cfg.Vault.TokenSocket,
 		Username:      username,
 	}
 }

@@ -75,6 +75,14 @@ type VaultConfig struct {
 
 	// AuthRole is an optional Vault role passed to the auth method.
 	AuthRole string
+
+	// TokenSocket is an optional path to a peer dotvault daemon's web-API
+	// Unix socket. When set, an interactive Login first tries to borrow a
+	// live token from the peer over the socket (the equivalent of
+	// `curl --unix-socket <path> http://localhost/api/v1/token`) before
+	// running the configured auth flow — the dotvault-to-dotvault sharing
+	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
+	TokenSocket string
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -137,6 +145,7 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthMethod:    cfg.Vault.AuthMethod,
 			AuthMount:     cfg.Vault.AuthMount,
 			AuthRole:      cfg.Vault.AuthRole,
+			TokenSocket:   cfg.Vault.TokenSocket,
 		},
 	}
 }

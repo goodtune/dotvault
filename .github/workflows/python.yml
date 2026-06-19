@@ -58,11 +58,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is arm64; macos-13 is the last Intel runner. Linux wheels
-        # built here are tagged for the runner's platform (not manylinux);
-        # producing manylinux-compliant wheels is a follow-up if/when these are
-        # published to PyPI.
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+        # macos-latest is arm64. Intel macOS (macos-13) is intentionally not
+        # built: GitHub is deprecating that runner, new Macs are arm64-only, and
+        # these wheels aren't published yet — so there's no Intel-mac consumer.
+        # Revisit with an x86_64 or universal2 build if/when these go to PyPI.
+        # Linux wheels are tagged for the runner's platform (not manylinux);
+        # manylinux compliance is a follow-up at publish time.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6

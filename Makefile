@@ -80,13 +80,15 @@ python-lib:
 
 .PHONY: python-test
 python-test: python-lib
-	cd python && python3 -m pytest tests/ -q
+	cd python && uv run --no-project --with pytest python -m pytest tests/ -q
 
 # Build a platform wheel. setup.py rebuilds the bridge as part of the build, so
-# this works from a clean tree; python-lib is not a prerequisite.
+# this works from a clean tree; python-lib is not a prerequisite. The wheel is
+# tagged py3-none-<platform> (ctypes over a native lib — no CPython ABI), so a
+# single wheel per OS serves every supported Python.
 .PHONY: python-wheel
 python-wheel:
-	cd python && python3 -m build --wheel
+	cd python && uv build --wheel
 
 .PHONY: build
 build:

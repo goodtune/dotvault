@@ -35,6 +35,14 @@ from setuptools import setup
 from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
 
+try:
+    # setuptools vendors bdist_wheel as of 70.1; we pin >=77, so this is the
+    # path taken. The wheel-package fallback keeps a hand-run on older tooling
+    # from breaking.
+    from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:  # pragma: no cover - very old setuptools
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG_DIR = os.path.join(HERE, "src", "dotvault")
 
@@ -113,6 +121,27 @@ class BinaryDistribution(Distribution):
         return True
 
 
+class GenericPlatformWheel(_bdist_wheel):
+    """Tag the wheel ``py3-none-<platform>``.
+
+    The package contains no CPython C-extension — it is pure ctypes loading a
+    native shared library that links libc, not the Python C-API — so it is
+    ABI-independent across every Python 3.x and must NOT carry an
+    interpreter-specific tag (``cp311-cp311``). It IS platform-specific (it
+    bundles a ``.so``/``.dylib``/``.dll``), so the platform tag is kept and the
+    wheel is not "pure". The result is one wheel per OS that installs on any
+    Python >= the project's ``requires-python``, rather than one per interpreter.
+    """
+
+    def finalize_options(self):
+        super().finalize_options()
+        self.root_is_pure = False  # keep the platform tag despite the py3 tag
+
+    def get_tag(self):
+        _python, _abi, plat = super().get_tag()
+        return "py3", "none", plat
+
+
 class BuildPyWithGo(build_py):
     """Build the native library before collecting package files."""
 
@@ -123,5 +152,5 @@ class BuildPyWithGo(build_py):
 
 setup(
     distclass=BinaryDistribution,
-    cmdclass={"build_py": BuildPyWithGo},
+    cmdclass={"build_py": BuildPyWithGo, "bdist_wheel": GenericPlatformWheel},
 )

@@ -17,18 +17,20 @@ Interactive login (OIDC browser pop, LDAP password + MFA terminal prompts) is **
 
 ## Install
 
-Wheels bundle the native library for their platform. From a checkout:
+The tooling is [uv](https://docs.astral.dev/uv/). Wheels bundle the native library for their platform. From a checkout:
 
 ```sh
-make python-wheel        # builds python/dist/dotvault-*.whl
-pip install python/dist/dotvault-*.whl
+make python-wheel               # -> python/dist/dotvault-*.whl  (runs `uv build`)
+uv pip install python/dist/dotvault-*.whl
 ```
 
 or an editable install (requires Go on `PATH`, since the bridge is compiled on install):
 
 ```sh
-cd python && pip install -e .
+cd python && uv pip install -e .
 ```
+
+The wheel is tagged `py3-none-<platform>`: it carries a native shared library (so it is platform-specific) but contains no CPython C-extension — it is pure ctypes — so a single wheel per OS installs on **any** Python ≥ 3.9, not one wheel per interpreter version.
 
 Building from source needs the Go toolchain and a C compiler — `go build -buildmode=c-shared` is the one place dotvault uses cgo (`CGO_ENABLED=1`). The main dotvault binaries remain pure-Go static builds; only this binding links libc. On Windows the C compiler must be a mingw-w64 gcc (the `c-shared` build does not work with MSVC); GitHub's `windows-latest` runners ship one, but a local Windows build needs it on `PATH`.
 
@@ -92,8 +94,10 @@ The Go runtime snapshots its environment at load time, so the bridge re-reads th
 
 ```sh
 make python-lib     # build the native bridge into the package for local use
-make python-test    # build the bridge + run the Python test suite (needs pytest)
+make python-test    # build the bridge + run the Python test suite (via `uv run`)
 go test ./python/bridge/...   # the Go-side bridge unit tests
 ```
+
+`make python-test` and `make python-wheel` shell out to `uv`, which provisions Python and the test/build dependencies; only the Go toolchain and a C compiler need to be present beforehand.
 
 The Python tests run fully offline — they point at a closed Vault port and assert the error categorisation — so no live Vault is needed.

@@ -15,6 +15,7 @@ cmd/dotvault/.version-stamp
 # python-lib Make target); the rest are standard setuptools/pytest output.
 python/src/dotvault/_dotvault.*
 python/build/
+python/wheelhouse/
 python/src/dotvault.egg-info/
 python/.pytest_cache/
 __pycache__/

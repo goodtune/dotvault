@@ -17,7 +17,17 @@ Interactive login (OIDC browser pop, LDAP password + MFA terminal prompts) is **
 
 ## Install
 
-The tooling is [uv](https://docs.astral.dev/uv/). Wheels bundle the native library for their platform. From a checkout:
+Released wheels are published to PyPI (Linux `manylinux_2_28`, macOS arm64, Windows x86_64):
+
+```sh
+pip install dotvault          # or: uv pip install dotvault
+```
+
+The wheel is tagged `py3-none-<platform>`: it carries a native shared library (so it is platform-specific) but contains no CPython C-extension — it is pure ctypes — so a single wheel per OS installs on **any** Python ≥ 3.9, not one wheel per interpreter version. Its version is derived from the repo's git tags by `setuptools-scm` (the same tags that version the daemon); `dotvault.__version__` reports it.
+
+Wheels are built for glibc Linux x86_64 (`manylinux_2_28`), Apple-Silicon macOS, and Windows x86_64. There are currently no wheels for Linux aarch64, musl/Alpine, Intel macOS, or Windows arm64 — `pip install` on those reports "no matching distribution"; build from a checkout instead.
+
+To build from a checkout instead — the tooling is [uv](https://docs.astral.dev/uv/):
 
 ```sh
 make python-wheel               # -> python/dist/dotvault-*.whl  (runs `uv build`)
@@ -29,8 +39,6 @@ or an editable install (requires Go on `PATH`, since the bridge is compiled on i
 ```sh
 cd python && uv pip install -e .
 ```
-
-The wheel is tagged `py3-none-<platform>`: it carries a native shared library (so it is platform-specific) but contains no CPython C-extension — it is pure ctypes — so a single wheel per OS installs on **any** Python ≥ 3.9, not one wheel per interpreter version. Its version is derived from the repo's git tags by `setuptools-scm` (the same tags that version the daemon), so build from a checkout with tags available; `dotvault.__version__` reports it.
 
 Building from source needs the Go toolchain and a C compiler — `go build -buildmode=c-shared` is the one place dotvault uses cgo (`CGO_ENABLED=1`). The main dotvault binaries remain pure-Go static builds; only this binding links libc. On Windows the C compiler must be a mingw-w64 gcc (the `c-shared` build does not work with MSVC); GitHub's `windows-latest` runners ship one, but a local Windows build needs it on `PATH`.
 
@@ -101,3 +109,7 @@ go test ./python/bridge/...   # the Go-side bridge unit tests
 `make python-test` and `make python-wheel` shell out to `uv`, which provisions Python and the test/build dependencies; only the Go toolchain and a C compiler need to be present beforehand.
 
 The Python tests run fully offline — they point at a closed Vault port and assert the error categorisation — so no live Vault is needed.
+
+## Releasing
+
+Publishing a GitHub Release with a `vX.Y.Z` tag drives both the Go release (`release.yml`) and the Python wheels: the `.github/workflows/python.yml` `publish` job builds the per-OS wheels and uploads them to PyPI via the official `pypa/gh-action-pypi-publish` action using **Trusted Publishing** (OIDC — no stored token). One-time setup before the first release: register a [pending publisher](https://docs.pypi.org/trusted-publishers/) on PyPI for project `dotvault` pointing at this repository, workflow `python.yml`, and environment `pypi`. A dev/untagged build produces a PEP 440 local version that PyPI rejects, so only exact tagged releases publish. Consider a one-off TestPyPI dry run (temporarily pointing the action at TestPyPI) before the first real release to validate the OIDC/publisher wiring.

@@ -9,8 +9,11 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/python.yml"
-  push:
-    tags: ["v*"]
+  # Build + publish wheels off the same event that drives the Go release
+  # (release.yml's `release: published`), so the two release artefacts ship from
+  # one human gesture and a stray pushed tag never leaks wheels to PyPI.
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -51,16 +54,22 @@ jobs:
   wheels:
     name: Wheel (${{ matrix.os }})
     needs: test
+    # Tag macOS wheels for 11.0 (the arm64 floor) rather than the runner's
+    # current OS version, so they install on every Apple-Silicon macOS. Ignored
+    # on the Windows runner.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
-        # macos-latest is arm64. Intel macOS (macos-13) is intentionally not
-        # built: GitHub is deprecating that runner, new Macs are arm64-only, and
-        # these wheels aren't published yet — so there's no Intel-mac consumer.
-        # Revisit with an x86_64 or universal2 build if/when these go to PyPI.
-        # Linux wheels are tagged for the runner's platform (not manylinux);
-        # manylinux compliance is a follow-up at publish time.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Native builds for macOS (arm64) and Windows; their platform tags
+        # (macosx_*_arm64, win_amd64) are accepted by PyPI as-is. Linux is built
+        # separately in a manylinux container (see wheel-linux) because a
+        # natively-built linux_x86_64 wheel is rejected by PyPI. Intel macOS
+        # (macos-13) is intentionally not built: GitHub is deprecating that
+        # runner and new Macs are arm64-only — revisit with an x86_64 or
+        # universal2 build if demand appears.
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Full history + tags so setuptools-scm derives the version from the same
@@ -92,3 +101,87 @@ jobs:
         with:
           name: dotvault-wheel-${{ matrix.os }}
           path: python/dist/*.whl
+
+  wheel-linux:
+    name: Wheel (manylinux)
+    needs: test
+    runs-on: ubuntu-latest
+    # Build inside a manylinux_2_28 container (glibc 2.28) so the cgo .so links
+    # an old-enough libc for broad compatibility, then auditwheel retags the
+    # wheel from linux_x86_64 (which PyPI rejects) to manylinux_2_28_x86_64.
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # The container runs as root and the checkout is not root-owned, so git
+      # (and therefore setuptools-scm) refuses to operate without this.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The manylinux image ships gcc, git, auditwheel and patchelf but no Go or
+      # uv. Use the same checksum-verifying actions as the native jobs rather
+      # than piping installers from the network.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: astral-sh/setup-uv@v7
+
+      # Fail fast with a clear message if the cgo C compiler isn't on PATH in
+      # the container, rather than surfacing it as an opaque cgo build error.
+      - name: Verify toolchain
+        run: |
+          go version
+          gcc --version
+          uv --version
+
+      - name: Build wheel
+        run: cd python && uv build --wheel
+
+      - name: Repair to manylinux
+        run: |
+          cd python
+          auditwheel repair dist/*.whl -w wheelhouse
+          ls -l wheelhouse
+
+      - name: Smoke-test the repaired wheel
+        run: |
+          wheel="$(ls python/wheelhouse/*.whl)"
+          uv run --no-project --with "$wheel" python -c "import dotvault; print(dotvault.default_config_path())"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dotvault-wheel-manylinux
+          path: python/wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    # Only when a GitHub Release is published; PR / dispatch runs build wheels
+    # but never publish. The release's tag gives setuptools-scm an exact, clean
+    # version (no dev/local segment), which is what PyPI accepts.
+    if: github.event_name == 'release'
+    needs: [wheels, wheel-linux]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted Publishing: GitHub mints a short-lived OIDC token; no API token
+      # or password is stored. Configure the matching pending publisher on PyPI
+      # (project dotvault, this repo, workflow python.yml, environment pypi).
+      id-token: write
+    steps:
+      - name: Collect wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dotvault-wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Make a re-run idempotent: if one platform's wheel already uploaded
+          # (e.g. a partial failure), skip it instead of failing the release.
+          skip-existing: true

@@ -63,7 +63,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # Full history + tags so setuptools-scm derives the version from the same
+      # git tags as the Go build; a shallow checkout would have no tags and fall
+      # back to 0.0.0.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:

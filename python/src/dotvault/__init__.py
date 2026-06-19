@@ -53,7 +53,16 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.0.0"
+# Resolve the installed distribution's version (baked in at build time by
+# setuptools-scm from the repo's git tags). Running from an uninstalled source
+# tree — e.g. the test suite, which adds src/ to sys.path without installing —
+# has no metadata, so fall back to a sentinel rather than failing import.
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("dotvault")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 # Sentinel handle for a closed/never-opened client. The bridge never issues 0.
 _CLOSED = 0

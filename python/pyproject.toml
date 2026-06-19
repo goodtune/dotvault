@@ -1,12 +1,15 @@
 [build-system]
 # >=77 so the PEP 639 SPDX `license` string below is validated rather than
 # treated as a legacy free-form value. Build isolation installs this fresh.
-requires = ["setuptools>=77", "wheel"]
+# setuptools-scm derives the version from the repo's git tags (see below).
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dotvault"
-version = "0.0.0"
+# Version is derived from git tags at build time by setuptools-scm — it is not
+# stored here. See [tool.setuptools_scm].
+dynamic = ["version"]
 description = "Python bindings for the dotvault public client API (read per-user Vault secrets dotvault enrols)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,3 +41,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 dotvault = ["_dotvault.*", "py.typed"]
+
+[tool.setuptools_scm]
+# The git checkout root is the repository, one level above this python/ dir, so
+# the same v-prefixed tags that version the Go build (v0.23.0 -> 0.23.0; the
+# leading v is stripped) version this wheel. An exact tag yields a clean release
+# version (0.23.0); commits past a tag yield a PEP 440 dev version
+# (0.23.1.dev8+g<sha>). fallback_version keeps a tagless/shallow checkout (no
+# tags fetched) from failing the build outright.
+root = ".."
+fallback_version = "0.0.0"

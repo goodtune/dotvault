@@ -30,7 +30,7 @@ or an editable install (requires Go on `PATH`, since the bridge is compiled on i
 cd python && uv pip install -e .
 ```
 
-The wheel is tagged `py3-none-<platform>`: it carries a native shared library (so it is platform-specific) but contains no CPython C-extension — it is pure ctypes — so a single wheel per OS installs on **any** Python ≥ 3.9, not one wheel per interpreter version.
+The wheel is tagged `py3-none-<platform>`: it carries a native shared library (so it is platform-specific) but contains no CPython C-extension — it is pure ctypes — so a single wheel per OS installs on **any** Python ≥ 3.9, not one wheel per interpreter version. Its version is derived from the repo's git tags by `setuptools-scm` (the same tags that version the daemon), so build from a checkout with tags available; `dotvault.__version__` reports it.
 
 Building from source needs the Go toolchain and a C compiler — `go build -buildmode=c-shared` is the one place dotvault uses cgo (`CGO_ENABLED=1`). The main dotvault binaries remain pure-Go static builds; only this binding links libc. On Windows the C compiler must be a mingw-w64 gcc (the `c-shared` build does not work with MSVC); GitHub's `windows-latest` runners ship one, but a local Windows build needs it on `PATH`.
 

@@ -16,6 +16,15 @@ on:
 permissions:
   contents: read
 
+# Cancel a superseded run when a new commit lands on the same PR. Without this,
+# an outdated run's jobs (notably the scarce macos-13 Intel runner) keep their
+# queue slot and block the new run's equivalent job from starting. The group
+# keys on the PR number for PR runs and on the ref otherwise, so each release
+# tag (a distinct ref) gets its own group and is never cancelled by another tag.
+concurrency:
+  group: python-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Python tests (ubuntu)

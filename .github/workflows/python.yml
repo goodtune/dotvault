@@ -37,7 +37,7 @@ jobs:
           go-version-file: go.mod
 
       # uv manages Python and the test env — no setup-python needed.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       - name: Build native bridge
         run: make python-lib
@@ -74,7 +74,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
 
       # setup.py compiles the cgo c-shared bridge as part of the wheel build, so
       # `uv build` from a full checkout produces a self-contained platform wheel
@@ -88,7 +88,7 @@ jobs:
           WHEEL=$(ls python/dist/*.whl)
           uv run --no-project --with "$WHEEL" python -c "import dotvault; print(dotvault.default_config_path())"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dotvault-wheel-${{ matrix.os }}
           path: python/dist/*.whl

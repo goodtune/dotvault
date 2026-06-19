@@ -46,6 +46,7 @@ func Parse(data []byte) (*config.Config, error) {
 	rules := map[string]bool{}      // set of rule names seen
 	enrolments := map[string]bool{} // set of enrolment names seen
 	agentKeys := map[string]bool{}  // set of Agent\Keys index subkeys seen
+	seenKeys := map[string]bool{}   // every in-scope key path seen as a [...] stanza
 
 	var currentKey string
 	for i := 1; i < len(lines); i++ {
@@ -65,6 +66,12 @@ func Parse(data []byte) (*config.Config, error) {
 				continue
 			}
 			currentKey = canonicalizeKeyPath(path)
+			// Record every in-scope key path so a nested settings subkey with
+			// no scalar values of its own (e.g. an empty `from: {}` map) is
+			// still discoverable when reconstructing the settings tree.
+			if pathInScope(currentKey) {
+				seenKeys[currentKey] = true
+			}
 			// Track rule / enrolment subkey names so we can emit them even
 			// when they have no values of their own (e.g. a rule whose
 			// fields are all empty strings would still produce its parent
@@ -101,7 +108,7 @@ func Parse(data []byte) (*config.Config, error) {
 	}
 
 	cfg := &config.Config{}
-	if err := applyValues(cfg, values, rules, enrolments, agentKeys); err != nil {
+	if err := applyValues(cfg, values, rules, enrolments, agentKeys, seenKeys); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -537,7 +544,7 @@ func childUnder(path, prefix string) (string, bool) {
 // applyValues populates cfg from the flat (key, name) -> value map produced
 // during parsing. Unknown values are ignored — the renderer is the source
 // of truth for the schema, so anything outside it is treated as opaque.
-func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[string]bool, enrolments map[string]bool, agentKeys map[string]bool) error {
+func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[string]bool, enrolments map[string]bool, agentKeys map[string]bool, seenKeys map[string]bool) error {
 	// Typed accessors so a known field with the wrong .reg type is a
 	// hard parse error instead of silently decoding to the zero value.
 	// We read against the schema produced by regfile.Generate*: every
@@ -626,6 +633,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.CACert, vaultKey, "CACert") },
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
+		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
 		func() error { return applyBool(&cfg.Vault.DisableTokenRenewal, vaultKey, "DisableTokenRenewal") },
 		func() error { return applyBool(&cfg.Vault.TLSSkipVerify, vaultKey, "TLSSkipVerify") },
 	} {
@@ -854,42 +862,15 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		} else if ok {
 			en.Engine = v
 		}
-		// Settings subkey: collect all values whose key path is exactly
-		// base\Settings.
+		// Settings subkey: collect the values directly under base\Settings
+		// and recurse into any nested subkeys so structured settings (e.g.
+		// the Copy engine's settings.from → mount/path) round-trip cleanly.
+		// This mirrors readRegistrySettingsBlock in the live Windows loader
+		// (internal/config/registry_windows.go); keep the two in lockstep.
 		settingsKey := base + `\Settings`
-		settings := map[string]any{}
-		for vk, v := range values {
-			if vk.key != settingsKey {
-				continue
-			}
-			// Normalize to lowercase: Windows registry value names are
-			// case-insensitive and the registry-side loader in
-			// internal/config/registry_windows.go applies the same lowering
-			// so engine setting keys (`client_id`, `host`, ...) match
-			// regardless of how the .reg file capitalises them.
-			settingKey := strings.ToLower(vk.name)
-			switch v.kind {
-			case rvSZ:
-				settings[settingKey] = v.str
-			case rvMultiSZ:
-				// Convert []string to []any so that the YAML round-trip
-				// produces the same type as a freshly-loaded YAML config
-				// (yaml.Unmarshal turns lists into []any).
-				out := make([]any, len(v.multi))
-				for i, s := range v.multi {
-					out[i] = s
-				}
-				settings[settingKey] = out
-			default:
-				// regfile.Generate refuses to emit any other kind for
-				// Settings values, so encountering one here means the
-				// .reg was hand-edited (or produced by a different
-				// tool) and silently dropping it would lose
-				// configuration without warning. Fail with the full
-				// path and observed kind so the offending line is
-				// easy to find.
-				return fmt.Errorf("registry value %s\\%s has unsupported type %s for an enrolment setting (only REG_SZ and REG_MULTI_SZ are supported)", settingsKey, vk.name, kindName(v.kind))
-			}
+		settings, err := collectSettingsBlock(settingsKey, values, seenKeys)
+		if err != nil {
+			return err
 		}
 		if len(settings) > 0 {
 			en.Settings = settings
@@ -898,6 +879,75 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 
 	return nil
+}
+
+// collectSettingsBlock reconstructs an enrolment Settings map rooted at
+// keyPath: every REG_SZ / REG_MULTI_SZ value directly under keyPath becomes a
+// scalar/list entry, and every immediate child subkey becomes a nested
+// map[string]any entry built by recursing. seenKeys carries the set of all
+// in-scope key paths so an empty nested map (a subkey stanza with no values of
+// its own) is still discovered even though it contributes no entries to values.
+//
+// This is the parser-side twin of writeSettingsBlock (regfile.go) and of
+// readRegistrySettingsBlock in the live Windows loader
+// (internal/config/registry_windows.go). Keep all three in lockstep.
+func collectSettingsBlock(keyPath string, values map[valueKey]regValue, seenKeys map[string]bool) (map[string]any, error) {
+	out := map[string]any{}
+
+	// Scalar and string-list values directly under keyPath. Value names are
+	// lowercased to match the case-insensitive registry semantics and the
+	// live loader, so engine setting keys (`client_id`, `host`, …) compare
+	// regardless of how the .reg file capitalises them.
+	for vk, v := range values {
+		if vk.key != keyPath {
+			continue
+		}
+		settingKey := strings.ToLower(vk.name)
+		switch v.kind {
+		case rvSZ:
+			out[settingKey] = v.str
+		case rvMultiSZ:
+			// Convert []string to []any so the YAML round-trip produces the
+			// same type as a freshly-loaded YAML config (yaml.Unmarshal turns
+			// lists into []any).
+			list := make([]any, len(v.multi))
+			for i, s := range v.multi {
+				list[i] = s
+			}
+			out[settingKey] = list
+		default:
+			// regfile.Generate refuses to emit any other kind for Settings
+			// values, so encountering one here means the .reg was hand-edited
+			// (or produced by a different tool) and silently dropping it would
+			// lose configuration without warning. Fail with the full path and
+			// observed kind so the offending line is easy to find.
+			return nil, fmt.Errorf("registry value %s\\%s has unsupported type %s for an enrolment setting (only REG_SZ and REG_MULTI_SZ are supported)", keyPath, vk.name, kindName(v.kind))
+		}
+	}
+
+	// Immediate child subkeys become nested maps. Children are discovered from
+	// the union of value-bearing keys and the seen-stanza set so empty nested
+	// maps survive too.
+	children := map[string]bool{}
+	for vk := range values {
+		if name, ok := childUnder(vk.key, keyPath); ok {
+			children[name] = true
+		}
+	}
+	for k := range seenKeys {
+		if name, ok := childUnder(k, keyPath); ok {
+			children[name] = true
+		}
+	}
+	for name := range children {
+		nested, err := collectSettingsBlock(keyPath+`\`+name, values, seenKeys)
+		if err != nil {
+			return nil, err
+		}
+		out[strings.ToLower(name)] = nested
+	}
+
+	return out, nil
 }
 
 // kindMismatchErr renders a clear "wrong .reg type" error mentioning the

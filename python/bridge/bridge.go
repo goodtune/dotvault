@@ -39,6 +39,28 @@ package main
 
 /*
 #include <stdlib.h>
+
+// dvTestSetenv / dvTestUnsetenv back the cSetenv/cUnsetenv test helpers
+// portably. POSIX setenv/unsetenv are absent from the Windows CRT (mingw),
+// which provides _putenv_s instead (an empty value removes the variable). These
+// are used only by the bridge's tests; production syncEnv reads via getenv,
+// which is standard C on every platform, so this shim is the only place a
+// non-portable env call lives.
+static int dvTestSetenv(const char* k, const char* v) {
+#ifdef _WIN32
+	return _putenv_s(k, v);
+#else
+	return setenv(k, v, 1);
+#endif
+}
+
+static int dvTestUnsetenv(const char* k) {
+#ifdef _WIN32
+	return _putenv_s(k, "");
+#else
+	return unsetenv(k);
+#endif
+}
 */
 import "C"
 
@@ -147,14 +169,14 @@ func drop(h C.longlong) { dropID(int64(h)) }
 // without importing "C" themselves.
 func cSetenv(key, val string) {
 	ck, cv := C.CString(key), C.CString(val)
-	C.setenv(ck, cv, 1)
+	C.dvTestSetenv(ck, cv)
 	C.free(unsafe.Pointer(ck))
 	C.free(unsafe.Pointer(cv))
 }
 
 func cUnsetenv(key string) {
 	ck := C.CString(key)
-	C.unsetenv(ck)
+	C.dvTestUnsetenv(ck)
 	C.free(unsafe.Pointer(ck))
 }
 

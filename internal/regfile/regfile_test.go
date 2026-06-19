@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -396,6 +397,119 @@ func TestGenerateNestedMapSetting(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q\n--- output ---\n%s", want, got)
 		}
+	}
+}
+
+// TestNestedMapSettingRoundTrip guards the YAML → .reg → YAML path for an
+// enrolment whose settings carry a nested map (the Copy engine's
+// settings.from → mount/path). The renderer emits the nested block as a
+// Settings\from subkey; Parse must descend into it rather than only reading
+// values directly under Settings, or the `from` struct is silently dropped.
+func TestNestedMapSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"format":   "json",
+					"template": `{"token": "{{ .data.password }}"}`,
+					"from": map[string]any{
+						"mount": "kv",
+						"path":  "apps/sample/keys/{{.user}}",
+					},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	en, ok := got.Enrolments["sample"]
+	if !ok {
+		t.Fatalf("enrolment did not round-trip; got %v", got.Enrolments)
+	}
+	from, ok := en.Settings["from"].(map[string]any)
+	if !ok {
+		t.Fatalf("settings.from did not round-trip as a nested map; got %T: %v", en.Settings["from"], en.Settings["from"])
+	}
+	want := map[string]any{"mount": "kv", "path": "apps/sample/keys/{{.user}}"}
+	if !reflect.DeepEqual(from, want) {
+		t.Errorf("settings.from = %v, want %v", from, want)
+	}
+}
+
+// TestEmptyNestedMapSettingRoundTrip exercises the seenKeys-only discovery
+// branch in collectSettingsBlock: an empty nested map (`from: {}`) emits a bare
+// Settings\from subkey stanza with no values, so it is invisible in the
+// value-bearing map and can only be recovered from the recorded [...] stanzas.
+func TestEmptyNestedMapSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"format": "json",
+					"from":   map[string]any{},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	from, ok := got.Enrolments["sample"].Settings["from"].(map[string]any)
+	if !ok {
+		t.Fatalf("empty settings.from did not round-trip as a nested map; got %T: %v",
+			got.Enrolments["sample"].Settings["from"], got.Enrolments["sample"].Settings["from"])
+	}
+	if len(from) != 0 {
+		t.Errorf("settings.from = %v, want empty map", from)
+	}
+}
+
+// TestDeeplyNestedSettingRoundTrip guards recursion beyond a single level and
+// confirms a nested map containing both a scalar and a further nested map
+// round-trips. Mixed-case subkey names are lowercased on the way back, matching
+// the live Windows loader (readRegistrySettingsBlock) — the lockstep contract.
+func TestDeeplyNestedSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"outer": map[string]any{
+						"leaf": "value",
+						"inner": map[string]any{
+							"deepest": "buried",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := map[string]any{
+		"outer": map[string]any{
+			"leaf": "value",
+			"inner": map[string]any{
+				"deepest": "buried",
+			},
+		},
+	}
+	if !reflect.DeepEqual(got.Enrolments["sample"].Settings, want) {
+		t.Errorf("settings = %#v, want %#v", got.Enrolments["sample"].Settings, want)
 	}
 }
 

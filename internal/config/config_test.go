@@ -69,6 +69,75 @@ rules:
 	}
 }
 
+func TestLoadLeastPrivilegePolicies(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+  policies:
+    - dotvault
+    - kv-read
+  no_default_policy: true
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      template: |
+        github.com:
+          oauth_token: "{{.token}}"
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(cfg.Vault.Policies) != 2 || cfg.Vault.Policies[0] != "dotvault" || cfg.Vault.Policies[1] != "kv-read" {
+		t.Errorf("Vault.Policies = %v, want [dotvault kv-read]", cfg.Vault.Policies)
+	}
+	if !cfg.Vault.NoDefaultPolicy {
+		t.Error("Vault.NoDefaultPolicy = false, want true")
+	}
+}
+
+// TestLoadDefaultsNoPolicyRestriction pins the pre-1.0 default: a config that
+// omits the policy fields parses with an empty policy set and no_default_policy
+// false (the token keeps every policy the auth role grants). The staged rollout
+// will flip this default in a later release; this test guards the current one.
+func TestLoadDefaultsNoPolicyRestriction(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: text
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(cfg.Vault.Policies) != 0 {
+		t.Errorf("Vault.Policies = %v, want empty by default", cfg.Vault.Policies)
+	}
+	if cfg.Vault.NoDefaultPolicy {
+		t.Error("Vault.NoDefaultPolicy = true, want false by default (pre-1.0)")
+	}
+}
+
 func TestLoadCustomUserPrefix(t *testing.T) {
 	yaml := `
 vault:

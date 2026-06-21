@@ -318,7 +318,11 @@ func (c *Client) manager() *auth.Manager {
 		AuthMount:     c.cfg.Vault.AuthMount,
 		AuthRole:      c.cfg.Vault.AuthRole,
 		TokenSocket:   c.cfg.Vault.TokenSocket,
-		Username:      username,
+		Policy: auth.PolicyConstraint{
+			Policies:        c.cfg.Vault.Policies,
+			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,
+		},
+		Username: username,
 	}
 }
 

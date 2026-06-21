@@ -225,6 +225,55 @@ func TestHandleAuthCallback_Success(t *testing.T) {
 	}
 }
 
+// TestHandleAuthCallback_Downscopes proves the web OIDC path narrows the
+// broad login token to a least-privilege child when vault.policies is set:
+// the broad token from the callback becomes the parent of an auth/token/create
+// call, and the child token is what the server adopts. Without the production
+// wiring this test fails because s.vault.Token() would still be the broad one.
+func TestHandleAuthCallback_Downscopes(t *testing.T) {
+	var createBody map[string]any
+	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/oidc/oidc/callback":
+			json.NewEncoder(w).Encode(map[string]any{
+				"auth": map[string]any{"client_token": "broad-token", "policies": []string{"default", "admin"}},
+			})
+		case "/v1/auth/token/create":
+			if got := r.Header.Get("X-Vault-Token"); got != "broad-token" {
+				t.Errorf("child created off token %q, want broad-token", got)
+			}
+			_ = json.NewDecoder(r.Body).Decode(&createBody)
+			json.NewEncoder(w).Encode(map[string]any{
+				"auth": map[string]any{"client_token": "child-token"},
+			})
+		default:
+			t.Errorf("unexpected vault path: %s", r.URL.Path)
+		}
+	})
+
+	s := authTestServer(t, vc)
+	s.vaultCfg = config.VaultConfig{Policies: []string{"dotvault"}, NoDefaultPolicy: true}
+	s.tokenFilePath = filepath.Join(t.TempDir(), "vault-token")
+
+	req := httptest.NewRequest("GET", "/auth/oidc/callback?code=c&state=s", nil)
+	w := httptest.NewRecorder()
+	s.handleAuthCallback(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+	if got := s.vault.Token(); got != "child-token" {
+		t.Errorf("adopted token = %q, want child-token (the downscoped child)", got)
+	}
+	if createBody == nil {
+		t.Fatal("auth/token/create was never called — downscoping did not happen")
+	}
+	if ndp, _ := createBody["no_default_policy"].(bool); !ndp {
+		t.Errorf("child create no_default_policy = %v, want true", createBody["no_default_policy"])
+	}
+}
+
 // --- WaitForAuth ---
 
 func TestWaitForAuth_SignalReceived(t *testing.T) {

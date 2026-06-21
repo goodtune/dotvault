@@ -33,6 +33,38 @@ func TestApplyRegistryLayer(t *testing.T) {
 	}
 }
 
+func TestApplyRegistryLayerLeastPrivilegePolicies(t *testing.T) {
+	cfg := &Config{}
+	noDefault := uint32(1)
+	layer := registryLayer{
+		VaultPolicies:        []string{"dotvault", "kv-read"},
+		VaultNoDefaultPolicy: &noDefault,
+	}
+	applyRegistryLayer(cfg, layer)
+
+	if len(cfg.Vault.Policies) != 2 || cfg.Vault.Policies[0] != "dotvault" || cfg.Vault.Policies[1] != "kv-read" {
+		t.Errorf("Policies = %v, want [dotvault kv-read]", cfg.Vault.Policies)
+	}
+	if !cfg.Vault.NoDefaultPolicy {
+		t.Error("NoDefaultPolicy should be true when DWORD is 1")
+	}
+
+	// An explicitly-set empty REG_MULTI_SZ (non-nil) must still override the
+	// base — present, not non-empty, gates the merge for the slice.
+	cfg2 := &Config{Vault: VaultConfig{Policies: []string{"stale"}}}
+	applyRegistryLayer(cfg2, registryLayer{VaultPolicies: []string{}})
+	if len(cfg2.Vault.Policies) != 0 {
+		t.Errorf("Policies = %v, want empty (explicit empty list must clear the base)", cfg2.Vault.Policies)
+	}
+
+	// A nil (absent) Policies must leave the base untouched.
+	cfg3 := &Config{Vault: VaultConfig{Policies: []string{"keep"}}}
+	applyRegistryLayer(cfg3, registryLayer{})
+	if len(cfg3.Vault.Policies) != 1 || cfg3.Vault.Policies[0] != "keep" {
+		t.Errorf("Policies = %v, want [keep] (absent value must not clear the base)", cfg3.Vault.Policies)
+	}
+}
+
 func TestApplyRegistryLayerMerge(t *testing.T) {
 	// Machine layer sets base values.
 	cfg := &Config{}

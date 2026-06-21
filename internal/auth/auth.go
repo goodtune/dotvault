@@ -31,6 +31,13 @@ type Manager struct {
 	// interactive flow. A missing or stale socket is ignored. See
 	// FetchTokenFromSocket.
 	TokenSocket string
+	// Policy narrows a freshly-minted login token to a least-privilege child
+	// token (vault.policies / vault.no_default_policy). The zero value applies
+	// no narrowing — the token carries every policy the auth role granted,
+	// today's behaviour. Consulted by the oidc/ldap/mtls flows; the bootstrap
+	// login that mints an mtls cert is deliberately left un-narrowed because it
+	// needs the pki/sign capability.
+	Policy PolicyConstraint
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
 }

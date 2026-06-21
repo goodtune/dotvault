@@ -634,6 +634,17 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
 		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
+		func() error {
+			v, ok, err := getMultiString(vaultKey, "Policies")
+			if err != nil {
+				return err
+			}
+			if ok {
+				cfg.Vault.Policies = v
+			}
+			return nil
+		},
+		func() error { return applyBool(&cfg.Vault.NoDefaultPolicy, vaultKey, "NoDefaultPolicy") },
 		func() error { return applyBool(&cfg.Vault.DisableTokenRenewal, vaultKey, "DisableTokenRenewal") },
 		func() error { return applyBool(&cfg.Vault.TLSSkipVerify, vaultKey, "TLSSkipVerify") },
 	} {

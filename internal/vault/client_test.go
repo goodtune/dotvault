@@ -139,6 +139,72 @@ func TestListKVv2(t *testing.T) {
 	}
 }
 
+func TestCreateChildToken(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/create" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Vault-Token"); got != "parent-token" {
+			t.Errorf("X-Vault-Token = %q, want parent-token (child must be created off the set token)", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"auth": map[string]any{
+				"client_token":      "hvs.child-token",
+				"lease_duration":    3600,
+				"renewable":         true,
+				"policies":          []string{"dotvault"},
+				"no_default_policy": true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL, Token: "parent-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	child, err := c.CreateChildToken(context.Background(), []string{"dotvault", "kv-read"}, true)
+	if err != nil {
+		t.Fatalf("CreateChildToken: %v", err)
+	}
+	if child != "hvs.child-token" {
+		t.Errorf("child token = %q, want hvs.child-token", child)
+	}
+
+	// The request must carry the requested policies, no_default_policy, and a
+	// renewable flag so the lifecycle manager can keep the child alive.
+	if pols, ok := gotBody["policies"].([]any); !ok || len(pols) != 2 || pols[0] != "dotvault" || pols[1] != "kv-read" {
+		t.Errorf("request policies = %v, want [dotvault kv-read]", gotBody["policies"])
+	}
+	if ndp, _ := gotBody["no_default_policy"].(bool); !ndp {
+		t.Errorf("request no_default_policy = %v, want true", gotBody["no_default_policy"])
+	}
+	if rnw, _ := gotBody["renewable"].(bool); !rnw {
+		t.Errorf("request renewable = %v, want true", gotBody["renewable"])
+	}
+}
+
+func TestCreateChildToken_ServerError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL, Token: "parent-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := c.CreateChildToken(context.Background(), []string{"nonexistent"}, false); err == nil {
+		t.Fatal("CreateChildToken should error when Vault rejects the request")
+	}
+}
+
 func TestLoginLDAP_NoMFA(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/auth/ldap/login/testuser" {

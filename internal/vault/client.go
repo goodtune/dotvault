@@ -227,6 +227,38 @@ func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret
 	return secret, nil
 }
 
+// CreateChildToken mints a child of the currently-set token, restricted to the
+// given policies and (optionally) without the implicit `default` policy. It is
+// the least-privilege downscoping primitive: a freshly-minted login token
+// carries every policy the auth role granted, and exchanging it for a narrower
+// child shrinks the blast radius of a leaked cached token. Vault enforces that
+// the requested policies are a subset of the parent token's own policies, so
+// this can only ever drop privilege, never escalate it.
+//
+// The child is renewable so the lifecycle manager can keep it alive; its TTL is
+// the Vault default for the parent (no explicit ttl is requested). A DisplayName
+// of "dotvault" is set so the downscoped tokens are recognisable in Vault's
+// audit log.
+func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefaultPolicy bool) (string, error) {
+	renewable := true
+	req := &vaultapi.TokenCreateRequest{
+		Policies:        policies,
+		NoDefaultPolicy: noDefaultPolicy,
+		Renewable:       &renewable,
+		DisplayName:     "dotvault",
+	}
+	secret, err := c.raw.Auth().Token().CreateWithContext(ctx, req)
+	if err != nil {
+		observability.RecordVaultCall(ctx, "create_child_token", classifyVaultErr(err))
+		return "", fmt.Errorf("create downscoped child token: %w", err)
+	}
+	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
+		return "", fmt.Errorf("no token in child token create response")
+	}
+	observability.RecordVaultCall(ctx, "create_child_token", "ok")
+	return secret.Auth.ClientToken, nil
+}
+
 // ServerHealth returns the Vault server health status.
 func (c *Client) ServerHealth(ctx context.Context) (*HealthResponse, error) {
 	resp, err := c.raw.Sys().HealthWithContext(ctx)
@@ -234,8 +266,8 @@ func (c *Client) ServerHealth(ctx context.Context) (*HealthResponse, error) {
 		return nil, fmt.Errorf("vault health check: %w", err)
 	}
 	return &HealthResponse{
-		Version:    resp.Version,
-		Enterprise: resp.Enterprise,
+		Version:     resp.Version,
+		Enterprise:  resp.Enterprise,
 		ClusterName: resp.ClusterName,
 	}, nil
 }

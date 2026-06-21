@@ -321,7 +321,10 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 	if err := certClient.LoginCert(ctx, m.MTLS.CertMount, m.MTLS.CertRole); err != nil {
 		return err
 	}
-	token := certClient.Token()
+	token, err := Downscope(ctx, m.VaultClient, certClient.Token(), m.Policy)
+	if err != nil {
+		return err
+	}
 	m.VaultClient.SetToken(token)
 	if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 		slog.Warn("failed to write token file", "error", err)

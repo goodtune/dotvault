@@ -2,6 +2,14 @@ vault:
   address: "http://127.0.0.1:8200"
   auth_method: "oidc"
   tls_skip_verify: true
+  # Least-privilege token policies (per-deployment; no default provided).
+  # When set, dotvault exchanges the login token for a child token restricted
+  # to exactly these policies. Left unset here so the dev OIDC role's policies
+  # flow through unchanged — the dev Vault doesn't seed a dedicated policy.
+  #
+  # policies:
+  #   - dotvault-sync
+  # no_default_policy: true
 
 sync:
   interval: "15m"

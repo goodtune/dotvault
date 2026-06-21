@@ -741,6 +741,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:     cfg.Vault.AuthMount,
 				AuthRole:      cfg.Vault.AuthRole,
 				TokenSocket:   cfg.Vault.TokenSocket,
+				Policy:        vaultPolicyConstraint(cfg),
 				Username:      username,
 				MTLS:          mtlsParams(cfg, username),
 			}
@@ -788,6 +789,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:     cfg.Vault.AuthMount,
 				AuthRole:      cfg.Vault.AuthRole,
 				TokenSocket:   cfg.Vault.TokenSocket,
+				Policy:        vaultPolicyConstraint(cfg),
 				Username:      username,
 				MTLS:          mtlsParams(cfg, username),
 			}
@@ -827,6 +829,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			AuthMount:     cfg.Vault.AuthMount,
 			AuthRole:      cfg.Vault.AuthRole,
 			TokenSocket:   cfg.Vault.TokenSocket,
+			Policy:        vaultPolicyConstraint(cfg),
 			Username:      username,
 			MTLS:          mtlsP,
 		}
@@ -1328,6 +1331,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		TokenSocket:   cfg.Vault.TokenSocket,
+		Policy:        vaultPolicyConstraint(cfg),
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}
@@ -1613,6 +1617,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		TokenSocket:   cfg.Vault.TokenSocket,
+		Policy:        vaultPolicyConstraint(cfg),
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}
@@ -1847,6 +1852,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:     cfg.Vault.AuthMount,
 		AuthRole:      cfg.Vault.AuthRole,
 		TokenSocket:   cfg.Vault.TokenSocket,
+		Policy:        vaultPolicyConstraint(cfg),
 		Username:      username,
 		MTLS:          mtlsParams(cfg, username),
 	}
@@ -2170,6 +2176,17 @@ func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 		StorageDir:      storageDir,
 		BYOCert:         m.BYO.Cert,
 		BYOKey:          m.BYO.Key,
+	}
+}
+
+// vaultPolicyConstraint projects the vault config's least-privilege policy
+// settings onto the auth.PolicyConstraint the auth manager consults when
+// downscoping a freshly-minted login token. Centralised so every auth.Manager
+// construction site wires the same source of truth.
+func vaultPolicyConstraint(cfg *config.Config) auth.PolicyConstraint {
+	return auth.PolicyConstraint{
+		Policies:        cfg.Vault.Policies,
+		NoDefaultPolicy: cfg.Vault.NoDefaultPolicy,
 	}
 }
 

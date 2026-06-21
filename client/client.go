@@ -169,24 +169,47 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	return c.Login(ctx)
 }
 
-// AuthenticateCached resolves a token from DOTVAULT_TOKEN then the token file and
-// validates it with a LookupSelf, but never initiates an interactive login.
-// It returns nil if a cached token is usable, an error wrapping
-// ErrLoginRequired if no usable token is present (missing, expired, or
-// revoked), or an error wrapping ErrUnreachable if Vault cannot be reached to
-// validate the token.
+// AuthenticateCached resolves a token from DOTVAULT_TOKEN, then the token file,
+// then — if a peer socket is configured — by borrowing a live token from the
+// peer dotvault over that socket, and validates the result with a LookupSelf.
+// It never initiates an interactive login. It returns nil if a cached or
+// borrowed token is usable, an error wrapping ErrLoginRequired if none is
+// present (missing, expired, or revoked), or an error wrapping ErrUnreachable
+// if Vault cannot be reached to validate the token.
+//
+// The socket borrow stays within the side-effect-free contract: it is a plain
+// HTTP GET over a Unix socket (the equivalent of
+// `curl --unix-socket <path> http://localhost/api/v1/token`) — no browser, no
+// password prompt — so a consumer that runs on a host with no local token but a
+// live peer socket (the SSH RemoteForward topology) authenticates without an
+// interactive Login. Best-effort: a missing/stale socket simply yields no
+// candidate.
 //
 // This is the entry point for callers that must remain side-effect-free — no
 // browser pop, no password prompt — such as a `doctor`/preflight check.
 func (c *Client) AuthenticateCached(ctx context.Context) error {
 	token := auth.ResolveToken(c.cfg.TokenFile)
+	if token == "" && c.cfg.Vault.TokenSocket != "" {
+		// Borrow from a peer before declaring login required. FetchTokenFromSocket
+		// is best-effort and never errors fatally, so an unreachable peer falls
+		// through to the ErrLoginRequired path below exactly as a missing file does.
+		token, _ = auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
+	}
 	if token == "" {
-		if c.cfg.TokenFile == "" {
+		switch {
+		case c.cfg.TokenFile == "" && c.cfg.Vault.TokenSocket == "":
 			return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
 				ErrLoginRequired)
+		case c.cfg.TokenFile == "":
+			return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket %s",
+				ErrLoginRequired, c.cfg.Vault.TokenSocket)
+		case c.cfg.Vault.TokenSocket == "":
+			return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
+				ErrLoginRequired, c.cfg.TokenFile)
+		default:
+			return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket %s",
+				ErrLoginRequired, c.cfg.TokenFile, c.cfg.Vault.TokenSocket)
 		}
-		return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
-			ErrLoginRequired, c.cfg.TokenFile)
 	}
 	c.vc.SetToken(token)
 	if _, err := c.vc.LookupSelf(ctx); err != nil {

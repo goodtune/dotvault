@@ -9,7 +9,7 @@ The package is a thin [ctypes](https://docs.python.org/3/library/ctypes.html) wr
 This first release exposes the **read-only + cached-auth** subset of the Go facade:
 
 - `Client(config_path=None, identity=None)` — load config, build the client.
-- `authenticate_cached(timeout=None)` — resolve a token (`DOTVAULT_TOKEN` → token file) and validate it. **Never prompts.**
+- `authenticate_cached(timeout=None)` — resolve a token (`DOTVAULT_TOKEN` → token file → peer socket borrow when `vault.token_socket` is configured) and validate it. The socket borrow is a plain read with no browser or prompt, so a host with no local token but a live peer socket authenticates without an interactive login. **Never prompts.**
 - `identity_name()`, `token()`.
 - `read_user_secret(service, field, timeout=None)`, `read_kv_field(mount, path, field, timeout=None)`.
 

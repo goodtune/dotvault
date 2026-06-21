@@ -109,7 +109,7 @@ Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault
 
 ### `token_socket` — dotvault-to-dotvault token sharing
 
-When `token_socket` points at a Unix-domain socket served by another dotvault daemon's web API, dotvault tries to **borrow a live Vault token from that peer** before falling back to its own authentication. The borrow is attempted exactly where dotvault would otherwise authenticate interactively: on a **fresh login** (`dotvault login`, or daemon/CLI startup when no cached token is usable — a still-valid cached token short-circuits first and never reaches the borrow), and on the lifecycle manager's **recovery path** after a cached token has gone invalid. A healthy token that is merely being renewed at 75% TTL (`RenewSelf`) does **not** trigger a borrow. It is the programmatic equivalent of:
+When `token_socket` points at a Unix-domain socket served by another dotvault daemon's web API, dotvault tries to **borrow a live Vault token from that peer** before falling back to its own authentication. The borrow is attempted everywhere dotvault would otherwise authenticate interactively or block waiting for a token: on a **fresh login** (`dotvault login`, or daemon/CLI startup when no cached token is usable — a still-valid cached token short-circuits first and never reaches the borrow); during **headless daemon startup**, where a daemon with no web UI and no terminal borrows directly instead of idling until a token file is written; and on the lifecycle manager's **recovery path** after a cached token has gone invalid. A healthy token that is merely being renewed at 75% TTL (`RenewSelf`) does **not** trigger a borrow. It is the programmatic equivalent of:
 
 ```sh
 curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/token
@@ -127,7 +127,11 @@ Host devbox
 
 The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows the workstation's token instead of needing its own browser or TTY to authenticate. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
 
+On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
+
 The borrow is **best-effort and never fatal**: if the socket path is empty, the socket file is missing, the socket is stale (left over from a dead SSH session, no listener), the peer is reachable but holds no token, or the response is malformed, dotvault silently carries on with its normal auth flow. A leading `~` is expanded to the user's home directory. The borrowed token is held in memory only — it is not written to the local token file, so the peer remains the single owner and the remote re-borrows on its next login or recovery rather than caching a copy that could go stale.
+
+The same borrow is available to the **dotvault client libraries** (Go `client/` and the Python bindings): their cached-auth entry point (`AuthenticateCached`) borrows from the configured peer socket after the `DOTVAULT_TOKEN` env var and token file come up empty, before reporting that a login is required. Because it is a plain socket read with no browser or prompt, a Go or Python program on a host with no local token but a live peer socket reads secrets without an interactive login of its own.
 
 !!! warning "The socket grants the token to anyone who can connect"
     Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it. dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.

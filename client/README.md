@@ -55,12 +55,14 @@ If your deployment can't guarantee same-user, pass `client.WithIdentity("<name>"
 | Method | Behaviour | Use when |
 | --- | --- | --- |
 | `Authenticate(ctx)` | `DOTVAULT_TOKEN` → token file → interactive login. Short-circuits with `ErrUnreachable` (no prompt) if Vault is down. | Normal startup where a human is present. |
-| `AuthenticateCached(ctx)` | env → file only. Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
+| `AuthenticateCached(ctx)` | env → token file → peer socket borrow (if `TokenSocket` is set). Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
 | `Login(ctx)` | Unconditional fresh login (ignores cached token). Equivalent to `dotvault login`. | Forcing re-auth. |
 
 > **`Authenticate` and `Login` are interactive.** They can open a browser (OIDC) or block reading a password and MFA code from the terminal (LDAP). That is surprising inside a library call: **do not call them from a non-interactive service or daemon.** In those contexts use `AuthenticateCached` and surface `ErrLoginRequired` to the operator, or arrange for a token to be present some other way. LDAP `Login` without a TTY returns an error wrapping `ErrAuthFailed` rather than hanging.
 
 Token precedence and the login flow match the daemon's exactly. `VAULT_TOKEN` is deliberately ignored — including the Vault SDK's own automatic pickup, which the underlying client construction neutralises — so a concurrent `vault` CLI session's environment never leaks in; use `DOTVAULT_TOKEN` to supply a token via the environment. The token file location (`~/.dotvault-token`) is dotvault's built-in default rather than a configured value — it isn't carried in the YAML/registry config; `New` fills an empty `Config.TokenFile` from `DefaultTokenFile()`. Set `Config.TokenFile` explicitly to override it.
+
+If `VaultConfig.TokenSocket` is set (dotvault's `vault.token_socket` — a peer dotvault daemon's web-API Unix socket), `AuthenticateCached` borrows a live token from the peer after `DOTVAULT_TOKEN` and the token file come up empty, before reporting `ErrLoginRequired`. The borrow is a plain HTTP GET over the socket with no browser or prompt, so it stays within the cached, side-effect-free contract — a consumer on a host with no local token but a live peer socket (the SSH `RemoteForward` topology) reads secrets without an interactive login of its own. It is best-effort: a missing or stale socket simply yields no token.
 
 ## Error categories
 

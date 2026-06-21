@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -245,6 +246,77 @@ func TestAuthenticateCached_Unreachable(t *testing.T) {
 	err := c.AuthenticateCached(context.Background())
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+// newUnixTokenServer starts an httptest server bound to a Unix socket at
+// sockPath serving GET /api/v1/token (the peer dotvault web-API endpoint the
+// borrow dials). If the platform cannot bind a Unix socket the test is skipped.
+func newUnixTokenServer(t *testing.T, sockPath, token string) {
+	t.Helper()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
+	})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+}
+
+// TestAuthenticateCached_SocketBorrow covers the headless-consumer path: no
+// DOTVAULT_TOKEN and no token file, but a configured peer socket serving a live
+// token. AuthenticateCached must borrow it (no prompt) and validate it.
+func TestAuthenticateCached_SocketBorrow(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, "borrowed-token")
+
+	c, err := New(&Config{
+		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		// No token file present (path points at an empty temp dir entry).
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "borrowed-token" {
+		t.Errorf("Token = %q, want borrowed-token", c.Token())
+	}
+}
+
+// TestAuthenticateCached_SocketBorrowMissing verifies that a configured but
+// absent socket is non-fatal and the call still reports ErrLoginRequired (with
+// a message naming the socket) rather than hanging or returning a transport
+// error.
+func TestAuthenticateCached_SocketBorrowMissing(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired", err)
+	}
+	if !strings.Contains(err.Error(), sock) {
+		t.Errorf("error message = %q, want it to name the socket %q", err.Error(), sock)
 	}
 }
 

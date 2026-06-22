@@ -169,62 +169,101 @@ func (c *Client) Authenticate(ctx context.Context) error {
 	return c.Login(ctx)
 }
 
-// AuthenticateCached resolves a token from DOTVAULT_TOKEN, then the token file,
+// AuthenticateCached resolves a usable Vault token, trying each source in turn
+// and validating it with a LookupSelf: DOTVAULT_TOKEN, then the token file,
 // then — if a peer socket is configured — by borrowing a live token from the
-// peer dotvault over that socket, and validates the result with a LookupSelf.
-// It never initiates an interactive login. It returns nil if a cached or
-// borrowed token is usable, an error wrapping ErrLoginRequired if none is
-// present (missing, expired, or revoked), or an error wrapping ErrUnreachable
-// if Vault cannot be reached to validate the token.
+// peer dotvault over that socket. It never initiates an interactive login. It
+// returns nil once a candidate validates, an error wrapping ErrLoginRequired
+// if no source yields a usable token (missing, expired, or revoked), or an
+// error wrapping ErrUnreachable if Vault cannot be reached to validate.
+//
+// A cached token that a *reachable* Vault rejects does not end the search: the
+// peer socket is tried next, so a remote host with a stale local token file
+// but a live peer still recovers — mirroring the daemon's startup path, which
+// clears a rejected token and then borrows. An ErrUnreachable from validating
+// any candidate short-circuits immediately: when Vault is down a borrowed
+// token could not be validated either, so there is nothing to gain by trying.
 //
 // The socket borrow stays within the side-effect-free contract: it is a plain
 // HTTP GET over a Unix socket (the equivalent of
 // `curl --unix-socket <path> http://localhost/api/v1/token`) — no browser, no
-// password prompt — so a consumer that runs on a host with no local token but a
-// live peer socket (the SSH RemoteForward topology) authenticates without an
-// interactive Login. Best-effort: a missing/stale socket simply yields no
-// candidate.
+// password prompt — so a consumer that runs on a host with no usable local
+// token but a live peer socket (the SSH RemoteForward topology) authenticates
+// without an interactive Login. Best-effort: a missing/stale socket simply
+// yields no candidate.
 //
 // This is the entry point for callers that must remain side-effect-free — no
 // browser pop, no password prompt — such as a `doctor`/preflight check.
 func (c *Client) AuthenticateCached(ctx context.Context) error {
-	token := auth.ResolveToken(c.cfg.TokenFile)
-	if token == "" && c.cfg.Vault.TokenSocket != "" {
-		// Borrow from a peer before declaring login required. FetchTokenFromSocket
-		// is best-effort and never errors fatally, so an unreachable peer falls
-		// through to the ErrLoginRequired path below exactly as a missing file does.
-		token, _ = auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
+	// tryCandidate validates tok against Vault. ok reports a usable token (the
+	// client is left holding it). When not ok, the token is cleared; unreachable
+	// is non-nil iff the failure was an unreachable Vault (the caller must stop
+	// and surface it rather than trying further candidates).
+	tryCandidate := func(tok string) (ok bool, unreachable error) {
+		if tok == "" {
+			return false, nil
+		}
+		c.vc.SetToken(tok)
+		if _, err := c.vc.LookupSelf(ctx); err != nil {
+			c.vc.SetToken("")
+			// An unreachable Vault is a transient/infra problem distinct from a
+			// genuinely invalid token. Wrap the cause too (multiple %w) so callers
+			// can errors.As it.
+			if errors.Is(classify(err), ErrUnreachable) {
+				return false, fmt.Errorf("%w: %w", ErrUnreachable, err)
+			}
+			// Reachable Vault rejected the token (403) or it has no TTL left.
+			return false, nil
+		}
+		return true, nil
 	}
-	if token == "" {
-		switch {
-		case c.cfg.TokenFile == "" && c.cfg.Vault.TokenSocket == "":
-			return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
-				ErrLoginRequired)
-		case c.cfg.TokenFile == "":
-			return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket %s",
-				ErrLoginRequired, c.cfg.Vault.TokenSocket)
-		case c.cfg.Vault.TokenSocket == "":
-			return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
-				ErrLoginRequired, c.cfg.TokenFile)
-		default:
-			return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket %s",
-				ErrLoginRequired, c.cfg.TokenFile, c.cfg.Vault.TokenSocket)
+
+	// Candidate 1: DOTVAULT_TOKEN env → token file.
+	cachedRejected := false
+	cached := auth.ResolveToken(c.cfg.TokenFile)
+	if ok, unreachable := tryCandidate(cached); ok {
+		return nil
+	} else if unreachable != nil {
+		return unreachable
+	} else if cached != "" {
+		// A token was present but a reachable Vault rejected it. Fall through to
+		// the peer socket before declaring login required.
+		cachedRejected = true
+	}
+
+	// Candidate 2: borrow from the peer socket. Best-effort — a missing/stale
+	// socket or an unauthenticated peer yields "" and falls through.
+	if c.cfg.Vault.TokenSocket != "" {
+		borrowed, _ := auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
+		if ok, unreachable := tryCandidate(borrowed); ok {
+			return nil
+		} else if unreachable != nil {
+			return unreachable
+		} else if borrowed != "" {
+			cachedRejected = true
 		}
 	}
-	c.vc.SetToken(token)
-	if _, err := c.vc.LookupSelf(ctx); err != nil {
-		c.vc.SetToken("")
-		// An unreachable Vault is a transient/infra problem, distinct from a
-		// genuinely invalid token. Preserve that distinction for callers, and
-		// wrap the cause too (multiple %w) so they can errors.As it.
-		if cat := classify(err); errors.Is(cat, ErrUnreachable) {
-			return fmt.Errorf("%w: %w", ErrUnreachable, err)
-		}
-		// Reachable Vault rejected the token (403) or it has no TTL left:
-		// from the caller's perspective a fresh login is required.
-		return fmt.Errorf("%w: cached token rejected: %w", ErrLoginRequired, err)
+
+	if cachedRejected {
+		// At least one source produced a token the reachable Vault rejected.
+		return fmt.Errorf("%w: cached token rejected and no usable replacement from DOTVAULT_TOKEN, token file, or peer socket",
+			ErrLoginRequired)
 	}
-	return nil
+	// No source produced a token at all.
+	switch {
+	case c.cfg.TokenFile == "" && c.cfg.Vault.TokenSocket == "":
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
+			ErrLoginRequired)
+	case c.cfg.TokenFile == "":
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket %s",
+			ErrLoginRequired, c.cfg.Vault.TokenSocket)
+	case c.cfg.Vault.TokenSocket == "":
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
+			ErrLoginRequired, c.cfg.TokenFile)
+	default:
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket %s",
+			ErrLoginRequired, c.cfg.TokenFile, c.cfg.Vault.TokenSocket)
+	}
 }
 
 // Login runs the configured fresh-auth flow unconditionally, ignoring any

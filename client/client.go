@@ -218,28 +218,43 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		return true, nil
 	}
 
-	// Candidate 1: DOTVAULT_TOKEN env → token file.
+	// Candidates 1 & 2: DOTVAULT_TOKEN, then the token file — validated
+	// separately and in that order. ResolveToken is deliberately NOT used here:
+	// it collapses env and file into a single env-first candidate, so a stale
+	// DOTVAULT_TOKEN would mask a valid token file (Vault rejects the env token
+	// and the file is never tried). Reading them apart lets a fresh token file
+	// recover even when the env var is stale. A file read error (file present
+	// but unreadable) is treated as no candidate, matching ResolveToken's own
+	// best-effort handling.
 	cachedRejected := false
-	cached := auth.ResolveToken(c.cfg.TokenFile)
-	if ok, unreachable := tryCandidate(cached); ok {
-		return nil
-	} else if unreachable != nil {
-		return unreachable
-	} else if cached != "" {
-		// A token was present but a reachable Vault rejected it. Fall through to
-		// the peer socket before declaring login required.
-		cachedRejected = true
-	}
-
-	// Candidate 2: borrow from the peer socket. Best-effort — a missing/stale
-	// socket or an unauthenticated peer yields "" and falls through.
-	if c.cfg.Vault.TokenSocket != "" {
-		borrowed, _ := auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
-		if ok, unreachable := tryCandidate(borrowed); ok {
+	fileToken, _ := auth.ReadTokenFile(c.cfg.TokenFile)
+	seen := map[string]bool{}
+	for _, cand := range []string{auth.ReadTokenEnv(), fileToken} {
+		if cand == "" || seen[cand] {
+			continue
+		}
+		seen[cand] = true
+		if ok, unreachable := tryCandidate(cand); ok {
 			return nil
 		} else if unreachable != nil {
 			return unreachable
-		} else if borrowed != "" {
+		}
+		// A token was present but a reachable Vault rejected it. Keep trying the
+		// remaining candidates (the other source, then the peer socket) before
+		// declaring login required.
+		cachedRejected = true
+	}
+
+	// Candidate 3: borrow from the peer socket. Best-effort — a missing/stale
+	// socket or an unauthenticated peer yields "" and falls through.
+	if c.cfg.Vault.TokenSocket != "" {
+		borrowed, _ := auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
+		if borrowed != "" && !seen[borrowed] {
+			if ok, unreachable := tryCandidate(borrowed); ok {
+				return nil
+			} else if unreachable != nil {
+				return unreachable
+			}
 			cachedRejected = true
 		}
 	}

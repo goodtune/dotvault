@@ -390,6 +390,34 @@ func TestAuthenticateCached_StaleTokenUnreachableShortCircuits(t *testing.T) {
 	}
 }
 
+// TestAuthenticateCached_StaleEnvValidFile is the regression for the P2 finding
+// that env and file must be validated as separate candidates: a stale
+// DOTVAULT_TOKEN must not mask a valid token file. The env token is rejected,
+// the file token is accepted, and no socket is involved.
+func TestAuthenticateCached_StaleEnvValidFile(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "stale-token") // present but rejected
+	fv := newFakeVault(t)
+	fv.acceptToken = "fresh-token" // only the file's token validates
+
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
+	if err := os.WriteFile(tokenFile, []byte("fresh-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token"},
+		TokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "fresh-token" {
+		t.Errorf("Token = %q, want fresh-token (file should win over the stale env token)", c.Token())
+	}
+}
+
 func TestAuthenticate_UnreachableDoesNotLogin(t *testing.T) {
 	t.Setenv("DOTVAULT_TOKEN", "tok")
 	fv := newFakeVault(t)

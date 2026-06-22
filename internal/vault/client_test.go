@@ -190,6 +190,37 @@ func TestCreateChildToken(t *testing.T) {
 	}
 }
 
+func TestCreateChildTokenFor(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/create" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Vault-Token"); got != "parent" {
+			t.Errorf("X-Vault-Token = %q, want parent (the explicit parent, not the receiver's token)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child"}})
+	}))
+	defer ts.Close()
+
+	// The receiver carries a DIFFERENT token; CreateChildTokenFor must use the
+	// passed parent and must not disturb the receiver's own token.
+	c, err := NewClient(Config{Address: ts.URL, Token: "receiver-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	child, err := c.CreateChildTokenFor(context.Background(), "parent", []string{"dotvault"}, true)
+	if err != nil {
+		t.Fatalf("CreateChildTokenFor: %v", err)
+	}
+	if child != "child" {
+		t.Errorf("child = %q, want child", child)
+	}
+	if got := c.Token(); got != "receiver-token" {
+		t.Errorf("receiver token = %q, want receiver-token (must be left untouched)", got)
+	}
+}
+
 func TestCreateChildToken_ServerError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)

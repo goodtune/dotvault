@@ -37,11 +37,20 @@ func (c PolicyConstraint) Active() bool {
 
 // Downscope exchanges a freshly-minted broad login token for a least-privilege
 // child token carrying only the configured policies, when the constraint is
-// active. The broad token must already be set on vc — the child is created as a
-// child of the current token, so Vault enforces that the requested policies are
-// a subset of the parent's. Returns the token the caller should adopt and
-// persist: the downscoped child when a constraint is active, otherwise the
-// original token unchanged.
+// active. The child is minted on an isolated sibling of vc (CreateChildTokenFor)
+// so vc itself is never set to the broad token — Vault still enforces that the
+// requested policies are a subset of the parent's, so this can only drop
+// privilege. Returns the token the caller should adopt and persist: the
+// downscoped child when a constraint is active, otherwise the original token
+// unchanged.
+//
+// Crucially, Downscope never mutates vc. On both the active-success and the
+// failure paths the caller's shared client is left exactly as it was, so a
+// downscope failure cannot leave the broad token installed on (or retrievable
+// from) the web server's shared client, and there is no window in which a
+// concurrent reader observes the broad token. The caller is therefore
+// responsible for adopting the returned token — it must call vc.SetToken on the
+// result itself; Downscope deliberately does not.
 //
 // A downscoping failure is returned as an error rather than silently falling
 // back to the broad token: least privilege must fail closed. The caller treats
@@ -56,8 +65,7 @@ func Downscope(ctx context.Context, vc *vault.Client, token string, c PolicyCons
 		slog.Warn("vault token carries every policy the auth role granted; set vault.policies (and vault.no_default_policy: true) to restrict it to least privilege — a future dotvault release will make no_default_policy default true and 1.0 will remove the ability to disable it")
 		return token, nil
 	}
-	vc.SetToken(token)
-	child, err := vc.CreateChildToken(ctx, c.Policies, c.NoDefaultPolicy)
+	child, err := vc.CreateChildTokenFor(ctx, token, c.Policies, c.NoDefaultPolicy)
 	if err != nil {
 		return "", fmt.Errorf("downscope token to least privilege: %w", err)
 	}

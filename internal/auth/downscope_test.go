@@ -103,3 +103,46 @@ func TestDownscopeFailsClosed(t *testing.T) {
 		t.Fatal("Downscope must fail closed when the child token cannot be minted")
 	}
 }
+
+// TestDownscopeNeverMutatesSharedClient is the regression test for the leak
+// where a failed (or in-progress) downscope left the broad login token
+// installed on the shared Vault client — observable via the web auth gate and
+// /api/v1/token. Downscope must mint the child on an isolated client and leave
+// the caller's client's token exactly as it found it, on both the success and
+// failure paths.
+func TestDownscopeNeverMutatesSharedClient(t *testing.T) {
+	t.Run("on success", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child-token"}})
+		}))
+		defer ts.Close()
+		c, err := vault.NewClient(vault.Config{Address: ts.URL})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		if _, err := Downscope(context.Background(), c, "broad-token", PolicyConstraint{Policies: []string{"x"}}); err != nil {
+			t.Fatalf("Downscope: %v", err)
+		}
+		if got := c.Token(); got != "" {
+			t.Errorf("shared client token = %q, want empty — Downscope must not install the broad or child token on the caller's client", got)
+		}
+	})
+
+	t.Run("on failure", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+		}))
+		defer ts.Close()
+		c, err := vault.NewClient(vault.Config{Address: ts.URL})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		if _, err := Downscope(context.Background(), c, "broad-token", PolicyConstraint{Policies: []string{"x"}}); err == nil {
+			t.Fatal("expected error")
+		}
+		if got := c.Token(); got != "" {
+			t.Errorf("shared client token = %q, want empty — a failed downscope must not leave the broad token installed", got)
+		}
+	})
+}

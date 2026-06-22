@@ -222,12 +222,16 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 // client to obtain a short-lived token authorised for PKI issuance.
 func (m *Manager) runBootstrap(ctx context.Context) error {
 	boot := &Manager{
-		VaultClient:   m.VaultClient,
-		TokenFilePath: m.TokenFilePath,
-		AuthMethod:    m.MTLS.BootstrapMethod,
-		AuthMount:     m.MTLS.BootstrapMount,
-		AuthRole:      m.AuthRole,
-		Username:      m.Username,
+		VaultClient: m.VaultClient,
+		// Deliberately no TokenFilePath: the bootstrap token is broad (it must
+		// carry pki/sign) and is only needed in memory on the shared client to
+		// mint the certificate. Persisting it would leave that broad token in
+		// the on-disk cache if PKI signing or the subsequent cert-login fails;
+		// only certLogin writes the final, downscoped cert-auth token.
+		AuthMethod: m.MTLS.BootstrapMethod,
+		AuthMount:  m.MTLS.BootstrapMount,
+		AuthRole:   m.AuthRole,
+		Username:   m.Username,
 	}
 	return boot.Login(ctx)
 }

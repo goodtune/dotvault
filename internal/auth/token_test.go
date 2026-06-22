@@ -68,6 +68,15 @@ func TestWriteTokenFile(t *testing.T) {
 	}
 }
 
+// TestWriteTokenFileEmptyPathIsNoOp covers the "do not persist" contract used
+// by the mTLS bootstrap login: an empty path must write nothing and not error,
+// so the broad bootstrap token never lands in the on-disk cache.
+func TestWriteTokenFileEmptyPathIsNoOp(t *testing.T) {
+	if err := WriteTokenFile("", "broad-bootstrap-token", false); err != nil {
+		t.Fatalf("WriteTokenFile(\"\") must be a no-op, got error: %v", err)
+	}
+}
+
 func TestResolveToken(t *testing.T) {
 	// Hermetic: clear both variables so an outer shell/CI environment
 	// can't satisfy (or break) the pre-override assertions below.

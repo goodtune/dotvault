@@ -35,6 +35,10 @@ type Secret struct {
 // Client wraps the Vault API client.
 type Client struct {
 	raw *vaultapi.Client
+	// cfg is the connection configuration the client was built from. Retained
+	// so CreateChildTokenFor can spin up an isolated sibling client (same
+	// address/TLS, a different token) without mutating this one.
+	cfg Config
 }
 
 // NewClient creates a new Vault API client.
@@ -81,7 +85,7 @@ func NewClient(cfg Config) (*Client, error) {
 	// is set unconditionally — an empty cfg.Token clears the SDK's pickup.
 	client.SetToken(cfg.Token)
 
-	return &Client{raw: client}, nil
+	return &Client{raw: client, cfg: cfg}, nil
 }
 
 // Raw returns the underlying Vault API client for direct access.
@@ -257,6 +261,29 @@ func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefa
 	}
 	observability.RecordVaultCall(ctx, "create_child_token", "ok")
 	return secret.Auth.ClientToken, nil
+}
+
+// CreateChildTokenFor mints a child of parentToken without disturbing the
+// receiver's own token. It builds an isolated sibling client (same address and
+// TLS settings, parentToken as the auth token) and creates the child there.
+//
+// This isolation is load-bearing for the downscope flow: minting on the shared
+// client would require installing the broad parent token on it first, and a
+// failure mid-mint (or a concurrent reader on the web server) could then
+// observe — or persist — that broad token. Because child creation is a plain
+// token-authenticated call, the sibling needs no client certificate even when
+// the parent was obtained via cert auth.
+func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, policies []string, noDefaultPolicy bool) (string, error) {
+	sibling, err := NewClient(Config{
+		Address:       c.cfg.Address,
+		CACert:        c.cfg.CACert,
+		TLSSkipVerify: c.cfg.TLSSkipVerify,
+		Token:         parentToken,
+	})
+	if err != nil {
+		return "", fmt.Errorf("build downscope client: %w", err)
+	}
+	return sibling.CreateChildToken(ctx, policies, noDefaultPolicy)
 }
 
 // ServerHealth returns the Vault server health status.

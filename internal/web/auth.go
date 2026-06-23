@@ -119,6 +119,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.vault.SetToken(token)
+	auth.WarnUnrestrictedPolicy(s.policyConstraint())
 
 	if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
 		slog.Warn("failed to write token file", "error", err)
@@ -196,6 +197,7 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.vault.SetToken(token)
+		auth.WarnUnrestrictedPolicy(s.policyConstraint())
 		if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
 			slog.Warn("failed to write token file", "error", err)
 		}

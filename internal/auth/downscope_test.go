@@ -1,14 +1,73 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/vault"
 )
+
+// captureSlog redirects the default slog logger to a buffer for the duration of
+// the test, returning the buffer. Used to assert on transition-warning output.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestWarnUnrestrictedPolicy locks the transition-warning behaviour now that it
+// lives outside Downscope: warn when no constraint is configured, stay silent
+// once the operator has opted in.
+func TestWarnUnrestrictedPolicy(t *testing.T) {
+	t.Run("warns when inactive", func(t *testing.T) {
+		buf := captureSlog(t)
+		WarnUnrestrictedPolicy(PolicyConstraint{})
+		if !strings.Contains(buf.String(), "set vault.policies") {
+			t.Errorf("expected transition warning, got: %q", buf.String())
+		}
+	})
+	t.Run("silent when policies set", func(t *testing.T) {
+		buf := captureSlog(t)
+		WarnUnrestrictedPolicy(PolicyConstraint{Policies: []string{"dotvault"}})
+		if buf.Len() != 0 {
+			t.Errorf("expected no warning once opted in, got: %q", buf.String())
+		}
+	})
+	t.Run("silent when no_default_policy set", func(t *testing.T) {
+		buf := captureSlog(t)
+		WarnUnrestrictedPolicy(PolicyConstraint{NoDefaultPolicy: true})
+		if buf.Len() != 0 {
+			t.Errorf("expected no warning when no_default_policy is set, got: %q", buf.String())
+		}
+	})
+}
+
+// TestDownscopeDoesNotWarn proves Downscope is now a pure exchange helper — it
+// must not emit the transition warning itself (that moved to
+// WarnUnrestrictedPolicy at the operational-token adoption sites, so the mtls
+// bootstrap path does not warn).
+func TestDownscopeDoesNotWarn(t *testing.T) {
+	buf := captureSlog(t)
+	c, err := vault.NewClient(vault.Config{Address: "https://vault.example:8200"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := Downscope(context.Background(), c, "token", PolicyConstraint{}); err != nil {
+		t.Fatalf("Downscope: %v", err)
+	}
+	if strings.Contains(buf.String(), "set vault.policies") {
+		t.Errorf("Downscope must not warn (the notice moved to WarnUnrestrictedPolicy): %q", buf.String())
+	}
+}
 
 func TestPolicyConstraintActive(t *testing.T) {
 	tests := []struct {

@@ -102,14 +102,26 @@ func (m *Manager) Login(ctx context.Context) error {
 
 	switch base {
 	case "oidc":
-		return m.authenticateOIDC(ctx)
+		if err := m.authenticateOIDC(ctx); err != nil {
+			return err
+		}
 	case "ldap":
-		return m.authenticateLDAP(ctx)
+		if err := m.authenticateLDAP(ctx); err != nil {
+			return err
+		}
 	case "mtls":
+		// authenticateMTLS emits the transition notice once per operational
+		// login itself (and suppresses it on the bootstrap sub-login and on
+		// certificate reissue), so Login does not warn for mtls.
 		return m.authenticateMTLS(ctx)
 	case "token":
 		return fmt.Errorf("auth method 'token' requires a valid token in %s or DOTVAULT_TOKEN env", m.TokenFilePath)
 	default:
 		return fmt.Errorf("unsupported auth method: %q", m.AuthMethod)
 	}
+	// Reached only by the oidc/ldap base methods, which adopt the operational
+	// token directly above. The mtls bootstrap reaches authenticateOIDC/LDAP
+	// through runBootstrap, not this dispatch, so it never warns here.
+	WarnUnrestrictedPolicy(m.Policy)
+	return nil
 }

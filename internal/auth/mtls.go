@@ -73,6 +73,11 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 		if reused, err := m.tryExistingCredential(ctx, store, cred); err != nil {
 			slog.Warn("existing mtls credential failed, re-seeding", "error", err)
 		} else if reused {
+			// Operational-login success: emit the transition notice exactly
+			// once here, not in certLogin — certLogin is also reached by the
+			// inner reissue (and the periodic ReissueIfDue), which would
+			// otherwise double-warn on rotation or spam it every rotation cycle.
+			WarnUnrestrictedPolicy(m.Policy)
 			return nil
 		}
 	}
@@ -85,7 +90,11 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 	if err := saveCredential(p.StorageDir, newCred); err != nil {
 		return fmt.Errorf("persist mtls credential: %w", err)
 	}
-	return m.certLogin(ctx, newCred, signer)
+	if err := m.certLogin(ctx, newCred, signer); err != nil {
+		return err
+	}
+	WarnUnrestrictedPolicy(m.Policy)
+	return nil
 }
 
 // tryExistingCredential loads the stored signer, optionally rotates a cert
@@ -248,8 +257,25 @@ func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 		AuthRole:    m.AuthRole,
 		Username:    m.Username,
 	}
-	if err := boot.Login(ctx); err != nil {
-		return nil, err
+	// Dispatch the bootstrap login directly rather than through boot.Login: the
+	// bootstrap token is transient and never operational, so it must not emit
+	// the "set vault.policies" transition notice that Login attaches to a real
+	// oidc/ldap login. The rest of Login is a no-op for a bootstrap anyway —
+	// boot has no TokenSocket (no peer borrow) and bootstrap_method is plain
+	// oidc/ldap (never +tpm, so no TPM preflight), both validated at config
+	// load — so the only behavioural difference of bypassing Login is skipping
+	// the notice.
+	switch BaseMethod(boot.AuthMethod) {
+	case "oidc":
+		if err := boot.authenticateOIDC(ctx); err != nil {
+			return nil, err
+		}
+	case "ldap":
+		if err := boot.authenticateLDAP(ctx); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported mtls bootstrap_method %q (want oidc or ldap)", m.MTLS.BootstrapMethod)
 	}
 	return bootClient, nil
 }

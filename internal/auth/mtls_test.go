@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,11 +204,16 @@ func TestMTLSByoSeedAndLogin(t *testing.T) {
 	m.MTLS.BYOCert = certPath
 	m.MTLS.BYOKey = keyPath
 
+	buf := captureSlog(t)
 	if err := m.authenticateMTLS(t.Context()); err != nil {
 		t.Fatalf("authenticateMTLS: %v", err)
 	}
 	if got := m.VaultClient.Token(); got != "s.operational-token" {
 		t.Errorf("token = %q, want operational token", got)
+	}
+	// No policy configured → the operational login warns exactly once.
+	if n := strings.Count(buf.String(), "set vault.policies"); n != 1 {
+		t.Errorf("transition warning emitted %d times, want exactly 1", n)
 	}
 	if f.loginCount != 1 {
 		t.Errorf("login count = %d, want 1", f.loginCount)
@@ -248,8 +254,13 @@ func TestMTLSDownscopePresentsClientCert(t *testing.T) {
 	m.MTLS.BYOKey = keyPath
 	m.Policy = PolicyConstraint{Policies: []string{"dotvault"}}
 
+	buf := captureSlog(t)
 	if err := m.authenticateMTLS(t.Context()); err != nil {
 		t.Fatalf("authenticateMTLS: %v", err)
+	}
+	// Policy configured → no transition warning.
+	if strings.Contains(buf.String(), "set vault.policies") {
+		t.Errorf("transition warning must not fire when policies are set: %q", buf.String())
 	}
 	if f.tokenCreateCount != 1 {
 		t.Fatalf("auth/token/create called %d times, want 1 (downscope must run)", f.tokenCreateCount)

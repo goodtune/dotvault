@@ -73,6 +73,11 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 		if reused, err := m.tryExistingCredential(ctx, store, cred); err != nil {
 			slog.Warn("existing mtls credential failed, re-seeding", "error", err)
 		} else if reused {
+			// Operational-login success: emit the transition notice exactly
+			// once here, not in certLogin — certLogin is also reached by the
+			// inner reissue (and the periodic ReissueIfDue), which would
+			// otherwise double-warn on rotation or spam it every rotation cycle.
+			WarnUnrestrictedPolicy(m.Policy)
 			return nil
 		}
 	}
@@ -85,7 +90,11 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 	if err := saveCredential(p.StorageDir, newCred); err != nil {
 		return fmt.Errorf("persist mtls credential: %w", err)
 	}
-	return m.certLogin(ctx, newCred, signer)
+	if err := m.certLogin(ctx, newCred, signer); err != nil {
+		return err
+	}
+	WarnUnrestrictedPolicy(m.Policy)
+	return nil
 }
 
 // tryExistingCredential loads the stored signer, optionally rotates a cert
@@ -200,14 +209,19 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 
 	// Bootstrap: human login → PKI sign/issue.
 	slog.Info("no usable mtls certificate; bootstrapping via human login", "method", p.BootstrapMethod)
-	if err := m.runBootstrap(ctx); err != nil {
+	bootClient, err := m.runBootstrap(ctx)
+	if err != nil {
 		return nil, nil, fmt.Errorf("bootstrap login: %w", err)
 	}
 	signer, handle, err := store.Generate(securestore.KeyType(p.KeyType), p.SealToPCRs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
-	issued, err := m.signOrIssue(ctx, m.VaultClient, signer, cn)
+	// PKI sign runs on the bootstrap client, not m.VaultClient: the broad,
+	// PKI-capable bootstrap token must never be installed on the shared client
+	// (which the web server exposes via /api/v1/token before the final cert
+	// login). Only certLogin adopts the final, downscoped cert-auth token.
+	issued, err := m.signOrIssue(ctx, bootClient, signer, cn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -218,18 +232,52 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	return cred, signer, nil
 }
 
-// runBootstrap runs the configured human-credential method on the Manager's
-// client to obtain a short-lived token authorised for PKI issuance.
-func (m *Manager) runBootstrap(ctx context.Context) error {
-	boot := &Manager{
-		VaultClient:   m.VaultClient,
-		TokenFilePath: m.TokenFilePath,
-		AuthMethod:    m.MTLS.BootstrapMethod,
-		AuthMount:     m.MTLS.BootstrapMount,
-		AuthRole:      m.AuthRole,
-		Username:      m.Username,
+// runBootstrap runs the configured human-credential method to obtain a
+// short-lived token authorised for PKI issuance, returning the isolated client
+// that holds it. The bootstrap login runs on a *sibling* of m.VaultClient
+// (same connection, separate token), never on m.VaultClient itself: the broad,
+// PKI-capable bootstrap token must not be installed on the shared client, which
+// the web server starts before auth and exposes via /api/v1/token — otherwise
+// that broad token would be retrievable during bootstrap and would linger if a
+// later step (PKI sign, cert login, downscope) failed. The caller uses the
+// returned client for PKI signing; only certLogin adopts the final, downscoped
+// cert-auth token onto m.VaultClient.
+//
+// The bootstrap Manager carries no TokenFilePath, so the broad token is never
+// written to the on-disk cache either (WriteTokenFile treats "" as a no-op).
+func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
+	bootClient, err := m.VaultClient.NewSibling("")
+	if err != nil {
+		return nil, fmt.Errorf("build bootstrap client: %w", err)
 	}
-	return boot.Login(ctx)
+	boot := &Manager{
+		VaultClient: bootClient,
+		AuthMethod:  m.MTLS.BootstrapMethod,
+		AuthMount:   m.MTLS.BootstrapMount,
+		AuthRole:    m.AuthRole,
+		Username:    m.Username,
+	}
+	// Dispatch the bootstrap login directly rather than through boot.Login: the
+	// bootstrap token is transient and never operational, so it must not emit
+	// the "set vault.policies" transition notice that Login attaches to a real
+	// oidc/ldap login. The rest of Login is a no-op for a bootstrap anyway —
+	// boot has no TokenSocket (no peer borrow) and bootstrap_method is plain
+	// oidc/ldap (never +tpm, so no TPM preflight), both validated at config
+	// load — so the only behavioural difference of bypassing Login is skipping
+	// the notice.
+	switch BaseMethod(boot.AuthMethod) {
+	case "oidc":
+		if err := boot.authenticateOIDC(ctx); err != nil {
+			return nil, err
+		}
+	case "ldap":
+		if err := boot.authenticateLDAP(ctx); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported mtls bootstrap_method %q (want oidc or ldap)", m.MTLS.BootstrapMethod)
+	}
+	return bootClient, nil
 }
 
 // signOrIssue mints a certificate for the signer's public key. It prefers the
@@ -321,7 +369,15 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 	if err := certClient.LoginCert(ctx, m.MTLS.CertMount, m.MTLS.CertRole); err != nil {
 		return err
 	}
-	token := certClient.Token()
+	// Downscope through certClient (which presents the client certificate), not
+	// m.VaultClient: on a Vault listener that requires a client cert on every
+	// request, the auth/token/create call must present it too. certClient's
+	// sibling inherits the cert via NewSibling. m.VaultClient adopts only the
+	// resulting downscoped token.
+	token, err := Downscope(ctx, certClient, certClient.Token(), m.Policy)
+	if err != nil {
+		return err
+	}
 	m.VaultClient.SetToken(token)
 	if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 		slog.Warn("failed to write token file", "error", err)

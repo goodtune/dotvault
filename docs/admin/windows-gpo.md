@@ -46,9 +46,11 @@ Every YAML field has a registry equivalent. The tables below give the value name
 | `Vault\TLSSkipVerify` | REG_DWORD | Skip TLS verification (0/1) |
 | `Vault\KVMount` | REG_SZ | KVv2 mount path |
 | `Vault\UserPrefix` | REG_SZ | Per-user path prefix |
-| `Vault\AuthMethod` | REG_SZ | `oidc`, `ldap`, or `token` |
+| `Vault\AuthMethod` | REG_SZ | `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` |
 | `Vault\AuthRole` | REG_SZ | Vault auth role |
 | `Vault\AuthMount` | REG_SZ | Vault auth mount path |
+| `Vault\Policies` | REG_MULTI_SZ | Least-privilege policy set the working token is downscoped to (empty = carry every granted policy) |
+| `Vault\NoDefaultPolicy` | REG_DWORD | Strip the implicit `default` policy from the working token (0/1) |
 | `Vault\DisableTokenRenewal` | REG_DWORD | Disable RenewSelf (0/1) |
 | `Vault\TokenSocket` | REG_SZ | Path to a peer dotvault web-API Unix socket to borrow a token from |
 

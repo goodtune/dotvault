@@ -66,8 +66,11 @@ func (m *Manager) authenticateLDAP(ctx context.Context) error {
 					fmt.Fprintln(os.Stderr, "Waiting for MFA approval (check your device)...")
 				}
 			case "authenticated":
-				token := status.Token
 				lt.Clear(sessionID)
+				token, err := Downscope(ctx, m.VaultClient, status.Token, m.Policy)
+				if err != nil {
+					return fmt.Errorf("LDAP authentication: %w", err)
+				}
 				m.VaultClient.SetToken(token)
 				if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
 					slog.Warn("failed to write token file", "error", err)

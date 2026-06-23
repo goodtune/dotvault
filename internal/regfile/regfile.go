@@ -106,6 +106,13 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("KVMount", v.KVMount)
 	e.writeString("UserPrefix", v.UserPrefix)
 	e.writeString("TokenSocket", v.TokenSocket)
+	// Emit Policies whenever non-nil so an explicit empty list round-trips as an
+	// empty REG_MULTI_SZ rather than being silently dropped, matching the OAuth
+	// Scopes / agent Principals treatment.
+	if v.Policies != nil {
+		e.writeMultiString("Policies", v.Policies)
+	}
+	e.writeBool("NoDefaultPolicy", v.NoDefaultPolicy)
 	e.writeBool("DisableTokenRenewal", v.DisableTokenRenewal)
 	e.writeBool("TLSSkipVerify", v.TLSSkipVerify)
 	e.WriteString("\r\n")

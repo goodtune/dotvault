@@ -95,9 +95,11 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `address` | string | *(required)* | Vault server URL |
-| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, or `token` |
+| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` (any base method also accepts a `+tpm` suffix) |
 | `auth_mount` | string | — | Vault auth mount path (e.g. `oidc`, `ldap`) |
 | `auth_role` | string | — | Vault auth role to request |
+| `policies` | list | — | Least-privilege policy set the working token should carry (see below) |
+| `no_default_policy` | bool | `false` | Strip the implicit `default` policy from the working token (see below) |
 | `kv_mount` | string | `kv` | KVv2 secrets engine mount path |
 | `user_prefix` | string | `users/` | Prefix for per-user secret paths (trailing slash enforced) |
 | `ca_cert` | string | — | Path to CA certificate for TLS verification |
@@ -106,6 +108,28 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `token_socket` | string | — | Optional path to a peer dotvault's web-API Unix socket to borrow a token from (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
+
+### `policies` / `no_default_policy` — least-privilege tokens
+
+By default dotvault runs with whatever policies its auth role (OIDC/LDAP/cert) grants the user. For a human that is often the union of everything that user can do in Vault — far more than dotvault needs to mirror a handful of secrets. A token that is cached on disk (`~/.dotvault-token`) is a standing credential; over-provisioning it widens the blast radius if the file ever leaks.
+
+Set `policies` to the minimal set dotvault actually needs (typically a read-only policy over the user's KV prefix). When it is non-empty, dotvault does **not** use the login token directly: immediately after authenticating it exchanges that token for a **child token restricted to exactly those policies** and runs with — and persists — the child. Vault enforces that the requested set is a subset of the login token's own policies, so this can only ever *drop* privilege, never escalate it. The narrowing applies identically on every auth path (CLI OIDC/LDAP/mTLS and the web UI). The `token` auth method is exempt — there you supply the token and own its scope.
+
+`no_default_policy: true` additionally strips Vault's implicit `default` policy from the working token. Combine the two to pin the token to precisely the capabilities dotvault uses.
+
+```yaml
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+  policies:
+    - dotvault-sync   # a read-only policy over kv/data/users/<you>/*
+  no_default_policy: true
+```
+
+This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
+
+!!! note "Staged rollout toward 1.0"
+    Today `no_default_policy` defaults to `false` and an unset `policies` keeps the historical "carry every granted policy" behaviour — so existing installs are unaffected. dotvault logs a one-line warning at each fresh login when no restriction is configured, nudging operators to opt in. A future release will flip the `no_default_policy` default to `true`, and the 1.0 release will remove the ability to run with the `default` policy attached at all. dotvault is pre-1.0, so this deliberately-breaking transition runs over a few releases; configure `policies` now to be ready. On Windows GPO the equivalents are a `Policies` REG_MULTI_SZ and a `NoDefaultPolicy` REG_DWORD under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Vault`.
 
 ### `token_socket` — dotvault-to-dotvault token sharing
 

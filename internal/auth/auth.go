@@ -31,6 +31,13 @@ type Manager struct {
 	// interactive flow. A missing or stale socket is ignored. See
 	// FetchTokenFromSocket.
 	TokenSocket string
+	// Policy narrows a freshly-minted login token to a least-privilege child
+	// token (vault.policies / vault.no_default_policy). The zero value applies
+	// no narrowing — the token carries every policy the auth role granted,
+	// today's behaviour. Consulted by the oidc/ldap/mtls flows; the bootstrap
+	// login that mints an mtls cert is deliberately left un-narrowed because it
+	// needs the pki/sign capability.
+	Policy PolicyConstraint
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
 }
@@ -95,14 +102,26 @@ func (m *Manager) Login(ctx context.Context) error {
 
 	switch base {
 	case "oidc":
-		return m.authenticateOIDC(ctx)
+		if err := m.authenticateOIDC(ctx); err != nil {
+			return err
+		}
 	case "ldap":
-		return m.authenticateLDAP(ctx)
+		if err := m.authenticateLDAP(ctx); err != nil {
+			return err
+		}
 	case "mtls":
+		// authenticateMTLS emits the transition notice once per operational
+		// login itself (and suppresses it on the bootstrap sub-login and on
+		// certificate reissue), so Login does not warn for mtls.
 		return m.authenticateMTLS(ctx)
 	case "token":
 		return fmt.Errorf("auth method 'token' requires a valid token in %s or DOTVAULT_TOKEN env", m.TokenFilePath)
 	default:
 		return fmt.Errorf("unsupported auth method: %q", m.AuthMethod)
 	}
+	// Reached only by the oidc/ldap base methods, which adopt the operational
+	// token directly above. The mtls bootstrap reaches authenticateOIDC/LDAP
+	// through runBootstrap, not this dispatch, so it never warns here.
+	WarnUnrestrictedPolicy(m.Policy)
+	return nil
 }

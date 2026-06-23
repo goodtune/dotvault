@@ -174,15 +174,35 @@ type Enrolment struct {
 
 // VaultConfig holds Vault connection settings.
 type VaultConfig struct {
-	Address             string `yaml:"address"`
-	CACert              string `yaml:"ca_cert"`
-	TLSSkipVerify       bool   `yaml:"tls_skip_verify"`
-	KVMount             string `yaml:"kv_mount"`
-	UserPrefix          string `yaml:"user_prefix"`
-	AuthMethod          string `yaml:"auth_method"`
-	AuthRole            string `yaml:"auth_role"`
-	AuthMount           string `yaml:"auth_mount"`
-	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
+	Address       string `yaml:"address"`
+	CACert        string `yaml:"ca_cert"`
+	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
+	KVMount       string `yaml:"kv_mount"`
+	UserPrefix    string `yaml:"user_prefix"`
+	AuthMethod    string `yaml:"auth_method"`
+	AuthRole      string `yaml:"auth_role"`
+	AuthMount     string `yaml:"auth_mount"`
+	// Policies is the least-privilege set of Vault policies the working token
+	// should carry. When non-empty, dotvault does not run with the token its
+	// auth role grants directly; instead it exchanges that login token for a
+	// child token restricted to exactly these policies (Vault enforces that the
+	// requested set is a subset of the login token's own policies). Empty — the
+	// default — keeps today's behaviour: the token carries every policy the
+	// auth role granted, which over-provisions a credential that could leak.
+	//
+	// This is a per-deployment concern; dotvault ships no default policy list
+	// because the right set is specific to each operator's Vault policy layout.
+	// See docs/configuration/config-reference.md for the staged rollout — a
+	// future release defaults NoDefaultPolicy to true, and 1.0 will make it
+	// impossible to run a token carrying the implicit `default` policy.
+	Policies []string `yaml:"policies"`
+	// NoDefaultPolicy, when true, strips the implicit `default` policy from the
+	// working token (it sets no_default_policy on the downscoped child token).
+	// Default false today for backwards compatibility; a future release flips
+	// the default to true and 1.0 removes the ability to set it false. Combine
+	// with Policies to pin a token to exactly the capabilities dotvault needs.
+	NoDefaultPolicy     bool `yaml:"no_default_policy"`
+	DisableTokenRenewal bool `yaml:"disable_token_renewal"`
 	// TokenSocket is an optional path to a Unix-domain socket served by a
 	// peer dotvault daemon's web API. When set, dotvault tries to borrow a
 	// live Vault token from the peer via `GET http://localhost/api/v1/token`

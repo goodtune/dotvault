@@ -76,6 +76,18 @@ type VaultConfig struct {
 	// AuthRole is an optional Vault role passed to the auth method.
 	AuthRole string
 
+	// Policies is the least-privilege set of Vault policies the working token
+	// should carry. When non-empty, an interactive Login exchanges the login
+	// token for a child token restricted to exactly these policies (Vault
+	// enforces the subset rule). Empty inherits every policy the auth role
+	// granted — dotvault's historical behaviour. Mirrors vault.policies.
+	Policies []string
+
+	// NoDefaultPolicy strips the implicit `default` policy from the working
+	// token. Mirrors vault.no_default_policy. Combine with Policies to pin the
+	// token to exactly the capabilities the consumer needs.
+	NoDefaultPolicy bool
+
 	// TokenSocket is an optional path to a peer dotvault daemon's web-API
 	// Unix socket. When set, an interactive Login first tries to borrow a
 	// live token from the peer over the socket (the equivalent of
@@ -137,15 +149,17 @@ func LoadConfig(path string) (*Config, error) {
 func fromInternal(cfg *config.Config) *Config {
 	return &Config{
 		Vault: VaultConfig{
-			Address:       cfg.Vault.Address,
-			CACert:        cfg.Vault.CACert,
-			TLSSkipVerify: cfg.Vault.TLSSkipVerify,
-			KVMount:       cfg.Vault.KVMount,
-			UserPrefix:    cfg.Vault.UserPrefix,
-			AuthMethod:    cfg.Vault.AuthMethod,
-			AuthMount:     cfg.Vault.AuthMount,
-			AuthRole:      cfg.Vault.AuthRole,
-			TokenSocket:   cfg.Vault.TokenSocket,
+			Address:         cfg.Vault.Address,
+			CACert:          cfg.Vault.CACert,
+			TLSSkipVerify:   cfg.Vault.TLSSkipVerify,
+			KVMount:         cfg.Vault.KVMount,
+			UserPrefix:      cfg.Vault.UserPrefix,
+			AuthMethod:      cfg.Vault.AuthMethod,
+			AuthMount:       cfg.Vault.AuthMount,
+			AuthRole:        cfg.Vault.AuthRole,
+			TokenSocket:     cfg.Vault.TokenSocket,
+			Policies:        cfg.Vault.Policies,
+			NoDefaultPolicy: cfg.Vault.NoDefaultPolicy,
 		},
 	}
 }

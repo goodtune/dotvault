@@ -97,7 +97,10 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 			return fmt.Errorf("no auth data in OIDC callback response")
 		}
 
-		token := loginSecret.Auth.ClientToken
+		token, err := Downscope(ctx, m.VaultClient, loginSecret.Auth.ClientToken, m.Policy)
+		if err != nil {
+			return err
+		}
 		m.VaultClient.SetToken(token)
 
 		if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {

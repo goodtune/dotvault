@@ -98,7 +98,16 @@ func ResolveToken(tokenFilePath string) string {
 // unseals. Sealing requires a working TPM (Linux/Windows); seal=true on a host
 // with no hardware backend returns an error rather than silently writing
 // plaintext — the same no-silent-fallback contract as mtls+tpm key sealing.
+//
+// An empty path is a deliberate no-op: it means "do not persist this token".
+// The mTLS bootstrap login uses this so its broad, PKI-capable bootstrap token
+// lives only in memory (long enough to mint the certificate) and is never left
+// in the on-disk cache if a later step fails — only the final cert-auth working
+// token is persisted, by certLogin with the real path.
 func WriteTokenFile(path string, token string, seal bool) error {
+	if path == "" {
+		return nil
+	}
 	payload := []byte(token)
 	if seal {
 		sealed, err := sealData([]byte(token))

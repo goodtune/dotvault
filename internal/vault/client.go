@@ -263,23 +263,39 @@ func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefa
 	return secret.Auth.ClientToken, nil
 }
 
+// NewSibling builds an isolated client that shares this client's connection
+// settings (address, CA, TLS-skip, and the client certificate) but carries the
+// given token instead of this client's. It is the seam for operations that must
+// run under a different token without disturbing the shared client: the
+// least-privilege downscope mint (CreateChildTokenFor) and the mTLS bootstrap
+// login both use it so a broad token is never installed on the shared,
+// web-exposed client.
+//
+// The client certificate is carried so that on a Vault listener configured to
+// require a client cert on every request, the sibling's calls still present it.
+func (c *Client) NewSibling(token string) (*Client, error) {
+	return NewClient(Config{
+		Address:       c.cfg.Address,
+		CACert:        c.cfg.CACert,
+		TLSSkipVerify: c.cfg.TLSSkipVerify,
+		ClientCert:    c.cfg.ClientCert,
+		Token:         token,
+	})
+}
+
 // CreateChildTokenFor mints a child of parentToken without disturbing the
-// receiver's own token. It builds an isolated sibling client (same address and
-// TLS settings, parentToken as the auth token) and creates the child there.
+// receiver's own token. It builds an isolated sibling client (NewSibling: same
+// address/TLS/client-cert, parentToken as the auth token) and creates the child
+// there.
 //
 // This isolation is load-bearing for the downscope flow: minting on the shared
 // client would require installing the broad parent token on it first, and a
 // failure mid-mint (or a concurrent reader on the web server) could then
-// observe — or persist — that broad token. Because child creation is a plain
-// token-authenticated call, the sibling needs no client certificate even when
-// the parent was obtained via cert auth.
+// observe — or persist — that broad token. The sibling carries the client
+// certificate too, so on an mTLS deployment that requires a client cert on
+// every Vault request the auth/token/create call still succeeds.
 func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, policies []string, noDefaultPolicy bool) (string, error) {
-	sibling, err := NewClient(Config{
-		Address:       c.cfg.Address,
-		CACert:        c.cfg.CACert,
-		TLSSkipVerify: c.cfg.TLSSkipVerify,
-		Token:         parentToken,
-	})
+	sibling, err := c.NewSibling(parentToken)
 	if err != nil {
 		return "", fmt.Errorf("build downscope client: %w", err)
 	}

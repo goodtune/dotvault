@@ -200,14 +200,19 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 
 	// Bootstrap: human login → PKI sign/issue.
 	slog.Info("no usable mtls certificate; bootstrapping via human login", "method", p.BootstrapMethod)
-	if err := m.runBootstrap(ctx); err != nil {
+	bootClient, err := m.runBootstrap(ctx)
+	if err != nil {
 		return nil, nil, fmt.Errorf("bootstrap login: %w", err)
 	}
 	signer, handle, err := store.Generate(securestore.KeyType(p.KeyType), p.SealToPCRs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
-	issued, err := m.signOrIssue(ctx, m.VaultClient, signer, cn)
+	// PKI sign runs on the bootstrap client, not m.VaultClient: the broad,
+	// PKI-capable bootstrap token must never be installed on the shared client
+	// (which the web server exposes via /api/v1/token before the final cert
+	// login). Only certLogin adopts the final, downscoped cert-auth token.
+	issued, err := m.signOrIssue(ctx, bootClient, signer, cn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -218,22 +223,35 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	return cred, signer, nil
 }
 
-// runBootstrap runs the configured human-credential method on the Manager's
-// client to obtain a short-lived token authorised for PKI issuance.
-func (m *Manager) runBootstrap(ctx context.Context) error {
-	boot := &Manager{
-		VaultClient: m.VaultClient,
-		// Deliberately no TokenFilePath: the bootstrap token is broad (it must
-		// carry pki/sign) and is only needed in memory on the shared client to
-		// mint the certificate. Persisting it would leave that broad token in
-		// the on-disk cache if PKI signing or the subsequent cert-login fails;
-		// only certLogin writes the final, downscoped cert-auth token.
-		AuthMethod: m.MTLS.BootstrapMethod,
-		AuthMount:  m.MTLS.BootstrapMount,
-		AuthRole:   m.AuthRole,
-		Username:   m.Username,
+// runBootstrap runs the configured human-credential method to obtain a
+// short-lived token authorised for PKI issuance, returning the isolated client
+// that holds it. The bootstrap login runs on a *sibling* of m.VaultClient
+// (same connection, separate token), never on m.VaultClient itself: the broad,
+// PKI-capable bootstrap token must not be installed on the shared client, which
+// the web server starts before auth and exposes via /api/v1/token — otherwise
+// that broad token would be retrievable during bootstrap and would linger if a
+// later step (PKI sign, cert login, downscope) failed. The caller uses the
+// returned client for PKI signing; only certLogin adopts the final, downscoped
+// cert-auth token onto m.VaultClient.
+//
+// The bootstrap Manager carries no TokenFilePath, so the broad token is never
+// written to the on-disk cache either (WriteTokenFile treats "" as a no-op).
+func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
+	bootClient, err := m.VaultClient.NewSibling("")
+	if err != nil {
+		return nil, fmt.Errorf("build bootstrap client: %w", err)
 	}
-	return boot.Login(ctx)
+	boot := &Manager{
+		VaultClient: bootClient,
+		AuthMethod:  m.MTLS.BootstrapMethod,
+		AuthMount:   m.MTLS.BootstrapMount,
+		AuthRole:    m.AuthRole,
+		Username:    m.Username,
+	}
+	if err := boot.Login(ctx); err != nil {
+		return nil, err
+	}
+	return bootClient, nil
 }
 
 // signOrIssue mints a certificate for the signer's public key. It prefers the
@@ -325,7 +343,12 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 	if err := certClient.LoginCert(ctx, m.MTLS.CertMount, m.MTLS.CertRole); err != nil {
 		return err
 	}
-	token, err := Downscope(ctx, m.VaultClient, certClient.Token(), m.Policy)
+	// Downscope through certClient (which presents the client certificate), not
+	// m.VaultClient: on a Vault listener that requires a client cert on every
+	// request, the auth/token/create call must present it too. certClient's
+	// sibling inherits the cert via NewSibling. m.VaultClient adopts only the
+	// resulting downscoped token.
+	token, err := Downscope(ctx, certClient, certClient.Token(), m.Policy)
 	if err != nil {
 		return err
 	}

@@ -76,10 +76,12 @@ func pemCert(der []byte) string {
 // fakeVault serves the two endpoints the cert-auth flow touches: PKI sign and
 // cert-auth login. loginCount/signCount let tests assert what happened.
 type fakeVault struct {
-	ca         *testCA
-	loginCount int
-	signCount  int
-	leafTTL    time.Duration
+	ca                 *testCA
+	loginCount         int
+	signCount          int
+	leafTTL            time.Duration
+	tokenCreateCount   int
+	tokenCreateSawCert bool
 }
 
 func (f *fakeVault) handler() http.Handler {
@@ -92,6 +94,16 @@ func (f *fakeVault) handler() http.Handler {
 		f.loginCount++
 		json.NewEncoder(w).Encode(map[string]any{
 			"auth": map[string]any{"client_token": "s.operational-token"},
+		})
+	})
+	mux.HandleFunc("/v1/auth/token/create", func(w http.ResponseWriter, r *http.Request) {
+		// Record whether the downscope call presented the client certificate.
+		// The server requests (not requires) the cert, so a sibling that drops
+		// it would arrive here with no peer certificate.
+		f.tokenCreateCount++
+		f.tokenCreateSawCert = r.TLS != nil && len(r.TLS.PeerCertificates) > 0
+		json.NewEncoder(w).Encode(map[string]any{
+			"auth": map[string]any{"client_token": "s.child-token"},
 		})
 	})
 	mux.HandleFunc("/v1/pki/sign/dotvault", func(w http.ResponseWriter, r *http.Request) {
@@ -210,6 +222,43 @@ func TestMTLSByoSeedAndLogin(t *testing.T) {
 	}
 	if cred.Identity != "alice" || cred.Backend != "file" {
 		t.Errorf("unexpected credential: %+v", cred)
+	}
+}
+
+// TestMTLSDownscopePresentsClientCert covers the cert-auth downscope path: when
+// vault.policies is set, the auth/token/create call that mints the downscoped
+// child must present the client certificate (some Vault listeners require a
+// client cert on every request). It also confirms the downscoped child token is
+// the one adopted onto the shared client.
+func TestMTLSDownscopePresentsClientCert(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
+	certPath := filepath.Join(dir, "byo.crt")
+	keyPath := filepath.Join(dir, "byo.key")
+	os.WriteFile(certPath, []byte(leaf), 0o600)
+	os.WriteFile(keyPath, []byte(newPEMKey(t, key)), 0o600)
+
+	m := mtlsManager(t, srv, dir)
+	m.MTLS.BYOCert = certPath
+	m.MTLS.BYOKey = keyPath
+	m.Policy = PolicyConstraint{Policies: []string{"dotvault"}}
+
+	if err := m.authenticateMTLS(t.Context()); err != nil {
+		t.Fatalf("authenticateMTLS: %v", err)
+	}
+	if f.tokenCreateCount != 1 {
+		t.Fatalf("auth/token/create called %d times, want 1 (downscope must run)", f.tokenCreateCount)
+	}
+	if !f.tokenCreateSawCert {
+		t.Error("downscope auth/token/create did not present the client certificate")
+	}
+	if got := m.VaultClient.Token(); got != "s.child-token" {
+		t.Errorf("token = %q, want the downscoped child token", got)
 	}
 }
 

@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -218,6 +219,33 @@ func TestCreateChildTokenFor(t *testing.T) {
 	}
 	if got := c.Token(); got != "receiver-token" {
 		t.Errorf("receiver token = %q, want receiver-token (must be left untouched)", got)
+	}
+}
+
+func TestNewSibling(t *testing.T) {
+	cert := &tls.Certificate{Certificate: [][]byte{{0x01}}}
+	c, err := NewClient(Config{Address: "https://vault.example:8200", Token: "receiver", ClientCert: cert})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	sib, err := c.NewSibling("sibling-token")
+	if err != nil {
+		t.Fatalf("NewSibling: %v", err)
+	}
+	if got := sib.Token(); got != "sibling-token" {
+		t.Errorf("sibling token = %q, want sibling-token", got)
+	}
+	if got := c.Token(); got != "receiver" {
+		t.Errorf("receiver token = %q, want receiver (must be untouched)", got)
+	}
+	// The sibling must inherit the connection config, including the client
+	// certificate, so it presents the cert on listeners that require one.
+	if sib.cfg.Address != "https://vault.example:8200" {
+		t.Errorf("sibling address = %q, want inherited", sib.cfg.Address)
+	}
+	if sib.cfg.ClientCert != cert {
+		t.Error("sibling must inherit the client certificate")
 	}
 }
 

@@ -449,7 +449,7 @@ Enrolment keys support one level of grouping (`group/name`, e.g. `databricks/pro
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), ghp (CLI device-authorization flow against a self-hosted ghp server), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
 
 Optional interfaces extend the contract for engines that need them:
 

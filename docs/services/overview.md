@@ -57,6 +57,7 @@ Enrolment configuration changes are detected on each polling tick without requir
 | `github` | GitHub / GitHub Enterprise | OAuth device flow |
 | `jfrog` | JFrog Platform / Artifactory | Browser-based web login + token rotation |
 | `databricks` | Databricks workspace / account | OAuth U2M (authorization code + PKCE) + token rotation |
+| `ghp` | Self-hosted ghp server (GitHub proxy) | CLI device-authorization flow |
 | `ssh` | SSH key generation | Ed25519 key pair |
 | `copy` | Mirror an existing Vault KVv2 secret | Non-interactive; template-driven copy with periodic re-evaluation |
 
@@ -65,6 +66,7 @@ See the individual engine pages for details:
 - [GitHub CLI](github.md)
 - [JFrog Platform](jfrog.md)
 - [Databricks](databricks.md)
+- [ghp](ghp.md)
 - [SSH Keys](ssh.md)
 - [Copy](copy.md)
 

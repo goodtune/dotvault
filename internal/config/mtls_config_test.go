@@ -104,6 +104,58 @@ func TestMTLSValidateBadKeyType(t *testing.T) {
 	}
 }
 
+func TestIsMTLSMethod(t *testing.T) {
+	for method, want := range map[string]bool{
+		"mtls":     true,
+		"mtls+tpm": true,
+		"mtls+os":  true,
+		"oidc":     false,
+		"ldap+tpm": false,
+		"token":    false,
+		"":         false,
+	} {
+		if got := IsMTLSMethod(method); got != want {
+			t.Errorf("IsMTLSMethod(%q) = %v, want %v", method, got, want)
+		}
+	}
+}
+
+func TestMTLSOSDefaultsAndValidation(t *testing.T) {
+	// mtls+os validates with cert_role + pki_role, defaults the TTL to 30d, and
+	// accepts rsa (only mtls+tpm is EC-only).
+	t.Run("defaults TTL to 30d and accepts rsa", func(t *testing.T) {
+		c := baseConfigWithMTLS("mtls+os", MTLSConfig{CertRole: "dv", PKIRole: "p", KeyType: "rsa"})
+		if err := c.validate(); err != nil {
+			t.Fatalf("mtls+os should validate: %v", err)
+		}
+		if c.Vault.MTLS.TTL != DefaultMTLSOSTTL {
+			t.Errorf("TTL default = %q, want %q", c.Vault.MTLS.TTL, DefaultMTLSOSTTL)
+		}
+	})
+
+	// An explicit TTL is honoured, not overridden by the 30d default.
+	t.Run("explicit TTL preserved", func(t *testing.T) {
+		c := baseConfigWithMTLS("mtls+os", MTLSConfig{CertRole: "dv", PKIRole: "p", TTL: "12h"})
+		if err := c.validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if c.Vault.MTLS.TTL != "12h" {
+			t.Errorf("TTL = %q, want it preserved as 12h", c.Vault.MTLS.TTL)
+		}
+	})
+
+	// BYO is rejected for mtls+os (the OS store cannot import an external key).
+	t.Run("rejects BYO", func(t *testing.T) {
+		c := baseConfigWithMTLS("mtls+os", MTLSConfig{
+			CertRole: "dv", PKIRole: "p",
+			BYO: MTLSBYO{Cert: "/c.pem", Key: "/k.pem"},
+		})
+		if err := c.validate(); err == nil || !strings.Contains(err.Error(), "mtls+os") {
+			t.Errorf("want mtls+os BYO rejection, got %v", err)
+		}
+	})
+}
+
 func TestMTLSValidateReissueBefore(t *testing.T) {
 	c := baseConfigWithMTLS("mtls", MTLSConfig{CertRole: "dv", PKIRole: "p", ReissueBefore: "3d"})
 	if err := c.validate(); err != nil {

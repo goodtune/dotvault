@@ -4,7 +4,7 @@
 // Open for a backend, then Generate/Import/Load a crypto.Signer plus an
 // opaque handle it can persist alongside the certificate.
 //
-// Two backends ship today:
+// Three backends ship today:
 //
 //   - "file"  — a software key stored as a PKCS#8 PEM handle. Used for the
 //     plain "mtls" auth method and on any platform without hardware support.
@@ -12,6 +12,14 @@
 //   - "tpm"   — (Linux/Windows only) the key is sealed under the TPM's
 //     Storage Root Key. The handle is the marshalled go-tpm-tools SealedBytes
 //     proto and carries no usable key material off the originating chip.
+//   - "os"    — (Windows only) the key and certificate live in the OS-native
+//     certificate store (CurrentUser, CNG software provider) via
+//     github.com/google/certtostore, so other software — most importantly the
+//     system browsers — can discover and present the certificate for mTLS. The
+//     handle records the CNG provider + key container; the cert is pushed into
+//     the store through the optional CertStorer capability. On non-Windows
+//     platforms Open("os") returns ErrUnsupported (Linux PKCS#11 and macOS
+//     Keychain backends are future work).
 //
 // macOS Secure Enclave support is a future backend: Open("tpm") returns
 // ErrUnsupported there until the binary is code-signed with the required
@@ -98,6 +106,21 @@ type DataSealer interface {
 	UnsealData(handle []byte) ([]byte, error)
 }
 
+// CertStorer is an optional capability for backends that keep the certificate
+// alongside the private key in a shared, externally-visible store (the "os"
+// backend's OS-native certificate store). The "file" and "tpm" backends do NOT
+// implement it — they hold only the key, and the certificate lives in
+// dotvault's own credential envelope. The cert-auth flow type-asserts this
+// capability after a certificate is issued and, when present, pushes the cert
+// into the store so other software (browsers, etc.) can present it.
+type CertStorer interface {
+	// StoreCert installs certPEM (leaf followed by its issuing CA chain) into
+	// the store, associating it with the key behind handle. It returns the
+	// handle to persist going forward (unchanged for the "os" backend, but the
+	// signature leaves room for a backend that re-keys on store).
+	StoreCert(handle []byte, certPEM string) ([]byte, error)
+}
+
 // SealData seals data under the platform hardware backend (TPM on
 // Linux/Windows), opening and closing the device around the operation. It
 // returns ErrUnsupported on a host with no hardware backend — callers MUST
@@ -155,19 +178,25 @@ func Open(mode string) (Storage, error) {
 		return fileStorage{}, nil
 	case "tpm":
 		return openHardware()
+	case "os":
+		return openOSStore()
 	default:
 		return nil, fmt.Errorf("securestore: unknown backend %q", mode)
 	}
 }
 
 // ModeForMethod maps a dotvault auth method to a securestore backend mode.
-// "mtls+tpm" wants hardware; everything else (including plain "mtls") uses
-// the file backend.
+// "mtls+tpm" wants hardware, "mtls+os" the OS-native cert store; everything
+// else (including plain "mtls") uses the file backend.
 func ModeForMethod(authMethod string) string {
-	if authMethod == "mtls+tpm" {
+	switch authMethod {
+	case "mtls+tpm":
 		return "tpm"
+	case "mtls+os":
+		return "os"
+	default:
+		return "file"
 	}
-	return "file"
 }
 
 // newSoftwareKey generates a private key of the requested type.

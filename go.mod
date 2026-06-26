@@ -8,6 +8,7 @@ require (
 	github.com/cli/oauth v1.2.2
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/gen2brain/beeep v0.11.2
+	github.com/google/certtostore v1.0.6
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.9
 	github.com/hashicorp/vault/api v1.23.0
@@ -36,6 +37,7 @@ require (
 
 require (
 	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260522213940-e5c6d01a3007 // indirect
+	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -48,6 +50,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/google/deck v0.0.0-20230104221208-105ad94aa8ae // indirect
 	github.com/google/go-configfs-tsm v0.3.3-0.20240919001351-b4b5b84fdcbc // indirect
 	github.com/google/go-eventlog v0.0.3-0.20260416001248-6807b85eecf0 // indirect
 	github.com/google/go-sev-guest v0.14.0 // indirect

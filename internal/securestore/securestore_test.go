@@ -19,6 +19,7 @@ func TestOpenUnknownBackend(t *testing.T) {
 func TestModeForMethod(t *testing.T) {
 	for method, want := range map[string]string{
 		"mtls+tpm": "tpm",
+		"mtls+os":  "os",
 		"mtls":     "file",
 		"oidc":     "file",
 		"":         "file",

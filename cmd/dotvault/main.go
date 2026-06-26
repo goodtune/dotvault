@@ -1188,17 +1188,39 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Resolve a token the same way the daemon does at startup: the local
+	// candidates first (DOTVAULT_TOKEN env, then ~/.dotvault-token), and if
+	// neither is present, borrow one from a configured peer socket. Without
+	// the socket fallback, a headless box that is authenticated purely by
+	// borrowing from a peer (no token file at rest) reports "not
+	// authenticated" here even though the running daemon is happily serving
+	// secrets — see vault.token_socket in CLAUDE.md.
 	token := auth.ResolveToken(paths.VaultTokenPath())
-	if token == "" {
+	borrowed := false
+	if token == "" && cfg.Vault.TokenSocket != "" {
+		if peerToken, _ := auth.FetchTokenFromSocket(ctx, cfg.Vault.TokenSocket); peerToken != "" {
+			token = peerToken
+			borrowed = true
+		}
+	}
+	switch {
+	case token == "" && cfg.Vault.TokenSocket != "":
+		fmt.Println("Auth: not authenticated (no local token; peer socket holds no token)")
+		fmt.Printf("  token socket: %s\n", cfg.Vault.TokenSocket)
+	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
-	} else {
+	default:
 		vc.SetToken(token)
 		secret, err := vc.LookupSelf(ctx)
 		if err != nil {
 			fmt.Printf("Auth: token invalid (%v)\n", err)
 		} else {
-			ttl, _ := secret.Data["ttl"]
+			ttl := secret.Data["ttl"]
 			fmt.Printf("Auth: authenticated (TTL: %v)\n", ttl)
+			if borrowed {
+				fmt.Printf("  source: borrowed from peer socket (%s)\n", cfg.Vault.TokenSocket)
+				fmt.Println("  (no token file at rest — the peer is the sole owner; re-borrowed on each login/refresh)")
+			}
 		}
 	}
 

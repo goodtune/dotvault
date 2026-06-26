@@ -86,12 +86,18 @@ const (
 	DefaultUserPrefix = "users/"
 
 	// mTLS / cert-auth defaults applied by validate() when auth_method is
-	// "mtls" or "mtls+tpm".
+	// "mtls", "mtls+tpm", or "mtls+os".
 	DefaultCertMount      = "cert"
 	DefaultPKIMount       = "pki"
 	DefaultMTLSKeyType    = "ec"
 	DefaultMTLSCommonName = "{{.user}}"
 	DefaultReissueBefore  = 168 * time.Hour // 7d
+	// DefaultMTLSOSTTL is the certificate TTL requested by mtls+os when ttl is
+	// unset. The OS-store credential is a general-purpose user identity (used by
+	// browsers, not just dotvault), so it defaults to a longer 30d lifetime than
+	// the unset "let the PKI role decide" behaviour of plain mtls/mtls+tpm. The
+	// Vault PKI role's max_ttl remains the authoritative cap.
+	DefaultMTLSOSTTL = "720h" // 30d
 
 	// DefaultAgentPipe is the Windows named pipe the SSH agent listens on
 	// when agent.windows.pipe is unset. dotvault claims its own pipe rather
@@ -220,14 +226,16 @@ type VaultConfig struct {
 	// flow proceeds — so the field is purely additive and needs no validation.
 	TokenSocket string `yaml:"token_socket"`
 	// MTLS configures the cert auth methods. It is consulted only when
-	// AuthMethod is "mtls" or "mtls+tpm".
+	// AuthMethod drives the cert-auth flow ("mtls", "mtls+tpm", "mtls+os").
 	MTLS MTLSConfig `yaml:"mtls"`
 }
 
-// MTLSConfig configures certificate-based Vault authentication (the "mtls" and
-// "mtls+tpm" auth methods). A TLS client certificate authenticates instead of
-// a human credential; LDAP/OIDC is demoted to a one-time bootstrap that mints
-// the first certificate via the Vault PKI engine.
+// MTLSConfig configures certificate-based Vault authentication (the "mtls",
+// "mtls+tpm", and "mtls+os" auth methods). A TLS client certificate
+// authenticates instead of a human credential; LDAP/OIDC is demoted to a
+// one-time bootstrap that mints the first certificate via the Vault PKI engine.
+// The key is held on disk ("mtls"), TPM-sealed ("mtls+tpm"), or in the
+// OS-native certificate store where browsers can present it ("mtls+os").
 type MTLSConfig struct {
 	// BootstrapMethod is the human-credential method used only to mint the
 	// first certificate ("ldap" or "oidc"). Default "oidc".
@@ -244,7 +252,7 @@ type MTLSConfig struct {
 	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
 	PKIRole string `yaml:"pki_role"`
 	// KeyType is "ec" (P-256) or "rsa" (2048). Default "ec". The mtls+tpm
-	// backend supports "ec" only.
+	// backend supports "ec" only; mtls/mtls+os accept both.
 	KeyType string `yaml:"key_type"`
 	// CommonName is a Go template (over {{.user}}) for the certificate CN.
 	// Default "{{.user}}".
@@ -554,11 +562,25 @@ func (c *Config) Validate() error {
 	return c.validate()
 }
 
+// IsMTLSMethod reports whether an auth_method drives the certificate-auth flow:
+// "mtls" (key on disk), "mtls+tpm" (key TPM-sealed), or "mtls+os" (key + cert in
+// the OS-native certificate store). Every site that gates on the cert-auth path
+// (validation, MTLSParams construction) consults this so a new variant is wired
+// in one place rather than enumerated as string literals across the codebase.
+func IsMTLSMethod(method string) bool {
+	switch method {
+	case "mtls", "mtls+tpm", "mtls+os":
+		return true
+	default:
+		return false
+	}
+}
+
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
-// unless auth_method is "mtls" or "mtls+tpm".
+// unless auth_method drives the cert-auth flow (see IsMTLSMethod).
 func (c *Config) validateMTLS() error {
 	method := c.Vault.AuthMethod
-	if method != "mtls" && method != "mtls+tpm" {
+	if !IsMTLSMethod(method) {
 		return nil
 	}
 	m := &c.Vault.MTLS
@@ -601,6 +623,13 @@ func (c *Config) validateMTLS() error {
 	if (m.BYO.Cert == "") != (m.BYO.Key == "") {
 		return fmt.Errorf("vault.mtls.byo: cert and key must be set together")
 	}
+	// mtls+os cannot import an external private key: the OS-native store
+	// (certtostore) installs certificates but offers no key-import path, so the
+	// key must be generated in the store. Reject BYO up front rather than failing
+	// at login time.
+	if method == "mtls+os" && m.BYO.Cert != "" {
+		return fmt.Errorf("vault.mtls.byo is not supported with auth_method mtls+os (the OS-native store cannot import an external key); use auth_method mtls for bring-your-own")
+	}
 	// PKI role is required whenever issuance might run (i.e. no BYO cert).
 	if m.BYO.Cert == "" && m.PKIRole == "" {
 		return fmt.Errorf("vault.mtls.pki_role is required unless a BYO certificate is supplied")
@@ -619,6 +648,13 @@ func (c *Config) validateMTLS() error {
 		m.ReissueBeforeDur = d
 	}
 
+	// mtls+os defaults the requested certificate TTL to 30d when unset (the
+	// OS-store credential doubles as a browser-presented user identity, so a
+	// longer-lived cert is the sensible default); plain mtls/mtls+tpm leave it
+	// unset and defer to the PKI role. Either way the role's max_ttl caps it.
+	if method == "mtls+os" && m.TTL == "" {
+		m.TTL = DefaultMTLSOSTTL
+	}
 	if m.TTL != "" {
 		if _, err := ParseDuration(m.TTL); err != nil {
 			return fmt.Errorf("vault.mtls.ttl %q: %w", m.TTL, err)

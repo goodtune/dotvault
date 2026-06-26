@@ -13,12 +13,16 @@ const envelopeSchema = 1
 
 // sealedCredential is the on-disk envelope for a cert-auth credential. The
 // private key is never in this file: for mtls+tpm the Handle is the TPM-sealed
-// blob; for mtls the Handle is the PEM key (the file backend is the only mode
-// where key bytes touch disk, by definition). Written 0600 via temp+rename.
+// blob; for mtls+os the Handle records the OS-store key container (the key lives
+// in the OS certificate store); for mtls the Handle is the PEM key (the file
+// backend is the only mode where key bytes touch disk, by definition). The
+// CertPEM is retained for every backend as the metadata/assembly source of
+// truth — including mtls+os, where the cert is *also* installed in the OS store.
+// Written 0600 via temp+rename.
 type sealedCredential struct {
 	Schema   int       `json:"schema"`
-	Method   string    `json:"method"`   // "mtls" | "mtls+tpm"
-	Backend  string    `json:"backend"`  // "tpm" | "file"
+	Method   string    `json:"method"`   // "mtls" | "mtls+tpm" | "mtls+os"
+	Backend  string    `json:"backend"`  // "tpm" | "file" | "os"
 	CertPEM  string    `json:"cert_pem"` // leaf + chain
 	Handle   []byte    `json:"handle"`   // opaque securestore handle
 	Serial   string    `json:"serial"`

@@ -17,10 +17,12 @@ var hardwareAvailable = securestore.HardwareAvailable
 type Manager struct {
 	VaultClient   *vault.Client
 	TokenFilePath string
-	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls", or
-	// "mtls+tpm". A "+tpm" suffix on any base method (e.g. "oidc+tpm") also
-	// requests TPM-sealing of the cached token file at rest; for "mtls+tpm"
-	// that is in addition to the cert key the cert flow already seals.
+	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls",
+	// "mtls+tpm", or "mtls+os". A "+tpm" suffix on any base method (e.g.
+	// "oidc+tpm") also requests TPM-sealing of the cached token file at rest;
+	// for "mtls+tpm" that is in addition to the cert key the cert flow already
+	// seals. The "mtls+os" modifier instead stores the cert key in the OS-native
+	// certificate store (it does not seal the token).
 	AuthMethod string
 	AuthMount  string // auth mount path
 	AuthRole   string // optional role

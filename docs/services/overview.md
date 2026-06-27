@@ -57,6 +57,7 @@ Enrolment configuration changes are detected on each polling tick without requir
 | `github` | GitHub / GitHub Enterprise | OAuth device flow |
 | `jfrog` | JFrog Platform / Artifactory | Browser-based web login + token rotation |
 | `databricks` | Databricks workspace / account | OAuth U2M (authorization code + PKCE) + token rotation |
+| `langsmith` | LangSmith (LangChain) | OAuth device flow + token rotation |
 | `ssh` | SSH key generation | Ed25519 key pair |
 | `copy` | Mirror an existing Vault KVv2 secret | Non-interactive; template-driven copy with periodic re-evaluation |
 
@@ -65,6 +66,7 @@ See the individual engine pages for details:
 - [GitHub CLI](github.md)
 - [JFrog Platform](jfrog.md)
 - [Databricks](databricks.md)
+- [LangSmith](langsmith.md)
 - [SSH Keys](ssh.md)
 - [Copy](copy.md)
 
@@ -79,7 +81,7 @@ Engines implement a simple interface:
 Engines that need extra behaviour layer it on through optional interfaces the manager probes for at run time:
 
 - **`SettingsFielder`** — for engines whose written-field set is determined by per-enrolment settings rather than being static (used by `copy`, where the JSON template decides the keys)
-- **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog` and `databricks`); driven by the daemon's `RefreshManager`
+- **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog`, `databricks`, and `langsmith`); driven by the daemon's `RefreshManager`
 - **`Watcher`** — for engines whose output is derived from upstream Vault data and must track source changes (used by `copy`); driven by the daemon's `WatchManager`, which polls on every sync interval and reacts to `kv-v2/data-write` events on Vault Enterprise
 
 This means new engines can be added to support additional services without changes to the core enrolment system.

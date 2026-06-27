@@ -163,6 +163,18 @@ enrolments:
       # sign into, or comment the block out to skip it in the dev loop.
       host: "https://dbc-00000000-0000.cloud.databricks.com"
       # account_id: "<uuid>"   # set for account-level login instead
+  # LangSmith OAuth device-flow login (`langsmith auth login`). Defaults to the
+  # LangSmith SaaS endpoint; there is no local LangSmith to test against, so
+  # signing in requires a real LangSmith account, or comment the block out to
+  # skip it in the dev loop. dotvault owns the rotation (the engine implements
+  # Refresher) so the synced token never expires in place.
+  langsmith:
+    engine: langsmith
+    settings:
+      # api_url defaults to https://api.smith.langchain.com; override for a
+      # self-hosted or EU deployment (e.g. https://eu.api.smith.langchain.com).
+      api_url: "https://api.smith.langchain.com"
+      # workspace_id: "<uuid>"   # optional passthrough for LANGSMITH_WORKSPACE_ID
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the
   # user's enrolment path under a different field name. Re-evaluated on
   # every poll cycle by the WatchManager and, on Enterprise Vault, on

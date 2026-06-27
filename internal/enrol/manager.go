@@ -305,7 +305,7 @@ func (m *Manager) RunOne(ctx context.Context, key string) error {
 // classifyVaultErr applies to Vault response codes.
 func classifyEngine(name string) string {
 	switch name {
-	case "copy", "databricks", "github", "jfrog", "ssh":
+	case "copy", "databricks", "github", "jfrog", "langsmith", "ssh":
 		return name
 	default:
 		return "unknown"

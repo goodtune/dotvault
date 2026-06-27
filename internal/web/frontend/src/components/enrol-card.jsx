@@ -339,6 +339,7 @@ function engineDescription(engine) {
     case 'github': return 'OAuth token via device flow';
     case 'jfrog': return 'Refreshable access token via web login';
     case 'databricks': return 'OAuth U2M token via browser login';
+    case 'langsmith': return 'Refreshable OAuth token via device flow';
     case 'ssh': return 'Ed25519 key generation';
     case 'copy': return 'Mirror an existing Vault secret';
     default: return engine;

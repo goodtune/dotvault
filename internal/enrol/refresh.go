@@ -330,4 +330,5 @@ func stringifyStringMap(data map[string]any) map[string]string {
 var (
 	_ Refresher = (*JFrogEngine)(nil)
 	_ Refresher = (*DatabricksEngine)(nil)
+	_ Refresher = (*LangSmithEngine)(nil)
 )

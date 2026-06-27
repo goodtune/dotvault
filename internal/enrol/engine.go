@@ -133,6 +133,7 @@ var (
 		"databricks": &DatabricksEngine{},
 		"github":     &GitHubEngine{},
 		"jfrog":      &JFrogEngine{},
+		"langsmith":  &LangSmithEngine{},
 		"ssh":        &SSHEngine{},
 	}
 )

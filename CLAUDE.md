@@ -449,12 +449,12 @@ Enrolment keys support one level of grouping (`group/name`, e.g. `databricks/pro
 
 ### Engine Interface
 
-Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
+Engines implement `Name()`, `Run(ctx, settings, io)`, and `Fields()`. Registered in a package-level map. Currently implemented: GitHub (OAuth device flow), JFrog (browser-based web login), Databricks (OAuth U2M authorization-code + PKCE), LangSmith (OAuth device flow + refresh), SSH (Ed25519 key generation), Copy (mirror an existing KVv2 secret).
 
 Optional interfaces extend the contract for engines that need them:
 
 - `SettingsFielder.FieldsFromSettings(settings)` — engines whose written-field set depends on per-enrolment settings (currently the Copy engine, where the JSON template determines the keys). The manager and web runner use `EngineFields(engine, settings)` which falls back to `Fields()` when not implemented.
-- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog and Databricks). Driven by `RefreshManager`.
+- `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog, Databricks, and LangSmith). Driven by `RefreshManager`.
 - `Watcher.WatchSources(settings, username) []WatchSource` — engines whose output is derived from upstream Vault data and must track source changes (currently Copy). Driven by `WatchManager`, which polls every sync interval and (on Enterprise Vault) reacts to source-write events within seconds.
 
 ### GitHub Engine Defaults
@@ -529,6 +529,25 @@ Flow (enrolment — runs once per user):
 Flow (refresh — periodic, driven by `RefreshManager`): every check interval, refresh past half-life via `grant_type=refresh_token`. Databricks may rotate the refresh token (adopted when returned, otherwise the existing one is kept). `401`/`403` is permanent revocation (`ErrRevoked` → wipe + re-enrol); other errors are transient.
 
 Vault schema: `access_token`, `refresh_token`, `host`, `issued_at` (RFC3339), `expires_at` (RFC3339), plus `user` (from SCIM `/Me`, written when available). `user` is deliberately excluded from `Fields()` so a transient SCIM failure doesn't mark an enrolment incomplete. The typical sync rule renders `~/.databrickscfg` (INI) with `host` + `token = {{ .access_token }}` — an OAuth access token is accepted wherever a PAT is, and dotvault keeps it fresh.
+
+### LangSmith Engine
+
+Replicates the `langsmith auth login` flow: the OAuth 2.0 device-authorization grant (RFC 8628) against LangSmith's OAuth endpoints. LangSmith access tokens are short-lived, so the engine implements `Refresher` and dotvault owns the rotation — the rendered credential carries only the access token (no native CLI token cache is written, so nothing races the sync-engine clobber), the same ownership model as JFrog/Databricks. Unlike GitHub (which uses the `cli/oauth` library) the device flow is implemented in-package (`internal/enrol/langsmith.go`) because LangSmith's endpoints and the public client ID differ.
+
+Optional settings (all have defaults — a bare `engine: langsmith` works):
+- `api_url` — LangSmith API endpoint, default `https://api.smith.langchain.com` (https-only; a bare host is assumed https, an explicit `http://` is rejected). The OAuth resource base is derived by stripping a trailing `/api/v1` (the conventional `LANGSMITH_ENDPOINT` value) and trailing slashes via `langsmithResource`, so the device/token endpoints root at the host; the stored `api_url` field is that clean base.
+- `client_id` — default `langsmith-cli` (the CLI's public OAuth app).
+- `workspace_id` — optional passthrough written to the secret verbatim (for a rendered `LANGSMITH_WORKSPACE_ID`); not acquired during login, not in `Fields()`.
+- `https_proxy` / `http_proxy` — same `internal/httpproxy.ClientFromSettings` contract as GitHub/JFrog/Databricks.
+
+Flow (enrolment — runs once per user):
+1. POST `{api_url}/oauth/device/code` with `client_id` + `resource` (the API base; no scope param, matching the CLI) → `device_code`, `user_code`, `verification_uri` (+ optional `verification_uri_complete`), `expires_in`, `interval`.
+2. Present the user code and verification URL. CLI mode opens the browser (preferring `verification_uri_complete` when present); web mode emits the `! First, copy your one-time code: X` line + the URL so the enrol card renders its device-code card (the daemon never opens a browser in web mode — `io.Browser == nil`).
+3. Poll `{api_url}/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` on the advertised interval (floored to 5s), honouring `authorization_pending` (keep waiting), `slow_down` (+5s), and `access_denied`/`expired_token` (fatal), until the access + refresh pair arrives. Requires a refresh token (dotvault needs it to rotate); an access-only response is rejected.
+
+Flow (refresh — periodic, driven by `RefreshManager`): every check interval, refresh past half-life via `grant_type=refresh_token`. LangSmith may rotate the refresh token (adopted when returned, otherwise the existing one is kept). `401`/`403` is permanent revocation (`ErrRevoked` → wipe + re-enrol); other errors are transient.
+
+Vault schema: `access_token`, `refresh_token`, `api_url`, `issued_at` (RFC3339), `expires_at` (RFC3339), plus optional `workspace_id` (passthrough, excluded from `Fields()`). A LangSmith OAuth access token is accepted wherever an API key is, so the typical sync rule renders an env/config file with `LANGSMITH_API_KEY = {{ .access_token }}` + `LANGSMITH_ENDPOINT = {{ .api_url }}`.
 
 ### SSH Engine
 

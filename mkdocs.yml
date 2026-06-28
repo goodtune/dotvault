@@ -69,6 +69,8 @@ nav:
       - Overview: services/overview.md
       - GitHub CLI: services/github.md
       - JFrog Platform: services/jfrog.md
+      - Databricks: services/databricks.md
+      - ghp: services/ghp.md
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
   - SSH Agent: guide/ssh-agent.md

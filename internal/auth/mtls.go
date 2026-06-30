@@ -20,14 +20,14 @@ import (
 
 // MTLSParams carries everything the cert-auth flow needs. It is populated by
 // the daemon (cmd/dotvault) from the validated vault.mtls config and attached
-// to a Manager whose AuthMethod is "mtls" or "mtls+tpm".
+// to a Manager whose AuthMethod is "mtls", "mtls+tpm", or "mtls+os".
 type MTLSParams struct {
 	// Connectivity for building a cert-presenting login client.
 	VaultAddress  string
 	CACert        string
 	TLSSkipVerify bool
 
-	Method          string // "mtls" | "mtls+tpm"
+	Method          string // "mtls" | "mtls+tpm" | "mtls+os"
 	BootstrapMethod string
 	BootstrapMount  string
 	CertMount       string
@@ -56,8 +56,11 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 
 	store, err := securestore.Open(securestore.ModeForMethod(p.Method))
 	if err != nil {
-		if p.Method == "mtls+tpm" {
+		switch p.Method {
+		case "mtls+tpm":
 			return fmt.Errorf("mtls+tpm requested but no hardware backend is available on this host (%w); re-run with auth_method: mtls to store the key on disk, or provision a TPM", err)
+		case "mtls+os":
+			return fmt.Errorf("mtls+os requested but the OS-native certificate store is unavailable (%w); mtls+os is Windows-only — re-run with auth_method: mtls to store the key on disk", err)
 		}
 		return fmt.Errorf("open secure store: %w", err)
 	}
@@ -136,7 +139,7 @@ func (m *Manager) tryExistingCredential(ctx context.Context, store securestore.S
 // expire unrotated. Safe to call repeatedly: after one successful rotation the
 // fresh NotAfter moves out of the window and subsequent calls return nil.
 func (m *Manager) ReissueIfDue(ctx context.Context) error {
-	if m.MTLS == nil || (m.AuthMethod != "mtls" && m.AuthMethod != "mtls+tpm") || m.MTLS.ReissueBefore <= 0 {
+	if m.MTLS == nil || BaseMethod(m.AuthMethod) != "mtls" || m.MTLS.ReissueBefore <= 0 {
 		return nil
 	}
 	cred, err := loadCredential(m.MTLS.StorageDir)
@@ -172,6 +175,9 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	}
 	newCred, err := m.buildCredential(store, issued, handle)
 	if err != nil {
+		return err
+	}
+	if err := storeCertInNativeStore(store, newCred); err != nil {
 		return err
 	}
 	if err := saveCredential(m.MTLS.StorageDir, newCred); err != nil {
@@ -229,7 +235,29 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := storeCertInNativeStore(store, cred); err != nil {
+		return nil, nil, err
+	}
 	return cred, signer, nil
+}
+
+// storeCertInNativeStore pushes the issued certificate into the OS-native
+// certificate store when the secure-store backend supports it (the "os"
+// backend), so other software — browsers above all — can present it for mTLS.
+// For the file and tpm backends, which hold only the key (the cert lives in the
+// credential envelope), it is a no-op. It updates cred.Handle with the value to
+// persist going forward.
+func storeCertInNativeStore(store securestore.Storage, cred *sealedCredential) error {
+	cs, ok := store.(securestore.CertStorer)
+	if !ok {
+		return nil
+	}
+	newHandle, err := cs.StoreCert(cred.Handle, cred.CertPEM)
+	if err != nil {
+		return fmt.Errorf("store certificate in OS-native store: %w", err)
+	}
+	cred.Handle = newHandle
+	return nil
 }
 
 // runBootstrap runs the configured human-credential method to obtain a

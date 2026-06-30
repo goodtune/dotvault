@@ -728,7 +728,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if cfg.Vault.AuthMethod == "mtls" || cfg.Vault.AuthMethod == "mtls+tpm" {
+		if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 			// Certificate auth: the steady state (load credential → cert
 			// login) needs no human and works headlessly, so it takes
 			// precedence over the web/TTY branching. Only first-run bootstrap
@@ -2168,10 +2168,11 @@ func stderrSupportsColour() bool {
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 // mtlsParams builds the cert-auth parameters for the auth.Manager. It returns
-// nil unless auth_method is "mtls" or "mtls+tpm", so the LDAP/OIDC/token paths
-// are unaffected. StorageDir defaults to {cache_dir}/mtls.
+// nil unless auth_method drives the cert-auth flow (mtls / mtls+tpm / mtls+os),
+// so the LDAP/OIDC/token paths are unaffected. StorageDir defaults to
+// {cache_dir}/mtls.
 func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
-	if cfg.Vault.AuthMethod != "mtls" && cfg.Vault.AuthMethod != "mtls+tpm" {
+	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return nil
 	}
 	m := cfg.Vault.MTLS

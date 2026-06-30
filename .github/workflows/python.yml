@@ -33,7 +33,7 @@ jobs:
     name: Python tests (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -75,7 +75,7 @@ jobs:
       # Full history + tags so setuptools-scm derives the version from the same
       # git tags as the Go build; a shallow checkout would have no tags and fall
       # back to 0.0.0.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -111,7 +111,7 @@ jobs:
     # wheel from linux_x86_64 (which PyPI rejects) to manylinux_2_28_x86_64.
     container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

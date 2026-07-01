@@ -133,8 +133,13 @@ func TestUpstreamSourceType(t *testing.T) {
 	}
 }
 
-// TestUpstreamSourceDialError confirms a dial failure is wrapped, not swallowed.
+// TestUpstreamSourceDialError confirms Identities surfaces a dial failure (so
+// status can report the upstream as unreachable), while Sign deliberately does
+// NOT: an unreachable upstream falls through (matched=false, nil error) so
+// Backend.SignWithFlags — which treats a source error as fatal — can still try
+// later sources for a key they own.
 func TestUpstreamSourceDialError(t *testing.T) {
+	_, pub := genUpstreamKey(t)
 	src := &upstreamSource{
 		name:     "agent",
 		endpoint: "/x",
@@ -145,7 +150,42 @@ func TestUpstreamSourceDialError(t *testing.T) {
 	if _, err := src.Identities(context.Background()); err == nil {
 		t.Errorf("want dial error from Identities")
 	}
-	if _, _, err := src.Sign(context.Background(), nil, nil, 0); err == nil {
-		t.Errorf("want dial error from Sign")
+	sig, matched, err := src.Sign(context.Background(), pub, []byte("x"), 0)
+	if err != nil {
+		t.Errorf("Sign should swallow the dial error (fall through), got %v", err)
+	}
+	if matched || sig != nil {
+		t.Errorf("Sign should not match when the upstream is unreachable")
+	}
+}
+
+// TestUpstreamSourceSignFastPathSkipsDial confirms that once the upstream has
+// advertised its keys, a Sign for a key it never offered short-circuits without
+// dialing — so a foreign key (owned by another source) never touches the
+// upstream socket.
+func TestUpstreamSourceSignFastPathSkipsDial(t *testing.T) {
+	priv, _ := genUpstreamKey(t)
+	sock := serveUpstreamAgent(t, priv)
+	src := newUpstreamSource("agent", sock)
+
+	// Populate the advertised-key cache via a real List.
+	if _, err := src.Identities(context.Background()); err != nil {
+		t.Fatalf("Identities: %v", err)
+	}
+
+	// Swap in a dial that fails the test if invoked.
+	dialed := false
+	src.dial = func(context.Context) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("should not dial for a foreign key")
+	}
+
+	_, otherPub := genUpstreamKey(t)
+	sig, matched, err := src.Sign(context.Background(), otherPub, []byte("x"), 0)
+	if err != nil || matched || sig != nil {
+		t.Fatalf("foreign key: matched=%v sig!=nil=%v err=%v", matched, sig != nil, err)
+	}
+	if dialed {
+		t.Errorf("Sign dialed the upstream for a key it never advertised")
 	}
 }

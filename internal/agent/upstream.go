@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -27,6 +29,14 @@ type upstreamSource struct {
 	// can drive an in-memory agent without a real socket; production wires it
 	// to the platform dialEndpoint.
 	dial func(ctx context.Context) (net.Conn, error)
+
+	// advertised is the set of Marshal()'d public-key blobs from the last
+	// successful List; listed reports whether a List has ever succeeded (so an
+	// empty advertised set means "no keys" rather than "not yet known"). Sign
+	// consults these to answer ownership without dialing — see mightOwn.
+	mu         sync.Mutex
+	advertised map[string]bool
+	listed     bool
 }
 
 func newUpstreamSource(name, endpoint string) *upstreamSource {
@@ -52,6 +62,33 @@ func (s *upstreamSource) connect(ctx context.Context) (agent.ExtendedAgent, net.
 	return agent.NewClient(conn), conn, nil
 }
 
+// remember records the keys a successful List advertised so a later Sign can
+// answer ownership without a round-trip.
+func (s *upstreamSource) remember(keys []*agent.Key) {
+	set := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		set[string(k.Marshal())] = true
+	}
+	s.mu.Lock()
+	s.advertised = set
+	s.listed = true
+	s.mu.Unlock()
+}
+
+// mightOwn reports whether key could belong to this upstream. Before the first
+// successful List (listed == false) ownership is unknown, so it returns true
+// and lets Sign dial to find out; afterwards it answers from the advertised
+// set, so a Sign for a key this upstream has never offered short-circuits
+// without touching the socket.
+func (s *upstreamSource) mightOwn(key ssh.PublicKey) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.listed {
+		return true
+	}
+	return s.advertised[string(key.Marshal())]
+}
+
 func (s *upstreamSource) Identities(ctx context.Context) ([]Identity, error) {
 	client, conn, err := s.connect(ctx)
 	if err != nil {
@@ -63,6 +100,7 @@ func (s *upstreamSource) Identities(ctx context.Context) ([]Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list upstream agent %s: %w", s.endpoint, err)
 	}
+	s.remember(keys)
 	ids := make([]Identity, 0, len(keys))
 	for _, k := range keys {
 		// *agent.Key satisfies ssh.PublicKey (Type/Marshal), which is all the
@@ -73,19 +111,39 @@ func (s *upstreamSource) Identities(ctx context.Context) ([]Identity, error) {
 }
 
 func (s *upstreamSource) Sign(ctx context.Context, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, bool, error) {
+	// Ownership fast-path: a key this upstream has never advertised cannot be
+	// ours, so fall through (matched == false) WITHOUT dialing. This is what
+	// keeps a down or slow upstream — even one ordered before kv/vault-ca in
+	// agent.keys — from blocking a Sign for a key another source owns:
+	// Backend.SignWithFlags treats a source error as fatal to the whole
+	// request, so this source must never return an error for a key it doesn't
+	// own.
+	if !s.mightOwn(key) {
+		return nil, false, nil
+	}
+
 	client, conn, err := s.connect(ctx)
 	if err != nil {
-		return nil, false, err
+		// An unreachable upstream owns no usable key right now. Treat it as
+		// "not mine" rather than a hard error so later sources are still tried;
+		// the aggregate result becomes ErrKeyNotFound only when no source
+		// matches. The connectivity failure is still surfaced via Identities
+		// (agent status), so it isn't lost.
+		slog.Debug("ssh agent: upstream unreachable during sign, falling through", "endpoint", s.endpoint, "error", err)
+		return nil, false, nil
 	}
 	defer conn.Close()
 
 	// Confirm the upstream still advertises this key before forwarding, so a
-	// key that belongs to another source falls through (matched == false)
-	// rather than surfacing the upstream's "not found" as a hard error.
+	// key that belongs to another source falls through rather than surfacing
+	// the upstream's "not found" as a hard error.
 	keys, err := client.List()
 	if err != nil {
-		return nil, false, fmt.Errorf("list upstream agent %s: %w", s.endpoint, err)
+		slog.Debug("ssh agent: upstream list failed during sign, falling through", "endpoint", s.endpoint, "error", err)
+		return nil, false, nil
 	}
+	s.remember(keys)
+
 	owned := false
 	for _, k := range keys {
 		if keyEqual(k, key) {

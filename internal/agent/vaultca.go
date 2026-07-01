@@ -141,6 +141,9 @@ func (s *vaultCASource) Identities(ctx context.Context) ([]Identity, error) {
 }
 
 func (s *vaultCASource) Sign(ctx context.Context, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, bool, error) {
+	if !s.mayOwn(key) {
+		return nil, false, nil
+	}
 	cert, cs, err := s.ensureCert(ctx)
 	if err != nil {
 		return nil, false, err
@@ -153,6 +156,26 @@ func (s *vaultCASource) Sign(ctx context.Context, key ssh.PublicKey, data []byte
 		return nil, false, fmt.Errorf("sign: %w", err)
 	}
 	return sig, true, nil
+}
+
+// mayOwn reports whether key could plausibly belong to this source without
+// minting a certificate: true when it matches the stable ephemeral base key
+// or the currently cached certificate (if any). It can't rule out a key on a
+// cold cache (no certificate minted yet), so callers still fall through to
+// ensureCert in that case — the List-parity skip in Backend.SignWithFlags is
+// what actually prevents a source that can't mint from blocking signing for
+// keys owned by other sources.
+func (s *vaultCASource) mayOwn(key ssh.PublicKey) bool {
+	if keyEqual(key, s.base.PublicKey()) {
+		return true
+	}
+	s.mu.Lock()
+	cert := s.cert
+	s.mu.Unlock()
+	if cert == nil {
+		return true
+	}
+	return keyEqual(key, cert)
 }
 
 // renderPrincipals expands each principal template against {vault_username}.

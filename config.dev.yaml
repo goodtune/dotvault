@@ -2,6 +2,14 @@ vault:
   address: "http://127.0.0.1:8200"
   auth_method: "oidc"
   tls_skip_verify: true
+  # Least-privilege token policies (per-deployment; no default provided).
+  # When set, dotvault exchanges the login token for a child token restricted
+  # to exactly these policies. Left unset here so the dev OIDC role's policies
+  # flow through unchanged — the dev Vault doesn't seed a dedicated policy.
+  #
+  # policies:
+  #   - dotvault-sync
+  # no_default_policy: true
 
 sync:
   interval: "15m"
@@ -116,6 +124,30 @@ rules:
           "version": "6"
         }
 
+  - name: ghp
+    vault_key: "ghp"
+    target:
+      path: "~/tmp/.config/ghp/config.yaml"
+      format: yaml
+      template: |
+        server_url: "{{ .server_url }}"
+        user_token: "{{ .user_token }}"
+
+  # Keyless rule: no vault_key, so it never reads Vault. It manages an
+  # ssh_config file built purely from the {{ username }} function and
+  # literals. The example exposes the local dotvault (Vault) endpoint on a
+  # remote host via a stable per-user socket — a dotvault-to-dotvault sharing
+  # setup. A keyless rule must carry a template (there is no secret data to
+  # fall back on).
+  - name: dotvault-forward
+    target:
+      path: "~/tmp/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
+
 enrolments:
   gh:
     engine: github
@@ -149,6 +181,16 @@ enrolments:
       # sign into, or comment the block out to skip it in the dev loop.
       host: "https://dbc-00000000-0000.cloud.databricks.com"
       # account_id: "<uuid>"   # set for account-level login instead
+  # ghp CLI device-authorization flow against a self-hosted ghp server
+  # (github.com/goodtune/ghp). There is no local ghp to test against, so point
+  # this at a real server you can sign into, or comment the block out to skip
+  # it in the dev loop. The enrolment stores user_token (the ghpr_ session
+  # token) and server_url — the two fields ghp's own dotvault integration reads
+  # back out of Vault.
+  ghp:
+    engine: ghp
+    settings:
+      url: "https://ghp.example.com"
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the
   # user's enrolment path under a different field name. Re-evaluated on
   # every poll cycle by the WatchManager and, on Enterprise Vault, on

@@ -5,7 +5,7 @@ go 1.25.6
 require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/cli/oauth v1.2.2
-	github.com/google/go-tpm v0.9.6
+	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.9
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0

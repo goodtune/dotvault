@@ -22,6 +22,10 @@ func TestParseTextRoundTrip(t *testing.T) {
 			AuthMethod:          "oidc",
 			KVMount:             "kv",
 			UserPrefix:          "users/",
+			OIDCCallbackPort:    8251,
+			TokenSocket:         "~/.ssh/dotvault.sock",
+			Policies:            []string{"dotvault", "kv-read"},
+			NoDefaultPolicy:     true,
 			DisableTokenRenewal: true,
 		},
 		Sync: config.SyncConfig{RawInterval: "30m"},
@@ -66,8 +70,9 @@ func TestParseTextRoundTrip(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	// Compare structurally.
-	if got.Vault != src.Vault {
+	// Compare structurally. VaultConfig carries a Policies slice, so it is no
+	// longer comparable with != — use reflect.DeepEqual.
+	if !reflect.DeepEqual(got.Vault, src.Vault) {
 		t.Errorf("Vault mismatch:\ngot:  %+v\nwant: %+v", got.Vault, src.Vault)
 	}
 	if got.Sync.RawInterval != src.Sync.RawInterval {

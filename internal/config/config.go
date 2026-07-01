@@ -174,15 +174,65 @@ type Enrolment struct {
 
 // VaultConfig holds Vault connection settings.
 type VaultConfig struct {
-	Address             string `yaml:"address"`
-	CACert              string `yaml:"ca_cert"`
-	TLSSkipVerify       bool   `yaml:"tls_skip_verify"`
-	KVMount             string `yaml:"kv_mount"`
-	UserPrefix          string `yaml:"user_prefix"`
-	AuthMethod          string `yaml:"auth_method"`
-	AuthRole            string `yaml:"auth_role"`
-	AuthMount           string `yaml:"auth_mount"`
-	DisableTokenRenewal bool   `yaml:"disable_token_renewal"`
+	Address       string `yaml:"address"`
+	CACert        string `yaml:"ca_cert"`
+	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
+	KVMount       string `yaml:"kv_mount"`
+	UserPrefix    string `yaml:"user_prefix"`
+	AuthMethod    string `yaml:"auth_method"`
+	AuthRole      string `yaml:"auth_role"`
+	AuthMount     string `yaml:"auth_mount"`
+	// OIDCCallbackPort is the fixed local TCP port the "oidc"/"oidc+tpm" CLI
+	// flow (dotvault login, and the mtls bootstrap sub-login) binds for the
+	// OAuth redirect_uri, so operators can register one predictable
+	// http://127.0.0.1:<port>/oidc/callback URI with both the Vault auth
+	// role's allowed_redirect_uris and the identity provider, instead of
+	// depending on RFC 8252 loopback (port-agnostic) redirect matching that
+	// not every IdP implements. Zero (the default) resolves to 8250, the
+	// same default the `vault` CLI itself uses, so a role/IdP already
+	// configured for `vault login -method=oidc` typically works for
+	// dotvault without any change. If the configured (or default) port is
+	// already in use, dotvault falls back to an OS-assigned random port and
+	// logs why. Not consulted by the daemon's web UI flow, which always
+	// binds web.listen. See docs/authentication/oidc.md.
+	OIDCCallbackPort int `yaml:"oidc_callback_port"`
+	// Policies is the least-privilege set of Vault policies the working token
+	// should carry. When non-empty, dotvault does not run with the token its
+	// auth role grants directly; instead it exchanges that login token for a
+	// child token restricted to exactly these policies (Vault enforces that the
+	// requested set is a subset of the login token's own policies). Empty — the
+	// default — keeps today's behaviour: the token carries every policy the
+	// auth role granted, which over-provisions a credential that could leak.
+	//
+	// This is a per-deployment concern; dotvault ships no default policy list
+	// because the right set is specific to each operator's Vault policy layout.
+	// See docs/configuration/config-reference.md for the staged rollout — a
+	// future release defaults NoDefaultPolicy to true, and 1.0 will make it
+	// impossible to run a token carrying the implicit `default` policy.
+	Policies []string `yaml:"policies"`
+	// NoDefaultPolicy, when true, strips the implicit `default` policy from the
+	// working token (it sets no_default_policy on the downscoped child token).
+	// Default false today for backwards compatibility; a future release flips
+	// the default to true and 1.0 removes the ability to set it false. Combine
+	// with Policies to pin a token to exactly the capabilities dotvault needs.
+	NoDefaultPolicy     bool `yaml:"no_default_policy"`
+	DisableTokenRenewal bool `yaml:"disable_token_renewal"`
+	// TokenSocket is an optional path to a Unix-domain socket served by a
+	// peer dotvault daemon's web API. When set, dotvault tries to borrow a
+	// live Vault token from the peer via `GET http://localhost/api/v1/token`
+	// over this socket — the equivalent of
+	// `curl --unix-socket <path> http://localhost/api/v1/token` — before
+	// falling back to its own authentication. The borrow runs where dotvault
+	// would otherwise authenticate interactively: on a fresh login (Manager
+	// .Login, after Authenticate finds no usable cached token) and on the
+	// lifecycle recovery path after a cached token goes invalid; a healthy
+	// RenewSelf renewal does not borrow. This is the dotvault-to-dotvault
+	// token-sharing seam: a machine with no interactive login facility (no
+	// browser, no TTY) borrows the token from a peer that has one, reached
+	// over an SSH RemoteForward'd socket. A leading ~ is expanded to the
+	// user's home. A missing or stale socket is ignored — the normal auth
+	// flow proceeds — so the field is purely additive and needs no validation.
+	TokenSocket string `yaml:"token_socket"`
 	// MTLS configures the cert auth methods. It is consulted only when
 	// AuthMethod is "mtls" or "mtls+tpm".
 	MTLS MTLSConfig `yaml:"mtls"`
@@ -361,12 +411,13 @@ type Target struct {
 }
 
 var validFormats = map[string]bool{
-	"yaml":  true,
-	"json":  true,
-	"ini":   true,
-	"toml":  true,
-	"text":  true,
-	"netrc": true,
+	"yaml":       true,
+	"json":       true,
+	"ini":        true,
+	"toml":       true,
+	"text":       true,
+	"netrc":      true,
+	"ssh_config": true,
 }
 
 // LoadSystem loads configuration using the platform-appropriate source.
@@ -626,6 +677,10 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {
+		return fmt.Errorf("vault.oidc_callback_port %d: must be between 0 and 65535", c.Vault.OIDCCallbackPort)
+	}
+
 	// Parse sync interval
 	if c.Sync.RawInterval == "" {
 		c.Sync.Interval = 15 * time.Minute // default fallback interval
@@ -799,14 +854,18 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	}
 	seen[r.Name] = true
 
-	if r.VaultKey == "" {
-		return fmt.Errorf("rules[%d] (%s): vault_key is required", i, r.Name)
+	// vault_key is optional: a rule may manage a file with no Vault-backed
+	// content (e.g. an ssh_config built purely from {{ username }} and
+	// literals). Such a keyless rule renders with an empty data context, so it
+	// must carry a template — there is no secret data to fall back on.
+	if r.VaultKey == "" && r.Target.Template == "" {
+		return fmt.Errorf("rules[%d] (%s): a rule without vault_key must supply target.template (no secret data to write otherwise)", i, r.Name)
 	}
 	if r.Target.Path == "" {
 		return fmt.Errorf("rules[%d] (%s): target.path is required", i, r.Name)
 	}
 	if !validFormats[r.Target.Format] {
-		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, or netrc)", i, r.Name, r.Target.Format)
+		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
 	}
 	return nil
 }

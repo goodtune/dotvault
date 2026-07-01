@@ -75,6 +75,32 @@ type VaultConfig struct {
 
 	// AuthRole is an optional Vault role passed to the auth method.
 	AuthRole string
+
+	// OIDCCallbackPort is the fixed local TCP port an interactive OIDC Login
+	// binds for the OAuth redirect_uri. Zero (the default) resolves to 8250,
+	// matching the `vault` CLI's own default; if that port is unavailable,
+	// Login falls back to a random port. Mirrors vault.oidc_callback_port.
+	OIDCCallbackPort int
+
+	// Policies is the least-privilege set of Vault policies the working token
+	// should carry. When non-empty, an interactive Login exchanges the login
+	// token for a child token restricted to exactly these policies (Vault
+	// enforces the subset rule). Empty inherits every policy the auth role
+	// granted — dotvault's historical behaviour. Mirrors vault.policies.
+	Policies []string
+
+	// NoDefaultPolicy strips the implicit `default` policy from the working
+	// token. Mirrors vault.no_default_policy. Combine with Policies to pin the
+	// token to exactly the capabilities the consumer needs.
+	NoDefaultPolicy bool
+
+	// TokenSocket is an optional path to a peer dotvault daemon's web-API
+	// Unix socket. When set, an interactive Login first tries to borrow a
+	// live token from the peer over the socket (the equivalent of
+	// `curl --unix-socket <path> http://localhost/api/v1/token`) before
+	// running the configured auth flow — the dotvault-to-dotvault sharing
+	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
+	TokenSocket string
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -129,14 +155,18 @@ func LoadConfig(path string) (*Config, error) {
 func fromInternal(cfg *config.Config) *Config {
 	return &Config{
 		Vault: VaultConfig{
-			Address:       cfg.Vault.Address,
-			CACert:        cfg.Vault.CACert,
-			TLSSkipVerify: cfg.Vault.TLSSkipVerify,
-			KVMount:       cfg.Vault.KVMount,
-			UserPrefix:    cfg.Vault.UserPrefix,
-			AuthMethod:    cfg.Vault.AuthMethod,
-			AuthMount:     cfg.Vault.AuthMount,
-			AuthRole:      cfg.Vault.AuthRole,
+			Address:          cfg.Vault.Address,
+			CACert:           cfg.Vault.CACert,
+			TLSSkipVerify:    cfg.Vault.TLSSkipVerify,
+			KVMount:          cfg.Vault.KVMount,
+			UserPrefix:       cfg.Vault.UserPrefix,
+			AuthMethod:       cfg.Vault.AuthMethod,
+			AuthMount:        cfg.Vault.AuthMount,
+			AuthRole:         cfg.Vault.AuthRole,
+			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+			TokenSocket:      cfg.Vault.TokenSocket,
+			Policies:         cfg.Vault.Policies,
+			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,
 		},
 	}
 }

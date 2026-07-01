@@ -295,45 +295,15 @@ func (e *JFrogEngine) Refresh(ctx context.Context, settings map[string]any, exis
 	}, nil
 }
 
-// ensureScheme prepends https:// if the URL has no scheme.
-// The check is case-insensitive so that inputs like "HTTPS://host" are
-// recognized as having a scheme rather than getting https:// prepended.
-func ensureScheme(u string) string {
-	lower := strings.ToLower(u)
-	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
-		return u
-	}
-	return "https://" + u
-}
-
-// normalizeJFrogPlatformURL parses `raw`, enforces that it is a
-// scheme+host-only URL (no path, query, or fragment), and returns the
-// canonical string form. JFrog API paths are concatenated directly onto
-// this value, so any embedded path would route requests incorrectly and
-// a query/fragment would appear verbatim in the stored template.
+// normalizeJFrogPlatformURL parses `raw` into a canonical scheme+host-only
+// JFrog Platform URL (see normalizeBaseURL). The empty case carries an
+// engine-specific hint; all other validation is shared with the other
+// base-URL engines.
 func normalizeJFrogPlatformURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", fmt.Errorf("jfrog enrolment requires a non-empty 'url' setting (your JFrog Platform URL, e.g. https://mycompany.jfrog.io)")
 	}
-	u, err := url.Parse(ensureScheme(raw))
-	if err != nil {
-		return "", fmt.Errorf("parse jfrog url: %w", err)
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("jfrog url must use http or https, got %q", raw)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("jfrog url must include a host: %q", raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("jfrog url must not include a query or fragment: %q", raw)
-	}
-	if u.Path != "" && u.Path != "/" {
-		return "", fmt.Errorf("jfrog url must be the platform base URL without a path (got %q)", raw)
-	}
-	return (&url.URL{Scheme: scheme, Host: u.Host}).String(), nil
+	return normalizeBaseURL("jfrog", raw)
 }
 
 // deduceJFrogServerID extracts a short server identifier from the platform

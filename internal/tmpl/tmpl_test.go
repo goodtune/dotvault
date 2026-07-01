@@ -106,6 +106,54 @@ func TestRender(t *testing.T) {
 	}
 }
 
+func TestRenderUsernameFunction(t *testing.T) {
+	// RenderWithUsername binds {{ username }} to the supplied identity, so a
+	// rule template can build paths from the OS account without the username
+	// being a field in the secret.
+	got, err := RenderWithUsername("ssh", `RemoteForward /home/{{ username }}/.ssh/dotvault.sock`, map[string]any{}, "gary")
+	if err != nil {
+		t.Fatalf("RenderWithUsername: %v", err)
+	}
+	if want := `RemoteForward /home/gary/.ssh/dotvault.sock`; got != want {
+		t.Errorf("RenderWithUsername() = %q, want %q", got, want)
+	}
+
+	// A secret field named "user" is independent of {{ username }} — they do
+	// not collide, because the username is a function, not a data key.
+	got, err = RenderWithUsername("both", `{{ .user }}/{{ username }}`, map[string]any{"user": "secretval"}, "osuser")
+	if err != nil {
+		t.Fatalf("RenderWithUsername (both): %v", err)
+	}
+	if want := "secretval/osuser"; got != want {
+		t.Errorf("RenderWithUsername (both) = %q, want %q", got, want)
+	}
+
+	// Plain Render leaves {{ username }} bound to the empty string rather than
+	// failing to parse, so the function is uniformly available.
+	got, err = Render("plain", `[{{ username }}]`, map[string]any{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if want := "[]"; got != want {
+		t.Errorf("Render() with username func = %q, want %q", got, want)
+	}
+}
+
+// TestRenderWithUsername_EmptyContext pins the keyless-rule contract: a rule
+// with no vault_key renders against an empty data context, where {{ username }}
+// (a function) still resolves but a reference to a would-be secret field
+// degrades to Go's <no value> sentinel rather than erroring. This is what lets
+// a keyless ssh_config template build per-user paths with no Vault data.
+func TestRenderWithUsername_EmptyContext(t *testing.T) {
+	got, err := RenderWithUsername("keyless", `User {{ username }} field={{ .secret_field }}`, map[string]any{}, "goodtune")
+	if err != nil {
+		t.Fatalf("RenderWithUsername (empty context): %v", err)
+	}
+	if want := "User goodtune field=<no value>"; got != want {
+		t.Errorf("empty-context render = %q, want %q", got, want)
+	}
+}
+
 func TestRenderEnvFunction(t *testing.T) {
 	t.Setenv("DOTVAULT_TEST_VAR", "test-value")
 

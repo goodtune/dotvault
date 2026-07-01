@@ -160,7 +160,11 @@ type registryLayer struct {
 	VaultAuthMethod          string
 	VaultAuthRole            string
 	VaultAuthMount           string
+	VaultOIDCCallbackPort    *uint32
+	VaultPolicies            []string
+	VaultNoDefaultPolicy     *uint32
 	VaultDisableTokenRenewal *uint32
+	VaultTokenSocket         string
 
 	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
 	MTLSBootstrapMethod string
@@ -242,7 +246,11 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultAuthMethod, _ = readRegString(vk, "AuthMethod")
 		layer.VaultAuthRole, _ = readRegString(vk, "AuthRole")
 		layer.VaultAuthMount, _ = readRegString(vk, "AuthMount")
+		layer.VaultOIDCCallbackPort = readRegDWORD(vk, "OIDCCallbackPort")
+		layer.VaultPolicies = readRegMultiString(vk, "Policies")
+		layer.VaultNoDefaultPolicy = readRegDWORD(vk, "NoDefaultPolicy")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
+		layer.VaultTokenSocket, _ = readRegString(vk, "TokenSocket")
 	}
 
 	// Read Vault\MTLS subkey (cert auth) and its nested BYO subkey.
@@ -379,8 +387,24 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.VaultAuthMount != "" {
 		cfg.Vault.AuthMount = layer.VaultAuthMount
 	}
+	if layer.VaultOIDCCallbackPort != nil {
+		cfg.Vault.OIDCCallbackPort = int(*layer.VaultOIDCCallbackPort)
+	}
+	// Present (non-nil), not non-empty, gates the merge: readRegMultiString
+	// returns nil only when the value is absent, so an explicitly-set empty
+	// REG_MULTI_SZ still overrides the base — matching the regfile parser's
+	// ok-check and keeping the .reg/registry round-trip lossless.
+	if layer.VaultPolicies != nil {
+		cfg.Vault.Policies = layer.VaultPolicies
+	}
+	if layer.VaultNoDefaultPolicy != nil {
+		cfg.Vault.NoDefaultPolicy = *layer.VaultNoDefaultPolicy != 0
+	}
 	if layer.VaultDisableTokenRenewal != nil {
 		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
+	}
+	if layer.VaultTokenSocket != "" {
+		cfg.Vault.TokenSocket = layer.VaultTokenSocket
 	}
 	if layer.MTLSBootstrapMethod != "" {
 		cfg.Vault.MTLS.BootstrapMethod = layer.MTLSBootstrapMethod

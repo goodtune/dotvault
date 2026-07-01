@@ -131,6 +131,7 @@ var (
 	engines   = map[string]Engine{
 		"copy":       &CopyEngine{},
 		"databricks": &DatabricksEngine{},
+		"ghp":        &GHPEngine{},
 		"github":     &GitHubEngine{},
 		"jfrog":      &JFrogEngine{},
 		"ssh":        &SSHEngine{},

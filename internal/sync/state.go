@@ -15,6 +15,12 @@ type RuleState struct {
 	VaultVersion int       `json:"vault_version"`
 	LastSynced   time.Time `json:"last_synced"`
 	FileChecksum string    `json:"file_checksum"`
+	// RuleHash fingerprints the rule's render-affecting definition (vault key
+	// and target path/format/template/merge) as of the last write. The skip
+	// gate compares it so a template edit re-applies even when the secret
+	// version and on-disk file are both unchanged. Empty in state written by
+	// older versions, which forces a one-time reconciling re-sync on upgrade.
+	RuleHash string `json:"rule_hash,omitempty"`
 }
 
 type stateFile struct {

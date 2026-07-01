@@ -3,6 +3,8 @@ package regfile
 import (
 	"bytes"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -145,6 +147,133 @@ func TestGenerateMultilineTemplate(t *testing.T) {
 	}
 }
 
+// TestSSHConfigRuleRoundTrip proves the ssh_config format has full Windows
+// registry parity: a rule whose target format is "ssh_config" with a multi-line
+// template (the dotvault-forward use case) survives both the .reg render → parse
+// cycle (the multi-line template routing through hex(1) like any other) and the
+// .reg → YAML → config.Load pipeline (so the format string is accepted by the
+// validator on both surfaces).
+func TestSSHConfigRuleRoundTrip(t *testing.T) {
+	const template = "Host *\n    User {{ username }}\n" +
+		"    RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200\n"
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name:     "ssh",
+				VaultKey: "ssh",
+				Target: config.Target{
+					Path:     "~/.ssh/config",
+					Format:   "ssh_config",
+					Template: template,
+				},
+			},
+		},
+	}
+
+	// .reg render carries the format verbatim and emits the multi-line
+	// template as hex(1).
+	text := mustGenerate(t, src)
+	if !strings.Contains(text, "\"TargetFormat\"=\"ssh_config\"\r\n") {
+		t.Errorf("rendered .reg missing ssh_config format\n--- output ---\n%s", text)
+	}
+	if !strings.Contains(text, "\"TargetTemplate\"=hex(1):") {
+		t.Errorf("multi-line ssh_config template should be hex(1)\n--- output ---\n%s", text)
+	}
+
+	// .reg parse reconstructs the rule with the format and template intact.
+	parsed, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(parsed.Rules))
+	}
+	if parsed.Rules[0].Target.Format != "ssh_config" {
+		t.Errorf("Format = %q, want ssh_config", parsed.Rules[0].Target.Format)
+	}
+	if parsed.Rules[0].Target.Template != template {
+		t.Errorf("Template round-trip mismatch.\n--- want ---\n%q\n--- got ---\n%q", template, parsed.Rules[0].Target.Template)
+	}
+
+	// The YAML path (reg-export → config.Load) accepts the format too.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load rejected ssh_config rule: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].Target.Format != "ssh_config" {
+		t.Errorf("ssh_config rule not preserved through YAML load: %+v", loaded.Rules)
+	}
+}
+
+// TestKeylessRuleRoundTrip covers a rule with no vault_key (an empty VaultKey):
+// it must survive the .reg render → parse cycle (VaultKey emitted as "" and read
+// back empty, not dropped or defaulted) and the .reg → YAML → config.Load
+// pipeline (the validator accepting a keyless rule because it carries a
+// template). This is the registry-parity guarantee for the keyless feature.
+func TestKeylessRuleRoundTrip(t *testing.T) {
+	const template = "Host *\n    User {{ username }}\n"
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{
+				Name: "dotvault-forward", // no VaultKey
+				Target: config.Target{
+					Path:     "~/.ssh/config",
+					Format:   "ssh_config",
+					Template: template,
+				},
+			},
+		},
+	}
+
+	text := mustGenerate(t, src)
+	if !strings.Contains(text, "\"VaultKey\"=\"\"\r\n") {
+		t.Errorf("keyless rule should emit VaultKey as \"\"\n--- output ---\n%s", text)
+	}
+
+	parsed, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(parsed.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(parsed.Rules))
+	}
+	if parsed.Rules[0].VaultKey != "" {
+		t.Errorf("VaultKey = %q, want empty (keyless)", parsed.Rules[0].VaultKey)
+	}
+	if parsed.Rules[0].Target.Template != template {
+		t.Errorf("Template round-trip mismatch: %q", parsed.Rules[0].Target.Template)
+	}
+
+	// The YAML path (reg-export → config.Load) accepts the keyless rule.
+	yamlBytes, err := MarshalYAML(src)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load rejected keyless rule: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].VaultKey != "" {
+		t.Errorf("keyless rule not preserved through YAML load: %+v", loaded.Rules)
+	}
+}
+
 func TestGenerateEnrolments(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
@@ -268,6 +397,119 @@ func TestGenerateNestedMapSetting(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q\n--- output ---\n%s", want, got)
 		}
+	}
+}
+
+// TestNestedMapSettingRoundTrip guards the YAML → .reg → YAML path for an
+// enrolment whose settings carry a nested map (the Copy engine's
+// settings.from → mount/path). The renderer emits the nested block as a
+// Settings\from subkey; Parse must descend into it rather than only reading
+// values directly under Settings, or the `from` struct is silently dropped.
+func TestNestedMapSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"format":   "json",
+					"template": `{"token": "{{ .data.password }}"}`,
+					"from": map[string]any{
+						"mount": "kv",
+						"path":  "apps/sample/keys/{{.user}}",
+					},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	en, ok := got.Enrolments["sample"]
+	if !ok {
+		t.Fatalf("enrolment did not round-trip; got %v", got.Enrolments)
+	}
+	from, ok := en.Settings["from"].(map[string]any)
+	if !ok {
+		t.Fatalf("settings.from did not round-trip as a nested map; got %T: %v", en.Settings["from"], en.Settings["from"])
+	}
+	want := map[string]any{"mount": "kv", "path": "apps/sample/keys/{{.user}}"}
+	if !reflect.DeepEqual(from, want) {
+		t.Errorf("settings.from = %v, want %v", from, want)
+	}
+}
+
+// TestEmptyNestedMapSettingRoundTrip exercises the seenKeys-only discovery
+// branch in collectSettingsBlock: an empty nested map (`from: {}`) emits a bare
+// Settings\from subkey stanza with no values, so it is invisible in the
+// value-bearing map and can only be recovered from the recorded [...] stanzas.
+func TestEmptyNestedMapSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"format": "json",
+					"from":   map[string]any{},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	from, ok := got.Enrolments["sample"].Settings["from"].(map[string]any)
+	if !ok {
+		t.Fatalf("empty settings.from did not round-trip as a nested map; got %T: %v",
+			got.Enrolments["sample"].Settings["from"], got.Enrolments["sample"].Settings["from"])
+	}
+	if len(from) != 0 {
+		t.Errorf("settings.from = %v, want empty map", from)
+	}
+}
+
+// TestDeeplyNestedSettingRoundTrip guards recursion beyond a single level and
+// confirms a nested map containing both a scalar and a further nested map
+// round-trips. Mixed-case subkey names are lowercased on the way back, matching
+// the live Windows loader (readRegistrySettingsBlock) — the lockstep contract.
+func TestDeeplyNestedSettingRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Enrolments: map[string]config.Enrolment{
+			"sample": {
+				Engine: "copy",
+				Settings: map[string]any{
+					"outer": map[string]any{
+						"leaf": "value",
+						"inner": map[string]any{
+							"deepest": "buried",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := map[string]any{
+		"outer": map[string]any{
+			"leaf": "value",
+			"inner": map[string]any{
+				"deepest": "buried",
+			},
+		},
+	}
+	if !reflect.DeepEqual(got.Enrolments["sample"].Settings, want) {
+		t.Errorf("settings = %#v, want %#v", got.Enrolments["sample"].Settings, want)
 	}
 }
 
@@ -635,10 +877,32 @@ func TestEmptyStringEmittedExplicitly(t *testing.T) {
 		`"AuthMount"=""`,
 		`"AuthRole"=""`,
 		`"CACert"=""`,
+		`"TokenSocket"=""`,
+		`"OIDCCallbackPort"=dword:00000000`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in output (clearing semantics):\n%s", want, got)
 		}
+	}
+}
+
+// TestOIDCCallbackPortEmitted pins that a non-zero oidc_callback_port
+// round-trips through the .reg render as a REG_DWORD under Vault, matching
+// the bool-style scalars rather than being dropped like an unset string.
+func TestOIDCCallbackPortEmitted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			Address:          "https://vault.example.com:8200",
+			OIDCCallbackPort: 8251,
+		},
+		Sync: config.SyncConfig{RawInterval: "15m"},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(got, `"OIDCCallbackPort"=dword:0000203b`) {
+		t.Errorf("expected OIDCCallbackPort dword:0000203b (8251) in output:\n%s", got)
 	}
 }
 

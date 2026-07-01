@@ -35,6 +35,10 @@ type Secret struct {
 // Client wraps the Vault API client.
 type Client struct {
 	raw *vaultapi.Client
+	// cfg is the connection configuration the client was built from. Retained
+	// so CreateChildTokenFor can spin up an isolated sibling client (same
+	// address/TLS, a different token) without mutating this one.
+	cfg Config
 }
 
 // NewClient creates a new Vault API client.
@@ -81,7 +85,7 @@ func NewClient(cfg Config) (*Client, error) {
 	// is set unconditionally — an empty cfg.Token clears the SDK's pickup.
 	client.SetToken(cfg.Token)
 
-	return &Client{raw: client}, nil
+	return &Client{raw: client, cfg: cfg}, nil
 }
 
 // Raw returns the underlying Vault API client for direct access.
@@ -227,6 +231,77 @@ func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret
 	return secret, nil
 }
 
+// CreateChildToken mints a child of the currently-set token, restricted to the
+// given policies and (optionally) without the implicit `default` policy. It is
+// the least-privilege downscoping primitive: a freshly-minted login token
+// carries every policy the auth role granted, and exchanging it for a narrower
+// child shrinks the blast radius of a leaked cached token. Vault enforces that
+// the requested policies are a subset of the parent token's own policies, so
+// this can only ever drop privilege, never escalate it.
+//
+// The child is renewable so the lifecycle manager can keep it alive; its TTL is
+// the Vault default for the parent (no explicit ttl is requested). A DisplayName
+// of "dotvault" is set so the downscoped tokens are recognisable in Vault's
+// audit log.
+func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefaultPolicy bool) (string, error) {
+	renewable := true
+	req := &vaultapi.TokenCreateRequest{
+		Policies:        policies,
+		NoDefaultPolicy: noDefaultPolicy,
+		Renewable:       &renewable,
+		DisplayName:     "dotvault",
+	}
+	secret, err := c.raw.Auth().Token().CreateWithContext(ctx, req)
+	if err != nil {
+		observability.RecordVaultCall(ctx, "create_child_token", classifyVaultErr(err))
+		return "", fmt.Errorf("create downscoped child token: %w", err)
+	}
+	if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
+		return "", fmt.Errorf("no token in child token create response")
+	}
+	observability.RecordVaultCall(ctx, "create_child_token", "ok")
+	return secret.Auth.ClientToken, nil
+}
+
+// NewSibling builds an isolated client that shares this client's connection
+// settings (address, CA, TLS-skip, and the client certificate) but carries the
+// given token instead of this client's. It is the seam for operations that must
+// run under a different token without disturbing the shared client: the
+// least-privilege downscope mint (CreateChildTokenFor) and the mTLS bootstrap
+// login both use it so a broad token is never installed on the shared,
+// web-exposed client.
+//
+// The client certificate is carried so that on a Vault listener configured to
+// require a client cert on every request, the sibling's calls still present it.
+func (c *Client) NewSibling(token string) (*Client, error) {
+	return NewClient(Config{
+		Address:       c.cfg.Address,
+		CACert:        c.cfg.CACert,
+		TLSSkipVerify: c.cfg.TLSSkipVerify,
+		ClientCert:    c.cfg.ClientCert,
+		Token:         token,
+	})
+}
+
+// CreateChildTokenFor mints a child of parentToken without disturbing the
+// receiver's own token. It builds an isolated sibling client (NewSibling: same
+// address/TLS/client-cert, parentToken as the auth token) and creates the child
+// there.
+//
+// This isolation is load-bearing for the downscope flow: minting on the shared
+// client would require installing the broad parent token on it first, and a
+// failure mid-mint (or a concurrent reader on the web server) could then
+// observe — or persist — that broad token. The sibling carries the client
+// certificate too, so on an mTLS deployment that requires a client cert on
+// every Vault request the auth/token/create call still succeeds.
+func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, policies []string, noDefaultPolicy bool) (string, error) {
+	sibling, err := c.NewSibling(parentToken)
+	if err != nil {
+		return "", fmt.Errorf("build downscope client: %w", err)
+	}
+	return sibling.CreateChildToken(ctx, policies, noDefaultPolicy)
+}
+
 // ServerHealth returns the Vault server health status.
 func (c *Client) ServerHealth(ctx context.Context) (*HealthResponse, error) {
 	resp, err := c.raw.Sys().HealthWithContext(ctx)
@@ -234,8 +309,8 @@ func (c *Client) ServerHealth(ctx context.Context) (*HealthResponse, error) {
 		return nil, fmt.Errorf("vault health check: %w", err)
 	}
 	return &HealthResponse{
-		Version:    resp.Version,
-		Enterprise: resp.Enterprise,
+		Version:     resp.Version,
+		Enterprise:  resp.Enterprise,
 		ClusterName: resp.ClusterName,
 	}, nil
 }

@@ -13,6 +13,17 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 )
 
+// policyConstraint projects the server's vault config onto the least-privilege
+// downscoping constraint applied to freshly-minted web-login tokens. It mirrors
+// the CLI flows (auth.Manager.Policy) so a token obtained through the web UI is
+// narrowed identically to one obtained on the terminal.
+func (s *Server) policyConstraint() auth.PolicyConstraint {
+	return auth.PolicyConstraint{
+		Policies:        s.vaultCfg.Policies,
+		NoDefaultPolicy: s.vaultCfg.NoDefaultPolicy,
+	}
+}
+
 // WaitForAuth blocks until authentication completes or the context is cancelled.
 func (s *Server) WaitForAuth(ctx context.Context) error {
 	select {
@@ -101,8 +112,14 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := loginSecret.Auth.ClientToken
+	token, err := auth.Downscope(r.Context(), s.vault, loginSecret.Auth.ClientToken, s.policyConstraint())
+	if err != nil {
+		slog.Error("downscoping token to least privilege failed", "error", err)
+		http.Error(w, "Authentication failed during token downscoping", http.StatusInternalServerError)
+		return
+	}
 	s.vault.SetToken(token)
+	auth.WarnUnrestrictedPolicy(s.policyConstraint())
 
 	if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
 		slog.Warn("failed to write token file", "error", err)
@@ -172,8 +189,16 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 
 	// If authenticated, consume the token server-side.
 	if status.State == "authenticated" && status.Token != "" {
-		s.vault.SetToken(status.Token)
-		if err := auth.WriteTokenFile(s.tokenFilePath, status.Token, s.sealToken); err != nil {
+		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
+		if err != nil {
+			slog.Error("downscoping token to least privilege failed", "error", err)
+			s.login.Clear(sessionID)
+			writeError(w, "authentication failed during token downscoping", http.StatusInternalServerError)
+			return
+		}
+		s.vault.SetToken(token)
+		auth.WarnUnrestrictedPolicy(s.policyConstraint())
+		if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
 			slog.Warn("failed to write token file", "error", err)
 		}
 		s.login.Clear(sessionID)

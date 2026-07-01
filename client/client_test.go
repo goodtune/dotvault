@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,9 +22,27 @@ type fakeVault struct {
 	secrets map[string]map[string]any
 	// tokenValid controls whether lookup-self succeeds.
 	tokenValid bool
+	// acceptToken, when non-empty, makes only that exact token validate (any
+	// other non-empty token is rejected). Lets a test distinguish a stale
+	// cached token from a fresh borrowed one. When empty, any non-empty token
+	// validates (subject to tokenValid).
+	acceptToken string
 	// unreachable, when set, makes every endpoint return 502 (simulating a
 	// dead upstream that still answers at the socket).
 	unreachable bool
+}
+
+// rejects reports whether the given request token should be denied, honouring
+// tokenValid (global) and acceptToken (specific). Centralised so lookup-self
+// and the KV path agree.
+func (fv *fakeVault) rejects(tok string) bool {
+	if !fv.tokenValid || tok == "" {
+		return true
+	}
+	if fv.acceptToken != "" && tok != fv.acceptToken {
+		return true
+	}
+	return false
 }
 
 func newFakeVault(t *testing.T) *fakeVault {
@@ -41,7 +60,7 @@ func newFakeVault(t *testing.T) *fakeVault {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		if !fv.tokenValid || r.Header.Get("X-Vault-Token") == "" {
+		if fv.rejects(r.Header.Get("X-Vault-Token")) {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
 			return
@@ -71,7 +90,7 @@ func newFakeVault(t *testing.T) *fakeVault {
 		}
 		// Real Vault gates KV reads on the token, same as lookup-self, so the
 		// fake does too — otherwise read-path tests couldn't exercise ErrDenied.
-		if !fv.tokenValid || r.Header.Get("X-Vault-Token") == "" {
+		if fv.rejects(r.Header.Get("X-Vault-Token")) {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
 			return
@@ -245,6 +264,157 @@ func TestAuthenticateCached_Unreachable(t *testing.T) {
 	err := c.AuthenticateCached(context.Background())
 	if !errors.Is(err, ErrUnreachable) {
 		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+// newUnixTokenServer starts an httptest server bound to a Unix socket at
+// sockPath serving GET /api/v1/token (the peer dotvault web-API endpoint the
+// borrow dials). If the platform cannot bind a Unix socket the test is skipped.
+func newUnixTokenServer(t *testing.T, sockPath, token string) {
+	t.Helper()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
+	})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+}
+
+// TestAuthenticateCached_SocketBorrow covers the headless-consumer path: no
+// DOTVAULT_TOKEN and no token file, but a configured peer socket serving a live
+// token. AuthenticateCached must borrow it (no prompt) and validate it.
+func TestAuthenticateCached_SocketBorrow(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, "borrowed-token")
+
+	c, err := New(&Config{
+		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		// No token file present (path points at an empty temp dir entry).
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "borrowed-token" {
+		t.Errorf("Token = %q, want borrowed-token", c.Token())
+	}
+}
+
+// TestAuthenticateCached_SocketBorrowMissing verifies that a configured but
+// absent socket is non-fatal and the call still reports ErrLoginRequired (with
+// a message naming the socket) rather than hanging or returning a transport
+// error.
+func TestAuthenticateCached_SocketBorrowMissing(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v, want ErrLoginRequired", err)
+	}
+	if !strings.Contains(err.Error(), sock) {
+		t.Errorf("error message = %q, want it to name the socket %q", err.Error(), sock)
+	}
+}
+
+// TestAuthenticateCached_StaleTokenBorrowsFromSocket is the regression for the
+// P2 review finding: a cached token that a reachable Vault rejects must not
+// short-circuit to ErrLoginRequired — the peer socket should still be tried, so
+// a remote host with a stale local token file but a live peer recovers.
+func TestAuthenticateCached_StaleTokenBorrowsFromSocket(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "stale-token") // present but will be rejected
+	fv := newFakeVault(t)
+	fv.acceptToken = "borrowed-token" // only the peer's token validates
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, "borrowed-token")
+
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "borrowed-token" {
+		t.Errorf("Token = %q, want borrowed-token (socket should win over the stale cached token)", c.Token())
+	}
+}
+
+// TestAuthenticateCached_StaleTokenUnreachableShortCircuits verifies the
+// short-circuit: when validating the cached token reports an unreachable Vault,
+// the function returns ErrUnreachable without trying the socket (a borrowed
+// token could not be validated either).
+func TestAuthenticateCached_StaleTokenUnreachableShortCircuits(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "stale-token")
+	fv := newFakeVault(t)
+	fv.unreachable = true
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, "borrowed-token")
+
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.AuthenticateCached(context.Background())
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+// TestAuthenticateCached_StaleEnvValidFile is the regression for the P2 finding
+// that env and file must be validated as separate candidates: a stale
+// DOTVAULT_TOKEN must not mask a valid token file. The env token is rejected,
+// the file token is accepted, and no socket is involved.
+func TestAuthenticateCached_StaleEnvValidFile(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "stale-token") // present but rejected
+	fv := newFakeVault(t)
+	fv.acceptToken = "fresh-token" // only the file's token validates
+
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
+	if err := os.WriteFile(tokenFile, []byte("fresh-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(&Config{
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token"},
+		TokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "fresh-token" {
+		t.Errorf("Token = %q, want fresh-token (file should win over the stale env token)", c.Token())
 	}
 }
 

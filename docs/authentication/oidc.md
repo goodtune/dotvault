@@ -10,6 +10,7 @@ vault:
   auth_method: "oidc"
   auth_mount: "oidc"       # optional, defaults to the method name
   auth_role: "default"     # optional, Vault role to request
+  oidc_callback_port: 8250 # optional, defaults to 8250 (see "Redirect URIs" below)
 ```
 
 !!! tip "Seal the cached token under the TPM"
@@ -17,9 +18,9 @@ vault:
 
 ## How it works
 
-1. dotvault requests an authentication URL from Vault's OIDC auth method
+1. dotvault requests an authentication URL from Vault's OIDC auth method, passing a `redirect_uri` that points at a local HTTP listener
 2. A browser window opens to the identity provider's login page
-3. dotvault listens on a random localhost port for the OAuth callback
+3. dotvault listens on `127.0.0.1:8250` (or `oidc_callback_port`, see below) for the OAuth callback
 4. After successful login, the callback delivers an authorisation code
 5. dotvault exchanges the code for a Vault token
 
@@ -29,6 +30,19 @@ In web UI mode, the OIDC flow is initiated from the web dashboard instead:
 2. Browser redirects to the identity provider
 3. After login, the callback returns to the web UI
 4. The web UI stores the session and the daemon receives the Vault token
+
+## Redirect URIs
+
+Vault's OIDC auth method forwards the `redirect_uri` dotvault supplies straight through to the identity provider's authorization request, so the callback lands directly on dotvault (or the browser) rather than being proxied back through Vault. Both Vault's `allowed_redirect_uris` on the role **and** the identity provider must therefore allow-list the exact URI dotvault is going to use — there are two distinct URIs depending on how dotvault is running:
+
+| Flow | Redirect URI | Notes |
+|------|---------------|-------|
+| `dotvault login` / CLI (`oidc`, `oidc+tpm`) | `http://127.0.0.1:<oidc_callback_port>/oidc/callback` | Port defaults to **8250** — the same default the `vault` CLI itself uses (`vault login -method=oidc`), so a role/IdP already configured for the `vault` CLI typically works for dotvault unchanged. Configurable via `vault.oidc_callback_port`. |
+| Daemon web UI | `http://<web.listen>/auth/oidc/callback` | Fixed at the configured `web.listen` address (e.g. `127.0.0.1:9000/auth/oidc/callback`); not affected by `oidc_callback_port`. |
+
+Vault's own redirect matcher (`vault-plugin-auth-jwt`) ignores only the **port** on a loopback host — scheme, host, and path must match exactly, and it treats `127.0.0.1` and `localhost` as different hosts. Not every identity provider implements the same RFC 8252 loopback leniency (some validate the redirect URI, including the port, exactly), which is why dotvault binds a **fixed** port by default rather than a random one: it lets you register one predictable URI with both Vault and the IdP instead of guessing at a port range. If the configured (or default) port is already bound by another process (e.g. a concurrent login, or the `vault` CLI itself mid-flow), dotvault falls back to an OS-assigned random port and logs why — that fallback only works end-to-end against an IdP/Vault role that does implement port-agnostic matching. Any other bind failure (for example, a privileged port below 1024 on Linux/macOS without the capability to bind one, or a firewall/policy block) is a hard login error rather than a silent fallback, since that kind of failure won't clear itself on the next login — pick a port `>= 1024` unless dotvault runs with the privilege to bind lower ones.
+
+If Vault returns a 200 response to the `auth_url` request but the response carries no `auth_url` field, this almost always means the `redirect_uri` dotvault sent was rejected — Vault fails this way (success status, empty body) rather than returning an error. dotvault's error message names the exact `redirect_uri` it sent plus the auth mount and role, so check that value against `allowed_redirect_uris` on the role and against the redirect URIs registered with the identity provider.
 
 ## Identity providers
 
@@ -60,18 +74,21 @@ The OIDC auth method must be configured in Vault. The key steps are:
         default_role="default"
     ```
 
-3. Create a role mapping:
+3. Create a role mapping. List every redirect URI a client of this role will use — dotvault's CLI flow, dotvault's own web UI (if enabled), and Vault's own web UI login (if used) each need a separate entry:
 
     ```sh
     vault write auth/oidc/role/default \
+        allowed_redirect_uris="http://127.0.0.1:8250/oidc/callback" \
+        allowed_redirect_uris="http://127.0.0.1:9000/auth/oidc/callback" \
         allowed_redirect_uris="https://vault.example.com:8200/ui/vault/auth/oidc/oidc/callback" \
-        allowed_redirect_uris="http://localhost:8250/oidc/callback" \
         user_claim="email" \
         policies="dotvault-user"
     ```
 
     !!! note
-        The `allowed_redirect_uris` must include `http://localhost:8250/oidc/callback` (or the port range dotvault uses) to support the CLI-based OIDC flow. The web UI callback must also be listed if using web-based login.
+        `http://127.0.0.1:8250/oidc/callback` is dotvault's CLI flow (`dotvault login`) — see the "Redirect URIs" table above; use `127.0.0.1`, not `localhost` (Vault treats them as different hosts and ignores only the port, not the host). `http://127.0.0.1:9000/auth/oidc/callback` is dotvault's own web UI, present only if `web.enabled` and adjusted to match `web.listen`. `.../ui/vault/auth/oidc/oidc/callback` is unrelated to dotvault — it's Vault's own browser-based UI login — and is only needed if operators also log in to the Vault UI directly.
+
+    Register the same URIs with the identity provider (Okta, Azure AD, etc.) — Vault forwards the `redirect_uri` straight through, so the IdP validates it independently and may not tolerate a mismatched port the way Vault does.
 
 For detailed Vault OIDC configuration, see the [HashiCorp OIDC Auth Method documentation](https://developer.hashicorp.com/vault/docs/auth/jwt).
 

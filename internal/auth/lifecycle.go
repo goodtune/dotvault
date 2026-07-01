@@ -34,6 +34,14 @@ type LifecycleManager struct {
 	// same stale value. Empty means no reload attempt is made.
 	tokenFilePath string
 
+	// tokenSocket is an optional path to a peer dotvault's web-API Unix
+	// socket. When set, tryReload also consults the peer for a fresh token
+	// (after the file and env candidates) so a daemon whose token has gone
+	// invalid can recover by borrowing the peer's live token instead of
+	// forcing a re-auth. Empty disables the socket candidate. See
+	// FetchTokenFromSocket.
+	tokenSocket string
+
 	// OnReauth, when non-nil, is invoked exactly once each time the
 	// manager transitions to the needs-reauth state. Used by web mode to
 	// clear in-memory auth state and force the SPA back to its login
@@ -120,6 +128,14 @@ func (lm *LifecycleManager) Reload() {
 // recover a running daemon without a restart.
 func (lm *LifecycleManager) SetTokenFilePath(p string) {
 	lm.tokenFilePath = p
+}
+
+// SetTokenSocket wires the path to a peer dotvault's web-API Unix socket so the
+// recovery path can borrow the peer's live token (dotvault-to-dotvault sharing)
+// before declaring re-auth necessary. Empty disables it. See
+// FetchTokenFromSocket.
+func (lm *LifecycleManager) SetTokenSocket(p string) {
+	lm.tokenSocket = p
 }
 
 // SetOnReauth registers a callback fired when the manager transitions into
@@ -263,21 +279,37 @@ func (lm *LifecycleManager) clearReauth() {
 // env-first policy would keep selecting it and never see a fresh
 // value on disk. Reading the file first sidesteps that loop.
 func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
-	if lm.tokenFilePath == "" {
+	// A reload has a candidate source if either a token file or a peer socket
+	// is configured. With neither there is nothing to pick up.
+	if lm.tokenFilePath == "" && lm.tokenSocket == "" {
 		return false
 	}
 	current := lm.client.Token()
 
-	candidates := make([]string, 0, 2)
-	if fileToken, _ := ReadTokenFile(lm.tokenFilePath); fileToken != "" && fileToken != current {
-		candidates = append(candidates, fileToken)
-	}
-	if envToken := ReadTokenEnv(); envToken != "" && envToken != current {
-		// Skip if we already queued an identical file token, but still
-		// try env when it differs from both the current and file values.
-		if len(candidates) == 0 || candidates[0] != envToken {
-			candidates = append(candidates, envToken)
+	candidates := make([]string, 0, 3)
+	addCandidate := func(tok string) {
+		if tok == "" || tok == current {
+			return
 		}
+		for _, c := range candidates {
+			if c == tok {
+				return
+			}
+		}
+		candidates = append(candidates, tok)
+	}
+
+	if lm.tokenFilePath != "" {
+		fileToken, _ := ReadTokenFile(lm.tokenFilePath)
+		addCandidate(fileToken)
+	}
+	addCandidate(ReadTokenEnv())
+	// The peer socket is consulted last: a locally-written token (file/env,
+	// e.g. from a parallel `dotvault login`) takes precedence over a borrowed
+	// one. Best-effort — a missing/stale socket yields no candidate.
+	if lm.tokenSocket != "" {
+		sockToken, _ := FetchTokenFromSocket(ctx, lm.tokenSocket)
+		addCandidate(sockToken)
 	}
 	if len(candidates) == 0 {
 		return false

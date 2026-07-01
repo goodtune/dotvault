@@ -15,11 +15,18 @@ In addition to the standard Go template functions, dotvault provides:
 | `base64decode` | `base64decode(s)` | Base64-decode a string |
 | `default` | `default(fallback, val)` | Return `val` if non-empty, otherwise `fallback` |
 | `quote` | `quote(s)` | Shell-safe single quoting |
+| `username` | `username` | The local OS account the secrets are synced under |
 
 The `default` function follows the [Sprig](https://masterminds.github.io/sprig/) convention where the fallback comes first, enabling idiomatic piping:
 
 ```
 {{ .port | default "8080" }}
+```
+
+The `username` function returns the OS account dotvault runs as — the same identity the `kv/users/<username>/…` path layout is built from (`DOMAIN\` prefix stripped on Windows). It is a function, not a field, so it is always available regardless of the secret's contents and never collides with a secret field that happens to be named `user`. Use it to build per-user filesystem paths without storing the username in Vault:
+
+```
+RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
 ```
 
 ## Examples by format
@@ -233,6 +240,28 @@ rules:
 
 Text format uses full replacement — the entire file content is overwritten. This is appropriate for opaque blobs like private keys and certificates where merging is not meaningful.
 
+### ssh_config
+
+Surgically manage directives in `~/.ssh/config`. The motivating case is exposing the local dotvault (Vault) endpoint on a remote host through a stable, per-user unix socket — one half of a dotvault-to-dotvault information-sharing setup. A `RemoteForward` creates the remote socket and forwards it back to `127.0.0.1:8200` on the originating machine:
+
+```yaml
+rules:
+  - name: dotvault-forward
+    target:
+      path: "~/.ssh/config"
+      format: ssh_config
+      template: |
+        Host *
+            User {{ username }}
+            RemoteForward /home/{{ username }}/.ssh/dotvault.sock 127.0.0.1:8200
+```
+
+This rule has **no `vault_key`** — an ssh_config has no Vault-backed secrets, so the rule is *keyless*: dotvault never contacts Vault for it and renders the template with an empty data context. The path-building username comes from the `username` function (the OS account dotvault runs as), which resolves regardless because it is a template function, not a context field. dotvault matches the `Host *` section by its criteria line and updates only the `User` and `RemoteForward` directives inside it. Every other section, comment, and directive in the file is preserved verbatim. Because `{{ username }}` is stable across syncs, the `RemoteForward` listen path stays constant and the directive updates in place instead of accumulating duplicates. (A rule *may* still set `vault_key` if its template needs secret fields — `vault_key` is simply optional. See [Sync rules → keyless rules](sync-rules.md#rules-without-a-vault-key).)
+
+> **Keep a forward's listen path stable.** A `RemoteForward` is identified for merge by its listen spec (the first argument, `/home/{{ username }}/.ssh/dotvault.sock` here). If that path ever renders differently from the line already in the file, dotvault sees a *new* forward, appends it, and leaves the old one behind — so a forward whose listen path you change is added rather than rewritten, and you remove the stale line by hand once. This is why the path uses the stable `{{ username }}` function: a template that previously rendered the path with a different (or empty) value will not match and will orphan. See [Sync rules → ssh_config](sync-rules.md#ssh_config) for the full discriminator semantics.
+
+The `ssh_config` format is **template-only** — there is no raw-data fallback, so the `template` field is required (see below).
+
 ## Templates without the template field
 
 If no `template` is specified, dotvault passes the raw Vault KV data map to the format handler. For YAML and JSON, this means all fields from the Vault secret are written to the file:
@@ -247,6 +276,8 @@ rules:
 ```
 
 If the Vault secret at `kv/data/users/jane/myapp` contains `{"api_key": "xxx", "db_pass": "yyy"}`, the resulting file would have both fields merged into it.
+
+The `ssh_config` format is the exception: it has no raw-data path (there is no sensible mapping from arbitrary key/value pairs to ssh directives), so a rule using it must always supply a `template`. Omitting it produces a clear error at sync time.
 
 ## Tips
 

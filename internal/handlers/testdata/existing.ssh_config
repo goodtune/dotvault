@@ -1,0 +1,21 @@
+# Managed partly by hand — keep my comments!
+Host *
+    ForwardAgent no
+    ServerAliveInterval 60
+    IdentityFile ~/.ssh/id_ed25519
+
+# Work jump host
+Host bastion
+    HostName bastion.corp.example.com
+    User olduser
+    Port 2222
+    # never remove this proxy line
+    ProxyCommand none
+
+Host gitlab.example.com github.com
+    User git
+    IdentityFile ~/.ssh/work_ed25519
+    IdentityFile ~/.ssh/personal_ed25519
+
+Match host *.internal user deploy
+    StrictHostKeyChecking no

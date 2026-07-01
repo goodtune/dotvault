@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -136,6 +137,130 @@ func TestListKVv2(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("ListKVv2 keys = %v, want to contain 'gh'", keys)
+	}
+}
+
+func TestCreateChildToken(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/create" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Vault-Token"); got != "parent-token" {
+			t.Errorf("X-Vault-Token = %q, want parent-token (child must be created off the set token)", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"auth": map[string]any{
+				"client_token":      "hvs.child-token",
+				"lease_duration":    3600,
+				"renewable":         true,
+				"policies":          []string{"dotvault"},
+				"no_default_policy": true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL, Token: "parent-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	child, err := c.CreateChildToken(context.Background(), []string{"dotvault", "kv-read"}, true)
+	if err != nil {
+		t.Fatalf("CreateChildToken: %v", err)
+	}
+	if child != "hvs.child-token" {
+		t.Errorf("child token = %q, want hvs.child-token", child)
+	}
+
+	// The request must carry the requested policies, no_default_policy, and a
+	// renewable flag so the lifecycle manager can keep the child alive.
+	if pols, ok := gotBody["policies"].([]any); !ok || len(pols) != 2 || pols[0] != "dotvault" || pols[1] != "kv-read" {
+		t.Errorf("request policies = %v, want [dotvault kv-read]", gotBody["policies"])
+	}
+	if ndp, _ := gotBody["no_default_policy"].(bool); !ndp {
+		t.Errorf("request no_default_policy = %v, want true", gotBody["no_default_policy"])
+	}
+	if rnw, _ := gotBody["renewable"].(bool); !rnw {
+		t.Errorf("request renewable = %v, want true", gotBody["renewable"])
+	}
+}
+
+func TestCreateChildTokenFor(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/token/create" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Vault-Token"); got != "parent" {
+			t.Errorf("X-Vault-Token = %q, want parent (the explicit parent, not the receiver's token)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child"}})
+	}))
+	defer ts.Close()
+
+	// The receiver carries a DIFFERENT token; CreateChildTokenFor must use the
+	// passed parent and must not disturb the receiver's own token.
+	c, err := NewClient(Config{Address: ts.URL, Token: "receiver-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	child, err := c.CreateChildTokenFor(context.Background(), "parent", []string{"dotvault"}, true)
+	if err != nil {
+		t.Fatalf("CreateChildTokenFor: %v", err)
+	}
+	if child != "child" {
+		t.Errorf("child = %q, want child", child)
+	}
+	if got := c.Token(); got != "receiver-token" {
+		t.Errorf("receiver token = %q, want receiver-token (must be left untouched)", got)
+	}
+}
+
+func TestNewSibling(t *testing.T) {
+	cert := &tls.Certificate{Certificate: [][]byte{{0x01}}}
+	c, err := NewClient(Config{Address: "https://vault.example:8200", Token: "receiver", ClientCert: cert})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	sib, err := c.NewSibling("sibling-token")
+	if err != nil {
+		t.Fatalf("NewSibling: %v", err)
+	}
+	if got := sib.Token(); got != "sibling-token" {
+		t.Errorf("sibling token = %q, want sibling-token", got)
+	}
+	if got := c.Token(); got != "receiver" {
+		t.Errorf("receiver token = %q, want receiver (must be untouched)", got)
+	}
+	// The sibling must inherit the connection config, including the client
+	// certificate, so it presents the cert on listeners that require one.
+	if sib.cfg.Address != "https://vault.example:8200" {
+		t.Errorf("sibling address = %q, want inherited", sib.cfg.Address)
+	}
+	if sib.cfg.ClientCert != cert {
+		t.Error("sibling must inherit the client certificate")
+	}
+}
+
+func TestCreateChildToken_ServerError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+	}))
+	defer ts.Close()
+
+	c, err := NewClient(Config{Address: ts.URL, Token: "parent-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := c.CreateChildToken(context.Background(), []string{"nonexistent"}, false); err == nil {
+		t.Fatal("CreateChildToken should error when Vault rejects the request")
 	}
 }
 

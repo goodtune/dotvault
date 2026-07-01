@@ -1,0 +1,53 @@
+[build-system]
+# >=77 so the PEP 639 SPDX `license` string below is validated rather than
+# treated as a legacy free-form value. Build isolation installs this fresh.
+# setuptools-scm derives the version from the repo's git tags (see below).
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dotvault"
+# Version is derived from git tags at build time by setuptools-scm — it is not
+# stored here. See [tool.setuptools_scm].
+dynamic = ["version"]
+description = "Python bindings for the dotvault public client API (read per-user Vault secrets dotvault enrols)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "dotvault authors" }]
+keywords = ["vault", "secrets", "dotvault", "hashicorp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/goodtune/dotvault"
+Repository = "https://github.com/goodtune/dotvault"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+# ext-module presence is forced in setup.py (BinaryDistribution) so the wheel
+# is tagged for the platform/arch of the embedded native library rather than
+# being a pure py3-none-any wheel that would be installed on the wrong ABI.
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dotvault = ["_dotvault.*", "py.typed"]
+
+[tool.setuptools_scm]
+# The git checkout root is the repository, one level above this python/ dir, so
+# the same v-prefixed tags that version the Go build (v0.23.0 -> 0.23.0; the
+# leading v is stripped) version this wheel. An exact tag yields a clean release
+# version (0.23.0); commits past a tag yield a PEP 440 dev version
+# (0.23.1.dev8+g<sha>). fallback_version keeps a tagless/shallow checkout (no
+# tags fetched) from failing the build outright.
+root = ".."
+fallback_version = "0.0.0"

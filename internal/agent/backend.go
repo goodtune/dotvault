@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -164,6 +165,13 @@ func (b *Backend) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 // SignWithFlags matches key to a source and signs data, honouring the
 // rsa-sha2 flags. If the daemon is mid-reauth it waits up to reauthTimeout for
 // a usable token before failing.
+//
+// A source that errors (e.g. a vault-ca source whose role can't currently
+// mint) is skipped rather than aborting the whole call, mirroring
+// identities(): a source's own failure must not deny signing for a key owned
+// by a different, healthy source. The error only surfaces if no source ends
+// up matching the key, so a genuine "no source can produce this signature"
+// case still reports why.
 func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), b.reauthTimeout)
 	defer cancel()
@@ -172,14 +180,20 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 		return nil, err
 	}
 
+	var errs []error
 	for _, src := range b.sources {
 		sig, matched, err := src.Sign(ctx, key, data, flags)
 		if err != nil {
-			return nil, fmt.Errorf("ssh agent: sign via %s: %w", src.Name(), err)
+			slog.Debug("ssh agent: source failed to sign", "source", src.Name(), "error", err)
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			continue
 		}
 		if matched {
 			return sig, nil
 		}
+	}
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("ssh agent: %w", errors.Join(errs...))
 	}
 	return nil, fmt.Errorf("ssh agent: %w", ErrKeyNotFound)
 }

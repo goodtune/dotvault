@@ -312,12 +312,13 @@ func (c *Client) Login(ctx context.Context) error {
 func (c *Client) manager() *auth.Manager {
 	username, _ := paths.Username()
 	return &auth.Manager{
-		VaultClient:   c.vc,
-		TokenFilePath: c.cfg.TokenFile,
-		AuthMethod:    c.cfg.Vault.AuthMethod,
-		AuthMount:     c.cfg.Vault.AuthMount,
-		AuthRole:      c.cfg.Vault.AuthRole,
-		TokenSocket:   c.cfg.Vault.TokenSocket,
+		VaultClient:      c.vc,
+		TokenFilePath:    c.cfg.TokenFile,
+		AuthMethod:       c.cfg.Vault.AuthMethod,
+		AuthMount:        c.cfg.Vault.AuthMount,
+		AuthRole:         c.cfg.Vault.AuthRole,
+		OIDCCallbackPort: c.cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      c.cfg.Vault.TokenSocket,
 		Policy: auth.PolicyConstraint{
 			Policies:        c.cfg.Vault.Policies,
 			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,

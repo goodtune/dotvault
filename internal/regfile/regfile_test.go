@@ -878,10 +878,31 @@ func TestEmptyStringEmittedExplicitly(t *testing.T) {
 		`"AuthRole"=""`,
 		`"CACert"=""`,
 		`"TokenSocket"=""`,
+		`"OIDCCallbackPort"=dword:00000000`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in output (clearing semantics):\n%s", want, got)
 		}
+	}
+}
+
+// TestOIDCCallbackPortEmitted pins that a non-zero oidc_callback_port
+// round-trips through the .reg render as a REG_DWORD under Vault, matching
+// the bool-style scalars rather than being dropped like an unset string.
+func TestOIDCCallbackPortEmitted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			Address:          "https://vault.example.com:8200",
+			OIDCCallbackPort: 8251,
+		},
+		Sync: config.SyncConfig{RawInterval: "15m"},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(got, `"OIDCCallbackPort"=dword:0000203b`) {
+		t.Errorf("expected OIDCCallbackPort dword:0000203b (8251) in output:\n%s", got)
 	}
 }
 

@@ -182,6 +182,20 @@ type VaultConfig struct {
 	AuthMethod    string `yaml:"auth_method"`
 	AuthRole      string `yaml:"auth_role"`
 	AuthMount     string `yaml:"auth_mount"`
+	// OIDCCallbackPort is the fixed local TCP port the "oidc"/"oidc+tpm" CLI
+	// flow (dotvault login, and the mtls bootstrap sub-login) binds for the
+	// OAuth redirect_uri, so operators can register one predictable
+	// http://127.0.0.1:<port>/oidc/callback URI with both the Vault auth
+	// role's allowed_redirect_uris and the identity provider, instead of
+	// depending on RFC 8252 loopback (port-agnostic) redirect matching that
+	// not every IdP implements. Zero (the default) resolves to 8250, the
+	// same default the `vault` CLI itself uses, so a role/IdP already
+	// configured for `vault login -method=oidc` typically works for
+	// dotvault without any change. If the configured (or default) port is
+	// already in use, dotvault falls back to an OS-assigned random port and
+	// logs why. Not consulted by the daemon's web UI flow, which always
+	// binds web.listen. See docs/authentication/oidc.md.
+	OIDCCallbackPort int `yaml:"oidc_callback_port"`
 	// Policies is the least-privilege set of Vault policies the working token
 	// should carry. When non-empty, dotvault does not run with the token its
 	// auth role grants directly; instead it exchanges that login token for a
@@ -649,6 +663,10 @@ func (c *Config) validate() error {
 	// mTLS / cert-auth validation and defaulting, gated on the auth method.
 	if err := c.validateMTLS(); err != nil {
 		return err
+	}
+
+	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {
+		return fmt.Errorf("vault.oidc_callback_port %d: must be between 0 and 65535", c.Vault.OIDCCallbackPort)
 	}
 
 	// Parse sync interval

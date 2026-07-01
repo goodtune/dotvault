@@ -735,15 +735,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// needs a TTY (or the configured BYO cert); the flow surfaces a
 			// clear error if neither is available.
 			mgr := &auth.Manager{
-				VaultClient:   vc,
-				TokenFilePath: tokenPath,
-				AuthMethod:    cfg.Vault.AuthMethod,
-				AuthMount:     cfg.Vault.AuthMount,
-				AuthRole:      cfg.Vault.AuthRole,
-				TokenSocket:   cfg.Vault.TokenSocket,
-				Policy:        vaultPolicyConstraint(cfg),
-				Username:      username,
-				MTLS:          mtlsParams(cfg, username),
+				VaultClient:      vc,
+				TokenFilePath:    tokenPath,
+				AuthMethod:       cfg.Vault.AuthMethod,
+				AuthMount:        cfg.Vault.AuthMount,
+				AuthRole:         cfg.Vault.AuthRole,
+				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+				TokenSocket:      cfg.Vault.TokenSocket,
+				Policy:           vaultPolicyConstraint(cfg),
+				Username:         username,
+				MTLS:             mtlsParams(cfg, username),
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -783,15 +784,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// Traditional auth flow (OIDC with ephemeral listener, LDAP
 			// prompt, or token file).
 			mgr := &auth.Manager{
-				VaultClient:   vc,
-				TokenFilePath: tokenPath,
-				AuthMethod:    cfg.Vault.AuthMethod,
-				AuthMount:     cfg.Vault.AuthMount,
-				AuthRole:      cfg.Vault.AuthRole,
-				TokenSocket:   cfg.Vault.TokenSocket,
-				Policy:        vaultPolicyConstraint(cfg),
-				Username:      username,
-				MTLS:          mtlsParams(cfg, username),
+				VaultClient:      vc,
+				TokenFilePath:    tokenPath,
+				AuthMethod:       cfg.Vault.AuthMethod,
+				AuthMount:        cfg.Vault.AuthMount,
+				AuthRole:         cfg.Vault.AuthRole,
+				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+				TokenSocket:      cfg.Vault.TokenSocket,
+				Policy:           vaultPolicyConstraint(cfg),
+				Username:         username,
+				MTLS:             mtlsParams(cfg, username),
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -823,15 +825,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// only mints when due, using the current operational token.
 	if mtlsP := mtlsParams(cfg, username); mtlsP != nil {
 		reissueMgr := &auth.Manager{
-			VaultClient:   vc,
-			TokenFilePath: tokenPath,
-			AuthMethod:    cfg.Vault.AuthMethod,
-			AuthMount:     cfg.Vault.AuthMount,
-			AuthRole:      cfg.Vault.AuthRole,
-			TokenSocket:   cfg.Vault.TokenSocket,
-			Policy:        vaultPolicyConstraint(cfg),
-			Username:      username,
-			MTLS:          mtlsP,
+			VaultClient:      vc,
+			TokenFilePath:    tokenPath,
+			AuthMethod:       cfg.Vault.AuthMethod,
+			AuthMount:        cfg.Vault.AuthMount,
+			AuthRole:         cfg.Vault.AuthRole,
+			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+			TokenSocket:      cfg.Vault.TokenSocket,
+			Policy:           vaultPolicyConstraint(cfg),
+			Username:         username,
+			MTLS:             mtlsP,
 		}
 		go func() {
 			ticker := time.NewTicker(time.Hour)
@@ -1347,15 +1350,16 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: paths.VaultTokenPath(),
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    paths.VaultTokenPath(),
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1633,15 +1637,16 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve username: %w", err)
 	}
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: tokenPath,
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    tokenPath,
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 	if !quiet {
 		printLoginNotice(os.Stderr, loginReason)
@@ -1868,15 +1873,16 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	}
 
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: paths.VaultTokenPath(),
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    paths.VaultTokenPath(),
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 
 	if err := mgr.Authenticate(ctx); err != nil {

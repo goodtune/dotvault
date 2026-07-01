@@ -28,6 +28,7 @@ vault:
   auth_method: "oidc"
   auth_role: "default"
   auth_mount: "oidc"
+  oidc_callback_port: 8250
   kv_mount: "kv"
   user_prefix: "users/"
   ca_cert: "/etc/ssl/certs/internal-ca.pem"
@@ -98,6 +99,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` (any base method also accepts a `+tpm` suffix) |
 | `auth_mount` | string | — | Vault auth mount path (e.g. `oidc`, `ldap`) |
 | `auth_role` | string | — | Vault auth role to request |
+| `oidc_callback_port` | int | `8250` | Fixed local TCP port the OIDC CLI flow (`dotvault login`) binds for the OAuth redirect_uri; falls back to a random port if unavailable. See [OIDC & SSO Authentication](../authentication/oidc.md#redirect-uris) |
 | `policies` | list | — | Least-privilege policy set the working token should carry (see below) |
 | `no_default_policy` | bool | `false` | Strip the implicit `default` policy from the working token (see below) |
 | `kv_mount` | string | `kv` | KVv2 secrets engine mount path |

@@ -2,13 +2,60 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"syscall"
 
 	"github.com/pkg/browser"
 )
+
+// openBrowser opens authURL in the user's default browser. Indirected so
+// tests can stub it out — authenticateOIDC otherwise pops a real browser tab.
+var openBrowser = browser.OpenURL
+
+// defaultOIDCCallbackPort is the local TCP port authenticateOIDC tries first
+// for the OAuth redirect_uri when vault.oidc_callback_port is unset. It
+// matches the `vault` CLI's own default (`vault login -method=oidc`), so a
+// Vault role/IdP already allow-listing the vault CLI's redirect URI
+// typically works for dotvault without any change.
+const defaultOIDCCallbackPort = 8250
+
+// listenForOIDCCallback binds the local HTTP listener used for the OIDC
+// redirect_uri. It tries the configured (or default) fixed port first, so
+// operators can register one predictable redirect_uri with both the Vault
+// auth role and the identity provider instead of relying on RFC 8252
+// loopback (port-agnostic) redirect matching, which not every IdP
+// implements. If that port is already bound by another process (e.g. a
+// concurrent login, or the `vault` CLI itself — syscall.EADDRINUSE), it
+// falls back to an OS-assigned random port and logs why — a working, if
+// less operable, fallback rather than a hard failure. Any other bind
+// failure (permission denied on a privileged port, a firewall/policy block)
+// is returned as a hard error instead of being silently masked by the same
+// fallback: those conditions won't clear themselves on the next login the
+// way a transient port conflict does, so failing loudly surfaces the
+// misconfiguration instead of quietly degrading to the less reliable
+// random-port path forever.
+func listenForOIDCCallback(configuredPort int) (net.Listener, int, error) {
+	port := configuredPort
+	if port <= 0 {
+		port = defaultOIDCCallbackPort
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, 0, fmt.Errorf("bind OIDC callback port %d: %w", port, err)
+		}
+		slog.Warn("OIDC callback port already in use, falling back to a random port; register a fixed redirect_uri with Vault and your identity provider for a more predictable login", "port", port, "error", err)
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return listener, listener.Addr().(*net.TCPAddr).Port, nil
+}
 
 func (m *Manager) authenticateOIDC(ctx context.Context) error {
 	mount := m.AuthMount
@@ -16,14 +63,12 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 		mount = "oidc"
 	}
 
-	// Start local callback listener on random port
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, callbackPort, err := listenForOIDCCallback(m.OIDCCallbackPort)
 	if err != nil {
 		return fmt.Errorf("start callback listener: %w", err)
 	}
 	defer listener.Close()
 
-	callbackPort := listener.Addr().(*net.TCPAddr).Port
 	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/oidc/callback", callbackPort)
 
 	// Request auth URL from Vault
@@ -39,7 +84,8 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 
 	authURL, ok := secret.Data["auth_url"].(string)
 	if !ok || authURL == "" {
-		return fmt.Errorf("no auth_url in OIDC response")
+		return fmt.Errorf("no auth_url in OIDC response: Vault returned success but no URL, which typically means the redirect_uri was rejected; verify that %q is present verbatim (scheme, host, and path — Vault ignores only the port) in the allowed_redirect_uris of auth mount %q role %q, and that your identity provider also allows this exact redirect URI",
+			callbackURL, mount, m.AuthRole)
 	}
 
 	// Channel to receive the callback result
@@ -71,7 +117,7 @@ func (m *Manager) authenticateOIDC(ctx context.Context) error {
 
 	// Open browser
 	slog.Info("opening browser for OIDC authentication", "url", authURL)
-	if err := browser.OpenURL(authURL); err != nil {
+	if err := openBrowser(authURL); err != nil {
 		slog.Warn("failed to open browser, please visit URL manually", "url", authURL, "error", err)
 	}
 

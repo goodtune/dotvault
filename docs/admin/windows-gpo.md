@@ -49,6 +49,7 @@ Every YAML field has a registry equivalent. The tables below give the value name
 | `Vault\AuthMethod` | REG_SZ | `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` |
 | `Vault\AuthRole` | REG_SZ | Vault auth role |
 | `Vault\AuthMount` | REG_SZ | Vault auth mount path |
+| `Vault\OIDCCallbackPort` | REG_DWORD | Fixed local TCP port for the OIDC CLI redirect_uri (0 = built-in default of 8250) |
 | `Vault\Policies` | REG_MULTI_SZ | Least-privilege policy set the working token is downscoped to (empty = carry every granted policy) |
 | `Vault\NoDefaultPolicy` | REG_DWORD | Strip the implicit `default` policy from the working token (0/1) |
 | `Vault\DisableTokenRenewal` | REG_DWORD | Disable RenewSelf (0/1) |

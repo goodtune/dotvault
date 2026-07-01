@@ -251,11 +251,12 @@ func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 		return nil, fmt.Errorf("build bootstrap client: %w", err)
 	}
 	boot := &Manager{
-		VaultClient: bootClient,
-		AuthMethod:  m.MTLS.BootstrapMethod,
-		AuthMount:   m.MTLS.BootstrapMount,
-		AuthRole:    m.AuthRole,
-		Username:    m.Username,
+		VaultClient:      bootClient,
+		AuthMethod:       m.MTLS.BootstrapMethod,
+		AuthMount:        m.MTLS.BootstrapMount,
+		AuthRole:         m.AuthRole,
+		Username:         m.Username,
+		OIDCCallbackPort: m.OIDCCallbackPort,
 	}
 	// Dispatch the bootstrap login directly rather than through boot.Login: the
 	// bootstrap token is transient and never operational, so it must not emit

@@ -97,6 +97,21 @@ func TestResolveUpstreamEndpointTemplate(t *testing.T) {
 	}
 }
 
+func TestResolveUpstreamEndpointUnknownVariable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket resolution")
+	}
+	// A mis-typed variable ({{.user}} instead of {{.username}}) must fail at
+	// resolution, not silently render "<no value>" into the path.
+	_, err := resolveUpstreamEndpoint(
+		config.AgentKeySource{Source: "agent", Socket: "/run/{{.user}}/agent.sock"},
+		"alice", "1000",
+	)
+	if err == nil {
+		t.Fatalf("mis-typed template variable should error, got nil")
+	}
+}
+
 func TestNewSourcesUpstreamSelfReferenceGuard(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket resolution")

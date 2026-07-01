@@ -123,21 +123,30 @@ The upstream endpoint is the other agent's socket (Unix) or named pipe
 ```yaml
 - source: agent
   socket: ""    # Unix; default $XDG_RUNTIME_DIR/ssh-agent.socket
+                # (required explicitly on macOS — no XDG_RUNTIME_DIR there)
   pipe: ""      # Windows; default \\.\pipe\openssh-ssh-agent
 ```
 
-| Field    | Platform | Description                          | Default                                |
-|----------|----------|--------------------------------------|----------------------------------------|
-| `socket` | Unix     | Upstream agent Unix socket path      | `$XDG_RUNTIME_DIR/ssh-agent.socket`    |
-| `pipe`   | Windows  | Upstream agent named pipe            | `\\.\pipe\openssh-ssh-agent`           |
+| Field    | Platform | Description                          | Default                                       |
+|----------|----------|--------------------------------------|-----------------------------------------------|
+| `socket` | Unix     | Upstream agent Unix socket path      | `$XDG_RUNTIME_DIR/ssh-agent.socket` (Linux)¹  |
+| `pipe`   | Windows  | Upstream agent named pipe            | `\\.\pipe\openssh-ssh-agent`                  |
+
+¹ The Unix default only exists when `XDG_RUNTIME_DIR` is set — the norm on
+Linux, but **not on macOS**, where it is typically unset. With no
+`XDG_RUNTIME_DIR` and no explicit `socket`, the upstream-agent source resolves
+to an error (reported in status) rather than a bogus path, so macOS users must
+set `socket` explicitly (e.g. the value of `$SSH_AUTH_SOCK`, or a fixed path).
 
 Both accept `{{.username}}` and `{{.uid}}` template variables, so a fleet-wide
 config can resolve to each user's own agent (e.g.
 `socket: "/run/user/{{.uid}}/ssh-agent.socket"`). `{{.username}}` is the bare OS
 account name; `{{.uid}}` is the numeric UID on Unix (and the user's SID on
-Windows, where it is rarely useful in a pipe name). A leading `~` in a socket
-path is expanded to your home directory. The Unix default keeps the upstream
-socket in the same XDG runtime directory dotvault's own socket lives in.
+Windows, where it is rarely useful in a pipe name). A mis-typed variable
+(e.g. `{{.user}}`) is rejected when the source is constructed, not silently left
+in the path. A leading `~` in a socket path is expanded to your home directory.
+The Unix default keeps the upstream socket in the same XDG runtime directory
+dotvault's own socket lives in.
 
 Two constraints apply:
 

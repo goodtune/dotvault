@@ -148,8 +148,14 @@ func resolveUpstreamEndpoint(k config.AgentKeySource, username, uid string) (str
 // are OS-derived (paths.Username/paths.UID — the account dotvault runs as), not
 // attacker-controlled, and the rendered result is a socket/pipe the same user
 // already controls, so there is no injection surface to sanitise.
+//
+// missingkey=error makes a mis-typed variable (e.g. {{.user}}) fail here, at
+// source construction, with a clear message — rather than rendering "<no value>"
+// into the path and surfacing later as a confusing dial error. An empty but
+// present key ({{.uid}} when the UID lookup failed) still renders "" without
+// error; only an absent key is rejected.
 func renderEndpointTemplate(raw, username, uid string) (string, error) {
-	t, err := template.New("agent-endpoint").Parse(raw)
+	t, err := template.New("agent-endpoint").Option("missingkey=error").Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("parse endpoint template %q: %w", raw, err)
 	}

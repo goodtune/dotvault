@@ -55,7 +55,14 @@ func serveUpstreamAgent(t *testing.T, keys ...ed25519.PrivateKey) string {
 			if err != nil {
 				return
 			}
-			go agent.ServeAgent(keyring, conn)
+			// Close the server-side fd when the client disconnects:
+			// agent.ServeAgent returns on EOF but does not close the conn
+			// itself, so leaving it open would leak fds across the many
+			// per-operation dials these tests make.
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = agent.ServeAgent(keyring, c)
+			}(conn)
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })

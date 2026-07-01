@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -98,9 +99,18 @@ func DefaultUpstreamAgentSocket() string {
 	return ""
 }
 
-// UID returns the current user's numeric UID as a string (the SID on Windows),
-// for substitution into agent-endpoint templates.
+// UID returns the current user's numeric UID as a string (the account SID on
+// Windows), for substitution into agent-endpoint templates. On Unix it uses the
+// os.Getuid() syscall rather than os/user.Current(): the latter's pure-Go
+// (CGO-disabled — dotvault's build) implementation reads /etc/passwd and errors
+// when the running UID has no entry there, which is common in containers /
+// distroless images; that would blank a {{.uid}} template and yield a bad path
+// like "/run/user//ssh-agent.socket". The syscall always succeeds. Only Windows
+// (where os.Getuid returns -1) falls back to os/user for the SID.
 func UID() (string, error) {
+	if runtime.GOOS != "windows" {
+		return strconv.Itoa(os.Getuid()), nil
+	}
 	u, err := user.Current()
 	if err != nil {
 		return "", fmt.Errorf("get current user: %w", err)

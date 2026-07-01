@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ type fakeCA struct {
 	caSigner  ssh.Signer
 	calls     int
 	lastPrinc []string
+	err       error // when set, SignSSHCert fails instead of minting
 }
 
 func newFakeCA(t *testing.T) *fakeCA {
@@ -32,6 +34,9 @@ func newFakeCA(t *testing.T) *fakeCA {
 
 func (f *fakeCA) SignSSHCert(_ context.Context, _, _ string, pub ssh.PublicKey, principals []string, ttl time.Duration) (*ssh.Certificate, error) {
 	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
 	f.lastPrinc = principals
 	now := time.Now()
 	cert := &ssh.Certificate{
@@ -137,6 +142,63 @@ func TestVaultCASourceNonEphemeralIsErrSource(t *testing.T) {
 	_, err = src.Identities(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ephemeral") {
 		t.Errorf("want ephemeral error, got %v", err)
+	}
+}
+
+// TestVaultCASourceSignSkipsMintForForeignKeyOnceCached is the secondary
+// hardening from the bug report: once a certificate is cached, Sign for a key
+// this source plainly doesn't own must short-circuit via mayOwn and never
+// attempt a mint, even when the CA is currently unable to mint (e.g. its role
+// can't currently sign for the active auth identity).
+func TestVaultCASourceSignSkipsMintForForeignKeyOnceCached(t *testing.T) {
+	ca := newFakeCA(t)
+	src, err := newVaultCASource("ca", ca, "ssh", "role", nil, "alice", 15*time.Minute, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Identities(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ca.calls != 1 {
+		t.Fatalf("want 1 mint to seed the cache, got %d", ca.calls)
+	}
+
+	// Now the CA can no longer mint (mirrors a role that stopped resolving
+	// under the active Vault identity).
+	ca.err = errors.New("permission denied")
+
+	_, _, foreignPub, _ := genEd25519(t, "foreign")
+	sig, matched, err := src.Sign(context.Background(), foreignPub, []byte("x"), 0)
+	if err != nil || matched || sig != nil {
+		t.Fatalf("Sign: want (nil, false, nil) for a foreign key, got (%v, %v, %v)", sig, matched, err)
+	}
+	if ca.calls != 1 {
+		t.Errorf("want no mint attempt for a foreign key once cached, got %d calls", ca.calls)
+	}
+}
+
+// TestVaultCASourceSignColdCacheForeignKeyStillErrors documents the residual
+// gap mayOwn's comment calls out: on a cold cache (no certificate minted
+// yet), ownership can't be ruled out cheaply, so Sign falls through to
+// ensureCert. If the CA can't mint, Sign surfaces that error rather than
+// silently returning (nil, false, nil) — Backend.SignWithFlags (the
+// List-parity skip) is what keeps this from blocking other sources, not this
+// method pretending the key isn't foreign.
+func TestVaultCASourceSignColdCacheForeignKeyStillErrors(t *testing.T) {
+	ca := newFakeCA(t)
+	ca.err = errors.New("permission denied")
+	src, err := newVaultCASource("ca", ca, "ssh", "role", nil, "alice", 15*time.Minute, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, foreignPub, _ := genEd25519(t, "foreign")
+	sig, matched, err := src.Sign(context.Background(), foreignPub, []byte("x"), 0)
+	if err == nil || matched || sig != nil {
+		t.Fatalf("Sign: want (nil, false, err) on a cold cache with a failing CA, got (%v, %v, %v)", sig, matched, err)
+	}
+	if ca.calls != 1 {
+		t.Errorf("want exactly 1 mint attempt on a cold cache, got %d", ca.calls)
 	}
 }
 

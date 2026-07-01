@@ -100,6 +100,67 @@ func TestBackendSignUnknownKey(t *testing.T) {
 	}
 }
 
+// TestBackendSignSkipsErroringSourceAndFindsMatch reproduces the reported bug:
+// a source that can't currently produce a signature (e.g. a vault-ca source
+// whose role can't mint) must not block a Sign for a key owned by a
+// different, healthy source — mirroring the List-skip behaviour. Ordering the
+// broken source first is the exact failure mode from the bug report.
+func TestBackendSignSkipsErroringSourceAndFindsMatch(t *testing.T) {
+	_, _, pubGood, signerGood := genEd25519(t, "good")
+	broken := &fakeSource{name: "broken", signErr: errors.New("role can't mint")}
+	good := &fakeSource{name: "good", ids: []Identity{{PubKey: pubGood}}, signer: signerGood}
+	b := NewBackend([]Source{broken, good})
+
+	data := []byte("challenge")
+	sig, err := b.Sign(pubGood, data)
+	if err != nil {
+		t.Fatalf("Sign: want success routing around the broken source, got %v", err)
+	}
+	if err := pubGood.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify against pubGood: %v", err)
+	}
+}
+
+// TestBackendSignSkipsErroringSourceRegardlessOfOrder pins that the fix does
+// not depend on the broken source coming first — the loop tries every source
+// unconditionally and only returns early on a match, so a broken source
+// listed after the owning source must not matter either.
+func TestBackendSignSkipsErroringSourceRegardlessOfOrder(t *testing.T) {
+	_, _, pubGood, signerGood := genEd25519(t, "good")
+	good := &fakeSource{name: "good", ids: []Identity{{PubKey: pubGood}}, signer: signerGood}
+	broken := &fakeSource{name: "broken", signErr: errors.New("role can't mint")}
+	b := NewBackend([]Source{good, broken})
+
+	data := []byte("challenge")
+	sig, err := b.Sign(pubGood, data)
+	if err != nil {
+		t.Fatalf("Sign: want success, got %v", err)
+	}
+	if err := pubGood.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify against pubGood: %v", err)
+	}
+}
+
+// TestBackendSignAllSourcesErrorReportsCombinedError ensures that when no
+// source can produce a signature, the accumulated per-source errors surface
+// instead of being swallowed as a generic ErrKeyNotFound.
+func TestBackendSignAllSourcesErrorReportsCombinedError(t *testing.T) {
+	brokenErr := errors.New("role can't mint")
+	broken := &fakeSource{name: "broken", signErr: brokenErr}
+	b := NewBackend([]Source{broken})
+
+	_, err := b.Sign(mustTestPub(t), []byte("x"))
+	if err == nil {
+		t.Fatal("Sign: want error, got nil")
+	}
+	if errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("want the underlying source error surfaced, got ErrKeyNotFound: %v", err)
+	}
+	if !errors.Is(err, brokenErr) {
+		t.Errorf("want error to wrap the source's error, got %v", err)
+	}
+}
+
 // stubGate is a controllable ReauthGate.
 type stubGate struct{ reauth atomic.Bool }
 

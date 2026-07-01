@@ -203,3 +203,10 @@ config tooling (Nix/Ansible/etc.).
 - **Concurrency.** The backend is safe for concurrent use — two clients may
   request signatures simultaneously, and identity listings are cached for a few
   seconds to avoid hammering Vault on repeated `ssh-add -l`.
+- **Per-source isolation on signing.** With multiple `agent.keys[]` sources
+  configured, a source that currently can't produce a signature (e.g. a
+  `vault-ca` role that doesn't resolve under your active Vault auth method)
+  never blocks signing for a key owned by a different, healthy source. If `ssh`
+  fails with `agent refused operation` even though `ssh-add -L` lists a valid,
+  non-expired identity, check `dotvault status` or the web dashboard for a
+  per-source error against one of your *other* configured sources.

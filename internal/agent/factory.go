@@ -135,8 +135,16 @@ func resolveUpstreamEndpoint(k config.AgentKeySource, username, uid string) (str
 	if err != nil {
 		return "", err
 	}
+	// Reject an endpoint that rendered empty (e.g. a socket set to a bare
+	// "{{.uid}}" when the UID lookup failed) rather than letting it become an
+	// empty dial target with a confusing downstream error.
+	if strings.TrimSpace(endpoint) == "" {
+		return "", fmt.Errorf("upstream agent endpoint resolved to empty; check the socket/pipe value and its {{.username}}/{{.uid}} template")
+	}
 	if runtime.GOOS != "windows" {
-		if expanded, err := paths.ExpandHome(endpoint); err == nil {
+		if expanded, err := paths.ExpandHome(endpoint); err != nil {
+			return "", fmt.Errorf("expand upstream agent socket %q: %w", endpoint, err)
+		} else {
 			endpoint = expanded
 		}
 	}

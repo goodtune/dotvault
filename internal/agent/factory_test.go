@@ -112,6 +112,21 @@ func TestResolveUpstreamEndpointUnknownVariable(t *testing.T) {
 	}
 }
 
+func TestResolveUpstreamEndpointEmptyRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket resolution")
+	}
+	// A socket that renders to empty (a bare {{.uid}} when the UID lookup
+	// failed) must be rejected here rather than becoming an empty dial target.
+	_, err := resolveUpstreamEndpoint(
+		config.AgentKeySource{Source: "agent", Socket: "{{.uid}}"},
+		"alice", "",
+	)
+	if err == nil {
+		t.Fatalf("empty resolved endpoint should error, got nil")
+	}
+}
+
 func TestNewSourcesUpstreamSelfReferenceGuard(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket resolution")

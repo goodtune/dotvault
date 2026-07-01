@@ -379,9 +379,11 @@ type AgentKeySource struct {
 	// dotvault never stores or reads the upstream's key material; it forwards
 	// the agent protocol. Socket is the Unix domain socket path, Pipe the
 	// Windows named pipe; both accept {{.username}} and {{.uid}} template
-	// variables. Empty resolves to a platform default
-	// ($XDG_RUNTIME_DIR/ssh-agent.socket on Unix, \\.\pipe\openssh-ssh-agent
-	// on Windows). At most one "agent" source may be configured.
+	// variables. Empty resolves to a platform default: on Windows always
+	// \\.\pipe\openssh-ssh-agent; on Unix $XDG_RUNTIME_DIR/ssh-agent.socket
+	// when XDG_RUNTIME_DIR is set (Linux), but where it is unset (macOS) an
+	// empty Socket is an error and must be set explicitly. At most one "agent"
+	// source may be configured.
 	Socket string `yaml:"socket,omitempty"`
 	Pipe   string `yaml:"pipe,omitempty"`
 }

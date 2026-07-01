@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"sync"
 
@@ -112,35 +111,34 @@ func (s *upstreamSource) Identities(ctx context.Context) ([]Identity, error) {
 
 func (s *upstreamSource) Sign(ctx context.Context, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, bool, error) {
 	// Ownership fast-path: a key this upstream has never advertised cannot be
-	// ours, so fall through (matched == false) WITHOUT dialing. This is what
-	// keeps a down or slow upstream — even one ordered before kv/vault-ca in
-	// agent.keys — from blocking a Sign for a key another source owns:
-	// Backend.SignWithFlags treats a source error as fatal to the whole
-	// request, so this source must never return an error for a key it doesn't
-	// own.
+	// ours, so fall through (matched == false) WITHOUT dialing. Besides saving
+	// a round-trip, this keeps a foreign key (owned by another source) from
+	// dialing the upstream at all — so when the upstream is down it contributes
+	// no spurious "unreachable" error to Backend.SignWithFlags's joined error
+	// for keys it doesn't own. Before the first successful List ownership is
+	// unknown, so mightOwn returns true and we dial to find out.
 	if !s.mightOwn(key) {
 		return nil, false, nil
 	}
 
 	client, conn, err := s.connect(ctx)
 	if err != nil {
-		// An unreachable upstream owns no usable key right now. Treat it as
-		// "not mine" rather than a hard error so later sources are still tried;
-		// the aggregate result becomes ErrKeyNotFound only when no source
-		// matches. The connectivity failure is still surfaced via Identities
-		// (agent status), so it isn't lost.
-		slog.Debug("ssh agent: upstream unreachable during sign, falling through", "endpoint", s.endpoint, "error", err)
-		return nil, false, nil
+		// Report the connectivity failure. Backend.SignWithFlags skips a source
+		// that errors and tries the rest, surfacing the accumulated errors only
+		// when no source matches — so returning the error here does not block a
+		// key owned by a healthy source, and it means an upstream-owned key that
+		// can't be signed reports why (unreachable) instead of a generic
+		// key-not-found.
+		return nil, false, err
 	}
 	defer conn.Close()
 
-	// Confirm the upstream still advertises this key before forwarding, so a
-	// key that belongs to another source falls through rather than surfacing
-	// the upstream's "not found" as a hard error.
+	// Confirm the upstream still advertises this key before forwarding, and
+	// refresh the advertised-key cache. A list failure propagates for the same
+	// reason as a dial failure above: the backend skips it and moves on.
 	keys, err := client.List()
 	if err != nil {
-		slog.Debug("ssh agent: upstream list failed during sign, falling through", "endpoint", s.endpoint, "error", err)
-		return nil, false, nil
+		return nil, false, fmt.Errorf("list upstream agent %s: %w", s.endpoint, err)
 	}
 	s.remember(keys)
 

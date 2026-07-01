@@ -133,11 +133,11 @@ func TestUpstreamSourceType(t *testing.T) {
 	}
 }
 
-// TestUpstreamSourceDialError confirms Identities surfaces a dial failure (so
-// status can report the upstream as unreachable), while Sign deliberately does
-// NOT: an unreachable upstream falls through (matched=false, nil error) so
-// Backend.SignWithFlags — which treats a source error as fatal — can still try
-// later sources for a key they own.
+// TestUpstreamSourceDialError confirms both Identities and Sign surface a dial
+// failure (matched=false, non-nil error). Sign reports the error rather than
+// swallowing it because Backend.SignWithFlags skips a source that errors and
+// tries the rest — so reporting doesn't block a key owned by a healthy source,
+// but does let an upstream-owned key that can't be reached explain why.
 func TestUpstreamSourceDialError(t *testing.T) {
 	_, pub := genUpstreamKey(t)
 	src := &upstreamSource{
@@ -151,8 +151,8 @@ func TestUpstreamSourceDialError(t *testing.T) {
 		t.Errorf("want dial error from Identities")
 	}
 	sig, matched, err := src.Sign(context.Background(), pub, []byte("x"), 0)
-	if err != nil {
-		t.Errorf("Sign should swallow the dial error (fall through), got %v", err)
+	if err == nil {
+		t.Errorf("Sign should surface the dial error, got nil")
 	}
 	if matched || sig != nil {
 		t.Errorf("Sign should not match when the upstream is unreachable")

@@ -104,10 +104,10 @@ func TestBackendSignUnknownKey(t *testing.T) {
 
 // TestBackendSignSkipsUnreachableUpstream guards the ordering hazard: an
 // unreachable upstream-agent source placed BEFORE the owning source must not
-// block the sign. The upstream source falls through (matched=false, nil error)
-// when it can't reach the agent, and Backend.SignWithFlags also skips any
-// source that errors, so a key owned by a later kv/vault-ca source still signs
-// even when the user's personal agent is down.
+// block the sign. The upstream source reports the dial failure as an error
+// (it can't reach the agent), and Backend.SignWithFlags skips any source that
+// errors and tries the rest, so a key owned by a later kv/vault-ca source
+// still signs even when the user's personal agent is down.
 func TestBackendSignSkipsUnreachableUpstream(t *testing.T) {
 	_, _, pubA, signerA := genEd25519(t, "a")
 	down := &upstreamSource{

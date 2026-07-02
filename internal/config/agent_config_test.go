@@ -76,6 +76,41 @@ func TestAgentValidateVaultCATTL(t *testing.T) {
 	}
 }
 
+func TestAgentValidateAgentSource(t *testing.T) {
+	// A single upstream-agent source, with and without an explicit socket.
+	c := baseConfigWithAgent(AgentConfig{
+		Enabled: true,
+		Keys:    []AgentKeySource{{Source: "agent"}},
+	})
+	if err := c.validate(); err != nil {
+		t.Errorf("agent source should validate: %v", err)
+	}
+
+	c = baseConfigWithAgent(AgentConfig{
+		Enabled: true,
+		Keys: []AgentKeySource{
+			{Source: "kv", PathPrefix: "ssh/"},
+			{Source: "agent", Socket: "/run/user/{{.uid}}/ssh-agent.socket"},
+		},
+	})
+	if err := c.validate(); err != nil {
+		t.Errorf("kv + agent sources should validate: %v", err)
+	}
+}
+
+func TestAgentValidateOnlyOneAgentSource(t *testing.T) {
+	c := baseConfigWithAgent(AgentConfig{
+		Enabled: true,
+		Keys: []AgentKeySource{
+			{Source: "agent", Socket: "/a.sock"},
+			{Source: "agent", Socket: "/b.sock"},
+		},
+	})
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Errorf("want only-one-agent-source error, got %v", err)
+	}
+}
+
 func TestAgentValidateInvalidSource(t *testing.T) {
 	c := baseConfigWithAgent(AgentConfig{
 		Enabled: true,

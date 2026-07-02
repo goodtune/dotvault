@@ -55,6 +55,15 @@ agent:
       principals: ["{{.vault_username}}"]
       ttl: "15m"
       ephemeral_key: true
+    # Delegate to an upstream SSH agent (your own ssh-agent / OpenSSH agent /
+    # Pageant) so legacy on-disk keys it already holds are served alongside the
+    # Vault-backed ones. dotvault forwards List/Sign and stores nothing. At most
+    # one such source; socket/pipe accept {{.username}}/{{.uid}} and default to
+    # $XDG_RUNTIME_DIR/ssh-agent.socket (Unix) / \\.\pipe\openssh-ssh-agent
+    # (Windows). If no upstream agent is running it just contributes no keys.
+    - source: agent
+      socket: ""
+      pipe: "\\\\.\\pipe\\openssh-ssh-agent"
 
 rules:
   - name: gh

@@ -208,6 +208,9 @@ func TestReadSingleEnrolment(t *testing.T) {
 	if err := base.SetStringValue("Engine", "github"); err != nil {
 		t.Fatalf("set Engine: %v", err)
 	}
+	if err := base.SetStringValue("HelpText", "Mints a **GitHub** OAuth token."); err != nil {
+		t.Fatalf("set HelpText: %v", err)
+	}
 
 	settings, _, err := registry.CreateKey(
 		registry.CURRENT_USER,

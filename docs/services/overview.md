@@ -10,11 +10,16 @@ Enrolments are declared in the configuration under the `enrolments` key. Each en
 enrolments:
   gh:                        # Vault KV path segment (secret stored at users/{username}/gh)
     engine: github           # enrolment engine to use
+    help_text: |             # admin-authored markdown shown in the web UI (optional)
+      Mints a GitHub OAuth token via a device flow. You'll sign in with
+      GitHub in your browser and approve a short code.
     settings:                # engine-specific settings (optional)
       scopes:
         - repo
         - read:org
 ```
+
+`help_text` is free-form Markdown (headers, bold/italic, links, inline code, and unordered lists) rendered to sanitized HTML and shown alongside the enrolment card in the web UI, explaining what the engine will do before the user runs it. It has no effect on the CLI picker (`dotvault enrol`). Like every other config field it round-trips through YAML, the Windows registry, and `.reg` files.
 
 ## Grouping enrolments
 

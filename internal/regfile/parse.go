@@ -885,6 +885,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		} else if ok {
 			en.Engine = v
 		}
+		if v, ok, err := getString(base, "HelpText"); err != nil {
+			return err
+		} else if ok {
+			en.HelpText = v
+		}
 		// Settings subkey: collect the values directly under base\Settings
 		// and recurse into any nested subkeys so structured settings (e.g.
 		// the Copy engine's settings.from → mount/path) round-trip cleanly.

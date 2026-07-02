@@ -177,9 +177,13 @@ enrolments:
   # this at a real server you can sign into, or comment the block out to skip
   # it in the dev loop. The enrolment stores user_token (the ghpr_ session
   # token) and server_url — the two fields ghp's own dotvault integration reads
-  # back out of Vault.
+  # back out of Vault. Also doubles as the dev loop's demo of help_text.
   ghp:
     engine: ghp
+    help_text: |
+      Mints a **GitHub Proxy** session token via a device-authorization flow.
+      You'll sign in with GitHub in your browser, then dotvault stores the
+      resulting token so it can keep your local config in sync.
     settings:
       url: "https://ghp.example.com"
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the

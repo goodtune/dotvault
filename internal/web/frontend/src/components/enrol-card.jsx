@@ -314,6 +314,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
           h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
         ),
       ),
+      h(EnrolHelpText, { html: enrolment.help_text_html }),
       h('p', { class: 'enrol-error-text' }, error),
     );
   }
@@ -330,8 +331,17 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
         h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
       ),
     ),
+    h(EnrolHelpText, { html: enrolment.help_text_html }),
     error && h('p', { class: 'enrol-error-text' }, error),
   );
+}
+
+// EnrolHelpText renders the admin-authored, markdown-to-HTML help text the
+// backend attaches to each enrolment (config.Enrolment.HelpText, rendered by
+// internal/web/markdown.go). Absent for enrolments with no configured text.
+function EnrolHelpText({ html }) {
+  if (!html) return null;
+  return h('div', { class: 'custom-text enrol-help-text', dangerouslySetInnerHTML: { __html: html } });
 }
 
 function engineDescription(engine) {

@@ -59,7 +59,7 @@ enrolments:
   (confirm it matches the code shown after you sign in)
 ✓ Opened https://ghp.example.com/cli/auth?user_code=ABCD-EFGH in browser
 ⠼ Waiting for authentication...
-✓ ghp — credentials acquired for @octocat
+✓ ghp (GitHub Proxy) — credentials acquired for @octocat
 ```
 
 ## Credentials stored in Vault

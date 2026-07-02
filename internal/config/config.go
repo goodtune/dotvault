@@ -170,6 +170,10 @@ type ObservabilityConfig struct {
 type Enrolment struct {
 	Engine   string         `yaml:"engine"`
 	Settings map[string]any `yaml:"settings"`
+	// HelpText is optional admin-authored markdown, rendered to HTML and
+	// shown alongside this enrolment in the web UI to explain what the
+	// engine does for the user before they run it.
+	HelpText string `yaml:"help_text,omitempty"`
 }
 
 // VaultConfig holds Vault connection settings.

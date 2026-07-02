@@ -672,6 +672,7 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 
 	enrolment := Enrolment{}
 	enrolment.Engine, _ = readRegString(key, "Engine")
+	enrolment.HelpText, _ = readRegString(key, "HelpText")
 
 	// Read optional Settings subkey, recursing into any nested subkeys
 	// so engines like "copy" with structured settings (e.g. settings.from

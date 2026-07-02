@@ -378,6 +378,10 @@ func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 	enrolPath := rootKey + `\Enrolments\` + name
 	e.writeKey(enrolPath)
 	e.writeString("Engine", en.Engine)
+	// HelpText is markdown that may span multiple lines; writeString falls
+	// through to hex(1) the same way Web's LoginText/SecretViewText do.
+	// Always emitted (even empty) so a re-import clears a stale value.
+	e.writeString("HelpText", en.HelpText)
 	e.WriteString("\r\n")
 
 	if len(en.Settings) == 0 {

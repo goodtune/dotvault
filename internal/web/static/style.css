@@ -392,6 +392,8 @@ body {
 }
 .enrol-card-header strong { font-size: 15px; color: #333; }
 .enrol-engine-desc { font-size: 13px; color: #888; margin-left: 8px; }
+.enrol-help-text { font-size: 13px; margin: 10px 0 0; }
+.enrol-help-text p:last-child { margin-bottom: 0; }
 
 .enrol-card-actions { display: flex; gap: 8px; }
 

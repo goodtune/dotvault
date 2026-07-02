@@ -365,6 +365,47 @@ func TestGroupedEnrolmentKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEnrolmentHelpTextRoundTrip verifies that an enrolment's admin-authored
+// HelpText — including a multi-line (and therefore hex(1)-encoded) value —
+// survives the .reg render -> parse cycle, mirroring Web's LoginText /
+// SecretViewText round trip.
+func TestEnrolmentHelpTextRoundTrip(t *testing.T) {
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{Name: "minimal", VaultKey: "minimal", Target: config.Target{Path: "~/.dotvault/minimal", Format: "text"}},
+		},
+		Enrolments: map[string]config.Enrolment{
+			"ghp": {
+				Engine:   "ghp",
+				HelpText: "Mints a **GitHub Proxy** session token.\nSign in via your browser to continue.",
+				Settings: map[string]any{"url": "https://ghp.example.com"},
+			},
+		},
+	}
+
+	text, err := GenerateText(src)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(text, `"HelpText"=hex(1):`) {
+		t.Errorf("rendered .reg missing hex(1)-encoded HelpText\n--- output ---\n%s", text)
+	}
+
+	got, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	e, ok := got.Enrolments["ghp"]
+	if !ok {
+		t.Fatalf("ghp enrolment did not round-trip; got %v", got.Enrolments)
+	}
+	want := "Mints a **GitHub Proxy** session token.\nSign in via your browser to continue."
+	if e.HelpText != want {
+		t.Errorf("HelpText = %q, want %q", e.HelpText, want)
+	}
+}
+
 func TestGenerateNestedMapSetting(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},

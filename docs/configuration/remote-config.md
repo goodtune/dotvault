@@ -67,7 +67,7 @@ A running daemon (in every mode — web, headless, CLI) re-fetches on each `refr
 - enrolments added/changed/removed → the enrolment managers and the web UI's enrolment page update (deferred one tick if an enrolment is mid-run);
 - `sync.interval` → the sync engine's ticker resets.
 
-Static sections still require a daemon restart, exactly as for a locally edited config.
+A tick doesn't have to be waited out: SIGHUP (or the Windows tray's "Reload config" entry) forces the same refresh pass immediately — see [Config reload](../admin/deployment.md#config-reload). Static sections still require a daemon restart, exactly as for a locally edited config.
 
 ## Which commands fetch
 

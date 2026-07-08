@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -408,10 +410,26 @@ func staticSectionsOf(c *config.Config) staticSections {
 	return s
 }
 
-// digestHeaders hashes a header map deterministically (sorted keys,
-// NUL-delimited) so two snapshots can be compared for equality without
-// either retaining the header values. An empty or nil map digests to the
-// zero value.
+// headerDigestSalt is a per-process random value mixed into every header
+// digest. Digests are only ever compared against digests computed in the
+// same process, so the salt costs nothing — and it makes a digest recovered
+// from a heap or core dump useless for offline confirmation of guessed
+// header values.
+var headerDigestSalt = func() []byte {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// An unsalted digest is still correct for the same-process
+		// equality comparison this exists for.
+		return nil
+	}
+	return b
+}()
+
+// digestHeaders hashes a header map deterministically (sorted keys, each
+// key and value length-prefixed so no delimiter can be forged by the
+// content) so two snapshots can be compared for equality without either
+// retaining the header values. An empty or nil map digests to the zero
+// value.
 func digestHeaders(h map[string]string) [sha256.Size]byte {
 	if len(h) == 0 {
 		return [sha256.Size]byte{}
@@ -422,11 +440,16 @@ func digestHeaders(h map[string]string) [sha256.Size]byte {
 	}
 	slices.Sort(keys)
 	d := sha256.New()
+	d.Write(headerDigestSalt)
+	var lenBuf [8]byte
+	writeString := func(s string) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		d.Write(lenBuf[:])
+		d.Write([]byte(s))
+	}
 	for _, k := range keys {
-		d.Write([]byte(k))
-		d.Write([]byte{0})
-		d.Write([]byte(h[k]))
-		d.Write([]byte{0})
+		writeString(k)
+		writeString(h[k])
 	}
 	var out [sha256.Size]byte
 	copy(out[:], d.Sum(nil))
@@ -466,9 +489,10 @@ func changedStaticSections(a, b staticSections) []string {
 // (CLI), the refresh/watch managers, and the web enrolment runner; rules and
 // the sync interval go to the sync engine and the web server's snapshots.
 // A manual reload request (SIGHUP, tray) runs the same pass immediately.
-// Static sections (vault, web, agent, observability, remote_config) are
-// applied only at startup; when a reload finds them changed the loop warns
-// that a restart is required rather than half-applying them.
+// Static sections (vault, web, agent, observability, remote_config, and the
+// top-level bypass_system_config flag) are applied only at startup; when a
+// reload finds them changed the loop warns that a restart is required rather
+// than half-applying them.
 func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -524,15 +548,19 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 		}
 
 		// Static sections can't be applied in place, so a change is a
-		// warning, not an application. Adopting the new snapshot as the
-		// comparison base keeps it one warning per edit rather than one
-		// per tick — and if a subsequent edit reverts the change, the
-		// running daemon matches the file again and a restart is no
-		// longer suggested.
+		// warning, not an application. The diff is always taken against
+		// initialStatic — the configuration the running subsystems were
+		// actually built from — so it names exactly what a restart would
+		// change; lastStatic only deduplicates, keeping it one message
+		// per edit rather than one per tick. An edit that reverts the
+		// file back to the running configuration logs an all-clear
+		// instead of a false restart-required warning.
 		if reloadedStatic := staticSectionsOf(reloaded); !reflect.DeepEqual(reloadedStatic, lastStatic) {
-			if sections := changedStaticSections(lastStatic, reloadedStatic); len(sections) > 0 {
+			if sections := changedStaticSections(d.initialStatic, reloadedStatic); len(sections) > 0 {
 				slog.Warn("static configuration sections changed; restart the daemon to apply them",
 					"sections", strings.Join(sections, ", "))
+			} else {
+				slog.Info("static configuration sections match the running configuration again; restart no longer needed")
 			}
 			lastStatic = reloadedStatic
 		}
@@ -716,13 +744,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
-	// auth completes further down). A SIGHUP arriving before lm exists is
-	// metered and logged as a debug no-op rather than dropped silently.
-	// configReloadCh is buffered so the same early SIGHUP leaves a pending
-	// nudge the refresh loop consumes as soon as it starts.
+	// auth completes further down). A reload arriving before lm exists
+	// skips the token re-read (there is no token to manage yet) but is not
+	// dropped: configReloadCh is buffered, so the nudge sits pending until
+	// the refresh loop starts and consumes it.
 	var lmPtr atomic.Pointer[auth.LifecycleManager]
 	configReloadCh := make(chan struct{}, 1)
-	requestConfigReload := func() {
+	// reloadNow is the shared body of the daemon's manual reload triggers
+	// (SIGHUP here, the tray's "Reload config" entry further down).
+	reloadNow := func() {
+		if lm := lmPtr.Load(); lm != nil {
+			lm.Reload()
+		} else {
+			slog.Debug("reload requested before lifecycle manager is ready; skipping token re-read, config reload deferred")
+		}
 		select {
 		case configReloadCh <- struct{}{}:
 		default: // a reload is already pending
@@ -738,13 +773,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				cancel()
 			case syscall.SIGHUP:
 				observability.RecordSIGHUP(ctx)
-				if lm := lmPtr.Load(); lm != nil {
-					slog.Info("received SIGHUP, re-reading vault token file and reloading configuration")
-					lm.Reload()
-				} else {
-					slog.Debug("received SIGHUP before lifecycle manager is ready; deferring config reload")
-				}
-				requestConfigReload()
+				slog.Info("received SIGHUP, re-reading vault token file and reloading configuration")
+				reloadNow()
 			}
 		}
 	}()
@@ -1246,15 +1276,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			cancel()
 		},
 		// Windows never delivers SIGHUP, so the tray menu is dotvaultw's
-		// (and the console daemon's) reload trigger. Mirrors the SIGHUP
-		// handler exactly: token-file re-read plus an immediate
+		// (and the console daemon's) reload trigger. Same body as the
+		// SIGHUP handler: token-file re-read plus an immediate
 		// config-refresh pass.
 		OnReload: func() {
 			slog.Info("config reload requested from tray, re-reading vault token file and reloading configuration")
-			if lm := lmPtr.Load(); lm != nil {
-				lm.Reload()
-			}
-			requestConfigReload()
+			reloadNow()
 		},
 	}
 	if webServer != nil {

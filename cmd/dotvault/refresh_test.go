@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"path/filepath"
+	"reflect"
+	"strings"
+	gosync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,5 +198,127 @@ func TestChangedStaticSections(t *testing.T) {
 				t.Errorf("changedStaticSections = %v, want [%s]", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestStaticSectionsCoverConfig guards the static/dynamic split against
+// drift: every top-level config.Config field must be explicitly classified
+// here. A section added to config.Config without a decision fails this test
+// instead of silently being neither applied on reload nor named in the
+// restart-required warning.
+func TestStaticSectionsCoverConfig(t *testing.T) {
+	classified := map[string]string{
+		"Vault":              "static",
+		"Sync":               "dynamic", // sync.interval applies in place on reload
+		"Web":                "static",
+		"Observability":      "static",
+		"Agent":              "static",
+		"RemoteConfig":       "static",
+		"Rules":              "dynamic",
+		"Enrolments":         "dynamic",
+		"BypassSystemConfig": "static",
+		"Managed":            "derived", // set by the loader from the config source, not a section
+	}
+	typ := reflect.TypeOf(config.Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		name := typ.Field(i).Name
+		if _, ok := classified[name]; !ok {
+			t.Errorf("config.Config field %q is not classified as static or dynamic; decide, then update staticSectionsOf/changedStaticSections (cmd/dotvault/main.go) or the refresh loop's dynamic fan-out, and record the decision here", name)
+		}
+	}
+	for name := range classified {
+		if _, ok := typ.FieldByName(name); !ok {
+			t.Errorf("classified field %q no longer exists on config.Config; prune it from this test", name)
+		}
+	}
+}
+
+// syncBuffer is a goroutine-safe bytes.Buffer for capturing slog output from
+// the refresh-loop goroutine.
+type syncBuffer struct {
+	mu  gosync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestRunConfigRefreshStaticChangeWarns drives the loop through a static
+// config change, a repeat of the same change, and a revert, asserting the
+// restart-required warning fires exactly once per edit and that reverting to
+// the running configuration produces the all-clear rather than a second
+// (false) restart-required warning.
+func TestRunConfigRefreshStaticChangeWarns(t *testing.T) {
+	logBuf := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{Name: "r", VaultKey: "k", Target: config.Target{Path: "/tmp/r", Format: "text"}},
+		},
+	}
+	edited := *initial
+	edited.Vault.Address = "https://other.example.com:8200"
+
+	var current atomic.Pointer[config.Config]
+	current.Store(&edited)
+	loader := func() (*config.Config, error) { return current.Load(), nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	// Unbuffered on purpose: each send returns only once the loop has
+	// received it, i.e. once the previous refresh pass fully completed and
+	// the loop is back at its select. That makes the log assertions below
+	// race-free without polling.
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour, // never ticks within the test
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+		})
+	}()
+
+	reloadCh <- struct{}{} // pass 1: static change -> warn
+	reloadCh <- struct{}{} // pass 2: same content -> deduplicated, no second warn
+	current.Store(initial)
+	reloadCh <- struct{}{} // pass 3: reverted -> all-clear, no restart-required warn
+	reloadCh <- struct{}{} // pass 4: barrier so pass 3's logging is complete
+	cancel()
+	<-done
+
+	logs := logBuf.String()
+	if got := strings.Count(logs, "restart the daemon to apply them"); got != 1 {
+		t.Errorf("restart-required warning logged %d times, want exactly 1\nlogs:\n%s", got, logs)
+	}
+	if !strings.Contains(logs, "sections=vault") {
+		t.Errorf("restart-required warning does not name the changed section\nlogs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "restart no longer needed") {
+		t.Errorf("revert to the running configuration did not log the all-clear\nlogs:\n%s", logs)
 	}
 }

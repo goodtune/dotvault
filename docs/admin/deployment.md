@@ -298,7 +298,7 @@ SIGHUP is the running daemon's reload trigger. It does two things at once: re-re
 What a reload can and cannot apply:
 
 - **Applied in place** — the *dynamic* sections: `rules`, `enrolments`, and `sync.interval`. These are the same sections the daemon already re-reads periodically on its config-refresh tick (default: the sync interval; see `remote_config.refresh_interval`), whether the change came from an edited local config or the remote overlay. The signal just skips the wait.
-- **Restart required** — the *static* sections: `vault`, `web`, `agent`, `observability`, and `remote_config` itself. These configure subsystems constructed once at startup (the Vault client, the web listener, the SSH agent, the OTel exporter, the remote-config fetcher). A reload that finds them changed logs a warning naming the changed sections; restart the daemon (`systemctl --user restart dotvault.service`) to apply them.
+- **Restart required** — the *static* sections: `vault`, `web`, `agent`, `observability`, `remote_config` itself, and the top-level `bypass_system_config` flag. These configure subsystems constructed once at startup (the Vault client, the web listener, the SSH agent, the OTel exporter, the remote-config fetcher). A reload that finds them changed logs a warning naming the changed sections; restart the daemon (`systemctl --user restart dotvault.service`) to apply them.
 
 The packaged systemd unit wires SIGHUP as `ExecReload=`, so the canonical gesture on Linux is:
 

@@ -20,8 +20,9 @@
 //
 // On every other platform Watch is a no-op that blocks until ctx is
 // cancelled, so the daemon can wire it unconditionally. macOS and
-// Windows had no path-unit equivalent to replace; SIGHUP (where
-// delivered) remains the manual nudge. Function-level docs live with
-// the build-tag-specific declarations so `go doc` picks up the right
+// Windows had no path-unit equivalent to replace; the manual nudge
+// remains available as SIGHUP on macOS and the tray's "Reload config"
+// entry on Windows. Function-level docs live with the
+// build-tag-specific declarations so `go doc` picks up the right
 // one per platform.
 package tokenwatch

@@ -13,7 +13,8 @@ ExecStart=/usr/bin/dotvault run
 # SIGHUP is the daemon's reload trigger: it re-reads ~/.dotvault-token and
 # immediately re-runs the config loader, applying the dynamic sections
 # (rules, enrolments, sync interval) in place. Static sections (vault, web,
-# agent, observability, remote_config) are logged as needing a restart.
+# agent, observability, remote_config, bypass_system_config) are logged as
+# needing a restart.
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure

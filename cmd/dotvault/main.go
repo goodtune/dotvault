@@ -355,12 +355,7 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 type refreshDeps struct {
 	load     func() (*config.Config, error)
 	interval time.Duration
-	// trackSyncTicks is set when the refresh cadence defaulted to
-	// sync.interval (no explicit remote_config.refresh_interval); the loop
-	// then follows a remotely-changed sync interval instead of staying
-	// pinned to the startup value.
-	trackSyncTicks bool
-	initial        *config.Config
+	initial  *config.Config
 	// initialStatic is the static-section snapshot taken at startup,
 	// before the daemon scrubs observability.headers from its long-lived
 	// config. The loop compares each reload against it to warn when a
@@ -380,19 +375,21 @@ type refreshDeps struct {
 
 // staticSections snapshots the config sections the daemon cannot apply
 // in-place: they configure subsystems constructed once at startup (the Vault
-// client, the web listener, the SSH agent, the OTel SDK, the remote-config
-// fetcher). The refresh loop diffs them only to tell the operator a restart
-// is needed. Observability headers are reduced to a digest rather than
-// retained: the values carry OTLP bearer tokens that the daemon deliberately
-// scrubs from its long-lived config after the OTel SDK consumes them, and a
-// comparison snapshot must not reintroduce them into the heap.
+// client, the web listener, the SSH agent, the OTel SDK). The refresh loop
+// diffs them only to tell the operator a restart is needed. remote_config is
+// deliberately NOT here: the withRemote loader rebuilds the overlay fetcher
+// whenever the section changes and the refresh loop re-derives its cadence
+// each pass, so the section applies live like the other dynamic sections.
+// Observability headers are reduced to a digest rather than retained: the
+// values carry OTLP bearer tokens that the daemon deliberately scrubs from
+// its long-lived config after the OTel SDK consumes them, and a comparison
+// snapshot must not reintroduce them into the heap.
 type staticSections struct {
 	Vault         config.VaultConfig
 	Web           config.WebConfig
 	Agent         config.AgentConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
-	RemoteConfig  config.RemoteConfig
 	Bypass        bool
 }
 
@@ -403,7 +400,6 @@ func staticSectionsOf(c *config.Config) staticSections {
 		Agent:         c.Agent,
 		Observability: c.Observability,
 		HeadersDigest: digestHeaders(c.Observability.Headers),
-		RemoteConfig:  c.RemoteConfig,
 		Bypass:        c.BypassSystemConfig,
 	}
 	s.Observability.Headers = nil
@@ -473,9 +469,6 @@ func changedStaticSections(a, b staticSections) []string {
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")
 	}
-	if !reflect.DeepEqual(a.RemoteConfig, b.RemoteConfig) {
-		out = append(out, "remote_config")
-	}
 	if a.Bypass != b.Bypass {
 		out = append(out, "bypass_system_config")
 	}
@@ -489,10 +482,13 @@ func changedStaticSections(a, b staticSections) []string {
 // (CLI), the refresh/watch managers, and the web enrolment runner; rules and
 // the sync interval go to the sync engine and the web server's snapshots.
 // A manual reload request (SIGHUP, tray) runs the same pass immediately.
-// Static sections (vault, web, agent, observability, remote_config, and the
-// top-level bypass_system_config flag) are applied only at startup; when a
-// reload finds them changed the loop warns that a restart is required rather
-// than half-applying them.
+// remote_config changes also apply live: the withRemote loader rebuilds the
+// overlay fetcher when the section changes, and the loop re-derives its own
+// tick cadence (explicit remote_config.refresh_interval, else the sync
+// interval) after every pass. Static sections (vault, web, agent,
+// observability, and the top-level bypass_system_config flag) are applied
+// only at startup; when a reload finds them changed the loop warns that a
+// restart is required rather than half-applying them.
 func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -500,6 +496,7 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastEnrolments := d.initial.Enrolments
 	lastRules := d.initial.Rules
 	lastInterval := d.initial.Sync.Interval
+	lastCadence := d.interval
 	lastStatic := d.initialStatic
 
 	refresh := func() {
@@ -540,11 +537,24 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 			if d.web != nil {
 				d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
 			}
-			if intervalChanged && d.trackSyncTicks {
-				ticker.Reset(reloaded.Sync.Interval)
-			}
 			lastRules = reloaded.Rules
 			lastInterval = reloaded.Sync.Interval
+		}
+
+		// Re-derive this loop's own cadence from the reloaded config,
+		// mirroring the startup rule: an explicit
+		// remote_config.refresh_interval wins, else the sync interval.
+		// This keeps remote_config fully dynamic — the withRemote loader
+		// already rebuilds the overlay fetcher when the section changes,
+		// so the cadence was the only piece pinned at startup.
+		cadence := reloaded.Sync.Interval
+		if reloaded.RemoteConfig.RefreshInterval > 0 {
+			cadence = reloaded.RemoteConfig.RefreshInterval
+		}
+		if cadence > 0 && cadence != lastCadence {
+			changed = true
+			ticker.Reset(cadence)
+			lastCadence = cadence
 		}
 
 		// Static sections can't be applied in place, so a change is a
@@ -1209,7 +1219,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	go runConfigRefresh(ctx, refreshDeps{
 		load:           loadCfg,
 		interval:       refreshInterval,
-		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
 		initial:        cfg,
 		initialStatic:  initialStatic,
 		reload:         configReloadCh,

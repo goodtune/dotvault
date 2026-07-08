@@ -164,9 +164,13 @@ func TestChangedStaticSections(t *testing.T) {
 	}
 
 	// Same static content, different dynamic content: no change reported.
+	// remote_config is dynamic — the loader rebuilds the overlay fetcher
+	// and the refresh loop re-derives its cadence — so it must not be
+	// reported either.
 	dynamicOnly := *base
 	dynamicOnly.Sync = config.SyncConfig{Interval: time.Minute}
 	dynamicOnly.Rules = nil
+	dynamicOnly.RemoteConfig.URL = "https://config.example/doc"
 	if got := changedStaticSections(snap, staticSectionsOf(&dynamicOnly)); len(got) != 0 {
 		t.Errorf("dynamic-only change reported static sections: %v", got)
 	}
@@ -181,7 +185,6 @@ func TestChangedStaticSections(t *testing.T) {
 		{"agent", func(c *config.Config) { c.Agent.Enabled = true }, "agent"},
 		{"observability scalar", func(c *config.Config) { c.Observability.Endpoint = "https://elsewhere.example" }, "observability"},
 		{"observability headers", func(c *config.Config) { c.Observability.Headers = map[string]string{"Authorization": "Bearer rotated"} }, "observability"},
-		{"remote_config", func(c *config.Config) { c.RemoteConfig.URL = "https://config.example/doc" }, "remote_config"},
 		{"bypass_system_config", func(c *config.Config) { c.BypassSystemConfig = true }, "bypass_system_config"},
 	}
 	for _, tc := range cases {
@@ -213,7 +216,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"Web":                "static",
 		"Observability":      "static",
 		"Agent":              "static",
-		"RemoteConfig":       "static",
+		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",
 		"BypassSystemConfig": "static",
@@ -321,4 +324,77 @@ func TestRunConfigRefreshStaticChangeWarns(t *testing.T) {
 	if !strings.Contains(logs, "restart no longer needed") {
 		t.Errorf("revert to the running configuration did not log the all-clear\nlogs:\n%s", logs)
 	}
+}
+
+// TestRunConfigRefreshCadenceFollowsReload pins remote_config's dynamic
+// classification: a reloaded remote_config.refresh_interval must retune the
+// loop's own ticker. The loop starts with an effectively-infinite cadence, a
+// manual nudge delivers a config carrying a fast refresh_interval, and then
+// — with no further nudges — a subsequent config change must be picked up by
+// the retuned ticker alone.
+func TestRunConfigRefreshCadenceFollowsReload(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{Name: "old", VaultKey: "old", Target: config.Target{Path: "/tmp/old", Format: "text"}},
+		},
+	}
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	engine.State().Set("old", sync.RuleState{VaultVersion: 1, LastSynced: time.Now()})
+
+	// Same rules as initial, but a fast refresh cadence.
+	retuned := *initial
+	retuned.RemoteConfig.RefreshInterval = 10 * time.Millisecond
+
+	// Different rules; only reachable once the retuned ticker fires.
+	swapped := retuned
+	swapped.Rules = []config.Rule{
+		{Name: "new", VaultKey: "new", Target: config.Target{Path: "/tmp/new", Format: "text"}},
+	}
+
+	var current atomic.Pointer[config.Config]
+	current.Store(&retuned)
+	loader := func() (*config.Config, error) { return current.Load(), nil }
+
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour, // start effectively tickless
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+		})
+	}()
+
+	reloadCh <- struct{}{} // applies the 10ms cadence
+	current.Store(&swapped)
+
+	// No further nudges: only the retuned ticker can deliver this.
+	deadline := time.After(3 * time.Second)
+	for {
+		if _, ok := engine.State().Rules()["old"]; !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("reloaded remote_config.refresh_interval did not retune the refresh ticker")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -357,11 +359,104 @@ type refreshDeps struct {
 	// pinned to the startup value.
 	trackSyncTicks bool
 	initial        *config.Config
+	// initialStatic is the static-section snapshot taken at startup,
+	// before the daemon scrubs observability.headers from its long-lived
+	// config. The loop compares each reload against it to warn when a
+	// change cannot be applied without a restart.
+	initialStatic staticSections
+	// reload delivers manual reload requests (SIGHUP on Unix, the tray's
+	// "Reload config" entry on Windows) that run a refresh pass
+	// immediately instead of waiting for the next tick. A nil channel is
+	// fine — it just never fires.
+	reload         <-chan struct{}
 	engine         *sync.Engine
 	refreshManager *enrol.RefreshManager
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
+}
+
+// staticSections snapshots the config sections the daemon cannot apply
+// in-place: they configure subsystems constructed once at startup (the Vault
+// client, the web listener, the SSH agent, the OTel SDK, the remote-config
+// fetcher). The refresh loop diffs them only to tell the operator a restart
+// is needed. Observability headers are reduced to a digest rather than
+// retained: the values carry OTLP bearer tokens that the daemon deliberately
+// scrubs from its long-lived config after the OTel SDK consumes them, and a
+// comparison snapshot must not reintroduce them into the heap.
+type staticSections struct {
+	Vault         config.VaultConfig
+	Web           config.WebConfig
+	Agent         config.AgentConfig
+	Observability config.ObservabilityConfig
+	HeadersDigest [sha256.Size]byte
+	RemoteConfig  config.RemoteConfig
+	Bypass        bool
+}
+
+func staticSectionsOf(c *config.Config) staticSections {
+	s := staticSections{
+		Vault:         c.Vault,
+		Web:           c.Web,
+		Agent:         c.Agent,
+		Observability: c.Observability,
+		HeadersDigest: digestHeaders(c.Observability.Headers),
+		RemoteConfig:  c.RemoteConfig,
+		Bypass:        c.BypassSystemConfig,
+	}
+	s.Observability.Headers = nil
+	return s
+}
+
+// digestHeaders hashes a header map deterministically (sorted keys,
+// NUL-delimited) so two snapshots can be compared for equality without
+// either retaining the header values. An empty or nil map digests to the
+// zero value.
+func digestHeaders(h map[string]string) [sha256.Size]byte {
+	if len(h) == 0 {
+		return [sha256.Size]byte{}
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	d := sha256.New()
+	for _, k := range keys {
+		d.Write([]byte(k))
+		d.Write([]byte{0})
+		d.Write([]byte(h[k]))
+		d.Write([]byte{0})
+	}
+	var out [sha256.Size]byte
+	copy(out[:], d.Sum(nil))
+	return out
+}
+
+// changedStaticSections names the static config sections that differ between
+// two snapshots, using their YAML section names so the warning reads back to
+// the file the operator just edited.
+func changedStaticSections(a, b staticSections) []string {
+	var out []string
+	if !reflect.DeepEqual(a.Vault, b.Vault) {
+		out = append(out, "vault")
+	}
+	if !reflect.DeepEqual(a.Web, b.Web) {
+		out = append(out, "web")
+	}
+	if !reflect.DeepEqual(a.Agent, b.Agent) {
+		out = append(out, "agent")
+	}
+	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
+		out = append(out, "observability")
+	}
+	if !reflect.DeepEqual(a.RemoteConfig, b.RemoteConfig) {
+		out = append(out, "remote_config")
+	}
+	if a.Bypass != b.Bypass {
+		out = append(out, "bypass_system_config")
+	}
+	return out
 }
 
 // runConfigRefresh re-runs the daemon's config loader on a fixed tick — the
@@ -370,8 +465,10 @@ type refreshDeps struct {
 // changes to the running daemon: enrolments fan out to the enrolment manager
 // (CLI), the refresh/watch managers, and the web enrolment runner; rules and
 // the sync interval go to the sync engine and the web server's snapshots.
-// Static sections (vault, web, agent, observability) are exclusively local
-// and still require a restart, as documented.
+// A manual reload request (SIGHUP, tray) runs the same pass immediately.
+// Static sections (vault, web, agent, observability, remote_config) are
+// applied only at startup; when a reload finds them changed the loop warns
+// that a restart is required rather than half-applying them.
 func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -379,71 +476,93 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastEnrolments := d.initial.Enrolments
 	lastRules := d.initial.Rules
 	lastInterval := d.initial.Sync.Interval
+	lastStatic := d.initialStatic
+
+	refresh := func() {
+		reloaded, err := d.load()
+		if err != nil {
+			observability.RecordConfigReload(ctx, "error")
+			slog.Warn("config reload failed", "error", err)
+			return
+		}
+
+		changed := false
+
+		if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+			// All-or-nothing: when the web runner is busy with a
+			// running enrolment the whole enrolment update is
+			// deferred (lastEnrolments stays put), so the next tick
+			// retries every consumer together rather than leaving
+			// the managers and the web runner disagreeing.
+			if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
+				slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
+			} else {
+				changed = true
+				slog.Info("enrolments config changed, re-checking")
+				if d.enrolManager != nil {
+					d.enrolManager.UpdateConfig(reloaded.Enrolments)
+				}
+				d.refreshManager.UpdateConfig(reloaded.Enrolments)
+				d.watchManager.UpdateConfig(reloaded.Enrolments)
+				lastEnrolments = reloaded.Enrolments
+			}
+		}
+
+		rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
+		intervalChanged := reloaded.Sync.Interval != lastInterval
+		if rulesChanged || intervalChanged {
+			changed = true
+			d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
+			if d.web != nil {
+				d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
+			}
+			if intervalChanged && d.trackSyncTicks {
+				ticker.Reset(reloaded.Sync.Interval)
+			}
+			lastRules = reloaded.Rules
+			lastInterval = reloaded.Sync.Interval
+		}
+
+		// Static sections can't be applied in place, so a change is a
+		// warning, not an application. Adopting the new snapshot as the
+		// comparison base keeps it one warning per edit rather than one
+		// per tick — and if a subsequent edit reverts the change, the
+		// running daemon matches the file again and a restart is no
+		// longer suggested.
+		if reloadedStatic := staticSectionsOf(reloaded); !reflect.DeepEqual(reloadedStatic, lastStatic) {
+			if sections := changedStaticSections(lastStatic, reloadedStatic); len(sections) > 0 {
+				slog.Warn("static configuration sections changed; restart the daemon to apply them",
+					"sections", strings.Join(sections, ", "))
+			}
+			lastStatic = reloadedStatic
+		}
+
+		if changed {
+			observability.RecordConfigReload(ctx, "applied")
+		} else {
+			observability.RecordConfigReload(ctx, "no_change")
+		}
+
+		// CLI mode keeps its historical behaviour: re-check enrolments
+		// every tick and trigger a sync when something newly enrolled.
+		if d.enrolManager != nil {
+			if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
+				slog.Warn("enrolment check failed", "error", err)
+			} else if ok {
+				d.engine.TriggerSync()
+			}
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reloaded, err := d.load()
-			if err != nil {
-				observability.RecordConfigReload(ctx, "error")
-				slog.Warn("config reload failed", "error", err)
-				continue
-			}
-
-			changed := false
-
-			if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-				// All-or-nothing: when the web runner is busy with a
-				// running enrolment the whole enrolment update is
-				// deferred (lastEnrolments stays put), so the next tick
-				// retries every consumer together rather than leaving
-				// the managers and the web runner disagreeing.
-				if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
-					slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
-				} else {
-					changed = true
-					slog.Info("enrolments config changed, re-checking")
-					if d.enrolManager != nil {
-						d.enrolManager.UpdateConfig(reloaded.Enrolments)
-					}
-					d.refreshManager.UpdateConfig(reloaded.Enrolments)
-					d.watchManager.UpdateConfig(reloaded.Enrolments)
-					lastEnrolments = reloaded.Enrolments
-				}
-			}
-
-			rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
-			intervalChanged := reloaded.Sync.Interval != lastInterval
-			if rulesChanged || intervalChanged {
-				changed = true
-				d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
-				if d.web != nil {
-					d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
-				}
-				if intervalChanged && d.trackSyncTicks {
-					ticker.Reset(reloaded.Sync.Interval)
-				}
-				lastRules = reloaded.Rules
-				lastInterval = reloaded.Sync.Interval
-			}
-
-			if changed {
-				observability.RecordConfigReload(ctx, "applied")
-			} else {
-				observability.RecordConfigReload(ctx, "no_change")
-			}
-
-			// CLI mode keeps its historical behaviour: re-check enrolments
-			// every tick and trigger a sync when something newly enrolled.
-			if d.enrolManager != nil {
-				if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
-					slog.Warn("enrolment check failed", "error", err)
-				} else if ok {
-					d.engine.TriggerSync()
-				}
-			}
+			refresh()
+		case <-d.reload:
+			slog.Info("manual config reload requested, re-reading configuration")
+			refresh()
 		}
 	}
 }
@@ -563,6 +682,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Headers map, and the scrub below only reassigns cfg's field, so this
 	// copy retains the real headers. Only consumed when web is enabled.
 	obsCfgForWeb := cfg.Observability
+	// Snapshot the static config sections before the scrub below so the
+	// config-refresh loop can warn when a reload changes a section that
+	// needs a restart. The snapshot reduces observability.headers to a
+	// digest, so it does not retain the bearer tokens the scrub removes.
+	initialStatic := staticSectionsOf(cfg)
 	// Zero out the bearer-token map on the daemon's long-lived cfg now that
 	// the SDK has consumed it. cfg lives for the daemon's full lifetime;
 	// keeping Headers in the heap-resident Config struct gives a future log
@@ -579,19 +703,31 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Windows box) or be lost to the no-op global logger.
 	emitConfigSourceLog(ctx, cfg, cfgPath)
 
-	// Handle signals. SIGHUP triggers an immediate ~/.dotvault-token re-read
-	// via the LifecycleManager so a fresh token written by `dotvault
-	// login` is picked up within seconds, without waiting for the
-	// 5-minute tick. This is the manual counterpart to the in-process
-	// inotify watcher (internal/tokenwatch) wired in further down, which
-	// performs the same re-read automatically on token-file changes.
-	// Full config reload on SIGHUP is still not implemented.
+	// Handle signals. SIGHUP is the daemon's reload trigger: it re-reads
+	// ~/.dotvault-token immediately via the LifecycleManager (so a fresh
+	// token written by `dotvault login` is picked up within seconds,
+	// without waiting for the 5-minute tick — the manual counterpart to
+	// the in-process inotify watcher wired in further down) AND nudges
+	// the config-refresh loop to re-run the loader now instead of on its
+	// next tick. Dynamic sections (rules, enrolments, sync interval)
+	// apply in place; the refresh loop warns when static sections changed
+	// and a restart is required. On Windows SIGHUP is not delivered; the
+	// tray's "Reload config" entry drives the same two calls instead.
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
 	// auth completes further down). A SIGHUP arriving before lm exists is
 	// metered and logged as a debug no-op rather than dropped silently.
+	// configReloadCh is buffered so the same early SIGHUP leaves a pending
+	// nudge the refresh loop consumes as soon as it starts.
 	var lmPtr atomic.Pointer[auth.LifecycleManager]
+	configReloadCh := make(chan struct{}, 1)
+	requestConfigReload := func() {
+		select {
+		case configReloadCh <- struct{}{}:
+		default: // a reload is already pending
+		}
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -603,11 +739,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			case syscall.SIGHUP:
 				observability.RecordSIGHUP(ctx)
 				if lm := lmPtr.Load(); lm != nil {
-					slog.Info("received SIGHUP, re-reading vault token file")
+					slog.Info("received SIGHUP, re-reading vault token file and reloading configuration")
 					lm.Reload()
 				} else {
-					slog.Debug("received SIGHUP before lifecycle manager is ready; ignoring")
+					slog.Debug("received SIGHUP before lifecycle manager is ready; deferring config reload")
 				}
+				requestConfigReload()
 			}
 		}
 	}()
@@ -1044,6 +1181,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		interval:       refreshInterval,
 		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
 		initial:        cfg,
+		initialStatic:  initialStatic,
+		reload:         configReloadCh,
 		engine:         engine,
 		refreshManager: rm,
 		watchManager:   wm,
@@ -1105,6 +1244,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		OnExit: func() {
 			slog.Info("exit requested from tray")
 			cancel()
+		},
+		// Windows never delivers SIGHUP, so the tray menu is dotvaultw's
+		// (and the console daemon's) reload trigger. Mirrors the SIGHUP
+		// handler exactly: token-file re-read plus an immediate
+		// config-refresh pass.
+		OnReload: func() {
+			slog.Info("config reload requested from tray, re-reading vault token file and reloading configuration")
+			if lm := lmPtr.Load(); lm != nil {
+				lm.Reload()
+			}
+			requestConfigReload()
 		},
 	}
 	if webServer != nil {

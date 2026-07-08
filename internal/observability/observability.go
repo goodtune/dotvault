@@ -476,14 +476,17 @@ func rebindInstruments() {
 	sighupAttempts, _ = meter.Int64Counter(
 		"dotvault.sighup.received",
 		// Permanently zero on Windows (SIGHUP isn't delivered to
-		// processes there); on Linux and macOS each SIGHUP forces
-		// the LifecycleManager to re-read ~/.dotvault-token. This counts
-		// only the manual SIGHUP path: on Linux the steady-state
+		// processes there; the tray's "Reload config" entry drives the
+		// same reload and is not metered here); on Linux and macOS each
+		// SIGHUP forces the LifecycleManager to re-read ~/.dotvault-token
+		// and runs an immediate config-refresh pass. This counts only the
+		// manual SIGHUP path: on Linux the steady-state token-re-read
 		// trigger is the in-process inotify watcher (internal/tokenwatch),
 		// whose re-reads are deliberately not metered here, so this
-		// counter undercounts total token re-reads on Linux. Full
-		// config reload still requires a daemon restart.
-		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate dotvault-token file re-read; full config reload still requires a daemon restart."),
+		// counter undercounts total token re-reads on Linux. The
+		// reload's outcome lands on dotvault.config.reloads; static
+		// config sections still require a daemon restart.
+		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate dotvault-token file re-read and config reload; static config sections still require a daemon restart."),
 	)
 }
 
@@ -616,8 +619,9 @@ func RecordRemoteConfigFetch(ctx context.Context, outcome string) {
 }
 
 // RecordSIGHUP records a SIGHUP receipt. Each SIGHUP triggers an
-// immediate ~/.dotvault-token re-read via LifecycleManager.Reload;
-// the counter surfaces how often that path fires.
+// immediate ~/.dotvault-token re-read via LifecycleManager.Reload plus
+// an immediate config-refresh pass; the counter surfaces how often that
+// path fires.
 func RecordSIGHUP(ctx context.Context) {
 	instrMu.RLock()
 	c := sighupAttempts

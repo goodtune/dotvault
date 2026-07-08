@@ -264,7 +264,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.enrol.attempts`       | counter   | `engine`, `outcome={completed,error}`                |
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
-| `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read |
+| `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read and config reload |
 
 ### Log records
 
@@ -293,11 +293,24 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 
 ## Config reload
 
-!!! note
-    dotvault does **not** support full config reload via SIGHUP. The daemon must be fully restarted to pick up configuration changes (the exception is the `enrolments` section, which is re-read on each polling tick).
+SIGHUP is the running daemon's reload trigger. It does two things at once: re-reads `~/.dotvault-token` immediately (picking up a token freshly written by `dotvault login`), and re-runs the configuration loader immediately instead of waiting for the next config-refresh tick.
 
-    On Linux the daemon watches `~/.dotvault-token` directly with inotify and re-reads it the moment the file is created or replaced — so when an interactive `dotvault login` writes a fresh token, the running daemon picks it up within seconds instead of waiting for the next five-minute lifecycle tick. This is built into the daemon (`internal/tokenwatch`); there is no separate unit to enable, and it works regardless of how dotvault was started. Deletes are ignored — the daemon keeps using its current in-memory token until a replacement is written.
+What a reload can and cannot apply:
+
+- **Applied in place** — the *dynamic* sections: `rules`, `enrolments`, and `sync.interval`. These are the same sections the daemon already re-reads periodically on its config-refresh tick (default: the sync interval; see `remote_config.refresh_interval`), whether the change came from an edited local config or the remote overlay. The signal just skips the wait.
+- **Restart required** — the *static* sections: `vault`, `web`, `agent`, `observability`, and `remote_config` itself. These configure subsystems constructed once at startup (the Vault client, the web listener, the SSH agent, the OTel exporter, the remote-config fetcher). A reload that finds them changed logs a warning naming the changed sections; restart the daemon (`systemctl --user restart dotvault.service`) to apply them.
+
+The packaged systemd unit wires SIGHUP as `ExecReload=`, so the canonical gesture on Linux is:
+
+```sh
+systemctl --user reload dotvault.service
+```
+
+This targets the unit's MainPID specifically — preferable to `kill -HUP $(pgrep -x dotvault)`, which would also signal any unrelated `dotvault sync` or `go run ./cmd/dotvault` invocation the user happens to be running (SIGHUP's default disposition is to *terminate*, so those side processes would die). On macOS the equivalent targeted form is `launchctl kill SIGHUP gui/$(id -u)/com.goodtune.dotvault`.
+
+On **Windows**, SIGHUP is never delivered to processes. The system-tray icon (installed by both `dotvault.exe run` and `dotvaultw.exe`) carries a **Reload config** menu entry that performs exactly the same token re-read + immediate config reload; static-section changes log the same restart-required warning. Alternatively, changes to the dynamic sections still converge on the next config-refresh tick with no action at all.
+
+!!! note "Token re-read is automatic on Linux"
+    On Linux the daemon also watches `~/.dotvault-token` directly with inotify and re-reads it the moment the file is created or replaced — so when an interactive `dotvault login` writes a fresh token, the running daemon picks it up within seconds without any signal. This is built into the daemon (`internal/tokenwatch`); there is no separate unit to enable, and it works regardless of how dotvault was started. Deletes are ignored — the daemon keeps using its current in-memory token until a replacement is written. The watcher is a no-op off Linux; operators who want automatic re-read on macOS should script the `launchctl kill` form above on a launchd `WatchPaths` trigger.
 
     Earlier releases shipped a `dotvault-token-watch.path` user unit that achieved the same nudge by SIGHUP-ing the daemon. It has been removed; the package upgrade deletes the unit files, but an enabled symlink left in `~/.config/systemd/user/` by a previous `systemctl --user enable` will persist and keep firing a (now redundant, but harmless) SIGHUP. After upgrading, clear it with `systemctl --user disable --now dotvault-token-watch.path`.
-
-    SIGHUP triggers the same re-read manually and remains available on every platform where it is delivered (i.e. not Windows). The macOS launchd plist has no inotify equivalent today (the watcher is a no-op off Linux); manual re-read works via `launchctl kill SIGHUP gui/$(id -u)/com.goodtune.dotvault`, which targets the labelled agent specifically — preferable to `kill -HUP $(pgrep -x dotvault)` because that would also signal any unrelated `dotvault sync` or `go run ./cmd/dotvault` invocation the user happens to be running (SIGHUP's default disposition is to *terminate*, so those side processes would die). Operators who want automatic re-read on macOS should script the `launchctl kill` form on a launchd `WatchPaths` trigger.

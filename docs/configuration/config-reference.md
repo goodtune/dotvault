@@ -159,6 +159,8 @@ The borrow is **best-effort and never fatal**: if the socket path is empty, the 
 
 The same borrow is available to the **dotvault client libraries** (Go `client/` and the Python bindings): their cached-auth entry point (`AuthenticateCached`) borrows from the configured peer socket after the `DOTVAULT_TOKEN` env var and token file come up empty, before reporting that a login is required. Because it is a plain socket read with no browser or prompt, a Go or Python program on a host with no local token but a live peer socket reads secrets without an interactive login of its own.
 
+The socket carries traffic the other way too: [`dotvault browse <url>`](../cli.md#dotvault-browse) posts a URL to the peer's `POST /api/v1/remote/browse` endpoint so the browser opens on the workstation — the machine that actually has one — falling back to the local browser when the peer is unreachable. Set `BROWSER="dotvault browse"` on the headless host and OAuth login pages launched there land in the workstation's browser.
+
 `dotvault status` reflects the borrow too. When no local token is present but the configured peer socket holds one, the auth line reports `authenticated` and adds a `source: borrowed from peer socket (<path>)` line, so a host that authenticates purely by borrowing — with no token file at rest — no longer misreports as `not authenticated`. If the socket is configured but the peer holds no token, status says so explicitly and prints the socket path rather than the bare `no token` message.
 
 !!! warning "The socket grants the token to anyone who can connect"

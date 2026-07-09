@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pkg/browser"
+
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -80,6 +82,10 @@ type Server struct {
 	enrolRunner        *EnrolmentRunner
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
+	// openBrowser launches a URL in this host's default browser for the
+	// remote-browse endpoint. Defaults to browser.OpenURL in NewServer;
+	// injected in tests. Nil disables the endpoint (503).
+	openBrowser func(string) error
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's
@@ -126,6 +132,10 @@ type ServerConfig struct {
 	Username      string
 	TokenFilePath string
 	Version       string
+	// OpenBrowser, when non-nil, overrides how the remote-browse endpoint
+	// launches URLs in this host's default browser (tests inject a fake).
+	// Nil selects the real browser.OpenURL.
+	OpenBrowser func(string) error
 }
 
 // NewServer creates a new web server.
@@ -173,6 +183,10 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		secretViewTextHTML: renderMarkdown(sc.WebCfg.SecretViewText),
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
+		openBrowser:        sc.OpenBrowser,
+	}
+	if s.openBrowser == nil {
+		s.openBrowser = browser.OpenURL
 	}
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
@@ -216,6 +230,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
+	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
+	// rationale (bare-curl consumer over a forwarded socket; no state read,
+	// nothing sensitive returned, side effect limited by a strict http/https
+	// scheme allowlist).
+	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
@@ -580,7 +599,8 @@ func routeLabel(p string) string {
 		p == "/api/v1/config",
 		p == "/api/v1/config/download",
 		p == "/api/v1/token",
-		p == "/api/v1/sync":
+		p == "/api/v1/sync",
+		p == "/api/v1/remote/browse":
 		return p
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without

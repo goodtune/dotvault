@@ -62,7 +62,7 @@ web:
 
 ## Security
 
-- **CSRF protection** — all mutating API endpoints require a CSRF token (obtained from `GET /api/v1/csrf`)
+- **CSRF protection** — all mutating API endpoints require a CSRF token (obtained from `GET /api/v1/csrf`), with one deliberate exception: `POST /api/v1/remote/browse` (see below)
 - **Content Security Policy** — `default-src 'self'` prevents XSS via injected scripts
 - **X-Content-Type-Options** — `nosniff` header on all responses
 - **Loopback binding** — enforced at startup; non-loopback addresses are rejected
@@ -78,7 +78,10 @@ The web UI communicates with the dotvault daemon via a REST API:
 | `GET` | `/api/v1/token` | Current Vault token (authenticated sessions only) |
 | `GET` | `/api/v1/secrets/{path}` | List or reveal a secret |
 | `POST` | `/api/v1/sync` | Trigger immediate sync (CSRF-protected) |
+| `POST` | `/api/v1/remote/browse` | Open a form-posted `url` in this host's default browser (not CSRF-protected) |
 | `GET` | `/api/v1/csrf` | Obtain a one-time CSRF token |
+
+`POST /api/v1/remote/browse` is the outbound counterpart of `GET /api/v1/token`: over the same SSH-forwarded Unix socket that lets a headless peer borrow the workstation's token, it lets the peer hand a URL back so browser-driven flows open where a browser actually exists — see [`dotvault browse`](cli.md#dotvault-browse). It accepts a form POST (`url=https://...`) and only `http`/`https` URLs with a host; `file://` and custom protocol schemes are rejected before anything reaches the OS URL opener. It is deliberately exempt from the CSRF handshake: its consumer is a bare `curl`/`dotvault browse` POST with no practical way to run the issue-then-spend token dance, it reads no state and returns nothing sensitive, and its only side effect — opening a web URL in the default browser — is something any web page can already do to a visitor and any local process can do directly.
 
 Auth endpoints:
 

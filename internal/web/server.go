@@ -83,8 +83,10 @@ type Server struct {
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
 	// openBrowser launches a URL in this host's default browser for the
-	// remote-browse endpoint. Defaults to browser.OpenURL in NewServer;
-	// injected in tests. Nil disables the endpoint (503).
+	// remote-browse endpoint. NewServer always sets it (browser.OpenURL
+	// unless ServerConfig.OpenBrowser overrides it, as tests do), so the
+	// endpoint cannot be disabled via config; the handler's nil guard
+	// (503) only protects hand-constructed Servers in tests.
 	openBrowser func(string) error
 
 	// initialSyncDone flips to true once the daemon calls

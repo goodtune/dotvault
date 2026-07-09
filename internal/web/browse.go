@@ -78,12 +78,14 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The INFO audit line carries scheme+host only; the full URL goes to
-	// DEBUG. This endpoint lets a remote peer pop a browser here, so the
-	// operator gets an audit trail — but URLs can be capability-bearing
-	// (signed links, OAuth redirects), so the full string stays out of
-	// default-level logs, consistent with the never-log-secrets posture.
+	// The INFO audit line carries scheme+hostname only (no port, no path);
+	// the full URL goes to DEBUG. This endpoint lets a remote peer pop a
+	// browser here, so the operator gets an audit trail — but URLs can be
+	// capability-bearing (signed links, OAuth redirects), so the full string
+	// stays out of default-level logs, consistent with the
+	// never-log-secrets posture.
 	parsed, _ := url.Parse(target)
+	host := parsed.Hostname()
 	slog.Debug("remote browse requested", "url", target)
 
 	// Bounded wait: run the opener in a goroutine and give it
@@ -98,17 +100,17 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	case err := <-errCh:
 		if err != nil {
 			slog.Warn("remote browse failed to open browser",
-				"scheme", parsed.Scheme, "host", parsed.Host, "error", err)
+				"scheme", parsed.Scheme, "host", host, "error", err)
 			writeError(w, fmt.Sprintf("failed to open browser: %v", err), http.StatusBadGateway)
 			return
 		}
 	case <-timer.C:
 		slog.Warn("remote browse timed out waiting for the browser opener",
-			"scheme", parsed.Scheme, "host", parsed.Host)
+			"scheme", parsed.Scheme, "host", host)
 		writeError(w, "timed out waiting for the browser opener (the URL may still open)", http.StatusBadGateway)
 		return
 	}
-	slog.Info("opened browser via remote browse API", "scheme", parsed.Scheme, "host", parsed.Host)
+	slog.Info("opened browser via remote browse API", "scheme", parsed.Scheme, "host", host)
 	writeJSON(w, map[string]any{"status": "browser opened"})
 }
 
@@ -145,7 +147,9 @@ func ValidateBrowseURL(raw string) (string, error) {
 	if scheme != "http" && scheme != "https" {
 		return "", fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
 	}
-	if u.Host == "" {
+	// Hostname() rather than Host: "http://:80" has a non-empty Host but no
+	// actual hostname, and must be rejected like any other host-less form.
+	if u.Hostname() == "" {
 		return "", errors.New("url has no host")
 	}
 	return u.String(), nil

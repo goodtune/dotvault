@@ -79,6 +79,7 @@ func TestHandleRemoteBrowse_RejectsBadURLs(t *testing.T) {
 		{"custom protocol handler", "vscode://open?path=/etc"},
 		{"javascript", "javascript:alert(1)"},
 		{"no host", "https:///nohost"},
+		{"port but no hostname", "http://:80"},
 		{"bare path", "/relative/path"},
 		{"bare hostname", "example.com"},
 	}

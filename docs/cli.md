@@ -123,7 +123,7 @@ Open a URL in a browser, preferring a browser on the machine at the other end of
 dotvault browse <url>
 ```
 
-When `vault.token_socket` names a reachable peer dotvault (typically an SSH `RemoteForward` from a workstation running the web UI), the URL is form-posted to the peer's `POST /api/v1/remote/browse` endpoint and the browser opens **on the workstation** — the machine that actually has one. When the socket is not configured, missing, or the peer errors, the URL is opened in this host's default browser instead. Only `http` and `https` URLs are accepted; the same allowlist is enforced by the peer endpoint.
+When `vault.token_socket` names a reachable peer dotvault (typically an SSH `RemoteForward` from a workstation running the web UI), the URL is form-posted to the peer's `POST /api/v1/remote/browse` endpoint and the browser opens **on the workstation** — the machine that actually has one. When the socket is not configured, missing, or the peer errors, the URL is opened in this host's default browser instead. Only `http` and `https` URLs without embedded `user:pass@` credentials are accepted; the same allowlist is enforced by the peer endpoint.
 
 This makes it a natural `BROWSER` target on a headless box, so tools that launch OAuth flows (`gh auth login`, dotvault's own enrolment engines) land their login pages on the workstation's browser:
 

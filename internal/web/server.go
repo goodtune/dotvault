@@ -88,6 +88,11 @@ type Server struct {
 	// endpoint cannot be disabled via config; the handler's nil guard
 	// (503) only protects hand-constructed Servers in tests.
 	openBrowser func(string) error
+	// browseOpenMu is the remote-browse single-flight gate: only one
+	// browser-opener call may be in flight, because a hung launcher is
+	// abandoned (not killed) by the handler's bounded wait and unbounded
+	// concurrent requests would otherwise pile up stuck goroutines.
+	browseOpenMu sync.Mutex
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's

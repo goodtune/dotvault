@@ -72,45 +72,63 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	// PostFormValue: the contract is a form POST — a url in the query string
 	// is deliberately ignored.
-	target, err := ValidateBrowseURL(r.PostFormValue("url"))
+	u, err := ValidateBrowseURL(r.PostFormValue("url"))
 	if err != nil {
 		writeError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	target := u.String()
 
-	// The INFO audit line carries scheme+hostname only (no port, no path);
-	// the full URL goes to DEBUG. This endpoint lets a remote peer pop a
-	// browser here, so the operator gets an audit trail — but URLs can be
-	// capability-bearing (signed links, OAuth redirects), so the full string
-	// stays out of default-level logs, consistent with the
-	// never-log-secrets posture.
-	parsed, _ := url.Parse(target)
-	host := parsed.Hostname()
-	slog.Debug("remote browse requested", "url", target)
+	// Log lines never carry the full URL, at any level: query strings are
+	// where capability-bearing material lives (signed links, OAuth codes),
+	// and the never-log-secrets posture applies even at DEBUG. The INFO
+	// audit line is scheme+hostname; DEBUG adds the path for
+	// troubleshooting, still without query/fragment.
+	host := u.Hostname()
+	slog.Debug("remote browse requested", "scheme", u.Scheme, "host", host, "path", u.Path)
+
+	// Single-flight gate: the bounded wait below abandons — but cannot kill
+	// — a hung launcher, so without a gate a misbehaving peer could pile up
+	// one stuck goroutine per request. Only one opener runs at a time;
+	// concurrent requests fail fast and the CLI treats the non-200 like any
+	// other peer failure. TryLock is released by the opener goroutine when
+	// the launcher actually returns, not when the handler does.
+	if !s.browseOpenMu.TryLock() {
+		writeError(w, "a browser open is already in progress; try again shortly", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Bounded wait: run the opener in a goroutine and give it
 	// browseOpenTimeout to return. See the const's comment — the goroutine
 	// (and launcher process) may outlive the request on timeout, which is
 	// accepted over stranding the handler forever.
 	errCh := make(chan error, 1)
-	go func() { errCh <- s.openBrowser(target) }()
+	go func() {
+		var err error
+		// LIFO defers: the gate is released before the result is sent, so
+		// by the time the handler reports the outcome a follow-up request
+		// can already acquire the gate.
+		defer func() { errCh <- err }()
+		defer s.browseOpenMu.Unlock()
+		err = s.openBrowser(target)
+	}()
 	timer := time.NewTimer(browseOpenTimeout)
 	defer timer.Stop()
 	select {
 	case err := <-errCh:
 		if err != nil {
 			slog.Warn("remote browse failed to open browser",
-				"scheme", parsed.Scheme, "host", host, "error", err)
+				"scheme", u.Scheme, "host", host, "error", err)
 			writeError(w, fmt.Sprintf("failed to open browser: %v", err), http.StatusBadGateway)
 			return
 		}
 	case <-timer.C:
 		slog.Warn("remote browse timed out waiting for the browser opener",
-			"scheme", parsed.Scheme, "host", host)
+			"scheme", u.Scheme, "host", host)
 		writeError(w, "timed out waiting for the browser opener (the URL may still open)", http.StatusBadGateway)
 		return
 	}
-	slog.Info("opened browser via remote browse API", "scheme", parsed.Scheme, "host", host)
+	slog.Info("opened browser via remote browse API", "scheme", u.Scheme, "host", host)
 	writeJSON(w, map[string]any{"status": "browser opened"})
 }
 
@@ -128,29 +146,35 @@ func (s *Server) originAllowed(origin string) bool {
 	return s.loopbackHostname(u.Hostname())
 }
 
-// ValidateBrowseURL enforces the remote-browse scheme allowlist: the value
-// must parse as an absolute http or https URL with a host. Everything else —
-// file://, custom protocol handlers (vscode:, ssh:), scheme-relative or bare
-// paths — is rejected, because the browser opener hands the string to
-// xdg-open / `open` / ShellExecute, which would happily dispatch non-web
-// schemes to arbitrary local handlers.
-func ValidateBrowseURL(raw string) (string, error) {
+// ValidateBrowseURL enforces the remote-browse allowlist: the value must
+// parse as an absolute http or https URL with a host and no embedded
+// credentials. Everything else — file://, custom protocol handlers (vscode:,
+// ssh:), scheme-relative or bare paths, user:pass@ forms — is rejected,
+// because the browser opener hands the string to xdg-open / `open` /
+// ShellExecute, which would happily dispatch non-web schemes to arbitrary
+// local handlers, and userinfo would carry credentials into the opener and
+// its logs. Returns the parsed URL so callers never re-parse (the canonical
+// string form is u.String()).
+func ValidateBrowseURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", errors.New("missing url form value")
+		return nil, errors.New("missing url form value")
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid url: %v", err)
+		return nil, fmt.Errorf("invalid url: %v", err)
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
+		return nil, fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
 	}
 	// Hostname() rather than Host: "http://:80" has a non-empty Host but no
 	// actual hostname, and must be rejected like any other host-less form.
 	if u.Hostname() == "" {
-		return "", errors.New("url has no host")
+		return nil, errors.New("url has no host")
 	}
-	return u.String(), nil
+	if u.User != nil {
+		return nil, errors.New("url must not contain embedded credentials")
+	}
+	return u, nil
 }

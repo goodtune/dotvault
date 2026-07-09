@@ -80,6 +80,7 @@ func TestHandleRemoteBrowse_RejectsBadURLs(t *testing.T) {
 		{"javascript", "javascript:alert(1)"},
 		{"no host", "https:///nohost"},
 		{"port but no hostname", "http://:80"},
+		{"embedded credentials", "https://user:pass@example.com/"},
 		{"bare path", "/relative/path"},
 		{"bare hostname", "example.com"},
 	}
@@ -141,12 +142,55 @@ func TestHandleRemoteBrowse_NilOpener(t *testing.T) {
 func TestValidateBrowseURL_Normalises(t *testing.T) {
 	// net/url lowercases the scheme on parse, so re-serialising yields the
 	// canonical form; the surrounding whitespace must be trimmed.
-	got, err := ValidateBrowseURL("  HTTPS://example.com/x  ")
+	u, err := ValidateBrowseURL("  HTTPS://example.com/x  ")
 	if err != nil {
 		t.Fatalf("ValidateBrowseURL: %v", err)
 	}
-	if got != "https://example.com/x" {
+	if got := u.String(); got != "https://example.com/x" {
 		t.Errorf("got %q, want %q", got, "https://example.com/x")
+	}
+}
+
+func TestHandleRemoteBrowse_SingleFlight(t *testing.T) {
+	// Only one opener call may be in flight: a hung launcher is abandoned
+	// (not killed) by the bounded wait, so concurrent requests must fail
+	// fast rather than stack goroutines behind it.
+	s := testServer(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan struct{})
+	first := true
+	s.openBrowser = func(string) error {
+		// Only the first call blocks; the post-release call below must
+		// succeed immediately.
+		if first {
+			first = false
+			close(started)
+			<-release
+		}
+		return nil
+	}
+
+	go func() {
+		defer close(firstDone)
+		s.handleRemoteBrowse(httptest.NewRecorder(), postBrowse("https://example.com/first"))
+	}()
+	<-started
+
+	w := httptest.NewRecorder()
+	s.handleRemoteBrowse(w, postBrowse("https://example.com/second"))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 while an open is in flight; body = %s", w.Code, w.Body.String())
+	}
+
+	close(release)
+	<-firstDone
+
+	// Once the opener returns, the gate is released and requests succeed.
+	w = httptest.NewRecorder()
+	s.handleRemoteBrowse(w, postBrowse("https://example.com/third"))
+	if w.Code != 200 {
+		t.Errorf("status = %d, want 200 after the in-flight open finished; body = %s", w.Code, w.Body.String())
 	}
 }
 

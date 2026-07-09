@@ -68,10 +68,11 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	// Validate up front with the same allowlist the peer endpoint enforces:
 	// neither the remote nor the local opener should ever see a non-http(s)
 	// URL, and a local error message beats a round-tripped 400.
-	target, err := web.ValidateBrowseURL(args[0])
+	u, err := web.ValidateBrowseURL(args[0])
 	if err != nil {
 		return err
 	}
+	target := u.String()
 
 	// Config is only needed to locate the peer socket. Local-only load (no
 	// remote-config fetch): the vault section is local-only, and $BROWSER

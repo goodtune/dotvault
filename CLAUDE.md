@@ -273,9 +273,15 @@ anyway); a config-load failure warns and degrades to the local
 browser rather than failing, so the command works on hosts with no
 dotvault config. Silent on success, per `$BROWSER` convention. The
 socket client lives in `cmd/dotvault/browse.go`
-(`postBrowseToSocket`), mirroring `auth.FetchTokenFromSocket` except
-that failures are returned rather than swallowed (the caller wants
-the reason for its debug log before falling back locally).
+(`postBrowseToSocket`); the transport (expand ~, stat-before-dial,
+unix `http.Transport`) is the shared `auth.PeerSocketClient` that
+`auth.FetchTokenFromSocket` also uses — only the error policy
+differs (browse returns failures for its fallback decision; the
+borrow swallows them). The local fallback opener is the injectable
+`openLocalBrowser` var (tests fake it, mirroring `internal/auth`'s
+`openBrowser`). Note the `$BROWSER` caveat: Python-based tools exec
+a multi-word value as one program name — docs point those at a
+wrapper script.
 
 The naming follows regedit's `/e` (export) and `/s` (import) directional
 convention: `reg-export` pulls policy out of the registry world into a
@@ -640,7 +646,7 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 - `GET /api/v1/config/download?format=yaml|reg` — full config download for the Effective Configuration screen
 - `GET /api/v1/secrets/{path}` — list or reveal secret (reveal requires `?reveal=true`)
 - `POST /api/v1/sync` — trigger immediate sync (CSRF-protected)
-- `POST /api/v1/remote/browse` — open a form-posted `url` in this host's default browser (`internal/web/browse.go`). The outbound counterpart of `GET /api/v1/token` over the same forwarded socket: a headless peer (or `dotvault browse`) hands a URL back to the workstation so browser-driven flows open where a browser exists. **Deliberately NOT CSRF-protected** — the consumer is a bare curl/form POST over a forwarded Unix socket with no practical way to run the issue-then-spend CSRF handshake; the handler reads no state, returns nothing sensitive, and its only side effect (opening a web URL in the default browser) is available to any web page or local process anyway. The load-bearing control is the strict scheme allowlist (`ValidateBrowseURL`: http/https with a host only), which keeps `file://` and custom-protocol strings away from xdg-open/ShellExecute. Browser launch is injected via `ServerConfig.OpenBrowser` (defaults to `browser.OpenURL`; tests fake it); the middleware's loopback Host check applies as on every route.
+- `POST /api/v1/remote/browse` — open a form-posted `url` (body only; query string ignored) in this host's default browser (`internal/web/browse.go`). The outbound counterpart of `GET /api/v1/token` over the same forwarded socket: a headless peer (or `dotvault browse`) hands a URL back to the workstation so browser-driven flows open where a browser exists. **Deliberately NOT CSRF-protected** — the consumer is a bare curl/form POST over a forwarded Unix socket with no practical way to run the issue-then-spend CSRF handshake, and the handler reads no state and returns nothing sensitive. Cross-site browser traffic (which the loopback Host check alone would pass, since a cross-origin form POST is a CORS "simple request") is rejected by an **Origin check** instead: a present `Origin` header must name the daemon's own loopback identity (`originAllowed` → `loopbackHostname`, the same allowlist as the Host check); curl and the CLI send none and pass, hostile pages always send theirs (or `null`) and are 403'd. The other load-bearing control is the strict scheme allowlist (`ValidateBrowseURL`: http/https with a host only), which keeps `file://` and custom-protocol strings away from xdg-open/ShellExecute. The opener runs under a bounded wait (`browseOpenTimeout`, 8s < the CLI's 10s POST timeout) so a hung launcher can't strand the handler; the INFO audit log carries scheme+host only (full URL at DEBUG — URLs can be capability-bearing). Browser launch is injected via `ServerConfig.OpenBrowser` (defaults to `browser.OpenURL`; tests fake it); the middleware's loopback Host check applies as on every route.
 
 **Security headers:** `Content-Security-Policy: default-src 'self'`, `X-Content-Type-Options: nosniff`.
 

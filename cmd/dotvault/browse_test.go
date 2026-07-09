@@ -93,6 +93,106 @@ func TestPostBrowseToSocket_PeerError(t *testing.T) {
 	}
 }
 
+// writeBrowseConfig writes a minimal valid config naming socketPath as the
+// peer socket and returns its path.
+func writeBrowseConfig(t *testing.T, socketPath string) string {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := `vault:
+  address: http://127.0.0.1:8200
+  token_socket: ` + socketPath + `
+rules:
+  - name: dummy
+    vault_key: dummy
+    target:
+      path: ~/dummy.txt
+      format: text
+`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return cfgPath
+}
+
+// runBrowseWith drives runBrowse with a fake local opener and the given
+// --config override, returning the command error and the URL (if any) the
+// local opener received.
+func runBrowseWith(t *testing.T, cfgPath, target string) (error, string) {
+	t.Helper()
+	prevCfg := flagConfig
+	flagConfig = cfgPath
+	prevOpen := openLocalBrowser
+	var openedLocally string
+	openLocalBrowser = func(u string) error {
+		openedLocally = u
+		return nil
+	}
+	t.Cleanup(func() {
+		flagConfig = prevCfg
+		openLocalBrowser = prevOpen
+	})
+
+	cmd := newBrowseCmd()
+	cmd.SetContext(context.Background())
+	err := runBrowse(cmd, []string{target})
+	return err, openedLocally
+}
+
+func TestRunBrowse_PrefersPeerSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "p.sock")
+	var peerGot string
+	newUnixBrowseServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		peerGot = r.FormValue("url")
+		_, _ = w.Write([]byte(`{"status":"browser opened"}`))
+	})
+
+	err, openedLocally := runBrowseWith(t, writeBrowseConfig(t, sock), "https://example.com/a")
+	if err != nil {
+		t.Fatalf("runBrowse: %v", err)
+	}
+	if peerGot != "https://example.com/a" {
+		t.Errorf("peer received %q, want the URL", peerGot)
+	}
+	if openedLocally != "" {
+		t.Errorf("local opener was called (%q) despite a healthy peer", openedLocally)
+	}
+}
+
+func TestRunBrowse_FallsBackWhenPeerUnreachable(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+
+	err, openedLocally := runBrowseWith(t, writeBrowseConfig(t, sock), "https://example.com/b")
+	if err != nil {
+		t.Fatalf("runBrowse: %v", err)
+	}
+	if openedLocally != "https://example.com/b" {
+		t.Errorf("local opener got %q, want the URL after peer fallback", openedLocally)
+	}
+}
+
+func TestRunBrowse_FallsBackWhenConfigUnloadable(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "missing.yaml")
+
+	err, openedLocally := runBrowseWith(t, cfgPath, "https://example.com/c")
+	if err != nil {
+		t.Fatalf("runBrowse: %v", err)
+	}
+	if openedLocally != "https://example.com/c" {
+		t.Errorf("local opener got %q, want the URL when config load fails", openedLocally)
+	}
+}
+
+func TestRunBrowse_RejectsInvalidURLBeforeAnything(t *testing.T) {
+	err, openedLocally := runBrowseWith(t, "", "file:///etc/passwd")
+	if err == nil {
+		t.Fatal("expected an error for a non-http(s) URL")
+	}
+	if openedLocally != "" {
+		t.Errorf("local opener was called (%q) for a rejected URL", openedLocally)
+	}
+}
+
 func TestPostBrowseToSocket_ExpandsHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)        // Linux/macOS

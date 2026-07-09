@@ -138,11 +138,113 @@ func TestHandleRemoteBrowse_NilOpener(t *testing.T) {
 }
 
 func TestValidateBrowseURL_Normalises(t *testing.T) {
+	// net/url lowercases the scheme on parse, so re-serialising yields the
+	// canonical form; the surrounding whitespace must be trimmed.
 	got, err := ValidateBrowseURL("  HTTPS://example.com/x  ")
 	if err != nil {
 		t.Fatalf("ValidateBrowseURL: %v", err)
 	}
-	if got != "HTTPS://example.com/x" && got != "https://example.com/x" {
-		t.Errorf("got %q, want trimmed URL", got)
+	if got != "https://example.com/x" {
+		t.Errorf("got %q, want %q", got, "https://example.com/x")
+	}
+}
+
+func TestHandleRemoteBrowse_RejectsCrossSiteOrigin(t *testing.T) {
+	// A hostile page's form/fetch POST is a CORS "simple request" that
+	// passes the loopback Host check, but browsers always attach the
+	// attacker's Origin to cross-origin POSTs — the handler must reject it
+	// (including the literal "null" from sandboxed iframes).
+	for _, origin := range []string{"https://evil.example", "null", "http://rebound.attacker.test"} {
+		t.Run(origin, func(t *testing.T) {
+			s := testServer(t)
+			called := false
+			s.openBrowser = func(string) error {
+				called = true
+				return nil
+			}
+
+			req := postBrowse("https://example.com")
+			req.Header.Set("Origin", origin)
+			w := httptest.NewRecorder()
+			s.handleRemoteBrowse(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403 for Origin %q; body = %s", w.Code, origin, w.Body.String())
+			}
+			if called {
+				t.Error("openBrowser was called for a cross-site request")
+			}
+		})
+	}
+}
+
+func TestHandleRemoteBrowse_AllowsLoopbackOrigin(t *testing.T) {
+	// The SPA's own origin (loopback) must still be able to use the
+	// endpoint.
+	s := testServer(t)
+	var opened string
+	s.openBrowser = func(u string) error {
+		opened = u
+		return nil
+	}
+
+	req := postBrowse("https://example.com")
+	req.Header.Set("Origin", "http://127.0.0.1:9000")
+	w := httptest.NewRecorder()
+	s.handleRemoteBrowse(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200 for a loopback Origin; body = %s", w.Code, w.Body.String())
+	}
+	if opened != "https://example.com" {
+		t.Errorf("opened = %q, want %q", opened, "https://example.com")
+	}
+}
+
+func TestHandleRemoteBrowse_OversizeBody(t *testing.T) {
+	// A body past the 64 KiB limit must produce a 400 via
+	// MaxBytesReader + ParseForm, not a hang or a success.
+	s := testServer(t)
+	called := false
+	s.openBrowser = func(string) error {
+		called = true
+		return nil
+	}
+
+	big := "url=" + strings.Repeat("a", browseBodyLimit+1)
+	req := httptest.NewRequest("POST", "/api/v1/remote/browse", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	s.handleRemoteBrowse(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an oversize body", w.Code)
+	}
+	if called {
+		t.Error("openBrowser was called for an oversize body")
+	}
+}
+
+func TestHandleRemoteBrowse_IgnoresQueryString(t *testing.T) {
+	// The contract is a form POST: a url smuggled into the query string
+	// with an empty body must be ignored (PostFormValue), yielding the
+	// missing-value 400.
+	s := testServer(t)
+	called := false
+	s.openBrowser = func(string) error {
+		called = true
+		return nil
+	}
+
+	req := httptest.NewRequest("POST", "/api/v1/remote/browse?url=https%3A%2F%2Fexample.com", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	s.handleRemoteBrowse(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 when the url is only in the query string", w.Code)
+	}
+	if called {
+		t.Error("openBrowser was called from a query-string url")
 	}
 }

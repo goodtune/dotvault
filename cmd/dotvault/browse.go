@@ -6,29 +6,32 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/web"
 )
 
-// browsePostTimeout bounds the browse POST to a peer socket. Slightly more
-// generous than the token-borrow timeout because the peer opens the browser
-// synchronously inside the request (xdg-open / `open` / ShellExecute has to
-// return before the 200 does).
+// browsePostTimeout bounds the browse POST to a peer socket. Deliberately
+// looser than the 3s token-borrow timeout: the peer opens the browser
+// synchronously inside the request (its own opener wait is bounded at 8s),
+// so the round-trip includes an actual process launch, not just a JSON read.
 const browsePostTimeout = 10 * time.Second
 
 // browseBodyLimit caps how much of the peer's response we read — the body is
 // a tiny JSON envelope either way.
 const browseBodyLimit = 1 << 16 // 64 KiB
+
+// openLocalBrowser is the local fallback opener. Indirected so tests can
+// assert the fallback ordering without popping a real browser (same pattern
+// as internal/auth's openBrowser).
+var openLocalBrowser = browser.OpenURL
 
 // newBrowseCmd defines `dotvault browse <url>` — a $BROWSER-shaped wrapper
 // over the remote-browse endpoint. It prefers handing the URL to the peer
@@ -49,7 +52,11 @@ URL is opened in this host's default browser instead.
 
 Suitable as a BROWSER environment variable target:
 
-  export BROWSER="dotvault browse"`,
+  export BROWSER="dotvault browse"
+
+Note that some tools (notably Python-based ones such as az) exec a multi-word
+BROWSER value as a single program name; for those, point BROWSER at a
+one-line wrapper script that runs: dotvault browse "$1"`,
 		Args: cobra.ExactArgs(1),
 		RunE: runBrowse,
 	}
@@ -87,7 +94,7 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 		slog.Debug("peer browse unavailable; opening locally", "socket", socket, "error", err)
 	}
 
-	if err := browser.OpenURL(target); err != nil {
+	if err := openLocalBrowser(target); err != nil {
 		return fmt.Errorf("open browser locally: %w", err)
 	}
 	return nil
@@ -98,27 +105,13 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 //
 //	curl --unix-socket <socketPath> http://localhost/api/v1/remote/browse -d url=<target>
 //
-// Unlike auth.FetchTokenFromSocket this reports failures: the caller falls
-// back to the local browser on any error, but wants the reason for the debug
-// log.
+// Unlike auth.FetchTokenFromSocket (which shares the auth.PeerSocketClient
+// transport) this reports failures: the caller falls back to the local
+// browser on any error, but wants the reason for the debug log.
 func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	expanded, err := paths.ExpandHome(socketPath)
+	client, _, err := auth.PeerSocketClient(socketPath)
 	if err != nil {
-		return fmt.Errorf("expand socket path: %w", err)
-	}
-	// A missing socket file is the common "peer not connected" case — skip
-	// the dial so we don't pay a timeout on it.
-	if _, err := os.Stat(expanded); err != nil {
-		return fmt.Errorf("peer socket not present: %w", err)
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", expanded)
-			},
-		},
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, browsePostTimeout)

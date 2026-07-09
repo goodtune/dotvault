@@ -231,9 +231,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
 	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
-	// rationale (bare-curl consumer over a forwarded socket; no state read,
-	// nothing sensitive returned, side effect limited by a strict http/https
-	// scheme allowlist).
+	// rationale (bare-curl consumer over a forwarded socket; nothing
+	// sensitive read or returned). Cross-site browser traffic is rejected
+	// by the handler's Origin check instead, and the side effect is limited
+	// by a strict http/https scheme allowlist.
 	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
@@ -634,7 +635,14 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 		host = h
 	}
 	host = unwrapIPv6(host)
+	return s.loopbackHostname(host)
+}
 
+// loopbackHostname applies the loopback-identity allowlist to a bare
+// hostname (no port, IPv6 brackets already unwrapped). Shared by the Host
+// check above and the remote-browse Origin check, so both enforce the same
+// notion of "names this daemon's loopback listener".
+func (s *Server) loopbackHostname(host string) bool {
 	// IP literals: accept any form that resolves to a loopback address.
 	// This covers "127.0.0.1", "::1", the long-form "0:0:0:0:0:0:0:1",
 	// "::ffff:127.0.0.1", and the entire 127.0.0.0/8 loopback range —

@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -25,6 +27,40 @@ const socketFetchTimeout = 3 * time.Second
 // guards against a misbehaving or hostile peer streaming an unbounded body.
 const socketTokenBodyLimit = 1 << 16 // 64 KiB
 
+// PeerSocketClient builds an http.Client that dials the peer dotvault web-API
+// Unix-domain socket at socketPath (a leading ~ is expanded), returning the
+// client and the expanded path. It is the shared transport seam for every
+// peer-socket consumer — the token borrow below and `dotvault browse` — so
+// "dial the peer's web API" has exactly one implementation. Callers own the
+// error policy: this reports why the socket is unusable (empty path,
+// unexpandable ~, missing file) and the caller decides whether that is fatal
+// (browse falls back to the local browser) or silently skipped (the borrow).
+// A missing socket file is checked here so callers neither log a connection
+// error nor pay a dial timeout for the common "peer not connected" case.
+func PeerSocketClient(socketPath string) (*http.Client, string, error) {
+	if socketPath == "" {
+		return nil, "", errors.New("no peer socket configured")
+	}
+	expanded, err := paths.ExpandHome(socketPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("expand socket path: %w", err)
+	}
+	if _, err := os.Stat(expanded); err != nil {
+		// Return the expanded path so callers can tell "socket missing"
+		// (expanded non-empty) from "path unresolvable" (expanded empty).
+		return nil, expanded, fmt.Errorf("peer socket not present: %w", err)
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", expanded)
+			},
+		},
+	}
+	return client, expanded, nil
+}
+
 // FetchTokenFromSocket retrieves a Vault token from a peer dotvault daemon's
 // web API exposed over a Unix-domain socket — the programmatic equivalent of
 //
@@ -45,28 +81,17 @@ func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error
 	if socketPath == "" {
 		return "", nil
 	}
-	expanded, err := paths.ExpandHome(socketPath)
+	// An unusable socket (unexpandable ~, missing file — the common "peer not
+	// connected" case) means the peer simply isn't reachable: skip silently
+	// rather than failing the auth flow.
+	client, expanded, err := PeerSocketClient(socketPath)
 	if err != nil {
-		// A ~ that cannot be resolved (no home dir) means we can't locate the
-		// socket — treat as unavailable rather than failing the auth flow.
-		slog.Debug("could not expand peer token socket path; continuing", "socket", socketPath, "error", err)
+		// A missing socket file (expanded non-empty) is routine and stays
+		// silent; an unresolvable path is worth a debug line.
+		if expanded == "" {
+			slog.Debug("could not expand peer token socket path; continuing", "socket", socketPath, "error", err)
+		}
 		return "", nil
-	}
-
-	// A missing socket file is the common "peer not connected" case (the SSH
-	// session that would create it isn't up). Skip the dial so we neither log
-	// a connection error nor pay a dial timeout on every attempt.
-	if _, statErr := os.Stat(expanded); statErr != nil {
-		return "", nil
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", expanded)
-			},
-		},
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, socketFetchTimeout)

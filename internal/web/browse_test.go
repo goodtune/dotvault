@@ -226,10 +226,20 @@ func TestHandleRemoteBrowse_RejectsCrossSiteOrigin(t *testing.T) {
 	// A hostile page's form/fetch POST is a CORS "simple request" that
 	// passes the loopback Host check, but browsers always attach the
 	// attacker's Origin to cross-origin POSTs — the handler must reject it
-	// (including the literal "null" from sandboxed iframes).
-	for _, origin := range []string{"https://evil.example", "null", "http://rebound.attacker.test"} {
+	// (including the literal "null" from sandboxed iframes, and pages
+	// served by OTHER loopback servers, which are loopback-hosted but not
+	// the daemon's own origin).
+	for _, origin := range []string{
+		"https://evil.example",
+		"null",
+		"http://rebound.attacker.test",
+		"http://127.0.0.1:12345", // another local server's page — wrong port
+		"http://localhost:12345",
+		"http://127.0.0.1", // scheme-default port 80 ≠ the daemon's 9000
+	} {
 		t.Run(origin, func(t *testing.T) {
 			s := testServer(t)
+			s.cfg.Listen = "127.0.0.1:9000"
 			called := false
 			s.openBrowser = func(string) error {
 				called = true
@@ -251,10 +261,42 @@ func TestHandleRemoteBrowse_RejectsCrossSiteOrigin(t *testing.T) {
 	}
 }
 
-func TestHandleRemoteBrowse_AllowsLoopbackOrigin(t *testing.T) {
-	// The SPA's own origin (loopback) must still be able to use the
-	// endpoint.
+func TestHandleRemoteBrowse_AllowsOwnOrigin(t *testing.T) {
+	// The SPA's own origin — a loopback hostname on the daemon's own
+	// listener port, whichever loopback alias the user browsed to — must
+	// still be able to use the endpoint.
+	for _, origin := range []string{"http://127.0.0.1:9000", "http://localhost:9000"} {
+		t.Run(origin, func(t *testing.T) {
+			s := testServer(t)
+			s.cfg.Listen = "127.0.0.1:9000"
+			var opened string
+			s.openBrowser = func(u string) error {
+				opened = u
+				return nil
+			}
+
+			req := postBrowse("https://example.com")
+			req.Header.Set("Origin", origin)
+			w := httptest.NewRecorder()
+			s.handleRemoteBrowse(w, req)
+
+			if w.Code != 200 {
+				t.Fatalf("status = %d, want 200 for the daemon's own Origin; body = %s", w.Code, w.Body.String())
+			}
+			if opened != "https://example.com" {
+				t.Errorf("opened = %q, want %q", opened, "https://example.com")
+			}
+		})
+	}
+}
+
+func TestHandleRemoteBrowse_BoundPortWinsOverConfigured(t *testing.T) {
+	// Once the listener is bound, listenAddr is authoritative — a config of
+	// "127.0.0.1:0" (random port) must validate Origins against the real
+	// bound port, not the configured 0.
 	s := testServer(t)
+	s.cfg.Listen = "127.0.0.1:0"
+	s.listenAddr = "127.0.0.1:38080"
 	var opened string
 	s.openBrowser = func(u string) error {
 		opened = u
@@ -262,15 +304,22 @@ func TestHandleRemoteBrowse_AllowsLoopbackOrigin(t *testing.T) {
 	}
 
 	req := postBrowse("https://example.com")
-	req.Header.Set("Origin", "http://127.0.0.1:9000")
+	req.Header.Set("Origin", "http://127.0.0.1:38080")
 	w := httptest.NewRecorder()
 	s.handleRemoteBrowse(w, req)
-
 	if w.Code != 200 {
-		t.Fatalf("status = %d, want 200 for a loopback Origin; body = %s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 200 for the bound-port Origin; body = %s", w.Code, w.Body.String())
 	}
 	if opened != "https://example.com" {
 		t.Errorf("opened = %q, want %q", opened, "https://example.com")
+	}
+
+	req = postBrowse("https://example.com")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w = httptest.NewRecorder()
+	s.handleRemoteBrowse(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for the configured-but-unbound port", w.Code)
 	}
 }
 

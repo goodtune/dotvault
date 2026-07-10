@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -146,9 +147,15 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 }
 
 // originAllowed reports whether an Origin header value names this daemon's
-// own loopback identity — the same allowlist the Host check applies, so the
-// SPA's own origin passes and everything else (including the literal "null"
-// sent by sandboxed iframes and privacy-redirects) is rejected.
+// own origin — a loopback hostname (the same allowlist the Host check
+// applies) AND the daemon's own listener port. The port matters here in a
+// way it doesn't for the Host check: a request's Host names the listener it
+// actually arrived on, but an Origin names whichever server served the page,
+// and a hostname-only check would let a page from any other loopback-served
+// origin (http://127.0.0.1:12345 — some other local app's UI rendering
+// untrusted content) drive this endpoint. Only the SPA's own origin passes;
+// everything else (including the literal "null" sent by sandboxed iframes
+// and privacy-redirects) is rejected.
 func (s *Server) originAllowed(origin string) bool {
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -156,7 +163,34 @@ func (s *Server) originAllowed(origin string) bool {
 	}
 	// u.Hostname() strips the port and any IPv6 brackets, matching what
 	// loopbackHostname expects.
-	return s.loopbackHostname(u.Hostname())
+	if !s.loopbackHostname(u.Hostname()) {
+		return false
+	}
+
+	// Prefer the bound address (authoritative once Start has run — it
+	// carries the real port when the configured one was 0 or fell back);
+	// the configured listen address covers the pre-Start window. No known
+	// port (possible only for a hand-constructed Server in tests) degrades
+	// to the hostname-only check.
+	listen := s.listenAddr
+	if listen == "" {
+		listen = s.cfg.Listen
+	}
+	_, listenPort, err := net.SplitHostPort(listen)
+	if err != nil || listenPort == "" {
+		return true
+	}
+	originPort := u.Port()
+	if originPort == "" {
+		// An Origin without an explicit port is at the scheme default.
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			originPort = "80"
+		case "https":
+			originPort = "443"
+		}
+	}
+	return originPort == listenPort
 }
 
 // ValidateBrowseURL enforces the remote-browse allowlist: the value must

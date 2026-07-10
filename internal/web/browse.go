@@ -80,13 +80,13 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	}
 	target := u.String()
 
-	// Log lines never carry the full URL, at any level: query strings are
-	// where capability-bearing material lives (signed links, OAuth codes),
-	// and the never-log-secrets posture applies even at DEBUG. The INFO
-	// audit line is scheme+hostname; DEBUG adds the path for
-	// troubleshooting, still without query/fragment.
+	// Log lines carry scheme+hostname only, at every level: query strings
+	// and even path segments can be capability-bearing (signed links, OAuth
+	// codes, reset tokens), and the never-log-secrets posture applies even
+	// at DEBUG. The requester already knows the URL it posted, so nothing
+	// is lost for troubleshooting.
 	host := u.Hostname()
-	slog.Debug("remote browse requested", "scheme", u.Scheme, "host", host, "path", u.Path)
+	slog.Debug("remote browse requested", "scheme", u.Scheme, "host", host)
 
 	// Single-flight gate: the bounded wait below abandons — but cannot kill
 	// — a hung launcher, so without a gate a misbehaving peer could pile up

@@ -93,10 +93,12 @@ func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error
 	// rather than failing the auth flow.
 	client, expanded, err := PeerSocketClient(socketPath)
 	if err != nil {
-		// A missing socket file (expanded non-empty) is routine and stays
-		// silent; an unresolvable path is worth a debug line.
-		if expanded == "" {
-			slog.Debug("could not expand peer token socket path; continuing", "socket", socketPath, "error", err)
+		// A missing socket file is routine (the SSH forward isn't up) and
+		// stays silent. Everything else — an unresolvable ~, a permission
+		// or I/O error on the path — is a real local problem worth a debug
+		// line, or a borrow that never happens is undiagnosable.
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("peer token socket unusable; continuing", "socket", socketPath, "error", err)
 		}
 		return "", nil
 	}

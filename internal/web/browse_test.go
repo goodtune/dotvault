@@ -151,6 +151,34 @@ func TestValidateBrowseURL_Normalises(t *testing.T) {
 	}
 }
 
+func TestHandleRemoteBrowse_OpenerPanic(t *testing.T) {
+	// A panicking opener must surface as a 502 — not kill the process (an
+	// unrecovered panic in the spawned goroutine would) — and must release
+	// the single-flight gate for the next request.
+	s := testServer(t)
+	s.openBrowser = func(string) error { panic("boom") }
+
+	w := httptest.NewRecorder()
+	s.handleRemoteBrowse(w, postBrowse("https://example.com"))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 after opener panic; body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if !strings.Contains(resp["error"], "panicked") {
+		t.Errorf("error = %q, want it to report the panic", resp["error"])
+	}
+
+	// Gate must be free again: a follow-up request with a healthy opener
+	// succeeds.
+	s.openBrowser = func(string) error { return nil }
+	w = httptest.NewRecorder()
+	s.handleRemoteBrowse(w, postBrowse("https://example.com"))
+	if w.Code != 200 {
+		t.Errorf("status = %d, want 200 after the gate was released by the panicked open", w.Code)
+	}
+}
+
 func TestHandleRemoteBrowse_SingleFlight(t *testing.T) {
 	// Only one opener call may be in flight: a hung launcher is abandoned
 	// (not killed) by the bounded wait, so concurrent requests must fail

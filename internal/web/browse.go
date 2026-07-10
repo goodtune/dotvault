@@ -105,11 +105,19 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	errCh := make(chan error, 1)
 	go func() {
 		var err error
-		// LIFO defers: the gate is released before the result is sent, so
-		// by the time the handler reports the outcome a follow-up request
-		// can already acquire the gate.
+		// LIFO defers: a panic in the opener is converted to an error
+		// first (an unrecovered panic in a spawned goroutine would kill
+		// the whole daemon — net/http's recovery only covers the handler
+		// goroutine), then the gate is released, then the result is sent —
+		// so by the time the handler reports the outcome a follow-up
+		// request can already acquire the gate.
 		defer func() { errCh <- err }()
 		defer s.browseOpenMu.Unlock()
+		defer func() {
+			if rcv := recover(); rcv != nil {
+				err = fmt.Errorf("browser opener panicked: %v", rcv)
+			}
+		}()
 		err = s.openBrowser(target)
 	}()
 	timer := time.NewTimer(browseOpenTimeout)

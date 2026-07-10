@@ -115,6 +115,38 @@ Display authentication state, token TTL, and per-rule sync status.
 dotvault status [flags]
 ```
 
+### `dotvault browse`
+
+Open a URL in a browser, preferring a browser on the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+
+```sh
+dotvault browse <url>
+```
+
+When `vault.token_socket` names a reachable peer dotvault (typically an SSH `RemoteForward` from a workstation running the web UI), the URL is form-posted to the peer's `POST /api/v1/remote/browse` endpoint and the browser opens **on the workstation** — the machine that actually has one. When the socket is not configured, missing, or the peer errors, the URL is opened in this host's default browser instead. Only `http` and `https` URLs without embedded `user:pass@` credentials are accepted; the same allowlist is enforced by the peer endpoint.
+
+This makes it a natural `BROWSER` target on a headless box, so tools that launch OAuth flows (`gh auth login`, dotvault's own enrolment engines) land their login pages on the workstation's browser:
+
+```sh
+export BROWSER="dotvault browse"
+```
+
+!!! note "Some tools don't word-split `BROWSER`"
+    Tools that shell out via `xdg-open`, `gh`, or git honour a multi-word `BROWSER` value. Python-based tools (`az login`, anything using Python's `webbrowser` module) exec the whole value as a single program name and fail. For those, point `BROWSER` at a one-line wrapper script instead:
+
+    ```sh
+    #!/bin/sh
+    exec dotvault browse "$1"
+    ```
+
+The raw endpoint is also curl-able over the forwarded socket:
+
+```sh
+curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/browse -d url=https://example.com
+```
+
+The command is silent on success (exit `0`), matching `BROWSER` conventions. Config-load failures downgrade to the local browser with a warning rather than failing, so the command still works on a host with no dotvault config at all. On a truly display-less host the local fallback depends on what `xdg-open` resolves to — often a console browser — so on machines that should only ever delegate to the peer, treat a fallback as a sign the SSH `RemoteForward` is down.
+
 ### `dotvault version`
 
 Print the build version and exit.
@@ -135,6 +167,7 @@ project README and the Windows admin docs for details.
 |------|---------|-------------|
 | `--config <path>` | *(system default)* | Override the config file path. Refused when a system-wide config is present unless that config sets `bypass_system_config: true` (see the [Configuration Reference](configuration/config-reference.md#bypass_system_config)). |
 | `--log-level <level>` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `--log-format <format>` | `auto` | Log format: `auto` (text on a TTY, JSON otherwise), `text`, `json` |
 | `--dry-run` | `false` | Show what would change without writing files |
 
 `--once` is scoped to `dotvault run` only.

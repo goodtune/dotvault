@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -48,7 +49,13 @@ func PeerSocketClient(socketPath string) (*http.Client, string, error) {
 	if _, err := os.Stat(expanded); err != nil {
 		// Return the expanded path so callers can tell "socket missing"
 		// (expanded non-empty) from "path unresolvable" (expanded empty).
-		return nil, expanded, fmt.Errorf("peer socket not present: %w", err)
+		// A non-ENOENT stat failure (permission denied, I/O error) is a
+		// real local problem, not the routine "peer not connected" case —
+		// keep the messages distinct so logs point at the right thing.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, expanded, fmt.Errorf("peer socket not present: %w", err)
+		}
+		return nil, expanded, fmt.Errorf("stat peer socket: %w", err)
 	}
 	client := &http.Client{
 		Transport: &http.Transport{

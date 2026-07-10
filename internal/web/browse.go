@@ -117,8 +117,13 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	select {
 	case err := <-errCh:
 		if err != nil {
+			// Some openers embed their argument in the error text; scrub
+			// the target so the no-full-URL log invariant holds even then.
+			// The unredacted error still goes back in the response — the
+			// requester already knows the URL it posted.
+			redacted := strings.ReplaceAll(err.Error(), target, "<url>")
 			slog.Warn("remote browse failed to open browser",
-				"scheme", u.Scheme, "host", host, "error", err)
+				"scheme", u.Scheme, "host", host, "error", redacted)
 			writeError(w, fmt.Sprintf("failed to open browser: %v", err), http.StatusBadGateway)
 			return
 		}

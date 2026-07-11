@@ -100,6 +100,7 @@ internal/
   tokenwatch/            Watches ~/.dotvault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
   notify/                Cross-platform desktop notifications via beeep (Windows toast / macOS Notification Center / Linux D-Bus), with a level vocabulary and input sanitization
+  urlallow/              Shared http/https URL allowlist for OS-opener/notification sinks (used by web browse + notify action link)
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc, ssh_config)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -298,7 +299,9 @@ go-toast directly, since beeep exposes no activation API — fire-and-forget,
 the shell handles the click), and degrades on macOS/Linux (a one-shot
 delivery cannot register a click handler there) by appending the URL to
 the body so it stays visible. The URL is validated with the same
-http/https allowlist as browse. Delivery lives in `internal/notify` (a thin
+http/https allowlist as browse — the rule lives in one place
+(`internal/urlallow.Validate`, shared by `web.ValidateBrowseURL` and
+`notify.validateActionURL`) so the invariant can't drift. Delivery lives in `internal/notify` (a thin
 level vocabulary — `info`/`warning`/`error`/`attention` — over
 `github.com/gen2brain/beeep`, pure-Go with build-tagged platform
 backends, preserving CGO_ENABLED=0). `notify.NewMessage` validates

@@ -16,14 +16,14 @@
 package notify
 
 import (
-	"errors"
 	"fmt"
-	"net/url"
 	"runtime"
 	"strings"
 	"unicode"
 
 	"github.com/gen2brain/beeep"
+
+	"github.com/goodtune/dotvault/internal/urlallow"
 )
 
 // appName is the application name beeep attributes notifications to (the
@@ -133,38 +133,22 @@ func NewMessage(level, title, body, actionURL string) (Message, error) {
 	return Message{Level: l, Title: title, Body: sanitize(body, maxBodyLen), ActionURL: au}, nil
 }
 
-// validateActionURL enforces the same allowlist the browse endpoint applies to
-// a URL handed to an OS opener: an absolute http/https URL with a host and no
-// embedded user:pass@ credentials, free of control characters. It returns the
-// canonical serialized URL, or "" for an empty (absent) input. It duplicates
-// web.ValidateBrowseURL's rules deliberately — internal/web imports
-// internal/notify, so importing back would cycle, and the action URL has its
-// own delivery-sink concerns (see safeToastArgs).
+// validateActionURL enforces the shared urlallow allowlist — the exact rule the
+// browse endpoint applies to a URL handed to an OS opener (http/https, a host,
+// no embedded credentials; url.Parse already rejects control characters) — and
+// returns the canonical serialized URL, or "" for an empty (absent) input. The
+// action URL is optional, so unlike urlallow.Validate an empty input is not an
+// error. Delivery-sink encoding for the Windows toast is a separate concern
+// handled at send time (see safeToastArgs).
 func validateActionURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	if strings.TrimSpace(raw) == "" {
 		return "", nil
 	}
-	u, err := url.Parse(raw)
+	u, err := urlallow.Validate(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid action url: %v", err)
+		return "", fmt.Errorf("action url: %w", err)
 	}
-	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("action url must be http or https (got %q)", u.Scheme)
-	}
-	if u.Hostname() == "" {
-		return "", errors.New("action url has no host")
-	}
-	if u.User != nil {
-		return "", errors.New("action url must not contain embedded credentials")
-	}
-	s := u.String()
-	for _, r := range s {
-		if unicode.IsControl(r) {
-			return "", errors.New("action url must not contain control characters")
-		}
-	}
-	return s, nil
+	return u.String(), nil
 }
 
 // sanitize prepares an untrusted title/body for delivery: it collapses control

@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/urlallow"
 )
 
 // browseBodyLimit caps the request body for the remote-browse endpoint. The
@@ -177,26 +179,11 @@ func (s *Server) originAllowed(origin string) bool {
 // local handlers, and userinfo would carry credentials into the opener and
 // its logs. Returns the parsed URL so callers never re-parse (the canonical
 // string form is u.String()).
+//
+// The rule itself lives in internal/urlallow so the notification action link
+// (internal/notify) enforces byte-for-byte the same allowlist from one
+// implementation — notify cannot import web (web imports notify), so a shared
+// leaf package is the seam.
 func ValidateBrowseURL(raw string) (*url.URL, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, errors.New("missing url form value")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("invalid url: %v", err)
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
-	}
-	// Hostname() rather than Host: "http://:80" has a non-empty Host but no
-	// actual hostname, and must be rejected like any other host-less form.
-	if u.Hostname() == "" {
-		return nil, errors.New("url has no host")
-	}
-	if u.User != nil {
-		return nil, errors.New("url must not contain embedded credentials")
-	}
-	return u, nil
+	return urlallow.Validate(raw)
 }

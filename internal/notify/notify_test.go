@@ -163,6 +163,7 @@ func TestValidateActionURL(t *testing.T) {
 		{"no host", "https:///nohost", false},
 		{"bare path", "/relative", false},
 		{"userinfo", "https://user:pass@x.example", false},
+		{"control char", "https://x.example/\x01", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,6 +188,20 @@ func TestNewMessage_ActionURL(t *testing.T) {
 	}
 	if _, err := NewMessage("info", "t", "b", "file:///etc"); err == nil {
 		t.Error("expected an error for a non-http(s) action URL")
+	}
+}
+
+func TestNewMessage_ActionURLPreservesQueryChars(t *testing.T) {
+	// The stored action URL must keep `&` and `$` in the query intact:
+	// safeToastArgs's XML-escaping of `&` back to a real separator depends on
+	// receiving an unmangled URL from NewMessage → validateActionURL.
+	in := "https://ci.example/build?a=1&b=2&t=$rev"
+	m, err := NewMessage("info", "t", "b", in)
+	if err != nil {
+		t.Fatalf("NewMessage: %v", err)
+	}
+	if m.ActionURL != in {
+		t.Errorf("ActionURL = %q, want %q (query separators preserved)", m.ActionURL, in)
 	}
 }
 

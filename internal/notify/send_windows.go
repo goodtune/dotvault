@@ -23,6 +23,11 @@ func platformDeliver(msg Message) error {
 // opens the (encoded) action URL. Title/Body are already sanitized by
 // NewMessage (the CDATA/PowerShell neutralization); the URL is encoded for the
 // launch attribute's XML/here-string sinks by safeToastArgs.
+//
+// n.Push registers the AppID as per-user AppData (an idempotent HKCU write) so
+// an unpackaged desktop app's toast displays. ActivationType Protocol means the
+// click is dispatched by the Windows shell, so no in-binary COM activator is
+// needed and the launch is fire-and-forget.
 func clickableToast(msg Message, urgent bool) error {
 	audio := toast.Silent
 	if urgent {

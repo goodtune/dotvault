@@ -147,6 +147,32 @@ curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/browse -d
 
 The command is silent on success (exit `0`), matching `BROWSER` conventions. Config-load failures downgrade to the local browser with a warning rather than failing, so the command still works on a host with no dotvault config at all. On a truly display-less host the local fallback depends on what `xdg-open` resolves to — often a console browser — so on machines that should only ever delegate to the peer, treat a fallback as a sign the SSH `RemoteForward` is down.
 
+### `dotvault notify`
+
+Raise a native desktop notification — a Windows toast, a macOS Notification Center panel, or a Linux D-Bus notification — preferring the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+
+```sh
+dotvault notify <level> <title> [description]
+```
+
+`<level>` is one of `info`, `warning`, `error`, `attention`. It sets the notification's urgency — `error` and `attention` are delivered as audible alerts, `info` and `warning` as quiet notifications — and, on Linux/BSD where the notification daemon accepts a named stock icon, the icon shown (`dialog-information`, `dialog-warning`, `dialog-error`, `dialog-question`). On macOS and Windows a stock icon name is not a valid file path, so no custom icon is set there and the level is conveyed by urgency alone.
+
+When `vault.token_socket` names a reachable peer dotvault, the notification is form-posted to the peer's `POST /api/v1/remote/notify` endpoint and appears **on the workstation** — where a human is actually looking. When the socket is not configured, missing, or the peer errors, the notification is raised on this host instead. This is the natural way for a long-running job on a headless box to get the operator's attention:
+
+```sh
+dotvault notify info "Sync complete" "all rules applied"
+dotvault notify error "Backup failed" "see /var/log/backup.log"
+```
+
+The raw endpoint is curl-able over the forwarded socket too:
+
+```sh
+curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/notify \
+     -d level=error -d title='Backup failed' -d body='see the logs'
+```
+
+The title is required; the description is optional. An unknown level or an empty title fails locally (exit `1`) before anything is sent. Config-load failures degrade to a local notification, like `browse`.
+
 ### `dotvault version`
 
 Print the build version and exit.

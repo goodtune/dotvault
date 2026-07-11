@@ -2,31 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
-	"strings"
-	"time"
 
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/web"
 )
-
-// browsePostTimeout bounds the browse POST to a peer socket. Deliberately
-// looser than the 3s token-borrow timeout: the peer opens the browser
-// synchronously inside the request (its own opener wait is bounded at 8s),
-// so the round-trip includes an actual process launch, not just a JSON read.
-const browsePostTimeout = 10 * time.Second
-
-// browseBodyLimit caps how much of the peer's response we read — the body is
-// a tiny JSON envelope either way.
-const browseBodyLimit = 1 << 16 // 64 KiB
 
 // openLocalBrowser is the local fallback opener. Indirected so tests can
 // assert the fallback ordering without popping a real browser (same pattern
@@ -102,46 +86,8 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 }
 
 // postBrowseToSocket posts the URL to a peer dotvault's remote-browse
-// endpoint over a Unix-domain socket — the programmatic equivalent of
-//
-//	curl --unix-socket <socketPath> http://localhost/api/v1/remote/browse -d url=<target>
-//
-// Unlike auth.FetchTokenFromSocket (which shares the auth.PeerSocketClient
-// transport) this reports failures: the caller falls back to the local
-// browser on any error, but wants the reason for the debug log.
+// endpoint over its Unix-domain socket, via the shared postFormToPeer
+// transport. The caller falls back to the local browser on any error.
 func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	client, _, err := auth.PeerSocketClient(socketPath)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, browsePostTimeout)
-	defer cancel()
-
-	form := url.Values{"url": {target}}
-	// The unix dialer ignores the URL host, but "localhost" is on the peer
-	// web server's DNS-rebinding Host allowlist.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://localhost/api/v1/remote/browse", strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var body struct {
-			Error string `json:"error"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, browseBodyLimit)).Decode(&body)
-		if body.Error != "" {
-			return fmt.Errorf("peer returned %d: %s", resp.StatusCode, body.Error)
-		}
-		return fmt.Errorf("peer returned %d", resp.StatusCode)
-	}
-	return nil
+	return postFormToPeer(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
 }

@@ -99,6 +99,7 @@ internal/
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
   tokenwatch/            Watches ~/.dotvault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
+  notify/                Cross-platform desktop notifications (Windows toast / macOS Notification Center / Linux D-Bus) via beeep; level vocabulary
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc, ssh_config)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -158,6 +159,7 @@ dotvault login       Force a fresh login via the configured auth method
 dotvault login-check Validate/renew cached token on interactive login (tty-aware)
 dotvault enrol       Interactive enrolment picker (`dotvault enrol <name>` to run one directly)
 dotvault browse      Open a URL in a browser, preferring the peer over vault.token_socket
+dotvault notify      Raise a desktop notification, preferring the peer over vault.token_socket
 dotvault status      Display auth state, token TTL, per-rule sync state
 dotvault version     Print build version (--json for machine-readable resource metadata)
 dotvault reg-export  Convert a Windows .reg file to YAML (or canonical .reg)
@@ -283,6 +285,31 @@ borrow swallows them). The local fallback opener is the injectable
 a multi-word value as one program name — docs point those at a
 wrapper script.
 
+`dotvault notify <level> <title> [description]` is the notification
+sibling of `browse`, same peer-preferring shape over the same
+`vault.token_socket`. It form-posts to the peer's `POST
+/api/v1/remote/notify` so a native desktop notification (Windows
+toast, macOS Notification Center, Linux D-Bus) appears on the
+workstation where a human is looking; otherwise it raises the
+notification locally. Delivery lives in `internal/notify` (a thin
+level vocabulary — `info`/`warning`/`error`/`attention` — over
+`github.com/gen2brain/beeep`, pure-Go with build-tagged platform
+backends, preserving CGO_ENABLED=0). `notify.NewMessage` validates
+the level and strips control characters from title/body (the
+injection guard into beeep's exec/XML/AppleScript backends), and is
+shared by the CLI and the endpoint so both reject bad input
+identically. Level drives urgency (error/attention → `beeep.Alert`,
+audible; info/warning → `beeep.Notify`) and, on Linux/BSD where the
+D-Bus `app_icon` accepts freedesktop stock names, the icon
+(`dialog-error` etc.); on macOS/Windows a stock name isn't a real
+file path so `iconArg` returns `""` there and the level shows via
+urgency. The local fallback notifier is the injectable
+`sendLocalNotification` var. Both `browse` and `notify` share the
+peer form-POST transport (`cmd/dotvault/peerpost.go`,
+`postFormToPeer`) and, on the server, the single-flight + bounded-wait
++ panic-recovery launcher (`internal/web/launcher.go`,
+`guardedLaunch`).
+
 The naming follows regedit's `/e` (export) and `/s` (import) directional
 convention: `reg-export` pulls policy out of the registry world into a
 user-facing form, `reg-import` casts a YAML config into the .reg form a
@@ -349,7 +376,7 @@ Config reload via SIGHUP is **dynamic sections only**. The dynamic sections — 
 
 ### Peer-socket token borrow (`vault.token_socket`)
 
-When `vault.token_socket` names a Unix-domain socket served by a peer dotvault daemon's web API, `Manager.Login` (and therefore every login and the recovery side of token refresh) first tries to **borrow a live token from the peer** before running the configured auth flow — the programmatic equivalent of `curl --unix-socket <path> http://localhost/api/v1/token` against the web UI's existing `GET /api/v1/token` endpoint. This is the dotvault-to-dotvault sharing seam: a machine with no browser or TTY (a headless Linux box reached over SSH) borrows the token from a workstation that authenticated interactively, with the workstation daemon's loopback web listener exposed on the remote as a socket via an SSH `RemoteForward`. The borrow logic is `auth.FetchTokenFromSocket` (`internal/auth/socket.go`): it stats the socket first (a missing file is the common "peer not connected" case and skips the dial), dials over a unix `http.Transport`, sends `Host: localhost` (on the web server's DNS-rebinding allowlist), and decodes `{"token": …}`. It is **best-effort and never fatal** — empty path, missing/stale socket, non-200 (peer holds no token), or malformed body all resolve to `("", nil)` and the caller carries on with its normal flow. The borrowed token is validated via `LookupSelf` at the call site (exactly like the file/env candidates) and is held **in memory only**, never written to `~/.dotvault-token`: the peer stays the single owner, so the "+tpm" sealing question never arises and the remote re-borrows on its next login/refresh rather than caching a copy that could go stale. The lifecycle manager wires it as a third `tryReload` candidate (after file and env, so a locally-written token wins), so an invalid token recovers by borrowing instead of forcing re-auth. The `token_socket` field is local-only data and round-trips through YAML, the registry (`Vault\TokenSocket` REG_SZ), and `.reg` like every other Vault field; a leading `~` is expanded at fetch time. The exported `client/` facade carries it too (`client.VaultConfig.TokenSocket`). The same socket carries traffic the other way: `dotvault browse` posts URLs to the peer's `POST /api/v1/remote/browse` endpoint so browser-driven flows on the headless box open in the workstation's browser (see CLI). See `docs/configuration/config-reference.md` for the SSH `RemoteForward` wiring.
+When `vault.token_socket` names a Unix-domain socket served by a peer dotvault daemon's web API, `Manager.Login` (and therefore every login and the recovery side of token refresh) first tries to **borrow a live token from the peer** before running the configured auth flow — the programmatic equivalent of `curl --unix-socket <path> http://localhost/api/v1/token` against the web UI's existing `GET /api/v1/token` endpoint. This is the dotvault-to-dotvault sharing seam: a machine with no browser or TTY (a headless Linux box reached over SSH) borrows the token from a workstation that authenticated interactively, with the workstation daemon's loopback web listener exposed on the remote as a socket via an SSH `RemoteForward`. The borrow logic is `auth.FetchTokenFromSocket` (`internal/auth/socket.go`): it stats the socket first (a missing file is the common "peer not connected" case and skips the dial), dials over a unix `http.Transport`, sends `Host: localhost` (on the web server's DNS-rebinding allowlist), and decodes `{"token": …}`. It is **best-effort and never fatal** — empty path, missing/stale socket, non-200 (peer holds no token), or malformed body all resolve to `("", nil)` and the caller carries on with its normal flow. The borrowed token is validated via `LookupSelf` at the call site (exactly like the file/env candidates) and is held **in memory only**, never written to `~/.dotvault-token`: the peer stays the single owner, so the "+tpm" sealing question never arises and the remote re-borrows on its next login/refresh rather than caching a copy that could go stale. The lifecycle manager wires it as a third `tryReload` candidate (after file and env, so a locally-written token wins), so an invalid token recovers by borrowing instead of forcing re-auth. The `token_socket` field is local-only data and round-trips through YAML, the registry (`Vault\TokenSocket` REG_SZ), and `.reg` like every other Vault field; a leading `~` is expanded at fetch time. The exported `client/` facade carries it too (`client.VaultConfig.TokenSocket`). The same socket carries traffic the other way: `dotvault browse` posts URLs to the peer's `POST /api/v1/remote/browse` endpoint so browser-driven flows on the headless box open in the workstation's browser, and `dotvault notify` posts to `POST /api/v1/remote/notify` so notifications appear there (see CLI). See `docs/configuration/config-reference.md` for the SSH `RemoteForward` wiring.
 
 The borrow is wired into every code path that needs a token, not just interactive `Manager.Login`. **Daemon startup borrows directly:** `cmd/dotvault` attempts a socket borrow centrally right after the initial token-file/env reuse check (before the web/headless/interactive method branching), so a headless box whose `.dotvault-token` is absent borrows from the peer instead of falling into the `waitForHeadlessToken` idle and blocking forever — the bug this seam previously had, since the headless idle only ever watched the token *file*. **The headless idle also watches the socket:** `waitForHeadlessToken` registers a second `tokenwatch` (inotify on Linux, no-op elsewhere) on the socket's parent directory alongside the token-file watch, and its acquire loop tries the file first then borrows from the socket — so a socket that materialises after startup (an SSH `RemoteForward` connecting late) triggers an immediate borrow rather than waiting out the 10s poll. **The running daemon watches the socket too:** a third `tokenwatch` on the socket directory nudges `LifecycleManager.Reload()` on creation/replacement *only when `lm.NeedsReauth()` is set* (the daemon's borrowed token expired while the socket was stale), and `tryReload` re-borrows — so a forwarder that reconnects after the token died is picked up the moment it returns instead of waiting out the 10s recovery poll. The gate is deliberate: `tryReload` adopts any *different* valid candidate, so an unconditional nudge would demote a still-healthy token to a borrowed one every time the forwarder flapped. **The `client/` facade borrows on the cached path:** `AuthenticateCached` (the side-effect-free, never-prompt entry point used by `doctor`-style preflight *and the Python bindings*) tries a socket borrow after env+file come up empty, before returning `ErrLoginRequired`. A plain HTTP GET over a Unix socket has no browser/prompt side effect, so it stays within the cached contract; this means a Go or Python consumer on a host with no local token but a live peer socket authenticates without an interactive `Login`. **`dotvault status` borrows read-only to report state:** `runStatus` resolves env+file first and, when both are empty and a socket is configured, borrows from the peer before calling `LookupSelf`, so a host authenticated purely by borrowing (no token file at rest) reports `authenticated` — with a `source: borrowed from peer socket` line — instead of the misleading `not authenticated (no token)`; it never writes the borrowed token, matching the in-memory-only ownership contract.
 
@@ -647,6 +674,7 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 - `GET /api/v1/secrets/{path}` — list or reveal secret (reveal requires `?reveal=true`)
 - `POST /api/v1/sync` — trigger immediate sync (CSRF-protected)
 - `POST /api/v1/remote/browse` — open a form-posted `url` (body only; query string ignored) in this host's default browser (`internal/web/browse.go`). The outbound counterpart of `GET /api/v1/token` over the same forwarded socket: a headless peer (or `dotvault browse`) hands a URL back to the workstation so browser-driven flows open where a browser exists. **Deliberately NOT CSRF-protected** — the consumer is a bare curl/form POST over a forwarded Unix socket with no practical way to run the issue-then-spend CSRF handshake, and the handler reads no state and returns nothing sensitive. Cross-site browser traffic (which the loopback Host check alone would pass, since a cross-origin form POST is a CORS "simple request") is rejected by an **Origin check** instead: a present `Origin` header must name the daemon's own origin — a loopback hostname (`originAllowed` → `loopbackHostname`, the same allowlist as the Host check) **on the daemon's own listener port** (bound `listenAddr` preferred, `cfg.Listen` pre-Start), because an Origin names whichever server served the page and a hostname-only check would admit pages from any other loopback-served origin; curl and the CLI send none and pass, hostile pages always send theirs (or `null`) and are 403'd. The other load-bearing control is the strict allowlist (`ValidateBrowseURL`: http/https with a host, no embedded `user:pass@` credentials), which keeps `file://` and custom-protocol strings away from xdg-open/ShellExecute. The opener runs under a bounded wait (`browseOpenTimeout`, 8s < the CLI's 10s POST timeout) so a hung launcher can't strand the handler, and behind a single-flight gate (`browseOpenMu.TryLock`, concurrent requests get 503) because an abandoned hung launcher can't be killed and unbounded requests would pile up stuck goroutines. Log lines carry scheme+hostname only, at every level — query strings and even path segments can be capability-bearing, and the requester already knows the URL it posted. Browser launch is injected via `ServerConfig.OpenBrowser` (defaults to `browser.OpenURL`; tests fake it); the middleware's loopback Host check applies as on every route.
+- `POST /api/v1/remote/notify` — raise a native desktop notification from a form-posted `level`/`title`/`body` (`internal/web/notify.go`). The sibling of `remote/browse` with the identical no-CSRF / Origin-check / bounded-single-flight posture (both share `guardedLaunch` in `internal/web/launcher.go`). Input validation is `notify.NewMessage` (known level set; control chars stripped from title/body — the injection guard into beeep's exec/XML/AppleScript backends). Delivery is injected via `ServerConfig.SendNotification` (defaults to `notify.Send`; tests fake it). Log lines carry the level and title/body *lengths* only — never the text, which is arbitrary user content that may name secret paths (the same never-log-content posture browse applies to URLs).
 
 **Security headers:** `Content-Security-Policy: default-src 'self'`, `X-Content-Type-Options: nosniff`.
 
@@ -671,7 +699,7 @@ This means a Windows GPO deployment can configure rules, enrolments, the SSH age
 - Config file: warns if group or world writable
 - Secret values are never logged, even at DEBUG level
 - All file writes are atomic (temp file + rename)
-- Web UI: loopback only, CSRF on all mutating endpoints (sole documented exception: `POST /api/v1/remote/browse` — see Web UI routes for the rationale), strict CSP
+- Web UI: loopback only, CSRF on all mutating endpoints (documented exceptions: `POST /api/v1/remote/browse` and `POST /api/v1/remote/notify`, which use an Origin check instead — see Web UI routes for the rationale), strict CSP
 - Windows: DACL-based permission checks via Security API (GetNamedSecurityInfo, GetAce)
 
 ## Key Dependencies
@@ -685,6 +713,7 @@ This means a Windows GPO deployment can configure rules, enrolments, the SSH age
 | `github.com/jdx/go-netrc` | Netrc parsing |
 | `github.com/cli/oauth` | GitHub OAuth device flow |
 | `github.com/pkg/browser` | Open browser |
+| `github.com/gen2brain/beeep` | Cross-platform desktop notifications (pure Go, no cgo) |
 | `nhooyr.io/websocket` | WebSocket client (Vault Events API) |
 | `github.com/Microsoft/go-winio` | Windows named-pipe listener (SSH agent transport) |
 | `golang.org/x/crypto/ssh/agent` | SSH agent protocol server (read-only backend) |

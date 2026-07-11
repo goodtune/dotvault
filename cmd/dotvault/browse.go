@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/web"
 )
 
@@ -86,8 +87,8 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 }
 
 // postBrowseToSocket posts the URL to a peer dotvault's remote-browse
-// endpoint over its Unix-domain socket, via the shared postFormToPeer
+// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
 // transport. The caller falls back to the local browser on any error.
 func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	return postFormToPeer(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
+	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
 }

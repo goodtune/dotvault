@@ -12,13 +12,16 @@
 // OS-user identity convention, and the kv/users/<user>/... layout all come from
 // the one Go implementation rather than being re-derived in Python.
 //
-// Scope is deliberately the read-only + cached-auth subset of the facade:
-// AuthenticateCached (never prompts), IdentityName, Token, ReadKVField, and
-// ReadUserSecret. Interactive Login/Authenticate (browser/terminal) are out —
-// driving an OIDC browser pop or an LDAP password prompt across an FFI boundary
-// from inside a Python process is awkward and is not what a library caller
-// wants; such callers should rely on a token already provisioned by the daemon
-// or `dotvault login`.
+// Scope is the read-only + cached-auth subset of the facade plus the
+// peer-action surface: AuthenticateCached (never prompts), IdentityName, Token,
+// ReadKVField, ReadUserSecret, and the socket-forwarded Browse/Notify.
+// Interactive Login/Authenticate (browser/terminal) are out — driving an OIDC
+// browser pop or an LDAP password prompt across an FFI boundary from inside a
+// Python process is awkward and is not what a library caller wants; such
+// callers should rely on a token already provisioned by the daemon or `dotvault
+// login`. Browse/Notify need no local token — they post over the peer socket —
+// so they are in scope: a headless Python program hands a URL or a notification
+// back to the workstation over the same forwarded socket it borrows tokens from.
 //
 // # ABI conventions
 //
@@ -117,12 +120,13 @@ func syncEnv() {
 // together. catOther is the catch-all for an error that matches no sentinel
 // (e.g. config-load/validation failures from dotvault_client_new).
 const (
-	catOK            = 0
-	catLoginRequired = 1
-	catDenied        = 2
-	catUnreachable   = 3
-	catAuthFailed    = 4
-	catOther         = 5
+	catOK              = 0
+	catLoginRequired   = 1
+	catDenied          = 2
+	catUnreachable     = 3
+	catAuthFailed      = 4
+	catOther           = 5
+	catPeerUnavailable = 6
 )
 
 // Handle table. A *client.Client is never exposed to C directly; it is parked
@@ -214,6 +218,8 @@ func categoryOf(err error) int {
 		return catUnreachable
 	case errors.Is(err, client.ErrAuthFailed):
 		return catAuthFailed
+	case errors.Is(err, client.ErrPeerUnavailable):
+		return catPeerUnavailable
 	default:
 		return catOther
 	}
@@ -376,6 +382,38 @@ func dotvault_read_user_secret(h C.longlong, service, field *C.char, timeoutMill
 	defer cancel()
 	value, found, err := c.ReadUserSecret(ctx, goString(service), goString(field))
 	return readResult(value, found, err, out, foundOut, errOut)
+}
+
+//export dotvault_remote_browse
+func dotvault_remote_browse(h C.longlong, rawURL *C.char, timeoutMillis C.longlong, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	if err := c.Browse(ctx, goString(rawURL)); err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	return catOK
+}
+
+//export dotvault_remote_notify
+func dotvault_remote_notify(h C.longlong, level, title, body *C.char, timeoutMillis C.longlong, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	if err := c.Notify(ctx, goString(level), goString(title), goString(body)); err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	return catOK
 }
 
 func main() {}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/notify"
 )
 
@@ -89,7 +90,7 @@ func runNotify(cmd *cobra.Command, args []string) error {
 }
 
 // postNotifyToSocket posts a notification to a peer dotvault's remote-notify
-// endpoint over its Unix-domain socket, via the shared postFormToPeer
+// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
 // transport. The caller falls back to a local notification on any error.
 func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Message) error {
 	form := url.Values{
@@ -97,5 +98,5 @@ func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Messa
 		"title": {msg.Title},
 		"body":  {msg.Body},
 	}
-	return postFormToPeer(ctx, socketPath, "/api/v1/remote/notify", form)
+	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/notify", form)
 }

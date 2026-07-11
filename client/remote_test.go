@@ -81,6 +81,12 @@ func TestBrowse_NoSocketConfigured(t *testing.T) {
 	if !errors.Is(err, ErrPeerUnavailable) {
 		t.Fatalf("err = %v, want ErrPeerUnavailable when no socket is configured", err)
 	}
+	// The distinct no-socket message is load-bearing: it points the operator at
+	// the config field. Assert it so dropping the early check (which would still
+	// yield ErrPeerUnavailable via the unreachable path) is caught.
+	if !strings.Contains(err.Error(), "token_socket") {
+		t.Errorf("err = %q, want it to name the token_socket config field", err)
+	}
 }
 
 func TestBrowse_PeerUnreachable(t *testing.T) {

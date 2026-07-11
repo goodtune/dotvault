@@ -15,12 +15,22 @@ import pytest
 
 import dotvault
 
+# Skip the whole module before anything below is evaluated where AF_UNIX is
+# unavailable (Windows CPython). socketserver.UnixStreamServer does not exist
+# there, so even *defining* the _UnixHTTPServer subclass would raise at
+# collection time and take the no-socket test down with it — the guard must be
+# a module-level skip ahead of the class definition, not inside the fixture.
+if not hasattr(socket, "AF_UNIX"):
+    pytest.skip("AF_UNIX unavailable on this platform", allow_module_level=True)
+
 
 class _PeerHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode()
-        form = urllib.parse.parse_qs(body)
+        # keep_blank_values so an empty "body=" field is visible rather than
+        # silently dropped — the notify default-body test asserts on it.
+        form = urllib.parse.parse_qs(body, keep_blank_values=True)
         self.server.received.append((self.path, form))
         status, payload = self.server.responder(self.path, form)
         self.send_response(status)
@@ -47,8 +57,6 @@ def peer(tmp_path):
     ``ctl.received`` collects (path, form) tuples; set ``ctl.responder`` to a
     ``(path, form) -> (status, json_body)`` callable to control the reply.
     """
-    if not hasattr(socket, "AF_UNIX"):
-        pytest.skip("AF_UNIX unavailable on this platform")
     sock_path = str(tmp_path / "peer.sock")
 
     server = _UnixHTTPServer(sock_path, _PeerHandler)
@@ -101,6 +109,17 @@ def test_notify_posts_to_peer(tmp_path, peer):
     assert form["level"] == ["error"]
     assert form["title"] == ["Job failed"]
     assert form["body"] == ["see logs"]
+
+
+def test_notify_default_body_is_empty(tmp_path, peer):
+    # The optional body defaults to "" and must still round-trip as an empty
+    # form field, not be omitted.
+    sock_path, ctl = peer
+    with _client_with_socket(tmp_path, sock_path) as c:
+        c.notify("info", "No body", timeout=5)
+    _, form = ctl.received[-1]
+    assert form["title"] == ["No body"]
+    assert form["body"] == [""]
 
 
 def test_browse_without_socket_is_peer_unavailable(config_file):

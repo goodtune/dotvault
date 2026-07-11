@@ -54,10 +54,20 @@ func (c *Client) Notify(ctx context.Context, level, title, body string) error {
 
 // peerAction posts a peer-action form to apiPath over the configured
 // TokenSocket and maps the shared transport's typed errors onto the facade's
-// taxonomy: a 400 (the peer rejected the request as invalid) stays a plain
-// error so callers see the peer's message without treating it as a transient
-// availability problem; everything else — no socket configured, unreachable
-// peer, or a non-400 non-200 — wraps ErrPeerUnavailable.
+// taxonomy:
+//
+//   - no socket configured, or the peer could not be contacted at all
+//     (ErrPeerUnreachable) → ErrPeerUnavailable (retryable availability);
+//   - the peer answered 5xx (it reached the action but could not complete it —
+//     a 502 opener failure, a 503 "busy, try again") → ErrPeerUnavailable;
+//   - any other non-200 (a 4xx: the peer rejected the request as invalid —
+//     bad URL, unknown level, empty title) → a plain uncategorised error
+//     carrying the peer's message, since that is a caller error to fix, not a
+//     transient condition to retry.
+//
+// Keying availability on the 5xx class (rather than singling out 400) keeps a
+// future 4xx the endpoint might grow — a 403, 405, 415 — correctly classified
+// as a permanent request error rather than a retryable one.
 func (c *Client) peerAction(ctx context.Context, action, apiPath string, form url.Values) error {
 	socket := c.cfg.Vault.TokenSocket
 	if socket == "" {
@@ -68,10 +78,7 @@ func (c *Client) peerAction(ctx context.Context, action, apiPath string, form ur
 		return nil
 	}
 	var se *auth.PeerStatusError
-	if errors.As(err, &se) && se.Status == 400 {
-		// The peer validated the request and rejected it as malformed (bad
-		// URL, unknown level, empty title). That is a caller error, not an
-		// availability problem — surface it plainly with the peer's message.
+	if errors.As(err, &se) && se.Status < 500 {
 		return fmt.Errorf("dotvault: peer rejected %s request: %s", action, se.Message)
 	}
 	return fmt.Errorf("%w: %s: %w", ErrPeerUnavailable, action, err)

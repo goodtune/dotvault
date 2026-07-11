@@ -57,6 +57,13 @@ func (e *PeerStatusError) Error() string {
 // Browse/Notify. It reuses PeerSocketClient (the same stat-before-dial unix
 // transport the token borrow uses).
 //
+// It lives in internal/auth for cohesion with PeerSocketClient and
+// FetchTokenFromSocket — all three speak the peer's web API over the same unix
+// transport — even though a browse/notify form-POST is not itself an auth
+// concept. If a third non-auth peer-action surface appears, consider promoting
+// the peer-socket transport to its own internal/peer package rather than
+// cementing internal/auth as the catch-all.
+//
 // Errors are typed so callers can react: ErrPeerUnreachable (wrapped) when the
 // peer could not be contacted, or a *PeerStatusError when it answered non-200.
 // The request is bounded by peerPostTimeout unless ctx carries a shorter

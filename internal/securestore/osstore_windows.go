@@ -7,9 +7,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"unsafe"
 
 	"github.com/google/certtostore"
+	"golang.org/x/sys/windows"
 )
+
+// nCryptGetProperty reads a CNG key property. certtostore keeps its own property
+// helpers unexported, so the "os" backend loads the proc itself to verify the
+// generated key's export policy (certtostore exposes the raw key handle via
+// Key.TransientTpmHandle).
+var nCryptGetProperty = windows.NewLazySystemDLL("ncrypt.dll").NewProc("NCryptGetProperty")
+
+// nCryptExportPolicyProperty is NCRYPT_EXPORT_POLICY_PROPERTY (L"Export Policy").
+const nCryptExportPolicyProperty = "Export Policy"
 
 // osContainer is the CNG key-container name dotvault generates its cert key
 // under, in the current user's key store. dotvault runs per-user and owns a
@@ -69,11 +81,61 @@ func (s *osStorage) Generate(kt KeyType, _ bool) (crypto.Signer, []byte, error) 
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key in OS certificate store: %w", err)
 	}
+	if err := assertNonExportable(signer); err != nil {
+		return nil, nil, err
+	}
 	handle, err := json.Marshal(osHandle{Provider: certtostore.ProviderMSSoftware, Container: s.container})
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal os handle: %w", err)
 	}
 	return signer, handle, nil
+}
+
+// assertNonExportable verifies the freshly generated CNG key cannot be exported
+// from the store, so the user cannot extract the private key and reuse the
+// Vault-issued identity on another machine. A key created with
+// NCryptCreatePersistedKey defaults to NCRYPT_ALLOW_EXPORT_NONE (certtostore
+// never sets an allow-export flag), so this is the CNG default — but we verify
+// it rather than trust it, failing closed if a future certtostore change ever
+// made the key exportable. The verification read itself failing is non-fatal
+// (logged): the default still protects the key, and a diagnostic hiccup should
+// not break authentication.
+func assertNonExportable(signer crypto.Signer) error {
+	h, ok := signer.(interface{ TransientTpmHandle() uintptr })
+	if !ok {
+		slog.Warn("cannot introspect OS-store key handle to verify non-exportability; relying on the non-exportable CNG default")
+		return nil
+	}
+	policy, err := keyExportPolicy(h.TransientTpmHandle())
+	if err != nil {
+		slog.Warn("could not read OS-store key export policy; relying on the non-exportable CNG default", "error", err)
+		return nil
+	}
+	if exportPolicyIsExportable(policy) {
+		return fmt.Errorf("refusing to use an exportable OS-store key (export policy %#x): the private key must be non-exportable so it cannot be extracted and reused off this machine", policy)
+	}
+	return nil
+}
+
+// keyExportPolicy reads NCRYPT_EXPORT_POLICY_PROPERTY from a CNG key handle.
+func keyExportPolicy(handle uintptr) (uint32, error) {
+	prop, err := windows.UTF16PtrFromString(nCryptExportPolicyProperty)
+	if err != nil {
+		return 0, err
+	}
+	var policy, cbResult uint32
+	r, _, _ := nCryptGetProperty.Call(
+		handle,
+		uintptr(unsafe.Pointer(prop)),
+		uintptr(unsafe.Pointer(&policy)),
+		unsafe.Sizeof(policy),
+		uintptr(unsafe.Pointer(&cbResult)),
+		0,
+	)
+	if r != 0 {
+		return 0, fmt.Errorf("NCryptGetProperty(Export Policy) returned %#x", r)
+	}
+	return policy, nil
 }
 
 // Import is unsupported: certtostore can install certificates but offers no path

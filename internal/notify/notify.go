@@ -25,14 +25,11 @@ import (
 )
 
 // appName is the application name beeep attributes notifications to (the
-// D-Bus app_name on Linux, the toast AppID hint on Windows). Set once at
-// package init rather than per-call so every notification is consistently
-// attributed to dotvault.
+// D-Bus app_name on Linux, the toast AppID hint on Windows). Applied inside
+// Send rather than an init() so importing this package has no invisible
+// import-time side effect of rebranding beeep process-wide; the assignment is
+// idempotent and cheap.
 const appName = "dotvault"
-
-func init() {
-	beeep.AppName = appName
-}
 
 // Maximum accepted lengths for the title and body. Notification surfaces
 // truncate long text anyway; capping here keeps a hostile or buggy peer from
@@ -107,9 +104,8 @@ type Message struct {
 
 // NewMessage validates and sanitizes the inputs into a Message. The level
 // must be a known level; the title must be non-empty after sanitization; the
-// body is optional. Title and body are stripped of control characters
-// (notification text is single-line, and control bytes are an injection
-// vector into the shell/AppleScript/XML backends beeep drives) and capped in
+// body is optional. Title and body are sanitized (control characters removed,
+// delivery-backend metacharacters neutralized — see sanitize) and capped in
 // length.
 func NewMessage(level, title, body string) (Message, error) {
 	l, err := ParseLevel(level)
@@ -123,11 +119,31 @@ func NewMessage(level, title, body string) (Message, error) {
 	return Message{Level: l, Title: title, Body: sanitize(body, maxBodyLen)}, nil
 }
 
-// sanitize collapses control characters (including newlines and tabs) to
-// spaces, trims surrounding whitespace, and truncates to max runes. Removing
-// control bytes keeps title/body from breaking out of the single-line
-// notification fields or injecting into the exec/XML/AppleScript delivery
-// backends; the length cap bounds what reaches the OS daemon.
+// sanitize prepares an untrusted title/body for delivery: it collapses control
+// characters to spaces, neutralizes the metacharacters that would break out of
+// beeep's Windows toast backends, trims, and truncates to max runes.
+//
+// The Windows neutralization is load-bearing, not cosmetic. beeep's toast path
+// (git.sr.ht/~jackmordaunt/go-toast) interpolates the title/body into TWO
+// unescaped sinks:
+//
+//   - an XML CDATA section (`<text><![CDATA[{{.Title}}]]></text>`), where the
+//     literal `]]>` closes the CDATA and injects arbitrary toast XML into
+//     doc.LoadXml; and
+//   - a PowerShell **expandable** here-string (`$template = @"…"@`) on the
+//     COM-unavailable fallback, where `$(…)` runs a subexpression (arbitrary
+//     command execution), `$name` expands a variable, and a backtick is the
+//     escape character.
+//
+// We cannot inject escaping into beeep's own pipeline, so we neutralize on the
+// way in. This is a complete handling of both sink grammars — CDATA has exactly
+// one terminator, and a PowerShell here-string has exactly two active
+// metacharacters (`$` and backtick) — not a best-effort blocklist. macOS
+// (osascript via fmt.Sprintf %q) and Linux (D-Bus method call / notify-send
+// argv) do not interpolate into an evaluated context, so this transform is
+// aimed at the Windows sinks; it is applied unconditionally because a message
+// validated on one host may be delivered on another (a headless peer posts to
+// a Windows workstation).
 func sanitize(s string, max int) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -141,12 +157,40 @@ func sanitize(s string, max int) string {
 		}
 		b.WriteRune(r)
 	}
-	out := strings.TrimSpace(b.String())
+	out := neutralizeToastMetachars(b.String())
+	out = strings.TrimSpace(out)
 	if len([]rune(out)) > max {
 		out = string([]rune(out)[:max])
 		out = strings.TrimSpace(out)
 	}
 	return out
+}
+
+// neutralizeToastMetachars defuses the CDATA terminator and PowerShell
+// here-string metacharacters described in sanitize's doc comment, keeping the
+// text otherwise verbatim.
+func neutralizeToastMetachars(s string) string {
+	// CDATA: break the only sequence that can close a CDATA section.
+	s = strings.ReplaceAll(s, "]]>", "]] >")
+	// PowerShell here-string: the backtick is the escape/line-continuation
+	// character; render it as an apostrophe.
+	s = strings.ReplaceAll(s, "`", "'")
+	// PowerShell here-string: a `$` immediately followed by any non-space
+	// character can start an expansion — `$(cmd)` (subexpression → command
+	// execution), `${name}`/`$name`/`$5`/`$$` (variable expansion). Inserting
+	// a space after such a `$` makes it a literal dollar sign and leaves the
+	// following text inert, while preserving a trailing/space-separated `$`
+	// (e.g. "cost: $").
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	runes := []rune(s)
+	for i, r := range runes {
+		b.WriteRune(r)
+		if r == '$' && i+1 < len(runes) && runes[i+1] != ' ' {
+			b.WriteRune(' ')
+		}
+	}
+	return b.String()
 }
 
 // Notifier delivers a validated Message. Send is the real implementation;
@@ -158,6 +202,7 @@ type Notifier func(Message) error
 // attention) or a normal notification (info / warning), and on platforms that
 // accept a named stock icon the level's icon is shown.
 func Send(msg Message) error {
+	beeep.AppName = appName
 	icon := iconArg(msg.Level)
 	if levelTable[msg.Level].urgent {
 		return beeep.Alert(msg.Title, msg.Body, icon)
@@ -174,8 +219,12 @@ func Send(msg Message) error {
 // urgency (audible alert vs quiet notification). beeep requires the icon be a
 // string or []byte, so this is "" rather than nil.
 func iconArg(level Level) string {
+	// The GOOS set matches beeep's own unix notification backend build tag
+	// (linux || freebsd || netbsd || openbsd || illumos), where the icon is a
+	// D-Bus app_icon / notify-send -i that accepts a stock name. On every
+	// other platform a string icon is a file path, so pass none.
 	switch runtime.GOOS {
-	case "linux", "freebsd", "netbsd", "openbsd", "dragonfly", "illumos":
+	case "linux", "freebsd", "netbsd", "openbsd", "illumos":
 		return levelTable[level].stockIcon
 	default:
 		return ""

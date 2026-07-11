@@ -157,6 +157,26 @@ func TestHandleRemoteNotify_SenderFailure(t *testing.T) {
 	}
 }
 
+func TestHandleRemoteNotify_BusyReturns503(t *testing.T) {
+	// Exercise the handler's errLauncherBusy → 503 arm: hold the gate so
+	// guardedLaunch fails fast without touching the sender.
+	s := testServer(t)
+	called := false
+	s.sendNotification = func(notify.Message) error {
+		called = true
+		return nil
+	}
+	s.notifyMu.Lock() // simulate an in-flight delivery
+	w := httptest.NewRecorder()
+	s.handleRemoteNotify(w, postNotify("info", "t", "b"))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 while a delivery is in flight; body = %s", w.Code, w.Body.String())
+	}
+	if called {
+		t.Error("sender was called while the gate was held")
+	}
+}
+
 func TestHandleRemoteNotify_NilSender(t *testing.T) {
 	// testServer builds the struct directly, so sendNotification is nil
 	// unless set — the handler must degrade to 503, not panic.

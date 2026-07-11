@@ -99,7 +99,7 @@ internal/
   sdnotify/              Tiny sd_notify(3) helper (READY/STOPPING/WATCHDOG); no-op off Linux
   tokenwatch/            Watches ~/.dotvault-token for replacement (inotify on Linux); no-op elsewhere
   httpproxy/             Per-request proxy resolver (ieproxy/PAC on Windows, env vars elsewhere) + http.Client builder
-  notify/                Cross-platform desktop notifications (Windows toast / macOS Notification Center / Linux D-Bus) via beeep; level vocabulary
+  notify/                Cross-platform desktop notifications via beeep (Windows toast / macOS Notification Center / Linux D-Bus), with a level vocabulary and input sanitization
   sync/                  Hybrid event+poll sync engine, state store
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc, ssh_config)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
@@ -295,10 +295,13 @@ notification locally. Delivery lives in `internal/notify` (a thin
 level vocabulary — `info`/`warning`/`error`/`attention` — over
 `github.com/gen2brain/beeep`, pure-Go with build-tagged platform
 backends, preserving CGO_ENABLED=0). `notify.NewMessage` validates
-the level and strips control characters from title/body (the
-injection guard into beeep's exec/XML/AppleScript backends), and is
-shared by the CLI and the endpoint so both reject bad input
-identically. Level drives urgency (error/attention → `beeep.Alert`,
+the level and sanitizes title/body — strips control characters and
+neutralizes the metacharacters that would break out of beeep's
+Windows toast backends (the XML CDATA terminator `]]>`, and the
+PowerShell here-string metacharacters `$`/backtick that the
+COM-unavailable fallback would otherwise evaluate as a subexpression,
+i.e. RCE). It is shared by the CLI and the endpoint so both reject or
+neutralize input identically. Level drives urgency (error/attention → `beeep.Alert`,
 audible; info/warning → `beeep.Notify`) and, on Linux/BSD where the
 D-Bus `app_icon` accepts freedesktop stock names, the icon
 (`dialog-error` etc.); on macOS/Windows a stock name isn't a real
@@ -674,7 +677,7 @@ Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to 
 - `GET /api/v1/secrets/{path}` — list or reveal secret (reveal requires `?reveal=true`)
 - `POST /api/v1/sync` — trigger immediate sync (CSRF-protected)
 - `POST /api/v1/remote/browse` — open a form-posted `url` (body only; query string ignored) in this host's default browser (`internal/web/browse.go`). The outbound counterpart of `GET /api/v1/token` over the same forwarded socket: a headless peer (or `dotvault browse`) hands a URL back to the workstation so browser-driven flows open where a browser exists. **Deliberately NOT CSRF-protected** — the consumer is a bare curl/form POST over a forwarded Unix socket with no practical way to run the issue-then-spend CSRF handshake, and the handler reads no state and returns nothing sensitive. Cross-site browser traffic (which the loopback Host check alone would pass, since a cross-origin form POST is a CORS "simple request") is rejected by an **Origin check** instead: a present `Origin` header must name the daemon's own origin — a loopback hostname (`originAllowed` → `loopbackHostname`, the same allowlist as the Host check) **on the daemon's own listener port** (bound `listenAddr` preferred, `cfg.Listen` pre-Start), because an Origin names whichever server served the page and a hostname-only check would admit pages from any other loopback-served origin; curl and the CLI send none and pass, hostile pages always send theirs (or `null`) and are 403'd. The other load-bearing control is the strict allowlist (`ValidateBrowseURL`: http/https with a host, no embedded `user:pass@` credentials), which keeps `file://` and custom-protocol strings away from xdg-open/ShellExecute. The opener runs under a bounded wait (`browseOpenTimeout`, 8s < the CLI's 10s POST timeout) so a hung launcher can't strand the handler, and behind a single-flight gate (`browseOpenMu.TryLock`, concurrent requests get 503) because an abandoned hung launcher can't be killed and unbounded requests would pile up stuck goroutines. Log lines carry scheme+hostname only, at every level — query strings and even path segments can be capability-bearing, and the requester already knows the URL it posted. Browser launch is injected via `ServerConfig.OpenBrowser` (defaults to `browser.OpenURL`; tests fake it); the middleware's loopback Host check applies as on every route.
-- `POST /api/v1/remote/notify` — raise a native desktop notification from a form-posted `level`/`title`/`body` (`internal/web/notify.go`). The sibling of `remote/browse` with the identical no-CSRF / Origin-check / bounded-single-flight posture (both share `guardedLaunch` in `internal/web/launcher.go`). Input validation is `notify.NewMessage` (known level set; control chars stripped from title/body — the injection guard into beeep's exec/XML/AppleScript backends). Delivery is injected via `ServerConfig.SendNotification` (defaults to `notify.Send`; tests fake it). Log lines carry the level and title/body *lengths* only — never the text, which is arbitrary user content that may name secret paths (the same never-log-content posture browse applies to URLs).
+- `POST /api/v1/remote/notify` — raise a native desktop notification from a form-posted `level`/`title`/`body` (`internal/web/notify.go`). The sibling of `remote/browse` with the identical no-CSRF / Origin-check / bounded-single-flight posture (both share `guardedLaunch` in `internal/web/launcher.go`). Input validation is `notify.NewMessage` (known level set; title/body sanitized — control chars stripped and Windows-toast-backend metacharacters neutralized: the XML CDATA terminator and the PowerShell here-string `$`/backtick that the fallback would otherwise evaluate as a subexpression → RCE; macOS `%q` and Linux D-Bus argv need no such handling). Delivery is injected via `ServerConfig.SendNotification` (defaults to `notify.Send`; tests fake it). Log lines carry the level and title/body *lengths* only — never the text, which is arbitrary user content that may name secret paths (the same never-log-content posture browse applies to URLs).
 
 **Security headers:** `Content-Security-Policy: default-src 'self'`, `X-Content-Type-Options: nosniff`.
 

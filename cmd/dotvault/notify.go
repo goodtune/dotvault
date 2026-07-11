@@ -75,11 +75,11 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	}
 
 	if socket != "" {
-		if err := postNotifyToSocket(cmd.Context(), socket, msg); err == nil {
+		err := postNotifyToSocket(cmd.Context(), socket, msg)
+		if err == nil {
 			return nil
-		} else {
-			slog.Debug("peer notify unavailable; notifying locally", "socket", socket, "error", err)
 		}
+		slog.Debug("peer notify unavailable; notifying locally", "socket", socket, "error", err)
 	}
 
 	if err := sendLocalNotification(msg); err != nil {

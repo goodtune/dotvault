@@ -80,14 +80,72 @@ func TestSanitize_Truncates(t *testing.T) {
 }
 
 func TestSanitize_TruncatesByRuneNotByte(t *testing.T) {
-	// Multi-byte runes must be counted as one each, and truncation must not
-	// split a rune (which would produce U+FFFD).
-	got := sanitize(strings.Repeat("é", maxBodyLen+10), maxBodyLen)
+	// Use a 3-byte rune with a cap that is NOT a multiple of 3, so a
+	// regression to byte-slicing would land mid-rune and produce U+FFFD (and
+	// a rune count above the cap). "あ" is 3 bytes; maxBodyLen (1000) is not a
+	// multiple of 3.
+	if maxBodyLen%3 == 0 {
+		t.Fatalf("test assumes maxBodyLen (%d) is not a multiple of 3", maxBodyLen)
+	}
+	got := sanitize(strings.Repeat("あ", maxBodyLen+10), maxBodyLen)
 	if n := len([]rune(got)); n > maxBodyLen {
 		t.Errorf("rune count = %d, want <= %d", n, maxBodyLen)
 	}
 	if strings.ContainsRune(got, '�') {
 		t.Error("truncation split a multi-byte rune")
+	}
+}
+
+func TestSanitize_TrimsWhitespaceAtTruncationBoundary(t *testing.T) {
+	// A space sitting exactly at the truncation boundary must be trimmed, so
+	// the result never ends in dangling whitespace.
+	in := strings.Repeat("x", maxTitleLen-1) + " " + strings.Repeat("y", 10)
+	got := sanitize(in, maxTitleLen)
+	if strings.HasSuffix(got, " ") {
+		t.Errorf("sanitize left trailing whitespace after truncation: %q", got)
+	}
+	if n := len([]rune(got)); n > maxTitleLen {
+		t.Errorf("rune count = %d, want <= %d", n, maxTitleLen)
+	}
+}
+
+func TestSanitize_NeutralizesToastMetachars(t *testing.T) {
+	// beeep's Windows toast backends interpolate title/body into an XML CDATA
+	// and a PowerShell expandable here-string. sanitize must defuse the
+	// breakout sequences so neither an injected toast-XML action nor a
+	// PowerShell subexpression survives.
+	cases := []struct {
+		name, in string
+		// substrings that must NOT survive verbatim
+		absent []string
+	}{
+		{"cdata terminator", "boom]]><action/>", []string{"]]>"}},
+		{"ps subexpression", "hi $(calc.exe)", []string{"$("}},
+		{"ps brace var", "x ${env:PATH} y", []string{"${"}},
+		{"ps bare var", "value is $env:SECRET", []string{"$env"}},
+		{"ps digit var", "pay $5now", []string{"$5"}},
+		{"ps double dollar", "$$", []string{"$$"}},
+		{"backtick", "a`b`c", []string{"`"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitize(tc.in, maxTitleLen)
+			for _, bad := range tc.absent {
+				if strings.Contains(got, bad) {
+					t.Errorf("sanitize(%q) = %q still contains %q", tc.in, got, bad)
+				}
+			}
+		})
+	}
+}
+
+func TestSanitize_PreservesBenignDollar(t *testing.T) {
+	// A trailing or space-separated `$` is not an expansion introducer and
+	// must be preserved verbatim, so legitimate text isn't mangled.
+	for _, in := range []string{"cost: $", "price $ each"} {
+		if got := sanitize(in, maxTitleLen); got != in {
+			t.Errorf("sanitize(%q) = %q, want it preserved", in, got)
+		}
 	}
 }
 

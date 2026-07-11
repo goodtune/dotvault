@@ -135,6 +135,25 @@ func TestRunNotify_FallsBackWhenPeerUnreachable(t *testing.T) {
 	}
 }
 
+func TestRunNotify_FallsBackWhenPeerErrors(t *testing.T) {
+	// The peer is reachable but returns a non-200 (e.g. its notification
+	// backend failed): runNotify must fall back to the local notifier rather
+	// than surfacing the peer error.
+	sock := filepath.Join(t.TempDir(), "p.sock")
+	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"no daemon"}`))
+	})
+
+	err, localMsg := runNotifyWith(t, writeBrowseConfig(t, sock), "info", "Fallback", "d")
+	if err != nil {
+		t.Fatalf("runNotify: %v", err)
+	}
+	if localMsg == nil || localMsg.Title != "Fallback" {
+		t.Errorf("local notifier got %+v, want the message after peer error", localMsg)
+	}
+}
+
 func TestRunNotify_FallsBackWhenConfigUnloadable(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "missing.yaml")
 

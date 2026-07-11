@@ -157,6 +157,9 @@ dotvault notify <level> <title> [description]
 
 `<level>` is one of `info`, `warning`, `error`, `attention`. It sets the notification's urgency — `error` and `attention` are delivered as audible alerts, `info` and `warning` as quiet notifications — and, on Linux/BSD where the notification daemon accepts a named stock icon, the icon shown (`dialog-information`, `dialog-warning`, `dialog-error`, `dialog-question`). On macOS and Windows a stock icon name is not a valid file path, so no custom icon is set there and the level is conveyed by urgency alone.
 
+!!! note "macOS delivery"
+    On macOS, notifications are delivered via `osascript` (or `terminal-notifier` if installed). An unsigned CLI binary driving `osascript display notification` is attributed to "Script Editor" and may be suppressed by Notification Center's per-app settings. The peer-preferring design largely sidesteps this — the workstation typically runs the daemon (web UI), which is the more reliable delivery path.
+
 When `vault.token_socket` names a reachable peer dotvault, the notification is form-posted to the peer's `POST /api/v1/remote/notify` endpoint and appears **on the workstation** — where a human is actually looking. When the socket is not configured, missing, or the peer errors, the notification is raised on this host instead. This is the natural way for a long-running job on a headless box to get the operator's attention:
 
 ```sh

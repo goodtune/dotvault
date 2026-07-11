@@ -38,8 +38,10 @@ const notifySendTimeout = 8 * time.Second
 // consumer is a bare curl/CLI form POST over a forwarded socket, with
 // cross-site browser traffic rejected by the Origin check instead. The
 // input-validation control here is notify.NewMessage, which restricts the
-// level to a known set and strips control characters from the title/body so
-// nothing injects into the exec/XML/AppleScript delivery backends.
+// level to a known set and sanitizes the title/body — stripping control
+// characters and neutralizing the metacharacters that would otherwise break
+// out of beeep's Windows toast backends (an XML CDATA section and a PowerShell
+// here-string); see internal/notify's sanitize.
 func (s *Server) handleRemoteNotify(w http.ResponseWriter, r *http.Request) {
 	if s.sendNotification == nil {
 		writeError(w, "notifications not available", http.StatusServiceUnavailable)

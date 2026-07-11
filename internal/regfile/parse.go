@@ -603,6 +603,17 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		}
 		return nil
 	}
+	// applyInt reads a REG_DWORD into an int field (e.g. a port number).
+	applyInt := func(target *int, keyPath, name string) error {
+		v, ok, err := getDWORD(keyPath, name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			*target = int(v)
+		}
+		return nil
+	}
 	// applyBoolPtr is the tri-state variant for `*bool` defaults: an absent
 	// value stays nil (the field's documented default) rather than being
 	// forced to false.
@@ -630,6 +641,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.AuthMethod, vaultKey, "AuthMethod") },
 		func() error { return apply(&cfg.Vault.AuthMount, vaultKey, "AuthMount") },
 		func() error { return apply(&cfg.Vault.AuthRole, vaultKey, "AuthRole") },
+		func() error { return applyInt(&cfg.Vault.OIDCCallbackPort, vaultKey, "OIDCCallbackPort") },
 		func() error { return apply(&cfg.Vault.CACert, vaultKey, "CACert") },
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
@@ -872,6 +884,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			return err
 		} else if ok {
 			en.Engine = v
+		}
+		if v, ok, err := getString(base, "HelpText"); err != nil {
+			return err
+		} else if ok {
+			en.HelpText = v
 		}
 		// Settings subkey: collect the values directly under base\Settings
 		// and recurse into any nested subkeys so structured settings (e.g.

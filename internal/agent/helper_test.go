@@ -46,6 +46,7 @@ type fakeSource struct {
 	ids       []Identity
 	signer    ssh.Signer // signs when a requested key matches one of ids
 	idErr     error
+	signErr   error // when set, Sign always fails before checking ids, regardless of key
 	listCalls int
 }
 
@@ -66,6 +67,9 @@ func (f *fakeSource) Identities(context.Context) ([]Identity, error) {
 }
 
 func (f *fakeSource) Sign(_ context.Context, key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, bool, error) {
+	if f.signErr != nil {
+		return nil, false, f.signErr
+	}
 	for _, id := range f.ids {
 		if keyEqual(id.PubKey, key) {
 			sig, err := signData(f.signer, data, flags)

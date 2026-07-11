@@ -102,6 +102,7 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("AuthMethod", v.AuthMethod)
 	e.writeString("AuthMount", v.AuthMount)
 	e.writeString("AuthRole", v.AuthRole)
+	e.writeDWORD("OIDCCallbackPort", uint32(v.OIDCCallbackPort))
 	e.writeString("CACert", v.CACert)
 	e.writeString("KVMount", v.KVMount)
 	e.writeString("UserPrefix", v.UserPrefix)
@@ -377,6 +378,10 @@ func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 	enrolPath := rootKey + `\Enrolments\` + name
 	e.writeKey(enrolPath)
 	e.writeString("Engine", en.Engine)
+	// HelpText is markdown that may span multiple lines; writeString falls
+	// through to hex(1) the same way Web's LoginText/SecretViewText do.
+	// Always emitted (even empty) so a re-import clears a stale value.
+	e.writeString("HelpText", en.HelpText)
 	e.WriteString("\r\n")
 
 	if len(en.Settings) == 0 {
@@ -505,6 +510,17 @@ func (e *emitter) writeBool(name string, value bool) {
 		v = 1
 	}
 	fmt.Fprintf(&e.b, "%s=dword:%08x\r\n", quoteREGName(name), v)
+}
+
+// writeDWORD emits an arbitrary REG_DWORD value (unlike writeBool, which is
+// always 0 or 1). Always emitted, even zero, so a re-import clears a stale
+// non-zero value.
+func (e *emitter) writeDWORD(name string, value uint32) {
+	if err := validateValueName(name); err != nil {
+		e.fail("%w", err)
+		return
+	}
+	fmt.Fprintf(&e.b, "%s=dword:%08x\r\n", quoteREGName(name), value)
 }
 
 func (e *emitter) writeMultiString(name string, values []string) {

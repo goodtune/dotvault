@@ -65,9 +65,10 @@ A running daemon (in every mode — web, headless, CLI) re-fetches on each `refr
 
 - rules added/changed/removed → applied on the next tick (state for removed rules is pruned, and a sync runs immediately);
 - enrolments added/changed/removed → the enrolment managers and the web UI's enrolment page update (deferred one tick if an enrolment is mid-run);
-- `sync.interval` → the sync engine's ticker resets.
+- `sync.interval` → the sync engine's ticker resets;
+- the local `remote_config` section itself → the fetcher is rebuilt (new URL/CA/headers, fresh conditional-GET state) and the refresh cadence re-derived, so editing `refresh_interval` — or enabling/disabling the overlay entirely — also converges without a restart.
 
-Static sections still require a daemon restart, exactly as for a locally edited config.
+A tick doesn't have to be waited out: SIGHUP (or the Windows tray's "Reload config" entry) forces the same refresh pass immediately — see [Config reload](../admin/deployment.md#config-reload). Static sections still require a daemon restart, exactly as for a locally edited config.
 
 ## Which commands fetch
 

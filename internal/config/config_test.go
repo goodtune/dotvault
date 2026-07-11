@@ -69,6 +69,90 @@ rules:
 	}
 }
 
+func TestLoadOIDCCallbackPort(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+  oidc_callback_port: 8251
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Vault.OIDCCallbackPort != 8251 {
+		t.Errorf("Vault.OIDCCallbackPort = %d, want 8251", cfg.Vault.OIDCCallbackPort)
+	}
+}
+
+func TestLoadOIDCCallbackPortDefaultsToZero(t *testing.T) {
+	// Unset means "let authenticateOIDC pick its own built-in default
+	// (8250)" — validate() must not force a value here so the .reg/registry
+	// round-trip and reg-export/reg-import stay lossless for an operator who
+	// never configured it.
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Vault.OIDCCallbackPort != 0 {
+		t.Errorf("Vault.OIDCCallbackPort = %d, want 0 (unset)", cfg.Vault.OIDCCallbackPort)
+	}
+}
+
+func TestLoadOIDCCallbackPortOutOfRange(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "oidc"
+  oidc_callback_port: 70000
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: yaml
+      merge: deep
+`
+	path := writeTemp(t, yaml)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for oidc_callback_port out of range")
+	}
+}
+
 func TestLoadLeastPrivilegePolicies(t *testing.T) {
 	yaml := `
 vault:

@@ -160,6 +160,7 @@ type registryLayer struct {
 	VaultAuthMethod          string
 	VaultAuthRole            string
 	VaultAuthMount           string
+	VaultOIDCCallbackPort    *uint32
 	VaultPolicies            []string
 	VaultNoDefaultPolicy     *uint32
 	VaultDisableTokenRenewal *uint32
@@ -245,6 +246,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultAuthMethod, _ = readRegString(vk, "AuthMethod")
 		layer.VaultAuthRole, _ = readRegString(vk, "AuthRole")
 		layer.VaultAuthMount, _ = readRegString(vk, "AuthMount")
+		layer.VaultOIDCCallbackPort = readRegDWORD(vk, "OIDCCallbackPort")
 		layer.VaultPolicies = readRegMultiString(vk, "Policies")
 		layer.VaultNoDefaultPolicy = readRegDWORD(vk, "NoDefaultPolicy")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
@@ -384,6 +386,9 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.VaultAuthMount != "" {
 		cfg.Vault.AuthMount = layer.VaultAuthMount
+	}
+	if layer.VaultOIDCCallbackPort != nil {
+		cfg.Vault.OIDCCallbackPort = int(*layer.VaultOIDCCallbackPort)
 	}
 	// Present (non-nil), not non-empty, gates the merge: readRegMultiString
 	// returns nil only when the value is absent, so an explicitly-set empty
@@ -667,6 +672,7 @@ func readSingleEnrolment(root registry.Key, basePath, name string) (Enrolment, e
 
 	enrolment := Enrolment{}
 	enrolment.Engine, _ = readRegString(key, "Engine")
+	enrolment.HelpText, _ = readRegString(key, "HelpText")
 
 	// Read optional Settings subkey, recursing into any nested subkeys
 	// so engines like "copy" with structured settings (e.g. settings.from

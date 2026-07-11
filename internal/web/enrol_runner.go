@@ -16,25 +16,27 @@ import (
 
 // EnrolStateInfo is the JSON-serializable view of an enrolment's state.
 type EnrolStateInfo struct {
-	Key        string   `json:"key"`
-	Engine     string   `json:"engine"`
-	EngineName string   `json:"name"`
-	Status     string   `json:"status"`
-	Fields     []string `json:"fields"`
-	Output     []string `json:"output,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	Key          string   `json:"key"`
+	Engine       string   `json:"engine"`
+	EngineName   string   `json:"name"`
+	Status       string   `json:"status"`
+	Fields       []string `json:"fields"`
+	Output       []string `json:"output,omitempty"`
+	Error        string   `json:"error,omitempty"`
+	HelpTextHTML string   `json:"help_text_html,omitempty"`
 }
 
 type enrolState struct {
-	key        string
-	engineName string // config engine string, e.g. "github"
-	engine     enrol.Engine
-	settings   map[string]any
-	status     string   // pending, running, complete, skipped, failed
-	output     []string // captured IO.Out lines
-	errMsg     string
-	doneCh     chan struct{} // closed when engine finishes
-	mu         sync.Mutex
+	key          string
+	engineName   string // config engine string, e.g. "github"
+	engine       enrol.Engine
+	settings     map[string]any
+	helpTextHTML string   // pre-rendered from config HelpText, mirroring Web.LoginText/SecretViewText
+	status       string   // pending, running, complete, skipped, failed
+	output       []string // captured IO.Out lines
+	errMsg       string
+	doneCh       chan struct{} // closed when engine finishes
+	mu           sync.Mutex
 }
 
 // Sentinel errors for enrolment operations.
@@ -72,24 +74,26 @@ func NewEnrolmentRunner(enrolments map[string]config.Enrolment) *EnrolmentRunner
 		if !ok {
 			slog.Warn("unknown enrolment engine", "key", key, "engine", e.Engine)
 			s := &enrolState{
-				key:        key,
-				engineName: e.Engine,
-				settings:   e.Settings,
-				status:     "failed",
-				errMsg:     fmt.Sprintf("unknown engine %q", e.Engine),
-				doneCh:     make(chan struct{}),
+				key:          key,
+				engineName:   e.Engine,
+				settings:     e.Settings,
+				helpTextHTML: renderMarkdown(e.HelpText),
+				status:       "failed",
+				errMsg:       fmt.Sprintf("unknown engine %q", e.Engine),
+				doneCh:       make(chan struct{}),
 			}
 			close(s.doneCh)
 			states[key] = s
 			continue
 		}
 		states[key] = &enrolState{
-			key:        key,
-			engineName: e.Engine,
-			engine:     engine,
-			settings:   e.Settings,
-			status:     "pending",
-			doneCh:     make(chan struct{}),
+			key:          key,
+			engineName:   e.Engine,
+			engine:       engine,
+			settings:     e.Settings,
+			helpTextHTML: renderMarkdown(e.HelpText),
+			status:       "pending",
+			doneCh:       make(chan struct{}),
 		}
 	}
 
@@ -126,11 +130,12 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 		}
 		s.mu.Lock()
 		info := EnrolStateInfo{
-			Key:    s.key,
-			Engine: s.engineName,
-			Status: s.status,
-			Output: append([]string{}, s.output...),
-			Error:  s.errMsg,
+			Key:          s.key,
+			Engine:       s.engineName,
+			Status:       s.status,
+			Output:       append([]string{}, s.output...),
+			Error:        s.errMsg,
+			HelpTextHTML: s.helpTextHTML,
 		}
 		if s.engine != nil {
 			info.EngineName = s.engine.Name()
@@ -211,11 +216,12 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info := EnrolStateInfo{
-		Key:    s.key,
-		Engine: s.engineName,
-		Status: s.status,
-		Output: append([]string{}, s.output...),
-		Error:  s.errMsg,
+		Key:          s.key,
+		Engine:       s.engineName,
+		Status:       s.status,
+		Output:       append([]string{}, s.output...),
+		Error:        s.errMsg,
+		HelpTextHTML: s.helpTextHTML,
 	}
 	if s.engine != nil {
 		info.EngineName = s.engine.Name()

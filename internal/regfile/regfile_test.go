@@ -365,6 +365,47 @@ func TestGroupedEnrolmentKeyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEnrolmentHelpTextRoundTrip verifies that an enrolment's admin-authored
+// HelpText — including a multi-line (and therefore hex(1)-encoded) value —
+// survives the .reg render -> parse cycle, mirroring Web's LoginText /
+// SecretViewText round trip.
+func TestEnrolmentHelpTextRoundTrip(t *testing.T) {
+	src := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{
+			{Name: "minimal", VaultKey: "minimal", Target: config.Target{Path: "~/.dotvault/minimal", Format: "text"}},
+		},
+		Enrolments: map[string]config.Enrolment{
+			"ghp": {
+				Engine:   "ghp",
+				HelpText: "Mints a **GitHub Proxy** session token.\nSign in via your browser to continue.",
+				Settings: map[string]any{"url": "https://ghp.example.com"},
+			},
+		},
+	}
+
+	text, err := GenerateText(src)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(text, `"HelpText"=hex(1):`) {
+		t.Errorf("rendered .reg missing hex(1)-encoded HelpText\n--- output ---\n%s", text)
+	}
+
+	got, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	e, ok := got.Enrolments["ghp"]
+	if !ok {
+		t.Fatalf("ghp enrolment did not round-trip; got %v", got.Enrolments)
+	}
+	want := "Mints a **GitHub Proxy** session token.\nSign in via your browser to continue."
+	if e.HelpText != want {
+		t.Errorf("HelpText = %q, want %q", e.HelpText, want)
+	}
+}
+
 func TestGenerateNestedMapSetting(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
@@ -878,10 +919,31 @@ func TestEmptyStringEmittedExplicitly(t *testing.T) {
 		`"AuthRole"=""`,
 		`"CACert"=""`,
 		`"TokenSocket"=""`,
+		`"OIDCCallbackPort"=dword:00000000`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in output (clearing semantics):\n%s", want, got)
 		}
+	}
+}
+
+// TestOIDCCallbackPortEmitted pins that a non-zero oidc_callback_port
+// round-trips through the .reg render as a REG_DWORD under Vault, matching
+// the bool-style scalars rather than being dropped like an unset string.
+func TestOIDCCallbackPortEmitted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{
+			Address:          "https://vault.example.com:8200",
+			OIDCCallbackPort: 8251,
+		},
+		Sync: config.SyncConfig{RawInterval: "15m"},
+	}
+	got, err := GenerateText(cfg)
+	if err != nil {
+		t.Fatalf("GenerateText: %v", err)
+	}
+	if !strings.Contains(got, `"OIDCCallbackPort"=dword:0000203b`) {
+		t.Errorf("expected OIDCCallbackPort dword:0000203b (8251) in output:\n%s", got)
 	}
 }
 

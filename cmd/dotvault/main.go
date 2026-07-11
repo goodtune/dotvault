@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -120,6 +124,7 @@ but driven by dotvault's loaded configuration (YAML or Group Policy).`,
 			RunE:  runStatus,
 		},
 		newEnrolCmd(),
+		newBrowseCmd(),
 		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),
@@ -351,17 +356,124 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 type refreshDeps struct {
 	load     func() (*config.Config, error)
 	interval time.Duration
-	// trackSyncTicks is set when the refresh cadence defaulted to
-	// sync.interval (no explicit remote_config.refresh_interval); the loop
-	// then follows a remotely-changed sync interval instead of staying
-	// pinned to the startup value.
-	trackSyncTicks bool
-	initial        *config.Config
+	initial  *config.Config
+	// initialStatic is the static-section snapshot taken at startup,
+	// before the daemon scrubs observability.headers from its long-lived
+	// config. The loop compares each reload against it to warn when a
+	// change cannot be applied without a restart.
+	initialStatic staticSections
+	// reload delivers manual reload requests (SIGHUP on Unix, the tray's
+	// "Reload config" entry on Windows) that run a refresh pass
+	// immediately instead of waiting for the next tick. A nil channel is
+	// fine — it just never fires.
+	reload         <-chan struct{}
 	engine         *sync.Engine
 	refreshManager *enrol.RefreshManager
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
+}
+
+// staticSections snapshots the config sections the daemon cannot apply
+// in-place: they configure subsystems constructed once at startup (the Vault
+// client, the web listener, the SSH agent, the OTel SDK). The refresh loop
+// diffs them only to tell the operator a restart is needed. remote_config is
+// deliberately NOT here: the withRemote loader rebuilds the overlay fetcher
+// whenever the section changes and the refresh loop re-derives its cadence
+// each pass, so the section applies live like the other dynamic sections.
+// Observability headers are reduced to a digest rather than retained: the
+// values carry OTLP bearer tokens that the daemon deliberately scrubs from
+// its long-lived config after the OTel SDK consumes them, and a comparison
+// snapshot must not reintroduce them into the heap.
+type staticSections struct {
+	Vault         config.VaultConfig
+	Web           config.WebConfig
+	Agent         config.AgentConfig
+	Observability config.ObservabilityConfig
+	HeadersDigest [sha256.Size]byte
+	Bypass        bool
+}
+
+func staticSectionsOf(c *config.Config) staticSections {
+	s := staticSections{
+		Vault:         c.Vault,
+		Web:           c.Web,
+		Agent:         c.Agent,
+		Observability: c.Observability,
+		HeadersDigest: digestHeaders(c.Observability.Headers),
+		Bypass:        c.BypassSystemConfig,
+	}
+	s.Observability.Headers = nil
+	return s
+}
+
+// headerDigestSalt is a per-process random value mixed into every header
+// digest. Digests are only ever compared against digests computed in the
+// same process, so the salt costs nothing — and it makes a digest recovered
+// from a heap or core dump useless for offline confirmation of guessed
+// header values.
+var headerDigestSalt = func() []byte {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// An unsalted digest is still correct for the same-process
+		// equality comparison this exists for.
+		return nil
+	}
+	return b
+}()
+
+// digestHeaders hashes a header map deterministically (sorted keys, each
+// key and value length-prefixed so no delimiter can be forged by the
+// content) so two snapshots can be compared for equality without either
+// retaining the header values. An empty or nil map digests to the zero
+// value.
+func digestHeaders(h map[string]string) [sha256.Size]byte {
+	if len(h) == 0 {
+		return [sha256.Size]byte{}
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	d := sha256.New()
+	d.Write(headerDigestSalt)
+	var lenBuf [8]byte
+	writeString := func(s string) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		d.Write(lenBuf[:])
+		d.Write([]byte(s))
+	}
+	for _, k := range keys {
+		writeString(k)
+		writeString(h[k])
+	}
+	var out [sha256.Size]byte
+	copy(out[:], d.Sum(nil))
+	return out
+}
+
+// changedStaticSections names the static config sections that differ between
+// two snapshots, using their YAML section names so the warning reads back to
+// the file the operator just edited.
+func changedStaticSections(a, b staticSections) []string {
+	var out []string
+	if !reflect.DeepEqual(a.Vault, b.Vault) {
+		out = append(out, "vault")
+	}
+	if !reflect.DeepEqual(a.Web, b.Web) {
+		out = append(out, "web")
+	}
+	if !reflect.DeepEqual(a.Agent, b.Agent) {
+		out = append(out, "agent")
+	}
+	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
+		out = append(out, "observability")
+	}
+	if a.Bypass != b.Bypass {
+		out = append(out, "bypass_system_config")
+	}
+	return out
 }
 
 // runConfigRefresh re-runs the daemon's config loader on a fixed tick — the
@@ -370,8 +482,14 @@ type refreshDeps struct {
 // changes to the running daemon: enrolments fan out to the enrolment manager
 // (CLI), the refresh/watch managers, and the web enrolment runner; rules and
 // the sync interval go to the sync engine and the web server's snapshots.
-// Static sections (vault, web, agent, observability) are exclusively local
-// and still require a restart, as documented.
+// A manual reload request (SIGHUP, tray) runs the same pass immediately.
+// remote_config changes also apply live: the withRemote loader rebuilds the
+// overlay fetcher when the section changes, and the loop re-derives its own
+// tick cadence (explicit remote_config.refresh_interval, else the sync
+// interval) after every pass. Static sections (vault, web, agent,
+// observability, and the top-level bypass_system_config flag) are applied
+// only at startup; when a reload finds them changed the loop warns that a
+// restart is required rather than half-applying them.
 func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -379,71 +497,111 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastEnrolments := d.initial.Enrolments
 	lastRules := d.initial.Rules
 	lastInterval := d.initial.Sync.Interval
+	lastCadence := d.interval
+	lastStatic := d.initialStatic
+
+	refresh := func() {
+		reloaded, err := d.load()
+		if err != nil {
+			observability.RecordConfigReload(ctx, "error")
+			slog.Warn("config reload failed", "error", err)
+			return
+		}
+
+		changed := false
+
+		if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+			// All-or-nothing: when the web runner is busy with a
+			// running enrolment the whole enrolment update is
+			// deferred (lastEnrolments stays put), so the next tick
+			// retries every consumer together rather than leaving
+			// the managers and the web runner disagreeing.
+			if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
+				slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
+			} else {
+				changed = true
+				slog.Info("enrolments config changed, re-checking")
+				if d.enrolManager != nil {
+					d.enrolManager.UpdateConfig(reloaded.Enrolments)
+				}
+				d.refreshManager.UpdateConfig(reloaded.Enrolments)
+				d.watchManager.UpdateConfig(reloaded.Enrolments)
+				lastEnrolments = reloaded.Enrolments
+			}
+		}
+
+		rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
+		intervalChanged := reloaded.Sync.Interval != lastInterval
+		if rulesChanged || intervalChanged {
+			changed = true
+			d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
+			if d.web != nil {
+				d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
+			}
+			lastRules = reloaded.Rules
+			lastInterval = reloaded.Sync.Interval
+		}
+
+		// Re-derive this loop's own cadence from the reloaded config,
+		// mirroring the startup rule: an explicit
+		// remote_config.refresh_interval wins, else the sync interval.
+		// This keeps remote_config fully dynamic — the withRemote loader
+		// already rebuilds the overlay fetcher when the section changes,
+		// so the cadence was the only piece pinned at startup.
+		cadence := reloaded.Sync.Interval
+		if reloaded.RemoteConfig.RefreshInterval > 0 {
+			cadence = reloaded.RemoteConfig.RefreshInterval
+		}
+		if cadence > 0 && cadence != lastCadence {
+			changed = true
+			ticker.Reset(cadence)
+			lastCadence = cadence
+		}
+
+		// Static sections can't be applied in place, so a change is a
+		// warning, not an application. The diff is always taken against
+		// initialStatic — the configuration the running subsystems were
+		// actually built from — so it names exactly what a restart would
+		// change; lastStatic only deduplicates, keeping it one message
+		// per edit rather than one per tick. An edit that reverts the
+		// file back to the running configuration logs an all-clear
+		// instead of a false restart-required warning.
+		if reloadedStatic := staticSectionsOf(reloaded); !reflect.DeepEqual(reloadedStatic, lastStatic) {
+			if sections := changedStaticSections(d.initialStatic, reloadedStatic); len(sections) > 0 {
+				slog.Warn("static configuration sections changed; restart the daemon to apply them",
+					"sections", strings.Join(sections, ", "))
+			} else {
+				slog.Info("static configuration sections match the running configuration again; restart no longer needed")
+			}
+			lastStatic = reloadedStatic
+		}
+
+		if changed {
+			observability.RecordConfigReload(ctx, "applied")
+		} else {
+			observability.RecordConfigReload(ctx, "no_change")
+		}
+
+		// CLI mode keeps its historical behaviour: re-check enrolments
+		// every tick and trigger a sync when something newly enrolled.
+		if d.enrolManager != nil {
+			if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
+				slog.Warn("enrolment check failed", "error", err)
+			} else if ok {
+				d.engine.TriggerSync()
+			}
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reloaded, err := d.load()
-			if err != nil {
-				observability.RecordConfigReload(ctx, "error")
-				slog.Warn("config reload failed", "error", err)
-				continue
-			}
-
-			changed := false
-
-			if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-				// All-or-nothing: when the web runner is busy with a
-				// running enrolment the whole enrolment update is
-				// deferred (lastEnrolments stays put), so the next tick
-				// retries every consumer together rather than leaving
-				// the managers and the web runner disagreeing.
-				if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
-					slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
-				} else {
-					changed = true
-					slog.Info("enrolments config changed, re-checking")
-					if d.enrolManager != nil {
-						d.enrolManager.UpdateConfig(reloaded.Enrolments)
-					}
-					d.refreshManager.UpdateConfig(reloaded.Enrolments)
-					d.watchManager.UpdateConfig(reloaded.Enrolments)
-					lastEnrolments = reloaded.Enrolments
-				}
-			}
-
-			rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
-			intervalChanged := reloaded.Sync.Interval != lastInterval
-			if rulesChanged || intervalChanged {
-				changed = true
-				d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
-				if d.web != nil {
-					d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
-				}
-				if intervalChanged && d.trackSyncTicks {
-					ticker.Reset(reloaded.Sync.Interval)
-				}
-				lastRules = reloaded.Rules
-				lastInterval = reloaded.Sync.Interval
-			}
-
-			if changed {
-				observability.RecordConfigReload(ctx, "applied")
-			} else {
-				observability.RecordConfigReload(ctx, "no_change")
-			}
-
-			// CLI mode keeps its historical behaviour: re-check enrolments
-			// every tick and trigger a sync when something newly enrolled.
-			if d.enrolManager != nil {
-				if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
-					slog.Warn("enrolment check failed", "error", err)
-				} else if ok {
-					d.engine.TriggerSync()
-				}
-			}
+			refresh()
+		case <-d.reload:
+			slog.Info("manual config reload requested, re-reading configuration")
+			refresh()
 		}
 	}
 }
@@ -563,6 +721,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Headers map, and the scrub below only reassigns cfg's field, so this
 	// copy retains the real headers. Only consumed when web is enabled.
 	obsCfgForWeb := cfg.Observability
+	// Snapshot the static config sections before the scrub below so the
+	// config-refresh loop can warn when a reload changes a section that
+	// needs a restart. The snapshot reduces observability.headers to a
+	// digest, so it does not retain the bearer tokens the scrub removes.
+	initialStatic := staticSectionsOf(cfg)
 	// Zero out the bearer-token map on the daemon's long-lived cfg now that
 	// the SDK has consumed it. cfg lives for the daemon's full lifetime;
 	// keeping Headers in the heap-resident Config struct gives a future log
@@ -579,19 +742,38 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Windows box) or be lost to the no-op global logger.
 	emitConfigSourceLog(ctx, cfg, cfgPath)
 
-	// Handle signals. SIGHUP triggers an immediate ~/.dotvault-token re-read
-	// via the LifecycleManager so a fresh token written by `dotvault
-	// login` is picked up within seconds, without waiting for the
-	// 5-minute tick. This is the manual counterpart to the in-process
-	// inotify watcher (internal/tokenwatch) wired in further down, which
-	// performs the same re-read automatically on token-file changes.
-	// Full config reload on SIGHUP is still not implemented.
+	// Handle signals. SIGHUP is the daemon's reload trigger: it re-reads
+	// ~/.dotvault-token immediately via the LifecycleManager (so a fresh
+	// token written by `dotvault login` is picked up within seconds,
+	// without waiting for the 5-minute tick — the manual counterpart to
+	// the in-process inotify watcher wired in further down) AND nudges
+	// the config-refresh loop to re-run the loader now instead of on its
+	// next tick. Dynamic sections (rules, enrolments, sync interval)
+	// apply in place; the refresh loop warns when static sections changed
+	// and a restart is required. On Windows SIGHUP is not delivered; the
+	// tray's "Reload config" entry drives the same two calls instead.
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
-	// auth completes further down). A SIGHUP arriving before lm exists is
-	// metered and logged as a debug no-op rather than dropped silently.
+	// auth completes further down). A reload arriving before lm exists
+	// skips the token re-read (there is no token to manage yet) but is not
+	// dropped: configReloadCh is buffered, so the nudge sits pending until
+	// the refresh loop starts and consumes it.
 	var lmPtr atomic.Pointer[auth.LifecycleManager]
+	configReloadCh := make(chan struct{}, 1)
+	// reloadNow is the shared body of the daemon's manual reload triggers
+	// (SIGHUP here, the tray's "Reload config" entry further down).
+	reloadNow := func() {
+		if lm := lmPtr.Load(); lm != nil {
+			lm.Reload()
+		} else {
+			slog.Debug("reload requested before lifecycle manager is ready; skipping token re-read, config reload deferred")
+		}
+		select {
+		case configReloadCh <- struct{}{}:
+		default: // a reload is already pending
+		}
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -602,12 +784,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				cancel()
 			case syscall.SIGHUP:
 				observability.RecordSIGHUP(ctx)
-				if lm := lmPtr.Load(); lm != nil {
-					slog.Info("received SIGHUP, re-reading vault token file")
-					lm.Reload()
-				} else {
-					slog.Debug("received SIGHUP before lifecycle manager is ready; ignoring")
-				}
+				slog.Info("received SIGHUP, re-reading vault token file and reloading configuration")
+				reloadNow()
 			}
 		}
 	}()
@@ -735,15 +913,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// needs a TTY (or the configured BYO cert); the flow surfaces a
 			// clear error if neither is available.
 			mgr := &auth.Manager{
-				VaultClient:   vc,
-				TokenFilePath: tokenPath,
-				AuthMethod:    cfg.Vault.AuthMethod,
-				AuthMount:     cfg.Vault.AuthMount,
-				AuthRole:      cfg.Vault.AuthRole,
-				TokenSocket:   cfg.Vault.TokenSocket,
-				Policy:        vaultPolicyConstraint(cfg),
-				Username:      username,
-				MTLS:          mtlsParams(cfg, username),
+				VaultClient:      vc,
+				TokenFilePath:    tokenPath,
+				AuthMethod:       cfg.Vault.AuthMethod,
+				AuthMount:        cfg.Vault.AuthMount,
+				AuthRole:         cfg.Vault.AuthRole,
+				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+				TokenSocket:      cfg.Vault.TokenSocket,
+				Policy:           vaultPolicyConstraint(cfg),
+				Username:         username,
+				MTLS:             mtlsParams(cfg, username),
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -783,15 +962,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// Traditional auth flow (OIDC with ephemeral listener, LDAP
 			// prompt, or token file).
 			mgr := &auth.Manager{
-				VaultClient:   vc,
-				TokenFilePath: tokenPath,
-				AuthMethod:    cfg.Vault.AuthMethod,
-				AuthMount:     cfg.Vault.AuthMount,
-				AuthRole:      cfg.Vault.AuthRole,
-				TokenSocket:   cfg.Vault.TokenSocket,
-				Policy:        vaultPolicyConstraint(cfg),
-				Username:      username,
-				MTLS:          mtlsParams(cfg, username),
+				VaultClient:      vc,
+				TokenFilePath:    tokenPath,
+				AuthMethod:       cfg.Vault.AuthMethod,
+				AuthMount:        cfg.Vault.AuthMount,
+				AuthRole:         cfg.Vault.AuthRole,
+				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+				TokenSocket:      cfg.Vault.TokenSocket,
+				Policy:           vaultPolicyConstraint(cfg),
+				Username:         username,
+				MTLS:             mtlsParams(cfg, username),
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -823,15 +1003,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// only mints when due, using the current operational token.
 	if mtlsP := mtlsParams(cfg, username); mtlsP != nil {
 		reissueMgr := &auth.Manager{
-			VaultClient:   vc,
-			TokenFilePath: tokenPath,
-			AuthMethod:    cfg.Vault.AuthMethod,
-			AuthMount:     cfg.Vault.AuthMount,
-			AuthRole:      cfg.Vault.AuthRole,
-			TokenSocket:   cfg.Vault.TokenSocket,
-			Policy:        vaultPolicyConstraint(cfg),
-			Username:      username,
-			MTLS:          mtlsP,
+			VaultClient:      vc,
+			TokenFilePath:    tokenPath,
+			AuthMethod:       cfg.Vault.AuthMethod,
+			AuthMount:        cfg.Vault.AuthMount,
+			AuthRole:         cfg.Vault.AuthRole,
+			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+			TokenSocket:      cfg.Vault.TokenSocket,
+			Policy:           vaultPolicyConstraint(cfg),
+			Username:         username,
+			MTLS:             mtlsP,
 		}
 		go func() {
 			ticker := time.NewTicker(time.Hour)
@@ -1039,8 +1220,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	go runConfigRefresh(ctx, refreshDeps{
 		load:           loadCfg,
 		interval:       refreshInterval,
-		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
 		initial:        cfg,
+		initialStatic:  initialStatic,
+		reload:         configReloadCh,
 		engine:         engine,
 		refreshManager: rm,
 		watchManager:   wm,
@@ -1102,6 +1284,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		OnExit: func() {
 			slog.Info("exit requested from tray")
 			cancel()
+		},
+		// Windows never delivers SIGHUP, so the tray menu is dotvaultw's
+		// (and the console daemon's) reload trigger. Same body as the
+		// SIGHUP handler: token-file re-read plus an immediate
+		// config-refresh pass.
+		OnReload: func() {
+			slog.Info("config reload requested from tray, re-reading vault token file and reloading configuration")
+			reloadNow()
 		},
 	}
 	if webServer != nil {
@@ -1347,15 +1537,16 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: paths.VaultTokenPath(),
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    paths.VaultTokenPath(),
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1633,15 +1824,16 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve username: %w", err)
 	}
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: tokenPath,
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    tokenPath,
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 	if !quiet {
 		printLoginNotice(os.Stderr, loginReason)
@@ -1868,15 +2060,16 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 	}
 
 	mgr := &auth.Manager{
-		VaultClient:   vc,
-		TokenFilePath: paths.VaultTokenPath(),
-		AuthMethod:    cfg.Vault.AuthMethod,
-		AuthMount:     cfg.Vault.AuthMount,
-		AuthRole:      cfg.Vault.AuthRole,
-		TokenSocket:   cfg.Vault.TokenSocket,
-		Policy:        vaultPolicyConstraint(cfg),
-		Username:      username,
-		MTLS:          mtlsParams(cfg, username),
+		VaultClient:      vc,
+		TokenFilePath:    paths.VaultTokenPath(),
+		AuthMethod:       cfg.Vault.AuthMethod,
+		AuthMount:        cfg.Vault.AuthMount,
+		AuthRole:         cfg.Vault.AuthRole,
+		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+		TokenSocket:      cfg.Vault.TokenSocket,
+		Policy:           vaultPolicyConstraint(cfg),
+		Username:         username,
+		MTLS:             mtlsParams(cfg, username),
 	}
 
 	if err := mgr.Authenticate(ctx); err != nil {

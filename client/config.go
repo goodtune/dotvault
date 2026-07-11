@@ -76,6 +76,12 @@ type VaultConfig struct {
 	// AuthRole is an optional Vault role passed to the auth method.
 	AuthRole string
 
+	// OIDCCallbackPort is the fixed local TCP port an interactive OIDC Login
+	// binds for the OAuth redirect_uri. Zero (the default) resolves to 8250,
+	// matching the `vault` CLI's own default; if that port is unavailable,
+	// Login falls back to a random port. Mirrors vault.oidc_callback_port.
+	OIDCCallbackPort int
+
 	// Policies is the least-privilege set of Vault policies the working token
 	// should carry. When non-empty, an interactive Login exchanges the login
 	// token for a child token restricted to exactly these policies (Vault
@@ -149,17 +155,18 @@ func LoadConfig(path string) (*Config, error) {
 func fromInternal(cfg *config.Config) *Config {
 	return &Config{
 		Vault: VaultConfig{
-			Address:         cfg.Vault.Address,
-			CACert:          cfg.Vault.CACert,
-			TLSSkipVerify:   cfg.Vault.TLSSkipVerify,
-			KVMount:         cfg.Vault.KVMount,
-			UserPrefix:      cfg.Vault.UserPrefix,
-			AuthMethod:      cfg.Vault.AuthMethod,
-			AuthMount:       cfg.Vault.AuthMount,
-			AuthRole:        cfg.Vault.AuthRole,
-			TokenSocket:     cfg.Vault.TokenSocket,
-			Policies:        cfg.Vault.Policies,
-			NoDefaultPolicy: cfg.Vault.NoDefaultPolicy,
+			Address:          cfg.Vault.Address,
+			CACert:           cfg.Vault.CACert,
+			TLSSkipVerify:    cfg.Vault.TLSSkipVerify,
+			KVMount:          cfg.Vault.KVMount,
+			UserPrefix:       cfg.Vault.UserPrefix,
+			AuthMethod:       cfg.Vault.AuthMethod,
+			AuthMount:        cfg.Vault.AuthMount,
+			AuthRole:         cfg.Vault.AuthRole,
+			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
+			TokenSocket:      cfg.Vault.TokenSocket,
+			Policies:         cfg.Vault.Policies,
+			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,
 		},
 	}
 }

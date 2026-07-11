@@ -21,9 +21,9 @@ func New(path string, onChange func()) (*Watcher, error) {
 }
 
 // Run blocks until ctx is cancelled and returns ctx.Err(). onChange is
-// never invoked: macOS and Windows had no systemd path-unit equivalent
-// to replace, and SIGHUP (where delivered) remains the manual re-read
-// nudge.
+// never invoked: non-Linux platforms had no systemd path-unit
+// equivalent to replace, and the manual re-read nudge remains available
+// (SIGHUP where delivered, the tray's "Reload config" entry on Windows).
 func (w *Watcher) Run(ctx context.Context) error {
 	<-ctx.Done()
 	return ctx.Err()

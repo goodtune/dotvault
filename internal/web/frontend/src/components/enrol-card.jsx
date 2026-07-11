@@ -43,7 +43,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
       pollRef.current = null;
     }
     // Only engines that block on interactive terminal input (ssh's passphrase)
-    // need the /enrol/prompt poll. github and jfrog are fully browser-driven.
+    // need the /enrol/prompt poll. github, jfrog, and ghp are fully browser-driven.
     const needsPrompt = enrolment.engine === 'ssh';
     pollRef.current = setInterval(async () => {
       try {
@@ -129,10 +129,10 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
   }
 
   // Parse device code and verification URL from the engine's line-oriented
-  // output. Both github and jfrog emit a "! First, copy your one-time code: X"
-  // line; jfrog then emits "✓ Opened https://... in browser", github emits
-  // "- Press Enter to open https://... in your browser...". Either shape
-  // contains an https URL we can link to.
+  // output. github, jfrog, and ghp all emit a "! First, copy your one-time
+  // code: X" line followed by a line containing an https URL ("✓ Opened
+  // https://... in browser", or github's "- Press Enter to open https://..."),
+  // so either shape contains an https URL we can link to.
   const deviceCode = output.reduce((found, line) => {
     const match = line.match(/one-time code:\s*(\S+)/);
     return match ? match[1] : found;
@@ -314,6 +314,7 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
           h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
         ),
       ),
+      h(EnrolHelpText, { html: enrolment.help_text_html }),
       h('p', { class: 'enrol-error-text' }, error),
     );
   }
@@ -330,8 +331,17 @@ export function EnrolCard({ enrolment, onUpdate, anyRunning, displayName }) {
         h('button', { class: 'enrol-btn-secondary', onClick: handleSkip, disabled: startDisabled }, 'Skip'),
       ),
     ),
+    h(EnrolHelpText, { html: enrolment.help_text_html }),
     error && h('p', { class: 'enrol-error-text' }, error),
   );
+}
+
+// EnrolHelpText renders the admin-authored, markdown-to-HTML help text the
+// backend attaches to each enrolment (config.Enrolment.HelpText, rendered by
+// internal/web/markdown.go). Absent for enrolments with no configured text.
+function EnrolHelpText({ html }) {
+  if (!html) return null;
+  return h('div', { class: 'custom-text enrol-help-text', dangerouslySetInnerHTML: { __html: html } });
 }
 
 function engineDescription(engine) {
@@ -339,6 +349,7 @@ function engineDescription(engine) {
     case 'github': return 'OAuth token via device flow';
     case 'jfrog': return 'Refreshable access token via web login';
     case 'databricks': return 'OAuth U2M token via browser login';
+    case 'ghp': return 'CLI session token via device flow';
     case 'ssh': return 'Ed25519 key generation';
     case 'copy': return 'Mirror an existing Vault secret';
     default: return engine;

@@ -27,6 +27,11 @@ type Manager struct {
 	AuthMount  string // auth mount path
 	AuthRole   string // optional role
 	Username   string
+	// OIDCCallbackPort is the fixed local TCP port authenticateOIDC binds for
+	// the OAuth redirect_uri (vault.oidc_callback_port). Zero defaults to
+	// 8250 (the `vault` CLI's own default); if that port is unavailable,
+	// authenticateOIDC falls back to a random port. See oidc.go.
+	OIDCCallbackPort int
 	// TokenSocket is an optional path to a peer dotvault's web-API Unix
 	// socket. When set, Login first tries to borrow a live token from the
 	// peer (dotvault-to-dotvault sharing) before running the configured

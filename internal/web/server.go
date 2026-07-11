@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/pkg/browser"
+
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -80,6 +82,17 @@ type Server struct {
 	enrolRunner        *EnrolmentRunner
 	shutdownCtx        context.Context
 	shutdownCancel     context.CancelFunc
+	// openBrowser launches a URL in this host's default browser for the
+	// remote-browse endpoint. NewServer always sets it (browser.OpenURL
+	// unless ServerConfig.OpenBrowser overrides it, as tests do), so the
+	// endpoint cannot be disabled via config; the handler's nil guard
+	// (503) only protects hand-constructed Servers in tests.
+	openBrowser func(string) error
+	// browseOpenMu is the remote-browse single-flight gate: only one
+	// browser-opener call may be in flight, because a hung launcher is
+	// abandoned (not killed) by the handler's bounded wait and unbounded
+	// concurrent requests would otherwise pile up stuck goroutines.
+	browseOpenMu sync.Mutex
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's
@@ -126,6 +139,10 @@ type ServerConfig struct {
 	Username      string
 	TokenFilePath string
 	Version       string
+	// OpenBrowser, when non-nil, overrides how the remote-browse endpoint
+	// launches URLs in this host's default browser (tests inject a fake).
+	// Nil selects the real browser.OpenURL.
+	OpenBrowser func(string) error
 }
 
 // NewServer creates a new web server.
@@ -173,6 +190,10 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		secretViewTextHTML: renderMarkdown(sc.WebCfg.SecretViewText),
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
+		openBrowser:        sc.OpenBrowser,
+	}
+	if s.openBrowser == nil {
+		s.openBrowser = browser.OpenURL
 	}
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
@@ -216,6 +237,12 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
+	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
+	// rationale (bare-curl consumer over a forwarded socket; nothing
+	// sensitive read or returned). Cross-site browser traffic is rejected
+	// by the handler's Origin check instead, and the side effect is limited
+	// by a strict http/https scheme allowlist.
+	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
@@ -580,7 +607,8 @@ func routeLabel(p string) string {
 		p == "/api/v1/config",
 		p == "/api/v1/config/download",
 		p == "/api/v1/token",
-		p == "/api/v1/sync":
+		p == "/api/v1/sync",
+		p == "/api/v1/remote/browse":
 		return p
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without
@@ -614,7 +642,14 @@ func (s *Server) hostAllowed(r *http.Request) bool {
 		host = h
 	}
 	host = unwrapIPv6(host)
+	return s.loopbackHostname(host)
+}
 
+// loopbackHostname applies the loopback-identity allowlist to a bare
+// hostname (no port, IPv6 brackets already unwrapped). Shared by the Host
+// check above and the remote-browse Origin check, so both enforce the same
+// notion of "names this daemon's loopback listener".
+func (s *Server) loopbackHostname(host string) bool {
 	// IP literals: accept any form that resolves to a loopback address.
 	// This covers "127.0.0.1", "::1", the long-form "0:0:0:0:0:0:0:1",
 	// "::ffff:127.0.0.1", and the entire 127.0.0.0/8 loopback range —

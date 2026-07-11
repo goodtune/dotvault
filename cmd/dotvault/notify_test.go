@@ -120,6 +120,53 @@ func TestRunNotify_PrefersPeerSocket(t *testing.T) {
 	}
 }
 
+func TestRunNotify_ActionURLFlagReachesPeer(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "p.sock")
+	var peerActionURL string
+	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		peerActionURL = r.FormValue("action_url")
+		_, _ = w.Write([]byte(`{"status":"notification delivered"}`))
+	})
+
+	prevCfg := flagConfig
+	flagConfig = writeBrowseConfig(t, sock)
+	t.Cleanup(func() { flagConfig = prevCfg })
+
+	cmd := newNotifyCmd()
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Set("action-url", "https://ci.example/build/42"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNotify(cmd, []string{"info", "Build done"}); err != nil {
+		t.Fatalf("runNotify: %v", err)
+	}
+	if peerActionURL != "https://ci.example/build/42" {
+		t.Errorf("peer got action_url = %q, want the flag value", peerActionURL)
+	}
+}
+
+func TestRunNotify_RejectsBadActionURLFlag(t *testing.T) {
+	cmd := newNotifyCmd()
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Set("action-url", "file:///etc/passwd"); err != nil {
+		t.Fatal(err)
+	}
+	// A bad action URL must fail locally before config load or any peer/local
+	// delivery, like a bad level.
+	prevSend := sendLocalNotification
+	called := false
+	sendLocalNotification = func(notify.Message) error { called = true; return nil }
+	t.Cleanup(func() { sendLocalNotification = prevSend })
+
+	if err := runNotify(cmd, []string{"info", "t"}); err == nil {
+		t.Fatal("expected an error for a non-http(s) action URL")
+	}
+	if called {
+		t.Error("local notifier was called despite a rejected action URL")
+	}
+}
+
 func TestRunNotify_FallsBackWhenPeerUnreachable(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "absent.sock")
 

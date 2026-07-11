@@ -64,11 +64,47 @@ func TestNotify_PostsToPeer(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"notification delivered"}`))
 	})
 
-	if err := newBrowseClient(t, sock).Notify(context.Background(), "error", "Job failed", "see logs"); err != nil {
+	if err := newBrowseClient(t, sock).Notify(context.Background(), "error", "Job failed", "see logs", ""); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 	if level != "error" || title != "Job failed" || body != "see logs" {
 		t.Errorf("peer got level=%q title=%q body=%q, want the posted fields", level, title, body)
+	}
+}
+
+func TestNotify_PostsActionURL(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	var actionURL string
+	newUnixActionServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		actionURL = r.PostFormValue("action_url")
+		_, _ = w.Write([]byte(`{"status":"notification delivered"}`))
+	})
+
+	err := newBrowseClient(t, sock).Notify(context.Background(), "info", "Build done", "", "https://ci.example/42")
+	if err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if actionURL != "https://ci.example/42" {
+		t.Errorf("peer got action_url = %q, want the posted URL", actionURL)
+	}
+}
+
+func TestNotify_OmitsEmptyActionURL(t *testing.T) {
+	// An empty actionURL must not be sent as a field at all.
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	present := true
+	newUnixActionServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		_, present = r.PostForm["action_url"]
+		_, _ = w.Write([]byte(`{"status":"notification delivered"}`))
+	})
+
+	if err := newBrowseClient(t, sock).Notify(context.Background(), "info", "t", "", ""); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	if present {
+		t.Error("action_url field was sent despite being empty")
 	}
 }
 
@@ -126,7 +162,7 @@ func TestNotify_PeerActionFailedIsUnavailable(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"no notification daemon"}`))
 	})
 
-	err := newBrowseClient(t, sock).Notify(context.Background(), "info", "hi", "")
+	err := newBrowseClient(t, sock).Notify(context.Background(), "info", "hi", "", "")
 	if !errors.Is(err, ErrPeerUnavailable) {
 		t.Fatalf("err = %v, want ErrPeerUnavailable for a 502 delivery failure", err)
 	}

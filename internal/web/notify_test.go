@@ -20,6 +20,48 @@ func postNotify(level, title, body string) *http.Request {
 	return req
 }
 
+func postNotifyForm(form url.Values) *http.Request {
+	req := httptest.NewRequest("POST", "/api/v1/remote/notify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
+}
+
+func TestHandleRemoteNotify_AcceptsActionURL(t *testing.T) {
+	s := testServer(t)
+	var got notify.Message
+	s.sendNotification = func(m notify.Message) error {
+		got = m
+		return nil
+	}
+	form := url.Values{"level": {"info"}, "title": {"t"}, "action_url": {"https://ci.example/build/42"}}
+	w := httptest.NewRecorder()
+	s.handleRemoteNotify(w, postNotifyForm(form))
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	if got.ActionURL != "https://ci.example/build/42" {
+		t.Errorf("delivered ActionURL = %q, want the posted URL", got.ActionURL)
+	}
+}
+
+func TestHandleRemoteNotify_RejectsBadActionURL(t *testing.T) {
+	s := testServer(t)
+	called := false
+	s.sendNotification = func(notify.Message) error {
+		called = true
+		return nil
+	}
+	form := url.Values{"level": {"info"}, "title": {"t"}, "action_url": {"file:///etc/passwd"}}
+	w := httptest.NewRecorder()
+	s.handleRemoteNotify(w, postNotifyForm(form))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a non-http(s) action URL", w.Code)
+	}
+	if called {
+		t.Error("sendNotification was called for an invalid action URL")
+	}
+}
+
 func TestHandleRemoteNotify_Delivers(t *testing.T) {
 	s := testServer(t)
 	var got notify.Message

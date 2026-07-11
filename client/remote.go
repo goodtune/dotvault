@@ -39,17 +39,25 @@ func (c *Client) Browse(ctx context.Context, rawURL string) error {
 // a toast/notification on the workstation.
 //
 // level must be one of "info", "warning", "error", "attention"; title is
-// required; body is optional. The level and text are validated and sanitized
-// authoritatively by the peer endpoint (the same neutralization the daemon
-// applies before delivery), so a bad level or empty title comes back as a
-// plain (uncategorised) error carrying the peer's message. A peer that cannot
-// be reached, or that reports it could not deliver, wraps ErrPeerUnavailable.
-func (c *Client) Notify(ctx context.Context, level, title, body string) error {
-	return c.peerAction(ctx, "notify", "/api/v1/remote/notify", url.Values{
+// required; body and actionURL are optional. actionURL, when set, is an
+// http/https link the notification takes the user to when clicked — clickable
+// on Windows, appended to the body on macOS/Linux (see the notify docs). The
+// level, text, and action URL are validated and sanitized authoritatively by
+// the peer endpoint (the same neutralization the daemon applies before
+// delivery), so a bad level, empty title, or malformed action URL comes back
+// as a plain (uncategorised) error carrying the peer's message. A peer that
+// cannot be reached, or that reports it could not deliver, wraps
+// ErrPeerUnavailable.
+func (c *Client) Notify(ctx context.Context, level, title, body, actionURL string) error {
+	form := url.Values{
 		"level": {level},
 		"title": {title},
 		"body":  {body},
-	})
+	}
+	if actionURL != "" {
+		form.Set("action_url", actionURL)
+	}
+	return c.peerAction(ctx, "notify", "/api/v1/remote/notify", form)
 }
 
 // peerAction posts a peer-action form to apiPath over the configured

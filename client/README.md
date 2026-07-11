@@ -72,12 +72,14 @@ Over the same `TokenSocket` peer, the client can ask the workstation dotvault to
 if err := cli.Browse(ctx, "https://example.com/report"); err != nil {
     // errors.Is(err, client.ErrPeerUnavailable) → no socket / peer down / open failed
 }
-if err := cli.Notify(ctx, "info", "Backup complete", "42 files, 0 errors"); err != nil {
+if err := cli.Notify(ctx, "info", "Backup complete", "42 files, 0 errors", ""); err != nil {
     // same taxonomy as Browse
 }
+// Attach a clickable link (opens on click on Windows; appended to the body on macOS/Linux):
+cli.Notify(ctx, "error", "Build failed", "click for the run", "https://ci.example/build/42")
 ```
 
-`Browse`/`Notify` differ from the `dotvault` CLIs in two deliberate ways: there is **no local fallback** (a headless library has no local browser or notifier), so an unreachable peer is an error rather than a silent local open; and there is **no local validation** — the peer endpoint validates and sanitizes the URL / level / title authoritatively (that is where the action happens and where the security boundary belongs), so the facade stays a thin transport. A peer that is not configured, cannot be reached, or reports it could not perform the action returns `ErrPeerUnavailable`; a request the peer *rejects as invalid* (a non-`http(s)` URL, an unknown level, an empty title) returns a plain error carrying the peer's message. `Notify`'s level is one of `info`, `warning`, `error`, `attention`.
+`Browse`/`Notify` differ from the `dotvault` CLIs in two deliberate ways: there is **no local fallback** (a headless library has no local browser or notifier), so an unreachable peer is an error rather than a silent local open; and there is **no local validation** — the peer endpoint validates and sanitizes the URL / level / title authoritatively (that is where the action happens and where the security boundary belongs), so the facade stays a thin transport. A peer that is not configured, cannot be reached, or reports it could not perform the action returns `ErrPeerUnavailable`; a request the peer *rejects as invalid* (a non-`http(s)` URL, an unknown level, an empty title) returns a plain error carrying the peer's message. `Notify`'s level is one of `info`, `warning`, `error`, `attention`; its final argument is an optional `actionURL` — an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux). Pass `""` for no link.
 
 ## Error categories
 

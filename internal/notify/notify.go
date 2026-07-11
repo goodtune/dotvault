@@ -16,7 +16,9 @@
 package notify
 
 import (
+	"errors"
 	"fmt"
+	"net/url"
 	"runtime"
 	"strings"
 	"unicode"
@@ -100,14 +102,22 @@ type Message struct {
 	Level Level
 	Title string
 	Body  string
+	// ActionURL, when non-empty, is an http/https URL the notification should
+	// take the user to when clicked. It is validated by NewMessage. Whether it
+	// is actually *clickable* is platform-dependent: on Windows the toast is
+	// activated to open the URL; on macOS/Linux, where a one-shot delivery
+	// cannot register a click handler, the URL is appended to the body so it
+	// stays visible and copyable (see actionBody / platformDeliver).
+	ActionURL string
 }
 
 // NewMessage validates and sanitizes the inputs into a Message. The level
 // must be a known level; the title must be non-empty after sanitization; the
 // body is optional. Title and body are sanitized (control characters removed,
 // delivery-backend metacharacters neutralized — see sanitize) and capped in
-// length.
-func NewMessage(level, title, body string) (Message, error) {
+// length. actionURL is optional; when set it must be an http/https URL with a
+// host and no embedded credentials.
+func NewMessage(level, title, body, actionURL string) (Message, error) {
 	l, err := ParseLevel(level)
 	if err != nil {
 		return Message{}, err
@@ -116,7 +126,45 @@ func NewMessage(level, title, body string) (Message, error) {
 	if title == "" {
 		return Message{}, fmt.Errorf("notification title must not be empty")
 	}
-	return Message{Level: l, Title: title, Body: sanitize(body, maxBodyLen)}, nil
+	au, err := validateActionURL(actionURL)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{Level: l, Title: title, Body: sanitize(body, maxBodyLen), ActionURL: au}, nil
+}
+
+// validateActionURL enforces the same allowlist the browse endpoint applies to
+// a URL handed to an OS opener: an absolute http/https URL with a host and no
+// embedded user:pass@ credentials, free of control characters. It returns the
+// canonical serialized URL, or "" for an empty (absent) input. It duplicates
+// web.ValidateBrowseURL's rules deliberately — internal/web imports
+// internal/notify, so importing back would cycle, and the action URL has its
+// own delivery-sink concerns (see safeToastArgs).
+func validateActionURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid action url: %v", err)
+	}
+	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("action url must be http or https (got %q)", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return "", errors.New("action url has no host")
+	}
+	if u.User != nil {
+		return "", errors.New("action url must not contain embedded credentials")
+	}
+	s := u.String()
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return "", errors.New("action url must not contain control characters")
+		}
+	}
+	return s, nil
 }
 
 // sanitize prepares an untrusted title/body for delivery: it collapses control
@@ -200,14 +248,56 @@ type Notifier func(Message) error
 // Send delivers msg via the platform's native notification mechanism. It is
 // the default Notifier. A level's urgency selects an audible alert (error /
 // attention) or a normal notification (info / warning), and on platforms that
-// accept a named stock icon the level's icon is shown.
+// accept a named stock icon the level's icon is shown. When msg carries an
+// ActionURL, delivery is platform-specific (see platformDeliver): a clickable
+// toast on Windows, the URL appended to the body elsewhere.
 func Send(msg Message) error {
 	beeep.AppName = appName
-	icon := iconArg(msg.Level)
-	if levelTable[msg.Level].urgent {
-		return beeep.Alert(msg.Title, msg.Body, icon)
+	return platformDeliver(msg)
+}
+
+// beeepDeliver is the shared beeep call: an audible Alert for urgent levels, a
+// quiet Notify otherwise. Both platform deliverers route their non-clickable
+// path through here so the urgency mapping lives in one place.
+func beeepDeliver(urgent bool, title, body, icon string) error {
+	if urgent {
+		return beeep.Alert(title, body, icon)
 	}
-	return beeep.Notify(msg.Title, msg.Body, icon)
+	return beeep.Notify(title, body, icon)
+}
+
+// actionBody returns the body to show when the platform cannot make the action
+// URL clickable: the URL appended to the body (space-separated, single line —
+// the sanitize contract keeps notifications single-line) so it stays visible
+// and copyable. With no action URL, or no room, it degrades sensibly.
+func actionBody(msg Message) string {
+	if msg.ActionURL == "" {
+		return msg.Body
+	}
+	if msg.Body == "" {
+		return msg.ActionURL
+	}
+	return msg.Body + " " + msg.ActionURL
+}
+
+// safeToastArgs encodes an action URL for safe interpolation into go-toast's
+// unescaped `launch="…"` XML attribute (the Windows clickable path). The
+// attribute-breaking characters `& " < >` are XML-escaped, so Windows decodes
+// them back to the real character when it parses the toast — crucially keeping
+// `&` query separators intact (percent-encoding `&` would merge query params).
+// The PowerShell here-string fallback expands `$` and a backtick BEFORE the XML
+// is parsed, which XML-escaping cannot prevent, so those two are percent-encoded
+// instead (a browser decodes %24/%60 to the same URL). Kept in this
+// (non-build-tagged) file so it is unit-tested on every platform even though the
+// toast push itself is Windows-only.
+func safeToastArgs(u string) string {
+	u = strings.NewReplacer(
+		"&", "&amp;",
+		`"`, "&quot;",
+		"<", "&lt;",
+		">", "&gt;",
+	).Replace(u)
+	return strings.NewReplacer("$", "%24", "`", "%60").Replace(u)
 }
 
 // iconArg returns the icon argument handed to beeep for a level. On Linux and

@@ -68,7 +68,7 @@ _declare(
 _declare(
     "dotvault_remote_notify",
     c_int,
-    [c_longlong, c_char_p, c_char_p, c_char_p, c_longlong, POINTER(c_void_p)],
+    [c_longlong, c_char_p, c_char_p, c_char_p, c_char_p, c_longlong, POINTER(c_void_p)],
 )
 
 lib = _lib

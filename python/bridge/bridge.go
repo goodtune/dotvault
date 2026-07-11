@@ -401,7 +401,7 @@ func dotvault_remote_browse(h C.longlong, rawURL *C.char, timeoutMillis C.longlo
 }
 
 //export dotvault_remote_notify
-func dotvault_remote_notify(h C.longlong, level, title, body *C.char, timeoutMillis C.longlong, errOut **C.char) C.int {
+func dotvault_remote_notify(h C.longlong, level, title, body, actionURL *C.char, timeoutMillis C.longlong, errOut **C.char) C.int {
 	c, ok := lookup(h)
 	if !ok {
 		setErr(errOut, errUnknownHandle)
@@ -409,7 +409,7 @@ func dotvault_remote_notify(h C.longlong, level, title, body *C.char, timeoutMil
 	}
 	ctx, cancel := callContext(timeoutMillis)
 	defer cancel()
-	if err := c.Notify(ctx, goString(level), goString(title), goString(body)); err != nil {
+	if err := c.Notify(ctx, goString(level), goString(title), goString(body), goString(actionURL)); err != nil {
 		setErr(errOut, err)
 		return category(err)
 	}

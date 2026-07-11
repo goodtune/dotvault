@@ -111,6 +111,25 @@ def test_notify_posts_to_peer(tmp_path, peer):
     assert form["body"] == ["see logs"]
 
 
+def test_notify_action_url_reaches_peer(tmp_path, peer):
+    sock_path, ctl = peer
+    with _client_with_socket(tmp_path, sock_path) as c:
+        c.notify("info", "Build done", action_url="https://ci.example/42", timeout=5)
+    _, form = ctl.received[-1]
+    assert form["action_url"] == ["https://ci.example/42"]
+
+
+def test_notify_bad_action_url_is_plain_error(tmp_path, peer):
+    # The peer validates the action URL and 400s a non-http(s) one → plain
+    # DotvaultError, not PeerUnavailable.
+    sock_path, ctl = peer
+    ctl.responder = lambda path, form: (400, '{"error":"action url must be http or https"}')
+    with _client_with_socket(tmp_path, sock_path) as c:
+        with pytest.raises(dotvault.DotvaultError) as exc:
+            c.notify("info", "t", action_url="file:///etc", timeout=5)
+    assert not isinstance(exc.value, dotvault.PeerUnavailable)
+
+
 def test_notify_default_body_is_empty(tmp_path, peer):
     # The optional body defaults to "" and must still round-trip as an empty
     # form field, not be omitted.

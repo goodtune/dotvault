@@ -38,16 +38,16 @@ func TestParseLevel(t *testing.T) {
 }
 
 func TestNewMessage_Validation(t *testing.T) {
-	if _, err := NewMessage("bogus", "t", "b"); err == nil {
+	if _, err := NewMessage("bogus", "t", "b", ""); err == nil {
 		t.Error("expected an error for an unknown level")
 	}
-	if _, err := NewMessage("info", "   ", "b"); err == nil {
+	if _, err := NewMessage("info", "   ", "b", ""); err == nil {
 		t.Error("expected an error for an empty title")
 	}
-	if _, err := NewMessage("info", "\x00\x07", "b"); err == nil {
+	if _, err := NewMessage("info", "\x00\x07", "b", ""); err == nil {
 		t.Error("expected an error for a title that is empty after control-char stripping")
 	}
-	m, err := NewMessage("Error", "  Hello  ", "  world  ")
+	m, err := NewMessage("Error", "  Hello  ", "  world  ", "")
 	if err != nil {
 		t.Fatalf("NewMessage: %v", err)
 	}
@@ -146,6 +146,88 @@ func TestSanitize_PreservesBenignDollar(t *testing.T) {
 		if got := sanitize(in, maxTitleLen); got != in {
 			t.Errorf("sanitize(%q) = %q, want it preserved", in, got)
 		}
+	}
+}
+
+func TestValidateActionURL(t *testing.T) {
+	cases := []struct {
+		name, in string
+		ok       bool
+	}{
+		{"empty is allowed", "", true},
+		{"https", "https://ci.example/build/42", true},
+		{"http", "http://x.example", true},
+		{"trims", "  https://x.example  ", true},
+		{"file scheme", "file:///etc/passwd", false},
+		{"custom scheme", "vscode://open", false},
+		{"no host", "https:///nohost", false},
+		{"bare path", "/relative", false},
+		{"userinfo", "https://user:pass@x.example", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateActionURL(tc.in)
+			if tc.ok != (err == nil) {
+				t.Fatalf("validateActionURL(%q) err = %v, want ok=%v", tc.in, err, tc.ok)
+			}
+			if tc.ok && tc.in != "" && got == "" {
+				t.Errorf("validateActionURL(%q) returned empty for a valid URL", tc.in)
+			}
+		})
+	}
+}
+
+func TestNewMessage_ActionURL(t *testing.T) {
+	m, err := NewMessage("info", "t", "b", "https://x.example/go")
+	if err != nil {
+		t.Fatalf("NewMessage: %v", err)
+	}
+	if m.ActionURL != "https://x.example/go" {
+		t.Errorf("ActionURL = %q, want the validated URL", m.ActionURL)
+	}
+	if _, err := NewMessage("info", "t", "b", "file:///etc"); err == nil {
+		t.Error("expected an error for a non-http(s) action URL")
+	}
+}
+
+func TestActionBody(t *testing.T) {
+	cases := []struct {
+		body, url, want string
+	}{
+		{"", "", ""},
+		{"detail", "", "detail"},
+		{"", "https://x/y", "https://x/y"},
+		{"detail", "https://x/y", "detail https://x/y"},
+	}
+	for _, tc := range cases {
+		got := actionBody(Message{Body: tc.body, ActionURL: tc.url})
+		if got != tc.want {
+			t.Errorf("actionBody(body=%q,url=%q) = %q, want %q", tc.body, tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestSafeToastArgs(t *testing.T) {
+	// The launch attribute is an unescaped XML attribute embedded in a
+	// PowerShell expandable here-string. `& " < >` must XML-escape (so they
+	// decode back — keeping `&` query separators intact); `$` and backtick must
+	// percent-encode (the here-string expands them before XML parsing).
+	got := safeToastArgs(`https://x/a?b=1&c="<>"$v` + "`z")
+	for _, bad := range []string{"&c=", `"`, "<", ">", "$v", "`"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("safeToastArgs left %q in %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "&amp;") {
+		t.Errorf("safeToastArgs should XML-escape & (got %q)", got)
+	}
+	if !strings.Contains(got, "%24") || !strings.Contains(got, "%60") {
+		t.Errorf("safeToastArgs should percent-encode $ and backtick (got %q)", got)
+	}
+	// A plain URL with no dangerous characters is untouched.
+	plain := "https://ci.example/build/42"
+	if safeToastArgs(plain) != plain {
+		t.Errorf("safeToastArgs mangled a benign URL: %q", safeToastArgs(plain))
 	}
 }
 

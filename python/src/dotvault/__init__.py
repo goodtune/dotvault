@@ -267,7 +267,12 @@ class Client:
         _check(code, err)
 
     def notify(
-        self, level: str, title: str, body: str = "", timeout: float | None = None
+        self,
+        level: str,
+        title: str,
+        body: str = "",
+        action_url: str = "",
+        timeout: float | None = None,
     ) -> None:
         """Ask the peer dotvault to raise a desktop notification on its host.
 
@@ -282,15 +287,19 @@ class Client:
                 ``"attention"`` — sets urgency and, where supported, the icon.
             title: The notification title (required).
             body: Optional detail line.
+            action_url: Optional http/https link the notification takes the user
+                to when clicked. Clickable on Windows (the toast opens the URL);
+                on macOS/Linux, where a one-shot notification cannot register a
+                click handler, it is appended to the body so it stays visible.
 
-        The level and text are validated and sanitized by the peer. Returns
-        ``None`` once the peer reports delivery.
+        The level, text, and action URL are validated and sanitized by the peer.
+        Returns ``None`` once the peer reports delivery.
 
         Raises:
             PeerUnavailable: No socket configured, peer unreachable, or the peer
                 could not deliver the notification.
-            DotvaultError: The peer rejected the level/title as invalid
-                (carrying its message), or the client handle is invalid.
+            DotvaultError: The peer rejected the level/title/action_url as
+                invalid (carrying its message), or the client handle is invalid.
         """
         self._require_open()
         err = c_void_p()
@@ -299,6 +308,7 @@ class Client:
             _ffi.encode(level),
             _ffi.encode(title),
             _ffi.encode(body),
+            _ffi.encode(action_url),
             _millis(timeout),
             byref(err),
         )

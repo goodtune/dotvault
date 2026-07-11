@@ -3,6 +3,7 @@ module github.com/goodtune/dotvault
 go 1.25.6
 
 require (
+	git.sr.ht/~jackmordaunt/go-toast v1.1.2
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/cli/oauth v1.2.2
 	github.com/gen2brain/beeep v0.11.2
@@ -33,7 +34,6 @@ require (
 )
 
 require (
-	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260522213940-e5c6d01a3007 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect

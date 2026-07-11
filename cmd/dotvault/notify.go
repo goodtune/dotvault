@@ -24,7 +24,7 @@ var sendLocalNotification = notify.Send
 // borrow and remote browse use), and falls back to raising the notification
 // locally when no peer is reachable.
 func newNotifyCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "notify <level> <title> [description]",
 		Short: "Raise a desktop notification, preferring the peer over vault.token_socket",
 		Long: fmt.Sprintf(`Raise a native desktop notification (a Windows toast, a macOS
@@ -40,11 +40,18 @@ The level is one of: %s. It drives the notification's urgency (error and
 attention are delivered as audible alerts) and, where the platform supports a
 named icon, the icon shown.
 
+Pass --action-url to attach an http/https link the user is taken to when they
+click the notification. This is clickable on Windows (the toast opens the URL);
+on macOS and Linux, where a one-shot notification cannot register a click
+handler, the URL is appended to the body so it stays visible.
+
   dotvault notify info "Sync complete" "all rules applied"
-  dotvault notify error "Backup failed" "see the logs"`, strings.Join(notify.Levels(), ", ")),
+  dotvault notify error "Backup failed" "see the logs" --action-url https://ci.example/build/42`, strings.Join(notify.Levels(), ", ")),
 		Args: cobra.RangeArgs(2, 3),
 		RunE: runNotify,
 	}
+	cmd.Flags().String("action-url", "", "http/https URL to open when the notification is clicked (Windows) or shown in the body (macOS/Linux)")
+	return cmd
 }
 
 func runNotify(cmd *cobra.Command, args []string) error {
@@ -55,12 +62,13 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	if len(args) == 3 {
 		body = args[2]
 	}
+	actionURL, _ := cmd.Flags().GetString("action-url")
 
 	// Validate up front with the same rules the peer endpoint enforces, so a
-	// bad level or empty title fails locally with a clear message instead of
-	// a round-tripped 400 (and neither the peer nor the local notifier is
-	// touched).
-	msg, err := notify.NewMessage(level, title, body)
+	// bad level, empty title, or malformed action URL fails locally with a
+	// clear message instead of a round-tripped 400 (and neither the peer nor
+	// the local notifier is touched).
+	msg, err := notify.NewMessage(level, title, body, actionURL)
 	if err != nil {
 		return err
 	}
@@ -97,6 +105,9 @@ func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Messa
 		"level": {string(msg.Level)},
 		"title": {msg.Title},
 		"body":  {msg.Body},
+	}
+	if msg.ActionURL != "" {
+		form.Set("action_url", msg.ActionURL)
 	}
 	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/notify", form)
 }

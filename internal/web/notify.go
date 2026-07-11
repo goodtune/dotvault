@@ -60,7 +60,12 @@ func (s *Server) handleRemoteNotify(w http.ResponseWriter, r *http.Request) {
 	}
 	// PostFormValue: the contract is a form POST — query-string fields are
 	// deliberately ignored, matching the browse endpoint.
-	msg, err := notify.NewMessage(r.PostFormValue("level"), r.PostFormValue("title"), r.PostFormValue("body"))
+	msg, err := notify.NewMessage(
+		r.PostFormValue("level"),
+		r.PostFormValue("title"),
+		r.PostFormValue("body"),
+		r.PostFormValue("action_url"),
+	)
 	if err != nil {
 		writeError(w, err.Error(), http.StatusBadRequest)
 		return

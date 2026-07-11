@@ -167,6 +167,19 @@ dotvault notify info "Sync complete" "all rules applied"
 dotvault notify error "Backup failed" "see /var/log/backup.log"
 ```
 
+Pass `--action-url <http/https URL>` to attach a link the user is taken to when they **click** the notification — e.g. straight to the failing CI build or the page where they resolve the problem:
+
+```sh
+dotvault notify error "Backup failed" "click for the run" --action-url https://ci.example/build/42
+```
+
+The click behaviour is platform-dependent, and the flag degrades gracefully:
+
+- **Windows** — the toast is protocol-activated, so clicking it opens the URL in the default browser.
+- **macOS / Linux** — a one-shot notification cannot register a click handler (macOS `osascript` has no open action; a Linux D-Bus click is delivered back to a sender that has already exited), so the URL is appended to the notification body instead, staying visible and copyable.
+
+The URL must be `http`/`https` with a host and no embedded credentials — the same allowlist `dotvault browse` enforces — and is rejected locally (exit `1`) before anything is sent.
+
 The raw endpoint is curl-able over the forwarded socket too:
 
 ```sh

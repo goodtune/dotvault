@@ -7,6 +7,27 @@ import (
 	"fmt"
 )
 
+// CNG NCRYPT_EXPORT_POLICY_PROPERTY flags. A key with neither bit set is
+// non-exportable (NCRYPT_ALLOW_EXPORT_NONE) — the default for a key created with
+// NCryptCreatePersistedKey, which is how the "os" backend generates its key. We
+// verify this rather than assume it (see assertNonExportable in
+// osstore_windows.go). The archiving flags (0x4/0x8) are deliberately not in the
+// mask: they govern backup/escrow, not the plaintext-key extraction the user is
+// protecting against.
+const (
+	cngAllowExport          = 0x1 // NCRYPT_ALLOW_EXPORT_FLAG
+	cngAllowPlaintextExport = 0x2 // NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG
+)
+
+// exportPolicyIsExportable reports whether a CNG export-policy value permits the
+// private key to be extracted from the store. It is the security-critical
+// interpretation of the raw policy DWORD, kept in a platform-neutral file so it
+// is unit-testable on every platform (the read that produces the DWORD is a
+// Windows syscall).
+func exportPolicyIsExportable(policy uint32) bool {
+	return policy&(cngAllowExport|cngAllowPlaintextExport) != 0
+}
+
 // parseLeafAndIssuer splits a PEM chain (leaf followed by its CA chain) into the
 // leaf and its immediate issuer. The OS-native backend's StoreCert needs both:
 // certtostore.Store dereferences the intermediate unconditionally, so an issuing

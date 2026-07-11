@@ -27,6 +27,8 @@ These methods are additive — `ldap`, `oidc`, and `token` remain valid and unch
 
 On Windows the key is generated in the **current user's** CNG key store (the *Microsoft Software Key Storage Provider*, DPAPI-protected — no administrator rights needed) and the certificate is installed into `Certificates - Current User → Personal` (`CurrentUser\My`), which is exactly where Edge and Chrome look for client certificates. dotvault never exports the key; it stays in the store and dotvault signs through it for both the Vault cert-auth handshake and ongoing rotation.
 
+The private key is **non-exportable**. Because dotvault generates the key inside the store (rather than importing a `.pfx`), the key is created with the CNG default export policy — `NCRYPT_ALLOW_EXPORT_NONE` — so a user cannot extract the private key from the certificate store and reuse the Vault-issued identity on another machine; only in-place signing is possible. dotvault verifies this after generation and refuses to proceed if the key is ever reported exportable, rather than assuming the default holds.
+
 Differences from the other cert methods:
 
 - **Platform support.** `mtls+os` is **Windows-only** today (it is built on [`github.com/google/certtostore`](https://github.com/google/certtostore), a Windows-CNG library). On Linux and macOS it fails fast with a clear "OS-native certificate store is unavailable" error rather than degrading to an on-disk key — Linux (PKCS#11/NSS) and macOS (Keychain) backends are planned follow-ups. Use `mtls` or `mtls+tpm` on those platforms.

@@ -34,6 +34,22 @@ func makeCertPEM(t *testing.T, cn string) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
+func TestExportPolicyIsExportable(t *testing.T) {
+	cases := map[uint32]bool{
+		0x0:       false, // NCRYPT_ALLOW_EXPORT_NONE — the non-exportable default we require
+		0x1:       true,  // NCRYPT_ALLOW_EXPORT_FLAG
+		0x2:       true,  // NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG
+		0x3:       true,  // both export flags
+		0x4:       false, // NCRYPT_ALLOW_ARCHIVING_FLAG — backup/escrow, not key extraction
+		0x1 | 0x4: true,  // export + archiving
+	}
+	for policy, want := range cases {
+		if got := exportPolicyIsExportable(policy); got != want {
+			t.Errorf("exportPolicyIsExportable(%#x) = %v, want %v", policy, got, want)
+		}
+	}
+}
+
 func TestParseLeafAndIssuer(t *testing.T) {
 	leafPEM := makeCertPEM(t, "leaf")
 	caPEM := makeCertPEM(t, "issuer")

@@ -4,7 +4,7 @@ dotvault can expose an SSH agent backed by your live Vault token. Because the
 daemon already holds a renewing token and reads your per-user KVv2 secrets, it
 can answer signing requests without ever writing a private key to disk.
 
-Two key sources are supported:
+Three key sources are supported:
 
 - **KV keys** — raw key pairs discovered under a KV path prefix (the same
   `public_key` / `private_key` schema the [SSH enrolment engine](../services/ssh.md)
@@ -12,6 +12,12 @@ Two key sources are supported:
 - **Vault-CA certificates** — short-lived certificates minted on demand by a
   Vault SSH CA secrets engine. The private key is generated in memory and never
   persisted.
+- **Upstream agent** — a second SSH agent (your own `ssh-agent`, the Windows
+  OpenSSH agent, or Pageant) that dotvault delegates `List`/`Sign` to. dotvault
+  never stores or reads its key material — it forwards the agent protocol — so
+  you keep using legacy on-disk keys that already live in your personal agent
+  (the static keys you've registered with GitHub, Bitbucket Server, etc.)
+  alongside dotvault's Vault-backed keys, from one socket.
 
 The agent is **read-only**: like dotvault's one-way sync, it never accepts keys,
 locks, or removals from clients. `ssh-add -d`, `ssh-add -D`, and `ssh-add`
@@ -45,6 +51,9 @@ agent:
       principals: ["{{.vault_username}}"]
       ttl: "15m"
       ephemeral_key: true
+    - source: agent
+      socket: ""                   # default: $XDG_RUNTIME_DIR/ssh-agent.socket
+      # pipe: "\\\\.\\pipe\\openssh-ssh-agent"   # Windows upstream agent
 ```
 
 | Field                | Description                                       | Default                     |
@@ -96,6 +105,64 @@ dotvault generates an in-memory key pair at startup and requests a certificate
 from Vault at signing time. Certificates are cached until shortly before expiry
 and transparently re-minted on the next request — including over a forwarded
 agent connection, so long-lived forwarded session chains keep working.
+
+### Upstream-agent source
+
+`source: agent` points dotvault at a *second* SSH agent and delegates the
+`List` and `Sign` requests to it. This is how you keep using legacy keys that
+live on disk and are already held by your personal agent — for example a static
+key you've registered with a service that can't take a short-lived cert — while
+still serving dotvault's Vault-backed keys from the same socket. dotvault is a
+pure proxy here: it never stores, reads, or persists the upstream's private
+keys, and it dials a fresh connection per request so the upstream agent can come
+and go without a dotvault restart.
+
+The upstream endpoint is the other agent's socket (Unix) or named pipe
+(Windows):
+
+```yaml
+- source: agent
+  socket: ""    # Unix; default $XDG_RUNTIME_DIR/ssh-agent.socket
+                # (required explicitly on macOS — no XDG_RUNTIME_DIR there)
+  pipe: ""      # Windows; default \\.\pipe\openssh-ssh-agent
+```
+
+| Field    | Platform | Description                          | Default                                       |
+|----------|----------|--------------------------------------|-----------------------------------------------|
+| `socket` | Unix     | Upstream agent Unix socket path      | `$XDG_RUNTIME_DIR/ssh-agent.socket` (Linux)¹  |
+| `pipe`   | Windows  | Upstream agent named pipe            | `\\.\pipe\openssh-ssh-agent`                  |
+
+¹ The Unix default only exists when `XDG_RUNTIME_DIR` is set — the norm on
+Linux, but **not on macOS**, where it is typically unset. With no
+`XDG_RUNTIME_DIR` and no explicit `socket`, the upstream-agent source resolves
+to an error (reported in status) rather than a bogus path, so macOS users must
+set `socket` explicitly (e.g. the value of `$SSH_AUTH_SOCK`, or a fixed path).
+
+Both accept `{{.username}}` and `{{.uid}}` template variables, so a fleet-wide
+config can resolve to each user's own agent (e.g.
+`socket: "/run/user/{{.uid}}/ssh-agent.socket"`). `{{.username}}` is the bare OS
+account name; `{{.uid}}` is the numeric UID on Unix (and the user's SID on
+Windows, where it is rarely useful in a pipe name). A mis-typed variable
+(e.g. `{{.user}}`) is rejected when the source is constructed, not silently left
+in the path. A leading `~` in a socket path is expanded to your home directory.
+The Unix default keeps the upstream socket in the same XDG runtime directory
+dotvault's own socket lives in.
+
+Two constraints apply:
+
+- **At most one upstream-agent source.** An agent advertises *all* of its
+  identities with no path scoping, so a second one would only fan out
+  redundantly and make `Sign` routing ambiguous. Configure one; it surfaces
+  every key the upstream holds.
+- **No self-reference.** dotvault refuses to delegate to its own endpoint — that
+  would loop `List`/`Sign` back into the daemon forever. If the resolved
+  upstream endpoint equals dotvault's own socket/pipe, the source is reported as
+  an error in status (see below) and contributes no keys, while the other
+  sources keep working.
+
+If the upstream agent isn't running, its source simply contributes no
+identities (and shows an "unreachable" error in the web dashboard); dotvault's
+other sources are unaffected.
 
 ## Pointing clients at the agent
 

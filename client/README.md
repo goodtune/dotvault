@@ -64,6 +64,23 @@ Token precedence and the login flow match the daemon's exactly. `VAULT_TOKEN` is
 
 If `VaultConfig.TokenSocket` is set (dotvault's `vault.token_socket` — a peer dotvault daemon's web-API Unix socket), `AuthenticateCached` borrows a live token from the peer after `DOTVAULT_TOKEN` and the token file come up empty, before reporting `ErrLoginRequired`. The borrow is a plain HTTP GET over the socket with no browser or prompt, so it stays within the cached, side-effect-free contract — a consumer on a host with no local token but a live peer socket (the SSH `RemoteForward` topology) reads secrets without an interactive login of its own. It is best-effort: a missing or stale socket simply yields no token.
 
+## Peer actions: Browse and Notify
+
+Over the same `TokenSocket` peer, the client can ask the workstation dotvault to **open a URL in a browser** or **raise a desktop notification** — the programmatic equivalents of `dotvault browse`/`dotvault notify`. This is for the headless-consumer topology: a program on a machine with no browser hands a URL or a notification back over the forwarded socket, so a browser-driven flow (an OAuth page, a report link) or a "job finished" toast lands on the workstation where a human is looking.
+
+```go
+if err := cli.Browse(ctx, "https://example.com/report"); err != nil {
+    // errors.Is(err, client.ErrPeerUnavailable) → no socket / peer down / open failed
+}
+if err := cli.Notify(ctx, "info", "Backup complete", "42 files, 0 errors", ""); err != nil {
+    // same taxonomy as Browse
+}
+// Attach a clickable link (opens on click on Windows; appended to the body on macOS/Linux):
+cli.Notify(ctx, "error", "Build failed", "click for the run", "https://ci.example/build/42")
+```
+
+`Browse`/`Notify` differ from the `dotvault` CLIs in two deliberate ways: there is **no local fallback** (a headless library has no local browser or notifier), so an unreachable peer is an error rather than a silent local open; and there is **no local validation** — the peer endpoint validates and sanitizes the URL / level / title authoritatively (that is where the action happens and where the security boundary belongs), so the facade stays a thin transport. A peer that is not configured, cannot be reached, or reports it could not perform the action returns `ErrPeerUnavailable`; a request the peer *rejects as invalid* (a non-`http(s)` URL, an unknown level, an empty title) returns a plain error carrying the peer's message. `Notify`'s level is one of `info`, `warning`, `error`, `attention`; its final argument is an optional `actionURL` — an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux). Pass `""` for no link.
+
 ## Error categories
 
 Sentinels are `errors.Is`-able and map to a small, stable set of outcomes:
@@ -75,6 +92,7 @@ Sentinels are `errors.Is`-able and map to a small, stable set of outcomes:
 | `ErrDenied` | Vault rejected the request (401/403) | `denied` |
 | `ErrUnreachable` | DNS/connection/TLS/timeout/5xx | `unreachable` |
 | `ErrAuthFailed` | interactive login ran but didn't yield a token | `denied` (your choice) |
+| `ErrPeerUnavailable` | `Browse`/`Notify`: no socket, peer down, or action failed | `peer_unavailable` |
 | `(value, false, nil)` from a read | secret/field absent | `missing_field` |
 
 `ErrAuthFailed` is a distinct sentinel from `ErrDenied` so you *can* tell "wrong/declined credentials" from "token lacks the policy". Folding both into a `denied` metric label is reasonable but is your decision, not the library's.

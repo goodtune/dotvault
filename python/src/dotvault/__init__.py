@@ -8,13 +8,20 @@ shared library, so the connectivity, token precedence, and identity convention
 all come from the one canonical Go implementation rather than being re-derived
 in Python.
 
-The surface is the read-only + cached-auth subset of the Go facade:
+The surface is the read-only + cached-auth subset of the Go facade, plus the
+socket-forwarded peer actions (``browse``/``notify``):
 
     import dotvault
 
     with dotvault.Client() as c:           # default config path, OS-user identity
         c.authenticate_cached(timeout=5)   # env -> token file; never prompts
         token = c.read_user_secret("gh", "oauth_token")
+        c.browse("https://example.com")    # opens on the workstation peer
+        c.notify("info", "Done", "job finished")
+
+``browse`` and ``notify`` post over the same ``vault.token_socket`` peer this
+client borrows tokens from, so a headless program hands a URL or a notification
+back to the workstation where a human is looking. They need no local token.
 
 Authentication never prompts: it resolves ``DOTVAULT_TOKEN`` then the token
 file and validates it. If no usable token is present it raises ``LoginRequired``
@@ -38,6 +45,7 @@ from ._errors import (
     Denied,
     DotvaultError,
     LoginRequired,
+    PeerUnavailable,
     Unreachable,
     error_for,
 )
@@ -50,6 +58,7 @@ __all__ = [
     "AuthFailed",
     "Denied",
     "Unreachable",
+    "PeerUnavailable",
     "__version__",
 ]
 
@@ -230,6 +239,80 @@ class Client:
         )
         _check(code, err)
         return _ffi.take_str(out) if found.value else None
+
+    def browse(self, url: str, timeout: float | None = None) -> None:
+        """Ask the peer dotvault to open ``url`` in a browser on its host.
+
+        Posts ``url`` to the peer named by ``vault.token_socket`` — the same
+        SSH-forwarded socket this client borrows a token from — so a
+        browser-driven flow opens on the workstation where a human is looking.
+        The programmatic equivalent of ``dotvault browse <url>``. Unlike the
+        CLI there is no local fallback: a headless library caller has no local
+        browser, so an unreachable peer raises rather than opening locally.
+
+        The URL is validated by the peer (``http``/``https`` only, a host, no
+        embedded credentials). Returns ``None`` once the peer reports success.
+
+        Raises:
+            PeerUnavailable: No socket configured, peer unreachable, or the peer
+                could not open the browser.
+            DotvaultError: The peer rejected the URL as invalid (carrying its
+                message), or the client handle is invalid.
+        """
+        self._require_open()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_remote_browse(
+            self._handle, _ffi.encode(url), _millis(timeout), byref(err)
+        )
+        _check(code, err)
+
+    def notify(
+        self,
+        level: str,
+        title: str,
+        body: str = "",
+        action_url: str = "",
+        timeout: float | None = None,
+    ) -> None:
+        """Ask the peer dotvault to raise a desktop notification on its host.
+
+        The notification sibling of :meth:`browse` over the same socket: a
+        long-running job on a headless box surfaces a native notification
+        (Windows toast / macOS Notification Center / Linux D-Bus) on the
+        workstation. The programmatic equivalent of
+        ``dotvault notify <level> <title> [body]``.
+
+        Args:
+            level: One of ``"info"``, ``"warning"``, ``"error"``,
+                ``"attention"`` — sets urgency and, where supported, the icon.
+            title: The notification title (required).
+            body: Optional detail line.
+            action_url: Optional http/https link the notification takes the user
+                to when clicked. Clickable on Windows (the toast opens the URL);
+                on macOS/Linux, where a one-shot notification cannot register a
+                click handler, it is appended to the body so it stays visible.
+
+        The level, text, and action URL are validated and sanitized by the peer.
+        Returns ``None`` once the peer reports delivery.
+
+        Raises:
+            PeerUnavailable: No socket configured, peer unreachable, or the peer
+                could not deliver the notification.
+            DotvaultError: The peer rejected the level/title/action_url as
+                invalid (carrying its message), or the client handle is invalid.
+        """
+        self._require_open()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_remote_notify(
+            self._handle,
+            _ffi.encode(level),
+            _ffi.encode(title),
+            _ffi.encode(body),
+            _ffi.encode(action_url),
+            _millis(timeout),
+            byref(err),
+        )
+        _check(code, err)
 
     def close(self) -> None:
         """Release the native handle. Idempotent; safe to call more than once."""

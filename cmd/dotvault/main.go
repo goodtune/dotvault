@@ -177,6 +177,14 @@ func setupLogging() {
 	} else {
 		handler = slog.NewTextHandler(os.Stderr, opts)
 	}
+	// Mirror every record to the OTel LoggerProvider alongside stderr.
+	// Safe to wrap unconditionally: before observability.Init runs (and
+	// whenever observability is disabled) the global provider is the
+	// OTel no-op implementation, so this costs a couple of interface
+	// calls per log line and emits nothing — no cfg.Observability.Enabled
+	// check needed here, matching the package's existing no-op-backed
+	// convention. See internal/observability.NewSlogHandler.
+	handler = observability.NewSlogHandler(handler)
 	slog.SetDefault(slog.New(handler))
 }
 

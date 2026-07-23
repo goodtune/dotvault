@@ -50,6 +50,13 @@ func newTestReader(t *testing.T) *sdkmetric.ManualReader {
 type recordingLogProcessor struct {
 	mu      sync.Mutex
 	records []sdklog.Record
+	// enabled backs Enabled below; defaults to true via newTestLogProcessor
+	// so existing callers see no behaviour change. A test can flip it to
+	// false to simulate a LoggerProvider that reports itself disabled
+	// (mirroring the real no-op provider's Logger.Enabled, which always
+	// returns false) and assert emit-side code short-circuits before
+	// OnEmit is ever called.
+	enabled bool
 }
 
 func (p *recordingLogProcessor) OnEmit(_ context.Context, r *sdklog.Record) error {
@@ -60,10 +67,12 @@ func (p *recordingLogProcessor) OnEmit(_ context.Context, r *sdklog.Record) erro
 }
 
 func (p *recordingLogProcessor) Enabled(context.Context, sdklog.EnabledParameters) bool {
-	return true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.enabled
 }
 
-func (p *recordingLogProcessor) Shutdown(context.Context) error  { return nil }
+func (p *recordingLogProcessor) Shutdown(context.Context) error   { return nil }
 func (p *recordingLogProcessor) ForceFlush(context.Context) error { return nil }
 
 func (p *recordingLogProcessor) Snapshot() []sdklog.Record {
@@ -81,7 +90,7 @@ func (p *recordingLogProcessor) Snapshot() []sdklog.Record {
 // global.GetLoggerProvider().
 func newTestLogProcessor(t *testing.T) *recordingLogProcessor {
 	t.Helper()
-	rec := &recordingLogProcessor{}
+	rec := &recordingLogProcessor{enabled: true}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(rec))
 	prev := global.GetLoggerProvider()
 	global.SetLoggerProvider(provider)

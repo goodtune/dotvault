@@ -6,7 +6,7 @@
     "watch": "node esbuild.config.mjs --watch"
   },
   "dependencies": {
-    "preact": "^10.29.4"
+    "preact": "^10.29.7"
   },
   "devDependencies": {
     "esbuild": "^0.28.1"

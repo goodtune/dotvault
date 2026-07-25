@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/urlallow"
 )
 
 // browseBodyLimit caps the request body for the remote-browse endpoint. The
@@ -26,6 +28,8 @@ const browseBodyLimit = 1 << 16 // 64 KiB
 // safely killed mid-launch) and may still open the URL later; the error text
 // says so because the CLI will have fallen back to a local open by then.
 const browseOpenTimeout = 8 * time.Second
+
+// (browse and notify share the launcher plumbing in launcher.go.)
 
 // handleRemoteBrowse accepts a form POST carrying url=<target> and opens the
 // target in this host's default browser. It is the outbound counterpart of
@@ -88,58 +92,31 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	host := u.Hostname()
 	slog.Debug("remote browse requested", "scheme", u.Scheme, "host", host)
 
-	// Single-flight gate: the bounded wait below abandons — but cannot kill
-	// — a hung launcher, so without a gate a misbehaving peer could pile up
-	// one stuck goroutine per request. Only one opener runs at a time;
-	// concurrent requests fail fast and the CLI treats the non-200 like any
-	// other peer failure. TryLock is released by the opener goroutine when
-	// the launcher actually returns, not when the handler does.
-	if !s.browseOpenMu.TryLock() {
+	// Single-flight gate + bounded wait + panic recovery, shared with the
+	// other remote-launch endpoints (see guardedLaunch). A launcher that
+	// hangs is abandoned but cannot pile up goroutines; concurrent requests
+	// fail fast and the CLI treats the non-200 like any other peer failure.
+	timedOut, err := guardedLaunch(&s.browseOpenMu, browseOpenTimeout, func() error {
+		return s.openBrowser(target)
+	})
+	switch {
+	case errors.Is(err, errLauncherBusy):
 		writeError(w, "a browser open is already in progress; try again shortly", http.StatusServiceUnavailable)
 		return
-	}
-
-	// Bounded wait: run the opener in a goroutine and give it
-	// browseOpenTimeout to return. See the const's comment — the goroutine
-	// (and launcher process) may outlive the request on timeout, which is
-	// accepted over stranding the handler forever.
-	errCh := make(chan error, 1)
-	go func() {
-		var err error
-		// LIFO defers: a panic in the opener is converted to an error
-		// first (an unrecovered panic in a spawned goroutine would kill
-		// the whole daemon — net/http's recovery only covers the handler
-		// goroutine), then the gate is released, then the result is sent —
-		// so by the time the handler reports the outcome a follow-up
-		// request can already acquire the gate.
-		defer func() { errCh <- err }()
-		defer s.browseOpenMu.Unlock()
-		defer func() {
-			if rcv := recover(); rcv != nil {
-				err = fmt.Errorf("browser opener panicked: %v", rcv)
-			}
-		}()
-		err = s.openBrowser(target)
-	}()
-	timer := time.NewTimer(browseOpenTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			// Some openers embed their argument in the error text; scrub
-			// the target so the no-full-URL log invariant holds even then.
-			// The unredacted error still goes back in the response — the
-			// requester already knows the URL it posted.
-			redacted := strings.ReplaceAll(err.Error(), target, "<url>")
-			slog.Warn("remote browse failed to open browser",
-				"scheme", u.Scheme, "host", host, "error", redacted)
-			writeError(w, fmt.Sprintf("failed to open browser: %v", err), http.StatusBadGateway)
-			return
-		}
-	case <-timer.C:
+	case timedOut:
 		slog.Warn("remote browse timed out waiting for the browser opener",
 			"scheme", u.Scheme, "host", host)
 		writeError(w, "timed out waiting for the browser opener (the URL may still open)", http.StatusBadGateway)
+		return
+	case err != nil:
+		// Some openers embed their argument in the error text; scrub the
+		// target so the no-full-URL log invariant holds even then. The
+		// unredacted error still goes back in the response — the requester
+		// already knows the URL it posted.
+		redacted := strings.ReplaceAll(err.Error(), target, "<url>")
+		slog.Warn("remote browse failed to open browser",
+			"scheme", u.Scheme, "host", host, "error", redacted)
+		writeError(w, fmt.Sprintf("failed to open browser: %v", err), http.StatusBadGateway)
 		return
 	}
 	slog.Info("opened browser via remote browse API", "scheme", u.Scheme, "host", host)
@@ -202,26 +179,11 @@ func (s *Server) originAllowed(origin string) bool {
 // local handlers, and userinfo would carry credentials into the opener and
 // its logs. Returns the parsed URL so callers never re-parse (the canonical
 // string form is u.String()).
+//
+// The rule itself lives in internal/urlallow so the notification action link
+// (internal/notify) enforces byte-for-byte the same allowlist from one
+// implementation — notify cannot import web (web imports notify), so a shared
+// leaf package is the seam.
 func ValidateBrowseURL(raw string) (*url.URL, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, errors.New("missing url form value")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("invalid url: %v", err)
-	}
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
-	}
-	// Hostname() rather than Host: "http://:80" has a non-empty Host but no
-	// actual hostname, and must be rejected like any other host-less form.
-	if u.Hostname() == "" {
-		return nil, errors.New("url has no host")
-	}
-	if u.User != nil {
-		return nil, errors.New("url must not contain embedded credentials")
-	}
-	return u, nil
+	return urlallow.Validate(raw)
 }

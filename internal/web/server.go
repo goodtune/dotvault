@@ -19,6 +19,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
@@ -93,6 +94,15 @@ type Server struct {
 	// abandoned (not killed) by the handler's bounded wait and unbounded
 	// concurrent requests would otherwise pile up stuck goroutines.
 	browseOpenMu sync.Mutex
+	// sendNotification delivers a desktop notification for the remote-notify
+	// endpoint. NewServer always sets it (notify.Send unless
+	// ServerConfig.SendNotification overrides it, as tests do); the handler's
+	// nil guard (503) only protects hand-constructed Servers in tests.
+	sendNotification notify.Notifier
+	// notifyMu is the remote-notify single-flight gate, mirroring
+	// browseOpenMu — a notification backend that hangs is abandoned, not
+	// killed, so only one delivery runs at a time.
+	notifyMu sync.Mutex
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's
@@ -143,6 +153,10 @@ type ServerConfig struct {
 	// launches URLs in this host's default browser (tests inject a fake).
 	// Nil selects the real browser.OpenURL.
 	OpenBrowser func(string) error
+	// SendNotification, when non-nil, overrides how the remote-notify
+	// endpoint delivers desktop notifications (tests inject a fake). Nil
+	// selects the real notify.Send.
+	SendNotification notify.Notifier
 }
 
 // NewServer creates a new web server.
@@ -191,9 +205,13 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
 		openBrowser:        sc.OpenBrowser,
+		sendNotification:   sc.SendNotification,
 	}
 	if s.openBrowser == nil {
 		s.openBrowser = browser.OpenURL
+	}
+	if s.sendNotification == nil {
+		s.sendNotification = notify.Send
 	}
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
@@ -243,6 +261,9 @@ func (s *Server) registerRoutes() {
 	// by the handler's Origin check instead, and the side effect is limited
 	// by a strict http/https scheme allowlist.
 	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
+	// Sibling of remote/browse — same forwarded-socket consumer and same
+	// no-CSRF / Origin-check posture (see handleRemoteNotify).
+	s.mux.HandleFunc("POST /api/v1/remote/notify", s.handleRemoteNotify)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
@@ -608,7 +629,8 @@ func routeLabel(p string) string {
 		p == "/api/v1/config/download",
 		p == "/api/v1/token",
 		p == "/api/v1/sync",
-		p == "/api/v1/remote/browse":
+		p == "/api/v1/remote/browse",
+		p == "/api/v1/remote/notify":
 		return p
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without

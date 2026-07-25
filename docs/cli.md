@@ -147,6 +147,48 @@ curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/browse -d
 
 The command is silent on success (exit `0`), matching `BROWSER` conventions. Config-load failures downgrade to the local browser with a warning rather than failing, so the command still works on a host with no dotvault config at all. On a truly display-less host the local fallback depends on what `xdg-open` resolves to — often a console browser — so on machines that should only ever delegate to the peer, treat a fallback as a sign the SSH `RemoteForward` is down.
 
+### `dotvault notify`
+
+Raise a native desktop notification — a Windows toast, a macOS Notification Center panel, or a Linux D-Bus notification — preferring the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+
+```sh
+dotvault notify <level> <title> [description]
+```
+
+`<level>` is one of `info`, `warning`, `error`, `attention`. It sets the notification's urgency — `error` and `attention` are delivered as audible alerts, `info` and `warning` as quiet notifications — and, on Linux/BSD where the notification daemon accepts a named stock icon, the icon shown (`dialog-information`, `dialog-warning`, `dialog-error`, `dialog-question`). On macOS and Windows a stock icon name is not a valid file path, so no custom icon is set there and the level is conveyed by urgency alone.
+
+!!! note "macOS delivery"
+    On macOS, notifications are delivered via `osascript` (or `terminal-notifier` if installed). An unsigned CLI binary driving `osascript display notification` is attributed to "Script Editor" and may be suppressed by Notification Center's per-app settings. The peer-preferring design largely sidesteps this — the workstation typically runs the daemon (web UI), which is the more reliable delivery path.
+
+When `vault.token_socket` names a reachable peer dotvault, the notification is form-posted to the peer's `POST /api/v1/remote/notify` endpoint and appears **on the workstation** — where a human is actually looking. When the socket is not configured, missing, or the peer errors, the notification is raised on this host instead. This is the natural way for a long-running job on a headless box to get the operator's attention:
+
+```sh
+dotvault notify info "Sync complete" "all rules applied"
+dotvault notify error "Backup failed" "see /var/log/backup.log"
+```
+
+Pass `--action-url <http/https URL>` to attach a link the user is taken to when they **click** the notification — e.g. straight to the failing CI build or the page where they resolve the problem:
+
+```sh
+dotvault notify error "Backup failed" "click for the run" --action-url https://ci.example/build/42
+```
+
+The click behaviour is platform-dependent, and the flag degrades gracefully:
+
+- **Windows** — the toast is protocol-activated, so clicking it opens the URL in the default browser.
+- **macOS / Linux** — a one-shot notification cannot register a click handler (macOS `osascript` has no open action; a Linux D-Bus click is delivered back to a sender that has already exited), so the URL is appended to the notification body instead, staying visible and copyable.
+
+The URL must be `http`/`https` with a host and no embedded credentials — the same allowlist `dotvault browse` enforces — and is rejected locally (exit `1`) before anything is sent.
+
+The raw endpoint is curl-able over the forwarded socket too:
+
+```sh
+curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/notify \
+     -d level=error -d title='Backup failed' -d body='see the logs'
+```
+
+The title is required; the description is optional. An unknown level or an empty title fails locally (exit `1`) before anything is sent. Config-load failures degrade to a local notification, like `browse`.
+
 ### `dotvault version`
 
 Print the build version and exit.

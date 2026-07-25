@@ -62,6 +62,7 @@ dotvault status
 | `dotvault login-check` | Validate or renew the cached token on interactive shell login |
 | `dotvault enrol` | Interactive enrolment picker (pass a name to run a single enrolment directly) |
 | `dotvault browse` | Open a URL in a browser, preferring the peer over `vault.token_socket` |
+| `dotvault notify` | Raise a desktop notification, preferring the peer over `vault.token_socket` |
 | `dotvault status` | Display auth state, token TTL, and per-rule sync state |
 | `dotvault reg-export` | Convert a Windows `.reg` file to YAML (or canonicalised `.reg`) |
 | `dotvault reg-import` | Convert a YAML config to a Windows `.reg` file |

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -42,6 +43,28 @@ type Config struct {
 // Vault namespaces are not a dotvault YAML field; the underlying Vault client
 // honours the VAULT_NAMESPACE environment variable, so namespaced
 // deployments work without an explicit field here.
+// MTLSConfig is the login-only view of the daemon's vault.mtls block: what a
+// consumer needs to present a certificate this host already holds, and
+// nothing more.
+//
+// The omissions are the design. Issuance parameters (pki_mount, pki_role,
+// bootstrap_method, byo, key_type, ttl, reissue_before) are absent because the
+// facade is consumption-only — it can use a certificate the daemon or CLI
+// enrolled, but it can never mint, rotate, or bootstrap one. A library inside
+// somebody else's process has no business opening a browser or writing new
+// credentials to a host it does not own.
+type MTLSConfig struct {
+	// CertMount is the Vault cert auth mount. Defaults to "cert".
+	CertMount string
+
+	// CertRole is the cert auth role. Required for a certificate login.
+	CertRole string
+
+	// StorageDir holds the credential envelope written at enrolment.
+	// Defaults to {cache_dir}/mtls, matching the daemon.
+	StorageDir string
+}
+
 type VaultConfig struct {
 	// Address is the Vault server URL (e.g. https://vault.example.com:8200).
 	// Required.
@@ -52,6 +75,15 @@ type VaultConfig struct {
 
 	// TLSSkipVerify disables TLS verification. Insecure; for dev only.
 	TLSSkipVerify bool
+
+	// MTLS carries the subset of the daemon's vault.mtls block needed to
+	// *use* an existing client certificate. Populated by LoadConfig when the
+	// auth method is a certificate method; ignored otherwise.
+	//
+	// Deliberately login-only: it carries no PKI mount/role, no bootstrap
+	// method, and no BYO paths, because the facade never issues a
+	// certificate. See Client.AuthenticateCached and Client.Login.
+	MTLS MTLSConfig
 
 	// KVMount is the KV v2 mount that holds user secrets. Defaults to "kv".
 	KVMount string
@@ -208,6 +240,11 @@ func fromInternal(cfg *config.Config) *Config {
 			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,
 			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,
+			MTLS: MTLSConfig{
+				CertMount:  cfg.Vault.MTLS.CertMount,
+				CertRole:   cfg.Vault.MTLS.CertRole,
+				StorageDir: cfg.Vault.MTLS.StorageDir,
+			},
 		},
 	}
 }
@@ -234,6 +271,16 @@ func (c *Config) withDefaults() Config {
 	}
 	if out.TokenFile == "" {
 		out.TokenFile = DefaultTokenFile()
+	}
+	// Certificate-login defaults must match the daemon's exactly, or the
+	// facade would look for the credential envelope somewhere the daemon
+	// never wrote it. Mirrors mtlsParams in cmd/dotvault and DefaultCertMount
+	// in internal/config.
+	if out.Vault.MTLS.CertMount == "" {
+		out.Vault.MTLS.CertMount = config.DefaultCertMount
+	}
+	if out.Vault.MTLS.StorageDir == "" {
+		out.Vault.MTLS.StorageDir = filepath.Join(paths.CacheDir(), "mtls")
 	}
 	return out
 }

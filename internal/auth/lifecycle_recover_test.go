@@ -387,3 +387,124 @@ func TestLifecycleManager_RecoverIsBounded(t *testing.T) {
 		t.Errorf("deadline %v out of range (0, %v]", remaining, recoverTimeout)
 	}
 }
+
+// TestLifecycleManager_RecoverBackoff pins the backoff on repeated recovery
+// failures.
+//
+// Why this matters beyond tidiness: a recovery attempt is expensive under
+// certificate auth. For mtls+tpm, securestore.Open derives the SRK with a
+// TPM2_CreatePrimary — hundreds of milliseconds to seconds on real hardware —
+// purely to verify the backend, and Load derives it again. At the ~10s recovery
+// poll a sustained Vault outage would mean hundreds of primary-key derivations
+// per hour, contending on /dev/tpmrm0 with everything else using the chip, and
+// anyone able to revoke tokens could sustain that indefinitely.
+//
+// The first failure is deliberately NOT delayed — the poll is already the
+// retry, so a transient blip heals at normal cadence. Growth starts from the
+// second consecutive failure and clamps at maxDelay.
+func TestLifecycleManager_RecoverBackoff(t *testing.T) {
+	// A real (if unused) client: tryRecover reads client.Token() on the
+	// success path, and a zero-value vault.Client has no underlying SDK
+	// client to read from.
+	newLM := func(t *testing.T) *LifecycleManager {
+		t.Helper()
+		vc, err := vault.NewClient(vault.Config{Address: "http://127.0.0.1:1"})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		return &LifecycleManager{
+			client:           vc,
+			recoveryInterval: 10 * time.Second,
+			maxDelay:         5 * time.Minute,
+		}
+	}
+
+	t.Run("growsAndClamps", func(t *testing.T) {
+		lm := newLM(t)
+		want := []time.Duration{
+			0,                // 1st failure: retry at the next natural poll
+			20 * time.Second, // 2nd
+			40 * time.Second, // 3rd
+			80 * time.Second, // 4th
+			160 * time.Second,
+			5 * time.Minute, // clamped
+			5 * time.Minute, // stays clamped
+		}
+		for i, w := range want {
+			lm.recoverFailures = i + 1
+			if got := lm.recoverBackoff(); got != w {
+				t.Errorf("after %d failures: backoff = %v, want %v", i+1, got, w)
+			}
+		}
+	})
+
+	t.Run("skipsHookWhileBackedOff", func(t *testing.T) {
+		lm := newLM(t)
+		var calls int
+		lm.SetRecover(func(context.Context) error {
+			calls++
+			return errors.New("still down")
+		})
+
+		// First failure: hook runs, no delay scheduled.
+		if lm.tryRecover(context.Background()) {
+			t.Fatal("tryRecover() = true, want false")
+		}
+		if calls != 1 {
+			t.Fatalf("calls = %d, want 1", calls)
+		}
+		if !lm.nextRecoverAt.IsZero() {
+			t.Error("first failure scheduled a delay; the natural poll should be the first retry")
+		}
+
+		// Second failure: hook runs again, now a delay IS scheduled.
+		if lm.tryRecover(context.Background()) {
+			t.Fatal("tryRecover() = true, want false")
+		}
+		if calls != 2 {
+			t.Fatalf("calls = %d, want 2", calls)
+		}
+		if lm.nextRecoverAt.IsZero() {
+			t.Fatal("second consecutive failure scheduled no backoff")
+		}
+
+		// Third call, still inside the window: the hook must NOT run — that is
+		// the whole point, since running it is what costs a TPM operation.
+		if lm.tryRecover(context.Background()) {
+			t.Fatal("tryRecover() = true, want false")
+		}
+		if calls != 2 {
+			t.Errorf("calls = %d, want it unchanged at 2 — the hook ran while backed off", calls)
+		}
+	})
+
+	t.Run("successResetsBackoff", func(t *testing.T) {
+		lm := newLM(t)
+		fail := true
+		lm.SetRecover(func(context.Context) error {
+			if fail {
+				return errors.New("down")
+			}
+			lm.client.SetToken("recovered")
+			return nil
+		})
+
+		lm.tryRecover(context.Background()) // failure 1
+		lm.tryRecover(context.Background()) // failure 2 → schedules backoff
+		if lm.recoverFailures != 2 {
+			t.Fatalf("recoverFailures = %d, want 2", lm.recoverFailures)
+		}
+
+		fail = false
+		lm.nextRecoverAt = time.Time{} // simulate the window elapsing
+		if !lm.tryRecover(context.Background()) {
+			t.Fatal("tryRecover() = false, want true once the hook succeeds")
+		}
+		if lm.recoverFailures != 0 {
+			t.Errorf("recoverFailures = %d, want 0 after success", lm.recoverFailures)
+		}
+		if !lm.nextRecoverAt.IsZero() {
+			t.Error("nextRecoverAt not cleared after success; a later failure would be over-penalised")
+		}
+	})
+}

@@ -13,6 +13,13 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
+// recoverTimeout bounds one unattended-recovery attempt. It runs on the
+// lifecycle goroutine, so an unbounded attempt against an unreachable Vault
+// would stall every other token this manager looks after. Comfortably longer
+// than a healthy secure-store open plus a TLS handshake and login, and short
+// enough that the ~10s recovery poll stays responsive.
+const recoverTimeout = 20 * time.Second
+
 // LifecycleManager manages token TTL checks and renewal.
 type LifecycleManager struct {
 	client         *vault.Client
@@ -179,6 +186,15 @@ func (lm *LifecycleManager) tryRecover(ctx context.Context) bool {
 	if lm.recover == nil {
 		return false
 	}
+	// Bound the attempt. The hook runs synchronously on the lifecycle
+	// goroutine and, for certificate auth, opens a secure store (TPM/CNG on
+	// some platforms) and performs a TLS handshake plus a Vault login. The
+	// Vault SDK's own default timeout is ~60s, which is long enough for an
+	// unreachable Vault to stall token management for every other token this
+	// manager looks after. Failing fast costs nothing: the recovery poll
+	// retries within ~10s anyway.
+	ctx, cancel := context.WithTimeout(ctx, recoverTimeout)
+	defer cancel()
 	if err := lm.recover(ctx); err != nil {
 		slog.Debug("unattended token recovery failed", "error", err)
 		return false

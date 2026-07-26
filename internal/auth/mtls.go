@@ -273,11 +273,33 @@ func storeCertInNativeStore(store securestore.Storage, cred *sealedCredential) e
 //
 // The bootstrap Manager carries no TokenFilePath, so the broad token is never
 // written to the on-disk cache either (WriteTokenFile treats "" as a no-op).
+//
+// When m.BootstrapLogin is set it replaces the CLI oidc/ldap dispatch entirely:
+// the daemon obtains the transient token another way (the web SPA login) and
+// hands it back here. Everything else is unchanged.
 func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 	bootClient, err := m.VaultClient.NewSibling("")
 	if err != nil {
 		return nil, fmt.Errorf("build bootstrap client: %w", err)
 	}
+	// Browser-driven bootstrap: when the daemon supplies a BootstrapLogin (the
+	// web SPA's login flow), use the token it returns instead of running a CLI
+	// oidc/ldap flow, which needs a browser or TTY on this host. The same
+	// invariants hold either way — the token is installed on the sibling only,
+	// never downscoped, never written to a token file, and never accompanied by
+	// the transition notice.
+	if m.BootstrapLogin != nil {
+		token, err := m.BootstrapLogin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if token == "" {
+			return nil, fmt.Errorf("bootstrap login returned an empty token")
+		}
+		bootClient.SetToken(token)
+		return bootClient, nil
+	}
+
 	boot := &Manager{
 		VaultClient:      bootClient,
 		AuthMethod:       m.MTLS.BootstrapMethod,

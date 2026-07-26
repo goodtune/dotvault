@@ -83,6 +83,9 @@ type fakeVault struct {
 	leafTTL            time.Duration
 	tokenCreateCount   int
 	tokenCreateSawCert bool
+	// signTokens records the X-Vault-Token presented on each PKI sign call, so
+	// tests can assert which client (and therefore which token) did the signing.
+	signTokens []string
 }
 
 func (f *fakeVault) handler() http.Handler {
@@ -108,6 +111,7 @@ func (f *fakeVault) handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("/v1/pki/sign/dotvault", func(w http.ResponseWriter, r *http.Request) {
+		f.signTokens = append(f.signTokens, r.Header.Get("X-Vault-Token"))
 		var body struct {
 			CSR        string `json:"csr"`
 			CommonName string `json:"common_name"`

@@ -128,6 +128,33 @@ vault:
   no_default_policy: true
 ```
 
+!!! warning "Your policy must grant token self-management"
+    Stripping the `default` policy also strips the token-self paths dotvault relies on, so **any policy you name in `policies` must grant all three** of the following. This is not optional — two of the three fail in ways that look like something else entirely:
+
+    ```hcl
+    # Downscope exchanges the login token for a least-privilege child.
+    # Missing: login fails closed with "permission denied" on auth/token/create.
+    path "auth/token/create" {
+      capabilities = ["create", "update"]
+    }
+
+    # The token lifecycle manager's health check, every 5 minutes.
+    # Missing: the check returns 403, which dotvault reads as "token invalid",
+    # so the daemon re-authenticates in a permanent loop while holding a
+    # perfectly good token. This is the nastiest of the three to diagnose.
+    path "auth/token/lookup-self" {
+      capabilities = ["read"]
+    }
+
+    # Renewal at 75% of TTL.
+    # Missing: every token runs to expiry and forces an avoidable re-auth.
+    path "auth/token/renew-self" {
+      capabilities = ["update"]
+    }
+    ```
+
+    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these and is a working reference. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
+
 This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
 
 !!! note "Staged rollout toward 1.0"

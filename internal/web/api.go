@@ -22,6 +22,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"auth_method":   s.authMethod,
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
+		// Bootstrap state, served unauthenticated alongside auth_method
+		// because the SPA needs it to choose a login form *before* any token
+		// exists — that is the entire point of the bootstrap. "active" is
+		// true only while a BootstrapLogin is waiting; the token itself is
+		// never exposed here or anywhere else.
+		"bootstrap": map[string]any{
+			"active": s.bootstrapActive(),
+			"method": s.bootstrapMethod,
+		},
 	}
 
 	// Only expose Vault connection details to authenticated sessions.

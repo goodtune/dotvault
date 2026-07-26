@@ -47,6 +47,12 @@ type Manager struct {
 	Policy PolicyConstraint
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
+	// BootstrapLogin, when non-nil, supplies the transient bootstrap token for
+	// the mTLS certificate bootstrap instead of running the CLI oidc/ldap flow.
+	// It returns a raw Vault token that MUST NOT have been downscoped (the
+	// bootstrap needs pki/sign, which an operational policy set would strip) and
+	// MUST NOT have been adopted onto any shared client.
+	BootstrapLogin func(ctx context.Context) (string, error)
 }
 
 // Authenticate attempts to authenticate with Vault.

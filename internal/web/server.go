@@ -65,9 +65,20 @@ type Server struct {
 	// sealToken records whether the configured auth method requested TPM
 	// token-sealing (the "+tpm" suffix), preserved here because authMethod has
 	// the suffix stripped for the SPA.
-	sealToken          bool
-	authMount          string
-	authRole           string
+	sealToken bool
+	authMount string
+	authRole  string
+	// bootstrapMethod is the login method the SPA should present for the
+	// one-time mTLS certificate bootstrap ("ldap"/"oidc", from
+	// vault.mtls.bootstrap_method). It is reported on /api/v1/status
+	// alongside authMethod; see bootstrap.go.
+	bootstrapMethod string
+	// bootstrapMu guards bootstrapCh, which is non-nil exactly while a
+	// BootstrapLogin is waiting for a browser-driven login to complete.
+	// Its non-nil-ness IS "bootstrap mode is active", so the token-adoption
+	// sites and the status handler read it under this lock.
+	bootstrapMu        sync.Mutex
+	bootstrapCh        chan string
 	tokenFilePath      string
 	version            string
 	vaultAddress       string
@@ -149,6 +160,11 @@ type ServerConfig struct {
 	Username      string
 	TokenFilePath string
 	Version       string
+	// BootstrapMethod is the login method used for the one-time mTLS
+	// certificate bootstrap ("ldap" or "oidc", from
+	// vault.mtls.bootstrap_method). Reported on /api/v1/status so the SPA
+	// knows which login form to present while a BootstrapLogin is waiting.
+	BootstrapMethod string
 	// OpenBrowser, when non-nil, overrides how the remote-browse endpoint
 	// launches URLs in this host's default browser (tests inject a fake).
 	// Nil selects the real browser.OpenURL.
@@ -197,6 +213,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		sealToken:          auth.SealTokenAtRest(sc.VaultCfg.AuthMethod),
 		authMount:          sc.VaultCfg.AuthMount,
 		authRole:           sc.VaultCfg.AuthRole,
+		bootstrapMethod:    sc.BootstrapMethod,
 		tokenFilePath:      sc.TokenFilePath,
 		version:            sc.Version,
 		vaultAddress:       sc.VaultCfg.Address,

@@ -62,7 +62,9 @@ type VaultConfig struct {
 	UserPrefix string
 
 	// AuthMethod is the fresh-auth method dotvault uses when no cached token
-	// is usable: "oidc", "ldap", "token", "mtls", or "mtls+tpm". A "+tpm"
+	// is usable: "oidc", "ldap", "token", "mtls", "mtls+tpm", or "mtls+os"
+	// (the last storing the certificate and its key in the OS-native
+	// certificate store; Windows-only). A "+tpm"
 	// suffix on any base method (e.g. "oidc+tpm") additionally TPM-seals the
 	// cached token file at rest. Reads are transparent to this — a sealed
 	// token file is self-describing and unsealed automatically — so a consumer

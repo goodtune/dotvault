@@ -64,6 +64,10 @@ export function App() {
       authMethod: status.auth_method,
       onAuth: loadData,
       customText: status.login_text,
+      // Certificate auth has no interactive step once bootstrapped, so the
+      // mtls card re-reads status itself to notice the daemon signing in.
+      bootstrap: status.bootstrap,
+      onRefresh: loadStatus,
     });
   }
 

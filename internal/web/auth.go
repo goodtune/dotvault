@@ -112,6 +112,17 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bootstrap mode: hand the RAW token back to the waiting BootstrapLogin
+	// and adopt nothing. The mTLS bootstrap token carries pki/sign and is
+	// consumed immediately to mint a certificate — downscoping it would strip
+	// the very capability it exists for, and persisting or installing it would
+	// put a broad credential on disk and behind GET /api/v1/token.
+	if s.deliverBootstrapToken(loginSecret.Auth.ClientToken) {
+		slog.Info("OIDC bootstrap login successful via web UI")
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
 	token, err := auth.Downscope(r.Context(), s.vault, loginSecret.Auth.ClientToken, s.policyConstraint())
 	if err != nil {
 		slog.Error("downscoping token to least privilege failed", "error", err)
@@ -189,6 +200,18 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 
 	// If authenticated, consume the token server-side.
 	if status.State == "authenticated" && status.Token != "" {
+		// Bootstrap mode: hand the RAW token to the waiting BootstrapLogin
+		// and adopt nothing — see handleAuthCallback for the rationale. The
+		// response body is unchanged either way (LoginStatus.Token is
+		// json:"-", so the token never crosses the wire).
+		if s.deliverBootstrapToken(status.Token) {
+			s.login.Clear(sessionID)
+			slog.Info("LDAP bootstrap login successful via web UI")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(status)
+			return
+		}
+
 		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
 		if err != nil {
 			slog.Error("downscoping token to least privilege failed", "error", err)

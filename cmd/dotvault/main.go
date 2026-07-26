@@ -1055,9 +1055,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Username:      username,
 			MTLS:          mtlsParams(cfg, username),
 			// No BootstrapLogin: recovery must never start a bootstrap. See
-			// Manager.RecoverCertLogin.
+			// Manager.CertLoginFromStore.
 		}
-		lm.SetRecover(recoverMgr.RecoverCertLogin)
+		lm.SetRecover(recoverMgr.CertLoginFromStore)
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)

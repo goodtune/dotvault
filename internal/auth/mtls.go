@@ -103,31 +103,37 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 // tryExistingCredential loads the stored signer, optionally rotates a cert
 // inside the re-issue window, and logs in. Returns (true, nil) when the
 // Manager's client now holds an operational token.
-// RecoverCertLogin mints a fresh operational token by re-running the
+// CertLoginFromStore mints a fresh operational token by performing the
 // certificate login against the credential this host already holds. It is the
-// unattended-recovery hook the token lifecycle manager calls when a Vault
-// token expires or is revoked (see LifecycleManager.SetRecover).
+// non-interactive half of certificate auth, split out so callers that must
+// never involve a human can use it:
 //
-// This is what makes certificate auth actually headless in steady state. The
-// daemon performs its cert login once at startup and ReissueIfDue rotates the
-// *certificate*, not the token — so without this a Vault token that expired
-// mid-session (or a token whose max_ttl was reached and can no longer be
-// renewed) left the daemon unauthenticated until someone restarted it, even
-// though the credential needed to fix it was sitting right there on disk.
+//   - the daemon's unattended token recovery (LifecycleManager.SetRecover),
+//     which is what makes certificate auth headless in steady state — the cert
+//     login otherwise happens only at startup, and ReissueIfDue rotates the
+//     *certificate*, not the token, so an expired token used to strand the
+//     daemon until a restart despite the credential sitting right there;
+//   - the public client facade (client.AuthenticateCached), where a consumer
+//     on a cert-auth host can obtain a token without a cached one and without
+//     ever prompting.
 //
 // It deliberately does NOT fall back to the bootstrap flow. Bootstrap needs a
-// human, and this runs on a background goroutine with nobody attached;
-// spontaneously launching a browser — or blocking the lifecycle goroutine on a
-// login that will never come — would be worse than reporting the failure. A
-// host whose certificate is genuinely gone or expired past re-issue reports an
-// error here and surfaces through the normal re-auth path instead.
+// human; these callers have none — a background goroutine with nobody
+// attached, or a library inside someone else's process. Spontaneously
+// launching a browser, or blocking on a login that will never come, would be
+// worse than reporting the failure. A host whose certificate is missing or
+// expired past re-issue reports an error here and is handled by the caller.
 //
-// Safe to call repeatedly: it re-reads the credential each time and is a no-op
-// beyond a fresh login.
-func (m *Manager) RecoverCertLogin(ctx context.Context) error {
+// It also does not rotate the certificate (see loginWithCredential): rotation
+// belongs to the startup path and the hourly re-issue check, which own it and
+// must not race a second writer.
+//
+// Safe to call repeatedly: it re-reads the credential each time and does
+// nothing beyond a fresh login.
+func (m *Manager) CertLoginFromStore(ctx context.Context) error {
 	p := m.MTLS
 	if p == nil {
-		return fmt.Errorf("certificate recovery requested but vault.mtls is not configured")
+		return fmt.Errorf("certificate login requested but vault.mtls is not configured")
 	}
 	store, err := securestore.Open(securestore.ModeForMethod(p.Method))
 	if err != nil {
@@ -154,7 +160,7 @@ func (m *Manager) RecoverCertLogin(ctx context.Context) error {
 // loginWithCredential validates a stored credential and performs the cert
 // login. It is the shared core of the startup path (tryExistingCredential,
 // which additionally rotates a near-expiry certificate) and unattended
-// recovery (RecoverCertLogin, which must not).
+// recovery (CertLoginFromStore, which must not).
 func (m *Manager) loginWithCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) error {
 	if cred.Identity != "" && m.Username != "" && cred.Identity != m.Username {
 		return fmt.Errorf("credential belongs to %q, not the current user %q", cred.Identity, m.Username)

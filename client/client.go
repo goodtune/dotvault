@@ -47,6 +47,7 @@ import (
 	"fmt"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -259,6 +260,39 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		}
 	}
 
+	// Candidate 4: this host's own client certificate. Last, so a cached token
+	// is always preferred — a cert login is a Vault round trip plus (for
+	// mtls+tpm / mtls+os) a hardware key operation, and it mints a new token
+	// where reusing one costs nothing.
+	//
+	// This stays inside AuthenticateCached's never-prompt contract: presenting
+	// a certificate the host already holds involves no browser, no terminal,
+	// and no user. It is the seam that makes certificate auth usable from a
+	// library at all — otherwise a consumer on a cert-auth host whose daemon
+	// is stopped, or whose cached token has expired, would get ErrLoginRequired
+	// while the credential that fixes it sits on the same disk.
+	//
+	// Consumption only: CertLoginFromStore never bootstraps and never rotates,
+	// so this can use an enrolled certificate but can never create one.
+	//
+	// The minted token is held in memory and deliberately NOT written to the
+	// token file: that file belongs to the daemon, and a library inside
+	// somebody else's process must not race it. Same ownership rule as the
+	// peer-socket borrow above.
+	if config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
+		mgr := c.manager()
+		mgr.TokenFilePath = "" // in-memory only; see above
+		if err := mgr.CertLoginFromStore(ctx); err != nil {
+			// Fall through to the ErrLoginRequired reporting below, which
+			// names the sources tried. A cert failure here is expected on a
+			// host that was never enrolled.
+			c.vc.SetToken("")
+			return fmt.Errorf("%w: no usable cached token and certificate login failed: %w",
+				ErrLoginRequired, err)
+		}
+		return nil
+	}
+
 	if cachedRejected {
 		// At least one source produced a token the reachable Vault rejected.
 		return fmt.Errorf("%w: cached token rejected and no usable replacement from DOTVAULT_TOKEN, token file, or peer socket",
@@ -295,6 +329,20 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 // binary, which has no console) should drive auth through OIDC, or stick to
 // AuthenticateCached and surface ErrLoginRequired to the operator.
 func (c *Client) Login(ctx context.Context) error {
+	// Certificate auth is consumption-only from the facade. A fresh Login
+	// under a cert method would, on a host with no usable credential, run the
+	// bootstrap: an OIDC browser flow or an LDAP terminal prompt, followed by
+	// minting a certificate and writing it to this host. None of that is
+	// appropriate from a library embedded in somebody else's process, and the
+	// non-interactive part is already available without it —
+	// AuthenticateCached presents an enrolled certificate with no prompting.
+	//
+	// So refuse explicitly rather than surprising a caller with a browser.
+	// Enrolment stays with the daemon or the CLI, which own this host.
+	if config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
+		return fmt.Errorf("%w: auth method %q is consumption-only from the client API: use AuthenticateCached to present an already-enrolled certificate, and enrol this host with the dotvault daemon or CLI",
+			ErrLoginRequired, c.cfg.Vault.AuthMethod)
+	}
 	if err := c.manager().Login(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
 	}
@@ -324,6 +372,20 @@ func (c *Client) manager() *auth.Manager {
 			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,
 		},
 		Username: username,
+		// Login-only certificate parameters. There is deliberately no PKI
+		// mount/role, no bootstrap method and no BYO here, so the flows that
+		// would issue a certificate cannot run from the facade even if they
+		// were reached: CertLoginFromStore is the only cert entry point the
+		// facade calls, and it never seeds. See MTLSConfig.
+		MTLS: &auth.MTLSParams{
+			VaultAddress:  c.cfg.Vault.Address,
+			CACert:        c.cfg.Vault.CACert,
+			TLSSkipVerify: c.cfg.Vault.TLSSkipVerify,
+			Method:        c.cfg.Vault.AuthMethod,
+			CertMount:     c.cfg.Vault.MTLS.CertMount,
+			CertRole:      c.cfg.Vault.MTLS.CertRole,
+			StorageDir:    c.cfg.Vault.MTLS.StorageDir,
+		},
 	}
 }
 

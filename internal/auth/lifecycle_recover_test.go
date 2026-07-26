@@ -63,7 +63,7 @@ func waitFor(cond func() bool, d time.Duration) bool {
 
 // TestLifecycleManager_RecoverWiring pins how the unattended-recovery hook
 // (LifecycleManager.SetRecover, satisfied in production by
-// Manager.RecoverCertLogin) participates in the recovery branch of the Start
+// Manager.CertLoginFromStore) participates in the recovery branch of the Start
 // loop. The headline case is recoverSucceeds: a certificate-auth daemon whose
 // Vault token expired mints a fresh one from the credential already on disk,
 // and — crucially — must NOT fire OnReauth, which in web mode would clear

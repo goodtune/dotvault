@@ -348,3 +348,42 @@ func TestLifecycleManager_tryRecover(t *testing.T) {
 		})
 	}
 }
+
+// TestLifecycleManager_RecoverIsBounded pins the timeout on an unattended
+// recovery attempt.
+//
+// The hook runs synchronously on the lifecycle goroutine and, for certificate
+// auth, opens a secure store and performs a TLS handshake plus a Vault login.
+// Unbounded, an unreachable Vault would stall token management for every other
+// token the manager looks after — the Vault SDK's own default is ~60s. The
+// hook must therefore receive a context carrying a deadline.
+//
+// Asserting the deadline exists (rather than timing a slow hook) keeps this
+// fast and non-flaky. Removing the context.WithTimeout in tryRecover must fail
+// this test.
+func TestLifecycleManager_RecoverIsBounded(t *testing.T) {
+	lm := &LifecycleManager{client: &vault.Client{}}
+
+	var (
+		gotDeadline bool
+		remaining   time.Duration
+	)
+	lm.SetRecover(func(ctx context.Context) error {
+		dl, ok := ctx.Deadline()
+		gotDeadline = ok
+		if ok {
+			remaining = time.Until(dl)
+		}
+		return context.DeadlineExceeded // force the failure path
+	})
+
+	if lm.tryRecover(context.Background()) {
+		t.Fatal("tryRecover() = true, want false when the hook errors")
+	}
+	if !gotDeadline {
+		t.Fatal("recovery hook received a context with no deadline; an unreachable Vault would stall the lifecycle goroutine")
+	}
+	if remaining <= 0 || remaining > recoverTimeout {
+		t.Errorf("deadline %v out of range (0, %v]", remaining, recoverTimeout)
+	}
+}

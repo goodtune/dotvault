@@ -143,28 +143,34 @@ func (m *Manager) RecoverCertLogin(ctx context.Context) error {
 		return fmt.Errorf("no certificate credential on this host; a bootstrap is required")
 	}
 
-	ok, err := m.tryExistingCredential(ctx, store, cred)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("certificate credential is unusable")
-	}
-	return nil
+	// Login only — deliberately NOT tryExistingCredential, which also rotates
+	// the certificate when inside the re-issue window. Rotation is the hourly
+	// ReissueIfDue goroutine's job; doing it here too would let a recovery and
+	// that goroutine mint certificates concurrently and race on the credential
+	// envelope. Recovery's job is to obtain a token, nothing more.
+	return m.loginWithCredential(ctx, store, cred)
 }
 
-func (m *Manager) tryExistingCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) (bool, error) {
+// loginWithCredential validates a stored credential and performs the cert
+// login. It is the shared core of the startup path (tryExistingCredential,
+// which additionally rotates a near-expiry certificate) and unattended
+// recovery (RecoverCertLogin, which must not).
+func (m *Manager) loginWithCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) error {
 	if cred.Identity != "" && m.Username != "" && cred.Identity != m.Username {
-		return false, fmt.Errorf("credential belongs to %q, not the current user %q", cred.Identity, m.Username)
+		return fmt.Errorf("credential belongs to %q, not the current user %q", cred.Identity, m.Username)
 	}
 	if !cred.NotAfter.IsZero() && time.Now().After(cred.NotAfter) {
-		return false, fmt.Errorf("certificate expired at %s", cred.NotAfter.Format(time.RFC3339))
+		return fmt.Errorf("certificate expired at %s", cred.NotAfter.Format(time.RFC3339))
 	}
 	signer, err := store.Load(cred.Handle)
 	if err != nil {
-		return false, fmt.Errorf("load key from secure store: %w", err)
+		return fmt.Errorf("load key from secure store: %w", err)
 	}
-	if err := m.certLogin(ctx, cred, signer); err != nil {
+	return m.certLogin(ctx, cred, signer)
+}
+
+func (m *Manager) tryExistingCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) (bool, error) {
+	if err := m.loginWithCredential(ctx, store, cred); err != nil {
 		return false, err
 	}
 

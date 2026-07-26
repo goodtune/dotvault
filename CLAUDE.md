@@ -429,11 +429,33 @@ On detecting an invalid/expired token (403 Forbidden or TTL=0 + concrete
    on the Vault client, clear the needs-reauth flag, and return to the
    normal 5-minute check cadence. This lets a parallel `dotvault login`
    recover a running daemon without a restart.
-2. If no fresh token is on disk, signal re-auth: fire the registered
+2. If no usable token is available anywhere, try **unattended recovery**:
+   the optional `SetRecover` hook mints a fresh token from a credential
+   this host already holds, with no human involved. Certificate auth is
+   the motivating case and currently the only registrant — the client
+   certificate *is* the credential, so `Manager.RecoverCertLogin`
+   (load credential → cert login, deliberately **never** falling back to
+   bootstrap, since a background goroutine has no user attached) fixes an
+   expired token on the spot. This runs *before* step 3 specifically so a
+   recovery the daemon healed itself never fires `OnReauth` and never
+   bounces the SPA to a login screen. Methods whose credential is a human
+   (oidc, ldap) leave the hook nil and fall straight through.
+3. If recovery is unavailable or fails, signal re-auth: fire the registered
    `OnReauth` callback (web mode clears the in-memory token, invalidating
    any browser session sitting on a stale "logged-in" view), push an
    error on the error channel, and switch to a 10-second recovery poll
-   so a subsequent token write is picked up quickly.
+   so a subsequent token write is picked up quickly. The recovery hook is
+   retried on every one of those polls, so a cert-auth daemon that could
+   not recover immediately (Vault briefly unreachable, say) still heals
+   without a restart once the cause clears.
+
+Why this matters for certificate auth: the daemon performs its cert login
+once at startup, and `ReissueIfDue` rotates the *certificate*, not the
+token. Without the recovery hook a Vault token that expired mid-session —
+or reached its `max_ttl` and could no longer be renewed — left the daemon
+unauthenticated until someone restarted it, despite the credential needed
+to fix it sitting right there on disk. That defeats the purpose of an auth
+method whose whole point is needing no human.
 
 In web mode the daemon also re-opens the browser to the web UI root when
 the lifecycle manager signals re-auth, subject to a 10-minute cooldown

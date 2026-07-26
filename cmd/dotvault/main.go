@@ -1038,6 +1038,27 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
 	}
+	// Certificate auth recovers without a human: the credential that mints
+	// tokens is already on this host, so an expired or revoked token is fixable
+	// on the spot. Registering this is what keeps a cert-auth daemon headless
+	// in steady state — the startup cert login is otherwise the only one, and
+	// ReissueIfDue rotates the certificate rather than the token, so a token
+	// that expired mid-session would strand the daemon until a restart.
+	if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		recoverMgr := &auth.Manager{
+			VaultClient:   vc,
+			TokenFilePath: tokenPath,
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Policy:        vaultPolicyConstraint(cfg),
+			Username:      username,
+			MTLS:          mtlsParams(cfg, username),
+			// No BootstrapLogin: recovery must never start a bootstrap. See
+			// Manager.RecoverCertLogin.
+		}
+		lm.SetRecover(recoverMgr.RecoverCertLogin)
+	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
 

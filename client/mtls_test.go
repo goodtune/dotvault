@@ -3,11 +3,13 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 )
 
@@ -136,4 +138,51 @@ func TestAuthenticateCached_CertLoginDoesNotWriteTokenFile(t *testing.T) {
 func readFileExists(path string) (struct{}, bool) {
 	_, err := os.Stat(path)
 	return struct{}{}, err == nil
+}
+
+// TestAuthenticateCached_CertErrorTaxonomy pins PR-review finding P2.
+//
+// A certificate login fails two very different ways and they call for opposite
+// responses: an unreachable / rate-limited / 5xx-ing Vault is a retry
+// condition, whereas a missing or unusable credential means the host must be
+// enrolled. Reporting both as ErrLoginRequired told consumers to enrol when
+// they should back off, contradicting AuthenticateCached's ErrUnreachable
+// contract.
+//
+// The split cannot be inferred from the error's shape — neither a transport
+// failure nor "no credential on this host" carries an HTTP response — so
+// internal/auth marks the local causes with ErrNoCertCredential. These cases
+// exercise both sides of that boundary through the real code path.
+func TestAuthenticateCached_CertErrorTaxonomy(t *testing.T) {
+	t.Run("noCredentialIsLoginRequired", func(t *testing.T) {
+		// Empty storage dir: loadCredential finds nothing, so the failure is
+		// local and must never be reported as a transport problem.
+		c, err := New(&Config{
+			Vault: VaultConfig{
+				Address:    "http://127.0.0.1:1",
+				AuthMethod: "mtls",
+				MTLS:       MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
+			},
+			TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		err = c.AuthenticateCached(context.Background())
+		if !errors.Is(err, ErrLoginRequired) {
+			t.Errorf("error = %v, want ErrLoginRequired for a host with no certificate", err)
+		}
+		if errors.Is(err, ErrUnreachable) {
+			t.Error("a missing local credential was reported as ErrUnreachable; consumers would retry forever instead of enrolling")
+		}
+	})
+
+	t.Run("localCauseIsNotMistakenForTransport", func(t *testing.T) {
+		// The sentinel is what makes the classification reliable: without it,
+		// classify() maps any error lacking an HTTP response to ErrUnreachable,
+		// which is precisely what a local credential failure looks like.
+		if !errors.Is(fmt.Errorf("%w: a bootstrap is required", auth.ErrNoCertCredential), auth.ErrNoCertCredential) {
+			t.Fatal("ErrNoCertCredential does not survive wrapping")
+		}
+	})
 }

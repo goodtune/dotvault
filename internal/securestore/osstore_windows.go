@@ -4,49 +4,60 @@ package securestore
 
 import (
 	"crypto"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"unsafe"
 
 	"github.com/google/certtostore"
 	"golang.org/x/sys/windows"
 )
 
-// nCryptGetProperty reads a CNG key property. certtostore keeps its own property
-// helpers unexported, so the "os" backend loads the proc itself to verify the
-// generated key's export policy (certtostore exposes the raw key handle via
-// Key.TransientTpmHandle).
-var nCryptGetProperty = windows.NewLazySystemDLL("ncrypt.dll").NewProc("NCryptGetProperty")
+// CNG entry points certtostore keeps unexported. The "os" backend loads them
+// itself to verify a generated key's export policy, to free the key handles
+// certtostore hands out (its Key type has no Close), and to delete a superseded
+// key container.
+var (
+	ncryptDLL           = windows.NewLazySystemDLL("ncrypt.dll")
+	nCryptGetProperty   = ncryptDLL.NewProc("NCryptGetProperty")
+	nCryptFreeObject    = ncryptDLL.NewProc("NCryptFreeObject")
+	nCryptOpenKey       = ncryptDLL.NewProc("NCryptOpenKey")
+	nCryptDeleteKey     = ncryptDLL.NewProc("NCryptDeleteKey")
+	nCryptSilentKeyFlag = uintptr(0x40) // NCRYPT_SILENT_FLAG
+)
 
 // nCryptExportPolicyProperty is NCRYPT_EXPORT_POLICY_PROPERTY (L"Export Policy").
 const nCryptExportPolicyProperty = "Export Policy"
 
-// osContainer is the CNG key-container name dotvault generates its cert key
-// under, in the current user's key store. dotvault runs per-user and owns a
-// single cert credential, so one fixed container is sufficient; the key lands
-// in the CurrentUser key store (DPAPI-protected) and the certificate in
-// CurrentUser\My, where the system browsers look for client certificates.
-const osContainer = "dotvault-mtls"
-
-// osHandle is the opaque securestore handle for the OS backend. It records only
-// where the key lives (CNG provider + container); the key material itself never
-// leaves the OS store. Load reopens the key by container name (CNG's
-// NCryptOpenKey), so the container is the stable association across restarts.
-type osHandle struct {
-	Provider  string `json:"provider"`
-	Container string `json:"container"`
-}
-
-// osStorage holds an open handle to the current user's CNG certificate store.
-// The store is opened once and kept open for the lifetime of the backend
-// (until Close): the crypto.Signer values returned by Generate and Load borrow
-// the store's CNG provider handle, so closing it earlier would invalidate a
-// signer still in use during the cert-auth TLS handshake.
+// osStorage holds open handles to the current user's CNG certificate store.
+//
+// Three lifetimes are managed here, all released by Close:
+//
+//   - certStore: the store used for certificate operations (install, delete).
+//     Container-independent.
+//   - keyStores: one certtostore.WinCertStore per key container. certtostore
+//     fixes the container at open time and looks keys up by it, so a backend
+//     that no longer uses a single fixed container needs one store per
+//     container it touches.
+//   - keyHandles: the NCRYPT_KEY_HANDLEs behind every crypto.Signer this
+//     backend has handed out. certtostore.Key exposes no Close and
+//     WinCertStore.Close frees only provider and store handles, so without
+//     this every Generate/Load leaked a key handle for the life of the daemon
+//     — once per startup, per unattended recovery attempt, per public-client
+//     cert login and per re-issue.
+//
+// The signers are used lazily, during the cert-auth TLS handshake via a
+// GetClientCertificate callback, so the handles must outlive the callback. They
+// are freed at Close, which every caller in internal/auth defers to the end of
+// the flow that owns the login — after certLogin has returned.
 type osStorage struct {
-	wcs       *certtostore.WinCertStore
-	container string
+	certStore *certtostore.WinCertStore
+
+	mu         sync.Mutex
+	keyStores  map[string]*certtostore.WinCertStore
+	keyHandles []uintptr
+	closed     bool
 }
 
 // openOSStore opens the current user's CNG certificate store (software key
@@ -54,12 +65,15 @@ type osStorage struct {
 // lands in CurrentUser\My and the key in the per-user DPAPI key store, so
 // browsers and other clients can present it.
 func openOSStore() (Storage, error) {
+	// The container passed here is irrelevant — this store is only used for
+	// certificate operations, which do not consult it. Key operations go
+	// through keyStore(container).
 	wcs, err := certtostore.OpenWinCertStoreCurrentUser(
-		certtostore.ProviderMSSoftware, osContainer, nil, nil, false)
+		certtostore.ProviderMSSoftware, osLegacyContainer, nil, nil, false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open Windows certificate store: %v", ErrUnsupported, err)
 	}
-	return &osStorage{wcs: wcs, container: osContainer}, nil
+	return &osStorage{certStore: wcs, keyStores: map[string]*certtostore.WinCertStore{}}, nil
 }
 
 func (s *osStorage) Capabilities() Capabilities {
@@ -69,24 +83,71 @@ func (s *osStorage) Capabilities() Capabilities {
 	return Capabilities{Name: "os", HardwareBound: true}
 }
 
-// Generate creates a key in the OS store's container and returns a signer over
+// keyStore returns (opening on first use) the certtostore store bound to a
+// given key container. certtostore takes the container at open time and its
+// Key/Generate look up by it, so each container needs its own store.
+func (s *osStorage) keyStore(container string) (*certtostore.WinCertStore, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errors.New("securestore: os store is closed")
+	}
+	if wcs, ok := s.keyStores[container]; ok {
+		return wcs, nil
+	}
+	wcs, err := certtostore.OpenWinCertStoreCurrentUser(
+		certtostore.ProviderMSSoftware, container, nil, nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("open Windows key store for container %q: %w", container, err)
+	}
+	s.keyStores[container] = wcs
+	return wcs, nil
+}
+
+// trackSigner records the CNG key handle behind a signer so Close can free it.
+func (s *osStorage) trackSigner(signer crypto.Signer) {
+	h, ok := signer.(interface{ TransientTpmHandle() uintptr })
+	if !ok || h.TransientTpmHandle() == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keyHandles = append(s.keyHandles, h.TransientTpmHandle())
+}
+
+// Generate creates a key in a *fresh* CNG container and returns a signer over
 // it plus a handle recording the container. sealToPCRs is ignored — boot-state
 // binding is a TPM concept; the OS software provider has no equivalent.
+//
+// The container is new every time by design (see osContainerPrefix): certtostore
+// generates with NCRYPT_OVERWRITE_KEY_FLAG, so generating into the container the
+// current certificate depends on would destroy a credential that is still in
+// use if any later step of the rotation failed. The old container is removed
+// only by CommitCert, once the replacement is operational.
 func (s *osStorage) Generate(kt KeyType, _ bool) (crypto.Signer, []byte, error) {
 	opts, err := generateOpts(kt)
 	if err != nil {
 		return nil, nil, err
 	}
-	signer, err := s.wcs.Generate(opts)
+	container, err := newOSContainer()
+	if err != nil {
+		return nil, nil, err
+	}
+	wcs, err := s.keyStore(container)
+	if err != nil {
+		return nil, nil, err
+	}
+	signer, err := wcs.Generate(opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key in OS certificate store: %w", err)
 	}
+	s.trackSigner(signer)
 	if err := assertNonExportable(signer); err != nil {
 		return nil, nil, err
 	}
-	handle, err := json.Marshal(osHandle{Provider: certtostore.ProviderMSSoftware, Container: s.container})
+	handle, err := encodeOSHandle(osHandle{Provider: certtostore.ProviderMSSoftware, Container: container})
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal os handle: %w", err)
+		return nil, nil, err
 	}
 	return signer, handle, nil
 }
@@ -146,15 +207,22 @@ func (s *osStorage) Import(crypto.PrivateKey, bool) (crypto.Signer, []byte, erro
 }
 
 // Load reopens the key behind handle from the OS store. CNG locates the key by
-// container name, so the cert need not be present for Load to succeed.
+// container name, so the cert need not be present for Load to succeed. The
+// returned signer's key handle is tracked and freed by Close.
 func (s *osStorage) Load(handle []byte) (crypto.Signer, error) {
-	if _, err := decodeOSHandle(handle); err != nil {
+	h, err := decodeOSHandle(handle)
+	if err != nil {
 		return nil, err
 	}
-	key, err := s.wcs.Key()
+	wcs, err := s.keyStore(h.Container)
+	if err != nil {
+		return nil, err
+	}
+	key, err := wcs.Key()
 	if err != nil {
 		return nil, fmt.Errorf("load key from OS certificate store: %w", err)
 	}
+	s.trackSigner(key)
 	return key, nil
 }
 
@@ -164,26 +232,221 @@ func (s *osStorage) Load(handle []byte) (crypto.Signer, error) {
 // lands in CurrentUser\My, readable by any process in the user's session; that
 // interoperability (browser-presentable mTLS identity) is the whole point of
 // the "os" backend and is the documented trade-off (docs/authentication/mtls.md).
-// The handle is returned unchanged (the container association is stable).
+//
+// The returned handle records the installed leaf's thumbprint and MUST be the
+// one persisted: it is what lets this leaf be found again — to delete it as
+// superseded once its own replacement commits, or to remove it on rollback if
+// this rotation never completes. Without that, every rotation would leave
+// another simultaneously valid client certificate in the store for browsers to
+// offer.
 func (s *osStorage) StoreCert(handle []byte, certPEM string) ([]byte, error) {
-	if _, err := decodeOSHandle(handle); err != nil {
+	h, err := decodeOSHandle(handle)
+	if err != nil {
 		return nil, err
 	}
 	leaf, intermediate, err := parseLeafAndIssuer(certPEM)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.wcs.Store(leaf, intermediate); err != nil {
+	if err := s.certStore.Store(leaf, intermediate); err != nil {
 		return nil, fmt.Errorf("store certificate in OS certificate store: %w", err)
 	}
-	return handle, nil
+	h.Thumbprint = certSHA1Thumbprint(leaf.Raw)
+	return encodeOSHandle(h)
 }
 
-func (s *osStorage) Close() error {
-	if s.wcs == nil {
+// CommitCert removes the key container and leaf certificate superseded by a
+// rotation that has fully committed. See securestore.CertLifecycle for the
+// ordering contract; errors here are advisory (the new credential is live).
+func (s *osStorage) CommitCert(newHandle, oldHandle []byte) error {
+	if len(oldHandle) == 0 {
+		return nil // first seed: nothing superseded
+	}
+	newH, err := decodeOSHandle(newHandle)
+	if err != nil {
+		return err
+	}
+	oldH, err := decodeOSHandle(oldHandle)
+	if err != nil {
+		// A handle we cannot parse is a handle we must not act on: deleting the
+		// wrong container or certificate is worse than leaking one.
+		return fmt.Errorf("decode superseded os handle: %w", err)
+	}
+	container, thumbprint := supersededOSArtifacts(newH, oldH)
+	return s.discard(container, thumbprint)
+}
+
+// RollbackCert removes the key container and any leaf certificate belonging to
+// a replacement credential that never became operational, leaving the previous
+// credential authoritative. Safe when StoreCert was never reached (there is no
+// leaf) and safe to call twice.
+func (s *osStorage) RollbackCert(newHandle []byte) error {
+	if len(newHandle) == 0 {
 		return nil
 	}
-	return s.wcs.Close()
+	h, err := decodeOSHandle(newHandle)
+	if err != nil {
+		return err
+	}
+	return s.discard(h.Container, h.Thumbprint)
+}
+
+// discard removes a key container and/or a leaf certificate, reporting every
+// failure rather than stopping at the first: the two artefacts are independent
+// and leaving one behind because the other failed helps nobody.
+func (s *osStorage) discard(container, thumbprint string) error {
+	var errs []error
+	if container != "" {
+		if err := s.deleteKeyContainer(container); err != nil {
+			errs = append(errs, err)
+		} else {
+			slog.Debug("removed superseded OS-store key container", "container", container)
+		}
+	}
+	if thumbprint != "" {
+		if err := deleteUserCertByThumbprint(thumbprint); err != nil {
+			errs = append(errs, err)
+		} else {
+			slog.Debug("removed superseded OS-store certificate", "thumbprint", thumbprint)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// deleteKeyContainer deletes a persisted CNG key by container name.
+// NCryptDeleteKey both deletes the key and frees the handle passed to it, so
+// the handle opened here must not also be freed. Any tracked signer over the
+// same container becomes unusable, which is the point — the container is being
+// discarded.
+func (s *osStorage) deleteKeyContainer(container string) error {
+	if !validOSContainer(container) {
+		return fmt.Errorf("refusing to delete key container %q: not a dotvault container", container)
+	}
+	wcs, err := s.keyStore(container)
+	if err != nil {
+		return err
+	}
+	name, err := windows.UTF16PtrFromString(container)
+	if err != nil {
+		return err
+	}
+	var kh uintptr
+	r, _, _ := nCryptOpenKey.Call(
+		wcs.Prov,
+		uintptr(unsafe.Pointer(&kh)),
+		uintptr(unsafe.Pointer(name)),
+		0,
+		nCryptSilentKeyFlag,
+	)
+	if r != 0 {
+		// NTE_BAD_KEYSET (0x80090016): already gone. Deleting what is not there
+		// is the desired end state, so this is success, not failure.
+		if r == 0x80090016 {
+			return nil
+		}
+		return fmt.Errorf("NCryptOpenKey(%q) returned %#x", container, r)
+	}
+	if r, _, _ := nCryptDeleteKey.Call(kh, nCryptSilentKeyFlag); r != 0 {
+		freeKeyHandle(kh)
+		return fmt.Errorf("NCryptDeleteKey(%q) returned %#x", container, r)
+	}
+	return nil
+}
+
+// deleteUserCertByThumbprint removes a certificate from CurrentUser\My by its
+// SHA-1 thumbprint. A certificate that is not there is not an error: the end
+// state is what matters, and a user may have removed it by hand.
+//
+// The match is duplicated and the enumeration ended before the delete, rather
+// than deleting the context the enumeration is sitting on — deleting the cursor
+// out from under CertEnumCertificatesInStore is not something to rely on, and
+// there is only ever one certificate to remove.
+func deleteUserCertByThumbprint(thumbprint string) error {
+	storeName, err := windows.UTF16PtrFromString("MY")
+	if err != nil {
+		return err
+	}
+	store, err := windows.CertOpenStore(
+		windows.CERT_STORE_PROV_SYSTEM,
+		0,
+		0,
+		windows.CERT_SYSTEM_STORE_CURRENT_USER,
+		uintptr(unsafe.Pointer(storeName)),
+	)
+	if err != nil {
+		return fmt.Errorf("open CurrentUser\\My certificate store: %w", err)
+	}
+	defer windows.CertCloseStore(store, 0)
+
+	var (
+		found *windows.CertContext
+		prev  *windows.CertContext
+	)
+	for {
+		ctx, err := windows.CertEnumCertificatesInStore(store, prev)
+		if err != nil || ctx == nil {
+			break
+		}
+		der := unsafe.Slice(ctx.EncodedCert, ctx.Length)
+		if certSHA1Thumbprint(der) == thumbprint {
+			found = windows.CertDuplicateCertificateContext(ctx)
+			windows.CertFreeCertificateContext(ctx) // ends the enumeration
+			break
+		}
+		prev = ctx
+	}
+	if found == nil {
+		return nil
+	}
+	if err := windows.CertDeleteCertificateFromStore(found); err != nil {
+		return fmt.Errorf("delete certificate %s from CurrentUser\\My: %w", thumbprint, err)
+	}
+	return nil
+}
+
+// freeKeyHandle releases a CNG key handle (NCryptFreeObject).
+func freeKeyHandle(h uintptr) error {
+	if h == 0 {
+		return nil
+	}
+	if r, _, _ := nCryptFreeObject.Call(h); r != 0 {
+		return fmt.Errorf("NCryptFreeObject returned %#x", r)
+	}
+	return nil
+}
+
+// Close frees every handle this backend opened: the CNG key handles behind the
+// signers it handed out, and the provider/store handles behind each per-
+// container certtostore store. Callers in internal/auth defer it to the end of
+// the flow, which is after the cert-auth TLS handshake has consumed the signer.
+func (s *osStorage) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	handles, stores := s.keyHandles, s.keyStores
+	s.keyHandles, s.keyStores = nil, nil
+	s.mu.Unlock()
+
+	var errs []error
+	for _, h := range handles {
+		if err := freeKeyHandle(h); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, wcs := range stores {
+		if err := wcs.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.certStore != nil {
+		if err := s.certStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // generateOpts maps a securestore KeyType onto certtostore.GenerateOpts. The OS
@@ -198,23 +461,4 @@ func generateOpts(kt KeyType) (certtostore.GenerateOpts, error) {
 	default:
 		return certtostore.GenerateOpts{}, fmt.Errorf("securestore: unknown key type %q", kt)
 	}
-}
-
-// decodeOSHandle parses and sanity-checks a handle. It rejects a handle whose
-// container does not match the one this backend actually opens (osContainer): the
-// key lookup keys off the open container, so a mismatched handle could only come
-// from a corrupted envelope or a different deployment, and failing loudly beats
-// silently operating on the wrong key.
-func decodeOSHandle(handle []byte) (osHandle, error) {
-	var h osHandle
-	if err := json.Unmarshal(handle, &h); err != nil {
-		return osHandle{}, fmt.Errorf("decode os handle: %w", err)
-	}
-	if h.Container == "" {
-		return osHandle{}, errors.New("securestore: os handle has no container")
-	}
-	if h.Container != osContainer {
-		return osHandle{}, fmt.Errorf("securestore: os handle container %q does not match expected %q", h.Container, osContainer)
-	}
-	return h, nil
 }

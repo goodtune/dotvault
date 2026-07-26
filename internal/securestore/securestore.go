@@ -116,9 +116,46 @@ type DataSealer interface {
 type CertStorer interface {
 	// StoreCert installs certPEM (leaf followed by its issuing CA chain) into
 	// the store, associating it with the key behind handle. It returns the
-	// handle to persist going forward (unchanged for the "os" backend, but the
-	// signature leaves room for a backend that re-keys on store).
+	// handle to persist going forward. For the "os" backend the returned handle
+	// records the installed leaf, so it differs from the one passed in and MUST
+	// be the one persisted.
 	StoreCert(handle []byte, certPEM string) ([]byte, error)
+}
+
+// CertLifecycle is an optional capability for CertStorer backends whose store
+// accumulates state that a rotation must clean up — the "os" backend, where
+// each rotation creates a new CNG key container and installs another leaf into
+// CurrentUser\My. It makes rotation two-phase so a failure part-way through
+// cannot destroy the credential the host is still using.
+//
+// The contract the cert-auth flow must honour, in order:
+//
+//  1. Generate a key and issue a certificate. The previous credential remains
+//     authoritative and usable throughout.
+//  2. StoreCert the new certificate, persist the returned handle in the
+//     envelope, and complete the replacement cert login.
+//  3. On success, CommitCert(newHandle, oldHandle) — the old key container and
+//     leaf are removed. On any failure at or after step 1,
+//     RollbackCert(newHandle) — the replacement's container and leaf are
+//     removed and the old credential stays authoritative.
+//
+// Backends that do not implement it (file, tpm) need no such cleanup: their
+// handle *is* the key material, so overwriting the envelope is the whole
+// transaction.
+type CertLifecycle interface {
+	// CommitCert finalises a rotation whose replacement credential is now
+	// persisted and operational, removing the superseded key container and
+	// leaf certificate. oldHandle may be nil or empty for a first seed, in
+	// which case there is nothing to remove. Errors are advisory — the new
+	// credential is already live and the only cost is a leftover artefact — so
+	// callers should log rather than fail the login.
+	CommitCert(newHandle, oldHandle []byte) error
+	// RollbackCert discards a replacement credential that never became
+	// operational, removing its key container and any leaf certificate
+	// installed for it. It is safe to call when StoreCert was never reached
+	// (the leaf simply does not exist) and safe to call twice. Like
+	// CommitCert, errors are advisory.
+	RollbackCert(newHandle []byte) error
 }
 
 // SealData seals data under the platform hardware backend (TPM on

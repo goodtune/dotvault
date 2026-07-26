@@ -80,6 +80,10 @@ type Server struct {
 	// display reasons — doing so silently re-opens the adoption race that
 	// guard exists to close.
 	bootstrapMethod string
+	// bootstrapMount is vault.mtls.bootstrap_mount — the auth mount the
+	// certificate bootstrap logs in against, which may differ from
+	// vault.auth_mount. See Server.loginMount.
+	bootstrapMount string
 	// bootstrapMu guards bootstrapCh, which is non-nil exactly while a
 	// BootstrapLogin is waiting for a browser-driven login to complete.
 	// Its non-nil-ness IS "bootstrap mode is active", so the token-adoption
@@ -172,6 +176,10 @@ type ServerConfig struct {
 	// vault.mtls.bootstrap_method). Reported on /api/v1/status so the SPA
 	// knows which login form to present while a BootstrapLogin is waiting.
 	BootstrapMethod string
+	// BootstrapMount is the auth mount used for the one-time mTLS certificate
+	// bootstrap (vault.mtls.bootstrap_mount). Empty falls back to the
+	// bootstrap method's conventional default, matching the CLI flow.
+	BootstrapMount string
 	// OpenBrowser, when non-nil, overrides how the remote-browse endpoint
 	// launches URLs in this host's default browser (tests inject a fake).
 	// Nil selects the real browser.OpenURL.
@@ -221,6 +229,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authMount:          sc.VaultCfg.AuthMount,
 		authRole:           sc.VaultCfg.AuthRole,
 		bootstrapMethod:    sc.BootstrapMethod,
+		bootstrapMount:     sc.BootstrapMount,
 		tokenFilePath:      sc.TokenFilePath,
 		version:            sc.Version,
 		vaultAddress:       sc.VaultCfg.Address,

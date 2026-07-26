@@ -35,10 +35,7 @@ func (s *Server) WaitForAuth(ctx context.Context) error {
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
-	}
+	mount := s.loginMount("oidc")
 
 	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)
 
@@ -89,10 +86,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
-	}
+	mount := s.loginMount("oidc")
 
 	callbackPath := fmt.Sprintf("auth/%s/oidc/callback", mount)
 	loginData := map[string][]string{
@@ -177,10 +171,7 @@ func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mount := s.authMount
-	if mount == "" {
-		mount = "ldap"
-	}
+	mount := s.loginMount("ldap")
 
 	s.login.StartLogin(sessionID, mount, req.Username, req.Password)
 

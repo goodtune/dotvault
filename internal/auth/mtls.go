@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -90,12 +91,32 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The seed is in the store but not yet authoritative; roll it back unless
+	// both persistence and the cert login succeed. seedCredential deliberately
+	// hands it over intact rather than committing, because only here do we know
+	// the replacement actually works.
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackCertRotation(store, newCred.Handle)
+		}
+	}()
 	if err := saveCredential(p.StorageDir, newCred); err != nil {
 		return fmt.Errorf("persist mtls credential: %w", err)
 	}
 	if err := m.certLogin(ctx, newCred, signer); err != nil {
 		return err
 	}
+	committed = true
+	// Retire whatever this replaced. cred is nil on a first enrolment and
+	// non-nil when an existing credential was present but unusable (expired,
+	// wrong identity, failed login) — in which case its container and leaf are
+	// exactly the stale artefacts that must not linger.
+	var oldHandle []byte
+	if cred != nil {
+		oldHandle = cred.Handle
+	}
+	commitCertRotation(store, newCred.Handle, oldHandle)
 	WarnUnrestrictedPolicy(m.Policy)
 	return nil
 }
@@ -103,6 +124,19 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 // tryExistingCredential loads the stored signer, optionally rotates a cert
 // inside the re-issue window, and logs in. Returns (true, nil) when the
 // Manager's client now holds an operational token.
+// ErrNoCertCredential marks a certificate-login failure whose cause is local to
+// this host — no credential enrolled, an unreadable envelope, an expired or
+// wrong-identity certificate, or an unavailable secure store — as opposed to a
+// failure talking to Vault.
+//
+// The distinction is load-bearing for the public client facade. A Vault that is
+// unreachable, rate-limited, or 5xx-ing is a retry condition; a missing or
+// unusable credential means the host must be enrolled. A transport failure
+// carries no HTTP response, so a caller cannot reliably tell the two apart by
+// inspecting the error alone — hence an explicit sentinel rather than a
+// heuristic. See client.AuthenticateCached.
+var ErrNoCertCredential = errors.New("no usable certificate credential on this host")
+
 // CertLoginFromStore mints a fresh operational token by performing the
 // certificate login against the credential this host already holds. It is the
 // non-interactive half of certificate auth, split out so callers that must
@@ -133,20 +167,20 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 func (m *Manager) CertLoginFromStore(ctx context.Context) error {
 	p := m.MTLS
 	if p == nil {
-		return fmt.Errorf("certificate login requested but vault.mtls is not configured")
+		return fmt.Errorf("%w: vault.mtls is not configured", ErrNoCertCredential)
 	}
 	store, err := securestore.Open(securestore.ModeForMethod(p.Method))
 	if err != nil {
-		return fmt.Errorf("open secure store: %w", err)
+		return fmt.Errorf("%w: open secure store: %w", ErrNoCertCredential, err)
 	}
 	defer store.Close()
 
 	cred, err := loadCredential(p.StorageDir)
 	if err != nil {
-		return fmt.Errorf("load certificate credential: %w", err)
+		return fmt.Errorf("%w: load certificate credential: %w", ErrNoCertCredential, err)
 	}
 	if cred == nil {
-		return fmt.Errorf("no certificate credential on this host; a bootstrap is required")
+		return fmt.Errorf("%w: a bootstrap is required", ErrNoCertCredential)
 	}
 
 	// Login only — deliberately NOT tryExistingCredential, which also rotates
@@ -163,14 +197,14 @@ func (m *Manager) CertLoginFromStore(ctx context.Context) error {
 // recovery (CertLoginFromStore, which must not).
 func (m *Manager) loginWithCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) error {
 	if cred.Identity != "" && m.Username != "" && cred.Identity != m.Username {
-		return fmt.Errorf("credential belongs to %q, not the current user %q", cred.Identity, m.Username)
+		return fmt.Errorf("%w: credential belongs to %q, not the current user %q", ErrNoCertCredential, cred.Identity, m.Username)
 	}
 	if !cred.NotAfter.IsZero() && time.Now().After(cred.NotAfter) {
-		return fmt.Errorf("certificate expired at %s", cred.NotAfter.Format(time.RFC3339))
+		return fmt.Errorf("%w: certificate expired at %s", ErrNoCertCredential, cred.NotAfter.Format(time.RFC3339))
 	}
 	signer, err := store.Load(cred.Handle)
 	if err != nil {
-		return fmt.Errorf("load key from secure store: %w", err)
+		return fmt.Errorf("%w: load key from secure store: %w", ErrNoCertCredential, err)
 	}
 	return m.certLogin(ctx, cred, signer)
 }
@@ -231,6 +265,21 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	if err != nil {
 		return fmt.Errorf("generate key: %w", err)
 	}
+	// From here the replacement exists in the store but is not yet
+	// authoritative. Every failure path must roll it back, or a store that
+	// accumulates state (the OS-native backend: one CNG container and one
+	// CurrentUser\My leaf per rotation) is left holding an orphan — and, for
+	// the leaf, a second simultaneously valid client identity a browser could
+	// offer. The old credential remains usable throughout, which is the point
+	// of doing this two-phase.
+	committed := false
+	newHandle := handle
+	defer func() {
+		if !committed {
+			rollbackCertRotation(store, newHandle)
+		}
+	}()
+
 	issued, err := m.signOrIssue(ctx, m.VaultClient, signer, cn)
 	if err != nil {
 		return err
@@ -242,10 +291,20 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	if err := storeCertInNativeStore(store, newCred); err != nil {
 		return err
 	}
+	// StoreCert may re-key the handle (the OS backend records the installed
+	// leaf), so roll back whatever the credential now carries.
+	newHandle = newCred.Handle
 	if err := saveCredential(m.MTLS.StorageDir, newCred); err != nil {
 		return fmt.Errorf("persist rotated credential: %w", err)
 	}
-	return m.certLogin(ctx, newCred, signer)
+	if err := m.certLogin(ctx, newCred, signer); err != nil {
+		return err
+	}
+	// Persisted and operational: the replacement is now authoritative, so the
+	// superseded container and leaf can go.
+	committed = true
+	commitCertRotation(store, newCred.Handle, old.Handle)
+	return nil
 }
 
 // seedCredential produces a fresh credential via BYO or LDAP/OIDC bootstrap.
@@ -285,6 +344,17 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}
+	// As in reissue: past this point a replacement exists in the store but is
+	// not authoritative until the caller has persisted it and completed the
+	// cert login. Any failure here must not leave an orphaned container or a
+	// second usable leaf behind. The caller commits (see authenticateMTLS).
+	seeded := false
+	newHandle := handle
+	defer func() {
+		if !seeded {
+			rollbackCertRotation(store, newHandle)
+		}
+	}()
 	// PKI sign runs on the bootstrap client, not m.VaultClient: the broad,
 	// PKI-capable bootstrap token must never be installed on the shared client
 	// (which the web server exposes via /api/v1/token before the final cert
@@ -300,7 +370,45 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	if err := storeCertInNativeStore(store, cred); err != nil {
 		return nil, nil, err
 	}
+	newHandle = cred.Handle
+	// Handed to the caller intact; it owns persistence, the cert login, and the
+	// commit that finally retires the superseded credential.
+	seeded = true
 	return cred, signer, nil
+}
+
+// commitCertRotation finalises a rotation whose replacement credential is
+// persisted and operational, letting a CertLifecycle backend drop the
+// superseded key container and leaf certificate. A no-op for backends without
+// the capability (file, tpm), where the handle IS the key material and
+// overwriting the envelope is the whole transaction.
+//
+// Errors are advisory and logged, never returned: the replacement is already
+// live, and failing an otherwise successful login because a stale artefact
+// could not be swept would trade a working daemon for a tidy certificate store.
+func commitCertRotation(store securestore.Storage, newHandle, oldHandle []byte) {
+	cl, ok := store.(securestore.CertLifecycle)
+	if !ok {
+		return
+	}
+	if err := cl.CommitCert(newHandle, oldHandle); err != nil {
+		slog.Warn("could not remove the superseded certificate credential; it remains in the store", "error", err)
+	}
+}
+
+// rollbackCertRotation discards a replacement credential that never became
+// operational, so a failed rotation leaves no orphaned key container or leaf
+// certificate behind and the previous credential stays authoritative. Like
+// commitCertRotation it is a no-op without the capability, and its errors are
+// advisory — the caller is already returning the failure that matters.
+func rollbackCertRotation(store securestore.Storage, newHandle []byte) {
+	cl, ok := store.(securestore.CertLifecycle)
+	if !ok {
+		return
+	}
+	if err := cl.RollbackCert(newHandle); err != nil {
+		slog.Warn("could not clean up the abandoned replacement credential", "error", err)
+	}
 }
 
 // storeCertInNativeStore pushes the issued certificate into the OS-native

@@ -40,14 +40,164 @@ func TestExportPolicyIsExportable(t *testing.T) {
 		0x1:       true,  // NCRYPT_ALLOW_EXPORT_FLAG
 		0x2:       true,  // NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG
 		0x3:       true,  // both export flags
-		0x4:       false, // NCRYPT_ALLOW_ARCHIVING_FLAG — backup/escrow, not key extraction
+		0x4:       true,  // NCRYPT_ALLOW_ARCHIVING_FLAG — a one-time export is still an extraction
+		0x8:       true,  // NCRYPT_ALLOW_PLAINTEXT_ARCHIVING_FLAG — one-time plaintext export
+		0xC:       true,  // both archiving flags
+		0xF:       true,  // everything set
 		0x1 | 0x4: true,  // export + archiving
+		0x10:      false, // an unrelated future bit must not read as exportable
 	}
 	for policy, want := range cases {
 		if got := exportPolicyIsExportable(policy); got != want {
 			t.Errorf("exportPolicyIsExportable(%#x) = %v, want %v", policy, got, want)
 		}
 	}
+}
+
+// TestExportPolicyArchivingFlagsAreLoadBearing pins the fix for the
+// archiving-flag gap: the mask previously covered only 0x1|0x2, so a key CNG
+// permits a one-time (or one-time plaintext) archival export of read as
+// non-exportable, and assertNonExportable waved it through. This asserts the
+// archiving bits are *individually* sufficient to fail the check, so the old
+// two-flag mask cannot come back without a red test.
+func TestExportPolicyArchivingFlagsAreLoadBearing(t *testing.T) {
+	oldMask := func(policy uint32) bool {
+		return policy&(cngAllowExport|cngAllowPlaintextExport) != 0
+	}
+	for _, policy := range []uint32{cngAllowArchiving, cngAllowPlaintextArchiving, cngAllowArchiving | cngAllowPlaintextArchiving} {
+		if oldMask(policy) {
+			t.Fatalf("test is not load-bearing: the old two-flag mask already rejected %#x", policy)
+		}
+		if !exportPolicyIsExportable(policy) {
+			t.Errorf("exportPolicyIsExportable(%#x) = false; an archiving flag permits the private key to be exported and must fail the check", policy)
+		}
+	}
+}
+
+func TestNewOSContainerIsUniqueAndValid(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		name, err := newOSContainer()
+		if err != nil {
+			t.Fatalf("newOSContainer: %v", err)
+		}
+		if !strings.HasPrefix(name, osContainerPrefix) {
+			t.Fatalf("container %q lacks prefix %q", name, osContainerPrefix)
+		}
+		if !validOSContainer(name) {
+			t.Fatalf("generated container %q fails validOSContainer", name)
+		}
+		if seen[name] {
+			t.Fatalf("duplicate container name %q — rotation would overwrite a live key", name)
+		}
+		seen[name] = true
+	}
+}
+
+func TestValidOSContainer(t *testing.T) {
+	cases := map[string]bool{
+		osLegacyContainer:          true, // pre-rotation envelopes stay loadable
+		"dotvault-mtls-0011aabb":   true,
+		"dotvault-mtls-":           false, // empty suffix
+		"dotvault-mtls-AABB":       false, // uppercase is not what we emit
+		"dotvault-mtls-zz":         false, // not hex
+		"dotvault-mtls-abc":        false, // odd-length hex
+		"":                         false,
+		"some-other-app":           false,
+		"dotvault-mtls-00/../evil": false,
+		"DOTVAULT-MTLS":            false,
+	}
+	for name, want := range cases {
+		if got := validOSContainer(name); got != want {
+			t.Errorf("validOSContainer(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestOSHandleRoundTrip(t *testing.T) {
+	in := osHandle{Provider: "Microsoft Software Key Storage Provider", Container: "dotvault-mtls-deadbeef", Thumbprint: "ABCD"}
+	b, err := encodeOSHandle(in)
+	if err != nil {
+		t.Fatalf("encodeOSHandle: %v", err)
+	}
+	out, err := decodeOSHandle(b)
+	if err != nil {
+		t.Fatalf("decodeOSHandle: %v", err)
+	}
+	if out != in {
+		t.Errorf("round trip = %+v, want %+v", out, in)
+	}
+}
+
+func TestDecodeOSHandleRejectsForeignContainer(t *testing.T) {
+	for _, body := range []string{
+		`{"provider":"p"}`, // no container
+		`{"provider":"p","container":"someone-else"}`, // not ours: deleting it would be destructive
+		`not json`,
+	} {
+		if _, err := decodeOSHandle([]byte(body)); err == nil {
+			t.Errorf("decodeOSHandle(%s) succeeded, want error", body)
+		}
+	}
+}
+
+func TestDecodeOSHandleAcceptsLegacyEnvelope(t *testing.T) {
+	// Envelopes written before rotation became two-phase name the single fixed
+	// container and carry no thumbprint. They must keep loading, and the first
+	// rotation then supersedes them.
+	h, err := decodeOSHandle([]byte(`{"provider":"p","container":"dotvault-mtls"}`))
+	if err != nil {
+		t.Fatalf("decodeOSHandle(legacy): %v", err)
+	}
+	if h.Container != osLegacyContainer || h.Thumbprint != "" {
+		t.Errorf("legacy handle = %+v", h)
+	}
+}
+
+func TestCertSHA1Thumbprint(t *testing.T) {
+	// Known-answer: the thumbprint of the empty DER input, uppercase hex SHA-1.
+	if got := certSHA1Thumbprint(nil); got != "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709" {
+		t.Errorf("certSHA1Thumbprint(nil) = %q", got)
+	}
+	block, _ := pem.Decode([]byte(makeCertPEM(t, "leaf")))
+	tp := certSHA1Thumbprint(block.Bytes)
+	if len(tp) != 40 {
+		t.Errorf("thumbprint %q is not 40 hex chars", tp)
+	}
+	if tp != strings.ToUpper(tp) {
+		t.Errorf("thumbprint %q is not uppercase (Windows convention)", tp)
+	}
+}
+
+func TestSupersededOSArtifacts(t *testing.T) {
+	old := osHandle{Container: "dotvault-mtls-1111", Thumbprint: "AAAA"}
+	newer := osHandle{Container: "dotvault-mtls-2222", Thumbprint: "BBBB"}
+
+	t.Run("rotation supersedes both", func(t *testing.T) {
+		c, tp := supersededOSArtifacts(newer, old)
+		if c != "dotvault-mtls-1111" || tp != "AAAA" {
+			t.Errorf("got (%q, %q), want the old container and thumbprint", c, tp)
+		}
+	})
+
+	t.Run("first seed supersedes nothing", func(t *testing.T) {
+		if c, tp := supersededOSArtifacts(newer, osHandle{}); c != "" || tp != "" {
+			t.Errorf("got (%q, %q), want empty", c, tp)
+		}
+	})
+
+	t.Run("never deletes an artefact the new credential uses", func(t *testing.T) {
+		same := osHandle{Container: newer.Container, Thumbprint: newer.Thumbprint}
+		if c, tp := supersededOSArtifacts(newer, same); c != "" || tp != "" {
+			t.Errorf("got (%q, %q), want empty — that is the live key/cert", c, tp)
+		}
+		// Legacy envelope: container superseded, but there is no old leaf
+		// recorded, so nothing to delete on the certificate side.
+		legacy := osHandle{Container: osLegacyContainer}
+		if c, tp := supersededOSArtifacts(newer, legacy); c != osLegacyContainer || tp != "" {
+			t.Errorf("got (%q, %q), want (%q, \"\")", c, tp, osLegacyContainer)
+		}
+	})
 }
 
 func TestParseLeafAndIssuer(t *testing.T) {

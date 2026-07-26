@@ -226,8 +226,7 @@ func (lm *LifecycleManager) tryRecover(ctx context.Context) bool {
 		slog.Debug("unattended token recovery reported success but left no token")
 		return false
 	}
-	lm.recoverFailures = 0
-	lm.nextRecoverAt = time.Time{}
+	lm.resetRecoveryBackoff()
 	slog.Info("recovered vault token without re-authentication")
 	return true
 }
@@ -425,6 +424,22 @@ func (lm *LifecycleManager) signalReauth(ctx context.Context, errCh chan<- error
 // (either after a clean cycle or after picking up a fresh token from disk).
 func (lm *LifecycleManager) clearReauth() {
 	lm.needsReauth.Store(false)
+	// Any return to a valid token ends the current failure episode, not just a
+	// successful recovery hook. Without this, a run of failed recoveries
+	// followed by a token arriving from disk/env/socket (tryReload) or a check
+	// simply going healthy would leave the failure count standing, and the next
+	// unrelated outage would start at the 5-minute cap instead of being treated
+	// as a fresh first failure — turning a brief blip into a five-minute
+	// outage for reasons that were resolved long ago.
+	lm.resetRecoveryBackoff()
+}
+
+// resetRecoveryBackoff clears the consecutive-failure state so the next
+// recovery episode starts from scratch. Called from every transition back to a
+// valid token.
+func (lm *LifecycleManager) resetRecoveryBackoff() {
+	lm.recoverFailures = 0
+	lm.nextRecoverAt = time.Time{}
 }
 
 // tryReload re-reads the token file (and DOTVAULT_TOKEN env) and, if a

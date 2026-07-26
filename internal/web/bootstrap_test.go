@@ -512,3 +512,75 @@ func TestTokenLogin_AllowedWithoutCertificateAuth(t *testing.T) {
 		t.Errorf("shared client token = %q, want the adopted token", got)
 	}
 }
+
+// TestLoginMount_UsesBootstrapMountUnderCertAuth pins PR-review finding P1.
+//
+// Under certificate auth every browser login is a bootstrap, so it must target
+// vault.mtls.bootstrap_mount. The CLI bootstrap already does — runBootstrap
+// builds its Manager with AuthMount: m.MTLS.BootstrapMount — so before this fix
+// a deployment whose bootstrap mount differed from its operational auth mount
+// worked from the CLI and silently hit the wrong Vault path from the SPA.
+//
+// Reverting loginMount (i.e. going back to s.authMount at the three handler
+// sites) must fail the certAuth cases below.
+func TestLoginMount_UsesBootstrapMountUnderCertAuth(t *testing.T) {
+	tests := []struct {
+		name            string
+		authMount       string
+		bootstrapMethod string
+		bootstrapMount  string
+		fallback        string
+		want            string
+	}{
+		{
+			name:            "certAuthPrefersBootstrapMount",
+			authMount:       "operational-ldap",
+			bootstrapMethod: "ldap",
+			bootstrapMount:  "bootstrap-ldap",
+			fallback:        "ldap",
+			want:            "bootstrap-ldap",
+		},
+		{
+			// The bug: auth_mount set, bootstrap_mount not. Must NOT leak the
+			// operational mount into the bootstrap login.
+			name:            "certAuthIgnoresAuthMount",
+			authMount:       "operational-ldap",
+			bootstrapMethod: "ldap",
+			bootstrapMount:  "",
+			fallback:        "ldap",
+			want:            "ldap",
+		},
+		{
+			name:            "certAuthOIDCFallback",
+			authMount:       "operational-oidc",
+			bootstrapMethod: "oidc",
+			bootstrapMount:  "",
+			fallback:        "oidc",
+			want:            "oidc",
+		},
+		{
+			name:      "nonCertAuthUsesAuthMount",
+			authMount: "corp-ldap",
+			fallback:  "ldap",
+			want:      "corp-ldap",
+		},
+		{
+			name:     "nonCertAuthFallsBack",
+			fallback: "oidc",
+			want:     "oidc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				authMount:       tt.authMount,
+				bootstrapMethod: tt.bootstrapMethod,
+				bootstrapMount:  tt.bootstrapMount,
+			}
+			if got := s.loginMount(tt.fallback); got != tt.want {
+				t.Errorf("loginMount(%q) = %q, want %q", tt.fallback, got, tt.want)
+			}
+		})
+	}
+}

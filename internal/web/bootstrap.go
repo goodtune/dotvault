@@ -89,6 +89,29 @@ func (s *Server) bootstrapActive() bool {
 	return s.bootstrapCh != nil
 }
 
+// loginMount resolves the Vault auth mount a browser login should target,
+// falling back to the method's conventional default when nothing is configured.
+//
+// Under certificate auth every browser login is a bootstrap (see
+// operationalAdoptionAllowed), so it must use vault.mtls.bootstrap_mount rather
+// than vault.auth_mount. The CLI bootstrap already does — runBootstrap builds
+// its Manager with AuthMount: m.MTLS.BootstrapMount — so without this the same
+// configuration would send the CLI and the browser to different Vault paths,
+// and any deployment with a non-default bootstrap mount would work from the CLI
+// and fail in the SPA.
+func (s *Server) loginMount(fallback string) string {
+	if s.bootstrapMethod != "" {
+		if s.bootstrapMount != "" {
+			return s.bootstrapMount
+		}
+		return fallback
+	}
+	if s.authMount != "" {
+		return s.authMount
+	}
+	return fallback
+}
+
 // operationalAdoptionAllowed reports whether a browser login may become this
 // daemon's operational Vault token.
 //

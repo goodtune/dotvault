@@ -508,3 +508,59 @@ func TestLifecycleManager_RecoverBackoff(t *testing.T) {
 		}
 	})
 }
+
+// TestLifecycleManager_BackoffResetsOnAnyRecovery pins PR-review finding P2:
+// the consecutive-failure counter must be cleared by ANY return to a valid
+// token, not only by the recovery hook succeeding.
+//
+// The failure mode is subtle and long-lived. Suppose certificate recovery fails
+// several times, then a token arrives from disk/env/socket (tryReload) or a
+// lifecycle check simply goes healthy. Before this fix clearReauth left the
+// failure count standing, so the NEXT — entirely unrelated — outage would start
+// at the 5-minute cap instead of being treated as a fresh first failure, turning
+// a brief blip into a five-minute outage for reasons resolved long ago.
+//
+// Reverting the resetRecoveryBackoff call in clearReauth must fail this test.
+func TestLifecycleManager_BackoffResetsOnAnyRecovery(t *testing.T) {
+	vc, err := vault.NewClient(vault.Config{Address: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	lm := &LifecycleManager{
+		client:           vc,
+		recoveryInterval: 10 * time.Second,
+		maxDelay:         5 * time.Minute,
+	}
+	lm.SetRecover(func(context.Context) error { return errors.New("vault down") })
+
+	// Two consecutive failures: the episode is now backed off.
+	lm.tryRecover(context.Background())
+	lm.tryRecover(context.Background())
+	if lm.recoverFailures != 2 {
+		t.Fatalf("precondition: recoverFailures = %d, want 2", lm.recoverFailures)
+	}
+	if lm.nextRecoverAt.IsZero() {
+		t.Fatal("precondition: expected a scheduled backoff window")
+	}
+
+	// The episode ends by some OTHER route — tryReload found a token, or a
+	// check went healthy. Both funnel through clearReauth.
+	lm.clearReauth()
+
+	if lm.recoverFailures != 0 {
+		t.Errorf("recoverFailures = %d, want 0 — a later unrelated outage would start at the backoff cap", lm.recoverFailures)
+	}
+	if !lm.nextRecoverAt.IsZero() {
+		t.Error("nextRecoverAt still set after the episode ended; the next outage would be delayed before its first attempt")
+	}
+
+	// And the next episode genuinely starts from scratch: the first failure of
+	// a new episode must not be penalised.
+	lm.tryRecover(context.Background())
+	if lm.recoverFailures != 1 {
+		t.Errorf("recoverFailures = %d, want 1 for the first failure of a new episode", lm.recoverFailures)
+	}
+	if got := lm.recoverBackoff(); got != 0 {
+		t.Errorf("backoff = %v, want 0 for a first failure", got)
+	}
+}

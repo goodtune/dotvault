@@ -291,11 +291,30 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		mgr := c.manager()
 		mgr.TokenFilePath = "" // in-memory only; see above
 		if err := mgr.CertLoginFromStore(ctx); err != nil {
-			// Fall through to the ErrLoginRequired reporting below, which
-			// names the sources tried. A cert failure here is expected on a
-			// host that was never enrolled.
 			c.vc.SetToken("")
-			return fmt.Errorf("%w: no usable cached token and certificate login failed: %w",
+			// Preserve the error taxonomy. A certificate login can fail two
+			// very different ways, and they call for opposite responses: an
+			// unreachable, rate-limited or 5xx-ing Vault is a retry condition,
+			// whereas a missing or unusable credential means the host must be
+			// enrolled. Reporting both as ErrLoginRequired would tell a Go or
+			// Python consumer to enrol when it should back off, contradicting
+			// this method's documented ErrUnreachable contract.
+			//
+			// The split cannot be inferred from the error's shape — a
+			// transport failure carries no HTTP response, and neither does
+			// "no credential on this host" — so internal/auth marks the local
+			// causes explicitly with ErrNoCertCredential and everything else
+			// goes through the same classifier as the cached-token path.
+			if errors.Is(err, auth.ErrNoCertCredential) {
+				return fmt.Errorf("%w: no usable cached token and this host has no usable certificate: %w",
+					ErrLoginRequired, err)
+			}
+			if cat := classify(err); errors.Is(cat, ErrUnreachable) {
+				return fmt.Errorf("%w: certificate login could not reach vault: %w", ErrUnreachable, err)
+			}
+			// Vault answered and rejected the certificate (401/403) — a
+			// credential problem, so enrolment is the correct next action.
+			return fmt.Errorf("%w: no usable cached token and the certificate was rejected: %w",
 				ErrLoginRequired, err)
 		}
 		return nil

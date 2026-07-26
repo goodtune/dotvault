@@ -1006,6 +1006,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// Lets the SPA render the right login form for the one-time
 			// certificate bootstrap. Empty for every non-mtls method.
 			BootstrapMethod: bootstrapMethodForWeb(cfg),
+			BootstrapMount:  bootstrapMountForWeb(cfg),
 		}
 		if agentSvc != nil {
 			webCfg.Agent = agentSvc.Backend
@@ -2686,6 +2687,22 @@ func bootstrapMethodForWeb(cfg *config.Config) string {
 		return ""
 	}
 	return cfg.Vault.MTLS.BootstrapMethod
+}
+
+// bootstrapMountForWeb reports the auth mount the certificate bootstrap logs in
+// against (vault.mtls.bootstrap_mount), or "" when the configured auth method is
+// not certificate auth.
+//
+// This is deliberately NOT vault.auth_mount: the CLI bootstrap logs in against
+// the bootstrap mount (runBootstrap sets AuthMount from MTLS.BootstrapMount), so
+// a deployment whose bootstrap mount differs from its operational one would
+// otherwise have the CLI and the SPA hitting different Vault paths for the same
+// config. Empty is fine — Server.loginMount falls back to the method default.
+func bootstrapMountForWeb(cfg *config.Config) string {
+	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		return ""
+	}
+	return cfg.Vault.MTLS.BootstrapMount
 }
 
 func isInteractive() bool {

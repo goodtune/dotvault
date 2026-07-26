@@ -44,7 +44,7 @@ func TestKeysToStatusesUnparseableBlob(t *testing.T) {
 // from config. The cert identity's parsed expiry confirms the blob round-trips
 // its true validity from the wire.
 func TestQueryListeningRoundTrip(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "agent.sock")
 
 	_, _, pub, signer := genEd25519(t, "laptop")
@@ -103,7 +103,7 @@ func TestQueryListeningRoundTrip(t *testing.T) {
 // returns an error (which the status command surfaces as "unexpected") rather
 // than blocking or creating the socket.
 func TestQueryListeningUnreachable(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "nonexistent.sock")
 
 	if _, err := QueryListening(context.Background(), sock); err == nil {

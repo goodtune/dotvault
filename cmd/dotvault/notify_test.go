@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/notify"
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // newUnixNotifyServer starts an httptest server bound to a Unix socket at
@@ -79,6 +80,10 @@ func TestPostNotifyToSocket_PeerError(t *testing.T) {
 // --config override, returning the command error and the message (if any) the
 // local notifier received.
 func runNotifyWith(t *testing.T, cfgPath string, args ...string) (error, *notify.Message) {
+	// Run as though no system-wide config were installed: --config is
+	// refused whenever one exists without bypass_system_config, which is
+	// the case on any machine running the product.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	t.Helper()
 	prevCfg := flagConfig
 	flagConfig = cfgPath

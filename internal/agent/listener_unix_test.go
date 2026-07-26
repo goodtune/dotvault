@@ -28,7 +28,7 @@ func waitForSocket(t *testing.T, path string) {
 }
 
 func TestUnixListenerServeRoundTrip(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "sub", "agent.sock")
 	_, _, pub, signer := genEd25519(t, "a")
 	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pub, Comment: "a"}}, signer: signer}
@@ -85,7 +85,7 @@ func TestUnixListenerServeRoundTrip(t *testing.T) {
 }
 
 func TestUnixListenerStaleSocketRemoved(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "agent.sock")
 	// A leftover plain file at the path: nothing is listening, so the
 	// listener should remove it and bind successfully.
@@ -106,7 +106,7 @@ func TestUnixListenerStaleSocketRemoved(t *testing.T) {
 }
 
 func TestUnixListenerAlreadyRunning(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "agent.sock")
 	b := NewBackend(nil)
 
@@ -130,7 +130,7 @@ func TestUnixListenerAlreadyRunning(t *testing.T) {
 }
 
 func TestListenerCloseIdempotent(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	sock := filepath.Join(dir, "agent.sock")
 	b := NewBackend(nil)
 	ln := NewListener(sock, b)

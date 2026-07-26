@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // newUnixBrowseServer starts an httptest server bound to a Unix socket at
@@ -118,6 +120,10 @@ rules:
 // --config override, returning the command error and the URL (if any) the
 // local opener received.
 func runBrowseWith(t *testing.T, cfgPath, target string) (error, string) {
+	// Run as though no system-wide config were installed: --config is
+	// refused whenever one exists without bypass_system_config, which is
+	// the case on any machine running the product.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	t.Helper()
 	prevCfg := flagConfig
 	flagConfig = cfgPath

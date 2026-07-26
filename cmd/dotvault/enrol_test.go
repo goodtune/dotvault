@@ -187,11 +187,7 @@ func TestEnrolUnauthenticated_SubprocessRoundTrip(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	workDir := t.TempDir()
 	configPath := filepath.Join(workDir, "config.yaml")
@@ -263,11 +259,7 @@ func TestEnrolTransientVaultError_SubprocessRoundTrip(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	workDir := t.TempDir()
 	configPath := filepath.Join(workDir, "config.yaml")

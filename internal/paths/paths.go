@@ -11,7 +11,48 @@ import (
 )
 
 // SystemConfigPath returns the OS-appropriate path for the system config file.
+// systemConfigOverride relocates the system config path. It is empty in every
+// shipped build and is set only via ldflags:
+//
+//	go build -ldflags "-X github.com/goodtune/dotvault/internal/paths.systemConfigOverride=/path"
+//
+// It exists for tests that must run with no system config present. Several
+// cmd/dotvault tests pass --config, which is refused whenever a system-wide
+// config exists and has not opted into bypass_system_config — so on any machine
+// with dotvault actually installed (macOS hardcodes
+// /Library/Application Support/dotvault/config.yaml) those tests failed, while
+// passing on CI where nothing is installed.
+//
+// Deliberately build-time rather than an environment variable. The bypass gate
+// exists to stop a user overriding managed configuration, and env is
+// user-controlled, so an env override would hand back exactly the escape hatch
+// the gate denies. A build-time value grants nothing new: whoever builds the
+// binary could just as easily remove the gate.
+var systemConfigOverride string
+
+// SetSystemConfigPathForTest points SystemConfigPath at path for the duration
+// of a test, returning a function that restores the previous value.
+//
+// It serves in-process tests the same purpose the ldflags variable above serves
+// for tests that build and exec a binary: letting a test run as though no
+// system-wide configuration were installed. Both exist because the --config
+// gate is (correctly) absolute, so a developer machine with dotvault installed
+// otherwise fails tests that pass --config.
+//
+// Test-only. It lives in internal/, so it can never become part of the public
+// client API, and nothing in the daemon calls it — an environment-variable
+// equivalent is deliberately NOT offered, since env is user-controlled and
+// would hand back the override the gate exists to refuse.
+func SetSystemConfigPathForTest(path string) func() {
+	prev := systemConfigOverride
+	systemConfigOverride = path
+	return func() { systemConfigOverride = prev }
+}
+
 func SystemConfigPath() string {
+	if systemConfigOverride != "" {
+		return systemConfigOverride
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "/Library/Application Support/dotvault/config.yaml"

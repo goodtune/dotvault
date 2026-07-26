@@ -103,6 +103,56 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 // tryExistingCredential loads the stored signer, optionally rotates a cert
 // inside the re-issue window, and logs in. Returns (true, nil) when the
 // Manager's client now holds an operational token.
+// RecoverCertLogin mints a fresh operational token by re-running the
+// certificate login against the credential this host already holds. It is the
+// unattended-recovery hook the token lifecycle manager calls when a Vault
+// token expires or is revoked (see LifecycleManager.SetRecover).
+//
+// This is what makes certificate auth actually headless in steady state. The
+// daemon performs its cert login once at startup and ReissueIfDue rotates the
+// *certificate*, not the token — so without this a Vault token that expired
+// mid-session (or a token whose max_ttl was reached and can no longer be
+// renewed) left the daemon unauthenticated until someone restarted it, even
+// though the credential needed to fix it was sitting right there on disk.
+//
+// It deliberately does NOT fall back to the bootstrap flow. Bootstrap needs a
+// human, and this runs on a background goroutine with nobody attached;
+// spontaneously launching a browser — or blocking the lifecycle goroutine on a
+// login that will never come — would be worse than reporting the failure. A
+// host whose certificate is genuinely gone or expired past re-issue reports an
+// error here and surfaces through the normal re-auth path instead.
+//
+// Safe to call repeatedly: it re-reads the credential each time and is a no-op
+// beyond a fresh login.
+func (m *Manager) RecoverCertLogin(ctx context.Context) error {
+	p := m.MTLS
+	if p == nil {
+		return fmt.Errorf("certificate recovery requested but vault.mtls is not configured")
+	}
+	store, err := securestore.Open(securestore.ModeForMethod(p.Method))
+	if err != nil {
+		return fmt.Errorf("open secure store: %w", err)
+	}
+	defer store.Close()
+
+	cred, err := loadCredential(p.StorageDir)
+	if err != nil {
+		return fmt.Errorf("load certificate credential: %w", err)
+	}
+	if cred == nil {
+		return fmt.Errorf("no certificate credential on this host; a bootstrap is required")
+	}
+
+	ok, err := m.tryExistingCredential(ctx, store, cred)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("certificate credential is unusable")
+	}
+	return nil
+}
+
 func (m *Manager) tryExistingCredential(ctx context.Context, store securestore.Storage, cred *sealedCredential) (bool, error) {
 	if cred.Identity != "" && m.Username != "" && cred.Identity != m.Username {
 		return false, fmt.Errorf("credential belongs to %q, not the current user %q", cred.Identity, m.Username)

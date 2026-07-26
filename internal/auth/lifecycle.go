@@ -50,6 +50,19 @@ type LifecycleManager struct {
 	// fires again on the next failure.
 	onReauth func()
 
+	// recover, when non-nil, mints a fresh token from a credential this host
+	// already holds, without any human interaction. It is tried during the
+	// recovery path — after the token-file/env/socket candidates and before
+	// declaring re-auth — and again on every recovery poll until it succeeds.
+	//
+	// Certificate auth is the motivating case and, today, the only one: the
+	// client certificate IS the credential, so an expired Vault token is
+	// recoverable on the spot. Without this the daemon would sit
+	// unauthenticated until someone restarted it, which defeats the point of
+	// a credential that needs no human. Auth methods whose credential is a
+	// human (oidc, ldap) leave this nil and still fall through to onReauth.
+	recover func(context.Context) error
+
 	// Recovery poll interval used while in the needs-reauth state. When
 	// the token is broken we want to pick up a freshly-minted token from
 	// the file faster than the normal 5-minute lookup cycle. Defaults to
@@ -147,6 +160,37 @@ func (lm *LifecycleManager) SetOnReauth(fn func()) {
 	lm.onReauth = fn
 }
 
+// SetRecover registers an unattended recovery function that mints a fresh
+// token from a credential this host already holds. See the recover field.
+//
+// It must be safe to call repeatedly (it is retried on every recovery poll)
+// and must not block indefinitely — it runs on the lifecycle goroutine, so a
+// hung call stalls token management. It must not prompt: a background
+// goroutine has no user attached.
+func (lm *LifecycleManager) SetRecover(fn func(context.Context) error) {
+	lm.recover = fn
+}
+
+// tryRecover attempts unattended recovery and reports whether the client now
+// holds a working token. Failures are logged at debug and swallowed: the
+// caller falls through to the normal re-auth signal, and the recovery poll
+// tries again shortly.
+func (lm *LifecycleManager) tryRecover(ctx context.Context) bool {
+	if lm.recover == nil {
+		return false
+	}
+	if err := lm.recover(ctx); err != nil {
+		slog.Debug("unattended token recovery failed", "error", err)
+		return false
+	}
+	if lm.client.Token() == "" {
+		slog.Debug("unattended token recovery reported success but left no token")
+		return false
+	}
+	slog.Info("recovered vault token without re-authentication")
+	return true
+}
+
 // NeedsReauth returns true if the token is expired or needs re-authentication.
 func (lm *LifecycleManager) NeedsReauth() bool {
 	return lm.needsReauth.Load()
@@ -207,6 +251,21 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// reload yields a working token we treat the
 						// failure as transient.
 						if lm.tryReload(ctx) {
+							lm.clearReauth()
+							lm.currentDelay = lm.checkInterval
+							timer.Reset(lm.currentDelay)
+							continue
+						}
+						// No usable token anywhere, but this host may hold a
+						// credential that can mint one without a human —
+						// certificate auth being the case that matters. Tried
+						// before signalReauth deliberately: a successful
+						// recovery must not fire OnReauth, which would clear
+						// web state and bounce the SPA to a login screen for
+						// an outage the daemon just healed by itself. If it
+						// fails we fall through, and the recovery poll retries
+						// it every cycle.
+						if lm.tryRecover(ctx) {
 							lm.clearReauth()
 							lm.currentDelay = lm.checkInterval
 							timer.Reset(lm.currentDelay)

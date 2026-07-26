@@ -13,13 +13,15 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
 func TestLifecycleManager_Start(t *testing.T) {
 	skipIfNoVault(t)
 
 	vc := mustVaultClient(t)
-	vc.SetToken("dev-root-token")
+	vc.SetToken(vaulttest.RootToken(t))
 
 	lm := NewLifecycleManager(vc, 1*time.Second, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -43,7 +45,7 @@ func TestLifecycleManager_NeedsReauth(t *testing.T) {
 	skipIfNoVault(t)
 
 	vc := mustVaultClient(t)
-	vc.SetToken("dev-root-token")
+	vc.SetToken(vaulttest.RootToken(t))
 
 	lm := NewLifecycleManager(vc, 1*time.Second, false)
 

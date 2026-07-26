@@ -14,6 +14,8 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
 func skipIfNoVault(t *testing.T) {
@@ -28,7 +30,7 @@ func testVaultClient(t *testing.T) *vault.Client {
 	t.Helper()
 	c, err := vault.NewClient(vault.Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   vaulttest.RootToken(t),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

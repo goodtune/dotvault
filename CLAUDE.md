@@ -445,9 +445,19 @@ On detecting an invalid/expired token (403 Forbidden or TTL=0 + concrete
    any browser session sitting on a stale "logged-in" view), push an
    error on the error channel, and switch to a 10-second recovery poll
    so a subsequent token write is picked up quickly. The recovery hook is
-   retried on every one of those polls, so a cert-auth daemon that could
-   not recover immediately (Vault briefly unreachable, say) still heals
-   without a restart once the cause clears.
+   retried on those polls, so a cert-auth daemon that could not recover
+   immediately (Vault briefly unreachable, say) still heals without a
+   restart once the cause clears — but with **exponential backoff after
+   the second consecutive failure** (doubling from the recovery interval
+   to the 5m cap). An attempt is not cheap: for `mtls+tpm`,
+   `securestore.Open` derives the SRK with a `TPM2_CreatePrimary`
+   (hundreds of ms to seconds on real hardware) purely to verify the
+   backend, and `Load` derives it again — so at full rate a sustained
+   outage would mean hundreds of primary-key derivations an hour
+   contending on `/dev/tpmrm0`, and anyone able to revoke tokens could
+   sustain that churn indefinitely. The *first* failure is deliberately
+   not penalised, since the poll is already the retry, so a brief blip
+   still heals at the normal cadence.
 
 Why this matters for certificate auth: the daemon performs its cert login
 once at startup, and `ReissueIfDue` rotates the *certificate*, not the

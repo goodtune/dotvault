@@ -72,6 +72,13 @@ type Server struct {
 	// one-time mTLS certificate bootstrap ("ldap"/"oidc", from
 	// vault.mtls.bootstrap_method). It is reported on /api/v1/status
 	// alongside authMethod; see bootstrap.go.
+	//
+	// It carries a SECOND, load-bearing meaning: non-empty exactly when the
+	// daemon is under certificate auth, so operationalAdoptionAllowed uses it
+	// to refuse token adoption at every browser-login site. That works because
+	// it is immutable for the daemon's life. Do not clear or repurpose it for
+	// display reasons — doing so silently re-opens the adoption race that
+	// guard exists to close.
 	bootstrapMethod string
 	// bootstrapMu guards bootstrapCh, which is non-nil exactly while a
 	// BootstrapLogin is waiting for a browser-driven login to complete.

@@ -112,7 +112,12 @@ function MTLSWaiting({ customText, issuing }) {
       h('p', { class: 'login-mfa-hint' },
         issuing
           ? 'Signed in. dotvault is now enrolling this host’s certificate — this only happens once. You will not need to sign in again.'
-          : 'Certificate authentication needs no credential. This page updates automatically once the daemon holds a Vault token.'),
+          // Deliberately does not promise an automatic transition. The daemon
+          // performs its certificate login at startup, and re-runs it only
+          // when the certificate itself is due for rotation — so a Vault token
+          // that expires mid-session is not recovered on its own, and this
+          // card would otherwise spin indefinitely telling the user to wait.
+          : 'Certificate authentication needs no credential — dotvault signs in with this host’s certificate. If this page does not update shortly, restart the dotvault daemon to obtain a fresh Vault token.'),
     ),
   );
 }

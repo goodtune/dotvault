@@ -379,3 +379,136 @@ func TestHandleStatus_BootstrapField(t *testing.T) {
 		t.Error("bootstrap object exposes a token field")
 	}
 }
+
+// TestLDAPStatus_LosingConcurrentPollCannotAdoptRawToken pins the fix for a
+// TOCTOU found in pre-push review.
+//
+// LoginTracker.GetStatus returns a *copy* of the session and the session is
+// cleared only after the bootstrap divert, so two overlapping polls of the
+// (unauthenticated, un-CSRF'd) /auth/ldap/status can both observe the same
+// authenticated session holding the same raw token. The winner is diverted to
+// the waiting BootstrapLogin; the loser used to fall through to the adoption
+// path — where Downscope is a NO-OP under an inactive constraint — installing
+// the raw pki/sign bootstrap token on the shared client, in the token file,
+// and behind GET /api/v1/token.
+//
+// This models the LOSER's state directly rather than racing two goroutines:
+// an authenticated session still present, bootstrap mode already consumed
+// (bootstrapCh nil), certificate auth configured. Sequencing two real polls
+// cannot reproduce it, because the winner's Clear makes the second poll 404
+// before it reaches the adoption path.
+//
+// Two things here are load-bearing and easy to lose in a refactor:
+//   - the constraint is the shipped DEFAULT (no policies), so Downscope is a
+//     no-op and adoption is silent. The other tests in this file set Policies,
+//     which is why they miss this.
+//   - bootstrapMethod is set, i.e. the daemon is under certificate auth.
+//
+// Reverting operationalAdoptionAllowed must fail this test.
+func TestLDAPStatus_LosingConcurrentPollCannotAdoptRawToken(t *testing.T) {
+	const rawToken = "raw-pki-sign-bootstrap-token"
+
+	s, sessionID := ldapBootstrapServer(t, rawToken)
+	tokenFile := filepath.Join(t.TempDir(), "vault-token")
+	s.tokenFilePath = tokenFile
+	s.vaultCfg = config.VaultConfig{} // shipped default: Downscope is a no-op
+	s.bootstrapMethod = "ldap"        // certificate auth is configured
+
+	// Wait for the session to authenticate WITHOUT polling the handler, so the
+	// session survives (a poll would divert-and-Clear it).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := s.login.GetStatus(sessionID); st != nil && st.State == "authenticated" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	st := s.login.GetStatus(sessionID)
+	if st == nil || st.State != "authenticated" || st.Token != rawToken {
+		t.Fatalf("precondition: session not authenticated with the raw token (got %+v)", st)
+	}
+
+	// bootstrapCh is nil — the winning poll already consumed bootstrap mode.
+	if s.bootstrapActive() {
+		t.Fatal("precondition: bootstrap mode should not be active")
+	}
+
+	req := httptest.NewRequest("GET", "/auth/ldap/status?session="+sessionID, nil)
+	w := httptest.NewRecorder()
+	s.handleLDAPStatus(w, req)
+
+	if got := s.vault.Token(); got == rawToken {
+		t.Error("shared client holds the raw pki/sign bootstrap token; it is now reachable via GET /api/v1/token")
+	}
+	if got := s.vault.Token(); got != "" {
+		t.Errorf("shared client token = %q, want empty — nothing may be adopted under certificate auth", got)
+	}
+	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
+		t.Errorf("token file %s was written (stat err %v) — the bootstrap token must never reach disk", tokenFile, err)
+	}
+	if strings.Contains(w.Body.String(), rawToken) {
+		t.Error("response body leaked the bootstrap token")
+	}
+}
+
+// TestTokenLogin_RefusedUnderCertificateAuth pins the third adoption site.
+//
+// operationalAdoptionAllowed's contract is that under certificate auth the
+// operational token comes from exactly one place — the cert login. Guarding
+// only the two bootstrap-adjacent sites left /auth/token/login able to install
+// a credential the cert flow never sanctioned, contradicting that contract.
+// It is CSRF-protected and loopback-only and the SPA never renders the form
+// under mtls, so this closes the direct-POST path rather than a likely one.
+//
+// Reverting the guard in handleTokenLogin must fail this test.
+func TestTokenLogin_RefusedUnderCertificateAuth(t *testing.T) {
+	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("Vault called at %s — the request must be refused before any lookup", r.URL.Path)
+	})
+	s := authTestServer(t, vc)
+	tokenFile := filepath.Join(t.TempDir(), "vault-token")
+	s.tokenFilePath = tokenFile
+	s.authMethod = "mtls"
+	s.bootstrapMethod = "ldap" // certificate auth is configured
+
+	body := strings.NewReader(`{"token":"s.user-supplied-token"}`)
+	req := httptest.NewRequest("POST", "/auth/token/login", body)
+	w := httptest.NewRecorder()
+	s.handleTokenLogin(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", w.Code)
+	}
+	if got := s.vault.Token(); got != "" {
+		t.Errorf("shared client token = %q, want empty — nothing may be adopted under certificate auth", got)
+	}
+	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
+		t.Errorf("token file %s was written (stat err %v)", tokenFile, err)
+	}
+}
+
+// TestTokenLogin_AllowedWithoutCertificateAuth is the counterpart: the guard
+// must not disturb the ordinary token-login path, which is exempt from
+// downscoping by design (a user-supplied token, like the CLI's token method).
+func TestTokenLogin_AllowedWithoutCertificateAuth(t *testing.T) {
+	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": "s.user-supplied-token"}})
+	})
+	s := authTestServer(t, vc)
+	s.tokenFilePath = filepath.Join(t.TempDir(), "vault-token")
+	s.authMethod = "token"
+	s.bootstrapMethod = "" // not certificate auth
+
+	body := strings.NewReader(`{"token":"s.user-supplied-token"}`)
+	req := httptest.NewRequest("POST", "/auth/token/login", body)
+	w := httptest.NewRecorder()
+	s.handleTokenLogin(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if got := s.vault.Token(); got != "s.user-supplied-token" {
+		t.Errorf("shared client token = %q, want the adopted token", got)
+	}
+}

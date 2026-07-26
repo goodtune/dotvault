@@ -26,6 +26,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
+	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/passwd"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -955,6 +956,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					go func() {
 						if err := browser.OpenURL(url); err != nil {
 							slog.Warn("failed to open browser, please visit URL manually", "url", url, "error", err)
+							// Under dotvaultw.exe (GUI subsystem) stderr goes
+							// nowhere and the tray is not installed until much
+							// later in startup, so the log line above would
+							// leave the user with a daemon blocking on a login
+							// they cannot reach. A desktop notification is the
+							// only channel available at this point; it carries
+							// the URL as a clickable action on Windows and in
+							// the body elsewhere. Best-effort by design — a
+							// notification failure must not fail the bootstrap.
+							notifyBootstrapURL(url)
 						}
 					}()
 					return webServer.BootstrapLogin(ctx)
@@ -2439,6 +2450,26 @@ func vaultPolicyConstraint(cfg *config.Config) auth.PolicyConstraint {
 	return auth.PolicyConstraint{
 		Policies:        cfg.Vault.Policies,
 		NoDefaultPolicy: cfg.Vault.NoDefaultPolicy,
+	}
+}
+
+// notifyBootstrapURL surfaces the web UI address as a desktop notification
+// when the browser could not be opened for a certificate bootstrap. It is the
+// last resort for a GUI-subsystem daemon (dotvaultw.exe), which has no stderr
+// a user will ever read and no tray icon yet at this point in startup.
+//
+// Every failure here is swallowed to a debug log: the bootstrap is already
+// usable by anyone who visits the URL, and a missing notification daemon must
+// not be the thing that stops a host enrolling.
+func notifyBootstrapURL(url string) {
+	msg, err := notify.NewMessage("attention", "dotvault: sign in to enrol this host",
+		"Open "+url+" to complete the one-time certificate enrolment.", url)
+	if err != nil {
+		slog.Debug("could not build bootstrap notification", "error", err)
+		return
+	}
+	if err := notify.Send(msg); err != nil {
+		slog.Debug("could not raise bootstrap notification", "error", err)
 	}
 }
 

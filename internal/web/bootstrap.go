@@ -88,3 +88,26 @@ func (s *Server) bootstrapActive() bool {
 	defer s.bootstrapMu.Unlock()
 	return s.bootstrapCh != nil
 }
+
+// operationalAdoptionAllowed reports whether a browser login may become this
+// daemon's operational Vault token.
+//
+// It may not under certificate auth. There the operational token comes from
+// exactly one place — the cert login in authenticateMTLS — and a browser login
+// exists solely to bootstrap the certificate. Adopting one would install a
+// credential the cert flow never sanctioned.
+//
+// This is a security boundary, not tidiness. deliverBootstrapToken hands the
+// token to a single waiter and clears bootstrap mode, but LoginTracker.GetStatus
+// returns a *copy* of the session and the session is cleared only after the
+// divert, so two overlapping polls of the (unauthenticated, un-CSRF'd)
+// /auth/ldap/status can both observe the same authenticated session holding the
+// same raw token. The first is diverted; without this guard the second falls
+// through to the adoption path, where Downscope is a no-op under the default
+// (inactive) constraint — putting the raw pki/sign bootstrap token on the shared
+// client, in the token file, and behind GET /api/v1/token. Gating on the
+// configured method rather than on bootstrap-mode-still-being-active closes that
+// race, because the method does not change while the daemon runs.
+func (s *Server) operationalAdoptionAllowed() bool {
+	return s.bootstrapMethod == ""
+}

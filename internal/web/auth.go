@@ -123,6 +123,15 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Under certificate auth a browser login is only ever a bootstrap, so it
+	// must not be adopted — see operationalAdoptionAllowed. Reached when a
+	// second callback arrives after the divert above consumed the first.
+	if !s.operationalAdoptionAllowed() {
+		slog.Debug("ignoring already-consumed bootstrap login on a repeat OIDC callback")
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
 	token, err := auth.Downscope(r.Context(), s.vault, loginSecret.Auth.ClientToken, s.policyConstraint())
 	if err != nil {
 		slog.Error("downscoping token to least privilege failed", "error", err)
@@ -212,6 +221,17 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Under certificate auth a browser login is only ever a bootstrap, so
+		// it must not be adopted — see operationalAdoptionAllowed. Reached when
+		// a concurrent poll of this endpoint lost the race to the divert above.
+		if !s.operationalAdoptionAllowed() {
+			s.login.Clear(sessionID)
+			slog.Debug("ignoring already-consumed bootstrap login on a concurrent status poll")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(status)
+			return
+		}
+
 		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
 		if err != nil {
 			slog.Error("downscoping token to least privilege failed", "error", err)
@@ -270,6 +290,16 @@ func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
+	// Under certificate auth the operational token comes from the cert login
+	// alone — see operationalAdoptionAllowed. Pasting a token here would
+	// install a credential the cert flow never sanctioned, so refuse rather
+	// than enforcing the invariant at only some adoption sites. The SPA never
+	// renders this form under mtls; this closes the direct-POST path.
+	if !s.operationalAdoptionAllowed() {
+		writeError(w, "token login is not available under certificate authentication: this daemon obtains its Vault token from its client certificate", http.StatusForbidden)
+		return
+	}
+
 	var req struct {
 		Token string `json:"token"`
 	}

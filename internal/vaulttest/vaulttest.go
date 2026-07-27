@@ -11,11 +11,20 @@
 package vaulttest
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+// dockerTimeout bounds the container lookup. Without it a slow or wedged Docker
+// daemon hangs the whole package until Go's 10-minute test timeout kills it,
+// which is far worse than skipping: the stack being unavailable is exactly the
+// case this helper is supposed to handle gracefully.
+const dockerTimeout = 10 * time.Second
 
 // RootToken returns the dev Vault's root token.
 //
@@ -29,14 +38,40 @@ func RootToken(t *testing.T) string {
 	if tok := strings.TrimSpace(os.Getenv("DOTVAULT_TEST_ROOT_TOKEN")); tok != "" {
 		return tok
 	}
-	out, err := exec.Command("docker", "exec", "dotvault-vault",
-		"cat", "/vault/data/root-token").Output()
+	tok, err := cachedDockerToken()
 	if err != nil {
 		t.Skipf("cannot read the dev Vault root token (start the stack with `docker compose up -d`, or set DOTVAULT_TEST_ROOT_TOKEN): %v", err)
 	}
-	tok := strings.TrimSpace(string(out))
 	if tok == "" {
 		t.Skip("the dev Vault has not finished initialising (no root token yet)")
 	}
 	return tok
+}
+
+var (
+	dockerOnce  sync.Once
+	dockerToken string
+	dockerErr   error
+)
+
+// cachedDockerToken runs the container lookup at most once per test binary.
+//
+// Without caching, a package whose tests all call RootToken pays the full
+// dockerTimeout on every one of them when the stack is down — turning a suite
+// that should skip in milliseconds into minutes of dead waiting. The result is
+// stable for a process's lifetime either way: the dev stack does not appear
+// or vanish mid-run in any workflow this supports.
+func cachedDockerToken() (string, error) {
+	dockerOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "docker", "exec", "dotvault-vault",
+			"cat", "/vault/data/root-token").Output()
+		if err != nil {
+			dockerErr = err
+			return
+		}
+		dockerToken = strings.TrimSpace(string(out))
+	})
+	return dockerToken, dockerErr
 }

@@ -2454,6 +2454,7 @@ func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 		PKIMount:        m.PKIMount,
 		PKIRole:         m.PKIRole,
 		KeyType:         m.KeyType,
+		KeyBits:         m.KeyBits,
 		CommonName:      m.CommonName,
 		TTL:             m.TTL,
 		ReissueBefore:   m.ReissueBeforeDur,

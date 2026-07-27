@@ -35,7 +35,7 @@ Differences from the other cert methods:
 - **Platform support.** `mtls+os` is **Windows-only** today (it is built on [`github.com/google/certtostore`](https://github.com/google/certtostore), a Windows-CNG library). On Linux and macOS it fails fast with a clear "OS-native certificate store is unavailable" error rather than degrading to an on-disk key — Linux (PKCS#11/NSS) and macOS (Keychain) backends are planned follow-ups. Use `mtls` or `mtls+tpm` on those platforms.
 - **No bring-your-own.** The OS store can install a certificate but cannot import an external private key, so `byo` is rejected at config-load for `mtls+os`. The key is always generated in the store and certified via `pki/sign`. (Use `mtls` for BYO.)
 - **Certificate TTL defaults to 30 days.** Because the credential doubles as a browser-presented user identity, an unset `ttl` defaults to `720h` (30d) for `mtls+os` (plain `mtls`/`mtls+tpm` leave it to the PKI role). dotvault requests this length; **the Vault PKI role's `max_ttl` is still the authoritative cap**, and `reissue_before` (default 7d) drives automatic rotation well before expiry.
-- **Key types.** Both `ec` (P-256) and `rsa` (2048) are accepted, like plain `mtls` (only `mtls+tpm` is EC-only).
+- **Key types.** Both `ec` (P-256) and `rsa` are accepted, like plain `mtls` (only `mtls+tpm` is EC-only). RSA defaults to 2048 and is sized by `key_bits`; the backend opens the *software* KSP (`ProviderMSSoftware`), whose 16384-bit ceiling means 3072/4096/8192 all work. Had it used the TPM KSP, RSA would be capped at 2048 and larger sizes would fail at runtime.
 - **Token at rest.** `mtls+os` governs the *certificate key* only; the operational Vault token rests as a plaintext `0600` file exactly as with plain `mtls`. Combine the `+tpm` token sealing with a different method if you also want the token sealed.
 
 ## Configuration
@@ -51,7 +51,8 @@ vault:
     cert_role: dotvault          # cert auth role name (required)
     pki_mount: pki               # PKI secrets engine mount (default "pki")
     pki_role: dotvault-client    # PKI role (required unless BYO)
-    key_type: ec                 # ec (P-256) | rsa (2048); mtls+tpm is ec-only
+    key_type: ec                 # ec (P-256) | rsa; mtls+tpm is ec-only
+    key_bits: 0                  # RSA modulus: 2048 | 3072 | 4096 | 8192; 0 = 2048. rsa only
     common_name: "{{.user}}"     # Go template over {{.user}} (the OS username)
     ttl: ""                      # optional TTL hint; PKI role TTL is authoritative (mtls+os defaults to 720h)
     reissue_before: 168h         # rotate this long before expiry (default 7d)
@@ -63,6 +64,31 @@ vault:
 ```
 
 The whole `vault.mtls` block round-trips losslessly through YAML, the Windows registry (`Vault\MTLS`, with `Vault\MTLS\BYO`), and `reg-import`/`reg-export`, like every other config section.
+
+### RSA key size (`key_bits`)
+
+A Vault PKI role's `key_bits` is a **minimum, not an exact match**: `pki/sign` compares the CSR's actual key length against the role's and rejects anything smaller. So a role configured with `key_bits: 4096` — a common hardening convention — refuses a 2048-bit CSR outright, and until this option existed dotvault generated 2048-bit RSA keys unconditionally, leaving operators with a stricter role no way to use certificate auth at all short of weakening the role.
+
+Set `key_bits` to match (or exceed) whatever the PKI role requires:
+
+```yaml
+vault:
+  auth_method: mtls
+  mtls:
+    key_type: rsa
+    key_bits: 4096   # the PKI role pins RSA at 4096
+```
+
+Accepted values are the RSA lengths Vault itself accepts: `2048`, `3072`, `4096`, `8192`. Unset (or `0`) keeps the previous behaviour of 2048, so upgrading changes nothing for anyone who does not set it. It applies to `mtls` and `mtls+os` alike. It is rejected at config load under `key_type: ec` (EC is fixed at P-256, and Vault's EC floor is a curve name rather than a tunable bit count) and under `mtls+tpm` (EC-only, so there is no modulus to size) — rejected rather than ignored, because an operator who sets it believes they have changed the key size.
+
+!!! warning "It applies to the next key, not the current one"
+    `key_bits` is consulted only when dotvault *generates* a key — at first enrolment, and at each rotation. An existing, still-valid credential is reused as-is, so changing `key_bits` on a host that already holds a certificate does **not** resize it: that host keeps presenting its current key until the certificate rotates (inside `reissue_before` of expiry) or the credential is removed and re-seeded.
+
+    If you are adopting a stricter PKI role and need the new size immediately, delete the credential envelope from `storage_dir` and let dotvault bootstrap afresh, rather than waiting for rotation.
+
+    Bring-your-own is the subtle case, because the two halves differ. The **seeded** credential uses the key you supplied, so `key_bits` has no effect on it — if that key is 1024-bit, it stays 1024-bit no matter what `key_bits` says. But dotvault generates the key itself at every **rotation**, and that generation *does* honour `key_bits`. So a BYO host silently moves to the configured size at its first rotation. This is deliberate — it is the only way a BYO deployment can ever control the size of the keys dotvault goes on to generate — but do not read `key_bits` as a statement about the certificate a BYO host is presenting *today*.
+
+Note that larger keys are slower to generate: 8192-bit RSA can take several seconds, which is paid once at enrolment and again at each rotation.
 
 ### Bring-your-own (BYO) certificate
 

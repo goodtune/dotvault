@@ -63,6 +63,11 @@ type MTLSConfig struct {
 	// StorageDir holds the credential envelope written at enrolment.
 	// Defaults to {cache_dir}/mtls, matching the daemon.
 	StorageDir string
+
+	// Deliberately absent: key_type and key_bits. Both size a key that is
+	// about to be generated, and the facade never generates one — it presents
+	// a certificate the daemon or CLI already enrolled. Projecting them would
+	// imply an issuance capability this surface does not have.
 }
 
 type VaultConfig struct {

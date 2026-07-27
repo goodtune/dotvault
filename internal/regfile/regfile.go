@@ -133,6 +133,7 @@ func (e *emitter) writeMTLS(m config.MTLSConfig) {
 	e.writeString("PKIMount", m.PKIMount)
 	e.writeString("PKIRole", m.PKIRole)
 	e.writeString("KeyType", m.KeyType)
+	e.writeDWORD("KeyBits", uint32(m.KeyBits))
 	e.writeString("CommonName", m.CommonName)
 	e.writeString("TTL", m.TTL)
 	e.writeString("ReissueBefore", m.ReissueBefore)

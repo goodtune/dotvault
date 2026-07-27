@@ -124,8 +124,8 @@ func (s *osStorage) trackSigner(signer crypto.Signer) {
 // current certificate depends on would destroy a credential that is still in
 // use if any later step of the rotation failed. The old container is removed
 // only by CommitCert, once the replacement is operational.
-func (s *osStorage) Generate(kt KeyType, _ bool) (crypto.Signer, []byte, error) {
-	opts, err := generateOpts(kt)
+func (s *osStorage) Generate(kt KeyType, bits int, _ bool) (crypto.Signer, []byte, error) {
+	opts, err := generateOpts(kt, bits)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -450,14 +450,20 @@ func (s *osStorage) Close() error {
 }
 
 // generateOpts maps a securestore KeyType onto certtostore.GenerateOpts. The OS
-// software provider supports both EC P-256 and RSA 2048 (unlike the TPM backend,
+// software provider supports both EC P-256 and RSA (unlike the TPM backend,
 // which is EC-only).
-func generateOpts(kt KeyType) (certtostore.GenerateOpts, error) {
+//
+// bits sizes the RSA modulus; zero selects defaultRSABits. EC ignores it — CNG
+// gets P-256 to match the software backend. Sizes above 2048 are safe here
+// specifically because this backend opens ProviderMSSoftware, whose ceiling is
+// 16384; the TPM KSP caps RSA at 2048, so the same value would fail at runtime
+// there.
+func generateOpts(kt KeyType, bits int) (certtostore.GenerateOpts, error) {
 	switch kt {
 	case KeyEC, "":
 		return certtostore.GenerateOpts{Algorithm: certtostore.EC, Size: 256}, nil
 	case KeyRSA:
-		return certtostore.GenerateOpts{Algorithm: certtostore.RSA, Size: 2048}, nil
+		return certtostore.GenerateOpts{Algorithm: certtostore.RSA, Size: rsaBitsOrDefault(bits)}, nil
 	default:
 		return certtostore.GenerateOpts{}, fmt.Errorf("securestore: unknown key type %q", kt)
 	}

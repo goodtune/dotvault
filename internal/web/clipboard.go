@@ -47,11 +47,15 @@ const clipboardSetTimeout = 8 * time.Second
 // the typical payload is a credential that must arrive byte-for-byte intact.
 //
 // The payload is the most secret-bearing of the three peer actions, so the
-// never-log-content posture is absolute: log lines carry the text's length
-// only, at every level, and even the error path scrubs the text from writer
-// errors — both the log line and the HTTP response (unlike browse, which
-// returns its opener error unredacted: a browse URL is something the caller
-// may reasonably log, a clipboard value never is).
+// never-log-content posture is strict: log lines carry the text's length
+// only, at every level, and the error path additionally scrubs the exact
+// text from writer errors — both the log line and the HTTP response (unlike
+// browse, which returns its opener error unredacted: a browse URL is
+// something the caller may reasonably log, a clipboard value never is). The
+// scrub is an exact-substring match and therefore best-effort defense in
+// depth, not the primary control: dotvault's own writers never embed their
+// input in an error (the exec writers capture no output and pass text on
+// stdin; the Win32 writer's errors are syscall errnos).
 func (s *Server) handleRemoteClipboard(w http.ResponseWriter, r *http.Request) {
 	if s.setClipboard == nil {
 		writeError(w, "clipboard not available", http.StatusServiceUnavailable)
@@ -93,10 +97,10 @@ func (s *Server) handleRemoteClipboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "timed out writing to the clipboard (it may still be set)", http.StatusBadGateway)
 		return
 	case err != nil:
-		// Scrub the text from the writer error before it reaches the log OR
-		// the response: an exec-based writer could embed its stdin in an
-		// error, and a clipboard value is a credential even to its sender's
-		// own logs.
+		// Scrub the exact text from the writer error before it reaches the
+		// log OR the response — defense in depth (our writers never embed
+		// their input in errors, but a clipboard value is a credential even
+		// to its sender's own logs, so scrub anyway).
 		redacted := strings.ReplaceAll(err.Error(), text, "<text>")
 		slog.Warn("remote clipboard failed", "text_len", len(text), "error", redacted)
 		writeError(w, fmt.Sprintf("failed to set clipboard: %s", redacted), http.StatusBadGateway)

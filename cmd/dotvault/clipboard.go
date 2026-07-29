@@ -85,7 +85,11 @@ func runClipboard(cmd *cobra.Command, args []string) error {
 		if err == nil {
 			return nil
 		}
-		slog.Debug("peer clipboard unavailable; using the local clipboard", "socket", socket, "error", err)
+		// Scrub the text from the logged error: a peer's non-200 body is
+		// echoed into PeerStatusError.Message, so a hostile or buggy peer
+		// could otherwise reflect the secret into this host's logs.
+		slog.Debug("peer clipboard unavailable; using the local clipboard",
+			"socket", socket, "error", strings.ReplaceAll(err.Error(), text, "<text>"))
 	}
 
 	if err := setLocalClipboard(text); err != nil {
@@ -104,15 +108,26 @@ func clipboardText(cmd *cobra.Command, args []string) (string, error) {
 	if len(args) == 1 && args[0] != "-" {
 		return args[0], nil
 	}
-	data, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), clipboard.MaxTextLen+1))
+	// Read up to the cap + 3: a maximal legitimate input is MaxTextLen bytes
+	// plus a trailing "\r\n", and one extra byte lets the over-limit check
+	// distinguish "too big" from "exactly at the limit". The length check runs
+	// AFTER newline stripping so `printf '%s\n' <64KiB-value>` is accepted —
+	// the stripped newline was never going to be part of the text.
+	data, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), clipboard.MaxTextLen+3))
 	if err != nil {
 		return "", fmt.Errorf("read stdin: %w", err)
 	}
-	if len(data) > clipboard.MaxTextLen {
+	text := string(data)
+	// "\r\n" before "\n" so a lone trailing "\r" (no "\n") is preserved —
+	// only a genuine trailing newline is stripped.
+	if strings.HasSuffix(text, "\r\n") {
+		text = text[:len(text)-2]
+	} else {
+		text = strings.TrimSuffix(text, "\n")
+	}
+	if len(text) > clipboard.MaxTextLen {
 		return "", fmt.Errorf("stdin exceeds the %d-byte clipboard limit", clipboard.MaxTextLen)
 	}
-	text := strings.TrimSuffix(string(data), "\n")
-	text = strings.TrimSuffix(text, "\r")
 	return text, nil
 }
 

@@ -2,6 +2,7 @@ package clipboard
 
 import (
 	"fmt"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -17,16 +18,17 @@ import (
 // logic it does not use (execSet) and the validation it sits behind are
 // unit-tested everywhere.
 var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	kernel32             = windows.NewLazySystemDLL("kernel32.dll")
-	procOpenClipboard    = user32.NewProc("OpenClipboard")
-	procCloseClipboard   = user32.NewProc("CloseClipboard")
-	procEmptyClipboard   = user32.NewProc("EmptyClipboard")
-	procSetClipboardData = user32.NewProc("SetClipboardData")
-	procGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
-	procGlobalFree       = kernel32.NewProc("GlobalFree")
-	procGlobalLock       = kernel32.NewProc("GlobalLock")
-	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
+	user32                   = windows.NewLazySystemDLL("user32.dll")
+	kernel32                 = windows.NewLazySystemDLL("kernel32.dll")
+	procOpenClipboard        = user32.NewProc("OpenClipboard")
+	procCloseClipboard       = user32.NewProc("CloseClipboard")
+	procEmptyClipboard       = user32.NewProc("EmptyClipboard")
+	procSetClipboardData     = user32.NewProc("SetClipboardData")
+	procRegisterClipboardFmt = user32.NewProc("RegisterClipboardFormatW")
+	procGlobalAlloc          = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree           = kernel32.NewProc("GlobalFree")
+	procGlobalLock           = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock         = kernel32.NewProc("GlobalUnlock")
 )
 
 const (
@@ -62,6 +64,16 @@ func platformSet(text string) error {
 		return fmt.Errorf("encode clipboard text: %w", err)
 	}
 
+	// The Win32 clipboard is thread-affine: an open clipboard belongs to the
+	// calling THREAD, so the whole Open→Empty→Set→Close sequence must run on
+	// one OS thread. Without the lock the Go scheduler may migrate the
+	// goroutine mid-sequence, failing later calls with
+	// ERROR_CLIPBOARD_NOT_OPEN and leaving the clipboard held open (blocking
+	// every other application) until the original thread dies. LIFO defers:
+	// CloseClipboard runs before the thread is unlocked.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if err := openClipboard(); err != nil {
 		return err
 	}
@@ -87,5 +99,52 @@ func platformSet(text string) error {
 		procGlobalFree.Call(h) //nolint:errcheck
 		return fmt.Errorf("set clipboard data: %w", err)
 	}
+	setExclusionFormats()
 	return nil
+}
+
+// exclusionFormats opt this clipboard update out of Windows' built-in
+// credential-exfiltration paths: `CanIncludeInClipboardHistory` = 0 keeps it
+// out of Clipboard History (Win+V), `CanUploadToCloudClipboard` = 0 keeps it
+// off cross-device Cloud Clipboard sync (which would copy the credential to
+// the user's Microsoft account and other devices), and
+// `ExcludeClipboardContentFromMonitorProcessing` tells format-monitor-based
+// clipboard managers to skip it entirely.
+var exclusionFormats = []string{
+	"CanIncludeInClipboardHistory",
+	"CanUploadToCloudClipboard",
+	"ExcludeClipboardContentFromMonitorProcessing",
+}
+
+// setExclusionFormats registers the exclusion formats alongside the text
+// while the clipboard is still open. Best-effort by design: the text is
+// already placed by the time this runs, so failing the user's copy over a
+// missing defense-in-depth marker (the formats are advisory, and third-party
+// managers may ignore them anyway) would be worse than proceeding — the docs
+// carry the residual-risk note either way.
+func setExclusionFormats() {
+	for _, name := range exclusionFormats {
+		namePtr, err := windows.UTF16PtrFromString(name)
+		if err != nil {
+			continue
+		}
+		fmtID, _, _ := procRegisterClipboardFmt.Call(uintptr(unsafe.Pointer(namePtr)))
+		if fmtID == 0 {
+			continue
+		}
+		h, _, _ := procGlobalAlloc.Call(gmemMoveable, 4)
+		if h == 0 {
+			continue
+		}
+		mem, _, _ := procGlobalLock.Call(h)
+		if mem == 0 {
+			procGlobalFree.Call(h) //nolint:errcheck
+			continue
+		}
+		*(*uint32)(unsafe.Pointer(mem)) = 0 // DWORD 0 = "not allowed"
+		procGlobalUnlock.Call(h)            //nolint:errcheck
+		if r, _, _ := procSetClipboardData.Call(fmtID, h); r == 0 {
+			procGlobalFree.Call(h) //nolint:errcheck
+		}
+	}
 }

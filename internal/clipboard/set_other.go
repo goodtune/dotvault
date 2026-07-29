@@ -1,4 +1,4 @@
-//go:build !windows && !darwin && !linux && !freebsd && !netbsd && !openbsd
+//go:build !windows && !darwin && !linux && !freebsd && !netbsd && !openbsd && !dragonfly && !illumos
 
 package clipboard
 

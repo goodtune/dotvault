@@ -197,9 +197,9 @@ Put text on the system clipboard, preferring the machine at the other end of the
 dotvault clipboard [text]
 ```
 
-When `vault.token_socket` names a reachable peer dotvault, the text is form-posted to the peer's `POST /api/v1/remote/clipboard` endpoint and lands on the clipboard **of the workstation** — the machine the user is actually pasting on. When the socket is not configured, missing, or the peer errors, the text is placed on this host's clipboard instead (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux, the Win32 clipboard on Windows).
+When `vault.token_socket` names a reachable peer dotvault, the text is form-posted to the peer's `POST /api/v1/remote/clipboard` endpoint and lands on the clipboard **of the workstation** — the machine the user is actually pasting on. When the socket is not configured, missing, or the peer errors, the text is placed on this host's clipboard instead (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux and the BSDs, the Win32 clipboard on Windows).
 
-This is the third peer action alongside `browse` and `notify`, and together they close the loop for authenticating to a service from a headless host — open the login page in the workstation's browser, then stage the value the user needs to paste right where their ++ctrl+v++ is:
+This is the third peer action alongside `browse` and `notify`, and together they close the loop for authenticating to a service from a headless host — open the login page in the workstation's browser, then stage the value the user needs to paste right where their Ctrl+V is:
 
 ```sh
 dotvault browse https://sso.example/device
@@ -220,7 +220,7 @@ curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/clipboard
 The command is silent on success (exit `0`). Config-load failures degrade to the local clipboard, like `browse` and `notify`.
 
 !!! note "Clipboard history managers"
-    A value placed on the clipboard is readable by any application in the user's session, and clipboard-history managers may persist it to disk. dotvault does not auto-clear the clipboard after a delay; paste the value, then overwrite it (copy something else) when it is sensitive and long-lived. One-time codes and short-TTL tokens are the intended payload.
+    A value placed on the clipboard is readable by any application in the user's session, and clipboard-history managers may persist it to disk. On Windows, dotvault marks the write as excluded from the built-in Clipboard History (Win+V) and from Cloud Clipboard cross-device sync; third-party managers on any platform may not honour such hints. dotvault does not auto-clear the clipboard after a delay; paste the value, then overwrite it (copy something else) when it is sensitive and long-lived. One-time codes and short-TTL tokens are the intended payload.
 
 ### `dotvault version`
 

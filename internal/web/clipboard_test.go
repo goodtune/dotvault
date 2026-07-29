@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/clipboard"
 )
 
 // postClipboard builds the form POST the documented curl invocation sends.
@@ -222,7 +224,7 @@ func TestHandleRemoteClipboard_OversizeTextWithinBody(t *testing.T) {
 		return nil
 	}
 	w := httptest.NewRecorder()
-	s.handleRemoteClipboard(w, postClipboard(strings.Repeat("a", 1<<16+1)))
+	s.handleRemoteClipboard(w, postClipboard(strings.Repeat("a", clipboard.MaxTextLen+1)))
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for over-limit text; body = %s", w.Code, w.Body.String())
 	}

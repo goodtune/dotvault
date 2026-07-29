@@ -178,6 +178,7 @@ func TestClipboardText_StripsExactlyOneTrailingNewline(t *testing.T) {
 		{"none", "token", "token"},
 		{"only one stripped", "token\n\n", "token\n"},
 		{"interior kept", "line1\nline2\n", "line1\nline2"},
+		{"lone trailing cr kept", "token\r", "token\r"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,6 +214,36 @@ func TestClipboardText_OversizeStdin(t *testing.T) {
 	cmd.SetIn(strings.NewReader(strings.Repeat("a", clipboard.MaxTextLen+1)))
 	if _, err := clipboardText(cmd, nil); err == nil {
 		t.Fatal("expected an error for over-limit stdin, not silent truncation")
+	}
+}
+
+func TestClipboardText_MaxLenBoundary(t *testing.T) {
+	// The limit applies to the text AFTER newline stripping: a maximal value
+	// terminated by a pipeline newline (printf '%s\n') must be accepted, and
+	// one byte over must be rejected even when newline-terminated.
+	max := strings.Repeat("a", clipboard.MaxTextLen)
+	cases := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{"max exactly", max, false},
+		{"max plus lf", max + "\n", false},
+		{"max plus crlf", max + "\r\n", false},
+		{"over plus lf", max + "a\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newClipboardCmd()
+			cmd.SetIn(strings.NewReader(tc.in))
+			got, err := clipboardText(cmd, nil)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && got != max {
+				t.Errorf("got %d bytes, want the %d-byte value intact", len(got), len(max))
+			}
+		})
 	}
 }
 

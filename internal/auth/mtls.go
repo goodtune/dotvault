@@ -622,8 +622,25 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 		return err
 	}
 	m.VaultClient.SetToken(token)
-	if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
-		slog.Warn("failed to write token file", "error", err)
+	if PersistTokenAtRest(m.AuthMethod) {
+		if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
+			slog.Warn("failed to write token file", "error", err)
+		}
+	} else {
+		// mtls+os: the token stays in memory only. Removing any existing file
+		// is the load-bearing half — a host upgraded from plain mtls, or from an
+		// earlier mtls+os build, still holds a readable plaintext token that
+		// remains valid until its TTL expires. Declining to write a new one
+		// would leave that stale credential in place and make the guarantee
+		// false exactly where it matters most.
+		//
+		// A failure here is escalated to an error rather than warned about,
+		// unlike the write path above: a token we could not remove is a token
+		// still on disk, so continuing would mean reporting success for a login
+		// whose central security property did not hold.
+		if err := RemoveTokenFile(m.TokenFilePath); err != nil {
+			return fmt.Errorf("auth_method %s requires no token at rest, but the existing token file could not be removed: %w", m.AuthMethod, err)
+		}
 	}
 	slog.Info("mtls authentication successful", "method", m.MTLS.Method, "serial", cred.Serial,
 		"not_after", cred.NotAfter.Format(time.RFC3339))

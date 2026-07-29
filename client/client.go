@@ -229,6 +229,12 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	// but unreadable) is treated as no candidate, matching ResolveToken's own
 	// best-effort handling.
 	cachedRejected := false
+	// Under mtls+os no token is written at rest, so this read simply comes up
+	// empty and the certificate candidate below answers instead. Left
+	// unconditional rather than branching on the method: an empty read costs
+	// nothing, and a host that still has a stale file from a previous method
+	// should not have it silently used — the daemon removes it at its next
+	// login, and until then Vault itself rejects it if it has expired.
 	fileToken, _ := auth.ReadTokenFile(c.cfg.TokenFile)
 	seen := map[string]bool{}
 	for _, cand := range []string{auth.ReadTokenEnv(), fileToken} {

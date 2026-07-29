@@ -36,7 +36,29 @@ Differences from the other cert methods:
 - **No bring-your-own.** The OS store can install a certificate but cannot import an external private key, so `byo` is rejected at config-load for `mtls+os`. The key is always generated in the store and certified via `pki/sign`. (Use `mtls` for BYO.)
 - **Certificate TTL defaults to 30 days.** Because the credential doubles as a browser-presented user identity, an unset `ttl` defaults to `720h` (30d) for `mtls+os` (plain `mtls`/`mtls+tpm` leave it to the PKI role). dotvault requests this length; **the Vault PKI role's `max_ttl` is still the authoritative cap**, and `reissue_before` (default 7d) drives automatic rotation well before expiry.
 - **Key types.** Both `ec` (P-256) and `rsa` are accepted, like plain `mtls` (only `mtls+tpm` is EC-only). RSA defaults to 2048 and is sized by `key_bits`; the backend opens the *software* KSP (`ProviderMSSoftware`), whose 16384-bit ceiling means 3072/4096/8192 all work. Had it used the TPM KSP, RSA would be capped at 2048 and larger sizes would fail at runtime.
-- **Token at rest.** `mtls+os` governs the *certificate key* only; the operational Vault token rests as a plaintext `0600` file exactly as with plain `mtls`. Combine the `+tpm` token sealing with a different method if you also want the token sealed.
+- **Token at rest.** None. `mtls+os` writes no Vault token to disk at all — see [No token at rest](#no-token-at-rest-mtlsos) below. This is the one place it diverges from plain `mtls`, which caches a plaintext token, and from `mtls+tpm`, which caches a sealed one.
+
+### No token at rest (`mtls+os`)
+
+Under `mtls+os` dotvault writes **no Vault token to disk at all**. There is no `~/.dotvault-token` for this method: the operational token lives in the daemon's memory and is re-derived from the certificate whenever it is needed.
+
+The reasoning is that the token was never load-bearing here. The certificate is the credential, it lives non-exportably inside the OS store, and a fresh operational token can be minted from it without any human involvement — delete the token file under `mtls+os` and restart, and the daemon simply logs in again. A cached token is therefore a latency optimisation, and caching it in plaintext beside a key store specifically hardened against that class of exposure buys nothing while re-creating exactly the risk the method exists to remove. (`mtls+tpm` reaches a comparable position differently: it keeps a file and seals it under the TPM. Sealing is not available in the same way here — the CNG key is deliberately non-exportable and sign-oriented, and `mtls+os` accepts EC P-256 as well as RSA, so there is no decrypt primitive covering both key types. Wrapping the token under some other Windows facility such as DPAPI would protect it, but would also create a second durable secret-bearing artefact outside the certificate store.)
+
+**On upgrade, an existing token file is deleted — on the first successful login, not before.** A host previously running plain `mtls`, or an earlier `mtls+os` build, already has a readable plaintext token that stays valid until its TTL expires, so declining to write a new one would leave that one in place. The first successful `mtls+os` login removes it, and fails loudly if it cannot, rather than reporting a success whose central property did not hold. Startup declines to *use* such a file but does not delete it: `mtls+os` is Windows-only, so on Linux or macOS the login fails later at store-open, and deleting first would destroy a working credential to enforce a guarantee that login was never going to reach.
+
+#### What this does and does not protect against
+
+It is worth being precise, because the guarantee is narrower than "the token is safe".
+
+**What holds.** After a successful `mtls+os` login there is no usable *Vault credential* in plaintext anywhere on the filesystem: no token file, and a certificate key CNG will not export. Backups, disk images, filesystem-level exfiltration and anything else reading files at rest therefore capture nothing that authenticates to Vault as you.
+
+Note the deliberate narrowness of "Vault credential". dotvault's entire purpose is writing secrets to disk — every sync rule target is a `0600` file holding an SSH private key, a JFrog token, a Databricks token or similar, and those are unaffected by any of this. A backup still captures them. What changes is that it no longer also captures the master credential that could mint *fresh* secrets from Vault.
+
+**What does not.** The OS store's access control is *per-user*, not per-process. Any process running as the same user can ask CNG to sign with that key, and can therefore perform a certificate login and obtain a perfectly valid Vault token of its own. Removing the token file raises the cost of that from "read one file" to "drive a TLS client-certificate handshake", which is a real difference for opportunistic file-grabbing malware and for anything scraping a stolen disk image, but it is **not** an isolation boundary between processes owned by the same user. If that is your threat model, this method does not deliver it.
+
+Three further exposures are unchanged by this and should be accounted for explicitly. A live token is still obtainable from `GET /api/v1/token` on the loopback web listener when `web.enabled` is set, and over the forwarded socket when `vault.token_socket` is configured — both are deliberate features, both hand out the same bearer token, and neither is gated by the certificate store. `DOTVAULT_TOKEN`, if an operator sets it, is an environment value dotvault reads but never wrote; the guarantee here is about what dotvault persists, not about what is injected. And the token exists in the daemon's process memory throughout, so anything able to read that memory (a debugger attached as the same user, a core dump) still reaches it.
+
+In short: this closes the at-rest exposure, and does not claim to close the same-user runtime one.
 
 ## Configuration
 

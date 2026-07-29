@@ -121,3 +121,27 @@ func WriteTokenFile(path string, token string, seal bool) error {
 	}
 	return nil
 }
+
+// RemoveTokenFile deletes a cached token file, treating an already-absent file
+// as success.
+//
+// It exists for auth methods that must not leave a token at rest ("mtls+os").
+// Simply declining to write is not enough: a host that previously ran plain
+// "mtls", or an older build of "mtls+os", still has a readable plaintext token
+// on disk, and it stays valid until its TTL runs out. Without an explicit
+// removal the no-plaintext-at-rest guarantee would hold only for hosts that had
+// never run anything else — which is not a guarantee worth stating.
+func RemoveTokenFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Windows has no POSIX unlink-while-open, and Go opens files without
+		// FILE_SHARE_DELETE, so an antivirus scanner, backup agent or search
+		// indexer holding a handle yields ERROR_SHARING_VIOLATION. Since the
+		// caller escalates this to a login failure, name the likely cause
+		// rather than surfacing a bare errno the operator has to decode.
+		return fmt.Errorf("remove token file %s: %w (on Windows another process holding the file open — antivirus, backup or indexing — can block deletion)", path, err)
+	}
+	return nil
+}

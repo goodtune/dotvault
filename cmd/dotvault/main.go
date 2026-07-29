@@ -763,6 +763,18 @@ func emitConfigSourceLog(ctx context.Context, cfg *config.Config, path string) {
 	observability.LogRegistryConfigManaged(ctx, path)
 }
 
+// resolveTokenForMethod resolves a cached token, optionally excluding the token
+// file. Methods that keep no token at rest (mtls+os) still honour DOTVAULT_TOKEN,
+// which is an operator-supplied value in the process environment rather than
+// something dotvault persisted — the guarantee this method makes is about what
+// is written to disk, not about what an operator chooses to inject.
+func resolveTokenForMethod(tokenPath string, allowFile bool) string {
+	if allowFile {
+		return auth.ResolveToken(tokenPath)
+	}
+	return auth.ReadTokenEnv()
+}
+
 func runDaemon(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
@@ -900,9 +912,24 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	tokenPath := paths.VaultTokenPath()
 
+	// Under mtls+os a token file found here is stale — left by plain mtls or an
+	// earlier build — and must not be adopted: reuse runs BEFORE any login, so
+	// otherwise the daemon would pick the stale credential up and certLogin's
+	// removal would never be reached. Env and the peer socket remain valid
+	// sources below; this is only about the file.
+	//
+	// It is deliberately NOT deleted here. Startup cannot yet know the method
+	// will work: mtls+os is Windows-only, so on Linux or macOS the login fails
+	// later at securestore.Open with ErrUnsupported. Deleting first would mean a
+	// misconfigured host loses a perfectly good token and then cannot obtain
+	// another — destroying a working credential to enforce a guarantee that
+	// login was never going to reach. Removal therefore happens in certLogin, on
+	// success, which is exactly the moment the guarantee is claimed for.
+	reuseFromFile := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+
 	// Try to reuse an existing token before starting any auth flow.
 	authenticated := false
-	if token := auth.ResolveToken(tokenPath); token != "" {
+	if token := resolveTokenForMethod(tokenPath, reuseFromFile); token != "" {
 		vc.SetToken(token)
 		if _, err := vc.LookupSelf(ctx); err == nil {
 			slog.Info("reusing existing vault token")
@@ -1591,6 +1618,37 @@ func runSync(cmd *cobra.Command, args []string) error {
 	return engine.RunOnce(ctx)
 }
 
+// reportCertCredential prints what can be known about a certificate-auth host
+// that keeps no token at rest, without contacting Vault or minting anything.
+//
+// The certificate envelope IS the credential under mtls+os, so its presence and
+// validity window are the meaningful status — more so than a token, which is
+// transient and re-derived on demand.
+func reportCertCredential(cfg *config.Config) {
+	fmt.Printf("Auth: certificate auth (%s) — no token is cached at rest by design\n", cfg.Vault.AuthMethod)
+	dir := mtlsStorageDir(cfg)
+	info, err := auth.InspectCertCredential(dir)
+	switch {
+	case err != nil:
+		fmt.Printf("  certificate: envelope in %s is unreadable (%v)\n", dir, err)
+		return
+	case !info.Present:
+		fmt.Printf("  certificate: none enrolled in %s (a bootstrap is required)\n", dir)
+		return
+	}
+	state := "valid"
+	if info.Expired {
+		// Worth calling out rather than just printing a past date: re-issuance
+		// needs a still-valid certificate, so this state is not self-healing.
+		state = "EXPIRED — no token can be derived; re-enrolment required"
+	}
+	fmt.Printf("  certificate: %s (identity %s, backend %s, not_after %s)\n",
+		state, info.Identity, info.Backend, info.NotAfter.Format(time.RFC3339))
+	if !info.Expired {
+		fmt.Println("  the daemon re-derives an operational token from this certificate as needed")
+	}
+}
+
 func runStatus(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
@@ -1619,7 +1677,19 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// borrowing from a peer (no token file at rest) reports "not
 	// authenticated" here even though the running daemon is happily serving
 	// secrets — see vault.token_socket in CLAUDE.md.
-	token := auth.ResolveToken(paths.VaultTokenPath())
+	//
+	// Under mtls+os there is deliberately no token at rest, so the file is not
+	// a source here — and its absence says nothing about whether the host is
+	// working. Report on the credential that actually exists instead: the
+	// certificate. That is verifiable from disk, side-effect free, and closer to
+	// what the operator wants to know.
+	//
+	// The alternative — performing a certificate login so status could show a
+	// live token — was rejected: `status` is an informational command, and
+	// minting a Vault token (with its lease) merely to answer "am I set up?"
+	// makes an observation command a mutating one.
+	persistsToken := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
 	borrowSockets := cfg.TokenBorrowSockets()
 	borrowedFrom := ""
 	if token == "" {
@@ -1629,6 +1699,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 	switch {
+	case token == "" && !persistsToken:
+		// mtls+os keeps no token at rest, so "no token" is the designed state,
+		// not a fault. Report the certificate — the credential that actually
+		// persists — INSTEAD of the token verdict below, which would otherwise
+		// print a contradictory "not authenticated" line beneath it.
+		reportCertCredential(cfg)
 	case token == "" && len(borrowSockets) > 0:
 		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
 		for _, s := range borrowSockets {
@@ -1988,6 +2064,55 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// Certificate auth: what this hook should do depends entirely on whether the
+	// certificate is still usable, and that is answerable from a local file.
+	//
+	// While it is valid, no interactive login can ever be required — the daemon
+	// re-derives an operational token from the certificate on demand — so the
+	// right answer is to return immediately. That matters most under mtls+os,
+	// which keeps no token at rest: the hook would otherwise find no token file
+	// on every single shell start and head toward a login that is neither
+	// possible nor needed. It also respects the latency budget, since a real
+	// certificate login (a TLS handshake plus a hardware key operation) has no
+	// business in shell startup merely to confirm something already true.
+	//
+	// But a certificate that is missing or expired is exactly the case this
+	// command exists for. Re-issuance requires a still-valid certificate, so once
+	// it lapses — a laptop left unused past its re-issue window, say — no token
+	// is derivable and the host needs a fresh bootstrap, which IS interactive.
+	// Returning silently there would report health on a host that cannot
+	// authenticate at all, and the user would discover it later as an
+	// unexplained failure. So we warn and fall through to the normal flow, which
+	// performs the bootstrap.
+	certBootstrapReason := ""
+	// Scoped to methods that keep no token at rest, i.e. mtls+os. Plain mtls and
+	// mtls+tpm still cache a token, and this hook still renews it for them —
+	// short-circuiting on certificate validity there would silently stop that
+	// renewal, which is a behaviour change to methods this work must not touch.
+	if !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) && config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		info, err := auth.InspectCertCredential(mtlsStorageDir(cfg))
+		switch {
+		case err != nil:
+			// Present but unreadable: treat as needing attention rather than
+			// assuming either state.
+			certBootstrapReason = "this host's certificate credential could not be read; a fresh enrolment is needed"
+		case !info.Present:
+			certBootstrapReason = "this host has no certificate enrolled yet"
+		case info.Expired:
+			certBootstrapReason = fmt.Sprintf("this host's certificate expired at %s and can no longer be renewed; a fresh enrolment is needed",
+				info.NotAfter.Format(time.RFC3339))
+		default:
+			slog.Debug("login-check: certificate valid, no interactive login required",
+				"method", cfg.Vault.AuthMethod, "not_after", info.NotAfter.Format(time.RFC3339))
+			// Refresh like every other exit past the freshness check, so
+			// concurrent shells stop at the marker instead of repeating this.
+			_ = loginsuppress.Refresh(markerPath)
+			return nil
+		}
+		// Fall through with certBootstrapReason set: it replaces the default
+		// notice below, and the configured flow then performs the bootstrap.
+	}
+
 	vc, err := vault.NewClient(vault.Config{
 		Address:       cfg.Vault.Address,
 		CACert:        cfg.Vault.CACert,
@@ -2006,6 +2131,9 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	// Default covers the "no cached token" path; the branches below
 	// overwrite it for the expired / revoked cases.
 	loginReason := "no cached Vault token was found"
+	if certBootstrapReason != "" {
+		loginReason = certBootstrapReason
+	}
 	if token != "" {
 		vc.SetToken(token)
 		secret, lookupErr := vc.LookupSelf(ctx)
@@ -2614,15 +2742,22 @@ func stderrSupportsColour() bool {
 // nil unless auth_method drives the cert-auth flow (mtls / mtls+tpm / mtls+os),
 // so the LDAP/OIDC/token paths are unaffected. StorageDir defaults to
 // {cache_dir}/mtls.
+// mtlsStorageDir resolves where the certificate credential envelope lives,
+// applying the same default as mtlsParams so callers that only need to inspect
+// it (status, login-check) agree with the flow that writes it.
+func mtlsStorageDir(cfg *config.Config) string {
+	if d := cfg.Vault.MTLS.StorageDir; d != "" {
+		return d
+	}
+	return filepath.Join(paths.CacheDir(), "mtls")
+}
+
 func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return nil
 	}
 	m := cfg.Vault.MTLS
-	storageDir := m.StorageDir
-	if storageDir == "" {
-		storageDir = filepath.Join(paths.CacheDir(), "mtls")
-	}
+	storageDir := mtlsStorageDir(cfg)
 	return &auth.MTLSParams{
 		VaultAddress:    cfg.Vault.Address,
 		CACert:          cfg.Vault.CACert,

@@ -189,6 +189,39 @@ curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/notify \
 
 The title is required; the description is optional. An unknown level or an empty title fails locally (exit `1`) before anything is sent. Config-load failures degrade to a local notification, like `browse`.
 
+### `dotvault clipboard`
+
+Put text on the system clipboard, preferring the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+
+```sh
+dotvault clipboard [text]
+```
+
+When `vault.token_socket` names a reachable peer dotvault, the text is form-posted to the peer's `POST /api/v1/remote/clipboard` endpoint and lands on the clipboard **of the workstation** — the machine the user is actually pasting on. When the socket is not configured, missing, or the peer errors, the text is placed on this host's clipboard instead (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux, the Win32 clipboard on Windows).
+
+This is the third peer action alongside `browse` and `notify`, and together they close the loop for authenticating to a service from a headless host — open the login page in the workstation's browser, then stage the value the user needs to paste right where their ++ctrl+v++ is:
+
+```sh
+dotvault browse https://sso.example/device
+jq -r .token creds.json | dotvault clipboard
+dotvault notify info "Login ready" "the device code is on your clipboard"
+```
+
+With no positional argument (or with `-`), the text is read from **stdin**, and exactly one trailing newline is stripped — so `echo`/pipeline usage does not paste a stray newline into whatever field the value lands in. Prefer stdin for secrets: a positional argument is visible to other local processes in the process listing (`ps`).
+
+The text is capped at 64 KiB and must be non-empty, valid UTF-8, with no NUL bytes; it is otherwise written verbatim (no sanitization — the typical payload is a credential that must arrive byte-for-byte intact). Invalid input fails locally (exit `1`) before anything is sent; the peer endpoint enforces the same rules and never logs the content, only its length.
+
+The raw endpoint is curl-able over the forwarded socket too:
+
+```sh
+curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/clipboard -d text=s3cr3t
+```
+
+The command is silent on success (exit `0`). Config-load failures degrade to the local clipboard, like `browse` and `notify`.
+
+!!! note "Clipboard history managers"
+    A value placed on the clipboard is readable by any application in the user's session, and clipboard-history managers may persist it to disk. dotvault does not auto-clear the clipboard after a delay; paste the value, then overwrite it (copy something else) when it is sensitive and long-lived. One-time codes and short-TTL tokens are the intended payload.
+
 ### `dotvault version`
 
 Print the build version and exit.

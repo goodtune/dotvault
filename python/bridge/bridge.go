@@ -14,14 +14,16 @@
 //
 // Scope is the read-only + cached-auth subset of the facade plus the
 // peer-action surface: AuthenticateCached (never prompts), IdentityName, Token,
-// ReadKVField, ReadUserSecret, and the socket-forwarded Browse/Notify.
+// ReadKVField, ReadUserSecret, and the socket-forwarded Browse/Notify/Clipboard.
 // Interactive Login/Authenticate (browser/terminal) are out — driving an OIDC
 // browser pop or an LDAP password prompt across an FFI boundary from inside a
 // Python process is awkward and is not what a library caller wants; such
 // callers should rely on a token already provisioned by the daemon or `dotvault
-// login`. Browse/Notify need no local token — they post over the peer socket —
-// so they are in scope: a headless Python program hands a URL or a notification
-// back to the workstation over the same forwarded socket it borrows tokens from.
+// login`. Browse/Notify/Clipboard need no local token — they post over the peer
+// socket — so they are in scope: a headless Python program hands a URL, a
+// notification, or a clipboard value (a token to paste into an opened page)
+// back to the workstation over the same forwarded socket it borrows tokens
+// from.
 //
 // # ABI conventions
 //
@@ -410,6 +412,22 @@ func dotvault_remote_notify(h C.longlong, level, title, body, actionURL *C.char,
 	ctx, cancel := callContext(timeoutMillis)
 	defer cancel()
 	if err := c.Notify(ctx, goString(level), goString(title), goString(body), goString(actionURL)); err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	return catOK
+}
+
+//export dotvault_remote_clipboard
+func dotvault_remote_clipboard(h C.longlong, text *C.char, timeoutMillis C.longlong, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	if err := c.Clipboard(ctx, goString(text)); err != nil {
 		setErr(errOut, err)
 		return category(err)
 	}

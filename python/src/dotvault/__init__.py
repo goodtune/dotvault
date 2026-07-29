@@ -9,7 +9,7 @@ all come from the one canonical Go implementation rather than being re-derived
 in Python.
 
 The surface is the read-only + cached-auth subset of the Go facade, plus the
-socket-forwarded peer actions (``browse``/``notify``):
+socket-forwarded peer actions (``browse``/``notify``/``clipboard``):
 
     import dotvault
 
@@ -17,11 +17,13 @@ socket-forwarded peer actions (``browse``/``notify``):
         c.authenticate_cached(timeout=5)   # env -> token file; never prompts
         token = c.read_user_secret("gh", "oauth_token")
         c.browse("https://example.com")    # opens on the workstation peer
+        c.clipboard(token)                 # ready to paste on the workstation
         c.notify("info", "Done", "job finished")
 
-``browse`` and ``notify`` post over the same ``vault.token_socket`` peer this
-client borrows tokens from, so a headless program hands a URL or a notification
-back to the workstation where a human is looking. They need no local token.
+``browse``, ``notify``, and ``clipboard`` post over the same
+``vault.token_socket`` peer this client borrows tokens from, so a headless
+program hands a URL, a notification, or a value to paste back to the
+workstation where a human is looking. They need no local token.
 
 Authentication never prompts: it resolves ``DOTVAULT_TOKEN`` then the token
 file and validates it. If no usable token is present it raises ``LoginRequired``
@@ -311,6 +313,36 @@ class Client:
             _ffi.encode(action_url),
             _millis(timeout),
             byref(err),
+        )
+        _check(code, err)
+
+    def clipboard(self, text: str, timeout: float | None = None) -> None:
+        """Ask the peer dotvault to put ``text`` on its host's clipboard.
+
+        The third peer action over the same socket as :meth:`browse` and
+        :meth:`notify`: where ``browse`` opens a login page on the workstation
+        and ``notify`` tells the user something happened, ``clipboard``
+        delivers the value they need to paste — a one-time token, a device
+        code — right where their Ctrl+V is. The programmatic equivalent of
+        ``dotvault clipboard``. Like the other peer actions there is no local
+        fallback: a headless caller has no clipboard, so an unreachable peer
+        raises.
+
+        The text is validated by the peer (non-empty, valid UTF-8, no NUL
+        bytes, at most 64 KiB) and written verbatim; the peer never logs the
+        content, only its length. Returns ``None`` once the peer reports the
+        clipboard set.
+
+        Raises:
+            PeerUnavailable: No socket configured, peer unreachable, or the
+                peer could not write its clipboard.
+            DotvaultError: The peer rejected the text as invalid (carrying its
+                message), or the client handle is invalid.
+        """
+        self._require_open()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_remote_clipboard(
+            self._handle, _ffi.encode(text), _millis(timeout), byref(err)
         )
         _check(code, err)
 

@@ -12,8 +12,8 @@ import (
 )
 
 // newUnixActionServer starts an httptest server bound to a Unix socket serving
-// the two remote-action endpoints with the given handler. Skips where AF_UNIX
-// is unavailable.
+// the remote-action endpoints with the given handler. Skips where AF_UNIX is
+// unavailable.
 func newUnixActionServer(t *testing.T, sockPath string, handler http.HandlerFunc) {
 	t.Helper()
 	ln, err := net.Listen("unix", sockPath)
@@ -23,6 +23,7 @@ func newUnixActionServer(t *testing.T, sockPath string, handler http.HandlerFunc
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/remote/browse", handler)
 	mux.HandleFunc("POST /api/v1/remote/notify", handler)
+	mux.HandleFunc("POST /api/v1/remote/clipboard", handler)
 	srv := httptest.NewUnstartedServer(mux)
 	srv.Listener = ln
 	srv.Start()
@@ -105,6 +106,69 @@ func TestNotify_OmitsEmptyActionURL(t *testing.T) {
 	}
 	if present {
 		t.Error("action_url field was sent despite being empty")
+	}
+}
+
+func TestClipboard_PostsToPeer(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	var path, text string
+	newUnixActionServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		path, text = r.URL.Path, r.PostFormValue("text")
+		_, _ = w.Write([]byte(`{"status":"clipboard set"}`))
+	})
+
+	if err := newBrowseClient(t, sock).Clipboard(context.Background(), "s3cr3t\nline2"); err != nil {
+		t.Fatalf("Clipboard: %v", err)
+	}
+	if path != "/api/v1/remote/clipboard" || text != "s3cr3t\nline2" {
+		t.Errorf("peer got path=%q text=%q, want the clipboard endpoint and verbatim text", path, text)
+	}
+}
+
+func TestClipboard_NoSocketConfigured(t *testing.T) {
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}}) // no TokenSocket
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Clipboard(context.Background(), "t")
+	if !errors.Is(err, ErrPeerUnavailable) {
+		t.Fatalf("err = %v, want ErrPeerUnavailable when no socket is configured", err)
+	}
+}
+
+func TestClipboard_PeerRejectsInvalid(t *testing.T) {
+	// A 400 from the peer (it validated and rejected the text) is a caller
+	// error, NOT ErrPeerUnavailable.
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixActionServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"clipboard text must not be empty"}`))
+	})
+
+	err := newBrowseClient(t, sock).Clipboard(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected an error for peer-rejected text")
+	}
+	if errors.Is(err, ErrPeerUnavailable) {
+		t.Errorf("a 400 must not map to ErrPeerUnavailable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must not be empty") {
+		t.Errorf("err = %q, want it to carry the peer's rejection message", err)
+	}
+}
+
+func TestClipboard_PeerActionFailedIsUnavailable(t *testing.T) {
+	// A 502 (peer reached, clipboard write failed) maps to ErrPeerUnavailable.
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixActionServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"no clipboard tool found"}`))
+	})
+
+	err := newBrowseClient(t, sock).Clipboard(context.Background(), "t")
+	if !errors.Is(err, ErrPeerUnavailable) {
+		t.Fatalf("err = %v, want ErrPeerUnavailable for a 502 write failure", err)
 	}
 }
 

@@ -20,7 +20,7 @@ type fakeCertStore struct {
 func (f *fakeCertStore) Capabilities() securestore.Capabilities {
 	return securestore.Capabilities{Name: "os", HardwareBound: true}
 }
-func (f *fakeCertStore) Generate(securestore.KeyType, bool) (crypto.Signer, []byte, error) {
+func (f *fakeCertStore) Generate(securestore.KeyType, int, bool) (crypto.Signer, []byte, error) {
 	return nil, nil, nil
 }
 func (f *fakeCertStore) Import(crypto.PrivateKey, bool) (crypto.Signer, []byte, error) {

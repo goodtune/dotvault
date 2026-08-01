@@ -36,6 +36,7 @@ type MTLSParams struct {
 	PKIMount        string
 	PKIRole         string
 	KeyType         string
+	KeyBits         int    // RSA modulus size; 0 = backend default (2048). Ignored for EC.
 	CommonName      string // template over {{.user}}
 	TTL             string
 	ReissueBefore   time.Duration
@@ -261,7 +262,7 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	if err != nil {
 		return err
 	}
-	signer, handle, err := store.Generate(securestore.KeyType(m.MTLS.KeyType), m.MTLS.SealToPCRs)
+	signer, handle, err := store.Generate(securestore.KeyType(m.MTLS.KeyType), m.MTLS.KeyBits, m.MTLS.SealToPCRs)
 	if err != nil {
 		return fmt.Errorf("generate key: %w", err)
 	}
@@ -340,7 +341,7 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("bootstrap login: %w", err)
 	}
-	signer, handle, err := store.Generate(securestore.KeyType(p.KeyType), p.SealToPCRs)
+	signer, handle, err := store.Generate(securestore.KeyType(p.KeyType), p.KeyBits, p.SealToPCRs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
 	}

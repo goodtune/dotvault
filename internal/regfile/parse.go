@@ -688,6 +688,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.MTLS.PKIMount, mtlsKey, "PKIMount") },
 		func() error { return apply(&cfg.Vault.MTLS.PKIRole, mtlsKey, "PKIRole") },
 		func() error { return apply(&cfg.Vault.MTLS.KeyType, mtlsKey, "KeyType") },
+		func() error { return applyInt(&cfg.Vault.MTLS.KeyBits, mtlsKey, "KeyBits") },
 		func() error { return apply(&cfg.Vault.MTLS.CommonName, mtlsKey, "CommonName") },
 		func() error { return apply(&cfg.Vault.MTLS.TTL, mtlsKey, "TTL") },
 		func() error { return apply(&cfg.Vault.MTLS.ReissueBefore, mtlsKey, "ReissueBefore") },

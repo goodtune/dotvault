@@ -497,9 +497,19 @@ type MTLSConfig struct {
 	PKIMount string `yaml:"pki_mount"`
 	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
 	PKIRole string `yaml:"pki_role"`
-	// KeyType is "ec" (P-256) or "rsa" (2048). Default "ec". The mtls+tpm
-	// backend supports "ec" only; mtls/mtls+os accept both.
+	// KeyType is "ec" (P-256) or "rsa". Default "ec". The mtls+tpm backend
+	// supports "ec" only; mtls/mtls+os accept both.
 	KeyType string `yaml:"key_type"`
+	// KeyBits is the RSA modulus size to generate: 2048, 3072, 4096 or 8192.
+	// Zero (the default) leaves it to the backend, which uses 2048.
+	//
+	// It exists because a Vault PKI role's key_bits is a *minimum*, not an
+	// exact match — SignCert rejects a CSR whose key is smaller than the role
+	// requires — so an operator whose role pins RSA at 4096 cannot use
+	// certificate auth at all unless dotvault generates a key at least that
+	// large. Only meaningful with key_type: rsa, and rejected under mtls+tpm,
+	// which is EC-only.
+	KeyBits int `yaml:"key_bits"`
 	// CommonName is a Go template (over {{.user}}) for the certificate CN.
 	// Default "{{.user}}".
 	CommonName string `yaml:"common_name"`
@@ -939,6 +949,26 @@ func (c *Config) validateMTLS() error {
 		}
 	default:
 		return fmt.Errorf("vault.mtls.key_type %q: must be ec or rsa", m.KeyType)
+	}
+	// key_bits is RSA-only and, when set, must be a length Vault itself accepts
+	// (certutil.ValidateKeyTypeLength). Zero means "backend default".
+	//
+	// Both misuses are errors rather than silent no-ops: an operator who sets
+	// key_bits under an EC or TPM configuration believes they have changed the
+	// key size, and quietly ignoring it would leave them debugging a Vault
+	// rejection whose cause is in their own config.
+	if m.KeyBits != 0 {
+		if method == "mtls+tpm" {
+			return fmt.Errorf("vault.mtls.key_bits is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only, so there is no RSA modulus to size)")
+		}
+		if m.KeyType != "rsa" {
+			return fmt.Errorf("vault.mtls.key_bits is only valid with key_type rsa (got key_type %q); EC keys are fixed at P-256", m.KeyType)
+		}
+		switch m.KeyBits {
+		case 2048, 3072, 4096, 8192:
+		default:
+			return fmt.Errorf("vault.mtls.key_bits %d: must be one of 2048, 3072, 4096, 8192 (the RSA lengths Vault accepts)", m.KeyBits)
+		}
 	}
 	if m.CommonName == "" {
 		m.CommonName = DefaultMTLSCommonName

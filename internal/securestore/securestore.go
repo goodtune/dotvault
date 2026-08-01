@@ -80,7 +80,11 @@ type Storage interface {
 	// reconstruct the signer. sealToPCRs binds the key to the current PCR
 	// (boot) state where the backend supports it; it is ignored by backends
 	// that do not.
-	Generate(kt KeyType, sealToPCRs bool) (crypto.Signer, []byte, error)
+	// bits sizes an RSA modulus (2048/3072/4096/8192); zero means the
+	// backend default of 2048, and it is ignored for EC, which is fixed at
+	// P-256. It is threaded through because a Vault PKI role's key_bits is a
+	// minimum, so an operator with a 4096-bit role needs a matching key.
+	Generate(kt KeyType, bits int, sealToPCRs bool) (crypto.Signer, []byte, error)
 	// Import takes an existing software private key (the BYO path) and
 	// returns a crypto.Signer plus a handle, sealing it into hardware where
 	// supported.
@@ -236,13 +240,34 @@ func ModeForMethod(authMethod string) string {
 	}
 }
 
-// newSoftwareKey generates a private key of the requested type.
-func newSoftwareKey(kt KeyType) (crypto.Signer, error) {
+// defaultRSABits is the modulus size used when key_bits is unset. It matches
+// what dotvault generated before key_bits existed, so an upgrade changes
+// nothing for an operator who does not set it.
+const defaultRSABits = 2048
+
+// rsaBitsOrDefault resolves a requested RSA modulus size, substituting the
+// default when unset.
+//
+// Platform-neutral on purpose: both key-generating backends need it (the
+// software one here and the Windows CNG one in osstore_windows.go), and the
+// Windows file cannot be compiled or tested off Windows. Keeping the default in
+// one place stops the two backends from silently disagreeing about what an
+// unset key_bits means.
+func rsaBitsOrDefault(bits int) int {
+	if bits == 0 {
+		return defaultRSABits
+	}
+	return bits
+}
+
+// newSoftwareKey generates a private key of the requested type. bits sizes an
+// RSA modulus; zero selects defaultRSABits. EC ignores it — P-256 is fixed.
+func newSoftwareKey(kt KeyType, bits int) (crypto.Signer, error) {
 	switch kt {
 	case KeyEC, "":
 		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	case KeyRSA:
-		return rsa.GenerateKey(rand.Reader, 2048)
+		return rsa.GenerateKey(rand.Reader, rsaBitsOrDefault(bits))
 	default:
 		return nil, fmt.Errorf("securestore: unknown key type %q", kt)
 	}
@@ -288,8 +313,8 @@ func (fileStorage) Capabilities() Capabilities {
 	return Capabilities{Name: "file", HardwareBound: false}
 }
 
-func (fileStorage) Generate(kt KeyType, _ bool) (crypto.Signer, []byte, error) {
-	signer, err := newSoftwareKey(kt)
+func (fileStorage) Generate(kt KeyType, bits int, _ bool) (crypto.Signer, []byte, error) {
+	signer, err := newSoftwareKey(kt, bits)
 	if err != nil {
 		return nil, nil, err
 	}

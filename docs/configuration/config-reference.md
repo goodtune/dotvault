@@ -101,7 +101,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `address` | string | *(required)* | Vault server URL |
-| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` (any base method also accepts a `+tpm` suffix) |
+| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, `mtls+tpm`, or `mtls+os` (any base method also accepts a `+tpm` suffix) |
 | `auth_mount` | string | — | Vault auth mount path (e.g. `oidc`, `ldap`) |
 | `auth_role` | string | — | Vault auth role to request |
 | `oidc_callback_port` | int | `8250` | Fixed local TCP port the OIDC CLI flow (`dotvault login`) binds for the OAuth redirect_uri; falls back to a random port if unavailable. See [OIDC & SSO Authentication](../authentication/oidc.md#redirect-uris) |

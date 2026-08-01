@@ -61,7 +61,9 @@ func rootToken(t *testing.T) string {
 // compose-up, so it cannot be committed and must be fetched at runtime.
 func vaultCACert(t *testing.T) string {
 	t.Helper()
-	out, err := exec.Command("docker", "exec", "dotvault-vault",
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", "dotvault-vault",
 		"cat", "/vault/tls/vault.crt").Output()
 	if err != nil {
 		t.Skipf("cannot read the dev TLS certificate from the vault container: %v", err)

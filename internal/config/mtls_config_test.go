@@ -170,3 +170,104 @@ func TestMTLSValidateReissueBefore(t *testing.T) {
 		t.Errorf("want positive error, got %v", err)
 	}
 }
+
+// TestMTLSValidateKeyBits covers vault.mtls.key_bits.
+//
+// The option exists because a Vault PKI role's key_bits is a MINIMUM, not an
+// exact match: SignCert rejects a CSR whose key is smaller than the role
+// requires, so an operator whose role pins RSA at 4096 cannot use certificate
+// auth at all while dotvault hard-codes 2048. The validation below is
+// deliberately strict in both directions — an unusable value is rejected at
+// config load, and so is a value that would be silently ignored, because an
+// operator who sets key_bits believes they have changed the key size.
+func TestMTLSValidateKeyBits(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		mtls    MTLSConfig
+		wantErr string // substring; empty means the config must validate
+	}{
+		{
+			name:   "unsetDefaultsToZero",
+			method: "mtls",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa"},
+		},
+		{
+			name:   "rsa2048",
+			method: "mtls",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 2048},
+		},
+		{
+			name:   "rsa3072",
+			method: "mtls",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 3072},
+		},
+		{
+			name:   "rsa4096",
+			method: "mtls",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 4096},
+		},
+		{
+			name:   "rsa8192",
+			method: "mtls",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 8192},
+		},
+		{
+			// key_bits applies to mtls+os too, not just plain mtls: the OS
+			// backend accepts rsa exactly as the file backend does.
+			name:   "rsa4096UnderMTLSOS",
+			method: "mtls+os",
+			mtls:   MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 4096},
+		},
+		{
+			name:    "tooSmall",
+			method:  "mtls",
+			mtls:    MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 1024},
+			wantErr: "must be one of 2048, 3072, 4096, 8192",
+		},
+		{
+			name:    "notAValidLength",
+			method:  "mtls",
+			mtls:    MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "rsa", KeyBits: 4097},
+			wantErr: "must be one of 2048, 3072, 4096, 8192",
+		},
+		{
+			// Rejected rather than ignored: EC is fixed at P-256, and an
+			// operator setting key_bits here has a false belief about the key.
+			name:    "rejectedWithEC",
+			method:  "mtls",
+			mtls:    MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyType: "ec", KeyBits: 4096},
+			wantErr: "only valid with key_type rsa",
+		},
+		{
+			// Same reasoning, and consistent with mtls+tpm already rejecting
+			// key_type: rsa outright.
+			name:    "rejectedUnderTPM",
+			method:  "mtls+tpm",
+			mtls:    MTLSConfig{CertRole: "dv", PKIRole: "dv-client", KeyBits: 4096},
+			wantErr: "not supported with auth_method mtls+tpm",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseConfigWithMTLS(tt.method, tt.mtls)
+			err := c.validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate() = %v, want nil", err)
+				}
+				if got := c.Vault.MTLS.KeyBits; got != tt.mtls.KeyBits {
+					t.Errorf("KeyBits = %d, want %d preserved", got, tt.mtls.KeyBits)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() = nil, want an error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validate() = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}

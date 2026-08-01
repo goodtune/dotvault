@@ -237,3 +237,41 @@ func TestParseLeafAndIssuer(t *testing.T) {
 		}
 	})
 }
+
+// TestRSABitsOrDefault covers the modulus-size defaulting shared by both
+// key-generating backends.
+//
+// It lives in the platform-neutral file deliberately: the Windows CNG backend
+// cannot be compiled or run off Windows, so without a shared helper its half of
+// this logic would be verified by inspection only — and the two backends could
+// drift on what an unset key_bits means, giving `mtls` and `mtls+os` different
+// key sizes from identical config.
+func TestRSABitsOrDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "unsetTakesDefault", in: 0, want: defaultRSABits},
+		{name: "explicit2048", in: 2048, want: 2048},
+		{name: "explicit3072", in: 3072, want: 3072},
+		{name: "explicit4096", in: 4096, want: 4096},
+		{name: "explicit8192", in: 8192, want: 8192},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rsaBitsOrDefault(tt.in); got != tt.want {
+				t.Errorf("rsaBitsOrDefault(%d) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDefaultRSABitsUnchanged pins the pre-key_bits behaviour: an operator who
+// never sets key_bits must keep getting exactly what dotvault generated before
+// the option existed, so upgrading cannot silently change their key size.
+func TestDefaultRSABitsUnchanged(t *testing.T) {
+	if defaultRSABits != 2048 {
+		t.Errorf("defaultRSABits = %d, want 2048 — changing this alters key size for every operator who has not set key_bits", defaultRSABits)
+	}
+}

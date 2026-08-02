@@ -12,7 +12,7 @@ This package exposes the **read-only + cached-auth** subset of the Go facade, pl
 - `authenticate_cached(timeout=None)` — resolve a token (`DOTVAULT_TOKEN` → token file → peer socket borrow when `vault.token_socket` is configured) and validate it. The socket borrow is a plain read with no browser or prompt, so a host with no local token but a live peer socket authenticates without an interactive login. **Never prompts.**
 - `identity_name()`, `token()`.
 - `read_user_secret(service, field, timeout=None)`, `read_kv_field(mount, path, field, timeout=None)`.
-- `browse(url, timeout=None)`, `notify(level, title, body="", action_url="", timeout=None)` — ask the `vault.token_socket` peer to open a URL in a browser, or raise a native desktop notification, **on the workstation**. For the headless topology: a Python program on a machine with no browser hands a URL or a notification back over the same forwarded socket it borrows tokens from. These need **no** local token. The peer validates/sanitizes the input; there is no local fallback (an unreachable peer raises `PeerUnavailable`). `notify` levels: `info`, `warning`, `error`, `attention`; the optional `action_url` is an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux).
+- `browse(url, timeout=None)`, `notify(level, title, body="", action_url="", timeout=None)`, `clipboard(text, timeout=None)` — ask the `vault.token_socket` peer to open a URL in a browser, raise a native desktop notification, or put text on the clipboard, **on the workstation**. For the headless topology: a Python program on a machine with no browser hands a URL, a notification, or a value to paste (a one-time token for a page `browse` just opened) back over the same forwarded socket it borrows tokens from. These need **no** local token. The peer validates/sanitizes the input; there is no local fallback (an unreachable peer raises `PeerUnavailable`). `notify` levels: `info`, `warning`, `error`, `attention`; the optional `action_url` is an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux). `clipboard` text is written verbatim (non-empty UTF-8, no NUL bytes, ≤ 64 KiB) and the peer logs only its length, never the content.
 
 Interactive login (OIDC browser pop, LDAP password + MFA terminal prompts) is **deliberately out of scope** — driving it across an FFI boundary from inside a Python process is awkward and not what a library caller wants. Provision a token out of band (`dotvault login`, or the daemon) and these bindings consume it.
 
@@ -89,7 +89,7 @@ Every failure is a `DotvaultError` or a subclass:
 | `Unreachable` | Vault down / 5xx / timeout. | Retry, back off. |
 | `Denied` | Vault rejected the read (401/403). | Fail closed; the token lacks the policy. |
 | `AuthFailed` | A login ran but failed. | Surface the auth problem (rare on this surface). |
-| `PeerUnavailable` | `browse`/`notify`: no socket, peer down, or the action failed. | Retry, or fall back to your own handling. |
+| `PeerUnavailable` | `browse`/`notify`/`clipboard`: no socket, peer down, or the action failed. | Retry, or fall back to your own handling. |
 | `DotvaultError` | Anything else (config load, closed client, a peer-*rejected* request). | Fail closed. |
 
 A not-found read is `None`, never an exception.

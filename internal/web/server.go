@@ -17,6 +17,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/notify"
@@ -103,6 +104,16 @@ type Server struct {
 	// browseOpenMu — a notification backend that hangs is abandoned, not
 	// killed, so only one delivery runs at a time.
 	notifyMu sync.Mutex
+	// setClipboard writes text to this host's clipboard for the
+	// remote-clipboard endpoint. NewServer always sets it (clipboard.Set
+	// unless ServerConfig.SetClipboard overrides it, as tests do); the
+	// handler's nil guard (503) only protects hand-constructed Servers in
+	// tests.
+	setClipboard clipboard.Setter
+	// clipboardMu is the remote-clipboard single-flight gate, mirroring
+	// browseOpenMu — a clipboard writer that hangs is abandoned, not killed,
+	// so only one write runs at a time.
+	clipboardMu sync.Mutex
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's
@@ -157,6 +168,10 @@ type ServerConfig struct {
 	// endpoint delivers desktop notifications (tests inject a fake). Nil
 	// selects the real notify.Send.
 	SendNotification notify.Notifier
+	// SetClipboard, when non-nil, overrides how the remote-clipboard
+	// endpoint writes to this host's clipboard (tests inject a fake). Nil
+	// selects the real clipboard.Set.
+	SetClipboard clipboard.Setter
 }
 
 // NewServer creates a new web server.
@@ -206,12 +221,16 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		readyCh:            make(chan error, 1),
 		openBrowser:        sc.OpenBrowser,
 		sendNotification:   sc.SendNotification,
+		setClipboard:       sc.SetClipboard,
 	}
 	if s.openBrowser == nil {
 		s.openBrowser = browser.OpenURL
 	}
 	if s.sendNotification == nil {
 		s.sendNotification = notify.Send
+	}
+	if s.setClipboard == nil {
+		s.setClipboard = clipboard.Set
 	}
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
@@ -264,6 +283,8 @@ func (s *Server) registerRoutes() {
 	// Sibling of remote/browse — same forwarded-socket consumer and same
 	// no-CSRF / Origin-check posture (see handleRemoteNotify).
 	s.mux.HandleFunc("POST /api/v1/remote/notify", s.handleRemoteNotify)
+	// Third peer action, same posture again (see handleRemoteClipboard).
+	s.mux.HandleFunc("POST /api/v1/remote/clipboard", s.handleRemoteClipboard)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
@@ -630,7 +651,8 @@ func routeLabel(p string) string {
 		p == "/api/v1/token",
 		p == "/api/v1/sync",
 		p == "/api/v1/remote/browse",
-		p == "/api/v1/remote/notify":
+		p == "/api/v1/remote/notify",
+		p == "/api/v1/remote/clipboard":
 		return p
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without

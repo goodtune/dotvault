@@ -70,6 +70,11 @@ _declare(
     c_int,
     [c_longlong, c_char_p, c_char_p, c_char_p, c_char_p, c_longlong, POINTER(c_void_p)],
 )
+_declare(
+    "dotvault_remote_clipboard",
+    c_int,
+    [c_longlong, c_char_p, c_longlong, POINTER(c_void_p)],
+)
 
 lib = _lib
 

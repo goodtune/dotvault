@@ -60,6 +60,26 @@ func (c *Client) Notify(ctx context.Context, level, title, body, actionURL strin
 	return c.peerAction(ctx, "notify", "/api/v1/remote/notify", form)
 }
 
+// Clipboard asks the peer dotvault named by the configured TokenSocket to put
+// text on the clipboard of the peer's host — the programmatic equivalent of
+// `dotvault clipboard` and the third peer action over the same socket. Where
+// Browse opens a login page on the workstation and Notify tells the user
+// something happened, Clipboard delivers the value they need to paste — a
+// one-time token, a device code — so a headless program can stage the
+// credential right where the user's Ctrl+V is. Like the other peer actions
+// there is no local fallback: an unreachable peer is an error, never a write
+// to the headless host's (typically non-existent) clipboard.
+//
+// The text is validated authoritatively by the peer endpoint (non-empty,
+// valid UTF-8, no NUL bytes, at most 64 KiB) and written verbatim — the peer
+// never logs the content, only its length. A rejected text comes back as a
+// plain (uncategorised) error carrying the peer's message. A peer that cannot
+// be reached, or that reports it could not write the clipboard, wraps
+// ErrPeerUnavailable. Returns nil once the peer reports the clipboard set.
+func (c *Client) Clipboard(ctx context.Context, text string) error {
+	return c.peerAction(ctx, "clipboard", "/api/v1/remote/clipboard", url.Values{"text": {text}})
+}
+
 // peerAction posts a peer-action form to apiPath over the configured
 // TokenSocket and maps the shared transport's typed errors onto the facade's
 // taxonomy:

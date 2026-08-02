@@ -1,4 +1,4 @@
-"""Tests for the peer-action surface (browse / notify) over a Unix socket.
+"""Tests for the peer-action surface (browse / notify / clipboard) over a Unix socket.
 
 These drive the real native bridge against a throwaway HTTP server bound to a
 Unix domain socket standing in for a peer dotvault. No Vault is involved — the
@@ -139,6 +139,42 @@ def test_notify_default_body_is_empty(tmp_path, peer):
     _, form = ctl.received[-1]
     assert form["title"] == ["No body"]
     assert form["body"] == [""]
+
+
+def test_clipboard_posts_to_peer(tmp_path, peer):
+    sock_path, ctl = peer
+    ctl.responder = lambda path, form: (200, '{"status":"clipboard set"}')
+    with _client_with_socket(tmp_path, sock_path) as c:
+        c.clipboard("s3cr3t token", timeout=5)
+    path, form = ctl.received[-1]
+    assert path == "/api/v1/remote/clipboard"
+    assert form["text"] == ["s3cr3t token"]
+
+
+def test_clipboard_rejection_is_plain_error(tmp_path, peer):
+    # A 400 from the peer (validated + rejected) must NOT be PeerUnavailable.
+    sock_path, ctl = peer
+    ctl.responder = lambda path, form: (400, '{"error":"clipboard text must not be empty"}')
+    with _client_with_socket(tmp_path, sock_path) as c:
+        with pytest.raises(dotvault.DotvaultError) as exc:
+            c.clipboard("", timeout=5)
+    assert not isinstance(exc.value, dotvault.PeerUnavailable)
+    assert "must not be empty" in str(exc.value)
+
+
+def test_clipboard_write_failure_is_unavailable(tmp_path, peer):
+    # A 502 (peer reached, clipboard write failed) maps to PeerUnavailable.
+    sock_path, ctl = peer
+    ctl.responder = lambda path, form: (502, '{"error":"no clipboard tool found"}')
+    with _client_with_socket(tmp_path, sock_path) as c:
+        with pytest.raises(dotvault.PeerUnavailable):
+            c.clipboard("t", timeout=5)
+
+
+def test_clipboard_without_socket_is_peer_unavailable(config_file):
+    with dotvault.Client(config_path=config_file) as c:
+        with pytest.raises(dotvault.PeerUnavailable):
+            c.clipboard("t", timeout=5)
 
 
 def test_browse_without_socket_is_peer_unavailable(config_file):

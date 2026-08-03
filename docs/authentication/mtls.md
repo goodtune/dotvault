@@ -46,6 +46,10 @@ The reasoning is that the token was never load-bearing here. The certificate is 
 
 **On upgrade, an existing token file is deleted — on the first successful login, not before.** A host previously running plain `mtls`, or an earlier `mtls+os` build, already has a readable plaintext token that stays valid until its TTL expires, so declining to write a new one would leave that one in place. The first successful `mtls+os` login removes it, and fails loudly if it cannot, rather than reporting a success whose central property did not hold. Startup declines to *use* such a file but does not delete it: `mtls+os` is Windows-only, so on Linux or macOS the login fails later at store-open, and deleting first would destroy a working credential to enforce a guarantee that login was never going to reach.
 
+**Nothing puts one back, either.** Removing the file at login would be worth little if the running daemon re-adopted the next one to appear, so under `mtls+os` the daemon does not wire the token file into its token-lifecycle manager, does not watch the file for changes, and does not consult it while idling for a credential. A token file that shows up on a host running this method — restored from a backup, written by an older build, or dropped by any process running as you — is ignored rather than promoted to the daemon's working credential. An expired token is replaced from the certificate instead, which is the only source this method recognises.
+
+The Go and Python **client libraries** decline to use it too. Their cached-auth entry point (`AuthenticateCached`) skips the token file entirely under `mtls+os` and presents the certificate instead. A library consumer cannot count on the daemon's next login ever removing a leftover file — the daemon may be stopped, or the consumer may be the only dotvault on the host — so reading it would keep a plaintext token from a previous method silently in use for the rest of its TTL.
+
 #### What this does and does not protect against
 
 It is worth being precise, because the guarantee is narrower than "the token is safe".

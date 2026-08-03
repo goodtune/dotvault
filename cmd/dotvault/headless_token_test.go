@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -162,5 +163,66 @@ func TestWaitForHeadlessToken_CancelWithoutToken(t *testing.T) {
 
 	if waitForHeadlessToken(ctx, vc, tokenPath, nil) {
 		t.Fatal("waitForHeadlessToken returned true with no token source")
+	}
+}
+
+// TestHeadlessTokenPathGatedByPersistence pins the runtime half of the
+// no-token-at-rest guarantee, which pre-push security review found missing.
+//
+// certLogin removing the token file only holds if nothing puts one back. The
+// headless idle watched and adopted the token file unconditionally, so a file
+// appearing afterwards — restored from a backup, written by an older build, or
+// dropped by anything running as this user — would be promoted to the daemon's
+// working credential, and ahead of the certificate that is the correct source
+// of a replacement under this method.
+func TestHeadlessTokenPathGatedByPersistence(t *testing.T) {
+	const path = "/home/alice/.dotvault-token"
+	for _, tt := range []struct {
+		method string
+		want   string
+	}{
+		{method: "mtls+os", want: ""},
+		{method: "mtls", want: path},
+		{method: "mtls+tpm", want: path},
+		{method: "oidc", want: path},
+		{method: "oidc+os", want: path}, // no-persist is implemented only off mtls
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			if got := headlessTokenPath(tt.method, path); got != tt.want {
+				t.Errorf("headlessTokenPath(%q, path) = %q, want %q", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWaitForHeadlessTokenIgnoresFileWhenPathEmpty is the behavioural half:
+// an empty token path must make the idle ignore the file entirely rather than
+// fall back to some default. A token file sits on disk and a live Vault would
+// accept it, so adopting it is observable — the call must instead block until
+// ctx expires.
+func TestWaitForHeadlessTokenIgnoresFileWhenPathEmpty(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"id":"s.dropped-in","ttl":3600}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	vc, err := vault.NewClient(vault.Config{Address: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(t.TempDir(), ".dotvault-token")
+	if err := os.WriteFile(tokenPath, []byte("s.dropped-in"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	if waitForHeadlessToken(ctx, vc, "", nil) {
+		t.Fatal("waitForHeadlessToken adopted a token despite an empty token path — a file dropped on a no-persist host would become the daemon's credential")
+	}
+	if got := vc.Token(); got != "" {
+		t.Errorf("client is holding %q", got)
 	}
 }

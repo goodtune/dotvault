@@ -25,7 +25,12 @@ func TestPersistTokenAtRest(t *testing.T) {
 		want   bool
 	}{
 		{method: "mtls+os", want: false},
-		{method: "oidc+os", want: false}, // suffix parses on any base, for uniformity
+		// The suffix parses on any base (BaseMethod strips it), but no-persist
+		// is implemented only off mtls: oidc+os routes to authenticateOIDC,
+		// which writes the token file unconditionally. Claiming no-persist for
+		// it would state a guarantee nothing enforces.
+		{method: "oidc+os", want: true},
+		{method: "ldap+os", want: true},
 		{method: "mtls", want: true},
 		{method: "mtls+tpm", want: true},
 		{method: "oidc", want: true},

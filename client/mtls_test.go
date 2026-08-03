@@ -239,3 +239,107 @@ func TestAuthenticateCached_CertErrorTaxonomy(t *testing.T) {
 		}
 	})
 }
+
+// TestAuthenticateCached_MTLSOSSkipsStaleTokenFile pins the facade's half of
+// the no-token-at-rest guarantee, which Copilot's review surfaced as a stale
+// comment and which turned out to be a real hole.
+//
+// The daemon removes a leftover token file on its next successful mtls+os
+// login, but a library consumer cannot count on that ever happening in its
+// own lifetime — the daemon may be stopped, or this process may be the only
+// dotvault on the host. Reading the file anyway would leave a plaintext token
+// from a previous method silently in use for the rest of its TTL, which is the
+// exact credential mtls+os exists to eliminate.
+//
+// The fake Vault ACCEPTS any token, which is what makes the two behaviours
+// distinguishable: adopting the file means LookupSelf succeeds and
+// AuthenticateCached returns nil, whereas skipping it falls through to a
+// certificate login that cannot succeed with no enrolled credential.
+// Reverting the gate must fail this.
+func TestAuthenticateCached_MTLSOSSkipsStaleTokenFile(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "") // hermetic: a developer export must not leak in
+	fv := newFakeVault(t)
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
+	if err := os.WriteFile(tokenFile, []byte("stale-from-plain-mtls\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	newClient := func(method string) *Client {
+		t.Helper()
+		c, err := New(&Config{
+			Vault: VaultConfig{
+				Address:    fv.srv.URL,
+				AuthMethod: method,
+				MTLS:       MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
+			},
+			TokenFile: tokenFile,
+		})
+		if err != nil {
+			t.Fatalf("New(%s): %v", method, err)
+		}
+		return c
+	}
+
+	t.Run("mtls+os ignores it", func(t *testing.T) {
+		c := newClient("mtls+os")
+		err := c.AuthenticateCached(context.Background())
+		if err == nil {
+			t.Fatal("AuthenticateCached() = nil — the stale plaintext token was adopted, which mtls+os must never do")
+		}
+		// Pin WHICH step failed. Without this the subtest would still pass if
+		// the call started failing earlier for an unrelated reason, e.g. a
+		// transport fault, which would make it stop testing the skip at all.
+		if !errors.Is(err, ErrLoginRequired) {
+			t.Errorf("error = %v, want ErrLoginRequired from the certificate candidate", err)
+		}
+		if got := c.Token(); got != "" {
+			t.Errorf("Token() = %q, want empty — no token from disk may be held under mtls+os", got)
+		}
+	})
+
+	t.Run("plain mtls still reuses it", func(t *testing.T) {
+		// The scope guard: same file, same Vault, only the method differs. A
+		// gate that grew too broad shows up here as an unexpected failure.
+		c := newClient("mtls")
+		if err := c.AuthenticateCached(context.Background()); err != nil {
+			t.Fatalf("plain mtls stopped reusing its cached token: %v", err)
+		}
+		if got := c.Token(); got != "stale-from-plain-mtls" {
+			t.Errorf("Token() = %q, want the cached file token", got)
+		}
+	})
+}
+
+// TestAuthenticateCached_MTLSOSHonoursEnvToken pins the exemption to the
+// no-token-at-rest rule, which pre-push review found asserted in three doc
+// surfaces and tested in none.
+//
+// DOTVAULT_TOKEN is caller-supplied and, being an environment value, is never
+// at rest — so mtls+os has no reason to refuse it, and a consumer that
+// provisions a token out of band must keep working. This is the behaviour a
+// future over-broad tightening of "no token at rest" would silently break,
+// including for the Python bindings, whose only auth entry point this is.
+func TestAuthenticateCached_MTLSOSHonoursEnvToken(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "supplied-by-caller")
+	fv := newFakeVault(t)
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token")
+
+	c, err := New(&Config{
+		Vault: VaultConfig{
+			Address:    fv.srv.URL,
+			AuthMethod: "mtls+os",
+			MTLS:       MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
+		},
+		TokenFile: tokenFile,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v — mtls+os must still honour DOTVAULT_TOKEN", err)
+	}
+	if got := c.Token(); got != "supplied-by-caller" {
+		t.Errorf("Token() = %q, want the env-supplied token", got)
+	}
+}

@@ -15,9 +15,15 @@ const tpmSuffix = "+tpm"
 // so the login dispatch can still route "mtls+os" to the same cert flow as its
 // "mtls" base.
 //
-// It does not seal the token file, because it does not write one at all — see
-// PersistTokenAtRest.
+// It does not seal the token file, because on "mtls+os" it does not write one
+// at all — see PersistTokenAtRest.
 const osSuffix = "+os"
+
+// methodMTLSOS is the one auth method that keeps no Vault token at rest. It is
+// named rather than composed from osSuffix because the no-persist behaviour is
+// specific to this method, not to the suffix — see PersistTokenAtRest.
+// Unexported: callers ask the predicate, not the constant.
+const methodMTLSOS = "mtls" + osSuffix
 
 // modifierSuffixes are the trailing modifiers BaseMethod strips to recover the
 // underlying auth flow. Order is irrelevant — a method carries at most one.
@@ -34,7 +40,18 @@ func SealTokenAtRest(method string) bool {
 }
 
 // PersistTokenAtRest reports whether the operational Vault token may be cached
-// on disk at all. It is false for "+os" and true for every other method.
+// on disk at all. It is false for exactly one method — "mtls+os" — and true for
+// every other, including any other base wearing the "+os" suffix.
+//
+// The literal comparison is deliberate. The suffix parses on any base for
+// uniformity (BaseMethod strips it), but nothing else about "+os" is
+// implemented off "mtls": there is no auth_method allowlist, so a config naming
+// "oidc+os" loads and routes to authenticateOIDC, which writes the token file
+// unconditionally and never consults this predicate. Keying off the bare suffix
+// would make this function claim no-persist for a flow that then persists
+// anyway — a guarantee stated but not enforced, which is worse than not
+// claiming it. This godoc is the canonical statement of that reasoning; other
+// sites applying the gate should point here rather than restate it.
 //
 // The point of "mtls+os" is that the credential lives inside the OS-native
 // certificate store and never leaves it: the CNG key is generated
@@ -59,7 +76,7 @@ func SealTokenAtRest(method string) bool {
 // answer under this method — see the call sites in cmd/dotvault and
 // client.AuthenticateCached.
 func PersistTokenAtRest(method string) bool {
-	return !strings.HasSuffix(method, osSuffix)
+	return method != methodMTLSOS
 }
 
 // BaseMethod strips a modifier suffix ("+tpm" or "+os"), returning the

@@ -1150,7 +1150,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from the peer socket")
-			if !waitForHeadlessToken(ctx, vc, tokenPath, borrowSockets) {
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrowSockets) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -1188,8 +1188,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// full re-auth. In web mode register a callback that clears the
 	// in-memory token, invalidating any browser session sitting on a
 	// stale "logged-in" view.
+	//
+	// Under a no-persist method the path is deliberately NOT wired, so the
+	// manager never reads the file (see auth.PersistTokenAtRest). Removing the
+	// file at login would otherwise be undone at runtime: a file appearing
+	// afterwards — restored from a backup, written by an older build, or
+	// dropped by anything running as this user — would be adopted on the next
+	// recovery, and ahead of the certificate hook that is the correct source
+	// of a replacement token for this method.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
-	lm.SetTokenFilePath(tokenPath)
+	if auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+		lm.SetTokenFilePath(tokenPath)
+	}
 	lm.SetTokenSockets(borrowSockets)
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
@@ -1300,11 +1310,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// that blocks until shutdown. Creation and update events trigger a
 	// reload; deletes are ignored so the daemon keeps using its current
 	// token until a new one is written.
+	//
+	// Skipped entirely under a no-persist method: there is no file to watch,
+	// and waking the manager on one appearing is precisely the behaviour the
+	// unwired path above exists to prevent.
 	onTokenChange := func() {
 		slog.Debug("vault token file changed, re-reading")
 		lm.Reload()
 	}
-	if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
+	if !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+		slog.Debug("token-file watcher not started; this auth method keeps no token at rest", "auth_method", cfg.Vault.AuthMethod)
+	} else if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
 		slog.Warn("token-file watcher unavailable; relying on periodic re-read", "error", err)
 	} else {
 		onTokenChange() // reconcile a token that appeared during startup
@@ -2845,10 +2861,23 @@ func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
+// headlessTokenPath returns the token path waitForHeadlessToken should watch,
+// or "" under an auth method that keeps no token at rest — the headless idle
+// must not adopt a file that method has undertaken never to use.
+func headlessTokenPath(method, tokenPath string) string {
+	if !auth.PersistTokenAtRest(method) {
+		return ""
+	}
+	return tokenPath
+}
+
 // waitForHeadlessToken blocks until a usable Vault token becomes available —
 // either written to tokenPath (by an external facility such as a login profile
 // running `dotvault login`) or borrowable from a peer dotvault over one of
-// socketPaths (an empty list disables the borrow) — or ctx is cancelled.
+// socketPaths (an empty list disables the borrow) — or ctx is cancelled. An
+// empty tokenPath likewise disables the file half, which is how a no-persist
+// auth method (auth.PersistTokenAtRest) idles on the socket alone rather than
+// adopting a file it has just guaranteed will not be used.
 // Returns true once a candidate validates against Vault and is set on vc;
 // false if ctx is cancelled first. The watches are registered synchronously
 // before the first read so a token written, or a socket created, during
@@ -2873,7 +2902,11 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 		}
 	}
 
-	if tw, err := tokenwatch.New(tokenPath, notify); err != nil {
+	if tokenPath == "" {
+		// No-persist method: nothing to watch, and filepath.Dir("") would
+		// otherwise put an inotify watch on the working directory.
+		slog.Debug("token-file watch skipped; this auth method keeps no token at rest")
+	} else if tw, err := tokenwatch.New(tokenPath, notify); err != nil {
 		slog.Warn("token-file watcher unavailable; polling for a token instead", "error", err)
 	} else {
 		go func() {
@@ -2935,6 +2968,9 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 
 	var lastReadErrMsg string
 	tryPromote := func() bool {
+		if tokenPath == "" {
+			return false // no-persist method; the socket borrow answers instead
+		}
 		fileToken, readErr := auth.ReadTokenFile(tokenPath)
 		if readErr != nil {
 			// ReadTokenFile returns ("", nil) for a missing file, so a

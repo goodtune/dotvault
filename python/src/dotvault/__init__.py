@@ -144,8 +144,14 @@ class Client:
     def authenticate_cached(self, timeout: float | None = None) -> None:
         """Resolve and validate a cached token; never prompts.
 
-        Resolves ``DOTVAULT_TOKEN`` then the configured token file and validates
-        it against Vault. Returns ``None`` on success.
+        Resolves ``DOTVAULT_TOKEN``, then the configured token file, then a
+        borrow from the ``vault.token_socket`` peer, then this host's client
+        certificate under an ``mtls*`` auth method, and validates the result
+        against Vault. Returns ``None`` on success.
+
+        Under ``mtls+os`` the token file is skipped: that method keeps no Vault
+        token at rest, so a file found there is a leftover from a previous auth
+        method and must not be used.
 
         Raises:
             LoginRequired: No usable cached token.

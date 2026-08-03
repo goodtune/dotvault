@@ -55,7 +55,7 @@ If your deployment can't guarantee same-user, pass `client.WithIdentity("<name>"
 | Method | Behaviour | Use when |
 | --- | --- | --- |
 | `Authenticate(ctx)` | `DOTVAULT_TOKEN` → token file → interactive login. Short-circuits with `ErrUnreachable` (no prompt) if Vault is down. | Normal startup where a human is present. |
-| `AuthenticateCached(ctx)` | env → token file → local API socket → peer socket borrow (if `TokenSocket` is set) → this host's client certificate (if the auth method is `mtls*`). Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
+| `AuthenticateCached(ctx)` | env → token file (skipped under `mtls+os`) → local API socket → peer socket borrow (if `TokenSocket` is set) → this host's client certificate (if the auth method is `mtls*`). Never prompts. `ErrLoginRequired` if no usable token. | Side-effect-free preflight (`doctor`), non-interactive / CI callers. |
 | `Login(ctx)` | Unconditional fresh login (ignores cached token). Equivalent to `dotvault login`. | Forcing re-auth. |
 
 > **`Authenticate` and `Login` are interactive.** They can open a browser (OIDC) or block reading a password and MFA code from the terminal (LDAP). That is surprising inside a library call: **do not call them from a non-interactive service or daemon.** In those contexts use `AuthenticateCached` and surface `ErrLoginRequired` to the operator, or arrange for a token to be present some other way. LDAP `Login` without a TTY returns an error wrapping `ErrAuthFailed` rather than hanging.
@@ -69,6 +69,10 @@ If either socket field is set, `AuthenticateCached` borrows a live token from a 
 When the operator has configured a certificate auth method (`mtls`, `mtls+tpm`, `mtls+os`), `AuthenticateCached` can present the certificate this host already holds — after `DOTVAULT_TOKEN`, the token file, and the peer socket have all come up empty. Presenting an existing certificate involves no browser, no terminal, and no user, so it stays inside the never-prompt contract. In practice this is what makes certificate auth usable from a library at all: without it a consumer on a cert-auth host whose daemon is stopped, or whose cached token has expired, would get `ErrLoginRequired` while the credential that fixes it sat on the same disk.
 
 It is tried **last** deliberately — a cached token is always preferred, because a certificate login is a Vault round trip plus (for `mtls+tpm` / `mtls+os`) a hardware key operation, and it mints a new token where reusing one costs nothing.
+
+Under `mtls+os` specifically, the **token file is not a candidate at all**: that method keeps no Vault token at rest, so a file found there is a leftover from a previous method. The daemon removes it on its next successful login, but a library consumer cannot rely on that ever happening — the daemon may be stopped, or your process may be the only dotvault on the host — so reading it would leave a plaintext token silently in use for the rest of its TTL. The certificate answers instead. `DOTVAULT_TOKEN` is unaffected; an environment value is caller-supplied and never at rest.
+
+`mtls+os` is **Windows-only**. On Linux or macOS the certificate candidate cannot succeed either — the OS-store backend is unavailable there — so a consumer on such a host gets `ErrLoginRequired` with `securestore: backend not supported on this platform` in the error chain. That combination means the deployment is misconfigured rather than unenrolled: the dotvault daemon on the same host cannot log in either. Use `mtls` there, or supply a token via `DOTVAULT_TOKEN` or the peer socket, both of which still work.
 
 The minted token is held **in memory only** and is never written to the token file. That file belongs to the daemon, and a library inside somebody else's process must not race it — the same ownership rule the peer-socket borrow follows.
 

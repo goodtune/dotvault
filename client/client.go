@@ -229,13 +229,21 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	// but unreadable) is treated as no candidate, matching ResolveToken's own
 	// best-effort handling.
 	cachedRejected := false
-	// Under mtls+os no token is written at rest, so this read simply comes up
-	// empty and the certificate candidate below answers instead. Left
-	// unconditional rather than branching on the method: an empty read costs
-	// nothing, and a host that still has a stale file from a previous method
-	// should not have it silently used — the daemon removes it at its next
-	// login, and until then Vault itself rejects it if it has expired.
-	fileToken, _ := auth.ReadTokenFile(c.cfg.TokenFile)
+	// Under mtls+os the token file is not a candidate at all — the same gate
+	// Manager.Authenticate and the daemon's startup reuse check apply. A
+	// library consumer cannot rely on the daemon having removed a leftover
+	// file: it is removed on the daemon's next successful login, which may
+	// never happen in this process's lifetime (the daemon may be stopped, or
+	// this may be the only dotvault on the host). Reading it anyway would let
+	// a token from a previous method stay silently in use for the rest of its
+	// TTL — precisely the credential this method exists to eliminate. The
+	// certificate candidate below answers instead, which is what the method
+	// intends. DOTVAULT_TOKEN is unaffected: it is caller-supplied and
+	// explicitly never at rest.
+	var fileToken string
+	if auth.PersistTokenAtRest(c.cfg.Vault.AuthMethod) {
+		fileToken, _ = auth.ReadTokenFile(c.cfg.TokenFile)
+	}
 	seen := map[string]bool{}
 	for _, cand := range []string{auth.ReadTokenEnv(), fileToken} {
 		if cand == "" || seen[cand] {

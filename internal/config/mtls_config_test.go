@@ -54,19 +54,31 @@ func TestMTLSValidateRequiresCertRole(t *testing.T) {
 	}
 }
 
-func TestMTLSValidateRequiresPKIRoleUnlessBYO(t *testing.T) {
+func TestMTLSValidateRequiresPKIRole(t *testing.T) {
 	c := baseConfigWithMTLS("mtls", MTLSConfig{CertRole: "dv"})
 	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "pki_role") {
 		t.Errorf("want pki_role error, got %v", err)
 	}
 
-	// With a BYO cert, pki_role is not required.
+	// BYO also requires pki_role: it only skips the first cert's bootstrap, but
+	// steady-state rotation still runs pki/sign/<role>, so a role-less BYO config
+	// cannot rotate and would expire unattended.
 	c = baseConfigWithMTLS("mtls", MTLSConfig{
 		CertRole: "dv",
 		BYO:      MTLSBYO{Cert: "/c.pem", Key: "/k.pem"},
 	})
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "pki_role") {
+		t.Errorf("byo config must still require pki_role for rotation, got %v", err)
+	}
+
+	// With both a BYO cert and a pki_role, the config validates.
+	c = baseConfigWithMTLS("mtls", MTLSConfig{
+		CertRole: "dv",
+		PKIRole:  "dv-client",
+		BYO:      MTLSBYO{Cert: "/c.pem", Key: "/k.pem"},
+	})
 	if err := c.validate(); err != nil {
-		t.Errorf("byo config should validate without pki_role: %v", err)
+		t.Errorf("byo config with pki_role should validate: %v", err)
 	}
 }
 

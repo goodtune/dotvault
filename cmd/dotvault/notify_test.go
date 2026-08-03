@@ -126,6 +126,12 @@ func TestRunNotify_PrefersPeerSocket(t *testing.T) {
 }
 
 func TestRunNotify_ActionURLFlagReachesPeer(t *testing.T) {
+	// This test sets flagConfig directly (it needs the --action-url flag on the
+	// cmd, which runNotifyWith does not expose), so it must repeat the
+	// system-config override runNotifyWith applies: without it, a developer
+	// machine with a system config installed refuses --config, config load fails,
+	// and the peer sees an empty action_url.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	sock := filepath.Join(t.TempDir(), "p.sock")
 	var peerActionURL string
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {

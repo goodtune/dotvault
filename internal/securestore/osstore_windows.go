@@ -248,10 +248,23 @@ func (s *osStorage) StoreCert(handle []byte, certPEM string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Record the leaf thumbprint before installing, not after. certtostore's
+	// Store adds the leaf to CurrentUser\My first and the issuer to the CA store
+	// second; the second add can fail after the leaf already exists. Making the
+	// install self-transactional — remove the leaf on any Store error (a no-op if
+	// it was never added) — means a partial failure leaves nothing behind, so the
+	// caller's RollbackCert never has to clean an orphaned leaf it has no
+	// thumbprint for. Without this, every failed rotation left another
+	// simultaneously valid client certificate in the store for a browser to offer.
+	thumbprint := certSHA1Thumbprint(leaf.Raw)
 	if err := s.certStore.Store(leaf, intermediate); err != nil {
+		if delErr := deleteUserCertByThumbprint(thumbprint); delErr != nil {
+			slog.Warn("could not remove a partially-installed leaf after a failed certificate store",
+				"thumbprint", thumbprint, "error", delErr)
+		}
 		return nil, fmt.Errorf("store certificate in OS certificate store: %w", err)
 	}
-	h.Thumbprint = certSHA1Thumbprint(leaf.Raw)
+	h.Thumbprint = thumbprint
 	return encodeOSHandle(h)
 }
 

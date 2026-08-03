@@ -50,7 +50,7 @@ vault:
     cert_mount: cert             # Vault cert auth mount (default "cert")
     cert_role: dotvault          # cert auth role name (required)
     pki_mount: pki               # PKI secrets engine mount (default "pki")
-    pki_role: dotvault-client    # PKI role (required unless BYO)
+    pki_role: dotvault-client    # PKI role (required; rotates the cert, BYO included)
     key_type: ec                 # ec (P-256) | rsa; mtls+tpm is ec-only
     key_bits: 0                  # RSA modulus: 2048 | 3072 | 4096 | 8192; 0 = 2048. rsa only
     common_name: "{{.user}}"     # Go template over {{.user}} (the OS username)

@@ -495,7 +495,9 @@ type MTLSConfig struct {
 	CertRole string `yaml:"cert_role"`
 	// PKIMount is the PKI secrets engine used to issue/sign. Default "pki".
 	PKIMount string `yaml:"pki_mount"`
-	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
+	// PKIRole is the PKI role. Always required: it signs both the bootstrap cert
+	// and every rotation (pki/sign/<role>), including for BYO, which only skips
+	// the first cert's issuance.
 	PKIRole string `yaml:"pki_role"`
 	// KeyType is "ec" (P-256) or "rsa". Default "ec". The mtls+tpm backend
 	// supports "ec" only; mtls/mtls+os accept both.
@@ -985,9 +987,15 @@ func (c *Config) validateMTLS() error {
 	if method == "mtls+os" && m.BYO.Cert != "" {
 		return fmt.Errorf("vault.mtls.byo is not supported with auth_method mtls+os (the OS-native store cannot import an external key); use auth_method mtls for bring-your-own")
 	}
-	// PKI role is required whenever issuance might run (i.e. no BYO cert).
-	if m.BYO.Cert == "" && m.PKIRole == "" {
-		return fmt.Errorf("vault.mtls.pki_role is required unless a BYO certificate is supplied")
+	// PKI role is required whenever issuance can run — which is always, BYO
+	// included. BYO only skips the *first* certificate's bootstrap; steady-state
+	// rotation still runs pki/sign/<role> once the cert enters the reissue window
+	// (ReissueIfDue/reissue make no BYO exception, and reissue_before is always
+	// positive), and key_bits sizes the key that rotation generates. A BYO config
+	// without a role would therefore fail every rotation and expire unattended, so
+	// require it up front rather than trapping the operator at cert expiry.
+	if m.PKIRole == "" {
+		return fmt.Errorf("vault.mtls.pki_role is required (it rotates the certificate before expiry, including for BYO seeding)")
 	}
 
 	if m.ReissueBefore == "" {

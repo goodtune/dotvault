@@ -81,6 +81,7 @@ type fakeVault struct {
 	loginCount         int
 	signCount          int
 	leafTTL            time.Duration
+	failLogin          bool // when set, /v1/auth/cert/login returns 500
 	tokenCreateCount   int
 	tokenCreateSawCert bool
 	// signTokens records the X-Vault-Token presented on each PKI sign call, so
@@ -93,6 +94,10 @@ func (f *fakeVault) handler() http.Handler {
 	mux.HandleFunc("/v1/auth/cert/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 			http.Error(w, "no client certificate", http.StatusBadRequest)
+			return
+		}
+		if f.failLogin {
+			http.Error(w, "cert auth rejected", http.StatusInternalServerError)
 			return
 		}
 		f.loginCount++
@@ -233,6 +238,77 @@ func TestMTLSByoSeedAndLogin(t *testing.T) {
 	if cred.Identity != "alice" || cred.Backend != "file" {
 		t.Errorf("unexpected credential: %+v", cred)
 	}
+}
+
+// writeBYO produces a valid BYO cert+key on disk and returns their paths.
+func writeBYO(t *testing.T, ca *testCA, dir string) (certPath, keyPath string) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
+	certPath = filepath.Join(dir, "byo.crt")
+	keyPath = filepath.Join(dir, "byo.key")
+	os.WriteFile(certPath, []byte(leaf), 0o600)
+	os.WriteFile(keyPath, []byte(newPEMKey(t, key)), 0o600)
+	return certPath, keyPath
+}
+
+// TestMTLSSeedLoginFailureDoesNotClobberEnvelope pins the P1 fix: the new
+// credential must not become authoritative until the replacement cert login
+// succeeds. Before the fix, saveCredential overwrote credential.json before the
+// login was known to work, so a failed login left the on-disk envelope pointing
+// at a credential the store had just rolled back — stranding the next restart or
+// unattended recovery. Reload credential.json on the failure path and assert it
+// still reflects the previous state.
+func TestMTLSSeedLoginFailureDoesNotClobberEnvelope(t *testing.T) {
+	ca := newTestCA(t)
+
+	t.Run("first enrolment leaves no envelope", func(t *testing.T) {
+		f := &fakeVault{ca: ca, failLogin: true}
+		srv := newFakeVaultServer(t, f)
+		dir := t.TempDir()
+		certPath, keyPath := writeBYO(t, ca, dir)
+
+		m := mtlsManager(t, srv, dir)
+		m.MTLS.BYOCert = certPath
+		m.MTLS.BYOKey = keyPath
+
+		if err := m.authenticateMTLS(t.Context()); err == nil {
+			t.Fatal("expected authenticateMTLS to fail when the cert login is rejected")
+		}
+		// No prior credential existed, so a failed login must not write one.
+		if _, err := os.Stat(filepath.Join(dir, "credential.json")); !os.IsNotExist(err) {
+			cred, _ := loadCredential(dir)
+			t.Fatalf("credential.json must not exist after a failed first enrolment; got %+v (stat err %v)", cred, err)
+		}
+	})
+
+	t.Run("re-seed keeps the previous envelope", func(t *testing.T) {
+		f := &fakeVault{ca: ca, failLogin: true}
+		srv := newFakeVaultServer(t, f)
+		dir := t.TempDir()
+		// An expired credential is present: startup reuse fails (expiry check,
+		// no login attempt), so the flow falls through to a BYO re-seed whose
+		// cert login then fails.
+		seedCredentialFile(t, ca, dir, time.Now().Add(-time.Hour))
+		certPath, keyPath := writeBYO(t, ca, dir)
+
+		m := mtlsManager(t, srv, dir)
+		m.MTLS.BYOCert = certPath
+		m.MTLS.BYOKey = keyPath
+
+		if err := m.authenticateMTLS(t.Context()); err == nil {
+			t.Fatal("expected authenticateMTLS to fail when the re-seed cert login is rejected")
+		}
+		// The envelope must still be the previous one, not the abandoned BYO
+		// re-seed. seedCredentialFile stamps serial "old-serial".
+		cred, err := loadCredential(dir)
+		if err != nil || cred == nil {
+			t.Fatalf("previous credential must survive a failed re-seed: %v", err)
+		}
+		if cred.Serial != "old-serial" {
+			t.Errorf("envelope serial = %q, want the preserved old-serial (a failed re-seed must not clobber it)", cred.Serial)
+		}
+	})
 }
 
 // TestMTLSDownscopePresentsClientCert covers the cert-auth downscope path: when

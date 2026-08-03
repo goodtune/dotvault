@@ -102,11 +102,18 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 			rollbackCertRotation(store, newCred.Handle)
 		}
 	}()
-	if err := saveCredential(p.StorageDir, newCred); err != nil {
-		return fmt.Errorf("persist mtls credential: %w", err)
-	}
+	// Log in before persisting: certLogin consumes only the in-memory cert and
+	// signer, so proving the replacement works first means a failed login never
+	// makes the new envelope authoritative. On a first enrolment credential.json
+	// is simply never written; on a re-seed the previous envelope survives
+	// untouched — either way the deferred rollback discards the abandoned
+	// replacement and no reader is left pointing at a credential the store no
+	// longer holds.
 	if err := m.certLogin(ctx, newCred, signer); err != nil {
 		return err
+	}
+	if err := saveCredential(p.StorageDir, newCred); err != nil {
+		return fmt.Errorf("persist mtls credential: %w", err)
 	}
 	committed = true
 	// Retire whatever this replaced. cred is nil on a first enrolment and
@@ -295,11 +302,15 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	// StoreCert may re-key the handle (the OS backend records the installed
 	// leaf), so roll back whatever the credential now carries.
 	newHandle = newCred.Handle
-	if err := saveCredential(m.MTLS.StorageDir, newCred); err != nil {
-		return fmt.Errorf("persist rotated credential: %w", err)
-	}
+	// Log in before persisting: certLogin consumes only the in-memory cert and
+	// signer, so a failed login leaves the old envelope authoritative (the
+	// deferred rollback discards the replacement's container and leaf) rather
+	// than stranding credential.json on a credential that was just rolled back.
 	if err := m.certLogin(ctx, newCred, signer); err != nil {
 		return err
+	}
+	if err := saveCredential(m.MTLS.StorageDir, newCred); err != nil {
+		return fmt.Errorf("persist rotated credential: %w", err)
 	}
 	// Persisted and operational: the replacement is now authoritative, so the
 	// superseded container and leaf can go.

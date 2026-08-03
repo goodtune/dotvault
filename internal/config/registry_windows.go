@@ -764,6 +764,8 @@ func readSingleAgentKey(root registry.Key, path string) (AgentKeySource, error) 
 	src.Mount, _ = readRegString(key, "Mount")
 	src.Role, _ = readRegString(key, "Role")
 	src.TTL, _ = readRegString(key, "TTL")
+	src.Socket, _ = readRegString(key, "Socket")
+	src.Pipe, _ = readRegString(key, "Pipe")
 	if v := readRegDWORD(key, "EphemeralKey"); v != nil {
 		src.EphemeralKey = *v != 0
 	}

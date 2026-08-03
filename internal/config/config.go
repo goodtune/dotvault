@@ -356,11 +356,11 @@ func (w AgentWindowsConfig) PuttyEnabled() bool {
 	return w.Putty == nil || *w.Putty
 }
 
-// AgentKeySource is one ordered origin of signing identities: either raw keys
-// discovered under a KV path prefix, or short-lived certificates minted by a
-// Vault SSH CA.
+// AgentKeySource is one ordered origin of signing identities: raw keys
+// discovered under a KV path prefix, short-lived certificates minted by a
+// Vault SSH CA, or an upstream SSH agent the requests are delegated to.
 type AgentKeySource struct {
-	// Source selects the engine: "kv" or "vault-ca".
+	// Source selects the engine: "kv", "vault-ca", or "agent".
 	Source string `yaml:"source"`
 
 	// PathPrefix (kv) is resolved under kv/data/{user_prefix}{you}/; every
@@ -376,6 +376,20 @@ type AgentKeySource struct {
 	Principals   []string `yaml:"principals,omitempty"`
 	TTL          string   `yaml:"ttl,omitempty"`
 	EphemeralKey bool     `yaml:"ephemeral_key,omitempty"`
+
+	// Socket, Pipe (agent) point at an upstream SSH agent dotvault delegates
+	// List/Sign to — so a user can keep using legacy on-disk keys held by
+	// their own ssh-agent (or Pageant) alongside dotvault's Vault-backed keys.
+	// dotvault never stores or reads the upstream's key material; it forwards
+	// the agent protocol. Socket is the Unix domain socket path, Pipe the
+	// Windows named pipe; both accept {{.username}} and {{.uid}} template
+	// variables. Empty resolves to a platform default: on Windows always
+	// \\.\pipe\openssh-ssh-agent; on Unix $XDG_RUNTIME_DIR/ssh-agent.socket
+	// when XDG_RUNTIME_DIR is set (Linux), but where it is unset (macOS) an
+	// empty Socket is an error and must be set explicitly. At most one "agent"
+	// source may be configured.
+	Socket string `yaml:"socket,omitempty"`
+	Pipe   string `yaml:"pipe,omitempty"`
 }
 
 // Rule defines a single sync rule.
@@ -758,6 +772,7 @@ func (c *Config) validate() error {
 		if len(c.Agent.Keys) == 0 {
 			return fmt.Errorf("agent.keys: at least one key source is required when the agent is enabled")
 		}
+		agentSources := 0
 		for i, k := range c.Agent.Keys {
 			switch k.Source {
 			case "kv":
@@ -778,10 +793,19 @@ func (c *Config) validate() error {
 						return fmt.Errorf("agent.keys[%d].ttl %q: must be positive", i, k.TTL)
 					}
 				}
+			case "agent":
+				// socket/pipe are optional (empty = platform default). Only one
+				// upstream-agent source is permitted: an agent advertises all of
+				// its identities with no path scoping, so a second one would
+				// fan out redundantly and make Sign routing ambiguous.
+				agentSources++
+				if agentSources > 1 {
+					return fmt.Errorf("agent.keys[%d]: only one %q source may be configured", i, k.Source)
+				}
 			case "":
-				return fmt.Errorf("agent.keys[%d]: source is required (kv or vault-ca)", i)
+				return fmt.Errorf("agent.keys[%d]: source is required (kv, vault-ca, or agent)", i)
 			default:
-				return fmt.Errorf("agent.keys[%d]: invalid source %q (must be kv or vault-ca)", i, k.Source)
+				return fmt.Errorf("agent.keys[%d]: invalid source %q (must be kv, vault-ca, or agent)", i, k.Source)
 			}
 		}
 	}

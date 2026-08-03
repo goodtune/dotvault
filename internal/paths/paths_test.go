@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 )
 
@@ -157,4 +158,23 @@ func testHomeDir(t *testing.T) string {
 		t.Fatalf("cannot get home dir: %v", err)
 	}
 	return home
+}
+
+// TestUIDUnixUsesGetuid confirms that on Unix UID() returns the real numeric
+// UID from the syscall — not a value derived from os/user, which can fail in a
+// CGO-disabled container with no /etc/passwd entry for the running UID.
+func TestUIDUnixUsesGetuid(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix UID semantics")
+	}
+	got, err := UID()
+	if err != nil {
+		t.Fatalf("UID: %v", err)
+	}
+	if want := strconv.Itoa(os.Getuid()); got != want {
+		t.Errorf("UID() = %q, want %q (os.Getuid)", got, want)
+	}
+	if got == "" {
+		t.Errorf("UID() must not be empty on Unix")
+	}
 }

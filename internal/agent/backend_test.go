@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -97,6 +99,32 @@ func TestBackendSignUnknownKey(t *testing.T) {
 	b := NewBackend([]Source{srcA})
 	if _, err := b.Sign(pubOther, []byte("x")); !errors.Is(err, ErrKeyNotFound) {
 		t.Errorf("want ErrKeyNotFound, got %v", err)
+	}
+}
+
+// TestBackendSignSkipsUnreachableUpstream guards the ordering hazard: an
+// unreachable upstream-agent source placed BEFORE the owning source must not
+// block the sign. The upstream source reports the dial failure as an error
+// (it can't reach the agent), and Backend.SignWithFlags skips any source that
+// errors and tries the rest, so a key owned by a later kv/vault-ca source
+// still signs even when the user's personal agent is down.
+func TestBackendSignSkipsUnreachableUpstream(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	down := &upstreamSource{
+		name:     "agent",
+		endpoint: "/down.sock",
+		dial:     func(context.Context) (net.Conn, error) { return nil, errors.New("upstream down") },
+	}
+	owner := &fakeSource{name: "kv", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+	b := NewBackend([]Source{down, owner}) // upstream first, owner second
+
+	data := []byte("challenge")
+	sig, err := b.Sign(pubA, data)
+	if err != nil {
+		t.Fatalf("Sign should fall through the unreachable upstream to the owner: %v", err)
+	}
+	if err := pubA.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify against pubA: %v", err)
 	}
 }
 

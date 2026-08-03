@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -82,6 +83,39 @@ func DefaultAgentSocket() string {
 		return filepath.Join(rt, "dotvault", "agent.sock")
 	}
 	return filepath.Join(CacheDir(), "agent.sock")
+}
+
+// DefaultUpstreamAgentSocket returns the per-user Unix domain socket path used
+// when an `agent` key source leaves its socket unset: the systemd user
+// ssh-agent convention $XDG_RUNTIME_DIR/ssh-agent.socket, keeping the default
+// in the same XDG runtime directory dotvault's own agent socket lives in.
+// Returns "" when XDG_RUNTIME_DIR is unset (typical on macOS), so the caller
+// can require an explicit path there rather than resolving a bare relative
+// name.
+func DefaultUpstreamAgentSocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "ssh-agent.socket")
+	}
+	return ""
+}
+
+// UID returns the current user's numeric UID as a string (the account SID on
+// Windows), for substitution into agent-endpoint templates. On Unix it uses the
+// os.Getuid() syscall rather than os/user.Current(): the latter's pure-Go
+// (CGO-disabled — dotvault's build) implementation reads /etc/passwd and errors
+// when the running UID has no entry there, which is common in containers /
+// distroless images; that would blank a {{.uid}} template and yield a bad path
+// like "/run/user//ssh-agent.socket". The syscall always succeeds. Only Windows
+// (where os.Getuid returns -1) falls back to os/user for the SID.
+func UID() (string, error) {
+	if runtime.GOOS != "windows" {
+		return strconv.Itoa(os.Getuid()), nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("get current user: %w", err)
+	}
+	return u.Uid, nil
 }
 
 // Username returns the current OS username with any domain prefix stripped.

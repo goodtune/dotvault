@@ -469,6 +469,8 @@ func TestReadRegistryAgentKeysOrdered(t *testing.T) {
 	k0.SetStringValue("Mount", "ssh-client-signer")
 	k0.SetStringValue("Role", "dotvault-user")
 	k0.SetStringValue("TTL", "15m")
+	k0.SetStringValue("Socket", "/run/user/{{.uid}}/ssh-agent.socket")
+	k0.SetStringValue("Pipe", `\\.\pipe\openssh-ssh-agent`)
 	k0.SetDWordValue("EphemeralKey", 1)
 	k0.SetStringsValue("Principals", []string{"{{.vault_username}}", "ops"})
 	k0.Close()
@@ -486,10 +488,13 @@ func TestReadRegistryAgentKeysOrdered(t *testing.T) {
 			t.Errorf("keys[%d].Source = %q, want %q", i, keys[i].Source, "src"+itoaTest(i))
 		}
 	}
-	// Index 0 carries the full vault-ca field set.
+	// Index 0 carries the full vault-ca field set plus the agent Socket/Pipe.
 	if keys[0].Source != "vault-ca" || keys[0].Mount != "ssh-client-signer" ||
 		keys[0].Role != "dotvault-user" || keys[0].TTL != "15m" || !keys[0].EphemeralKey {
 		t.Errorf("keys[0] = %+v", keys[0])
+	}
+	if keys[0].Socket != "/run/user/{{.uid}}/ssh-agent.socket" || keys[0].Pipe != `\\.\pipe\openssh-ssh-agent` {
+		t.Errorf("keys[0] socket/pipe = %q / %q", keys[0].Socket, keys[0].Pipe)
 	}
 	if len(keys[0].Principals) != 2 || keys[0].Principals[0] != "{{.vault_username}}" {
 		t.Errorf("keys[0].Principals = %v", keys[0].Principals)

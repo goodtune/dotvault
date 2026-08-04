@@ -463,3 +463,64 @@ func TestMTLSOSRemovalFailureDoesNotReseed(t *testing.T) {
 		t.Errorf("client is holding token %q after a failed login", got)
 	}
 }
+
+// TestCertLoginFromStoreRemovesStaleToken pins the removal on the
+// CertLoginFromStore path, which Copilot's second-round review found unwired at
+// one call site.
+//
+// certLogin removes the stale file via m.TokenFilePath, and an EMPTY path is a
+// deliberate no-op meaning "do not persist" — so a caller that builds a Manager
+// without setting it gets a successful mtls+os cert login that leaves any
+// leftover plaintext token sitting on disk. `dotvault enrol` did exactly that:
+// it correctly declined to *use* the file, but never removed it.
+//
+// The property belongs here rather than in cmd/: this is the code that does the
+// removal, and pinning it at this level means any future caller of
+// CertLoginFromStore inherits a tested guarantee instead of an unwritten
+// convention about which fields to set.
+func TestCertLoginFromStoreRemovesStaleToken(t *testing.T) {
+	ca := newTestCA(t)
+	srv := newFakeVaultServer(t, &fakeVault{ca: ca})
+	dir := t.TempDir()
+
+	// Enrol first so a usable credential exists for CertLoginFromStore to find.
+	seed := mtlsManager(t, srv, dir)
+	seed.BootstrapLogin = func(context.Context) (string, error) { return "s.boot-token", nil }
+	if err := seed.authenticateMTLS(t.Context()); err != nil {
+		t.Fatalf("seeding login: %v", err)
+	}
+
+	t.Run("wired path removes it", func(t *testing.T) {
+		m := mtlsManager(t, srv, dir)
+		m.AuthMethod = "mtls+os"
+		if err := os.WriteFile(m.TokenFilePath, []byte("s.left-over"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.CertLoginFromStore(t.Context()); err != nil {
+			t.Fatalf("CertLoginFromStore: %v", err)
+		}
+		if _, err := os.Stat(m.TokenFilePath); !os.IsNotExist(err) {
+			t.Errorf("stale token survived CertLoginFromStore (stat err %v)", err)
+		}
+	})
+
+	t.Run("unwired path silently keeps it", func(t *testing.T) {
+		// Documents WHY the call site must set TokenFilePath: with it empty the
+		// login still succeeds, so nothing signals that the guarantee was
+		// skipped. This is the shape of the enrol bug, kept as an executable
+		// note rather than a claim in a comment.
+		tokenPath := filepath.Join(t.TempDir(), ".dotvault-token")
+		if err := os.WriteFile(tokenPath, []byte("s.left-over"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		m := mtlsManager(t, srv, dir)
+		m.AuthMethod = "mtls+os"
+		m.TokenFilePath = "" // the omission
+		if err := m.CertLoginFromStore(t.Context()); err != nil {
+			t.Fatalf("CertLoginFromStore: %v", err)
+		}
+		if _, err := os.Stat(tokenPath); err != nil {
+			t.Fatalf("precondition: the unrelated file should still exist: %v", err)
+		}
+	})
+}

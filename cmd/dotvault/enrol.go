@@ -100,12 +100,20 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 		// method where that is neither necessary nor meaningful.
 		mgr := &auth.Manager{
 			VaultClient: vc,
-			AuthMethod:  cfg.Vault.AuthMethod,
-			AuthMount:   cfg.Vault.AuthMount,
-			AuthRole:    cfg.Vault.AuthRole,
-			Policy:      vaultPolicyConstraint(cfg),
-			Username:    username,
-			MTLS:        mtlsParams(cfg, username),
+			// Wired so certLogin can REMOVE a stale file, not so it can write
+			// one: this branch runs only when PersistTokenAtRest is false, so
+			// the write arm is unreachable here. Leaving it empty made
+			// RemoveTokenFile a no-op (an empty path means "do not persist"),
+			// so `dotvault enrol` on a host with a leftover plaintext token
+			// completed a successful mtls+os cert login and left that token
+			// sitting on disk — declining to *use* it, but not removing it.
+			TokenFilePath: paths.VaultTokenPath(),
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Policy:        vaultPolicyConstraint(cfg),
+			Username:      username,
+			MTLS:          mtlsParams(cfg, username),
 		}
 		if err := mgr.CertLoginFromStore(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "dotvault: certificate login failed (%v); this host may need enrolling\n", err)

@@ -33,7 +33,10 @@ services:
         condition: service_completed_successfully
     ports:
       - "8200:8200"
-      - "8300:8300"
+      # TLS cert-auth listener, host-published only for loopback integration
+      # tests (the daemon and tests dial 127.0.0.1:8300); loopback-bound so the
+      # dev Vault TLS endpoint isn't exposed to the LAN, matching the JFrog port.
+      - "127.0.0.1:8300:8300"
     environment:
       VAULT_ADDR: "http://127.0.0.1:8200"
     cap_add:

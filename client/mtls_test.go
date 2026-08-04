@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -95,6 +96,58 @@ func TestNew_MTLSDefaultsMatchDaemon(t *testing.T) {
 	}
 	if !strings.HasSuffix(filepath.ToSlash(c.cfg.Vault.MTLS.StorageDir), "/mtls") {
 		t.Errorf("StorageDir = %q, want it to end in /mtls", c.cfg.Vault.MTLS.StorageDir)
+	}
+}
+
+// TestNew_NonCertMethodSkipsMTLSDefaults pins that New() applies no
+// certificate-login defaults for a non-certificate auth method. Beyond keeping
+// the projection honest (AuthenticateCached consults the MTLS fields only under
+// a cert method), computing the StorageDir default calls paths.CacheDir(),
+// which panics when the OS home cannot be resolved — so a plain token/oidc
+// consumer on a home-less host must not be dragged through that path. Revert the
+// method gate in withDefaults and StorageDir would be populated here, failing
+// this test.
+func TestNew_NonCertMethodSkipsMTLSDefaults(t *testing.T) {
+	for _, method := range []string{"token", "oidc", "ldap", ""} {
+		t.Run("method="+method, func(t *testing.T) {
+			c, err := New(&Config{
+				Vault: VaultConfig{Address: "http://127.0.0.1:8200", AuthMethod: method},
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if got := c.cfg.Vault.MTLS.StorageDir; got != "" {
+				t.Errorf("StorageDir = %q, want empty for a non-cert method (must not touch paths.CacheDir)", got)
+			}
+			if got := c.cfg.Vault.MTLS.CertMount; got != "" {
+				t.Errorf("CertMount = %q, want empty for a non-cert method", got)
+			}
+		})
+	}
+}
+
+// TestNew_CertMethodDoesNotPanicWithoutHome pins that even under a certificate
+// method, New() degrades rather than panicking when the OS home is
+// unresolvable: paths.CacheDir panics via mustHomeDir there, and a public
+// library must not. StorageDir resolves to "" (the cert login then fails with a
+// clear error instead of crashing New). Non-Windows only — on Windows CacheDir
+// reads LOCALAPPDATA and never consults the home directory, so there is no
+// panic path to guard.
+func TestNew_CertMethodDoesNotPanicWithoutHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("CacheDir uses LOCALAPPDATA on Windows; no mustHomeDir panic path")
+	}
+	// os.UserHomeDir errors on an empty $HOME, which is what makes mustHomeDir
+	// panic; the recover in defaultMTLSStorageDir must swallow it.
+	t.Setenv("HOME", "")
+	c, err := New(&Config{
+		Vault: VaultConfig{Address: "http://127.0.0.1:8200", AuthMethod: "mtls", MTLS: MTLSConfig{CertRole: "dotvault"}},
+	})
+	if err != nil {
+		t.Fatalf("New must not fail without a home dir: %v", err)
+	}
+	if got := c.cfg.Vault.MTLS.StorageDir; got != "" {
+		t.Errorf("StorageDir = %q, want empty when the home dir is unresolvable", got)
 	}
 }
 

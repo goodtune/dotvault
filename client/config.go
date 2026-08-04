@@ -277,15 +277,38 @@ func (c *Config) withDefaults() Config {
 	if out.TokenFile == "" {
 		out.TokenFile = DefaultTokenFile()
 	}
-	// Certificate-login defaults must match the daemon's exactly, or the
-	// facade would look for the credential envelope somewhere the daemon
-	// never wrote it. Mirrors mtlsParams in cmd/dotvault and DefaultCertMount
-	// in internal/config.
-	if out.Vault.MTLS.CertMount == "" {
-		out.Vault.MTLS.CertMount = config.DefaultCertMount
-	}
-	if out.Vault.MTLS.StorageDir == "" {
-		out.Vault.MTLS.StorageDir = filepath.Join(paths.CacheDir(), "mtls")
+	// Certificate-login defaults are applied only under a certificate auth
+	// method, and must then match the daemon's exactly or the facade would look
+	// for the credential envelope somewhere the daemon never wrote it. Gating on
+	// the method matters beyond tidiness: defaulting StorageDir unconditionally
+	// would pull paths.CacheDir() — which panics via mustHomeDir when the OS home
+	// cannot be resolved — into New() for *every* caller, so a plain token/oidc
+	// consumer on a home-less host (a minimal container) would panic. The MTLS
+	// fields are consumed only when config.IsMTLSMethod is true (see
+	// AuthenticateCached), so non-cert methods need no defaults. Mirrors
+	// mtlsParams in cmd/dotvault and DefaultCertMount in internal/config.
+	if config.IsMTLSMethod(out.Vault.AuthMethod) {
+		if out.Vault.MTLS.CertMount == "" {
+			out.Vault.MTLS.CertMount = config.DefaultCertMount
+		}
+		if out.Vault.MTLS.StorageDir == "" {
+			out.Vault.MTLS.StorageDir = defaultMTLSStorageDir()
+		}
 	}
 	return out
+}
+
+// defaultMTLSStorageDir is {cache_dir}/mtls, matching the daemon, or "" when the
+// OS home directory cannot be resolved. paths.CacheDir panics (via mustHomeDir)
+// in that case — acceptable inside the daemon, but a public library must not
+// panic on a recoverable environment condition, so we guard it exactly as
+// DefaultTokenFile does. A cert-auth consumer on such a host then fails its
+// certificate login with a clear error rather than crashing New().
+func defaultMTLSStorageDir() (dir string) {
+	defer func() {
+		if recover() != nil {
+			dir = ""
+		}
+	}()
+	return filepath.Join(paths.CacheDir(), "mtls")
 }

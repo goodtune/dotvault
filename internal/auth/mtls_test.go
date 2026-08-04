@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -309,6 +310,34 @@ func TestMTLSSeedLoginFailureDoesNotClobberEnvelope(t *testing.T) {
 			t.Errorf("envelope serial = %q, want the preserved old-serial (a failed re-seed must not clobber it)", cred.Serial)
 		}
 	})
+}
+
+// TestCertLoginFromStore_EmptyStorageDirIgnoresCwd pins that an empty
+// StorageDir is treated as "no credential" and never probes a cwd-relative
+// "credential.json". The client facade yields an empty StorageDir on a
+// home-less host (defaultMTLSStorageDir → ""); without the guard, loadCredential
+// would read whatever ./credential.json sits in the working directory and
+// authenticate as it — the same cwd-relative hazard DefaultTokenFile avoids.
+// Chdir into a temp dir holding a valid envelope and assert the login is
+// refused, not performed.
+func TestCertLoginFromStore_EmptyStorageDirIgnoresCwd(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(60*24*time.Hour)) // writes dir/credential.json
+	t.Chdir(dir)                                                    // so "" would resolve to ./credential.json
+
+	m := mtlsManager(t, srv, dir)
+	m.MTLS.StorageDir = "" // the home-less-host case
+
+	err := m.CertLoginFromStore(t.Context())
+	if !errors.Is(err, ErrNoCertCredential) {
+		t.Fatalf("err = %v, want ErrNoCertCredential (an empty StorageDir must not probe cwd)", err)
+	}
+	if f.loginCount != 0 {
+		t.Errorf("login attempted %d times; an empty StorageDir must not read ./credential.json and log in", f.loginCount)
+	}
 }
 
 // TestMTLSDownscopePresentsClientCert covers the cert-auth downscope path: when

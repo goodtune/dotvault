@@ -177,6 +177,16 @@ func (m *Manager) CertLoginFromStore(ctx context.Context) error {
 	if p == nil {
 		return fmt.Errorf("%w: vault.mtls is not configured", ErrNoCertCredential)
 	}
+	if p.StorageDir == "" {
+		// An empty storage directory would make loadCredential probe a
+		// cwd-relative "credential.json" (filepath.Join("", …)) and authenticate
+		// as whatever certificate happens to sit in the working directory. Treat
+		// it as "no credential" instead — the same reasoning DefaultTokenFile
+		// uses to return "" rather than a cwd-relative token path. This arises
+		// only from the client facade's home-less-host fallback
+		// (defaultMTLSStorageDir → ""); the daemon always sets StorageDir.
+		return fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
+	}
 	store, err := securestore.Open(securestore.ModeForMethod(p.Method))
 	if err != nil {
 		return fmt.Errorf("%w: open secure store: %w", ErrNoCertCredential, err)

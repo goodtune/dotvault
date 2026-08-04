@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/perms"
@@ -140,8 +141,14 @@ func RemoveTokenFile(path string) error {
 		// FILE_SHARE_DELETE, so an antivirus scanner, backup agent or search
 		// indexer holding a handle yields ERROR_SHARING_VIOLATION. Since the
 		// caller escalates this to a login failure, name the likely cause
-		// rather than surfacing a bare errno the operator has to decode.
-		return fmt.Errorf("remove token file %s: %w (on Windows another process holding the file open — antivirus, backup or indexing — can block deletion)", path, err)
+		// rather than surfacing a bare errno the operator has to decode. The
+		// hint is gated on the platform: mtls+os is Windows-only, but this
+		// helper is reachable in tests and by any future no-persist method, and
+		// a Unix EACCES explained in terms of antivirus would misdirect.
+		if runtime.GOOS == "windows" {
+			return fmt.Errorf("remove token file %s: %w (another process holding the file open — antivirus, backup or indexing — can block deletion on Windows)", path, err)
+		}
+		return fmt.Errorf("remove token file %s: %w", path, err)
 	}
 	return nil
 }

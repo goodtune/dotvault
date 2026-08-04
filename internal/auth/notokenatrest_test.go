@@ -2,10 +2,12 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,5 +357,109 @@ func TestAuthenticateIgnoresStaleTokenUnderNoPersist(t *testing.T) {
 	m2 := &Manager{VaultClient: vc, TokenFilePath: tokenPath, AuthMethod: "mtls"}
 	if err := m2.Authenticate(t.Context()); err != nil {
 		t.Errorf("plain mtls stopped reusing its cached token: %v", err)
+	}
+}
+
+// TestMTLSOSNoTokenInstalledWhenRemovalFails pins the fail-closed contract that
+// Copilot's re-review found leaking.
+//
+// certLogin adopted the freshly-minted token onto the shared client and only
+// then removed the stale file, so a removal failure returned an error while
+// leaving a live token installed — observable by anything holding the client
+// and, in daemon+web mode, servable from GET /api/v1/token. A login reported as
+// failed must leave nothing behind.
+//
+// The fix is ordering, not rollback: removal runs before adoption, so there is
+// no window in which a token is installed by a login that did not succeed. That
+// is why this test asserts on the CLIENT rather than on the error — the error
+// was always returned; the token was the leak.
+//
+// Removal is made to fail portably by putting a non-empty DIRECTORY where the
+// token file goes: os.Remove refuses that on every supported platform, standing
+// in for the real cause (a Windows sharing violation from antivirus, backup, or
+// indexing holding the file open), which cannot be provoked in a portable test.
+func TestMTLSOSNoTokenInstalledWhenRemovalFails(t *testing.T) {
+	ca := newTestCA(t)
+	srv := newFakeVaultServer(t, &fakeVault{ca: ca})
+	dir := t.TempDir()
+
+	m := mtlsManager(t, srv, dir)
+	m.AuthMethod = "mtls+os"
+	m.BootstrapLogin = func(context.Context) (string, error) { return "s.boot-token", nil }
+
+	// Non-empty directory at the token path: os.Remove refuses it on every
+	// supported platform (ENOTEMPTY on Unix, ERROR_DIR_NOT_EMPTY on Windows).
+	if err := os.MkdirAll(filepath.Join(m.TokenFilePath, "blocker"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.authenticateMTLS(t.Context())
+	if err == nil {
+		t.Fatal("authenticateMTLS() = nil, want an error when the token file cannot be removed")
+	}
+	if !strings.Contains(err.Error(), "no token at rest") {
+		t.Errorf("error = %v, want it to name the guarantee that could not be met", err)
+	}
+
+	// The property under test: nothing usable installed by a failed login.
+	if got := m.VaultClient.Token(); got != "" {
+		t.Errorf("client is holding token %q after a failed login — a login reported as failed must install nothing, or the web API would serve a token the operator was told was never obtained", got)
+	}
+}
+
+// TestMTLSOSRemovalFailureDoesNotReseed pins the second half of the fail-closed
+// contract, which pre-push security review found: failing closed is only useful
+// if the failure is not then mistaken for something else.
+//
+// authenticateMTLS treats any error out of tryExistingCredential as "this
+// credential is unusable" and falls through to seedCredential — a full
+// interactive bootstrap (OIDC browser or LDAP TTY) plus a fresh PKI issuance.
+// For an undeletable token file that is exactly wrong: the certificate is
+// perfectly good, a new one changes nothing, and the re-seed hits the same file
+// and fails anyway. Left unfixed, a file antivirus or backup briefly holds open
+// costs a human prompt and a wasted certificate on every single startup.
+//
+// The BootstrapLogin hook is the detector: it is what seedCredential would call,
+// so if it ever runs, the fallthrough happened.
+func TestMTLSOSRemovalFailureDoesNotReseed(t *testing.T) {
+	ca := newTestCA(t)
+	srv := newFakeVaultServer(t, &fakeVault{ca: ca})
+	dir := t.TempDir()
+
+	// First, enrol normally under plain mtls so a valid credential exists on
+	// disk for the second login to find and reuse.
+	seed := mtlsManager(t, srv, dir)
+	seed.BootstrapLogin = func(context.Context) (string, error) { return "s.boot-token", nil }
+	if err := seed.authenticateMTLS(t.Context()); err != nil {
+		t.Fatalf("seeding login: %v", err)
+	}
+	if err := os.Remove(seed.TokenFilePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now switch to mtls+os and block removal of the token file.
+	m := mtlsManager(t, srv, dir)
+	m.AuthMethod = "mtls+os"
+	bootstrapped := false
+	m.BootstrapLogin = func(context.Context) (string, error) {
+		bootstrapped = true
+		return "s.boot-token", nil
+	}
+	if err := os.MkdirAll(filepath.Join(m.TokenFilePath, "blocker"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.authenticateMTLS(t.Context())
+	if err == nil {
+		t.Fatal("authenticateMTLS() = nil, want an error when the token file cannot be removed")
+	}
+	if !errors.Is(err, ErrTokenAtRest) {
+		t.Errorf("error = %v, want it to wrap ErrTokenAtRest so callers can tell it from an unusable credential", err)
+	}
+	if bootstrapped {
+		t.Error("a bootstrap was run for an undeletable token file — the certificate was fine; this would prompt a human and mint a wasted certificate on every startup, then fail identically")
+	}
+	if got := m.VaultClient.Token(); got != "" {
+		t.Errorf("client is holding token %q after a failed login", got)
 	}
 }

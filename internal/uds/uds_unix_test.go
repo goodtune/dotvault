@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -138,4 +139,85 @@ func TestCleanupRemovesSocket(t *testing.T) {
 	// An empty path and an already-removed path are both no-ops.
 	Cleanup("")
 	Cleanup(sock)
+}
+
+// TestRemoveStaleToleratesMissingNode is the unit-level form of the
+// concurrent-cold-start race: two processes both get past the liveness probe
+// on the same stale path, only one of them performs the removal, and the
+// loser must not fail startup over a node that is already gone — which is the
+// state it wanted in the first place.
+func TestRemoveStaleToleratesMissingNode(t *testing.T) {
+	dir := t.TempDir()
+	absent := filepath.Join(dir, "never-existed.sock")
+
+	if err := removeStale(absent); err != nil {
+		t.Errorf("removeStale on a missing node = %v, want nil", err)
+	}
+
+	// A node that does exist is still removed.
+	present := filepath.Join(dir, "stale.sock")
+	if err := os.WriteFile(present, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStale(present); err != nil {
+		t.Fatalf("removeStale on an existing node = %v, want nil", err)
+	}
+	if _, err := os.Stat(present); !os.IsNotExist(err) {
+		t.Error("stale node still present after removeStale")
+	}
+
+	// A genuine failure still surfaces: a non-empty directory cannot be
+	// unlinked, standing in for the permission/IO errors worth reporting.
+	stubborn := filepath.Join(dir, "notasocket")
+	if err := os.MkdirAll(filepath.Join(stubborn, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeStale(stubborn); err == nil {
+		t.Error("removeStale on an undeletable node = nil, want error")
+	}
+}
+
+// TestConcurrentListenYieldsOneWinner exercises the cold-start race end to
+// end: several processes racing for the same stale path must resolve to
+// exactly one listener, and every loser must report it as "already
+// listening" rather than as a raw bind or unlink error an operator would read
+// as a dotvault bug.
+func TestConcurrentListenYieldsOneWinner(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "api.sock")
+	// Seed a stale node so every racer takes the probe-then-remove path.
+	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const racers = 8
+	var wg sync.WaitGroup
+	lns := make([]net.Listener, racers)
+	errs := make([]error, racers)
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			lns[i], errs[i] = Listen(sock)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i := range racers {
+		if errs[i] == nil {
+			winners++
+			lns[i].Close()
+			continue
+		}
+		if !errors.Is(errs[i], ErrAlreadyListening) {
+			t.Errorf("racer %d: err = %v, want ErrAlreadyListening", i, errs[i])
+		}
+	}
+	if winners != 1 {
+		t.Errorf("winners = %d, want exactly 1", winners)
+	}
 }

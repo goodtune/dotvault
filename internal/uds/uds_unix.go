@@ -3,10 +3,13 @@
 package uds
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -56,28 +59,96 @@ func Listen(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("chmod socket dir %s: %w", dir, err)
 	}
 
-	if _, err := os.Stat(path); err == nil {
-		// Something is at the path. If a connect succeeds a live instance
-		// owns it — refuse to clobber. Otherwise it's a stale socket from an
-		// unclean shutdown; remove it.
-		if c, derr := net.DialTimeout("unix", path, liveProbeTimeout); derr == nil {
-			c.Close()
-			return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+	// The probe-remove-bind-chmod sequence below must be atomic with respect
+	// to other dotvault processes — see withBindLock.
+	return withBindLock(path, func() (net.Listener, error) {
+		if _, err := os.Stat(path); err == nil {
+			// Something is at the path. If a connect succeeds a live instance
+			// owns it — refuse to clobber. Otherwise it's a stale socket from
+			// an unclean shutdown; remove it.
+			if c, derr := net.DialTimeout("unix", path, liveProbeTimeout); derr == nil {
+				c.Close()
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+			}
+			if err := removeStale(path); err != nil {
+				return nil, fmt.Errorf("remove stale socket %s: %w", path, err)
+			}
 		}
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("remove stale socket %s: %w", path, err)
-		}
-	}
 
-	ln, err := net.Listen("unix", path)
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			// Can't happen while we hold the bind lock, but a foreign process
+			// binding the path would land here: report it in the vocabulary
+			// callers already handle rather than as a raw bind error, which
+			// reads like a bug in dotvault rather than a second instance.
+			if errors.Is(err, syscall.EADDRINUSE) {
+				return nil, fmt.Errorf("%w: %s", ErrAlreadyListening, path)
+			}
+			return nil, fmt.Errorf("listen unix %s: %w", path, err)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("chmod socket %s: %w", path, err)
+		}
+		return ln, nil
+	})
+}
+
+// bindLockSuffix names the advisory lock file that serialises binding, kept
+// beside the socket inside the same 0700 directory.
+const bindLockSuffix = ".lock"
+
+// withBindLock runs fn holding an exclusive advisory lock on a file beside the
+// socket, so only one process at a time may run the probe-remove-bind
+// sequence.
+//
+// Without it, two processes starting concurrently against the same stale path
+// can both get past the liveness probe, and then the loser unlinks the
+// *winner's* freshly-bound socket and binds its own on top. Both believe they
+// succeeded; the winner serves an inode no client can reach. That is the same
+// silent failure the already-running check exists to prevent, arriving by a
+// different route — and it is reproducible, not theoretical (see
+// TestConcurrentListenYieldsOneWinner, which fails without this lock).
+//
+// The lock is held only across the bind, not for the listener's lifetime: once
+// the socket is bound it is itself the evidence a live instance owns the path,
+// which is what the liveness probe reads. The lock file is deliberately never
+// unlinked — removing a file other processes hold flocked is the classic way
+// to end up with two "holders" of the same lock — so it persists as an empty
+// 0600 file beside the socket. flock is released by the kernel if the holder
+// dies, so a crashed daemon cannot wedge the next start.
+func withBindLock(path string, fn func() (net.Listener, error)) (net.Listener, error) {
+	lockFile := path + bindLockSuffix
+	lf, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("listen unix %s: %w", path, err)
+		return nil, fmt.Errorf("open bind lock %s: %w", lockFile, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		ln.Close()
-		return nil, fmt.Errorf("chmod socket %s: %w", path, err)
+	defer lf.Close()
+
+	// Blocking: the critical section is our own bounded work (a probe capped
+	// at liveProbeTimeout, plus a bind), and the kernel releases the lock if
+	// the holder dies, so waiting cannot hang on a dead process.
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("acquire bind lock %s: %w", lockFile, err)
 	}
-	return ln, nil
+	defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+
+	return fn()
+}
+
+// removeStale unlinks a socket node that no live instance answered on,
+// treating "already gone" as success.
+//
+// Two processes starting concurrently against the same stale path can both
+// get past the liveness probe, and only one of them gets to do the removal;
+// the loser would otherwise fail startup with a confusing ENOENT about a node
+// it was trying to delete anyway. The goal is that the path is clear, not
+// that we personally cleared it.
+func removeStale(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Cleanup removes the socket file. net.UnixListener.Close already unlinks it

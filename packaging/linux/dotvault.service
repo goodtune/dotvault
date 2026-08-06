@@ -13,9 +13,21 @@ ExecStart=/usr/bin/dotvault run
 # SIGHUP is the daemon's reload trigger: it re-reads ~/.dotvault-token and
 # immediately re-runs the config loader, applying the dynamic sections
 # (rules, enrolments, sync interval, remote_config) in place. Static
-# sections (vault, web, agent, observability, bypass_system_config) are
-# logged as needing a restart.
+# sections (vault, web, agent, api, observability, bypass_system_config)
+# are logged as needing a restart.
 ExecReload=/bin/kill -HUP $MAINPID
+
+# %t/dotvault (i.e. $XDG_RUNTIME_DIR/dotvault), created 0700 and owned by
+# this unit, is where the SSH agent socket and the local API socket
+# (api.enabled) live. Declaring it here means systemd creates it before
+# ExecStart and removes it on stop, so a killed daemon leaves no stale
+# socket behind. Note that $XDG_RUNTIME_DIR itself is torn down when the
+# user's last session ends unless lingering is enabled
+# (`loginctl enable-linger <user>`) — which is required anyway for a user
+# service that is meant to outlive an SSH session, the exact case the local
+# API socket exists to serve.
+RuntimeDirectory=dotvault
+RuntimeDirectoryMode=0700
 
 Restart=on-failure
 RestartSec=5s

@@ -74,7 +74,7 @@ func TestWaitForHeadlessToken_BorrowsFromSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, sock) {
+	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrowed token")
 	}
 	if got := vc.Token(); got != "peer-token" {
@@ -135,7 +135,7 @@ func TestWaitForHeadlessToken_SocketMaterialisesLater(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, sock) {
+	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrow once the socket materialised")
 	}
 	if got := vc.Token(); got != "late-token" {
@@ -160,7 +160,7 @@ func TestWaitForHeadlessToken_CancelWithoutToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	if waitForHeadlessToken(ctx, vc, tokenPath, "") {
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil) {
 		t.Fatal("waitForHeadlessToken returned true with no token source")
 	}
 }

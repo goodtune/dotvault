@@ -30,12 +30,13 @@ type Manager struct {
 	// 8250 (the `vault` CLI's own default); if that port is unavailable,
 	// authenticateOIDC falls back to a random port. See oidc.go.
 	OIDCCallbackPort int
-	// TokenSocket is an optional path to a peer dotvault's web-API Unix
-	// socket. When set, Login first tries to borrow a live token from the
-	// peer (dotvault-to-dotvault sharing) before running the configured
-	// interactive flow. A missing or stale socket is ignored. See
-	// FetchTokenFromSocket.
-	TokenSocket string
+	// TokenSockets is an ordered list of peer dotvault web-API Unix sockets.
+	// When non-empty, Login first tries to borrow a live token from each in
+	// turn (dotvault-to-dotvault sharing) before running the configured
+	// interactive flow. Missing or stale entries are skipped. Callers build
+	// the list most-stable-first via config.TokenBorrowSockets — the local
+	// API socket ahead of an SSH-forwarded peer. See FetchTokenFromSockets.
+	TokenSockets []string
 	// Policy narrows a freshly-minted login token to a least-privilege child
 	// token (vault.policies / vault.no_default_policy). The zero value applies
 	// no narrowing — the token carries every policy the auth role granted,
@@ -80,16 +81,14 @@ func (m *Manager) Login(ctx context.Context) error {
 	// stays the single owner and we re-borrow on the next login rather than
 	// caching a copy that could go stale — and the "+tpm" sealing question
 	// never arises for it.
-	if m.TokenSocket != "" {
-		if token, _ := FetchTokenFromSocket(ctx, m.TokenSocket); token != "" {
-			m.VaultClient.SetToken(token)
-			if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
-				slog.Info("using vault token borrowed from peer socket", "socket", m.TokenSocket)
-				return nil
-			}
-			slog.Warn("token from peer socket is not usable, proceeding to configured auth flow")
-			m.VaultClient.SetToken("")
+	if token, source := FetchTokenFromSockets(ctx, m.TokenSockets); token != "" {
+		m.VaultClient.SetToken(token)
+		if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
+			slog.Info("using vault token borrowed from peer socket", "socket", source)
+			return nil
 		}
+		slog.Warn("token from peer socket is not usable, proceeding to configured auth flow", "socket", source)
+		m.VaultClient.SetToken("")
 	}
 
 	base := BaseMethod(m.AuthMethod)

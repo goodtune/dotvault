@@ -183,6 +183,7 @@ func TestChangedStaticSections(t *testing.T) {
 		{"vault", func(c *config.Config) { c.Vault.Address = "https://other.example.com:8200" }, "vault"},
 		{"web", func(c *config.Config) { c.Web.Listen = "127.0.0.1:9001" }, "web"},
 		{"agent", func(c *config.Config) { c.Agent.Enabled = true }, "agent"},
+		{"api", func(c *config.Config) { c.API.Enabled = true }, "api"},
 		{"observability scalar", func(c *config.Config) { c.Observability.Endpoint = "https://elsewhere.example" }, "observability"},
 		{"observability headers", func(c *config.Config) { c.Observability.Headers = map[string]string{"Authorization": "Bearer rotated"} }, "observability"},
 		{"bypass_system_config", func(c *config.Config) { c.BypassSystemConfig = true }, "bypass_system_config"},
@@ -216,6 +217,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"Web":                "static",
 		"Observability":      "static",
 		"Agent":              "static",
+		"API":                "static",  // the socket listener is bound once at startup
 		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",

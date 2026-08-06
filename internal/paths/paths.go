@@ -84,6 +84,28 @@ func DefaultAgentSocket() string {
 	return filepath.Join(CacheDir(), "agent.sock")
 }
 
+// DefaultAPISocket returns the per-user Unix domain socket path for the local
+// API surface when api.unix.path is unset. It follows DefaultAgentSocket's
+// resolution exactly — the runtime dir ($XDG_RUNTIME_DIR/dotvault/api.sock),
+// which is owner-only and cleared on logout, falling back to the cache dir
+// when XDG_RUNTIME_DIR is empty (typical on macOS).
+//
+// Both sides of the borrow resolve the path through this one function: the
+// daemon binds it, and a client on the same machine derives the same value
+// from the same config, so neither has to be told where the other put it.
+//
+// Note for service deployments: /run/user/<uid> is torn down when the user's
+// last session ends unless lingering is enabled (`loginctl enable-linger`),
+// which is exactly the disconnect the local socket exists to survive. The
+// packaged systemd unit declares RuntimeDirectory=dotvault so the directory
+// is owned by the unit; see docs/configuration/config-reference.md.
+func DefaultAPISocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "api.sock")
+	}
+	return filepath.Join(CacheDir(), "api.sock")
+}
+
 // Username returns the current OS username with any domain prefix stripped.
 func Username() (string, error) {
 	u, err := user.Current()

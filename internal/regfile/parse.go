@@ -775,6 +775,15 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		cfg.RemoteConfig.Headers = remoteHeaders
 	}
 
+	// API (local API socket).
+	apiKey := rootKey + `\API`
+	if err := applyBool(&cfg.API.Enabled, apiKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.API.Unix.Path, apiKey, "UnixPath"); err != nil {
+		return err
+	}
+
 	// Agent.
 	agentKey := rootKey + `\Agent`
 	if err := applyBool(&cfg.Agent.Enabled, agentKey, "Enabled"); err != nil {

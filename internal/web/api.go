@@ -534,6 +534,7 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		Web:           s.cfg,
 		Observability: obsCfg,
 		Agent:         s.agentCfg,
+		API:           s.apiCfg,
 		RemoteConfig:  s.remoteCfg,
 		Rules:         rules,
 		Enrolments:    enrolments,
@@ -616,7 +617,18 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	slog.Info("vault token retrieved via web UI", "username", s.username)
+	// Don't lend out a token the daemon already knows has gone invalid. The
+	// borrower would validate it, fail, and fall back to its own auth flow —
+	// which on a headless host means no token at all. A 401 sends it round
+	// the retry loop instead, and the daemon's own recovery path (re-borrow
+	// from its upstream peer, or re-auth) is what fixes the situation for
+	// everyone at once. The borrower still validates what it receives; this
+	// only removes a known-bad answer.
+	if s.needsReauth() {
+		writeError(w, "not authenticated (re-authentication pending)", http.StatusUnauthorized)
+		return
+	}
+	slog.Info("vault token retrieved via web API", "username", s.username)
 	writeJSON(w, map[string]any{"token": s.vault.Token()})
 }
 

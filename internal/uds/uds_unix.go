@@ -35,6 +35,18 @@ const liveProbeTimeout = 200 * time.Millisecond
 // before the chmod lands is closed by the 0700 parent: no other user can
 // traverse into it to reach the socket, whatever the socket's own bits are.
 func Listen(path string) (net.Listener, error) {
+	// AF_UNIX addresses are a fixed-size sun_path field — 104 bytes on the
+	// BSDs/macOS, 108 on Linux — and the kernel reports an over-long path as
+	// a bare EINVAL, which surfaces as "listen unix …: invalid argument" and
+	// tells the operator nothing about what to change. Check it here so a
+	// long custom api.unix.path names its own problem. Use the smaller limit
+	// everywhere: a path that fails on macOS is worth rejecting on Linux too
+	// rather than having one config work on some of a fleet.
+	const maxSocketPath = 104
+	if len(path) >= maxSocketPath {
+		return nil, fmt.Errorf("socket path %s is %d bytes; the operating system limit for a unix socket is %d", path, len(path), maxSocketPath-1)
+	}
+
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir %s: %w", dir, err)

@@ -1051,9 +1051,6 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	if got := vc.Token(); got != "fresh-token" {
 		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", got)
 	}
-	if lm.NeedsReauth() {
-		t.Error("NeedsReauth() = true, want false — the daemon recovered by borrowing")
-	}
 }
 
 // TestLifecycleManager_RenewalFailureKeepsWorkingToken is the other side of

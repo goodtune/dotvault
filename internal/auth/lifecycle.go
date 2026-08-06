@@ -493,7 +493,11 @@ func IsExpired(err error) bool {
 
 // renewFailedError tags a RenewSelf failure on a token that is otherwise
 // still valid — lookup-self succeeded moments earlier in the same check.
-// It wraps the underlying error so IsForbidden/IsExpired still classify it.
+// It wraps the underlying error so vault.IsForbidden (which uses errors.As)
+// still classifies a 403 from the renew call. IsExpired is a bare type
+// assertion on the sentinel and does not see through wrapping, which is
+// correct here: the expired sentinel is only ever returned unwrapped by
+// checkAndRenew, never from a renewal.
 type renewFailedError struct{ err error }
 
 func (e *renewFailedError) Error() string { return "vault token renewal failed: " + e.err.Error() }

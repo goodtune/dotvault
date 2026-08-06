@@ -1165,7 +1165,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 		for err := range lifecycleErrCh {
 			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
-			if webServer != nil {
+			// cfg.Web.Enabled, not merely webServer != nil: a socket-only
+			// server has no browsable address, so re-opening a browser would
+			// mean handing the opener an empty URL.
+			if webServer != nil && cfg.Web.Enabled {
 				if lastReauthOpen.IsZero() || time.Since(lastReauthOpen) >= reauthCooldown {
 					lastReauthOpen = time.Now()
 					url := webServer.URL()
@@ -1181,8 +1184,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// enrolMgr drives the terminal wizard and exists only in CLI-interactive
 	// mode; the refresh loop below treats it as optional.
 	var enrolMgr *enrol.Manager
-	if webServer != nil {
-		// Web mode: let the frontend drive enrolments.
+	if webServer != nil && cfg.Web.Enabled {
+		// Web mode: let the frontend drive enrolments. Gated on the browser
+		// surface actually existing — a socket-only daemon registers no
+		// enrolment routes and no browser can reach a Unix socket, so waiting
+		// for the frontend to complete an enrolment would block until ctx.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
 
 		waitDone := make(chan struct{})
@@ -1326,6 +1332,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		},
 	}
 	if webServer != nil {
+		// Empty for a socket-only daemon; the tray omits its "View web UI"
+		// entry rather than opening nothing.
 		trayCfg.WebURL = webServer.URL()
 	}
 	if err := tray.Run(ctx, trayCfg); err != nil {
@@ -1590,7 +1598,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSockets:     cfg.TokenBorrowSockets(),
+		TokenSockets:     freshLoginBorrowSockets(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),

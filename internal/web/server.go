@@ -56,11 +56,30 @@ type Server struct {
 	// socketPath is the resolved local API socket path, or "" when the
 	// socket surface is disabled.
 	socketPath string
-	csrf       *CSRFStore
-	oauth      *OAuthManager
-	login      *auth.LoginTracker
-	mux        *http.ServeMux
-	server     *http.Server
+	// socketBound records that this Server successfully bound socketPath, so
+	// Shutdown knows the node is *ours* to unlink.
+	//
+	// This is load-bearing, not bookkeeping. When a second daemon starts
+	// against a socket a live instance already owns, uds.Listen correctly
+	// refuses — and the losing daemon then runs its deferred Shutdown on the
+	// way out. Unlinking unconditionally there would delete the *winning*
+	// daemon's socket node: it would keep serving an unlinked inode that no
+	// new client can dial, silently destroying the very surface the
+	// already-running check exists to protect.
+	//
+	// Written by listen() before Serve starts and read by Shutdown, both on
+	// the daemon's startup path with no concurrent Start; guarded by
+	// startMu so the race detector sees the ordering explicitly rather than
+	// relying on that happening to be true.
+	socketBound bool
+	// startMu guards socketBound (and s.server) across the Start/Shutdown
+	// pair, which the daemon can interleave when startup fails.
+	startMu sync.Mutex
+	csrf    *CSRFStore
+	oauth   *OAuthManager
+	login   *auth.LoginTracker
+	mux     *http.ServeMux
+	server  *http.Server
 	// rulesMu guards rules and syncCfg, which the daemon's config-refresh
 	// loop swaps at runtime via UpdateDynamicConfig while request handlers
 	// read them.
@@ -408,30 +427,56 @@ func (s *Server) Start() error {
 		return err
 	}
 
+	s.startMu.Lock()
 	s.server = &http.Server{
 		Handler: s.middleware(s.mux),
 	}
+	srv := s.server
+	s.startMu.Unlock()
 
 	s.readyCh <- nil // signal ready
 
-	// One goroutine per listener. Shutdown closes all of them, so every
-	// Serve returns ErrServerClosed on a clean stop; anything else is a real
-	// failure and is reported (first one wins — they are not independent,
-	// since a dead listener means the surface is gone either way).
+	// One goroutine per listener. Shutdown closes all of them, so every Serve
+	// returns ErrServerClosed on a clean stop; anything else is a real
+	// failure.
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(lns))
 	for _, ln := range lns {
 		wg.Add(1)
 		go func(ln net.Listener) {
 			defer wg.Done()
-			if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				errCh <- err
 			}
 		}(ln)
 	}
-	wg.Wait()
-	close(errCh)
-	return <-errCh
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Report the first listener failure immediately rather than waiting for
+	// the others to finish. With two listeners, waiting would mean a dead TCP
+	// listener goes unreported for as long as the socket keeps serving — the
+	// daemon would look healthy while half its surface was gone. A failure on
+	// either listener takes the whole server down: the surfaces are two doors
+	// into one daemon, and limping along behind one of them hides the fault
+	// from whoever needs to fix it.
+	select {
+	case err := <-errCh:
+		srv.Close()
+		<-done
+		return err
+	case <-done:
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			return nil
+		}
+	}
 }
 
 // listen binds every configured listener, cleaning up the ones it already
@@ -470,6 +515,11 @@ func (s *Server) listen() ([]net.Listener, error) {
 			return nil, fmt.Errorf("local API socket: %w", err)
 		}
 		slog.Info("starting local API socket", "path", s.socketPath)
+		// Record that *this* Server owns the socket node. Shutdown consults
+		// this before unlinking — see socketBound.
+		s.startMu.Lock()
+		s.socketBound = true
+		s.startMu.Unlock()
 		lns = append(lns, ln)
 	}
 
@@ -492,13 +542,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	// Shutdown closes the listeners, and net.UnixListener unlinks the socket
 	// on close; Cleanup is the backstop for the paths that don't reach it
-	// (a Server that failed partway through Start, or a Shutdown that timed
-	// out). A leftover node is not fatal — the next start detects it as
-	// stale — but leaving one behind means the next start has to prove
-	// nobody is serving it, which is worth avoiding.
-	defer uds.Cleanup(s.socketPath)
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
+	// (a Shutdown that timed out, or a partially-bound Start). A leftover
+	// node is not fatal — the next start detects it as stale — but leaving
+	// one behind means the next start has to prove nobody is serving it.
+	//
+	// Gated on socketBound: a Server that never bound the socket must not
+	// touch the node, because the reason it didn't bind is usually that
+	// another live daemon owns it.
+	s.startMu.Lock()
+	bound := s.socketBound
+	srv := s.server
+	s.startMu.Unlock()
+	if bound {
+		defer uds.Cleanup(s.socketPath)
+	}
+	if srv != nil {
+		return srv.Shutdown(ctx)
 	}
 	return nil
 }

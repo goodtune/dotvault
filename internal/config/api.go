@@ -3,26 +3,44 @@ package config
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/paths"
 )
 
-// APISocketPath resolves the local API socket path the daemon should bind,
-// with a leading ~ expanded. It returns "" when the local API socket is
-// disabled, so callers can treat "no path" and "not enabled" identically.
+// apiSocketCandidate returns the configured local API socket path — the
+// operator's literal value, or the per-user runtime default when unset —
+// without expanding a leading ~. It returns "" whenever no socket will exist:
+// the section is disabled, or the platform has no local API socket at all.
 //
-// An unset api.unix.path resolves to the per-user runtime default. Resolution
-// happens here rather than at config-load time so an exported config
-// round-trips the operator's literal value ("" means "use the default")
-// instead of baking in one machine's runtime directory.
-func (c *Config) APISocketPath() (string, error) {
-	if !c.API.Enabled {
-		return "", nil
+// Windows is gated here rather than only at the daemon's bind site so that
+// *every* consumer agrees. A path resolved on Windows would name a socket
+// nothing ever binds, which would put a permanently dead candidate in every
+// borrow list and make `dotvault status` report a socket as merely "not
+// present (daemon not running?)" when in fact it can never appear.
+//
+// Defaulting happens here rather than at config-load time so an exported
+// config round-trips the operator's literal value ("" means "use the
+// default") instead of baking in one machine's runtime directory.
+func (c *Config) apiSocketCandidate() string {
+	if !c.API.Enabled || runtime.GOOS == "windows" {
+		return ""
 	}
-	p := c.API.Unix.Path
+	if p := c.API.Unix.Path; p != "" {
+		return p
+	}
+	return paths.DefaultAPISocket()
+}
+
+// APISocketPath resolves the local API socket path the daemon should bind,
+// with a leading ~ expanded. It returns "" when no local API socket applies
+// (disabled, or an unsupported platform), so callers can treat "no path" and
+// "not enabled" identically.
+func (c *Config) APISocketPath() (string, error) {
+	p := c.apiSocketCandidate()
 	if p == "" {
-		p = paths.DefaultAPISocket()
+		return "", nil
 	}
 	expanded, err := paths.ExpandHome(p)
 	if err != nil {
@@ -52,18 +70,8 @@ func (c *Config) APISocketPath() (string, error) {
 // vault.token_socket directly.
 func (c *Config) TokenBorrowSockets() []string {
 	var out []string
-	if c.API.Enabled {
-		// The literal configured value (or "" for the default) is resolved
-		// here rather than reusing APISocketPath so a home-directory failure
-		// degrades to "no local candidate" instead of failing the borrow —
-		// borrowing is best-effort at every call site.
-		p := c.API.Unix.Path
-		if p == "" {
-			p = paths.DefaultAPISocket()
-		}
-		if p != "" {
-			out = append(out, p)
-		}
+	if p := c.apiSocketCandidate(); p != "" {
+		out = append(out, p)
 	}
 	if c.Vault.TokenSocket != "" {
 		out = append(out, c.Vault.TokenSocket)

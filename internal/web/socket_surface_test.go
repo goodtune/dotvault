@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -262,6 +263,113 @@ func TestShutdownRemovesSocket(t *testing.T) {
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Errorf("socket still present after Shutdown")
 	}
+}
+
+// TestLosingServerDoesNotUnlinkWinnersSocket is the regression test for the
+// worst failure this feature can produce. A second daemon started against a
+// socket a live instance already owns is correctly refused by uds.Listen —
+// but the daemon then runs its deferred Shutdown on the way out. If that
+// Shutdown unlinked the socket node unconditionally it would delete the
+// *winning* daemon's socket: the winner keeps serving an inode nobody can
+// reach, every client loses the borrow endpoint, and `dotvault status`
+// reports the daemon as not running. The failure is silent on both sides.
+func TestLosingServerDoesNotUnlinkWinnersSocket(t *testing.T) {
+	winner, client, sock := startSocketServer(t, http.HandlerFunc(fakeVaultHandler))
+
+	ts := httptest.NewServer(http.HandlerFunc(fakeVaultHandler))
+	defer ts.Close()
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "loser-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	loser, err := NewServer(ServerConfig{
+		WebCfg:        config.WebConfig{Enabled: false},
+		VaultCfg:      config.VaultConfig{Address: ts.URL, KVMount: "kv", UserPrefix: "users/"},
+		APICfg:        config.APIConfig{Enabled: true},
+		APISocketPath: sock, // the same socket the winner is serving
+		Vault:         vc,
+		Username:      "testuser",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- loser.Start() }()
+	if err := loser.WaitReady(); err == nil {
+		t.Fatal("second server bound a socket the first was serving, want refusal")
+	} else if !strings.Contains(err.Error(), "already serving") {
+		t.Errorf("err = %v, want an already-serving error", err)
+	}
+	<-startErr
+
+	// The daemon's shutdown path runs even when startup failed.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := loser.Shutdown(ctx); err != nil {
+		t.Fatalf("loser Shutdown: %v", err)
+	}
+
+	// The winner's socket node must still exist and still serve.
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("winner's socket was removed by the losing server: %v", err)
+	}
+	resp, err := client.Get("http://localhost/api/v1/token")
+	if err != nil {
+		t.Fatalf("winner no longer reachable after loser shut down: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 — winner should be unaffected", resp.StatusCode)
+	}
+	_ = winner
+}
+
+// TestPartialBindCleansUpBoundListeners covers the other half of listen():
+// when a later bind fails, the listeners already opened must be closed rather
+// than left dangling — including the socket node, which would otherwise have
+// to be proven stale on the next start.
+func TestPartialBindCleansUpBoundListeners(t *testing.T) {
+	// Occupy a TCP port, then ask for it explicitly so the TCP bind fails
+	// after the socket path has been chosen.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(fakeVaultHandler))
+	defer ts.Close()
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sock := filepath.Join(t.TempDir(), "api.sock")
+	s, err := NewServer(ServerConfig{
+		WebCfg:        config.WebConfig{Enabled: true, Listen: occupied.Addr().String()},
+		VaultCfg:      config.VaultConfig{Address: ts.URL},
+		APICfg:        config.APIConfig{Enabled: true},
+		APISocketPath: sock,
+		Vault:         vc,
+		Username:      "testuser",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go s.Start()
+	if err := s.WaitReady(); err == nil {
+		t.Fatal("Start succeeded despite an occupied TCP port")
+	}
+
+	// The TCP listener is bound first, so the socket was never created here.
+	// What matters is that nothing is left listening: a subsequent bind on
+	// the same socket path must succeed cleanly.
+	ln, err := uds.Listen(sock)
+	if err != nil {
+		t.Fatalf("socket path unusable after a failed Start: %v", err)
+	}
+	ln.Close()
 }
 
 // fakeReauthGate reports a fixed re-auth state.

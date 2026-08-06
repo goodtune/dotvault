@@ -163,6 +163,8 @@ On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon
 !!! tip "This socket dies with the SSH session"
     Everything above depends on the SSH connection being up. A process that outlives the session it was started in — a `tmux` job, a long-running service — will fail its next borrow once the forward is gone. Enable the [`api` section](#api-section) on the remote host so the long-lived daemon serves the borrow endpoint from a stable path, and local clients keep working across disconnects.
 
+One behaviour change for existing deployments: a peer's `/api/v1/token` now returns 401 once that peer's daemon knows its own token has gone invalid and is awaiting re-authentication, instead of handing out a credential it knows is dead. Borrowers already validate what they receive, so this only removes a known-bad answer earlier.
+
 The borrow is **best-effort and never fatal**: if the socket path is empty, the socket file is missing, the socket is stale (left over from a dead SSH session, no listener), the peer is reachable but holds no token, or the response is malformed, dotvault silently carries on with its normal auth flow. A leading `~` is expanded to the user's home directory. The borrowed token is held in memory only — it is not written to the local token file, so the peer remains the single owner and the remote re-borrows on its next login or recovery rather than caching a copy that could go stale.
 
 The same borrow is available to the **dotvault client libraries** (Go `client/` and the Python bindings): their cached-auth entry point (`AuthenticateCached`) borrows from the configured peer socket after the `DOTVAULT_TOKEN` env var and token file come up empty, before reporting that a login is required. Because it is a plain socket read with no browser or prompt, a Go or Python program on a host with no local token but a live peer socket reads secrets without an interactive login of its own.
@@ -214,7 +216,7 @@ api:
 
 ### Why it exists: surviving a dropped SSH session
 
-[`vault.token_socket`](#token_socket--dotvault-to-dotvault-token-sharing) lets a headless host borrow a token from a workstation over an SSH `RemoteForward`. That socket **dies with the SSH session**. A process started inside that session but outliving it — a job in `tmux`, a long-running service — succeeds at first and then fails the moment it next needs a token, because the only socket it knew about is gone.
+[`vault.token_socket`](#token_socket-dotvault-to-dotvault-token-sharing) lets a headless host borrow a token from a workstation over an SSH `RemoteForward`. That socket **dies with the SSH session**. A process started inside that session but outliving it — a job in `tmux`, a long-running service — succeeds at first and then fails the moment it next needs a token, because the only socket it knew about is gone.
 
 Enabling `api` fixes that by putting a second, stable dotvault on the near side of the problem. The long-lived per-user daemon serves the same borrow endpoint from a path that no disconnect can take away, keeps its own token alive, and re-borrows across the forwarded socket whenever the SSH session comes back. Local clients borrow from the daemon instead of from the forward:
 

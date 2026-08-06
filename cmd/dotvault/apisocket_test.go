@@ -89,3 +89,33 @@ func TestResolveAPISocketEnabled(t *testing.T) {
 		t.Errorf("resolveAPISocket = %q, want /run/dotvault/api.sock", got)
 	}
 }
+
+// TestFreshLoginBorrowSocketsExcludesLocal: `dotvault login` exists to run the
+// configured fresh-auth flow and ignore any cached token. The local API
+// socket is a cache of the token this host already holds, so borrowing from
+// it would make the command a silent no-op — the user asks to
+// re-authenticate and gets the same token back. A peer socket is different in
+// kind (a separate authentication authority where a human actually logged in)
+// and stays.
+func TestFreshLoginBorrowSocketsExcludesLocal(t *testing.T) {
+	cfg := &config.Config{
+		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
+		Vault: config.VaultConfig{TokenSocket: "/home/u/.ssh/dotvault.sock"},
+	}
+	got := freshLoginBorrowSockets(cfg)
+	want := []string{"/home/u/.ssh/dotvault.sock"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("freshLoginBorrowSockets = %v, want %v", got, want)
+	}
+}
+
+// TestFreshLoginBorrowSocketsKeepsPeerOnly confirms the ordinary headless
+// deployment (no local socket) is untouched by that exclusion.
+func TestFreshLoginBorrowSocketsKeepsPeerOnly(t *testing.T) {
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}}
+	got := freshLoginBorrowSockets(cfg)
+	want := []string{"~/.ssh/dotvault.sock"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("freshLoginBorrowSockets = %v, want %v", got, want)
+	}
+}

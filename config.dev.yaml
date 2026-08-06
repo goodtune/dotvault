@@ -40,7 +40,12 @@ web:
 api:
   enabled: true
   unix:
-    path: ""              # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+    # Deliberately NOT the default path. A dev run and an installed daemon
+    # would otherwise contend for $XDG_RUNTIME_DIR/dotvault/api.sock, and the
+    # loser refuses to start (a bind conflict is a real deployment error, so
+    # it is fatal rather than degraded). Same reasoning as the web port above
+    # being 9000 instead of the usual.
+    path: "~/.cache/dotvault/api-dev.sock"
 
 # SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
 # domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the

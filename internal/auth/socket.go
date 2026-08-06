@@ -84,6 +84,31 @@ func PeerSocketClient(socketPath string) (*http.Client, string, error) {
 // to ("", nil) so the caller simply carries on with its normal auth flow. The
 // returned token is deliberately NOT validated here — callers run LookupSelf
 // before adopting it, exactly as they do for the token file and DOTVAULT_TOKEN.
+// FetchTokenFromSockets tries each socket in order and returns the first
+// token any peer yields, together with the socket path it came from (both ""
+// when no peer produced one). Callers pass the list in most-stable-first
+// order — see config.TokenBorrowSockets, which puts the long-lived local API
+// socket ahead of an SSH-forwarded peer precisely because the forwarded one
+// disappears when the session drops.
+//
+// Like FetchTokenFromSocket it is best-effort and never fatal: unusable
+// entries are skipped and an exhausted list is ("", ""). The returned token
+// is NOT validated here; callers run LookupSelf before adopting it, exactly
+// as they do for the token file and DOTVAULT_TOKEN. Returning the source lets
+// them say which peer answered, which is the difference between a diagnosable
+// borrow and a mystery.
+func FetchTokenFromSockets(ctx context.Context, socketPaths []string) (string, string) {
+	for _, p := range socketPaths {
+		if p == "" {
+			continue
+		}
+		if token, _ := FetchTokenFromSocket(ctx, p); token != "" {
+			return token, p
+		}
+	}
+	return "", ""
+}
+
 func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error) {
 	if socketPath == "" {
 		return "", nil

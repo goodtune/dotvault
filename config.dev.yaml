@@ -30,6 +30,18 @@ web:
 #   insecure: true
 #   export_interval: "15s"
 
+# Local API socket. Serves the daemon's web API over a per-user Unix socket
+# (default $XDG_RUNTIME_DIR/dotvault/api.sock, 0600) in addition to the
+# loopback web UI above. Clients on this machine borrow the live Vault token
+# from it — and because the long-lived daemon owns it, that keeps working
+# after the SSH session a client was started in has gone away. Enabled
+# separately from web: a headless host wants the borrow endpoint without
+# standing up a browser UI.
+api:
+  enabled: true
+  unix:
+    path: ""              # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+
 # SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
 # domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
 # live Vault token. Point SSH_AUTH_SOCK at the socket to use it.

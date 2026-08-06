@@ -134,6 +134,16 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 // everything else (including the literal "null" sent by sandboxed iframes
 // and privacy-redirects) is rejected.
 func (s *Server) originAllowed(origin string) bool {
+	// With no TCP listener there is no origin this daemon could have served,
+	// so no Origin header can legitimately name it. A browser cannot reach a
+	// Unix socket at all, which makes any Origin arriving on a socket-only
+	// daemon a proxied request. Reject here rather than falling through to
+	// the port comparison below, which degrades to a hostname-only check when
+	// no listen port is known and would then admit a page served by any other
+	// loopback listener.
+	if !s.webEnabled {
+		return false
+	}
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return false

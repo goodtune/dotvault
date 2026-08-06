@@ -49,6 +49,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeObservability(cfg.Observability)
 	e.writeRemoteConfig(cfg.RemoteConfig)
 	e.writeAgent(cfg.Agent)
+	e.writeAPI(cfg.API)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
 
@@ -277,6 +278,17 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 	for i, k := range a.Keys {
 		e.writeAgentKey(i, k)
 	}
+}
+
+// writeAPI emits the API section (the local API socket). Flat scalars under
+// one key, matching the Agent section's transport treatment: the YAML nests
+// the path under `unix:` so a future `windows:` block has somewhere to go,
+// but the registry has no reason to mirror that nesting for a single value.
+func (e *emitter) writeAPI(a config.APIConfig) {
+	e.writeKey(rootKey + `\API`)
+	e.writeBool("Enabled", a.Enabled)
+	e.writeString("UnixPath", a.Unix.Path)
+	e.WriteString("\r\n")
 }
 
 func (e *emitter) writeAgentKey(index int, k config.AgentKeySource) {

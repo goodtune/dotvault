@@ -206,6 +206,10 @@ type registryLayer struct {
 	AgentWindowsPipe  string
 	AgentWindowsPutty *uint32
 
+	// API (local API socket).
+	APIEnabled  *uint32
+	APIUnixPath string
+
 	// RemoteConfig (scalar fields; the Headers map is read separately by
 	// readRegistryRemoteConfigHeaders).
 	RemoteConfigURL             string
@@ -336,6 +340,17 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
 		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
 		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
+	}
+
+	// Read API subkey (local API socket).
+	apik, err := registry.OpenKey(root, registryPolicyPath+`\API`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open API policy key: %w", err)
+	}
+	if err == nil {
+		defer apik.Close()
+		layer.APIEnabled = readRegDWORD(apik, "Enabled")
+		layer.APIUnixPath, _ = readRegString(apik, "UnixPath")
 	}
 
 	// Read RemoteConfig subkey (scalar fields only; Headers is a nested
@@ -490,6 +505,12 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.AgentWindowsPutty != nil {
 		b := *layer.AgentWindowsPutty != 0
 		cfg.Agent.Windows.Putty = &b
+	}
+	if layer.APIEnabled != nil {
+		cfg.API.Enabled = *layer.APIEnabled != 0
+	}
+	if layer.APIUnixPath != "" {
+		cfg.API.Unix.Path = layer.APIUnixPath
 	}
 	if layer.RemoteConfigURL != "" {
 		cfg.RemoteConfig.URL = layer.RemoteConfigURL

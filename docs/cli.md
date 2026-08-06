@@ -115,6 +115,8 @@ Display authentication state, token TTL, and per-rule sync status.
 dotvault status [flags]
 ```
 
+When a token is not found locally but is borrowable from a peer socket, the auth line reports `authenticated` and names the socket it came from. With the [`api` section](configuration/config-reference.md#api-section) enabled, status also reports the local API socket path and whether it is currently present — the first thing to check when a client on this host cannot get a token.
+
 ### `dotvault browse`
 
 Open a URL in a browser, preferring a browser on the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.

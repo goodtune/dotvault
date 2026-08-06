@@ -45,6 +45,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -245,18 +246,25 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		cachedRejected = true
 	}
 
-	// Candidate 3: borrow from the peer socket. Best-effort — a missing/stale
-	// socket or an unauthenticated peer yields "" and falls through.
-	if c.cfg.Vault.TokenSocket != "" {
-		borrowed, _ := auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
-		if borrowed != "" && !seen[borrowed] {
-			if ok, unreachable := tryCandidate(borrowed); ok {
-				return nil
-			} else if unreachable != nil {
-				return unreachable
-			}
-			cachedRejected = true
+	// Candidate 3: borrow from a peer socket, local API socket first (see
+	// VaultConfig.APISocket for why that order). Best-effort — a
+	// missing/stale socket or an unauthenticated peer yields "" and falls
+	// through. Each distinct token is tried once: two sockets can front the
+	// same token (a local daemon that itself borrowed from the workstation),
+	// and re-validating an identical value would just be a wasted round trip.
+	sockets := c.cfg.Vault.borrowSockets()
+	for _, sock := range sockets {
+		borrowed, _ := auth.FetchTokenFromSocket(ctx, sock)
+		if borrowed == "" || seen[borrowed] {
+			continue
 		}
+		seen[borrowed] = true
+		if ok, unreachable := tryCandidate(borrowed); ok {
+			return nil
+		} else if unreachable != nil {
+			return unreachable
+		}
+		cachedRejected = true
 	}
 
 	if cachedRejected {
@@ -266,18 +274,18 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	}
 	// No source produced a token at all.
 	switch {
-	case c.cfg.TokenFile == "" && c.cfg.Vault.TokenSocket == "":
+	case c.cfg.TokenFile == "" && len(sockets) == 0:
 		return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
 			ErrLoginRequired)
 	case c.cfg.TokenFile == "":
-		return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket %s",
-			ErrLoginRequired, c.cfg.Vault.TokenSocket)
-	case c.cfg.Vault.TokenSocket == "":
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket(s) %s",
+			ErrLoginRequired, strings.Join(sockets, ", "))
+	case len(sockets) == 0:
 		return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
 			ErrLoginRequired, c.cfg.TokenFile)
 	default:
-		return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket %s",
-			ErrLoginRequired, c.cfg.TokenFile, c.cfg.Vault.TokenSocket)
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket(s) %s",
+			ErrLoginRequired, c.cfg.TokenFile, strings.Join(sockets, ", "))
 	}
 }
 
@@ -318,7 +326,7 @@ func (c *Client) manager() *auth.Manager {
 		AuthMount:        c.cfg.Vault.AuthMount,
 		AuthRole:         c.cfg.Vault.AuthRole,
 		OIDCCallbackPort: c.cfg.Vault.OIDCCallbackPort,
-		TokenSocket:      c.cfg.Vault.TokenSocket,
+		TokenSockets:     c.cfg.Vault.borrowSockets(),
 		Policy: auth.PolicyConstraint{
 			Policies:        c.cfg.Vault.Policies,
 			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,

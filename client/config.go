@@ -101,6 +101,36 @@ type VaultConfig struct {
 	// running the configured auth flow — the dotvault-to-dotvault sharing
 	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
 	TokenSocket string
+
+	// APISocket is an optional path to the *local* dotvault daemon's API
+	// socket (mirrors the api section: the resolved api.unix.path, or the
+	// per-user runtime default when api.enabled is set without a path).
+	//
+	// It is the same endpoint as TokenSocket and is tried ahead of it,
+	// because the two differ in lifetime rather than capability: the local
+	// socket is served by the long-lived per-user daemon, while TokenSocket
+	// is typically an SSH RemoteForward that vanishes when the session drops.
+	// A consumer started inside an SSH session therefore keeps borrowing
+	// successfully after that session ends.
+	//
+	// Borrow direction only. The peer actions (Browse / Notify / Clipboard)
+	// deliberately keep using TokenSocket: their whole purpose is to reach
+	// the workstation where a human is looking, and sending them to the local
+	// daemon would open a browser on the headless host nobody is sitting at.
+	APISocket string
+}
+
+// borrowSockets returns the ordered token-borrow candidates, most-stable
+// first. Mirrors config.TokenBorrowSockets on the internal side.
+func (v VaultConfig) borrowSockets() []string {
+	var out []string
+	if v.APISocket != "" {
+		out = append(out, v.APISocket)
+	}
+	if v.TokenSocket != "" {
+		out = append(out, v.TokenSocket)
+	}
+	return out
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -153,6 +183,14 @@ func LoadConfig(path string) (*Config, error) {
 // The internal loader has already applied defaults and normalisation
 // (KVMount, UserPrefix trailing slash), so this is a straight copy.
 func fromInternal(cfg *config.Config) *Config {
+	// A path-resolution failure (no resolvable home directory) degrades to
+	// "no local socket" rather than failing the load: borrowing is
+	// best-effort everywhere else too, and the remaining candidates still
+	// work.
+	apiSocket, err := cfg.APISocketPath()
+	if err != nil {
+		apiSocket = ""
+	}
 	return &Config{
 		Vault: VaultConfig{
 			Address:          cfg.Vault.Address,
@@ -165,6 +203,7 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 			TokenSocket:      cfg.Vault.TokenSocket,
+			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,
 			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,
 		},

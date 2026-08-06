@@ -107,6 +107,7 @@ type Config struct {
 	Web           WebConfig            `yaml:"web"`
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
+	API           APIConfig            `yaml:"api,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
@@ -318,6 +319,53 @@ type AgentConfig struct {
 	Unix    AgentUnixConfig    `yaml:"unix"`
 	Windows AgentWindowsConfig `yaml:"windows"`
 	Keys    []AgentKeySource   `yaml:"keys"`
+}
+
+// APIConfig configures the local API socket: the daemon's web API served over
+// a per-user Unix domain socket in addition to (or instead of) the loopback
+// TCP listener that web.enabled controls.
+//
+// It exists for the dotvault-to-dotvault token borrow. A workstation forwards
+// its web API to a remote host over an SSH RemoteForward, and processes on
+// that host borrow the live token via vault.token_socket — but the forwarded
+// socket dies with the SSH session, so a long-running process (a tmux job
+// that outlives the connection) loses its only source of tokens. Enabling
+// this makes the long-lived per-user daemon serve the same borrow endpoint
+// from a stable path that no disconnect can take away: the daemon keeps its
+// own token alive (re-borrowing across the forwarded socket when the SSH
+// session returns) and local clients borrow from it instead.
+//
+// Deliberately separate from web.enabled. The two surfaces have different
+// audiences and different exposure: the TCP listener is a browser UI
+// reachable by every uid on the box, while this socket is owner-only (0600 in
+// a 0700 directory) and carries no SPA. An operator who wants the borrow
+// endpoint on a headless host should not have to stand up a web UI to get it,
+// and enabling it does not widen what web.enabled already exposes.
+//
+// Unix only for now. Windows has no equivalent surface yet — the analogue
+// would be a named pipe with a protected DACL, mirroring the SSH agent's
+// listener — so enabling this on Windows logs a warning and serves nothing.
+// The nested `unix:` block (rather than a flat `path:`) is what leaves room
+// for a sibling `windows:` block to be added without reshaping the section
+// across YAML, the registry, and .reg.
+//
+// The inner fields deliberately omit `omitempty` for the same round-trip
+// reason as AgentConfig: an exported config must re-emit cleared optional
+// values so a re-import can blank a previously-set path. The top-level API
+// field keeps `omitempty` so operators who don't use the socket see no empty
+// block in downloads.
+type APIConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Unix    APIUnixConfig `yaml:"unix"`
+}
+
+// APIUnixConfig holds the Unix-domain-socket transport settings for the local
+// API surface.
+type APIUnixConfig struct {
+	// Path is the socket path. Empty resolves to the per-user runtime path
+	// at daemon-start time (see paths.DefaultAPISocket). A leading ~ is
+	// expanded, as it is for vault.token_socket.
+	Path string `yaml:"path"`
 }
 
 // AgentUnixConfig holds the Unix-domain-socket transport settings.
@@ -784,6 +832,13 @@ func (c *Config) validate() error {
 				return fmt.Errorf("agent.keys[%d]: invalid source %q (must be kv or vault-ca)", i, k.Source)
 			}
 		}
+	}
+
+	// Local API socket. Validated unconditionally (like the header checks
+	// above): a relative path is a mistake worth naming whether or not the
+	// section is currently enabled.
+	if err := c.validateAPI(); err != nil {
+		return err
 	}
 
 	// Remote-config validation (URL shape, refresh interval, header

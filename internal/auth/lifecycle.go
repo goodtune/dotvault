@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -34,13 +35,13 @@ type LifecycleManager struct {
 	// same stale value. Empty means no reload attempt is made.
 	tokenFilePath string
 
-	// tokenSocket is an optional path to a peer dotvault's web-API Unix
-	// socket. When set, tryReload also consults the peer for a fresh token
+	// tokenSockets is an ordered list of peer dotvault web-API Unix sockets.
+	// When non-empty, tryReload also consults each peer for a fresh token
 	// (after the file and env candidates) so a daemon whose token has gone
-	// invalid can recover by borrowing the peer's live token instead of
-	// forcing a re-auth. Empty disables the socket candidate. See
-	// FetchTokenFromSocket.
-	tokenSocket string
+	// invalid can recover by borrowing a peer's live token instead of
+	// forcing a re-auth. Empty disables the socket candidates. See
+	// FetchTokenFromSockets.
+	tokenSockets []string
 
 	// OnReauth, when non-nil, is invoked exactly once each time the
 	// manager transitions to the needs-reauth state. Used by web mode to
@@ -130,12 +131,12 @@ func (lm *LifecycleManager) SetTokenFilePath(p string) {
 	lm.tokenFilePath = p
 }
 
-// SetTokenSocket wires the path to a peer dotvault's web-API Unix socket so the
-// recovery path can borrow the peer's live token (dotvault-to-dotvault sharing)
+// SetTokenSockets wires the ordered peer dotvault web-API Unix sockets so the
+// recovery path can borrow a peer's live token (dotvault-to-dotvault sharing)
 // before declaring re-auth necessary. Empty disables it. See
-// FetchTokenFromSocket.
-func (lm *LifecycleManager) SetTokenSocket(p string) {
-	lm.tokenSocket = p
+// FetchTokenFromSockets.
+func (lm *LifecycleManager) SetTokenSockets(paths []string) {
+	lm.tokenSockets = paths
 }
 
 // SetOnReauth registers a callback fired when the manager transitions into
@@ -215,6 +216,30 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
 						lm.signalReauth(ctx, errCh, err)
 						lm.currentDelay = nextDelay
+					} else if IsRenewFailed(err) {
+						// The token still answers lookup-self — it just could
+						// not be extended. The common cause is a lease that
+						// has reached its max TTL, which no amount of retrying
+						// will fix: this token is now on a countdown to
+						// expiry. A peer may already hold a fresher one, so
+						// try a borrow now rather than waiting for the token
+						// to die and the recovery path to notice. tryReload
+						// only adopts a *different* token that passes
+						// lookup-self, so a failed attempt leaves the current
+						// (still working) token in place and we fall through
+						// to the normal backoff.
+						if lm.tryReload(ctx) {
+							lm.clearReauth()
+							lm.currentDelay = lm.checkInterval
+							timer.Reset(lm.currentDelay)
+							continue
+						}
+						nextDelay := lm.currentDelay * 2
+						if nextDelay > lm.maxDelay {
+							nextDelay = lm.maxDelay
+						}
+						slog.Warn("token renewal failed and no fresher token available, will retry", "error", err, "next_retry", nextDelay)
+						lm.currentDelay = nextDelay
 					} else {
 						// Transient error: backoff up to maxDelay.
 						nextDelay := lm.currentDelay * 2
@@ -281,7 +306,7 @@ func (lm *LifecycleManager) clearReauth() {
 func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 	// A reload has a candidate source if either a token file or a peer socket
 	// is configured. With neither there is nothing to pick up.
-	if lm.tokenFilePath == "" && lm.tokenSocket == "" {
+	if lm.tokenFilePath == "" && len(lm.tokenSockets) == 0 {
 		return false
 	}
 	current := lm.client.Token()
@@ -304,11 +329,11 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 		addCandidate(fileToken)
 	}
 	addCandidate(ReadTokenEnv())
-	// The peer socket is consulted last: a locally-written token (file/env,
+	// The peer sockets are consulted last: a locally-written token (file/env,
 	// e.g. from a parallel `dotvault login`) takes precedence over a borrowed
-	// one. Best-effort — a missing/stale socket yields no candidate.
-	if lm.tokenSocket != "" {
-		sockToken, _ := FetchTokenFromSocket(ctx, lm.tokenSocket)
+	// one. Best-effort — missing/stale sockets yield no candidate.
+	if len(lm.tokenSockets) > 0 {
+		sockToken, _ := FetchTokenFromSockets(ctx, lm.tokenSockets)
 		addCandidate(sockToken)
 	}
 	if len(candidates) == 0 {
@@ -424,7 +449,13 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 		_, err := lm.client.RenewSelf(ctx, 0)
 		if err != nil {
 			observability.RecordTokenRenewal(ctx, "failed")
-			return err
+			// Tagged so the Start loop can tell "the token is broken" from
+			// "the token is fine but could not be extended". The latter is
+			// terminal for this token — a lease at its max TTL never becomes
+			// renewable again — and is the one failure a peer borrow can
+			// actually fix. Wrapped, not replaced, so IsForbidden/IsExpired
+			// still see through it.
+			return &renewFailedError{err: err}
 		}
 		observability.RecordTokenRenewal(ctx, "renewed")
 		slog.Info("token renewed successfully")
@@ -458,4 +489,21 @@ func (*expiredError) Error() string { return "vault token has expired" }
 func IsExpired(err error) bool {
 	_, ok := err.(*expiredError)
 	return ok
+}
+
+// renewFailedError tags a RenewSelf failure on a token that is otherwise
+// still valid — lookup-self succeeded moments earlier in the same check.
+// It wraps the underlying error so IsForbidden/IsExpired still classify it.
+type renewFailedError struct{ err error }
+
+func (e *renewFailedError) Error() string { return "vault token renewal failed: " + e.err.Error() }
+func (e *renewFailedError) Unwrap() error { return e.err }
+
+// IsRenewFailed reports whether err came from a failed renewal of a token
+// that still passes lookup-self. The Start loop uses it to attempt a peer
+// borrow: a token at its max TTL cannot be extended, so the only way to stay
+// authenticated without an interactive login is to pick up someone else's.
+func IsRenewFailed(err error) bool {
+	var rfe *renewFailedError
+	return errors.As(err, &rfe)
 }

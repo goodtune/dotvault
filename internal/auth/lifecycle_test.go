@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -571,7 +572,7 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	// No token file and no DOTVAULT_TOKEN: the socket is the only candidate.
-	lm.SetTokenSocket(sock)
+	lm.SetTokenSockets([]string{sock})
 
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
@@ -980,5 +981,121 @@ func TestLifecycleManager_TransientErrorNoReauth(t *testing.T) {
 
 	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true, want false for transient (non-403) error")
+	}
+}
+
+// TestLifecycleManager_ReborrowsWhenRenewalFails covers the max-TTL case a
+// borrowed token eventually hits. lookup-self keeps succeeding — the token is
+// valid — but RenewSelf fails permanently, so waiting for the normal recovery
+// path would mean running the token to expiry first. The peer already holds a
+// fresher token, so the manager should pick it up while it still has a
+// working one.
+func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/auth/token/renew-self"):
+			// The lease is at its max TTL: renewal can never succeed again.
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string][]string{
+				"errors": {"lease is not renewable"},
+			})
+		default:
+			// Both the old and the fresh token look up fine. The old one
+			// reports a low TTL so the renew threshold is crossed.
+			ttl := json.Number("60")
+			if r.Header.Get("X-Vault-Token") == "fresh-token" {
+				ttl = json.Number("3600")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"ttl":          ttl,
+					"creation_ttl": json.Number("3600"),
+					"renewable":    true,
+				},
+			})
+		}
+	}))
+	defer ts.Close()
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"fresh-token"}`))
+	})
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "expiring-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	lm.SetTokenSockets([]string{sock})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	deadline := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if vc.Token() == "fresh-token" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := vc.Token(); got != "fresh-token" {
+		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", got)
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() = true, want false — the daemon recovered by borrowing")
+	}
+}
+
+// TestLifecycleManager_RenewalFailureKeepsWorkingToken is the other side of
+// the same behaviour: with no fresher token available, a failed renewal must
+// leave the current (still valid) token in place rather than clearing it.
+func TestLifecycleManager_RenewalFailureKeepsWorkingToken(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/auth/token/renew-self") {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"lease is not renewable"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"ttl":          json.Number("60"),
+				"creation_ttl": json.Number("3600"),
+				"renewable":    true,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "expiring-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
+	// No socket, no token file: nothing to swap to.
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+	<-ctx.Done()
+
+	if got := vc.Token(); got != "expiring-token" {
+		t.Errorf("client token = %q, want the original token retained", got)
 	}
 }

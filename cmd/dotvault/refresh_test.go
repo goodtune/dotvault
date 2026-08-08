@@ -339,6 +339,68 @@ func TestWarnSharedHeadersToOverriddenEndpoint(t *testing.T) {
 
 func boolPtrTest(b bool) *bool { return &b }
 
+// TestWarnDeprecatedObservabilityConfig covers the stage-one deprecation
+// gate: the WARN fires only when the master switch is on AND a shared
+// exporter field is in use, names every field in one line, stays silent for
+// the per-signal migration target, and returns exactly the fields the
+// caller must meter once the real provider is up.
+func TestWarnDeprecatedObservabilityConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.ObservabilityConfig
+		want []string
+	}{
+		{
+			name: "shared fields under enabled master warn",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer x"},
+			},
+			want: []string{"observability.endpoint", "observability.headers"},
+		},
+		{
+			name: "disabled master is silent even with shared fields",
+			cfg: config.ObservabilityConfig{
+				Endpoint: "shared:4317",
+			},
+			want: nil,
+		},
+		{
+			name: "per-signal-only config is silent",
+			cfg: config.ObservabilityConfig{
+				Enabled: true,
+				Metrics: config.ObservabilitySignalConfig{Endpoint: "metrics:4317"},
+			},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuf := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			got := warnDeprecatedObservabilityConfig(tc.cfg)
+
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("returned fields = %v, want %v", got, tc.want)
+			}
+			warned := strings.Contains(logBuf.String(), "deprecated shared observability fields")
+			if warned != (tc.want != nil) {
+				t.Errorf("warned = %v, want %v (log: %q)", warned, tc.want != nil, logBuf.String())
+			}
+			if tc.want != nil && !strings.Contains(logBuf.String(), "observability.endpoint") {
+				t.Error("warning must name the deprecated fields")
+			}
+			if strings.Contains(logBuf.String(), "Bearer x") {
+				t.Error("warning must never carry header values")
+			}
+		})
+	}
+}
+
 // TestStaticSectionsCoverConfig guards the static/dynamic split against
 // drift: every top-level config.Config field must be explicitly classified
 // here. A section added to config.Config without a decision fails this test

@@ -133,13 +133,16 @@ type Config struct {
 }
 
 // ObservabilityConfig configures the OpenTelemetry metric and log
-// exporters. The top-level fields are shared defaults for both signals —
-// Endpoint / Protocol / Insecure / Headers drive metrics and logs against
-// one collector, which is the common deployment. The nested Metrics and
-// Logs blocks override those defaults per signal, so the two can go to
-// separate backends (or one can be switched off) without duplicating the
-// shared case. Disabled by default — set Enabled and Endpoint (or the
-// standard OTEL_* env vars) to point the daemon at a local OTel collector.
+// exporters. Each signal is configured in its nested Metrics/Logs block, so
+// the two can go to separate backends or one can be switched off. The
+// top-level Endpoint / Protocol / Insecure / Headers fields are shared
+// defaults the signal blocks layer onto — still functional, but DEPRECATED
+// (staged removal, tracking issue #140): using them draws a startup WARN
+// plus a dotvault.config.deprecated increment per field (see
+// DeprecatedSharedFields), and 1.0 removes them in favour of per-signal-only
+// configuration with the OTEL_* env vars as the cross-signal sharing
+// mechanism. Disabled by default — set Enabled and a signal's Endpoint (or
+// the standard OTEL_* env vars) to point the daemon at an OTel collector.
 //
 // The layering deliberately mirrors the OTel SDK's own environment-variable
 // convention (generic OTEL_EXPORTER_OTLP_* plus signal-specific
@@ -304,6 +307,38 @@ func (o ObservabilityConfig) ResolveSignal(sig ObservabilitySignalConfig) Resolv
 // one place.
 func (o ObservabilityConfig) MetricsSignal() ResolvedSignal { return o.ResolveSignal(o.Metrics) }
 func (o ObservabilityConfig) LogsSignal() ResolvedSignal    { return o.ResolveSignal(o.Logs) }
+
+// DeprecatedSharedFields reports which of the deprecated shared exporter
+// fields are in use, as dotted YAML paths ("observability.endpoint", …).
+// The shared endpoint/protocol/insecure/headers layer is being retired in
+// stages in favour of the per-signal metrics:/logs: blocks: this release
+// warns and meters the usage, a later release makes the warning louder, and
+// 1.0 removes the fields. Enabled (the master switch) and export_interval
+// (which has no per-signal home yet) are not part of the deprecation.
+//
+// Detection is presence-based, matching what the fields can express:
+// endpoint/protocol when non-empty, insecure only when true (the shared
+// field is a plain bool, so an explicit false is indistinguishable from
+// unset), headers when non-empty (for the shared map, nil and {} mean the
+// same thing — only the per-signal maps carry the presence distinction).
+// The caller decides how to surface the result; this stays a pure query so
+// the config package does not log or meter.
+func (o ObservabilityConfig) DeprecatedSharedFields() []string {
+	var fields []string
+	if o.Endpoint != "" {
+		fields = append(fields, "observability.endpoint")
+	}
+	if o.Protocol != "" {
+		fields = append(fields, "observability.protocol")
+	}
+	if o.Insecure {
+		fields = append(fields, "observability.insecure")
+	}
+	if len(o.Headers) > 0 {
+		fields = append(fields, "observability.headers")
+	}
+	return fields
+}
 
 // validateOTLPProtocol accepts the OTel canonical names from the
 // OTEL_EXPORTER_OTLP_PROTOCOL spec, or empty (inherit / SDK default). One

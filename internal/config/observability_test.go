@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestResolveSignal pins the per-signal layering: the shared observability
@@ -95,6 +96,76 @@ func TestResolveSignal(t *testing.T) {
 			t.Error("signal enabled=true must not override observability.enabled=false")
 		}
 	})
+}
+
+// TestDeprecatedSharedFields pins the stage-one deprecation query: exactly
+// the four shared exporter fields count, detected by presence (insecure only
+// when true — the shared field is a plain bool, so an explicit false is
+// indistinguishable from unset), and per-signal configuration never trips
+// it — that is the migration target, not the deprecated surface.
+func TestDeprecatedSharedFields(t *testing.T) {
+	cases := []struct {
+		name string
+		obs  ObservabilityConfig
+		want []string
+	}{
+		{
+			name: "zero value has nothing deprecated",
+			obs:  ObservabilityConfig{Enabled: true},
+			want: nil,
+		},
+		{
+			name: "all four shared exporter fields",
+			obs: ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Protocol: "grpc",
+				Insecure: true,
+				Headers:  map[string]string{"Authorization": "Bearer x"},
+			},
+			want: []string{
+				"observability.endpoint",
+				"observability.protocol",
+				"observability.insecure",
+				"observability.headers",
+			},
+		},
+		{
+			name: "per-signal-only config is the migration target, not deprecated",
+			obs: ObservabilityConfig{
+				Enabled: true,
+				Metrics: ObservabilitySignalConfig{
+					Endpoint: "metrics:4317",
+					Protocol: "grpc",
+					Insecure: boolPtr(true),
+					Headers:  map[string]string{"X-Key": "m"},
+				},
+				Logs: ObservabilitySignalConfig{
+					Endpoint: "https://logs.vendor.example",
+					Protocol: "http/protobuf",
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "export_interval and enabled are not part of the deprecation",
+			obs:  ObservabilityConfig{Enabled: true, RawInterval: "30s", ExportInterval: 30 * time.Second},
+			want: nil,
+		},
+		{
+			name: "empty shared headers map is not a use",
+			obs:  ObservabilityConfig{Enabled: true, Headers: map[string]string{}},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.obs.DeprecatedSharedFields()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("DeprecatedSharedFields = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestValidateObservabilitySignals covers the new validation surface: bad

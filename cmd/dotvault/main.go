@@ -2681,6 +2681,7 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 	// config package owns those semantics (ResolveSignal) and the
 	// observability package deliberately consumes only resolved values.
 	warnSharedHeadersToOverriddenEndpoint(cfg)
+	deprecated := warnDeprecatedObservabilityConfig(cfg)
 	metrics := cfg.MetricsSignal()
 	logs := cfg.LogsSignal()
 	provider, err := observability.Init(initCtx, observability.Config{
@@ -2709,7 +2710,38 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 		slog.Error("failed to initialise observability, continuing without metrics", "error", err)
 		return &observability.Provider{}
 	}
+	// The counter half of the deprecation report waits for a successful
+	// Init — before that the instruments are bound to the no-op meter and
+	// the increments would vanish. The WARN half deliberately ran earlier,
+	// Init outcome regardless: an operator with a broken collector is
+	// exactly the operator who must not miss the migration pointer.
+	for _, field := range deprecated {
+		observability.RecordDeprecatedConfig(ctx, field)
+	}
 	return provider
+}
+
+// warnDeprecatedObservabilityConfig surfaces stage one of the shared-field
+// deprecation (#140): the top-level endpoint/protocol/insecure/headers layer
+// is being retired in favour of the per-signal metrics:/logs: blocks. Each
+// deprecated field in active use draws one WARN naming its replacement, and
+// the returned list feeds one dotvault.config.deprecated increment per field
+// once Init has bound the real meter — so an operator sees the migration
+// pointer locally even when the collector is down, and a fleet's collector
+// can measure how much of it still depends on the shared layer before the
+// removal release ships. Gated on the master switch: with observability
+// disabled the fields are inert and there is no exporter for the metric.
+func warnDeprecatedObservabilityConfig(cfg config.ObservabilityConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	deprecated := cfg.DeprecatedSharedFields()
+	if len(deprecated) == 0 {
+		return nil
+	}
+	slog.Warn("deprecated shared observability fields in use; move these settings into the per-signal metrics:/logs: blocks (or the standard OTEL_EXPORTER_OTLP_* env vars) — the shared exporter fields will be removed in a future release",
+		"fields", strings.Join(deprecated, ", "))
+	return deprecated
 }
 
 // warnSharedHeadersToOverriddenEndpoint flags the cross-backend credential

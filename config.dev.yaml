@@ -19,24 +19,24 @@ web:
   listen: "127.0.0.1:9000"
 
 # Observability is opt-in. Uncomment and point at a local OTel
-# collector to exercise the metric exporter end-to-end. The Endpoint
-# field accepts a host:port for gRPC (default) or a full URL for
-# http/protobuf.
+# collector to exercise the exporters end-to-end. Each signal is
+# configured in its own block; the endpoint accepts a host:port for
+# gRPC (default) or a full URL for http/protobuf. Top-level shared
+# endpoint/protocol/insecure/headers still work but are deprecated
+# (startup WARN + dotvault.config.deprecated metric; see issue #140).
 #
 # observability:
 #   enabled: true
-#   endpoint: "127.0.0.1:4317"   # shared default for both signals
-#   protocol: "grpc"
-#   insecure: true
 #   export_interval: "15s"
-#   # Per-signal overrides: send logs to a different backend, or switch one
-#   # signal off. Headers REPLACE the shared map (no merging).
-#   # metrics:
-#   #   enabled: true
+#   metrics:
+#     endpoint: "127.0.0.1:4317"
+#     protocol: "grpc"
+#     insecure: true
+#   # Send logs to a different backend, or switch a signal off with
+#   # enabled: false. Per-signal headers REPLACE any shared map (no merging).
 #   # logs:
 #   #   endpoint: "https://logs.vendor.example"
 #   #   protocol: "http/protobuf"
-#   #   insecure: false
 #   #   headers:
 #   #     X-Api-Key: "logs-key"
 

@@ -3,6 +3,7 @@
 package config
 
 import (
+	"reflect"
 	"testing"
 
 	"golang.org/x/sys/windows/registry"
@@ -178,6 +179,17 @@ func TestApplyRegistryLayerObservability(t *testing.T) {
 	}
 	if cfg.Observability.RawInterval != "30s" {
 		t.Errorf("RawInterval = %q, want %q", cfg.Observability.RawInterval, "30s")
+	}
+
+	// GPO parity for the shared-field deprecation (#140): registry-authored
+	// top-level values land on the same struct fields as YAML, so they must
+	// trip the same DeprecatedSharedFields query — endpoint and protocol
+	// here, but not the explicit Insecure=0 DWORD, which loads as the
+	// default false and is presence-wise indistinguishable from absent.
+	got := cfg.Observability.DeprecatedSharedFields()
+	want := []string{"observability.endpoint", "observability.protocol"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("DeprecatedSharedFields = %v, want %v", got, want)
 	}
 }
 

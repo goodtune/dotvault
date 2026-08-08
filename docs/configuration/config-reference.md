@@ -279,17 +279,20 @@ On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ
 
 ## Observability section
 
-Exports OpenTelemetry **metrics and logs** over OTLP. The top-level fields are shared defaults driving both signals against one collector; the nested `metrics:` and `logs:` blocks override them per signal, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
+Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured in its own nested `metrics:` / `logs:` block, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch for both signals. A per-signal `enabled: true` cannot resurrect a disabled subsystem |
-| `endpoint` | string | — | OTLP collector endpoint. For `http/protobuf` this must be a *base* URL (the exporters append `/v1/metrics` and `/v1/logs` themselves) |
-| `protocol` | string | — | `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
-| `insecure` | bool | `false` | Disable transport TLS |
-| `headers` | map | — | OTLP headers, typically a vendor bearer token — treat as a credential |
-| `export_interval` | string | SDK default | Metric export cadence as a Go duration (e.g. `30s`) |
-| `metrics` / `logs` | block | — | Per-signal overrides, fields below |
+| `endpoint` | string | — | **Deprecated** shared default (see note below). OTLP collector endpoint. For `http/protobuf` this must be a *base* URL (the exporters append `/v1/metrics` and `/v1/logs` themselves) |
+| `protocol` | string | — | **Deprecated** shared default. `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
+| `insecure` | bool | `false` | **Deprecated** shared default. Disable transport TLS |
+| `headers` | map | — | **Deprecated** shared default. OTLP headers, typically a vendor bearer token — treat as a credential |
+| `export_interval` | string | SDK default | Metric export cadence as a Go duration (e.g. `30s`). Not deprecated |
+| `metrics` / `logs` | block | — | Per-signal configuration, fields below — the supported home for exporter settings |
+
+!!! warning "Shared exporter fields are deprecated"
+    The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work as shared defaults the per-signal blocks layer onto, but they are being retired in stages ([#140](https://github.com/goodtune/dotvault/issues/140)): this release warns at startup and counts each use on the `dotvault.config.deprecated` metric (attribute `field`), a later release makes the warning louder, and 1.0 removes them. Configure each signal in its own block, or use the standard `OTEL_EXPORTER_OTLP_*` environment variables for values shared across both signals — the env-var fallthrough remains fully supported.
 
 Per-signal override block (`metrics:` / `logs:`):
 
@@ -304,17 +307,19 @@ Per-signal override block (`metrics:` / `logs:`):
 ```yaml
 observability:
   enabled: true
-  endpoint: https://otel.internal.example      # metrics stay here
-  protocol: http/protobuf
-  headers:
-    authorization: "Bearer metrics-token"
+  metrics:
+    endpoint: https://otel.internal.example
+    protocol: http/protobuf
+    headers:
+      authorization: "Bearer metrics-token"
   logs:
-    endpoint: https://logs.vendor.example      # logs go elsewhere
-    headers:                                   # and carry their own credentials
+    endpoint: https://logs.vendor.example      # separate backend
+    protocol: http/protobuf
+    headers:                                   # with its own credentials
       x-api-key: "logs-token"
 ```
 
-A signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
+While the deprecated shared fields remain in play, a signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
 
 ## Remote config section
 

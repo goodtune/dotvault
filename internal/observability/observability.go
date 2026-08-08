@@ -482,6 +482,7 @@ var (
 	configReloads   metric.Int64Counter
 	remoteFetches   metric.Int64Counter
 	sighupAttempts  metric.Int64Counter
+	deprecatedUses  metric.Int64Counter
 )
 
 func init() {
@@ -553,6 +554,16 @@ func rebindInstruments() {
 		// reload's outcome lands on dotvault.config.reloads; static
 		// config sections still require a daemon restart.
 		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate dotvault-token file re-read and config reload; static config sections still require a daemon restart."),
+	)
+	deprecatedUses, _ = meter.Int64Counter(
+		"dotvault.config.deprecated",
+		// The fleet-visibility side of a staged config deprecation:
+		// each process start that finds a deprecated field in active use
+		// adds one per field, so a collector-side sum grouped by `field`
+		// shows how much of the fleet still needs migrating before the
+		// removal release can ship. Bounded cardinality — the attribute
+		// values are a fixed set of config paths, never user content.
+		metric.WithDescription("Deprecated configuration fields in active use, counted once per process start, by field"),
 	)
 }
 
@@ -696,6 +707,22 @@ func RecordSIGHUP(ctx context.Context) {
 		return
 	}
 	c.Add(ctx, 1)
+}
+
+// RecordDeprecatedConfig records one deprecated configuration field found
+// in active use, by its dotted YAML path (e.g. "observability.endpoint").
+// Called once per field per process start, so a collector-side sum grouped
+// by `field` measures fleet-wide migration progress ahead of the field's
+// removal release. Pass only fixed config paths — never user-supplied
+// values — to keep the attribute cardinality bounded.
+func RecordDeprecatedConfig(ctx context.Context, field string) {
+	instrMu.RLock()
+	c := deprecatedUses
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("field", field)))
 }
 
 // LogRegistryConfigManaged emits a WARN-severity OTel log record

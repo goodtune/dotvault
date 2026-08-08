@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -69,6 +70,7 @@ func TestRecordReachesActiveMeterProvider(t *testing.T) {
 	RecordSyncTick(ctx, "ok")
 	RecordVaultCall(ctx, "read", "ok")
 	RecordEnrolAttempt(ctx, "ssh", "completed")
+	RecordDeprecatedConfig(ctx, "observability.endpoint")
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
@@ -76,6 +78,7 @@ func TestRecordReachesActiveMeterProvider(t *testing.T) {
 	}
 
 	counters := map[string]int64{}
+	deprecatedHasFieldAttr := false
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			sum, ok := m.Data.(metricdata.Sum[int64])
@@ -85,15 +88,27 @@ func TestRecordReachesActiveMeterProvider(t *testing.T) {
 			var total int64
 			for _, dp := range sum.DataPoints {
 				total += dp.Value
+				if m.Name == "dotvault.config.deprecated" {
+					if v, ok := dp.Attributes.Value(attribute.Key("field")); ok && v.AsString() == "observability.endpoint" {
+						deprecatedHasFieldAttr = true
+					}
+				}
 			}
 			counters[m.Name] = total
 		}
+	}
+	// The field attribute is the fleet-migration contract for
+	// dotvault.config.deprecated — a collector-side sum grouped by `field`
+	// only measures anything if the attribute is actually attached.
+	if !deprecatedHasFieldAttr {
+		t.Error(`dotvault.config.deprecated datapoint lacks the field="observability.endpoint" attribute`)
 	}
 
 	for _, name := range []string{
 		"dotvault.sync.ticks",
 		"dotvault.vault.calls",
 		"dotvault.enrol.attempts",
+		"dotvault.config.deprecated",
 	} {
 		if counters[name] < 1 {
 			t.Errorf("counter %q = %d, want ≥1 — rebindInstruments did not wire it to the active provider", name, counters[name])

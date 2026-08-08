@@ -258,33 +258,27 @@ There is no file-based logging — integrate with your platform's log collection
 
 ## Observability
 
-dotvault can export OpenTelemetry **metrics and logs** to an OTel collector. The top-level fields of the `observability:` block are shared defaults driving both signals against one endpoint — the common deployment — and the nested `metrics:` / `logs:` blocks override them per signal, so the two can go to **separate backends** or one can be switched off. Disabled by default; enable with:
+dotvault can export OpenTelemetry **metrics and logs** to an OTel collector. Each signal is configured in its own nested block — `metrics:` and `logs:` — so the two can go to **separate backends** or one can be switched off independently. Disabled by default; enable with:
 
 ```yaml
 observability:
-  enabled: true
-  endpoint: "127.0.0.1:4317"  # shared default for both signals
-  protocol: "grpc"            # or "http/protobuf"
-  insecure: true              # disable TLS for the local hop
-  export_interval: "15s"      # metric export cadence
-  # headers:
-  #   authorization: "Bearer …"
-```
-
-Per-signal overrides layer onto those shared fields — the model deliberately mirrors the OTel SDK's own env-var convention (generic `OTEL_EXPORTER_OTLP_*` plus signal-specific `OTEL_EXPORTER_OTLP_METRICS_*` / `_LOGS_*`), so an operator who knows one knows both:
-
-```yaml
-observability:
-  enabled: true
-  endpoint: "127.0.0.1:4317"          # metrics keep using this…
-  insecure: true
-  logs:                                # …while logs go to a vendor backend
+  enabled: true                  # master switch for both signals
+  export_interval: "15s"         # metric export cadence
+  metrics:
+    endpoint: "127.0.0.1:4317"
+    protocol: "grpc"             # or "http/protobuf"
+    insecure: true               # disable TLS for the local hop
+  logs:
     endpoint: "https://logs.vendor.example"
     protocol: "http/protobuf"
-    insecure: false
     headers:
       X-Api-Key: "logs-backend-key"
 ```
+
+The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work as shared defaults that the per-signal blocks layer onto — the model deliberately mirrors the OTel SDK's own env-var convention (generic `OTEL_EXPORTER_OTLP_*` plus signal-specific `OTEL_EXPORTER_OTLP_METRICS_*` / `_LOGS_*`) — but they are **deprecated** and being retired in stages:
+
+!!! warning "Shared exporter fields are deprecated"
+    Setting `observability.endpoint`, `protocol`, `insecure`, or `headers` at the top level (with observability enabled) logs a startup WARN naming the fields and increments the `dotvault.config.deprecated` counter once per field per process start, so a fleet's collector can measure migration progress. Everything keeps working for now; a later release makes the warning louder and 1.0 removes the shared fields. Move the settings into the per-signal `metrics:` / `logs:` blocks — or, for values shared across both signals (a common bearer token, a common collector), use the standard `OTEL_EXPORTER_OTLP_*` environment variables, which remain fully supported. Tracked in [#140](https://github.com/goodtune/dotvault/issues/140).
 
 Field semantics: `enabled` (unset = on whenever `observability.enabled` is; explicit `false` switches that signal off — the top-level flag remains the master switch and a per-signal `true` cannot resurrect a disabled subsystem), `endpoint` / `protocol` (non-empty overrides), `insecure` (set overrides), and `headers`, which **replace the shared map wholesale** rather than merging — merging credential maps invites sending one backend's bearer token to the other. An explicitly empty `headers: {}` therefore means "this signal sends no headers" even when the shared map is populated. Watch the inverse case, too: a signal that overrides `endpoint` but leaves `headers` unset inherits the shared map — shared bearer token included — and sends it to the new backend. The daemon warns at startup when it sees that combination; set an explicit per-signal `headers:` (`{}` for none) to state the intent and silence it. Enabling `observability.enabled` with both signals explicitly off is rejected at config load as the contradiction it is.
 
@@ -295,7 +289,7 @@ Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op i
 !!! note "Windows Group Policy"
     The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`), with the per-signal overrides as `Observability\Metrics` / `Observability\Logs` subkeys (tri-state `Enabled`/`Insecure` DWORDs, and their own `Headers` subkeys — a present-but-empty per-signal `Headers` key means "no headers for this signal", distinct from an absent key meaning inherit). Header values round-trip too (as REG_SZ values under the respective `Headers` keys), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.
 
-The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the `endpoint`/`headers` fields can be left empty and managed centrally via `/etc/default/dotvault`.
+The standard `OTEL_*` environment variables (generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS`, and the signal-specific `_METRICS_*` / `_LOGS_*` variants) are honoured by the SDK whenever the corresponding config field is empty, so endpoint and header configuration can live entirely outside the config file. Put credential-bearing values (`OTEL_EXPORTER_OTLP_HEADERS`) in the per-user `EnvironmentFile` (`~/.config/dotvault/env`, mode 0600) rather than a world-readable location — this is the recommended way to share a token across both signals without it appearing in any config artefact, and it is where the shared-field deprecation steers that use case.
 
 The exporter emits a bounded set of instruments:
 
@@ -310,6 +304,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
 | `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read and config reload |
+| `dotvault.config.deprecated`    | counter   | `field` — deprecated config fields in active use, one increment per field per process start; sum by `field` to measure fleet migration progress |
 
 ### Log records
 

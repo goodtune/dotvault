@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"time"
 
 	otellog "go.opentelemetry.io/otel/log"
@@ -175,7 +177,11 @@ func slogValueToOTel(v slog.Value) otellog.Value {
 	case slog.KindTime:
 		return otellog.StringValue(v.Time().Format(time.RFC3339Nano))
 	case slog.KindUint64:
-		return otellog.Int64Value(int64(v.Uint64()))
+		u := v.Uint64()
+		if u <= math.MaxInt64 {
+			return otellog.Int64Value(int64(u))
+		}
+		return otellog.StringValue(strconv.FormatUint(u, 10))
 	case slog.KindGroup:
 		group := v.Group()
 		kvs := make([]otellog.KeyValue, 0, len(group))

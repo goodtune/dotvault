@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"math"
 	"testing"
 
 	otellog "go.opentelemetry.io/otel/log"
@@ -207,6 +208,26 @@ func TestSlogValueToOTelAnyFallback(t *testing.T) {
 	}
 	if bytes.Contains([]byte(got), []byte("internal")) {
 		t.Errorf("json fallback = %q, leaked the unexported field", got)
+	}
+}
+
+// TestSlogValueToOTelUint64Overflow confirms a uint64 that exceeds
+// math.MaxInt64 is rendered as its decimal string rather than silently
+// wrapping to a negative int64, which would corrupt any logged
+// counter/size that crosses 2^63-1.
+func TestSlogValueToOTelUint64Overflow(t *testing.T) {
+	const big uint64 = math.MaxInt64 + 1 // 9223372036854775808
+
+	got := slogValueToOTel(slog.Uint64Value(big))
+	if got.Kind() != otellog.KindString {
+		t.Fatalf("kind = %v, want KindString", got.Kind())
+	}
+	if want := "9223372036854775808"; got.AsString() != want {
+		t.Errorf("value = %q, want %q", got.AsString(), want)
+	}
+
+	if got := slogValueToOTel(slog.Uint64Value(math.MaxInt64)); got.Kind() != otellog.KindInt64 || got.AsInt64() != math.MaxInt64 {
+		t.Errorf("in-range uint64 = %v, want Int64Value(%d)", got, int64(math.MaxInt64))
 	}
 }
 

@@ -785,6 +785,9 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		if err := apply(&sig.cfg.Protocol, sigKey, "Protocol"); err != nil {
 			return err
 		}
+		if err := apply(&sig.cfg.Temporality, sigKey, "Temporality"); err != nil {
+			return err
+		}
 		sigHeadersKey := sigKey + `\Headers`
 		var sigHeaders map[string]string
 		if seenKeys[sigHeadersKey] {

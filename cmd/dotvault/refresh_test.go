@@ -14,6 +14,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/sync"
 )
 
@@ -338,6 +339,37 @@ func TestWarnSharedHeadersToOverriddenEndpoint(t *testing.T) {
 }
 
 func boolPtrTest(b bool) *bool { return &b }
+
+// TestResolvedSignalLockstep guards the one lockstep pair with no other
+// drift detection: config.ResolvedSignal and observability.Signal are
+// deliberately separate structs (the observability package must not import
+// config), bridged by a field-by-field copy in initObservability that
+// compiles silently if a field is added on one side and forgotten on the
+// other. Matching field-name sets won't catch a forgotten copy line, but
+// they catch the far more likely failure of the structs themselves
+// drifting.
+func TestResolvedSignalLockstep(t *testing.T) {
+	fieldNames := func(v any) map[string]bool {
+		names := map[string]bool{}
+		typ := reflect.TypeOf(v)
+		for i := 0; i < typ.NumField(); i++ {
+			names[typ.Field(i).Name] = true
+		}
+		return names
+	}
+	resolved := fieldNames(config.ResolvedSignal{})
+	signal := fieldNames(observability.Signal{})
+	for name := range resolved {
+		if !signal[name] {
+			t.Errorf("config.ResolvedSignal.%s has no observability.Signal counterpart; add it (and the copy in initObservability) or record the exception here", name)
+		}
+	}
+	for name := range signal {
+		if !resolved[name] {
+			t.Errorf("observability.Signal.%s has no config.ResolvedSignal counterpart; add it (and the copy in initObservability) or record the exception here", name)
+		}
+	}
+}
 
 // TestWarnDeprecatedObservabilityConfig covers the stage-one deprecation
 // gate: the WARN fires only when the master switch is on AND a shared

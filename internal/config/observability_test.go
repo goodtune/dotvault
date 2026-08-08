@@ -37,19 +37,21 @@ func TestResolveSignal(t *testing.T) {
 			},
 		},
 		{
-			name: "separate backend overrides endpoint, protocol, insecure, headers",
+			name: "separate backend overrides endpoint, protocol, insecure, headers, temporality",
 			sig: ObservabilitySignalConfig{
-				Endpoint: "https://logs.vendor.example",
-				Protocol: "http/protobuf",
-				Insecure: boolPtr(false),
-				Headers:  map[string]string{"X-Api-Key": "logs-key"},
+				Endpoint:    "https://logs.vendor.example",
+				Protocol:    "http/protobuf",
+				Insecure:    boolPtr(false),
+				Headers:     map[string]string{"X-Api-Key": "logs-key"},
+				Temporality: "delta",
 			},
 			want: ResolvedSignal{
-				Enabled:  true,
-				Endpoint: "https://logs.vendor.example",
-				Protocol: "http/protobuf",
-				Insecure: false,
-				Headers:  map[string]string{"X-Api-Key": "logs-key"},
+				Enabled:     true,
+				Endpoint:    "https://logs.vendor.example",
+				Protocol:    "http/protobuf",
+				Insecure:    false,
+				Headers:     map[string]string{"X-Api-Key": "logs-key"},
+				Temporality: "delta",
 			},
 		},
 		{
@@ -224,6 +226,45 @@ func TestValidateObservabilitySignals(t *testing.T) {
 		}
 		if err := c.Validate(); err != nil {
 			t.Errorf("Validate: %v", err)
+		}
+	})
+
+	t.Run("valid metrics temporality values pass", func(t *testing.T) {
+		for _, v := range []string{"", "cumulative", "delta", "lowmemory", "Delta"} {
+			c := base()
+			c.Observability = ObservabilityConfig{
+				Enabled: true,
+				Metrics: ObservabilitySignalConfig{Temporality: v},
+			}
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate with metrics.temporality=%q: %v", v, err)
+			}
+		}
+	})
+
+	t.Run("bad metrics temporality names the field", func(t *testing.T) {
+		c := base()
+		c.Observability = ObservabilityConfig{
+			Enabled: true,
+			Metrics: ObservabilitySignalConfig{Temporality: "sideways"},
+		}
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "observability.metrics.temporality") {
+			t.Errorf("err = %v, want a message naming observability.metrics.temporality", err)
+		}
+	})
+
+	t.Run("temporality on the log signal is rejected", func(t *testing.T) {
+		// Temporality is a metric concept; silently ignoring it on logs
+		// would let the operator believe a setting took effect.
+		c := base()
+		c.Observability = ObservabilityConfig{
+			Enabled: true,
+			Logs:    ObservabilitySignalConfig{Temporality: "delta"},
+		}
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "observability.logs.temporality") {
+			t.Errorf("err = %v, want a message naming observability.logs.temporality", err)
 		}
 	})
 }

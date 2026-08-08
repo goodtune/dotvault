@@ -99,12 +99,18 @@ type Signal struct {
 	// Provider.
 	Enabled bool
 
-	// Endpoint is the OTLP collector address for this signal. For gRPC:
-	// "host:port" (e.g. "localhost:4317"). For HTTP: a *base* URL with no
-	// signal-specific path (e.g. "https://otel.example") — the exporters
-	// append "/v1/metrics" and "/v1/logs" themselves. Passing a URL that
-	// already ends in a signal-specific path routes the signal to the
-	// wrong route on the collector. When empty the SDK falls through to
+	// Endpoint is the OTLP collector address for this signal, and both
+	// signals share one contract. A full URL with a scheme is the
+	// recommended form: the scheme carries the TLS intent (https → TLS,
+	// http → plaintext) and an explicit path is used verbatim — no mount
+	// path is assumed, so a vendor route like
+	// "https://collector.example/tenant/v1/metrics" works as written. A
+	// URL without a path gets the OTLP standard "/v1/metrics" /
+	// "/v1/logs" appended (http/protobuf only; gRPC has no URL path).
+	// Bare "host:port" also works — canonical for gRPC — with TLS then
+	// governed by Insecure. A "grpc://" prefix is tolerated and stripped
+	// (carrying no TLS meaning); "dns:///" is preserved as a gRPC
+	// resolver target. When empty the SDK falls through to
 	// OTEL_EXPORTER_OTLP_ENDPOINT (and the signal-specific
 	// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT / _LOGS_ENDPOINT variants).
 	Endpoint string
@@ -113,9 +119,18 @@ type Signal struct {
 	// "http/protobuf".
 	Protocol string
 
-	// Insecure disables transport security for the gRPC exporter
-	// (HTTP/protobuf carries this via the endpoint scheme).
+	// Insecure disables transport security. Meaningful for scheme-less
+	// endpoints; an endpoint URL's scheme already carries the TLS intent,
+	// and Insecure true additionally forces plaintext over it.
 	Insecure bool
+
+	// Temporality is the metric temporality preference: "cumulative",
+	// "delta", or "lowmemory", mirroring the vocabulary (and instrument-
+	// kind mapping) of OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE.
+	// Empty falls through to that env var, then the SDK default
+	// (cumulative). Metrics-only — config validation rejects it on the
+	// log signal, and buildLogExporter ignores it.
+	Temporality string
 
 	// Headers are attached to every export request for this signal —
 	// useful for authenticating to a collector that fronts a vendor
@@ -322,11 +337,26 @@ func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, e
 
 	protocol := resolveProtocol(sig.Protocol, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
 
+	temporality, err := temporalitySelector(sig.Temporality)
+	if err != nil {
+		return nil, err
+	}
+
 	switch protocol {
 	case "grpc":
 		opts := []otlpmetricgrpc.Option{}
 		if sig.Endpoint != "" {
-			opts = append(opts, otlpmetricgrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			// An http(s) scheme carries the TLS intent (WithEndpointURL
+			// derives insecure from it), matching the http/protobuf path
+			// below so the scheme means the same thing on every protocol.
+			// Other prefixes keep the historical handling: grpc:// is
+			// stripped, dns:/// passes through as a gRPC resolver target.
+			if hasHTTPScheme(sig.Endpoint) {
+				warnGRPCSchemeDowngrade("metrics", sig)
+				opts = append(opts, otlpmetricgrpc.WithEndpointURL(sig.Endpoint))
+			} else {
+				opts = append(opts, otlpmetricgrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			}
 		}
 		if sig.Insecure {
 			opts = append(opts, otlpmetricgrpc.WithInsecure())
@@ -334,24 +364,25 @@ func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, e
 		if len(sig.Headers) > 0 {
 			opts = append(opts, otlpmetricgrpc.WithHeaders(sig.Headers))
 		}
+		if temporality != nil {
+			opts = append(opts, otlpmetricgrpc.WithTemporalitySelector(temporality))
+		}
 		return otlpmetricgrpc.New(ctx, opts...)
 	case "http/protobuf":
 		opts := []otlpmetrichttp.Option{}
 		if sig.Endpoint != "" {
 			// otlpmetrichttp distinguishes endpoint vs URL: WithEndpoint
 			// takes host[:port], WithEndpointURL takes a fully-qualified
-			// URL. The user-facing config is a single field, so we infer
-			// which to call from the literal presence of "://": url.Parse
-			// will happily report `Scheme: "127.0.0.1"` for `127.0.0.1:4317`
-			// (interpreting the colon as a scheme separator), so a
-			// Scheme-only check would misroute host:port values to
-			// WithEndpointURL and produce a confusing init failure. The
-			// substring check is what the OTel SDK's own env-var loader
-			// does internally for the same reason.
-			if strings.Contains(sig.Endpoint, "://") {
+			// URL. The single user-facing field routes on hasHTTPScheme —
+			// the same predicate as the gRPC branch, so the scheme means
+			// the same thing on every protocol — with anything else
+			// treated as a dial target (a stray grpc:// stripped rather
+			// than fed to WithEndpointURL, where its non-https scheme
+			// would silently select plaintext).
+			if hasHTTPScheme(sig.Endpoint) {
 				opts = append(opts, otlpmetrichttp.WithEndpointURL(sig.Endpoint))
 			} else {
-				opts = append(opts, otlpmetrichttp.WithEndpoint(sig.Endpoint))
+				opts = append(opts, otlpmetrichttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}
 		}
 		if sig.Insecure {
@@ -359,6 +390,9 @@ func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, e
 		}
 		if len(sig.Headers) > 0 {
 			opts = append(opts, otlpmetrichttp.WithHeaders(sig.Headers))
+		}
+		if temporality != nil {
+			opts = append(opts, otlpmetrichttp.WithTemporalitySelector(temporality))
 		}
 		return otlpmetrichttp.New(ctx, opts...)
 	default:
@@ -385,14 +419,72 @@ func warnInsecureHeaders(signal string, sig Signal) {
 }
 
 // insecureHeaderFootgun is the predicate behind warnInsecureHeaders, split
-// out so the condition is testable without capturing log output.
+// out so the condition is testable without capturing log output. Plaintext
+// transport arrives two ways — the Insecure flag, or an explicit http://
+// scheme on the endpoint (which WithEndpointURL translates to insecure on
+// every protocol) — and the guard must catch both, or the recommended
+// full-URL form would be exactly the shape that ships a bearer token over
+// cleartext unwarned.
 func insecureHeaderFootgun(sig Signal) bool {
-	return sig.Insecure && len(sig.Headers) > 0
+	plaintext := sig.Insecure || strings.HasPrefix(sig.Endpoint, "http://")
+	return plaintext && len(sig.Headers) > 0
+}
+
+// warnGRPCSchemeDowngrade flags the one shape whose meaning this release
+// changed: a gRPC endpoint written as "http://host:port". Previous releases
+// stripped the scheme and attempted TLS; the scheme now selects plaintext,
+// matching http/protobuf. A config that was (mis)written that way against a
+// TLS collector will stop exporting and start sending its HTTP/2 preface —
+// headers included — in cleartext, so the change must be loud: one WARN per
+// exporter build naming the fix for each intent.
+func warnGRPCSchemeDowngrade(signal string, sig Signal) {
+	if strings.HasPrefix(sig.Endpoint, "http://") {
+		slog.Warn("gRPC OTLP endpoint has an http:// scheme, which now selects PLAINTEXT transport (earlier releases ignored the scheme and used TLS) — use https:// or drop the scheme to keep TLS, or keep http:// if plaintext is intended", "signal", signal)
+	}
+}
+
+// temporalitySelector maps the configured temporality preference onto the
+// SDK selector, using the exact vocabulary and instrument-kind mapping of
+// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE so an operator who knows
+// the env var knows the config field: "cumulative" (everything cumulative,
+// the OTLP default), "delta" (counters, observable counters, and histograms
+// delta; up-down counters stay cumulative), "lowmemory" (only synchronous
+// counters and histograms delta). Empty returns a nil selector — the option
+// is then not passed at all, so the SDK's own env-var reading applies,
+// consistent with every other empty exporter field. A non-empty value
+// overrides the env var, also like every other field. An unknown value is a
+// config error surfaced at Init rather than the env var's warn-and-ignore,
+// because a config file is validated where an ambient variable is tolerated.
+func temporalitySelector(preference string) (sdkmetric.TemporalitySelector, error) {
+	switch strings.ToLower(strings.TrimSpace(preference)) {
+	case "":
+		return nil, nil
+	case "cumulative":
+		return sdkmetric.DefaultTemporalitySelector, nil
+	case "delta":
+		return sdkmetric.DeltaTemporalitySelector, nil
+	case "lowmemory":
+		return sdkmetric.LowMemoryTemporalitySelector, nil
+	default:
+		return nil, fmt.Errorf("unsupported metric temporality %q (use cumulative, delta, or lowmemory)", preference)
+	}
+}
+
+// hasHTTPScheme reports whether an endpoint is written as a full http(s)
+// URL — the form whose scheme carries the TLS intent on every protocol.
+// Deliberately a prefix check, not url.Parse: parsing "127.0.0.1:4317"
+// yields Scheme "127.0.0.1", so a parse-based check would misclassify the
+// canonical host:port form.
+func hasHTTPScheme(s string) bool {
+	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
 }
 
 // stripScheme normalises an OTLP gRPC endpoint by removing a
 // URL-style scheme so the underlying gRPC dialer receives a bare
 // host:port (which is what otlpmetricgrpc.WithEndpoint expects).
+// http(s):// endpoints are routed through WithEndpointURL before this
+// runs (their scheme carries TLS intent); this handles the leftovers —
+// grpc:// is stripped as a tolerated no-meaning prefix.
 //
 // dns:/// is deliberately preserved: it is a valid gRPC resolver
 // prefix (not a URL scheme) that enables the DNS resolver for
@@ -449,7 +541,15 @@ func buildLogExporter(ctx context.Context, sig Signal) (sdklog.Exporter, error) 
 	case "grpc":
 		opts := []otlploggrpc.Option{}
 		if sig.Endpoint != "" {
-			opts = append(opts, otlploggrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			// Same scheme contract as the metric exporter: http(s) URLs
+			// carry TLS intent via WithEndpointURL, everything else is a
+			// dial target (grpc:// stripped, dns:/// preserved).
+			if hasHTTPScheme(sig.Endpoint) {
+				warnGRPCSchemeDowngrade("logs", sig)
+				opts = append(opts, otlploggrpc.WithEndpointURL(sig.Endpoint))
+			} else {
+				opts = append(opts, otlploggrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			}
 		}
 		if sig.Insecure {
 			opts = append(opts, otlploggrpc.WithInsecure())
@@ -461,10 +561,13 @@ func buildLogExporter(ctx context.Context, sig Signal) (sdklog.Exporter, error) 
 	case "http/protobuf":
 		opts := []otlploghttp.Option{}
 		if sig.Endpoint != "" {
-			if strings.Contains(sig.Endpoint, "://") {
+			// Same routing as the metric http branch: hasHTTPScheme →
+			// full URL, anything else a dial target with stray schemes
+			// stripped.
+			if hasHTTPScheme(sig.Endpoint) {
 				opts = append(opts, otlploghttp.WithEndpointURL(sig.Endpoint))
 			} else {
-				opts = append(opts, otlploghttp.WithEndpoint(sig.Endpoint))
+				opts = append(opts, otlploghttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}
 		}
 		if sig.Insecure {

@@ -269,9 +269,8 @@ observability:
   enabled: true                  # master switch for both signals
   export_interval: "15s"         # metric export cadence
   metrics:
-    endpoint: "127.0.0.1:4317"
-    protocol: "grpc"             # or "http/protobuf"
-    insecure: true               # disable TLS for the local hop
+    endpoint: "http://127.0.0.1:4317"   # http:// = plaintext for the local hop
+    protocol: "grpc"                    # or "http/protobuf"
   logs:
     endpoint: "https://logs.vendor.example"
     protocol: "http/protobuf"
@@ -286,9 +285,14 @@ The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work
 
 Field semantics: `enabled` (unset = on whenever `observability.enabled` is; explicit `false` switches that signal off — the top-level flag remains the master switch and a per-signal `true` cannot resurrect a disabled subsystem), `endpoint` / `protocol` (non-empty overrides), `insecure` (set overrides), and `headers`, which **replace the shared map wholesale** rather than merging — merging credential maps invites sending one backend's bearer token to the other. An explicitly empty `headers: {}` therefore means "this signal sends no headers" even when the shared map is populated. Watch the inverse case, too: a signal that overrides `endpoint` but leaves `headers` unset inherits the shared map — shared bearer token included — and sends it to the new backend. The daemon warns at startup when it sees that combination; set an explicit per-signal `headers:` (`{}` for none) to state the intent and silence it. Enabling `observability.enabled` with both signals explicitly off is rejected at config load as the contradiction it is.
 
-For `http/protobuf`, set `endpoint` to a *base* URL like `https://otel.example` — the SDK appends `/v1/metrics` and `/v1/logs` itself. A URL that already includes a signal-specific path (e.g. ending in `/v1/metrics`) routes that signal to the wrong route.
+**Endpoint form.** Both signals share one endpoint contract, and a **full URL with a scheme is the recommended form**: the scheme carries the TLS intent (`https://` → TLS, `http://` → plaintext, on gRPC and http/protobuf alike), and an explicit path is used verbatim — no mount path is assumed, so a vendor route like `https://collector.example/tenant-42/v1/metrics` works as written. A URL *without* a path gets the OTLP standard `/v1/metrics` / `/v1/logs` appended automatically (http/protobuf; gRPC has no URL path), so `https://otel.example` alone still routes correctly. Bare `host:port` also works — the traditional gRPC form — with TLS then governed by the `insecure` flag; `dns:///` targets pass through to the gRPC resolver. An explicit `insecure: true` forces plaintext even over an `https://` scheme — prefer stating the intent in the scheme and leaving the flag alone. The insecure-transport-with-auth-headers warning fires however the plaintext arises, flag or `http://` scheme.
 
-Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op implementation, so the `Log*` helpers emit nothing for that daemon — `metrics.enabled` alone gives you series without shipping any log records.
+!!! warning "Upgraders: gRPC endpoints with an `http://` scheme"
+    Earlier releases ignored a URL scheme on gRPC endpoints (stripping it and attempting TLS regardless). The scheme is now authoritative, so a gRPC endpoint written `http://…` switches from attempting TLS to **plaintext**. The daemon logs a WARN naming this change whenever it builds a gRPC exporter from an `http://` endpoint — use `https://` or drop the scheme to keep TLS, or keep `http://` if plaintext was the intent all along (the common case for a loopback collector, where the old TLS attempt simply failed).
+
+**Metric temporality.** `metrics.temporality` selects the aggregation temporality the metric exporter reports: `cumulative` (the OTLP default), `delta` (counters, observable counters, and histograms report per-interval deltas — what Datadog and some other vendors expect), or `lowmemory` (only synchronous counters and histograms delta). The vocabulary and instrument-kind mapping are exactly those of `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`, which an unset field falls through to. Metrics-only — setting it under `logs:` is a config error.
+
+Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op implementation, so both the `Log*` helpers and the slog→OTel mirror go quiet for that daemon (stderr/journald logging is unaffected) — `metrics.enabled` alone gives you series without shipping any log records.
 
 !!! note "Windows Group Policy"
     The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`), with the per-signal overrides as `Observability\Metrics` / `Observability\Logs` subkeys (tri-state `Enabled`/`Insecure` DWORDs, and their own `Headers` subkeys — a present-but-empty per-signal `Headers` key means "no headers for this signal", distinct from an absent key meaning inherit). Header values round-trip too (as REG_SZ values under the respective `Headers` keys), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.

@@ -2695,11 +2695,12 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 	provider, err := observability.Init(initCtx, observability.Config{
 		Enabled: cfg.Enabled,
 		Metrics: observability.Signal{
-			Enabled:  metrics.Enabled,
-			Endpoint: metrics.Endpoint,
-			Protocol: metrics.Protocol,
-			Insecure: metrics.Insecure,
-			Headers:  metrics.Headers,
+			Enabled:     metrics.Enabled,
+			Endpoint:    metrics.Endpoint,
+			Protocol:    metrics.Protocol,
+			Insecure:    metrics.Insecure,
+			Headers:     metrics.Headers,
+			Temporality: metrics.Temporality,
 		},
 		Logs: observability.Signal{
 			Enabled:  logs.Enabled,
@@ -2707,6 +2708,8 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 			Protocol: logs.Protocol,
 			Insecure: logs.Insecure,
 			Headers:  logs.Headers,
+			// Temporality deliberately not copied: metrics-only, and
+			// validation already rejects it on the logs block.
 		},
 		ExportInterval: cfg.ExportInterval,
 		ServiceVersion: version,

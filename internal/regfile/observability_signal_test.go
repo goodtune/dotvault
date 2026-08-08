@@ -26,10 +26,11 @@ func TestObservabilitySignalRoundTrip(t *testing.T) {
 				Protocol: "grpc",
 				Headers:  map[string]string{"Authorization": "Bearer shared"},
 				Metrics: config.ObservabilitySignalConfig{
-					Endpoint: "https://metrics.vendor.example",
-					Protocol: "http/protobuf",
-					Insecure: boolPtr(false),
-					Headers:  map[string]string{"X-Metrics-Key": "m"},
+					Endpoint:    "https://metrics.vendor.example",
+					Protocol:    "http/protobuf",
+					Insecure:    boolPtr(false),
+					Headers:     map[string]string{"X-Metrics-Key": "m"},
+					Temporality: "delta",
 				},
 				Logs: config.ObservabilitySignalConfig{
 					Enabled:  boolPtr(false),
@@ -161,7 +162,11 @@ func TestObservabilitySignalYAMLRoundTrip(t *testing.T) {
 		Enabled:  true,
 		Endpoint: "shared:4317",
 		Headers:  map[string]string{"Authorization": "Bearer shared-secret"},
-		// Metrics: zero value — nil headers, must round-trip as nil (inherit).
+		// Metrics: temporality only — nil headers must round-trip as nil
+		// (inherit), and the temporality string must survive MarshalYAML
+		// (the custom marshaller's scalar mirror drops any field it
+		// doesn't carry).
+		Metrics: config.ObservabilitySignalConfig{Temporality: "delta"},
 		Logs: config.ObservabilitySignalConfig{
 			Enabled: boolPtr(false),
 			Headers: map[string]string{}, // explicitly none, must stay non-nil empty
@@ -180,6 +185,9 @@ func TestObservabilitySignalYAMLRoundTrip(t *testing.T) {
 
 	if got.Observability.Metrics.Headers != nil {
 		t.Errorf("metrics.headers = %v after YAML round-trip, want nil (inherit) — shared credentials were silently detached", got.Observability.Metrics.Headers)
+	}
+	if got.Observability.Metrics.Temporality != "delta" {
+		t.Errorf("metrics.temporality = %q after YAML round-trip, want %q — MarshalYAML's scalar mirror dropped the field", got.Observability.Metrics.Temporality, "delta")
 	}
 	if got.Observability.Logs.Headers == nil {
 		t.Error("logs.headers = nil after YAML round-trip, want non-nil empty (explicitly none)")

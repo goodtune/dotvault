@@ -664,10 +664,11 @@ func TestApplyRegistryLayerObservabilitySignals(t *testing.T) {
 	applyRegistryLayer(cfg, registryLayer{
 		ObservabilityEnabled: &enabled,
 		ObsMetrics: registrySignalLayer{
-			Endpoint: "https://metrics.vendor.example",
-			Protocol: "http/protobuf",
-			Insecure: &disabled,
-			Headers:  map[string]string{"X-Metrics-Key": "m"},
+			Endpoint:    "https://metrics.vendor.example",
+			Protocol:    "http/protobuf",
+			Insecure:    &disabled,
+			Headers:     map[string]string{"X-Metrics-Key": "m"},
+			Temporality: "delta",
 		},
 		ObsLogs: registrySignalLayer{
 			Enabled: &disabled,
@@ -689,6 +690,9 @@ func TestApplyRegistryLayerObservabilitySignals(t *testing.T) {
 	}
 	if m.Headers["X-Metrics-Key"] != "m" {
 		t.Errorf("Metrics.Headers = %v", m.Headers)
+	}
+	if m.Temporality != "delta" {
+		t.Errorf("Metrics.Temporality = %q, want %q", m.Temporality, "delta")
 	}
 	l := cfg.Observability.Logs
 	if l.Enabled == nil || *l.Enabled {

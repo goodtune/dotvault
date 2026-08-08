@@ -20,18 +20,21 @@ web:
 
 # Observability is opt-in. Uncomment and point at a local OTel
 # collector to exercise the exporters end-to-end. Each signal is
-# configured in its own block; the endpoint accepts a host:port for
-# gRPC (default) or a full URL for http/protobuf. Top-level shared
-# endpoint/protocol/insecure/headers still work but are deprecated
-# (startup WARN + dotvault.config.deprecated metric; see issue #140).
+# configured in its own block; a full URL is the recommended endpoint
+# form on both protocols — the scheme carries the TLS intent (http://
+# = plaintext, https:// = TLS) and an explicit path is used verbatim.
+# Bare host:port also works, with TLS then governed by `insecure`.
+# Top-level shared endpoint/protocol/insecure/headers still work but
+# are deprecated (startup WARN + dotvault.config.deprecated metric;
+# see issue #140).
 #
 # observability:
 #   enabled: true
 #   export_interval: "15s"
 #   metrics:
-#     endpoint: "127.0.0.1:4317"
+#     endpoint: "http://127.0.0.1:4317"   # scheme carries TLS intent; full URLs preferred
 #     protocol: "grpc"
-#     insecure: true
+#     # temporality: delta                # cumulative (default) | delta | lowmemory
 #   # Send logs to a different backend, or switch a signal off with
 #   # enabled: false. Per-signal headers REPLACE any shared map (no merging).
 #   # logs:

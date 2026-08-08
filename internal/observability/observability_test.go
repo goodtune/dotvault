@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
@@ -352,6 +353,46 @@ func TestInitSignalSelective(t *testing.T) {
 	_ = p.Shutdown(ctx)
 }
 
+// TestEndpointSchemeRouting pins the predicate pair that decides how an
+// endpoint reaches the SDK — the headline of the scheme-carries-TLS
+// contract. hasHTTPScheme owns the "full URL, scheme is meaningful" branch
+// (WithEndpointURL); everything else is a dial target where stripScheme
+// removes a stray grpc:// and preserves dns:/// resolver targets. Both
+// protocols route through the same pair, so these tables pin the routing
+// for gRPC and http/protobuf alike.
+func TestEndpointSchemeRouting(t *testing.T) {
+	urlForm := map[string]bool{
+		"http://127.0.0.1:4317":                  true,
+		"https://collector.example":              true,
+		"https://collector.example/t/v1/metrics": true,
+		"127.0.0.1:4317":                         false,
+		"collector.example:4317":                 false,
+		"grpc://collector.example:4317":          false,
+		"dns:///collector.example:4317":          false,
+		"":                                       false,
+	}
+	for endpoint, want := range urlForm {
+		if got := hasHTTPScheme(endpoint); got != want {
+			t.Errorf("hasHTTPScheme(%q) = %v, want %v", endpoint, got, want)
+		}
+	}
+
+	stripped := map[string]string{
+		"grpc://collector.example:4317": "collector.example:4317",
+		"collector.example:4317":        "collector.example:4317",
+		"dns:///collector.example:4317": "dns:///collector.example:4317",
+		// Dead at the current call sites (hasHTTPScheme routes these to
+		// WithEndpointURL first) but kept as defence in depth — pinned so
+		// a future call-site change doesn't find surprising behaviour.
+		"https://collector.example:4317": "collector.example:4317",
+	}
+	for in, want := range stripped {
+		if got := stripScheme(in); got != want {
+			t.Errorf("stripScheme(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestBuildInfoGauge pins the Prometheus-convention build-identity gauge:
 // constant value 1, one series per build, attributes mirroring
 // `dotvault version --json` (version / go_version / os / arch), with the
@@ -407,19 +448,123 @@ func TestBuildInfoGauge(t *testing.T) {
 	}
 }
 
-// TestInsecureHeaderFootgun pins the warning predicate: it must fire only
-// for the plaintext-transport-plus-auth-headers combination, per signal.
+// TestTemporalitySelector pins the config-to-SDK mapping and its contract
+// with the OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE vocabulary:
+// empty means "don't pass the option" (nil selector — the SDK then reads the
+// env var itself), each named preference maps onto the SDK selector with the
+// spec's instrument-kind split, and an unknown name is a hard error rather
+// than the env var's warn-and-ignore.
+func TestTemporalitySelector(t *testing.T) {
+	t.Run("empty falls through (nil selector)", func(t *testing.T) {
+		sel, err := temporalitySelector("")
+		if err != nil {
+			t.Fatalf("temporalitySelector: %v", err)
+		}
+		if sel != nil {
+			t.Error("empty preference must yield a nil selector so the SDK's env-var reading applies")
+		}
+	})
+
+	t.Run("unknown name errors", func(t *testing.T) {
+		if _, err := temporalitySelector("sideways"); err == nil {
+			t.Error("want an error for an unknown temporality preference")
+		}
+	})
+
+	t.Run("normalization matches validation", func(t *testing.T) {
+		// config.validateOTLPTemporality accepts mixed case and padding;
+		// a value that validates must resolve here or a validated config
+		// would fail at Init. Lockstep normalization is the contract.
+		for _, v := range []string{"Delta", "CUMULATIVE", " lowmemory "} {
+			sel, err := temporalitySelector(v)
+			if err != nil {
+				t.Errorf("temporalitySelector(%q): %v — validation would have accepted this", v, err)
+			}
+			if sel == nil {
+				t.Errorf("temporalitySelector(%q) = nil selector", v)
+			}
+		}
+	})
+
+	t.Run("selector is consulted by the exporter builders", func(t *testing.T) {
+		// The pure mapping above proves nothing about wiring: an invalid
+		// preference must fail the build on BOTH protocol paths, which is
+		// the cheapest observable proof that buildMetricExporter consults
+		// the selector at all (a live collector would be needed to observe
+		// the temporality itself).
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		for _, protocol := range []string{"grpc", "http/protobuf"} {
+			if _, err := buildMetricExporter(ctx, Signal{
+				Protocol:    protocol,
+				Endpoint:    "127.0.0.1:0",
+				Insecure:    true,
+				Temporality: "sideways",
+			}); err == nil {
+				t.Errorf("buildMetricExporter(%s) with invalid temporality: want error, got nil", protocol)
+			}
+		}
+	})
+
+	// The kind→temporality split per preference, straight from the spec:
+	// delta flips counters, observable counters, and histograms;
+	// lowmemory flips only the synchronous counter and histogram;
+	// cumulative flips nothing. UpDownCounters stay cumulative throughout.
+	kinds := map[string]sdkmetric.InstrumentKind{
+		"counter":            sdkmetric.InstrumentKindCounter,
+		"histogram":          sdkmetric.InstrumentKindHistogram,
+		"observable_counter": sdkmetric.InstrumentKindObservableCounter,
+		"updown_counter":     sdkmetric.InstrumentKindUpDownCounter,
+	}
+	wantDelta := map[string]map[string]bool{
+		"cumulative": {},
+		"delta":      {"counter": true, "histogram": true, "observable_counter": true},
+		"lowmemory":  {"counter": true, "histogram": true},
+	}
+	for preference, deltaKinds := range wantDelta {
+		t.Run(preference, func(t *testing.T) {
+			sel, err := temporalitySelector(preference)
+			if err != nil {
+				t.Fatalf("temporalitySelector(%q): %v", preference, err)
+			}
+			if sel == nil {
+				t.Fatalf("temporalitySelector(%q) = nil, want a selector", preference)
+			}
+			for name, kind := range kinds {
+				got := sel(kind)
+				want := metricdata.CumulativeTemporality
+				if deltaKinds[name] {
+					want = metricdata.DeltaTemporality
+				}
+				if got != want {
+					t.Errorf("%s(%s) = %v, want %v", preference, name, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestInsecureHeaderFootgun pins the warning predicate: it must fire for
+// the plaintext-transport-plus-auth-headers combination however the
+// plaintext arrives — the Insecure flag or an explicit http:// scheme on
+// the endpoint (the recommended full-URL form must not be the unwarned
+// path) — and stay quiet otherwise.
 func TestInsecureHeaderFootgun(t *testing.T) {
+	auth := map[string]string{"Authorization": "Bearer x"}
 	cases := []struct {
 		name string
 		sig  Signal
 		want bool
 	}{
-		{"insecure with headers", Signal{Insecure: true, Headers: map[string]string{"Authorization": "Bearer x"}}, true},
+		{"insecure with headers", Signal{Insecure: true, Headers: auth}, true},
 		{"insecure without headers", Signal{Insecure: true}, false},
 		{"insecure with empty headers map", Signal{Insecure: true, Headers: map[string]string{}}, false},
-		{"tls with headers", Signal{Headers: map[string]string{"Authorization": "Bearer x"}}, false},
+		{"tls with headers", Signal{Headers: auth}, false},
 		{"neither", Signal{}, false},
+		{"http scheme with headers", Signal{Endpoint: "http://collector.example:4318", Headers: auth}, true},
+		{"http scheme without headers", Signal{Endpoint: "http://collector.example:4318"}, false},
+		{"https scheme with headers", Signal{Endpoint: "https://collector.example", Headers: auth}, false},
+		{"schemeless endpoint with headers", Signal{Endpoint: "collector.example:4317", Headers: auth}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -284,7 +284,7 @@ Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch for both signals. A per-signal `enabled: true` cannot resurrect a disabled subsystem |
-| `endpoint` | string | — | **Deprecated** shared default (see note below). OTLP collector endpoint. For `http/protobuf` this must be a *base* URL (the exporters append `/v1/metrics` and `/v1/logs` themselves) |
+| `endpoint` | string | — | **Deprecated** shared default (see note below). OTLP collector endpoint; same value contract as the per-signal `endpoint` |
 | `protocol` | string | — | **Deprecated** shared default. `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
 | `insecure` | bool | `false` | **Deprecated** shared default. Disable transport TLS |
 | `headers` | map | — | **Deprecated** shared default. OTLP headers, typically a vendor bearer token — treat as a credential |
@@ -299,10 +299,11 @@ Per-signal override block (`metrics:` / `logs:`):
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | inherit | Tri-state: unset inherits the master switch, explicit `false` turns this signal off |
-| `endpoint` | string | inherit | Non-empty overrides the shared endpoint (separate backend) |
+| `endpoint` | string | inherit | Non-empty overrides the shared endpoint (separate backend). A **full URL is the recommended form**: the scheme carries TLS intent (`https` → TLS, `http` → plaintext, on both protocols) and an explicit path is used verbatim — no mount path assumed; a path-less URL gets the standard `/v1/metrics` / `/v1/logs` appended (http/protobuf). Bare `host:port` (canonical gRPC) leaves TLS to `insecure`; `dns:///` passes through to the gRPC resolver |
 | `protocol` | string | inherit | Non-empty overrides the shared protocol |
-| `insecure` | bool | inherit | Tri-state: unset inherits the shared value |
+| `insecure` | bool | inherit | Tri-state: unset inherits the shared value. Meaningful for scheme-less endpoints; an endpoint URL's scheme already carries the TLS intent, and an explicit `true` forces plaintext even over `https://` — prefer stating the intent in the scheme |
 | `headers` | map | inherit | **Replaces** the shared map wholesale — never merged, so one backend's token is not sent to the other. An explicitly empty `headers: {}` means "this signal sends no headers", distinct from omitting the field (inherit) |
+| `temporality` | string | `cumulative` | Metric temporality preference: `cumulative`, `delta`, or `lowmemory` — the `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` vocabulary and instrument-kind mapping (empty falls through to that env var). `delta` reports counters/observable counters/histograms as per-interval deltas, as Datadog and some other vendors expect. **Metrics block only** — setting it under `logs:` is a config error |
 
 ```yaml
 observability:
@@ -310,6 +311,7 @@ observability:
   metrics:
     endpoint: https://otel.internal.example
     protocol: http/protobuf
+    temporality: delta                         # e.g. for a Datadog-fronted collector
     headers:
       authorization: "Bearer metrics-token"
   logs:

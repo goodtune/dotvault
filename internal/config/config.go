@@ -202,7 +202,10 @@ type ObservabilitySignalConfig struct {
 	// never resurrect a disabled subsystem.
 	Enabled *bool `yaml:"enabled,omitempty"`
 	// Endpoint, when non-empty, replaces the shared endpoint for this
-	// signal — the "separate backends" field.
+	// signal — the "separate backends" field. A full URL is the
+	// recommended form: the scheme carries the TLS intent and an explicit
+	// path is used verbatim (no assumed mount path); see
+	// observability.Signal.Endpoint for the complete value contract.
 	Endpoint string `yaml:"endpoint"`
 	// Protocol, when non-empty, replaces the shared protocol ("grpc" or
 	// "http/protobuf") for this signal.
@@ -226,6 +229,16 @@ type ObservabilitySignalConfig struct {
 	// would turn "inherit the shared credentials" into "send none",
 	// silently detaching auth from both signals.
 	Headers map[string]string `yaml:"headers"`
+	// Temporality is the metric temporality preference — "cumulative",
+	// "delta", or "lowmemory", the exact vocabulary of
+	// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE (which an empty
+	// value falls through to). Meaningful on the metrics block only:
+	// temporality is a metric concept with no log analogue, so validation
+	// rejects it on `logs` rather than silently ignoring a setting the
+	// operator believed took effect. It lives on the per-signal struct
+	// (not the deprecated shared layer) because new exporter knobs go
+	// where the config is headed, not where it is leaving.
+	Temporality string `yaml:"temporality"`
 }
 
 // MarshalYAML preserves the Headers nil-vs-empty distinction on the YAML
@@ -235,17 +248,23 @@ type ObservabilitySignalConfig struct {
 // scalar fields keep the section's always-emit round-trip contract, and the
 // tri-state pointers keep their omit-when-unset behaviour.
 func (s ObservabilitySignalConfig) MarshalYAML() (any, error) {
+	// Keep this scalar mirror in lockstep with ObservabilitySignalConfig:
+	// a field added there and forgotten here is silently DROPPED from
+	// every YAML export (config download, reg-export) — the regfile
+	// round-trip tests are what catch the drift.
 	type scalars struct {
-		Enabled  *bool  `yaml:"enabled,omitempty"`
-		Endpoint string `yaml:"endpoint"`
-		Protocol string `yaml:"protocol"`
-		Insecure *bool  `yaml:"insecure,omitempty"`
+		Enabled     *bool  `yaml:"enabled,omitempty"`
+		Endpoint    string `yaml:"endpoint"`
+		Protocol    string `yaml:"protocol"`
+		Insecure    *bool  `yaml:"insecure,omitempty"`
+		Temporality string `yaml:"temporality"`
 	}
 	base := scalars{
-		Enabled:  s.Enabled,
-		Endpoint: s.Endpoint,
-		Protocol: s.Protocol,
-		Insecure: s.Insecure,
+		Enabled:     s.Enabled,
+		Endpoint:    s.Endpoint,
+		Protocol:    s.Protocol,
+		Insecure:    s.Insecure,
+		Temporality: s.Temporality,
 	}
 	if s.Headers == nil {
 		return base, nil
@@ -264,11 +283,12 @@ func (s ObservabilitySignalConfig) MarshalYAML() (any, error) {
 // separate (the observability package must not import this one), so a field
 // added here and forgotten there compiles silently and drops.
 type ResolvedSignal struct {
-	Enabled  bool
-	Endpoint string
-	Protocol string
-	Insecure bool
-	Headers  map[string]string
+	Enabled     bool
+	Endpoint    string
+	Protocol    string
+	Insecure    bool
+	Headers     map[string]string
+	Temporality string
 }
 
 // ResolveSignal layers a signal's overrides onto the shared fields.
@@ -285,6 +305,10 @@ func (o ObservabilityConfig) ResolveSignal(sig ObservabilitySignalConfig) Resolv
 		Protocol: o.Protocol,
 		Insecure: o.Insecure,
 		Headers:  o.Headers,
+		// Temporality has no shared-layer default to inherit — it is
+		// per-signal-only by design (see the field's godoc), so the
+		// signal's own value passes straight through.
+		Temporality: sig.Temporality,
 	}
 	if sig.Endpoint != "" {
 		r.Endpoint = sig.Endpoint
@@ -350,6 +374,22 @@ func validateOTLPProtocol(field, protocol string) error {
 		return nil
 	default:
 		return fmt.Errorf("%s %q: must be grpc or http/protobuf", field, protocol)
+	}
+}
+
+// validateOTLPTemporality accepts the vocabulary of
+// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE, or empty (fall through
+// to that env var / the SDK's cumulative default). Kept in lockstep with
+// observability.temporalitySelector, which maps the same names onto the SDK
+// selectors.
+func validateOTLPTemporality(field, temporality string) error {
+	// Identical normalization to observability.temporalitySelector —
+	// lockstep means a value that validates here must resolve there.
+	switch strings.ToLower(strings.TrimSpace(temporality)) {
+	case "", "cumulative", "delta", "lowmemory":
+		return nil
+	default:
+		return fmt.Errorf("%s %q: must be cumulative, delta, or lowmemory", field, temporality)
 	}
 }
 
@@ -941,6 +981,16 @@ func (c *Config) validate() error {
 		}
 		if err := validateOTLPProtocol("observability.logs.protocol", c.Observability.Logs.Protocol); err != nil {
 			return err
+		}
+		if err := validateOTLPTemporality("observability.metrics.temporality", c.Observability.Metrics.Temporality); err != nil {
+			return err
+		}
+		// Temporality is a metric concept with no log analogue. Rejecting
+		// it on the log signal (rather than silently ignoring it) tells
+		// the operator their setting is on the wrong block instead of
+		// letting them believe it took effect.
+		if c.Observability.Logs.Temporality != "" {
+			return fmt.Errorf("observability.logs.temporality %q: temporality applies to the metrics signal only", c.Observability.Logs.Temporality)
 		}
 		// Both signals explicitly off under an enabled master switch is a
 		// contradiction, not a configuration: the operator's intent is

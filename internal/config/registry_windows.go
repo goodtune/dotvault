@@ -170,11 +170,12 @@ func readRegistryHeaderMapPresence(root registry.Key, headersPath string) (map[s
 // registrySignalLayer holds one signal's override values from an
 // Observability\Metrics or Observability\Logs subkey.
 type registrySignalLayer struct {
-	Enabled  *uint32
-	Endpoint string
-	Protocol string
-	Insecure *uint32
-	Headers  map[string]string
+	Enabled     *uint32
+	Endpoint    string
+	Protocol    string
+	Insecure    *uint32
+	Headers     map[string]string
+	Temporality string
 }
 
 // readRegistrySignal reads one per-signal observability subkey. An absent
@@ -193,6 +194,7 @@ func readRegistrySignal(root registry.Key, basePath, name string) (registrySigna
 	l.Endpoint, _ = readRegString(key, "Endpoint")
 	l.Protocol, _ = readRegString(key, "Protocol")
 	l.Insecure = readRegDWORD(key, "Insecure")
+	l.Temporality, _ = readRegString(key, "Temporality")
 	key.Close()
 
 	headers, present, err := readRegistryHeaderMapPresence(root, sigPath+`\Headers`)
@@ -225,6 +227,9 @@ func applySignalLayer(dst *ObservabilitySignalConfig, l registrySignalLayer) {
 	}
 	if l.Headers != nil {
 		dst.Headers = l.Headers
+	}
+	if l.Temporality != "" {
+		dst.Temporality = l.Temporality
 	}
 }
 

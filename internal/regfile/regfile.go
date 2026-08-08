@@ -237,6 +237,7 @@ func (e *emitter) writeObservabilitySignal(name string, sig config.Observability
 	if sig.Insecure != nil {
 		e.writeBool("Insecure", *sig.Insecure)
 	}
+	e.writeString("Temporality", sig.Temporality)
 	e.WriteString("\r\n")
 
 	if sig.Headers != nil {

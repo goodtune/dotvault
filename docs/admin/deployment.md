@@ -305,6 +305,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
 | `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read and config reload |
 | `dotvault.config.deprecated`    | counter   | `field` — deprecated config fields in active use, one increment per field per process start; sum by `field` to measure fleet migration progress |
+| `dotvault.build_info`           | gauge     | `version`, `go_version`, `os`, `arch` — constant `1`, one series per build, following the Prometheus `*_build_info` convention. `version` is the v-stripped release semver on tagged builds and `dev` on untagged/hand-rolled ones (same value as `dotvault version`), so a `dev` series in a fleet view means an unofficial build, not missing data. Join other series against it to slice by build — e.g. `dotvault.config.deprecated` joined by `version` shows whether deprecated-config stragglers are just old builds. The same identity also rides every series as OTel resource attributes (`service.version`, `os.type`, `host.arch`, `process.runtime.*`) for backends that surface `target_info` |
 
 ### Log records
 

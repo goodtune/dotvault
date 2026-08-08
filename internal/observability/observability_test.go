@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -203,18 +204,31 @@ func TestInitBuildsResource(t *testing.T) {
 		rebindInstruments()
 	})
 
+	t.Cleanup(func() { setBuildVersion("") })
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	p, err := Init(ctx, Config{
-		Enabled: true,
-		Metrics: Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
-		Logs:    Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		Enabled:        true,
+		Metrics:        Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		Logs:           Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		ServiceVersion: "9.9.9-init-test",
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	if p == nil {
 		t.Fatal("Init returned a nil provider")
+	}
+	// Init must thread cfg.ServiceVersion through to the build_info gauge
+	// (setBuildVersion before its rebind) — TestBuildInfoGauge covers the
+	// seam, this covers the caller: dropping the setBuildVersion call in
+	// Init would ship version="dev" on every tagged build.
+	instrMu.RLock()
+	gotVersion := buildVersion
+	instrMu.RUnlock()
+	if gotVersion != "9.9.9-init-test" {
+		t.Errorf("buildVersion after Init = %q, want %q", gotVersion, "9.9.9-init-test")
 	}
 	_ = p.Shutdown(ctx)
 }
@@ -336,6 +350,61 @@ func TestInitSignalSelective(t *testing.T) {
 		t.Error("Init with both signals disabled must leave both globals untouched")
 	}
 	_ = p.Shutdown(ctx)
+}
+
+// TestBuildInfoGauge pins the Prometheus-convention build-identity gauge:
+// constant value 1, one series per build, attributes mirroring
+// `dotvault version --json` (version / go_version / os / arch), with the
+// version flowing from setBuildVersion — the seam Init uses to inject
+// main.version — and repeated rebinds replacing rather than stacking the
+// callback registration.
+func TestBuildInfoGauge(t *testing.T) {
+	// newTestReader first: its LIFO cleanup rebinds onto the restored
+	// provider, and setBuildVersion's cleanup must have run by then so the
+	// restore-time registration doesn't carry the test version.
+	reader := newTestReader(t)
+	setBuildVersion("1.2.3-test")
+	t.Cleanup(func() { setBuildVersion("") })
+	// A second rebind on the same meter must unregister the first
+	// callback; two live registrations would observe the gauge twice.
+	rebindInstruments()
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+
+	var points []metricdata.DataPoint[int64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "dotvault.build_info" {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("dotvault.build_info data type = %T, want Gauge[int64]", m.Data)
+			}
+			points = append(points, g.DataPoints...)
+		}
+	}
+	if len(points) != 1 {
+		t.Fatalf("dotvault.build_info datapoints = %d, want exactly 1 (duplicate registrations stack observations)", len(points))
+	}
+	dp := points[0]
+	if dp.Value != 1 {
+		t.Errorf("build_info value = %d, want the constant 1", dp.Value)
+	}
+	for key, want := range map[string]string{
+		"version":    "1.2.3-test",
+		"go_version": runtime.Version(),
+		"os":         runtime.GOOS,
+		"arch":       runtime.GOARCH,
+	} {
+		v, ok := dp.Attributes.Value(attribute.Key(key))
+		if !ok || v.AsString() != want {
+			t.Errorf("build_info attribute %q = %q (present=%v), want %q", key, v.AsString(), ok, want)
+		}
+	}
 }
 
 // TestInsecureHeaderFootgun pins the warning predicate: it must fire only

@@ -181,6 +181,11 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 		return &Provider{}, nil
 	}
 
+	// Record the build version for the dotvault.build_info gauge before
+	// rebindInstruments runs, so the callback registered against the real
+	// provider observes the injected release rather than the "dev" default.
+	setBuildVersion(cfg.ServiceVersion)
+
 	// Each signal's exporter is built only when that signal is enabled; a
 	// disabled signal's global provider is left untouched, so its consumers
 	// — the metric instruments, or the Log* helpers resolving the global
@@ -233,6 +238,15 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 			semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
 			semconv.HostName(hostname),
 			semconv.OSTypeKey.String(runtime.GOOS),
+			// Raw GOARCH coincides with semconv's host.arch well-known
+			// values for every target this project ships (amd64, arm64).
+			// They diverge on 32-bit targets (GOARCH "386"/"arm" vs
+			// semconv "x86"/"arm32") — host.arch is an open enum so raw
+			// values remain legal, but add a mapping here before ever
+			// shipping a 32-bit build.
+			semconv.HostArchKey.String(runtime.GOARCH),
+			semconv.ProcessRuntimeName("go"),
+			semconv.ProcessRuntimeVersion(runtime.Version()),
 		),
 	)
 	if err != nil {
@@ -483,6 +497,17 @@ var (
 	remoteFetches   metric.Int64Counter
 	sighupAttempts  metric.Int64Counter
 	deprecatedUses  metric.Int64Counter
+
+	// buildVersion feeds the dotvault.build_info gauge's version attribute.
+	// Set by Init before it rebinds the instruments; empty (a test calling
+	// rebindInstruments directly, or a hand-rolled build) reports as "dev",
+	// matching the resource's service.version fallback.
+	buildVersion string
+	// buildInfoReg is the previous rebind's callback registration.
+	// Unregistered before re-registering so a repeated rebind (Init after
+	// package init, tests swapping providers) doesn't accumulate duplicate
+	// observations of the gauge on the same meter.
+	buildInfoReg metric.Registration
 )
 
 func init() {
@@ -565,6 +590,47 @@ func rebindInstruments() {
 		// values are a fixed set of config paths, never user content.
 		metric.WithDescription("Deprecated configuration fields in active use, counted once per process start, by field"),
 	)
+
+	// dotvault.build_info follows the Prometheus *_build_info convention: a
+	// constant-1 gauge whose attributes carry the build identity, there to
+	// be joined against — e.g. dotvault.config.deprecated by version tells
+	// a fleet operator whether deprecated-config stragglers are just old
+	// builds. The same identity also rides every series as OTel resource
+	// attributes (service.version, os.type, host.arch, …), but not every
+	// backend surfaces resource/target_info well, and the join idiom
+	// expects a metric. Attributes mirror `dotvault version --json`;
+	// all values are process constants, so cardinality is one series per
+	// build. The previous registration (if any) is dropped first so
+	// repeated rebinds don't observe the gauge twice on one meter.
+	if buildInfoReg != nil {
+		_ = buildInfoReg.Unregister()
+		buildInfoReg = nil
+	}
+	buildInfo, err := meter.Int64ObservableGauge(
+		"dotvault.build_info",
+		metric.WithDescription("Build identity as a constant-1 gauge: version, go_version, os, arch"),
+	)
+	if err == nil {
+		observation := metric.WithAttributes(
+			attribute.String("version", stringOr(buildVersion, "dev")),
+			attribute.String("go_version", runtime.Version()),
+			attribute.String("os", runtime.GOOS),
+			attribute.String("arch", runtime.GOARCH),
+		)
+		buildInfoReg, _ = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+			o.ObserveInt64(buildInfo, 1, observation)
+			return nil
+		}, buildInfo)
+	}
+}
+
+// setBuildVersion stores the release version the dotvault.build_info gauge
+// reports. Called by Init ahead of its rebindInstruments so the callback
+// registered on the real provider carries the injected main.version.
+func setBuildVersion(v string) {
+	instrMu.Lock()
+	buildVersion = v
+	instrMu.Unlock()
 }
 
 // RecordSyncTick increments the sync-tick counter with the outcome

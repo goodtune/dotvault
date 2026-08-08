@@ -254,7 +254,11 @@ dotvault run --log-format auto   # default — text on TTY, JSON otherwise
 
 This is useful when running under a service manager that captures stderr but is connected to a TTY for debugging, or when forcing structured logs for ingestion into a log collector regardless of how the daemon was launched.
 
-There is no file-based logging — integrate with your platform's log collection (journald, syslog, Windows Event Log via a wrapper, etc.). On systemd hosts the packaged unit routes stderr to the journal, so the OpenTelemetry collector's `journaldreceiver` can filter on `_SYSTEMD_USER_UNIT=dotvault.service` (or `_SYSTEMD_UNIT` when the unit was enabled with `systemctl --global`) to pick logs up directly.
+dotvault itself never writes a log file — integrate with your platform's log collection (journald, syslog, Windows Event Log via a wrapper, etc.), or use the OTel mirror described next. On systemd hosts the packaged unit routes stderr to the journal, so the OpenTelemetry collector's `journaldreceiver` can filter on `_SYSTEMD_USER_UNIT=dotvault.service` (or `_SYSTEMD_UNIT` when the unit was enabled with `systemctl --global`) to pick logs up directly.
+
+Separately, every log record is also mirrored to the OTel LoggerProvider alongside stderr (see [Observability](#observability) below) — this is additive, not a replacement: stderr/journald keeps working exactly as before, so a collector outage or `observability.enabled: false` never loses the local copy. When observability is enabled, the mirrored records flow to your collector as OTLP log records, which lets the collector fan them out to a `file` exporter, a syslog/journald forwarder, or — via a collector build that includes a Windows Event Log exporter (not a stock component of the core OTel Collector distribution, so this typically means a custom/contrib collector build) — the Event Log. dotvault ships none of that collector-side configuration; the fan-out target is entirely operator-authored.
+
+**Security note:** because every record now leaves the process once a collector endpoint is configured, treat `observability.endpoint`/`insecure`/`headers` as part of the logging trust boundary, not just the metrics one — a call site that logs something sensitive is no longer contained to local stderr/journald.
 
 ## Observability
 
@@ -294,9 +298,11 @@ The exporter emits a bounded set of instruments:
 
 ### Log records
 
-The OTel logs exporter is **not** a wholesale replacement for stderr — operational logging still goes through `log/slog` to stderr / journald. The OTel logger is reserved for deployment-fact records that should reach a central collector but must not noise up an end user's terminal. Currently the only emit is:
+`log/slog` to stderr / journald is still the primary logging path, but every record handled through it is also mirrored to the OTel LoggerProvider — the mirror is additive, not a replacement, so a collector outage or `observability.enabled: false` never loses the stderr/journald copy. This is what lets a collector fan dotvault's operational log stream (not just deployment-fact records) out to a `file` exporter, a syslog/journald forwarder, or the Windows Event Log — see [Logging](#logging) above.
 
-- **`configuration loaded from Windows Registry (Group Policy); file-based config is ignored`** — WARN severity, attribute `path=<would-be config file>`. Fires once per daemon/sync startup on a GPO-managed Windows box. Replaces the per-invocation `slog.Info` line that previously leaked onto stdout for every CLI invocation on a GPO-managed install.
+One record is emitted directly through the OTel logger rather than via the slog mirror, because it must reach a central collector without ever printing to an end user's terminal:
+
+- **`configuration loaded from Windows Registry (Group Policy); file-based config is ignored`** — WARN severity, attribute `path=<would-be config file>`. Fires once per daemon/sync startup on a GPO-managed Windows box. Routing this through slog would print an INFO line on every CLI invocation on a GPO-managed install, which is exactly the noise this record avoids.
 
 Health probes are served on **whichever HTTP surfaces the daemon has**: the loopback listener when `web.enabled: true`, and/or the per-user Unix socket when [`api.enabled: true`](../configuration/config-reference.md#api-section). A deployment with neither enabled has nothing to probe; enable one of them, or rely on the systemd `sd_notify(READY=1)` signal instead. The OTel `httpcheckreceiver` speaks TCP, so it needs `web.enabled`; a socket-only daemon is probed with `curl --unix-socket <path> http://localhost/readyz`, which is the way to get a readiness check without opening a port at all.
 

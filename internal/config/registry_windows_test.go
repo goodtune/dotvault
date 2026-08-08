@@ -3,6 +3,7 @@
 package config
 
 import (
+	"reflect"
 	"testing"
 
 	"golang.org/x/sys/windows/registry"
@@ -178,6 +179,17 @@ func TestApplyRegistryLayerObservability(t *testing.T) {
 	}
 	if cfg.Observability.RawInterval != "30s" {
 		t.Errorf("RawInterval = %q, want %q", cfg.Observability.RawInterval, "30s")
+	}
+
+	// GPO parity for the shared-field deprecation (#140): registry-authored
+	// top-level values land on the same struct fields as YAML, so they must
+	// trip the same DeprecatedSharedFields query — endpoint and protocol
+	// here, but not the explicit Insecure=0 DWORD, which loads as the
+	// default false and is presence-wise indistinguishable from absent.
+	got := cfg.Observability.DeprecatedSharedFields()
+	want := []string{"observability.endpoint", "observability.protocol"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("DeprecatedSharedFields = %v, want %v", got, want)
 	}
 }
 
@@ -643,4 +655,144 @@ func itoaTest(i int) string {
 		i /= 10
 	}
 	return string(b[pos:])
+}
+
+func TestApplyRegistryLayerObservabilitySignals(t *testing.T) {
+	cfg := &Config{}
+	enabled := uint32(1)
+	disabled := uint32(0)
+	applyRegistryLayer(cfg, registryLayer{
+		ObservabilityEnabled: &enabled,
+		ObsMetrics: registrySignalLayer{
+			Endpoint:    "https://metrics.vendor.example",
+			Protocol:    "http/protobuf",
+			Insecure:    &disabled,
+			Headers:     map[string]string{"X-Metrics-Key": "m"},
+			Temporality: "delta",
+		},
+		ObsLogs: registrySignalLayer{
+			Enabled: &disabled,
+		},
+	})
+
+	if !cfg.Observability.Enabled {
+		t.Error("Observability.Enabled = false, want true")
+	}
+	m := cfg.Observability.Metrics
+	if m.Endpoint != "https://metrics.vendor.example" || m.Protocol != "http/protobuf" {
+		t.Errorf("Metrics = %+v", m)
+	}
+	if m.Insecure == nil || *m.Insecure {
+		t.Errorf("Metrics.Insecure = %v, want explicit false", m.Insecure)
+	}
+	if m.Enabled != nil {
+		t.Errorf("Metrics.Enabled = %v, want nil (inherit)", *m.Enabled)
+	}
+	if m.Headers["X-Metrics-Key"] != "m" {
+		t.Errorf("Metrics.Headers = %v", m.Headers)
+	}
+	if m.Temporality != "delta" {
+		t.Errorf("Metrics.Temporality = %q, want %q", m.Temporality, "delta")
+	}
+	l := cfg.Observability.Logs
+	if l.Enabled == nil || *l.Enabled {
+		t.Errorf("Logs.Enabled = %v, want explicit false", l.Enabled)
+	}
+	if l.Headers != nil {
+		t.Errorf("Logs.Headers = %v, want nil (inherit)", l.Headers)
+	}
+}
+
+// TestReadRegistryHeaderMapPresence exercises the presence-aware reader
+// against the real registry: an absent key must report not-present (inherit),
+// a present-but-empty key must return a non-nil empty map ("explicitly no
+// headers"), and a value of the wrong registry type is skipped rather than
+// failing the whole map.
+func TestReadRegistryHeaderMapPresence(t *testing.T) {
+	base := `SOFTWARE\dotvault-test-hdr-presence`
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Empty`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Mixed`)
+		registry.DeleteKey(registry.CURRENT_USER, base)
+	})
+
+	t.Run("absent key is not present", func(t *testing.T) {
+		headers, present, err := readRegistryHeaderMapPresence(registry.CURRENT_USER, base+`\Nonexistent`)
+		if err != nil {
+			t.Fatalf("readRegistryHeaderMapPresence: %v", err)
+		}
+		if present {
+			t.Error("present = true for an absent key, want false (inherit)")
+		}
+		if headers != nil {
+			t.Errorf("headers = %v for an absent key, want nil", headers)
+		}
+	})
+
+	t.Run("present empty key is an explicit empty map", func(t *testing.T) {
+		k, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\Empty`, registry.ALL_ACCESS)
+		if err != nil {
+			t.Fatalf("create key: %v", err)
+		}
+		k.Close()
+
+		headers, present, err := readRegistryHeaderMapPresence(registry.CURRENT_USER, base+`\Empty`)
+		if err != nil {
+			t.Fatalf("readRegistryHeaderMapPresence: %v", err)
+		}
+		if !present {
+			t.Error("present = false for an existing key, want true")
+		}
+		if headers == nil {
+			t.Fatal("headers = nil for a present-but-empty key, want non-nil empty map")
+		}
+		if len(headers) != 0 {
+			t.Errorf("headers = %v, want empty", headers)
+		}
+	})
+
+	t.Run("non-string value is skipped, strings kept", func(t *testing.T) {
+		k, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\Mixed`, registry.ALL_ACCESS)
+		if err != nil {
+			t.Fatalf("create key: %v", err)
+		}
+		if err := k.SetStringValue("Authorization", "Bearer tok"); err != nil {
+			t.Fatalf("set string header: %v", err)
+		}
+		if err := k.SetDWordValue("BadType", 1); err != nil {
+			t.Fatalf("set dword header: %v", err)
+		}
+		k.Close()
+
+		headers, present, err := readRegistryHeaderMapPresence(registry.CURRENT_USER, base+`\Mixed`)
+		if err != nil {
+			t.Fatalf("readRegistryHeaderMapPresence: %v", err)
+		}
+		if !present {
+			t.Error("present = false, want true")
+		}
+		if headers["Authorization"] != "Bearer tok" {
+			t.Errorf("Authorization = %q, want the string value kept", headers["Authorization"])
+		}
+		if _, ok := headers["BadType"]; ok {
+			t.Error("REG_DWORD value must be skipped, not coerced into the header map")
+		}
+	})
+}
+
+// TestApplyRegistryLayerSignalEmptyHeaders pins the presence semantics
+// through the live loader: a Headers subkey that exists with no values
+// arrives as a non-nil empty map, which resolution treats as "this signal
+// sends no headers" rather than inheriting the shared credentials.
+func TestApplyRegistryLayerSignalEmptyHeaders(t *testing.T) {
+	cfg := &Config{}
+	applyRegistryLayer(cfg, registryLayer{
+		ObsLogs: registrySignalLayer{Headers: map[string]string{}},
+	})
+	if cfg.Observability.Logs.Headers == nil {
+		t.Fatal("Logs.Headers = nil, want non-nil empty (explicitly no headers)")
+	}
+	if len(cfg.Observability.Logs.Headers) != 0 {
+		t.Errorf("Logs.Headers = %v, want empty", cfg.Observability.Logs.Headers)
+	}
 }

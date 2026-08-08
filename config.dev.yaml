@@ -19,16 +19,29 @@ web:
   listen: "127.0.0.1:9000"
 
 # Observability is opt-in. Uncomment and point at a local OTel
-# collector to exercise the metric exporter end-to-end. The Endpoint
-# field accepts a host:port for gRPC (default) or a full URL for
-# http/protobuf.
+# collector to exercise the exporters end-to-end. Each signal is
+# configured in its own block; a full URL is the recommended endpoint
+# form on both protocols — the scheme carries the TLS intent (http://
+# = plaintext, https:// = TLS) and an explicit path is used verbatim.
+# Bare host:port also works, with TLS then governed by `insecure`.
+# Top-level shared endpoint/protocol/insecure/headers still work but
+# are deprecated (startup WARN + dotvault.config.deprecated metric;
+# see issue #140).
 #
 # observability:
 #   enabled: true
-#   endpoint: "127.0.0.1:4317"
-#   protocol: "grpc"
-#   insecure: true
 #   export_interval: "15s"
+#   metrics:
+#     endpoint: "http://127.0.0.1:4317"   # scheme carries TLS intent; full URLs preferred
+#     protocol: "grpc"
+#     # temporality: delta                # cumulative (default) | delta | lowmemory
+#   # Send logs to a different backend, or switch a signal off with
+#   # enabled: false. Per-signal headers REPLACE any shared map (no merging).
+#   # logs:
+#   #   endpoint: "https://logs.vendor.example"
+#   #   protocol: "http/protobuf"
+#   #   headers:
+#   #     X-Api-Key: "logs-key"
 
 # Local API socket. Serves the daemon's web API over a per-user Unix socket
 # (default $XDG_RUNTIME_DIR/dotvault/api.sock, 0600) in addition to the

@@ -14,6 +14,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/sync"
 )
 
@@ -146,10 +147,16 @@ func TestRunConfigRefreshManualReload(t *testing.T) {
 // digest even though the snapshot does not retain the header values.
 func TestChangedStaticSections(t *testing.T) {
 	base := &config.Config{
-		Vault:         config.VaultConfig{Address: "https://vault.example.com:8200"},
-		Sync:          config.SyncConfig{Interval: time.Hour},
-		Web:           config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
-		Observability: config.ObservabilityConfig{Enabled: true, Endpoint: "https://otel.example", Headers: map[string]string{"Authorization": "Bearer s3cret"}},
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Web:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
+		Observability: config.ObservabilityConfig{
+			Enabled:  true,
+			Endpoint: "https://otel.example",
+			Headers:  map[string]string{"Authorization": "Bearer s3cret"},
+			Metrics:  config.ObservabilitySignalConfig{Headers: map[string]string{"X-Metrics-Key": "m3trics"}},
+			Logs:     config.ObservabilitySignalConfig{Headers: map[string]string{"X-Logs-Key": "l0gs"}},
+		},
 		Rules: []config.Rule{
 			{Name: "r", VaultKey: "k", Target: config.Target{Path: "/tmp/r", Format: "text"}},
 		},
@@ -158,6 +165,9 @@ func TestChangedStaticSections(t *testing.T) {
 	snap := staticSectionsOf(base)
 	if snap.Observability.Headers != nil {
 		t.Fatal("staticSectionsOf must not retain observability header values")
+	}
+	if snap.Observability.Metrics.Headers != nil || snap.Observability.Logs.Headers != nil {
+		t.Fatal("staticSectionsOf must not retain the per-signal observability header values either")
 	}
 	if snap.HeadersDigest == ([32]byte{}) {
 		t.Fatal("non-empty headers must produce a non-zero digest")
@@ -186,6 +196,12 @@ func TestChangedStaticSections(t *testing.T) {
 		{"api", func(c *config.Config) { c.API.Enabled = true }, "api"},
 		{"observability scalar", func(c *config.Config) { c.Observability.Endpoint = "https://elsewhere.example" }, "observability"},
 		{"observability headers", func(c *config.Config) { c.Observability.Headers = map[string]string{"Authorization": "Bearer rotated"} }, "observability"},
+		{"observability metrics headers", func(c *config.Config) {
+			c.Observability.Metrics.Headers = map[string]string{"X-Metrics-Key": "rotated"}
+		}, "observability"},
+		{"observability logs headers", func(c *config.Config) {
+			c.Observability.Logs.Headers = map[string]string{"X-Logs-Key": "rotated"}
+		}, "observability"},
 		{"bypass_system_config", func(c *config.Config) { c.BypassSystemConfig = true }, "bypass_system_config"},
 	}
 	for _, tc := range cases {
@@ -200,6 +216,218 @@ func TestChangedStaticSections(t *testing.T) {
 			got := changedStaticSections(snap, staticSectionsOf(&mutated))
 			if len(got) != 1 || got[0] != tc.want {
 				t.Errorf("changedStaticSections = %v, want [%s]", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDigestObservabilityHeadersDomainSeparation pins that the header digest
+// distinguishes WHICH map a header lives in, not just the multiset of
+// key/value pairs: moving a credential from the shared map to a per-signal
+// map redirects which backend receives it, which is a real config change the
+// restart-required diff must see.
+func TestDigestObservabilityHeadersDomainSeparation(t *testing.T) {
+	shared := config.ObservabilityConfig{
+		Headers: map[string]string{"Authorization": "Bearer tok"},
+	}
+	moved := config.ObservabilityConfig{
+		Metrics: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	if digestObservabilityHeaders(shared) == digestObservabilityHeaders(moved) {
+		t.Error("moving a header from the shared map to metrics must change the digest")
+	}
+
+	metricsOnly := config.ObservabilityConfig{
+		Metrics: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	logsOnly := config.ObservabilityConfig{
+		Logs: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	if digestObservabilityHeaders(metricsOnly) == digestObservabilityHeaders(logsOnly) {
+		t.Error("the same header under metrics vs logs must digest differently")
+	}
+
+	if digestObservabilityHeaders(shared) != digestObservabilityHeaders(shared) {
+		t.Error("digest must be deterministic within a process")
+	}
+}
+
+// TestWarnSharedHeadersToOverriddenEndpoint covers the cross-backend
+// credential warning: it fires only for an enabled signal that redirects the
+// endpoint while inheriting (nil) headers under a non-empty shared map, and
+// an explicit per-signal headers map — empty included — silences it.
+func TestWarnSharedHeadersToOverriddenEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.ObservabilityConfig
+		want bool
+	}{
+		{
+			name: "overridden endpoint with inherited headers warns",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs:     config.ObservabilitySignalConfig{Endpoint: "logs.vendor.example:4317"},
+			},
+			want: true,
+		},
+		{
+			name: "explicit empty per-signal headers silences",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs: config.ObservabilitySignalConfig{
+					Endpoint: "logs.vendor.example:4317",
+					Headers:  map[string]string{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no shared headers, nothing to leak",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Logs:     config.ObservabilitySignalConfig{Endpoint: "logs.vendor.example:4317"},
+			},
+			want: false,
+		},
+		{
+			name: "disabled signal cannot leak",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs: config.ObservabilitySignalConfig{
+					Enabled:  boolPtrTest(false),
+					Endpoint: "logs.vendor.example:4317",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "same endpoint restated is not an override",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Metrics:  config.ObservabilitySignalConfig{Endpoint: "shared:4317"},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuf := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			warnSharedHeadersToOverriddenEndpoint(tc.cfg)
+
+			got := strings.Contains(logBuf.String(), "inherits the shared headers")
+			if got != tc.want {
+				t.Errorf("warned = %v, want %v (log: %q)", got, tc.want, logBuf.String())
+			}
+			if strings.Contains(logBuf.String(), "Bearer shared") {
+				t.Error("warning must never carry header values")
+			}
+		})
+	}
+}
+
+func boolPtrTest(b bool) *bool { return &b }
+
+// TestResolvedSignalLockstep guards the one lockstep pair with no other
+// drift detection: config.ResolvedSignal and observability.Signal are
+// deliberately separate structs (the observability package must not import
+// config), bridged by a field-by-field copy in initObservability that
+// compiles silently if a field is added on one side and forgotten on the
+// other. Matching field-name sets won't catch a forgotten copy line, but
+// they catch the far more likely failure of the structs themselves
+// drifting.
+func TestResolvedSignalLockstep(t *testing.T) {
+	fieldNames := func(v any) map[string]bool {
+		names := map[string]bool{}
+		typ := reflect.TypeOf(v)
+		for i := 0; i < typ.NumField(); i++ {
+			names[typ.Field(i).Name] = true
+		}
+		return names
+	}
+	resolved := fieldNames(config.ResolvedSignal{})
+	signal := fieldNames(observability.Signal{})
+	for name := range resolved {
+		if !signal[name] {
+			t.Errorf("config.ResolvedSignal.%s has no observability.Signal counterpart; add it (and the copy in initObservability) or record the exception here", name)
+		}
+	}
+	for name := range signal {
+		if !resolved[name] {
+			t.Errorf("observability.Signal.%s has no config.ResolvedSignal counterpart; add it (and the copy in initObservability) or record the exception here", name)
+		}
+	}
+}
+
+// TestWarnDeprecatedObservabilityConfig covers the stage-one deprecation
+// gate: the WARN fires only when the master switch is on AND a shared
+// exporter field is in use, names every field in one line, stays silent for
+// the per-signal migration target, and returns exactly the fields the
+// caller must meter once the real provider is up.
+func TestWarnDeprecatedObservabilityConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.ObservabilityConfig
+		want []string
+	}{
+		{
+			name: "shared fields under enabled master warn",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer x"},
+			},
+			want: []string{"observability.endpoint", "observability.headers"},
+		},
+		{
+			name: "disabled master is silent even with shared fields",
+			cfg: config.ObservabilityConfig{
+				Endpoint: "shared:4317",
+			},
+			want: nil,
+		},
+		{
+			name: "per-signal-only config is silent",
+			cfg: config.ObservabilityConfig{
+				Enabled: true,
+				Metrics: config.ObservabilitySignalConfig{Endpoint: "metrics:4317"},
+			},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuf := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			got := warnDeprecatedObservabilityConfig(tc.cfg)
+
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("returned fields = %v, want %v", got, tc.want)
+			}
+			warned := strings.Contains(logBuf.String(), "deprecated shared observability fields")
+			if warned != (tc.want != nil) {
+				t.Errorf("warned = %v, want %v (log: %q)", warned, tc.want != nil, logBuf.String())
+			}
+			if tc.want != nil && !strings.Contains(logBuf.String(), "observability.endpoint") {
+				t.Error("warning must name the deprecated fields")
+			}
+			if strings.Contains(logBuf.String(), "Bearer x") {
+				t.Error("warning must never carry header values")
 			}
 		})
 	}

@@ -133,10 +133,21 @@ type Config struct {
 }
 
 // ObservabilityConfig configures the OpenTelemetry metric and log
-// exporters. A single block drives both signals against the same
-// collector — Endpoint / Protocol / Insecure / Headers are shared.
-// Disabled by default — set Enabled and Endpoint (or the standard
-// OTEL_* env vars) to point the daemon at a local OTel collector.
+// exporters. Each signal is configured in its nested Metrics/Logs block, so
+// the two can go to separate backends or one can be switched off. The
+// top-level Endpoint / Protocol / Insecure / Headers fields are shared
+// defaults the signal blocks layer onto — still functional, but DEPRECATED
+// (staged removal, tracking issue #140): using them draws a startup WARN
+// plus a dotvault.config.deprecated increment per field (see
+// DeprecatedSharedFields), and 1.0 removes them in favour of per-signal-only
+// configuration with the OTEL_* env vars as the cross-signal sharing
+// mechanism. Disabled by default — set Enabled and a signal's Endpoint (or
+// the standard OTEL_* env vars) to point the daemon at an OTel collector.
+//
+// The layering deliberately mirrors the OTel SDK's own environment-variable
+// convention (generic OTEL_EXPORTER_OTLP_* plus signal-specific
+// OTEL_EXPORTER_OTLP_METRICS_* / _LOGS_* overrides), so an operator who
+// knows one model knows both. Resolution lives in ResolveSignal.
 //
 // The inner fields deliberately do NOT carry `omitempty`. The
 // project's YAML/regfile round-trip contract (see
@@ -165,6 +176,221 @@ type ObservabilityConfig struct {
 	Headers        map[string]string `yaml:"headers"`
 	RawInterval    string            `yaml:"export_interval"`
 	ExportInterval time.Duration     `yaml:"-"`
+
+	// Metrics and Logs override the shared fields above per signal. The
+	// zero value inherits everything, so existing configs behave exactly
+	// as before.
+	Metrics ObservabilitySignalConfig `yaml:"metrics"`
+	Logs    ObservabilitySignalConfig `yaml:"logs"`
+}
+
+// ObservabilitySignalConfig is one signal's overrides of the shared
+// observability fields. Empty/nil fields inherit; see ResolveSignal for the
+// exact semantics of each.
+//
+// Enabled and Insecure are pointers for the same tri-state reason as
+// AgentWindowsConfig.Putty: an unset value must stay distinguishable from
+// an explicit false (unset inherits, explicit false overrides), and a nil
+// pointer is the default rather than a "cleared" value that must be
+// re-emitted, so `omitempty` is correct on exactly those two fields. The
+// string and map fields follow the section's round-trip contract and are
+// always emitted.
+type ObservabilitySignalConfig struct {
+	// Enabled switches this signal on or off. Unset (nil) means enabled
+	// whenever the top-level observability.enabled is — the top-level flag
+	// remains the master switch, and a per-signal true can only select,
+	// never resurrect a disabled subsystem.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Endpoint, when non-empty, replaces the shared endpoint for this
+	// signal — the "separate backends" field. A full URL is the
+	// recommended form: the scheme carries the TLS intent and an explicit
+	// path is used verbatim (no assumed mount path); see
+	// observability.Signal.Endpoint for the complete value contract.
+	Endpoint string `yaml:"endpoint"`
+	// Protocol, when non-empty, replaces the shared protocol ("grpc" or
+	// "http/protobuf") for this signal.
+	Protocol string `yaml:"protocol"`
+	// Insecure, when set, replaces the shared insecure flag for this
+	// signal.
+	Insecure *bool `yaml:"insecure,omitempty"`
+	// Headers, when non-nil, REPLACES the shared headers map for this
+	// signal — no merging, matching the OTel env-var convention where a
+	// signal-specific OTEL_EXPORTER_OTLP_LOGS_HEADERS supersedes the
+	// generic value wholesale. Merging credential maps invites sending one
+	// backend's bearer token to the other. An explicitly empty map
+	// (`headers: {}`) therefore means "this signal sends no headers" even
+	// when the shared map is populated.
+	//
+	// nil-vs-empty is semantic (inherit vs suppress), and no struct tag can
+	// express it: `omitempty` collapses both to absent, and no tag emits
+	// `{}` for empty while omitting nil. The custom MarshalYAML below is
+	// what preserves the distinction on emission; without it a single
+	// export→import cycle through the config-download or reg-export YAML
+	// would turn "inherit the shared credentials" into "send none",
+	// silently detaching auth from both signals.
+	Headers map[string]string `yaml:"headers"`
+	// Temporality is the metric temporality preference — "cumulative",
+	// "delta", or "lowmemory", the exact vocabulary of
+	// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE (which an empty
+	// value falls through to). Meaningful on the metrics block only:
+	// temporality is a metric concept with no log analogue, so validation
+	// rejects it on `logs` rather than silently ignoring a setting the
+	// operator believed took effect. It lives on the per-signal struct
+	// (not the deprecated shared layer) because new exporter knobs go
+	// where the config is headed, not where it is leaving.
+	Temporality string `yaml:"temporality"`
+}
+
+// MarshalYAML preserves the Headers nil-vs-empty distinction on the YAML
+// emission path (config download, reg-export): a nil map omits the
+// `headers:` key entirely (inherit), while a non-nil map — including an
+// empty one — emits it (`headers: {}` = this signal sends no headers). The
+// scalar fields keep the section's always-emit round-trip contract, and the
+// tri-state pointers keep their omit-when-unset behaviour.
+func (s ObservabilitySignalConfig) MarshalYAML() (any, error) {
+	// Keep this scalar mirror in lockstep with ObservabilitySignalConfig:
+	// a field added there and forgotten here is silently DROPPED from
+	// every YAML export (config download, reg-export) — the regfile
+	// round-trip tests are what catch the drift.
+	type scalars struct {
+		Enabled     *bool  `yaml:"enabled,omitempty"`
+		Endpoint    string `yaml:"endpoint"`
+		Protocol    string `yaml:"protocol"`
+		Insecure    *bool  `yaml:"insecure,omitempty"`
+		Temporality string `yaml:"temporality"`
+	}
+	base := scalars{
+		Enabled:     s.Enabled,
+		Endpoint:    s.Endpoint,
+		Protocol:    s.Protocol,
+		Insecure:    s.Insecure,
+		Temporality: s.Temporality,
+	}
+	if s.Headers == nil {
+		return base, nil
+	}
+	return struct {
+		scalars `yaml:",inline"`
+		Headers map[string]string `yaml:"headers"`
+	}{base, s.Headers}, nil
+}
+
+// ResolvedSignal is one signal's effective exporter settings after
+// layering its overrides onto the shared observability fields.
+//
+// Keep in lockstep with observability.Signal and the field-by-field copy in
+// cmd/dotvault's initObservability: the two structs are deliberately
+// separate (the observability package must not import this one), so a field
+// added here and forgotten there compiles silently and drops.
+type ResolvedSignal struct {
+	Enabled     bool
+	Endpoint    string
+	Protocol    string
+	Insecure    bool
+	Headers     map[string]string
+	Temporality string
+}
+
+// ResolveSignal layers a signal's overrides onto the shared fields.
+// Semantics per field: Enabled is the top-level master switch AND-ed with
+// the signal's own flag (unset = true); Endpoint and Protocol override when
+// non-empty; Insecure overrides when set; Headers replace wholesale when
+// non-nil. An empty resolved Endpoint still works — the OTel exporters fall
+// through to the standard OTEL_EXPORTER_OTLP_* (and signal-specific)
+// environment variables exactly as before.
+func (o ObservabilityConfig) ResolveSignal(sig ObservabilitySignalConfig) ResolvedSignal {
+	r := ResolvedSignal{
+		Enabled:  o.Enabled && (sig.Enabled == nil || *sig.Enabled),
+		Endpoint: o.Endpoint,
+		Protocol: o.Protocol,
+		Insecure: o.Insecure,
+		Headers:  o.Headers,
+		// Temporality has no shared-layer default to inherit — it is
+		// per-signal-only by design (see the field's godoc), so the
+		// signal's own value passes straight through.
+		Temporality: sig.Temporality,
+	}
+	if sig.Endpoint != "" {
+		r.Endpoint = sig.Endpoint
+	}
+	if sig.Protocol != "" {
+		r.Protocol = sig.Protocol
+	}
+	if sig.Insecure != nil {
+		r.Insecure = *sig.Insecure
+	}
+	if sig.Headers != nil {
+		r.Headers = sig.Headers
+	}
+	return r
+}
+
+// MetricsSignal and LogsSignal are the two concrete resolutions; every
+// consumer (the daemon's exporter wiring, the docs' description of what a
+// config means) goes through these so the layering is defined in exactly
+// one place.
+func (o ObservabilityConfig) MetricsSignal() ResolvedSignal { return o.ResolveSignal(o.Metrics) }
+func (o ObservabilityConfig) LogsSignal() ResolvedSignal    { return o.ResolveSignal(o.Logs) }
+
+// DeprecatedSharedFields reports which of the deprecated shared exporter
+// fields are in use, as dotted YAML paths ("observability.endpoint", …).
+// The shared endpoint/protocol/insecure/headers layer is being retired in
+// stages in favour of the per-signal metrics:/logs: blocks: this release
+// warns and meters the usage, a later release makes the warning louder, and
+// 1.0 removes the fields. Enabled (the master switch) and export_interval
+// (which has no per-signal home yet) are not part of the deprecation.
+//
+// Detection is presence-based, matching what the fields can express:
+// endpoint/protocol when non-empty, insecure only when true (the shared
+// field is a plain bool, so an explicit false is indistinguishable from
+// unset), headers when non-empty (for the shared map, nil and {} mean the
+// same thing — only the per-signal maps carry the presence distinction).
+// The caller decides how to surface the result; this stays a pure query so
+// the config package does not log or meter.
+func (o ObservabilityConfig) DeprecatedSharedFields() []string {
+	var fields []string
+	if o.Endpoint != "" {
+		fields = append(fields, "observability.endpoint")
+	}
+	if o.Protocol != "" {
+		fields = append(fields, "observability.protocol")
+	}
+	if o.Insecure {
+		fields = append(fields, "observability.insecure")
+	}
+	if len(o.Headers) > 0 {
+		fields = append(fields, "observability.headers")
+	}
+	return fields
+}
+
+// validateOTLPProtocol accepts the OTel canonical names from the
+// OTEL_EXPORTER_OTLP_PROTOCOL spec, or empty (inherit / SDK default). One
+// helper for the shared field and both per-signal overrides so the accepted
+// set cannot drift between them.
+func validateOTLPProtocol(field, protocol string) error {
+	switch strings.ToLower(protocol) {
+	case "", "grpc", "http/protobuf":
+		return nil
+	default:
+		return fmt.Errorf("%s %q: must be grpc or http/protobuf", field, protocol)
+	}
+}
+
+// validateOTLPTemporality accepts the vocabulary of
+// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE, or empty (fall through
+// to that env var / the SDK's cumulative default). Kept in lockstep with
+// observability.temporalitySelector, which maps the same names onto the SDK
+// selectors.
+func validateOTLPTemporality(field, temporality string) error {
+	// Identical normalization to observability.temporalitySelector —
+	// lockstep means a value that validates here must resolve there.
+	switch strings.ToLower(strings.TrimSpace(temporality)) {
+	case "", "cumulative", "delta", "lowmemory":
+		return nil
+	default:
+		return fmt.Errorf("%s %q: must be cumulative, delta, or lowmemory", field, temporality)
+	}
 }
 
 // Enrolment declares a credential acquisition flow for a Vault KV key.
@@ -747,14 +973,32 @@ func (c *Config) validate() error {
 	// defaults (60s export interval, standard env-var fallbacks) so
 	// most fields stay omittable.
 	if c.Observability.Enabled {
-		if c.Observability.Protocol != "" {
-			switch strings.ToLower(c.Observability.Protocol) {
-			case "grpc", "http/protobuf":
-				// accepted — the OTel canonical names from the
-				// OTEL_EXPORTER_OTLP_PROTOCOL spec.
-			default:
-				return fmt.Errorf("observability.protocol %q: must be grpc or http/protobuf", c.Observability.Protocol)
-			}
+		if err := validateOTLPProtocol("observability.protocol", c.Observability.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPProtocol("observability.metrics.protocol", c.Observability.Metrics.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPProtocol("observability.logs.protocol", c.Observability.Logs.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPTemporality("observability.metrics.temporality", c.Observability.Metrics.Temporality); err != nil {
+			return err
+		}
+		// Temporality is a metric concept with no log analogue. Rejecting
+		// it on the log signal (rather than silently ignoring it) tells
+		// the operator their setting is on the wrong block instead of
+		// letting them believe it took effect.
+		if c.Observability.Logs.Temporality != "" {
+			return fmt.Errorf("observability.logs.temporality %q: temporality applies to the metrics signal only", c.Observability.Logs.Temporality)
+		}
+		// Both signals explicitly off under an enabled master switch is a
+		// contradiction, not a configuration: the operator's intent is
+		// unclear (did they mean to disable observability, or did a partial
+		// edit leave this behind?), and silently initialising nothing would
+		// hide whichever mistake it was.
+		if !c.Observability.MetricsSignal().Enabled && !c.Observability.LogsSignal().Enabled {
+			return fmt.Errorf("observability.enabled is true but both metrics.enabled and logs.enabled are false; set observability.enabled false instead")
 		}
 		if c.Observability.RawInterval != "" {
 			// Use the project's ParseDuration so observability.export_interval
@@ -790,12 +1034,18 @@ func (c *Config) validate() error {
 	// header smuggling; NUL is rejected because HTTP/2 and gRPC
 	// treat it as a field terminator in some implementations and
 	// proxies vary in handling.
-	for k, v := range c.Observability.Headers {
-		if strings.ContainsAny(k, "\r\n:\x00") {
-			return fmt.Errorf("observability.headers: key %q must not contain CR, LF, NUL, or colon", k)
-		}
-		if strings.ContainsAny(v, "\r\n\x00") {
-			return fmt.Errorf("observability.headers[%q]: value must not contain CR, LF, or NUL", k)
+	for field, headers := range map[string]map[string]string{
+		"observability.headers":         c.Observability.Headers,
+		"observability.metrics.headers": c.Observability.Metrics.Headers,
+		"observability.logs.headers":    c.Observability.Logs.Headers,
+	} {
+		for k, v := range headers {
+			if strings.ContainsAny(k, "\r\n:\x00") {
+				return fmt.Errorf("%s: key %q must not contain CR, LF, NUL, or colon", field, k)
+			}
+			if strings.ContainsAny(v, "\r\n\x00") {
+				return fmt.Errorf("%s[%q]: value must not contain CR, LF, or NUL", field, k)
+			}
 		}
 	}
 

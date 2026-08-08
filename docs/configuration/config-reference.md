@@ -277,6 +277,52 @@ This is required for any user service meant to outlive an SSH session, which is 
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\API`, and the section round-trips through `reg-import`/`reg-export` like every other.
 
+## Observability section
+
+Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured in its own nested `metrics:` / `logs:` block, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for both signals. A per-signal `enabled: true` cannot resurrect a disabled subsystem |
+| `endpoint` | string | — | **Deprecated** shared default (see note below). OTLP collector endpoint; same value contract as the per-signal `endpoint` |
+| `protocol` | string | — | **Deprecated** shared default. `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
+| `insecure` | bool | `false` | **Deprecated** shared default. Disable transport TLS |
+| `headers` | map | — | **Deprecated** shared default. OTLP headers, typically a vendor bearer token — treat as a credential |
+| `export_interval` | string | SDK default | Metric export cadence as a Go duration (e.g. `30s`). Not deprecated |
+| `metrics` / `logs` | block | — | Per-signal configuration, fields below — the supported home for exporter settings |
+
+!!! warning "Shared exporter fields are deprecated"
+    The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work as shared defaults the per-signal blocks layer onto, but they are being retired in stages ([#140](https://github.com/goodtune/dotvault/issues/140)): this release warns at startup and counts each use on the `dotvault.config.deprecated` metric (attribute `field`), a later release makes the warning louder, and 1.0 removes them. Configure each signal in its own block, or use the standard `OTEL_EXPORTER_OTLP_*` environment variables for values shared across both signals — the env-var fallthrough remains fully supported.
+
+Per-signal override block (`metrics:` / `logs:`):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | inherit | Tri-state: unset inherits the master switch, explicit `false` turns this signal off |
+| `endpoint` | string | inherit | Non-empty overrides the shared endpoint (separate backend). A **full URL is the recommended form**: the scheme carries TLS intent (`https` → TLS, `http` → plaintext, on both protocols) and an explicit path is used verbatim — no mount path assumed; a path-less URL gets the standard `/v1/metrics` / `/v1/logs` appended (http/protobuf). Bare `host:port` (canonical gRPC) leaves TLS to `insecure`; `dns:///` passes through to the gRPC resolver |
+| `protocol` | string | inherit | Non-empty overrides the shared protocol |
+| `insecure` | bool | inherit | Tri-state: unset inherits the shared value. Meaningful for scheme-less endpoints; an endpoint URL's scheme already carries the TLS intent, and an explicit `true` forces plaintext even over `https://` — prefer stating the intent in the scheme |
+| `headers` | map | inherit | **Replaces** the shared map wholesale — never merged, so one backend's token is not sent to the other. An explicitly empty `headers: {}` means "this signal sends no headers", distinct from omitting the field (inherit) |
+| `temporality` | string | `cumulative` | Metric temporality preference: `cumulative`, `delta`, or `lowmemory` — the `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` vocabulary and instrument-kind mapping (empty falls through to that env var). `delta` reports counters/observable counters/histograms as per-interval deltas, as Datadog and some other vendors expect. **Metrics block only** — setting it under `logs:` is a config error |
+
+```yaml
+observability:
+  enabled: true
+  metrics:
+    endpoint: https://otel.internal.example
+    protocol: http/protobuf
+    temporality: delta                         # e.g. for a Datadog-fronted collector
+    headers:
+      authorization: "Bearer metrics-token"
+  logs:
+    endpoint: https://logs.vendor.example      # separate backend
+    protocol: http/protobuf
+    headers:                                   # with its own credentials
+      x-api-key: "logs-token"
+```
+
+While the deprecated shared fields remain in play, a signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
+
 ## Remote config section
 
 See [Remote Configuration](remote-config.md) for details. When `remote_config.url` is set, the local file/registry config becomes a base that is overlaid with dynamic sections (`rules`, `enrolments`, `sync`) fetched from a `dotvault-config` service.

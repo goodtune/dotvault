@@ -504,16 +504,29 @@ func canonicalizeKeyPath(path string) string {
 			parts[rootDepth+2] = c
 		}
 	}
-	// Observability\Headers and RemoteConfig\Headers are the fixed segments
-	// at rootDepth+1 (a position otherwise reserved for user-defined
-	// rule/enrolment names, which we never fold). Canonicalise only when the
-	// parent is one of those sections so a hand-authored .reg using
-	// `headers` in any case still matches the exact-string lookups in
-	// applyValues.
-	if len(parts) > rootDepth+1 &&
-		(parts[rootDepth] == "Observability" || parts[rootDepth] == "RemoteConfig") &&
-		strings.EqualFold(parts[rootDepth+1], "Headers") {
-		parts[rootDepth+1] = "Headers"
+	// Observability\Headers and RemoteConfig\Headers are fixed segments at
+	// rootDepth+1 (a position otherwise reserved for user-defined
+	// rule/enrolment names, which we never fold), as are the per-signal
+	// Observability\Metrics and Observability\Logs subkeys — and each
+	// signal's own Headers subtree one level below. Canonicalise only when
+	// the parent is one of those sections so a hand-authored .reg using any
+	// case still matches the exact-string lookups in applyValues.
+	if len(parts) > rootDepth+1 {
+		switch {
+		case (parts[rootDepth] == "Observability" || parts[rootDepth] == "RemoteConfig") &&
+			strings.EqualFold(parts[rootDepth+1], "Headers"):
+			parts[rootDepth+1] = "Headers"
+		case parts[rootDepth] == "Observability" && strings.EqualFold(parts[rootDepth+1], "Metrics"):
+			parts[rootDepth+1] = "Metrics"
+		case parts[rootDepth] == "Observability" && strings.EqualFold(parts[rootDepth+1], "Logs"):
+			parts[rootDepth+1] = "Logs"
+		}
+	}
+	if len(parts) > rootDepth+2 &&
+		parts[rootDepth] == "Observability" &&
+		(parts[rootDepth+1] == "Metrics" || parts[rootDepth+1] == "Logs") &&
+		strings.EqualFold(parts[rootDepth+2], "Headers") {
+		parts[rootDepth+2] = "Headers"
 	}
 	return strings.Join(parts, `\`)
 }
@@ -745,6 +758,54 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 	if len(headers) > 0 {
 		cfg.Observability.Headers = headers
+	}
+
+	// Per-signal override blocks. The tri-state Enabled/Insecure only apply
+	// when the value is present (nil = inherit), and each signal's Headers
+	// map is non-nil iff its subkey exists — key presence is what encodes
+	// the "explicitly no headers for this signal" state that must not
+	// collapse into "inherit the shared credentials" across a round-trip.
+	for _, sig := range []struct {
+		name string
+		cfg  *config.ObservabilitySignalConfig
+	}{
+		{"Metrics", &cfg.Observability.Metrics},
+		{"Logs", &cfg.Observability.Logs},
+	} {
+		sigKey := obsKey + `\` + sig.name
+		if err := applyBoolPtr(&sig.cfg.Enabled, sigKey, "Enabled"); err != nil {
+			return err
+		}
+		if err := applyBoolPtr(&sig.cfg.Insecure, sigKey, "Insecure"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Endpoint, sigKey, "Endpoint"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Protocol, sigKey, "Protocol"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Temporality, sigKey, "Temporality"); err != nil {
+			return err
+		}
+		sigHeadersKey := sigKey + `\Headers`
+		var sigHeaders map[string]string
+		if seenKeys[sigHeadersKey] {
+			sigHeaders = map[string]string{}
+		}
+		for vk, v := range values {
+			if vk.key != sigHeadersKey {
+				continue
+			}
+			if v.kind != rvSZ {
+				return fmt.Errorf("registry value %s\\%s has unsupported type %s for an observability header (only REG_SZ is supported)", sigHeadersKey, vk.name, kindName(v.kind))
+			}
+			if sigHeaders == nil {
+				sigHeaders = map[string]string{}
+			}
+			sigHeaders[vk.name] = v.str
+		}
+		sig.cfg.Headers = sigHeaders
 	}
 
 	// RemoteConfig. Scalar fields mirror the renderer; Headers live in a

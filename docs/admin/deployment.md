@@ -262,25 +262,42 @@ Separately, every log record is also mirrored to the OTel LoggerProvider alongsi
 
 ## Observability
 
-dotvault can export OpenTelemetry **metrics and logs** to a local OTel collector — a single `observability:` block in `config.yaml` drives both signals against the same endpoint. Disabled by default; enable with:
+dotvault can export OpenTelemetry **metrics and logs** to an OTel collector. Each signal is configured in its own nested block — `metrics:` and `logs:` — so the two can go to **separate backends** or one can be switched off independently. Disabled by default; enable with:
 
 ```yaml
 observability:
-  enabled: true
-  endpoint: "127.0.0.1:4317"  # local OTel collector
-  protocol: "grpc"            # or "http/protobuf"
-  insecure: true              # disable TLS for the local hop
-  export_interval: "15s"
-  # headers:
-  #   authorization: "Bearer …"
+  enabled: true                  # master switch for both signals
+  export_interval: "15s"         # metric export cadence
+  metrics:
+    endpoint: "http://127.0.0.1:4317"   # http:// = plaintext for the local hop
+    protocol: "grpc"                    # or "http/protobuf"
+  logs:
+    endpoint: "https://logs.vendor.example"
+    protocol: "http/protobuf"
+    headers:
+      X-Api-Key: "logs-backend-key"
 ```
 
-For `http/protobuf`, set `endpoint` to a *base* URL like `https://otel.example` — the SDK appends `/v1/metrics` and `/v1/logs` itself. A URL that already includes a signal-specific path (e.g. ending in `/v1/metrics`) routes both signals to the same wrong route.
+The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work as shared defaults that the per-signal blocks layer onto — the model deliberately mirrors the OTel SDK's own env-var convention (generic `OTEL_EXPORTER_OTLP_*` plus signal-specific `OTEL_EXPORTER_OTLP_METRICS_*` / `_LOGS_*`) — but they are **deprecated** and being retired in stages:
+
+!!! warning "Shared exporter fields are deprecated"
+    Setting `observability.endpoint`, `protocol`, `insecure`, or `headers` at the top level (with observability enabled) logs a startup WARN naming the fields and increments the `dotvault.config.deprecated` counter once per field per process start, so a fleet's collector can measure migration progress. Everything keeps working for now; a later release makes the warning louder and 1.0 removes the shared fields. Move the settings into the per-signal `metrics:` / `logs:` blocks — or, for values shared across both signals (a common bearer token, a common collector), use the standard `OTEL_EXPORTER_OTLP_*` environment variables, which remain fully supported. Tracked in [#140](https://github.com/goodtune/dotvault/issues/140).
+
+Field semantics: `enabled` (unset = on whenever `observability.enabled` is; explicit `false` switches that signal off — the top-level flag remains the master switch and a per-signal `true` cannot resurrect a disabled subsystem), `endpoint` / `protocol` (non-empty overrides), `insecure` (set overrides), and `headers`, which **replace the shared map wholesale** rather than merging — merging credential maps invites sending one backend's bearer token to the other. An explicitly empty `headers: {}` therefore means "this signal sends no headers" even when the shared map is populated. Watch the inverse case, too: a signal that overrides `endpoint` but leaves `headers` unset inherits the shared map — shared bearer token included — and sends it to the new backend. The daemon warns at startup when it sees that combination; set an explicit per-signal `headers:` (`{}` for none) to state the intent and silence it. Enabling `observability.enabled` with both signals explicitly off is rejected at config load as the contradiction it is.
+
+**Endpoint form.** Both signals share one endpoint contract, and a **full URL with a scheme is the recommended form**: the scheme carries the TLS intent (`https://` → TLS, `http://` → plaintext, on gRPC and http/protobuf alike), and an explicit path is used verbatim — no mount path is assumed, so a vendor route like `https://collector.example/tenant-42/v1/metrics` works as written. A URL *without* a path gets the OTLP standard `/v1/metrics` / `/v1/logs` appended automatically (http/protobuf; gRPC has no URL path), so `https://otel.example` alone still routes correctly. Bare `host:port` also works — the traditional gRPC form — with TLS then governed by the `insecure` flag; `dns:///` targets pass through to the gRPC resolver. An explicit `insecure: true` forces plaintext even over an `https://` scheme — prefer stating the intent in the scheme and leaving the flag alone. The insecure-transport-with-auth-headers warning fires however the plaintext arises, flag or `http://` scheme.
+
+!!! warning "Upgraders: gRPC endpoints with an `http://` scheme"
+    Earlier releases ignored a URL scheme on gRPC endpoints (stripping it and attempting TLS regardless). The scheme is now authoritative, so a gRPC endpoint written `http://…` switches from attempting TLS to **plaintext**. The daemon logs a WARN naming this change whenever it builds a gRPC exporter from an `http://` endpoint — use `https://` or drop the scheme to keep TLS, or keep `http://` if plaintext was the intent all along (the common case for a loopback collector, where the old TLS attempt simply failed).
+
+**Metric temporality.** `metrics.temporality` selects the aggregation temporality the metric exporter reports: `cumulative` (the OTLP default), `delta` (counters, observable counters, and histograms report per-interval deltas — what Datadog and some other vendors expect), or `lowmemory` (only synchronous counters and histograms delta). The vocabulary and instrument-kind mapping are exactly those of `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`, which an unset field falls through to. Metrics-only — setting it under `logs:` is a config error.
+
+Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op implementation, so both the `Log*` helpers and the slog→OTel mirror go quiet for that daemon (stderr/journald logging is unaffected) — `metrics.enabled` alone gives you series without shipping any log records.
 
 !!! note "Windows Group Policy"
-    The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`). Header values round-trip too (as REG_SZ values under `Observability\Headers`), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.
+    The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`), with the per-signal overrides as `Observability\Metrics` / `Observability\Logs` subkeys (tri-state `Enabled`/`Insecure` DWORDs, and their own `Headers` subkeys — a present-but-empty per-signal `Headers` key means "no headers for this signal", distinct from an absent key meaning inherit). Header values round-trip too (as REG_SZ values under the respective `Headers` keys), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.
 
-The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the `endpoint`/`headers` fields can be left empty and managed centrally via `/etc/default/dotvault`.
+The standard `OTEL_*` environment variables (generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS`, and the signal-specific `_METRICS_*` / `_LOGS_*` variants) are honoured by the SDK whenever the corresponding config field is empty, so endpoint and header configuration can live entirely outside the config file. Put credential-bearing values (`OTEL_EXPORTER_OTLP_HEADERS`) in the per-user `EnvironmentFile` (`~/.config/dotvault/env`, mode 0600) rather than a world-readable location — this is the recommended way to share a token across both signals without it appearing in any config artefact, and it is where the shared-field deprecation steers that use case.
 
 The exporter emits a bounded set of instruments:
 
@@ -295,6 +312,8 @@ The exporter emits a bounded set of instruments:
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |
 | `dotvault.sighup.received`      | counter   | (no attrs) — each SIGHUP forces an immediate `~/.dotvault-token` re-read and config reload |
+| `dotvault.config.deprecated`    | counter   | `field` — deprecated config fields in active use, one increment per field per process start; sum by `field` to measure fleet migration progress |
+| `dotvault.build_info`           | gauge     | `version`, `go_version`, `os`, `arch` — constant `1`, one series per build, following the Prometheus `*_build_info` convention. `version` is the v-stripped release semver on tagged builds and `dev` on untagged/hand-rolled ones (same value as `dotvault version`), so a `dev` series in a fleet view means an unofficial build, not missing data. Join other series against it to slice by build — e.g. `dotvault.config.deprecated` joined by `version` shows whether deprecated-config stragglers are just old builds. The same identity also rides every series as OTel resource attributes (`service.version`, `os.type`, `host.arch`, `process.runtime.*`) for backends that surface `target_info` |
 
 ### Log records
 

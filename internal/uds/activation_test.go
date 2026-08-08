@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -53,99 +52,6 @@ func listenerFile(t *testing.T, path string) *os.File {
 	}
 	t.Cleanup(func() { f.Close() })
 	return f
-}
-
-// fileProvider adapts a slice of files to parseActivation's fileAt hook: a
-// test cannot arrange for its fds to sit at exactly 3..n, so the index-based
-// contract is exercised with real listeners at whatever numbers the OS gave.
-func fileProvider(files []*os.File) func(i int) *os.File {
-	return func(i int) *os.File { return files[i] }
-}
-
-func TestParseActivation(t *testing.T) {
-	pid := os.Getpid()
-
-	t.Run("no env means no activation", func(t *testing.T) {
-		got, err := parseActivation("", "", "", pid, nil)
-		if got != nil || err != nil {
-			t.Errorf("got (%v, %v), want (nil, nil)", got, err)
-		}
-	})
-
-	t.Run("foreign pid is ignored per protocol", func(t *testing.T) {
-		// The variables may be inherited from a parent that was the real
-		// activation target; touching its fds would be theft.
-		got, err := parseActivation(strconv.Itoa(pid+1), "2", "api:agent", pid, nil)
-		if got != nil || err != nil {
-			t.Errorf("got (%v, %v), want (nil, nil)", got, err)
-		}
-	})
-
-	t.Run("names map positionally", func(t *testing.T) {
-		dir := shortSockDir(t)
-		files := []*os.File{
-			listenerFile(t, filepath.Join(dir, "a.sock")),
-			listenerFile(t, filepath.Join(dir, "b.sock")),
-		}
-		got, err := parseActivation(strconv.Itoa(pid), "2", "api:agent", pid, fileProvider(files))
-		if err != nil {
-			t.Fatalf("parseActivation: %v", err)
-		}
-		if len(got["api"]) != 1 || got["api"][0] != files[0] {
-			t.Errorf("api fd mismatch")
-		}
-		if len(got["agent"]) != 1 || got["agent"][0] != files[1] {
-			t.Errorf("agent fd mismatch")
-		}
-	})
-
-	t.Run("missing names default to unknown", func(t *testing.T) {
-		dir := shortSockDir(t)
-		files := []*os.File{listenerFile(t, filepath.Join(dir, "a.sock"))}
-		got, err := parseActivation(strconv.Itoa(pid), "1", "", pid, fileProvider(files))
-		if err != nil {
-			t.Fatalf("parseActivation: %v", err)
-		}
-		if len(got["unknown"]) != 1 {
-			t.Errorf("fd without FileDescriptorName should land under \"unknown\", got %v", got)
-		}
-	})
-
-	t.Run("fds are claimed even when the name list is malformed", func(t *testing.T) {
-		// The production fileAt hook is what sets CLOEXEC; it must run for
-		// every fd addressed to us before names are validated, or a garbled
-		// LISTEN_FDNAMES leaves live listeners inheritable by every child.
-		claimed := 0
-		_, err := parseActivation(strconv.Itoa(pid), "2", "api", pid, func(i int) *os.File {
-			claimed++
-			r, w, perr := os.Pipe()
-			if perr != nil {
-				t.Fatal(perr)
-			}
-			t.Cleanup(func() { w.Close() })
-			return r // closed by parseActivation's error path
-		})
-		if err == nil {
-			t.Fatal("want a name-count mismatch error")
-		}
-		if claimed != 2 {
-			t.Errorf("fileAt ran %d times, want 2 (once per fd, before name validation)", claimed)
-		}
-	})
-
-	t.Run("malformed values are loud", func(t *testing.T) {
-		// Under a socket unit, misreading the environment means serving
-		// nothing while systemd believes we hold the fds — an error, never
-		// a silent nil.
-		for _, tc := range [][3]string{
-			{"notapid", "1", "api"},
-			{strconv.Itoa(pid), "notacount", "api"},
-		} {
-			if _, err := parseActivation(tc[0], tc[1], tc[2], pid, func(int) *os.File { return nil }); err == nil {
-				t.Errorf("parseActivation(%q, %q, %q) = nil error, want failure", tc[0], tc[1], tc[2])
-			}
-		}
-	})
 }
 
 func TestAdoptActivated(t *testing.T) {

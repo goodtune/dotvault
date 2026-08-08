@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -31,7 +32,6 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
-	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
@@ -719,7 +719,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// (WatchdogSec=120s by default) and systemd would restart the
 	// process mid-startup. sd_notify(READY=1) is still delayed until
 	// after auth + initial sync further down.
-	go sdnotify.WatchdogLoop(ctx)
+	go watchdogLoop(ctx)
 
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
@@ -1318,7 +1318,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// NOTIFY_SOCKET is unset; a non-nil return from Ready()
 		// means a genuine socket write failure (warn loudly so
 		// the systemd "start-limit-hit" log has a breadcrumb).
-		if err := sdnotify.Ready(); err != nil {
+		if err := sdNotify(daemon.SdNotifyReady); err != nil {
 			slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
 		}
 	}
@@ -1372,7 +1372,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Stop the sync loop and propagate its result. Notify systemd we're
 	// stopping so the unit state reflects the shutdown sequence rather
 	// than appearing to crash.
-	_ = sdnotify.Stopping()
+	_ = sdNotify(daemon.SdNotifyStopping)
 	cancel()
 	return <-loopErrCh
 }

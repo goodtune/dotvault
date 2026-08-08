@@ -1,19 +1,20 @@
 package uds
 
 import (
-	"fmt"
 	"os"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 )
 
-// systemd socket activation (sd_listen_fds), hand-rolled like
-// internal/sdnotify rather than imported: the protocol is three environment
-// variables and a file-descriptor convention, and dotvault's rule for every
-// socket it serves — owner-only or nothing — has to be enforced on *inherited*
-// fds too, which a stock helper does not do.
+// systemd socket activation (sd_listen_fds). The protocol layer — parsing
+// LISTEN_FDS/LISTEN_PID/LISTEN_FDNAMES, setting CLOEXEC on the inherited
+// fds, scrubbing the environment — comes from the canonical
+// github.com/coreos/go-systemd/v22 activation package (see
+// activation_linux.go); owning a bespoke copy of an ecosystem-standard
+// protocol was judged not worth it. What remains here is everything the
+// library deliberately does not do: dotvault's rule that every socket it
+// serves is owner-only or nothing, enforced on *inherited* fds
+// (activation_unix.go), and the retained-master claim model below.
 //
 // The daemon consumes this through ActivatedListener("api") /
 // ActivatedListener("agent"), matching the FileDescriptorName= set in the
@@ -35,10 +36,6 @@ import (
 // hang in systemd's backlog. Re-claiming from the retained master makes a
 // listener restart under activation behave exactly like one under self-bind.
 
-// listenFdsStart is SD_LISTEN_FDS_START: the first inherited listener fd.
-// Fixed by the sd_listen_fds contract, not configurable.
-const listenFdsStart = 3
-
 // activationState is the one-time snapshot of the activation environment:
 // the inherited fds as retained master files, keyed by FileDescriptorName.
 //
@@ -56,81 +53,6 @@ type activationState struct {
 	// housekeeping (DrainUnclaimedActivation) can tell "enabled surface owns
 	// this" from "nobody will ever serve this".
 	claimed map[string]bool
-}
-
-// parseActivation interprets the sd_listen_fds environment triplet and
-// claims the inherited fds.
-//
-// It returns nil (no error) when activation is not in effect: LISTEN_FDS
-// absent, or LISTEN_PID naming a different process — the latter is the
-// protocol's own rule, since the variables may have been inherited from a
-// parent that was the real activation target. Malformed values are an error
-// rather than a silent nil: under a socket unit, misreading the environment
-// means serving nothing while systemd believes we hold the fds, which
-// deserves a loud failure.
-//
-// fileAt adopts fd number listenFdsStart+i; it is a parameter so tests can
-// substitute real listeners at arbitrary fd numbers (a test cannot arrange
-// for its fds to sit at exactly 3..n). The contract callers rely on: once
-// the fd *count* has parsed, fileAt runs for every fd BEFORE the names are
-// validated, so the production hook's CLOEXEC scrub covers fds addressed to
-// us even when LISTEN_FDNAMES turns out to be malformed — those fds must
-// not leak into exec'd children just because the name list was garbled. On
-// a name error the claimed files are closed and the error returned.
-func parseActivation(listenPid, listenFds, listenFdNames string, ourPid int, fileAt func(i int) *os.File) (map[string][]*os.File, error) {
-	if listenFds == "" {
-		return nil, nil
-	}
-	pid, err := strconv.Atoi(listenPid)
-	if err != nil {
-		return nil, fmt.Errorf("LISTEN_PID %q is not a PID", listenPid)
-	}
-	if pid != ourPid {
-		// Addressed to another process (our parent, typically). Per the
-		// protocol, not ours to touch.
-		return nil, nil
-	}
-	n, err := strconv.Atoi(listenFds)
-	if err != nil || n < 0 {
-		return nil, fmt.Errorf("LISTEN_FDS %q is not a count", listenFds)
-	}
-	if n == 0 {
-		return nil, nil
-	}
-
-	// Claim every fd first — see the fileAt contract above.
-	files := make([]*os.File, n)
-	for i := range files {
-		files[i] = fileAt(i)
-	}
-
-	// LISTEN_FDNAMES is colon-separated, one entry per fd. systemd sends the
-	// FileDescriptorName= of each socket unit; an fd with no name (a unit
-	// without the setting, or systemd < 227 which does not send names at
-	// all) is "unknown" per the protocol. dotvault claims fds strictly by
-	// name, so "unknown" entries are never consumed — the daemon drains
-	// them with a warning naming the fix (set FileDescriptorName= in the
-	// socket unit).
-	names := make([]string, n)
-	for i := range names {
-		names[i] = "unknown"
-	}
-	if listenFdNames != "" {
-		split := strings.Split(listenFdNames, ":")
-		if len(split) != n {
-			for _, f := range files {
-				f.Close()
-			}
-			return nil, fmt.Errorf("LISTEN_FDNAMES carries %d names for %d fds", len(split), n)
-		}
-		copy(names, split)
-	}
-
-	byName := make(map[string][]*os.File, n)
-	for i, name := range names {
-		byName[name] = append(byName[name], files[i])
-	}
-	return byName, nil
 }
 
 // master returns the retained master file for name — marking the name

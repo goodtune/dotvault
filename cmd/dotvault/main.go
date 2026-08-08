@@ -2718,7 +2718,7 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 		// Telemetry must never take the daemon down. Log loudly and
 		// continue with a no-op provider so instrument call sites
 		// stay safe.
-		slog.Error("failed to initialise observability, continuing without metrics", "error", err)
+		slog.Error("failed to initialise observability, continuing without OTLP export (metrics and logs)", "error", err)
 		return &observability.Provider{}
 	}
 	// The counter half of the deprecation report waits for a successful

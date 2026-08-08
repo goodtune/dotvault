@@ -365,11 +365,17 @@ func TestEndpointSchemeRouting(t *testing.T) {
 		"http://127.0.0.1:4317":                  true,
 		"https://collector.example":              true,
 		"https://collector.example/t/v1/metrics": true,
-		"127.0.0.1:4317":                         false,
-		"collector.example:4317":                 false,
-		"grpc://collector.example:4317":          false,
-		"dns:///collector.example:4317":          false,
-		"":                                       false,
+		// Schemes are case-insensitive (url.Parse canonicalises them), so
+		// the routing predicate must fold case or the uppercase form would
+		// skip WithEndpointURL — and the plaintext warnings — while still
+		// meaning plaintext to any parser that did accept it.
+		"HTTP://127.0.0.1:4317":         true,
+		"HTTPS://collector.example":     true,
+		"127.0.0.1:4317":                false,
+		"collector.example:4317":        false,
+		"grpc://collector.example:4317": false,
+		"dns:///collector.example:4317": false,
+		"":                              false,
 	}
 	for endpoint, want := range urlForm {
 		if got := hasHTTPScheme(endpoint); got != want {
@@ -379,6 +385,7 @@ func TestEndpointSchemeRouting(t *testing.T) {
 
 	stripped := map[string]string{
 		"grpc://collector.example:4317": "collector.example:4317",
+		"GRPC://collector.example:4317": "collector.example:4317",
 		"collector.example:4317":        "collector.example:4317",
 		"dns:///collector.example:4317": "dns:///collector.example:4317",
 		// Dead at the current call sites (hasHTTPScheme routes these to
@@ -562,6 +569,7 @@ func TestInsecureHeaderFootgun(t *testing.T) {
 		{"tls with headers", Signal{Headers: auth}, false},
 		{"neither", Signal{}, false},
 		{"http scheme with headers", Signal{Endpoint: "http://collector.example:4318", Headers: auth}, true},
+		{"uppercase http scheme with headers", Signal{Endpoint: "HTTP://collector.example:4318", Headers: auth}, true},
 		{"http scheme without headers", Signal{Endpoint: "http://collector.example:4318"}, false},
 		{"https scheme with headers", Signal{Endpoint: "https://collector.example", Headers: auth}, false},
 		{"schemeless endpoint with headers", Signal{Endpoint: "collector.example:4317", Headers: auth}, false},

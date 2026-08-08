@@ -426,7 +426,7 @@ func warnInsecureHeaders(signal string, sig Signal) {
 // full-URL form would be exactly the shape that ships a bearer token over
 // cleartext unwarned.
 func insecureHeaderFootgun(sig Signal) bool {
-	plaintext := sig.Insecure || strings.HasPrefix(sig.Endpoint, "http://")
+	plaintext := sig.Insecure || hasPrefixFold(sig.Endpoint, "http://")
 	return plaintext && len(sig.Headers) > 0
 }
 
@@ -438,7 +438,7 @@ func insecureHeaderFootgun(sig Signal) bool {
 // headers included — in cleartext, so the change must be loud: one WARN per
 // exporter build naming the fix for each intent.
 func warnGRPCSchemeDowngrade(signal string, sig Signal) {
-	if strings.HasPrefix(sig.Endpoint, "http://") {
+	if hasPrefixFold(sig.Endpoint, "http://") {
 		slog.Warn("gRPC OTLP endpoint has an http:// scheme, which now selects PLAINTEXT transport (earlier releases ignored the scheme and used TLS) — use https:// or drop the scheme to keep TLS, or keep http:// if plaintext is intended", "signal", signal)
 	}
 }
@@ -474,9 +474,20 @@ func temporalitySelector(preference string) (sdkmetric.TemporalitySelector, erro
 // URL — the form whose scheme carries the TLS intent on every protocol.
 // Deliberately a prefix check, not url.Parse: parsing "127.0.0.1:4317"
 // yields Scheme "127.0.0.1", so a parse-based check would misclassify the
-// canonical host:port form.
+// canonical host:port form. Case-insensitive, because URL schemes are:
+// url.Parse canonicalises "HTTP://" to scheme "http", so a case-sensitive
+// check here would route the uppercase form away from WithEndpointURL —
+// and past the plaintext warnings — while the SDK would still have
+// treated it as plaintext had it arrived.
 func hasHTTPScheme(s string) bool {
-	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
+	return hasPrefixFold(s, "https://") || hasPrefixFold(s, "http://")
+}
+
+// hasPrefixFold is strings.HasPrefix under Unicode case-folding — the
+// one predicate all scheme checks share so their case handling cannot
+// drift apart.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // stripScheme normalises an OTLP gRPC endpoint by removing a
@@ -484,7 +495,8 @@ func hasHTTPScheme(s string) bool {
 // host:port (which is what otlpmetricgrpc.WithEndpoint expects).
 // http(s):// endpoints are routed through WithEndpointURL before this
 // runs (their scheme carries TLS intent); this handles the leftovers —
-// grpc:// is stripped as a tolerated no-meaning prefix.
+// grpc:// is stripped as a tolerated no-meaning prefix, in any case
+// (schemes are case-insensitive).
 //
 // dns:/// is deliberately preserved: it is a valid gRPC resolver
 // prefix (not a URL scheme) that enables the DNS resolver for
@@ -492,8 +504,8 @@ func hasHTTPScheme(s string) bool {
 // would change the dial-target semantics and break those setups.
 func stripScheme(s string) string {
 	for _, prefix := range []string{"https://", "http://", "grpc://"} {
-		if strings.HasPrefix(s, prefix) {
-			return strings.TrimPrefix(s, prefix)
+		if hasPrefixFold(s, prefix) {
+			return s[len(prefix):]
 		}
 	}
 	return s

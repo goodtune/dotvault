@@ -55,25 +55,37 @@ type activationState struct {
 	claimed map[string]bool
 }
 
-// master returns the retained master file for name — marking the name
+// claim returns the retained master file for name — marking the name
 // claimed — or nil when activation is off or carries nothing under that
 // name. The master stays open and owned by the snapshot; callers adopt it
 // via net.FileListener (which dups) and must never close it.
-func (s *activationState) master(name string) *os.File {
+//
+// extras carries any further fds systemd passed under the same name (a
+// socket unit with several ListenStream= entries shares its single
+// FileDescriptorName= across all of them), and only on the first claim for
+// the name, so a re-claim after a listener restart does not hand the same
+// extras out twice. dotvault serves exactly one socket per surface, so the
+// caller's job is to drain them: served-by-nobody is the one state they
+// must not be left in, since clients connecting to those sockets would
+// otherwise hang in systemd's backlog indefinitely.
+func (s *activationState) claim(name string) (master *os.File, extras []*os.File) {
 	if s == nil {
-		return nil
+		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	files := s.byName[name]
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	if s.claimed == nil {
 		s.claimed = make(map[string]bool)
 	}
-	s.claimed[name] = true
-	return files[0]
+	if !s.claimed[name] {
+		s.claimed[name] = true
+		extras = files[1:]
+	}
+	return files[0], extras
 }
 
 // unclaimedNames lists names no surface has claimed, sorted for stable logs.

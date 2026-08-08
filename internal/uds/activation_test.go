@@ -214,16 +214,16 @@ func TestActivationStateClaims(t *testing.T) {
 		"unknown": {fUnknown},
 	}}
 
-	if got := st.master("api"); got != fAPI {
-		t.Errorf("master(api) returned the wrong file")
+	if got, _ := st.claim("api"); got != fAPI {
+		t.Errorf("claim(api) returned the wrong file")
 	}
 	// Masters are retained: a second claim gets the same file (the
 	// re-listen contract), not nil.
-	if got := st.master("api"); got != fAPI {
-		t.Errorf("second master(api) = %v, want the retained master", got)
+	if got, _ := st.claim("api"); got != fAPI {
+		t.Errorf("second claim(api) = %v, want the retained master", got)
 	}
-	if got := st.master("agent"); got != nil {
-		t.Errorf("master(agent) = %v, want nil (never passed)", got)
+	if got, _ := st.claim("agent"); got != nil {
+		t.Errorf("claim(agent) = %v, want nil (never passed)", got)
 	}
 	if got := st.unclaimedNames(); len(got) != 1 || got[0] != "unknown" {
 		t.Errorf("unclaimedNames = %v, want [unknown]", got)
@@ -237,8 +237,46 @@ func TestActivationStateClaims(t *testing.T) {
 	}
 	// A nil state (no activation) is inert everywhere.
 	var none *activationState
-	if none.master("api") != nil || none.unclaimedNames() != nil {
+	if m, _ := none.claim("api"); m != nil {
 		t.Error("nil activationState must be inert")
+	}
+	if none.unclaimedNames() != nil {
+		t.Error("nil activationState must report no unclaimed names")
+	}
+}
+
+// TestActivationStateClaimExtras pins the multi-fd contract: a socket unit
+// with several ListenStream= entries passes every fd under its single
+// FileDescriptorName=, and dotvault serves exactly one socket per surface.
+// The first claim must hand the extras over exactly once — so the caller
+// can drain them and no socket is left in the served-by-nobody state where
+// clients hang — and a re-claim after a listener restart must not hand the
+// same extras out again.
+func TestActivationStateClaimExtras(t *testing.T) {
+	dir := shortSockDir(t)
+	f1 := listenerFile(t, filepath.Join(dir, "a.sock"))
+	f2 := listenerFile(t, filepath.Join(dir, "b.sock"))
+	f3 := listenerFile(t, filepath.Join(dir, "c.sock"))
+	st := &activationState{byName: map[string][]*os.File{
+		"api": {f1, f2, f3},
+	}}
+
+	m, extras := st.claim("api")
+	if m != f1 {
+		t.Errorf("claim master = %v, want the first fd (ListenStream order)", m)
+	}
+	if len(extras) != 2 || extras[0] != f2 || extras[1] != f3 {
+		t.Errorf("extras = %v, want the second and third fds", extras)
+	}
+
+	// Re-claim: same master, no extras — they were already handed over for
+	// draining and must not be double-adopted.
+	m, extras = st.claim("api")
+	if m != f1 {
+		t.Errorf("re-claim master = %v, want the retained first fd", m)
+	}
+	if len(extras) != 0 {
+		t.Errorf("re-claim extras = %v, want none", extras)
 	}
 }
 

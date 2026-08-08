@@ -4,6 +4,7 @@ package uds
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -34,27 +35,36 @@ func TestActivationEndToEnd(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(dir, "api.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
+	mkListener := func(name string) (*os.File, string) {
+		path := filepath.Join(dir, name)
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := ln.(*net.UnixListener).File()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f, path
 	}
-	defer ln.Close()
-	if err := os.Chmod(sock, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f, err := ln.(*net.UnixListener).File()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
+	f, sock := mkListener("api.sock")
+	// A second fd under the SAME name, as a socket unit with two
+	// ListenStream= entries would pass. The child must drain it: served by
+	// nobody is the one state it may not be left in.
+	fExtra, sockExtra := mkListener("api2.sock")
 
 	cmd := exec.Command(os.Args[0], "-test.run", "TestActivationEndToEnd")
-	cmd.ExtraFiles = []*os.File{f} // lands at fd 3 in the child
+	cmd.ExtraFiles = []*os.File{f, fExtra} // land at fds 3 and 4 in the child
 	cmd.Env = append(os.Environ(),
 		"UDS_ACTIVATION_CHILD=1",
-		"LISTEN_FDS=1",
-		"LISTEN_FDNAMES=api",
+		"UDS_ACTIVATION_EXTRA_PATH="+sockExtra,
+		"LISTEN_FDS=2",
+		"LISTEN_FDNAMES=api:api",
 		// LISTEN_PID must be the child's PID, which we can't know before
 		// starting it. Real systemd sets it post-fork; the child
 		// substitutes its own PID before snapshotting (see
@@ -66,7 +76,7 @@ func TestActivationEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child failed: %v\n%s", err, out)
 	}
-	for _, want := range []string{"CLAIMED path=" + sock, "CLOEXEC_SET", "ENV_SCRUBBED", "SERVED", "RECLAIMED"} {
+	for _, want := range []string{"CLAIMED path=" + sock, "CLOEXEC_SET", "ENV_SCRUBBED", "SERVED", "EXTRA_DRAINED", "RECLAIMED"} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("child output missing %q:\n%s", want, out)
 		}
@@ -130,6 +140,24 @@ func activationChild() {
 		fail("accept on adopted listener: %v", err)
 	}
 	fmt.Println("SERVED")
+
+	// The second fd under the same name must be drained: a connection to it
+	// is accepted and closed immediately (EOF), never left hanging in the
+	// backlog of a socket nobody serves.
+	if extraPath := os.Getenv("UDS_ACTIVATION_EXTRA_PATH"); extraPath != "" {
+		ce, err := net.DialTimeout("unix", extraPath, 2*time.Second)
+		if err != nil {
+			fail("dial drained extra socket: %v", err)
+		}
+		ce.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1)
+		if _, err := ce.Read(buf); err != io.EOF {
+			ce.Close()
+			fail("read on drained extra socket = %v, want io.EOF (fail fast, not hang)", err)
+		}
+		ce.Close()
+		fmt.Println("EXTRA_DRAINED")
+	}
 
 	// Re-claim after closing the listener — the supervision-loop contract.
 	// A consume-once model would return nil here and the surface would

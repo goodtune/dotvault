@@ -75,11 +75,37 @@ func snapshotActivation() {
 // still owns the path.
 func ActivatedListener(name string) (net.Listener, string, error) {
 	snapshotActivation()
-	m := activated.master(name)
+	m, extras := activated.claim(name)
 	if m == nil {
 		return nil, "", nil
 	}
+	// A socket unit with several ListenStream= entries passes every fd under
+	// its one FileDescriptorName=. dotvault serves exactly one socket per
+	// surface, so the first fd (the unit's first ListenStream=, a stable
+	// order) is the one adopted; the rest are drained so their clients fail
+	// fast instead of hanging in a backlog nobody accepts.
+	if len(extras) > 0 {
+		slog.Warn("socket unit passes multiple fds under one name; dotvault serves one socket per surface — serving the first, draining the rest",
+			"name", name, "extra_fds", len(extras),
+			"hint", "use a single ListenStream= per dotvault socket unit")
+		drainFiles(name, extras)
+	}
 	return adoptActivated(name, m)
+}
+
+// drainFiles adopts each file as a listener and drains it. Adoption failures
+// are only logged — the files are retained masters owned by the snapshot,
+// and an fd that cannot even become a listener has no backlog to strand
+// clients in.
+func drainFiles(name string, files []*os.File) {
+	for _, f := range files {
+		ln, err := net.FileListener(f)
+		if err != nil {
+			slog.Warn("could not drain extra activated fd", "name", name, "error", err)
+			continue
+		}
+		go drainListener(ln)
+	}
 }
 
 // DrainUnclaimedActivation deals with activated fds whose names no enabled
@@ -106,15 +132,13 @@ func DrainUnclaimedActivation(keep ...string) {
 		if kept[name] {
 			continue
 		}
-		m := activated.master(name) // marks it claimed so this runs once
-		ln, err := net.FileListener(m)
-		if err != nil {
-			slog.Warn("systemd passed an unusable fd dotvault is not configured to serve", "name", name, "error", err)
-			continue
-		}
+		m, extras := activated.claim(name) // marks it claimed so this runs once
 		slog.Warn("systemd passed a socket dotvault is not configured to serve; draining it so clients fail fast instead of hanging in the backlog",
 			"name", name,
 			"hint", "disable the socket unit, enable the matching dotvault surface, or set FileDescriptorName= if the name looks like LISTEN_FD_<n>")
-		go drainListener(ln)
+		// Every fd under the name is drained — an unclaimed name can carry
+		// several (a multi-ListenStream unit), and each one left undrained
+		// is a socket whose clients hang.
+		drainFiles(name, append([]*os.File{m}, extras...))
 	}
 }

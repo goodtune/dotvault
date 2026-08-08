@@ -253,6 +253,10 @@ The two surfaces are enabled independently because they have different audiences
 
 With `web.enabled: false`, the socket serves the API routes (`/api/v1/token`, `/api/v1/status`, `/healthz`, `/readyz`, the peer actions, …) but **not** the browser-facing routes. The SPA and the interactive login flows build redirect URIs from a bound TCP address that does not exist in that mode, so they are not registered at all rather than being published as a login flow that cannot complete.
 
+### systemd socket activation
+
+On Linux, the packaged `dotvault-api.socket` unit (optional, not enabled by default) lets **systemd bind this socket and hold the fd across daemon restarts**, so borrowers queue instead of getting connection-refused while the daemon is down. `api.enabled` remains the master switch — the socket unit decides who binds, not whether the surface exists — and under activation the unit's `ListenStream=` path wins over `unix.path`, with the daemon logging any divergence and refusing an inherited socket whose mode is wider than `0600`. See [Socket activation](../admin/deployment.md#socket-activation-optional) in the deployment guide.
+
 ### Running as a service
 
 The socket lives in `$XDG_RUNTIME_DIR`, which systemd tears down when the user's last session ends — **unless lingering is enabled**:

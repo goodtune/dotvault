@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
@@ -31,10 +32,10 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
-	"github.com/goodtune/dotvault/internal/sdnotify"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
+	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
 	vaultapi "github.com/hashicorp/vault/api"
@@ -718,7 +719,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// (WatchdogSec=120s by default) and systemd would restart the
 	// process mid-startup. sd_notify(READY=1) is still delayed until
 	// after auth + initial sync further down.
-	go sdnotify.WatchdogLoop(ctx)
+	go watchdogLoop(ctx)
 
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
@@ -831,6 +832,24 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// it is both a surface this daemon serves and an entry the daemon must
 	// exclude from its own borrow list.
 	apiSocket := resolveAPISocket(cfg)
+
+	// systemd socket activation housekeeping (Linux; no-op elsewhere). Any
+	// activated fd no enabled surface will claim is drained now — accepted
+	// and closed immediately, so clients fail fast — with a warning naming
+	// the mismatch. Draining rather than closing our fd, because systemd
+	// retains its own copy of the listener: closing ours would refuse
+	// nobody, it would just leave clients hanging in a backlog no one
+	// accepts. The keep list names the surfaces that claim their fds
+	// themselves: the web server takes "api" when it starts (below), and
+	// the SSH agent takes "agent" after the first successful auth.
+	var keepActivated []string
+	if apiSocket != "" {
+		keepActivated = append(keepActivated, "api")
+	}
+	if cfg.Agent.Enabled {
+		keepActivated = append(keepActivated, "agent")
+	}
+	uds.DrainUnclaimedActivation(keepActivated...)
 	borrowSockets := daemonBorrowSockets(cfg, apiSocket)
 
 	// Peer-socket token borrow. If no local token was usable and a peer socket
@@ -1299,7 +1318,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// NOTIFY_SOCKET is unset; a non-nil return from Ready()
 		// means a genuine socket write failure (warn loudly so
 		// the systemd "start-limit-hit" log has a breadcrumb).
-		if err := sdnotify.Ready(); err != nil {
+		if err := sdNotify(daemon.SdNotifyReady); err != nil {
 			slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
 		}
 	}
@@ -1353,7 +1372,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Stop the sync loop and propagate its result. Notify systemd we're
 	// stopping so the unit state reflects the shutdown sequence rather
 	// than appearing to crash.
-	_ = sdnotify.Stopping()
+	_ = sdNotify(daemon.SdNotifyStopping)
 	cancel()
 	return <-loopErrCh
 }

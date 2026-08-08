@@ -6,6 +6,7 @@ require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/cli/oauth v1.2.2
+	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/gen2brain/beeep v0.11.2
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.9

@@ -108,6 +108,41 @@ nfpms:
         file_info:
           mode: 0644
         packager: apk
+      # Optional socket-activation units — shipped, not enabled. With one
+      # enabled, systemd binds the local API / SSH agent socket and holds
+      # it across daemon restarts, so clients queue instead of getting
+      # ECONNREFUSED while the daemon is down. Same three-packager set as
+      # the service unit above and the same APK dormancy caveat.
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: deb
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: apk
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
+        file_info:
+          mode: 0644
+        packager: deb
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
+        file_info:
+          mode: 0644
+        packager: apk
 
 checksum:
   name_template: checksums.txt

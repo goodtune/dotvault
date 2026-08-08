@@ -1,5 +1,10 @@
 dist/
+# Compiled binaries at the repo root (go build ./... drops them here). The
+# Windows pair is listed explicitly: a dotvault.exe was once committed by
+# accident and sat in the tree for months because nothing ignored it.
 /dotvault
+/dotvault.exe
+/dotvaultw.exe
 internal/web/frontend/node_modules/
 site/
 .worktrees/

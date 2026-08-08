@@ -809,7 +809,7 @@ func RecordDeprecatedConfig(ctx context.Context, field string) {
 // global lookup per emit is fine and removes that test-only API from
 // the production surface.
 func LogRegistryConfigManaged(ctx context.Context, path string) {
-	l := global.GetLoggerProvider().Logger("github.com/goodtune/dotvault")
+	l := global.GetLoggerProvider().Logger(loggerName)
 	var rec log.Record
 	rec.SetTimestamp(time.Now())
 	rec.SetSeverity(log.SeverityWarn)

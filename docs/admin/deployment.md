@@ -130,6 +130,32 @@ sudo systemctl --global enable dotvault.service
 
 `--global` enables the unit in every user's session; each user runs their own instance and authenticates with their own Vault identity.
 
+#### Socket activation (optional)
+
+The packages also ship two **socket units**, installed but not enabled: `dotvault-api.socket` (the [local API socket](../configuration/config-reference.md#api-section)) and `dotvault-agent.socket` (the [SSH agent](../guide/ssh-agent.md) socket). Without them the daemon binds its sockets itself, and each socket disappears whenever the daemon does — `systemctl --user restart dotvault.service` is a brief outage for anything borrowing a token or requesting a signature at that moment. With a socket unit enabled, **systemd binds the socket and holds the listening fd across daemon restarts**, so clients queue in the backlog and are served when the daemon returns; the socket also exists from `sockets.target` at session start, before the daemon has authenticated.
+
+```sh
+systemctl --user enable --now dotvault-api.socket
+systemctl --user enable --now dotvault-agent.socket   # optional, independent
+```
+
+Things to know:
+
+- **The config is still the master switch.** `api.enabled` / `agent.enabled` decide whether the surface exists; the socket unit only decides who binds it. If systemd passes a socket the daemon is not configured to serve, the daemon *drains* it — connections are accepted and closed immediately, so clients fail fast with EOF — and logs a warning naming the mismatch. (Merely closing the daemon's copy would refuse nobody: systemd retains its own listening fd, so clients would hang in a backlog no one accepts.) Enabling the socket unit is not a substitute for enabling the feature.
+- **This is fd-passing, not start-on-demand.** The service stays `WantedBy=default.target` and runs regardless of connections — it is syncing files and keeping a token alive. Enable both the `.socket` and the `.service`; enabling only one is a half-configured state.
+- **Owner-only is verified, not assumed.** The units set `SocketMode=0600`, and the daemon independently checks the inherited socket's filesystem mode and **refuses** anything wider — `SocketMode` defaults to `0666`, so a hand-edited unit that drops the line fails loudly instead of silently exposing the token endpoint to every uid on the box.
+- **The socket unit's path wins.** Under activation the socket lives wherever `ListenStream=` says; if that differs from `api.unix.path` / `agent.unix.path`, the daemon logs the divergence and reports the activated path in `dotvault status`.
+- **Owner-only covers the directory too.** Alongside the socket-node mode, the daemon verifies the parent directory is owner-only and owned by the same user (`DirectoryMode=0700` in the units) — a socket in a directory someone else can write to can be swapped for an impostor, which no node check catches.
+- Requires systemd ≥ 227 (`FileDescriptorName=` support). On older systemd the fds arrive unnamed, and the daemon drains them with a warning rather than serving them.
+- Not applicable on macOS (launchd has its own, incompatible mechanism) or Alpine/OpenRC; on those the daemon's self-bind path runs unchanged.
+
+!!! tip "Enable lingering if the daemon must outlive a login session"
+    A `--user` service normally stops when the user's last session ends, and `$XDG_RUNTIME_DIR` (where the SSH agent and [local API socket](../configuration/config-reference.md#api-section) live) is torn down with it. For a machine people reach over SSH — where a `tmux` job or the local API socket is expected to survive a disconnect — enable lingering so the user manager keeps running:
+
+    ```sh
+    sudo loginctl enable-linger <user>
+    ```
+
 Environment-variable overrides (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`) can be set via four optional `EnvironmentFile=` paths referenced by the unit:
 
 - `~/.config/dotvault/env` (preferred for per-user secrets)
@@ -278,7 +304,7 @@ One record is emitted directly through the OTel logger rather than via the slog 
 
 - **`configuration loaded from Windows Registry (Group Policy); file-based config is ignored`** — WARN severity, attribute `path=<would-be config file>`. Fires once per daemon/sync startup on a GPO-managed Windows box. Routing this through slog would print an INFO line on every CLI invocation on a GPO-managed install, which is exactly the noise this record avoids.
 
-Health probes are served on the same loopback listener as the web UI and are therefore **only available when `web.enabled: true`**. A deployment with the OTel metrics block enabled but the web UI disabled has nothing to probe; point the `httpcheckreceiver` only at hosts where `web` is also enabled, or rely on the systemd `sd_notify(READY=1)` signal instead.
+Health probes are served on **whichever HTTP surfaces the daemon has**: the loopback listener when `web.enabled: true`, and/or the per-user Unix socket when [`api.enabled: true`](../configuration/config-reference.md#api-section). A deployment with neither enabled has nothing to probe; enable one of them, or rely on the systemd `sd_notify(READY=1)` signal instead. The OTel `httpcheckreceiver` speaks TCP, so it needs `web.enabled`; a socket-only daemon is probed with `curl --unix-socket <path> http://localhost/readyz`, which is the way to get a readiness check without opening a port at all.
 
 - `GET /healthz` — liveness, always 200 while serving
 - `GET /readyz` — readiness, 200 once the daemon is authenticated to Vault AND has completed its initial sync cycle, 503 otherwise. Mirrors the `sd_notify(READY=1)` contract so a Kubernetes `readinessProbe` or the OTel `httpcheckreceiver` never observes a green daemon before secrets exist on disk. The auth check reflects the cached in-memory token, not a per-probe Vault round-trip; a revoked token flips `/readyz` back to 503 within the lifecycle check cadence (default 5 min).
@@ -304,7 +330,7 @@ SIGHUP is the running daemon's reload trigger. It does two things at once: re-re
 What a reload can and cannot apply:
 
 - **Applied in place** — the *dynamic* sections: `rules`, `enrolments`, `sync.interval`, and `remote_config` itself (the overlay fetcher is rebuilt and the refresh cadence re-derived on the next pass; note that a *remote* document still cannot carry `remote_config` — the section is local-only). These are the same sections the daemon already re-reads periodically on its config-refresh tick (default: the sync interval; see `remote_config.refresh_interval`), whether the change came from an edited local config or the remote overlay. The signal just skips the wait.
-- **Restart required** — the *static* sections: `vault`, `web`, `agent`, `observability`, and the top-level `bypass_system_config` flag. These configure subsystems constructed once at startup (the Vault client, the web listener, the SSH agent, the OTel exporter). A reload that finds them changed logs a warning naming the changed sections; restart the daemon (`systemctl --user restart dotvault.service`) to apply them.
+- **Restart required** — the *static* sections: `vault`, `web`, `api`, `agent`, `observability`, and the top-level `bypass_system_config` flag. These configure subsystems constructed once at startup (the Vault client, the web listener, the local API socket, the SSH agent, the OTel exporter). A reload that finds them changed logs a warning naming the changed sections; restart the daemon (`systemctl --user restart dotvault.service`) to apply them.
 
 The packaged systemd unit wires SIGHUP as `ExecReload=`, so the canonical gesture on Linux is:
 

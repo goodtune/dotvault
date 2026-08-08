@@ -15,6 +15,7 @@ CAT_DENIED = 2
 CAT_UNREACHABLE = 3
 CAT_AUTH_FAILED = 4
 CAT_OTHER = 5
+CAT_PEER_UNAVAILABLE = 6
 
 
 class DotvaultError(Exception):
@@ -60,11 +61,25 @@ class Unreachable(DotvaultError):
     """
 
 
+class PeerUnavailable(DotvaultError):
+    """A peer-action call (:meth:`Client.browse`/:meth:`Client.notify`) could
+    not be completed by the peer dotvault (``ErrPeerUnavailable``).
+
+    The ``vault.token_socket`` peer is not configured, could not be reached
+    (missing/stale socket, SSH forward down), or reported it could not perform
+    the action (a browser opener failed, or it was busy). Retryable. A request
+    the peer *rejected as invalid* (a bad URL, an unknown level, an empty
+    title) is raised as a bare :class:`DotvaultError` instead, carrying the
+    peer's message.
+    """
+
+
 _BY_CATEGORY = {
     CAT_LOGIN_REQUIRED: LoginRequired,
     CAT_DENIED: Denied,
     CAT_UNREACHABLE: Unreachable,
     CAT_AUTH_FAILED: AuthFailed,
+    CAT_PEER_UNAVAILABLE: PeerUnavailable,
 }
 
 

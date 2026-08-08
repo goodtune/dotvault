@@ -861,10 +861,14 @@ func testServer(t *testing.T) *Server {
 				},
 			},
 		},
-		kvMount:        "secret",
-		userPrefix:     "users/",
-		username:       "testuser",
-		authMethod:     "oidc",
+		kvMount:    "secret",
+		userPrefix: "users/",
+		username:   "testuser",
+		authMethod: "oidc",
+		// The default test server models the full daemon: loopback TCP
+		// listener plus the browser-facing routes. Tests covering the
+		// socket-only shape build their own (see socket_surface_test.go).
+		webEnabled:     true,
 		shutdownCtx:    ctx,
 		shutdownCancel: cancel,
 	}

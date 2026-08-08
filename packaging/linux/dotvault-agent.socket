@@ -1,0 +1,30 @@
+[Unit]
+Description=dotvault SSH agent socket (systemd socket activation)
+Documentation=https://github.com/goodtune/dotvault
+
+# Optional and NOT enabled by default; the SSH-agent sibling of
+# dotvault-api.socket (see that unit for the rationale). With systemd
+# holding the fd, an ssh/ssh-add invocation during a daemon restart queues
+# instead of failing. Enable with:
+#
+#   systemctl --user enable --now dotvault-agent.socket
+#
+# agent.enabled must still be set in the dotvault config. Note the daemon
+# starts serving the agent only after its first successful Vault
+# authentication — connections arriving earlier queue in the backlog, which
+# is the point.
+
+[Socket]
+# Must match FileDescriptorName exactly: the daemon claims inherited fds by
+# this name (see internal/uds). Renaming it orphans the fd.
+ListenStream=%t/dotvault/agent.sock
+FileDescriptorName=agent
+Service=dotvault.service
+
+# Owner-only is a hard invariant, enforced twice: set here, and verified by
+# the daemon, which refuses an inherited fd wider than 0600.
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

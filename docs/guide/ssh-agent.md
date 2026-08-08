@@ -112,6 +112,9 @@ integration step, left to you (or your fleet tooling).
   ssh-add -l   # list the identities dotvault is serving
   ```
 
+    !!! tip "Surviving daemon restarts (Linux)"
+        The packaged `dotvault-agent.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an `ssh` launched mid-restart queues briefly instead of failing. `agent.enabled` remains required, and under activation the unit's `ListenStream=` path wins over `agent.unix.path`. See [Socket activation](../admin/deployment.md#socket-activation-optional).
+
 - **PuTTY / Pageant (Windows):** modern PuTTY-family clients (PuTTY 0.71+,
   WinSCP, FileZilla, …) locate Pageant over a named pipe whose name follows a
   fixed convention — `\\.\pipe\pageant.<user>.<hash>` — that they compute

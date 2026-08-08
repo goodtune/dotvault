@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -17,12 +18,15 @@ import (
 
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
+	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -40,11 +44,42 @@ type Server struct {
 	// reports the overlay's last fetch outcome for /api/v1/status.
 	remoteCfg    config.RemoteConfig
 	remoteStatus func() *remoteconfig.Status
-	csrf         *CSRFStore
-	oauth        *OAuthManager
-	login        *auth.LoginTracker
-	mux          *http.ServeMux
-	server       *http.Server
+	// apiCfg is the local-only api section, retained so the config-download
+	// endpoint round-trips it (like agentCfg and remoteCfg).
+	apiCfg config.APIConfig
+	// webEnabled records whether the loopback TCP listener (and with it the
+	// browser-facing surface: the SPA, the auth routes, the OAuth callbacks)
+	// is in play. It is NOT the same question as "was this Server
+	// constructed" — a Server exists whenever either surface is enabled, and
+	// with web.enabled false it serves the API over the Unix socket alone.
+	webEnabled bool
+	// socketPath is the resolved local API socket path, or "" when the
+	// socket surface is disabled.
+	socketPath string
+	// socketBound records that this Server successfully bound socketPath, so
+	// Shutdown knows the node is *ours* to unlink.
+	//
+	// This is load-bearing, not bookkeeping. When a second daemon starts
+	// against a socket a live instance already owns, uds.Listen correctly
+	// refuses — and the losing daemon then runs its deferred Shutdown on the
+	// way out. Unlinking unconditionally there would delete the *winning*
+	// daemon's socket node: it would keep serving an unlinked inode that no
+	// new client can dial, silently destroying the very surface the
+	// already-running check exists to protect.
+	//
+	// Written by listen() before Serve starts and read by Shutdown, both on
+	// the daemon's startup path with no concurrent Start; guarded by
+	// startMu so the race detector sees the ordering explicitly rather than
+	// relying on that happening to be true.
+	socketBound bool
+	// startMu guards socketBound (and s.server) across the Start/Shutdown
+	// pair, which the daemon can interleave when startup fails.
+	startMu sync.Mutex
+	csrf    *CSRFStore
+	oauth   *OAuthManager
+	login   *auth.LoginTracker
+	mux     *http.ServeMux
+	server  *http.Server
 	// rulesMu guards rules and syncCfg, which the daemon's config-refresh
 	// loop swaps at runtime via UpdateDynamicConfig while request handlers
 	// read them.
@@ -93,6 +128,35 @@ type Server struct {
 	// abandoned (not killed) by the handler's bounded wait and unbounded
 	// concurrent requests would otherwise pile up stuck goroutines.
 	browseOpenMu sync.Mutex
+	// sendNotification delivers a desktop notification for the remote-notify
+	// endpoint. NewServer always sets it (notify.Send unless
+	// ServerConfig.SendNotification overrides it, as tests do); the handler's
+	// nil guard (503) only protects hand-constructed Servers in tests.
+	sendNotification notify.Notifier
+	// notifyMu is the remote-notify single-flight gate, mirroring
+	// browseOpenMu — a notification backend that hangs is abandoned, not
+	// killed, so only one delivery runs at a time.
+	notifyMu sync.Mutex
+	// setClipboard writes text to this host's clipboard for the
+	// remote-clipboard endpoint. NewServer always sets it (clipboard.Set
+	// unless ServerConfig.SetClipboard overrides it, as tests do); the
+	// handler's nil guard (503) only protects hand-constructed Servers in
+	// tests.
+	setClipboard clipboard.Setter
+	// clipboardMu is the remote-clipboard single-flight gate, mirroring
+	// browseOpenMu — a clipboard writer that hangs is abandoned, not killed,
+	// so only one write runs at a time.
+	clipboardMu sync.Mutex
+
+	// reauthGate, when set, reports whether the daemon's own token has gone
+	// invalid and is awaiting re-authentication. /api/v1/token consults it so
+	// a borrowing client is told "not authenticated" rather than handed a
+	// token known to be dead — which matters now that a local daemon can be
+	// the authority for a whole machine's worth of clients. Stored in an
+	// atomic.Value because the daemon wires it after construction (the
+	// lifecycle manager is built later in startup), concurrently with
+	// requests already being served. *auth.LifecycleManager satisfies it.
+	reauthGate atomic.Value // reauthGateHolder
 
 	// initialSyncDone flips to true once the daemon calls
 	// MarkInitialSyncComplete (wired into the sync engine's
@@ -129,6 +193,15 @@ type ServerConfig struct {
 	// YAML/.reg renderers as every other section even when the daemon loaded
 	// its config from a Windows GPO.
 	AgentCfg config.AgentConfig
+	// APICfg is the loaded local-API-socket configuration, retained for the
+	// config-download round-trip (like AgentCfg).
+	APICfg config.APIConfig
+	// APISocketPath is the resolved path for the local API socket. Empty
+	// serves no socket. The caller resolves it (config.APISocketPath) so this
+	// package holds no path-defaulting policy; when it is set, Start binds it
+	// with owner-only permissions in addition to — or instead of — the
+	// loopback TCP listener that WebCfg.Enabled controls.
+	APISocketPath string
 	// RemoteCfg is the local-only remote_config section, retained for the
 	// config-download round-trip (like AgentCfg).
 	RemoteCfg config.RemoteConfig
@@ -143,12 +216,28 @@ type ServerConfig struct {
 	// launches URLs in this host's default browser (tests inject a fake).
 	// Nil selects the real browser.OpenURL.
 	OpenBrowser func(string) error
+	// SendNotification, when non-nil, overrides how the remote-notify
+	// endpoint delivers desktop notifications (tests inject a fake). Nil
+	// selects the real notify.Send.
+	SendNotification notify.Notifier
+	// SetClipboard, when non-nil, overrides how the remote-clipboard
+	// endpoint writes to this host's clipboard (tests inject a fake). Nil
+	// selects the real clipboard.Set.
+	SetClipboard clipboard.Setter
 }
 
 // NewServer creates a new web server.
 func NewServer(sc ServerConfig) (*Server, error) {
-	if err := paths.ValidateLoopback(sc.WebCfg.Listen); err != nil {
-		return nil, fmt.Errorf("web.listen: %w", err)
+	// The loopback invariant is checked only when the TCP listener is
+	// actually going to be bound. A socket-only server has no listen address
+	// to validate, and web.listen may legitimately be empty there.
+	if sc.WebCfg.Enabled {
+		if err := paths.ValidateLoopback(sc.WebCfg.Listen); err != nil {
+			return nil, fmt.Errorf("web.listen: %w", err)
+		}
+	}
+	if !sc.WebCfg.Enabled && sc.APISocketPath == "" {
+		return nil, fmt.Errorf("web server has no surface to serve: neither web.enabled nor api.enabled")
 	}
 
 	// Retain the full observability config, including the Headers map.
@@ -169,6 +258,9 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		engine:             sc.Engine,
 		agentStatus:        sc.Agent,
 		agentCfg:           sc.AgentCfg,
+		apiCfg:             sc.APICfg,
+		webEnabled:         sc.WebCfg.Enabled,
+		socketPath:         sc.APISocketPath,
 		remoteCfg:          sc.RemoteCfg,
 		remoteStatus:       sc.RemoteStatus,
 		csrf:               NewCSRFStore(),
@@ -191,9 +283,17 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		authDone:           make(chan struct{}, 1),
 		readyCh:            make(chan error, 1),
 		openBrowser:        sc.OpenBrowser,
+		sendNotification:   sc.SendNotification,
+		setClipboard:       sc.SetClipboard,
 	}
 	if s.openBrowser == nil {
 		s.openBrowser = browser.OpenURL
+	}
+	if s.sendNotification == nil {
+		s.sendNotification = notify.Send
+	}
+	if s.setClipboard == nil {
+		s.setClipboard = clipboard.Set
 	}
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 
@@ -201,7 +301,33 @@ func NewServer(sc ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+// registerRoutes wires the mux. It is split in two because the two listeners
+// front genuinely different surfaces.
+//
+// The API routes are safe on either listener: they read and write daemon
+// state for a caller that has already proved it is the owning user (loopback
+// plus the Host allowlist for TCP; 0600 filesystem permissions for the
+// socket).
+//
+// The UI routes are registered only when the TCP listener exists, because
+// every one of them is meaningless or actively broken without it. The auth
+// and OAuth handlers build redirect URIs from the bound listen address, so on
+// a socket-only daemon they would hand the identity provider a URI pointing
+// nowhere; the SPA and the enrolment routes it drives need a browser that
+// cannot reach a Unix socket in the first place. Registering them anyway
+// would mean publishing a login surface whose only possible outcome is a
+// confusing failure.
 func (s *Server) registerRoutes() {
+	s.registerAPIRoutes()
+	if s.webEnabled {
+		s.registerUIRoutes()
+	}
+}
+
+// registerUIRoutes wires the browser-facing surface: interactive login, the
+// OAuth callbacks, the enrolment routes the SPA drives, and the SPA itself.
+// Requires the TCP listener — see registerRoutes.
+func (s *Server) registerUIRoutes() {
 	// Auth routes — OIDC
 	s.mux.HandleFunc("GET /auth/oidc/start", s.handleAuthStart)
 	s.mux.HandleFunc("GET /auth/oidc/callback", s.handleAuthCallback)
@@ -214,35 +340,6 @@ func (s *Server) registerRoutes() {
 	// Auth routes — Token
 	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
 
-	// Health probes. /healthz reports liveness — the daemon is
-	// running and able to serve HTTP. /readyz reports readiness:
-	// 200 only after BOTH a Vault token is present AND the
-	// daemon has marked its initial sync complete (via
-	// MarkInitialSyncComplete, called from the sync engine's
-	// AfterInitialSync hook after the initial RunOnce returns).
-	// This mirrors the sd_notify(READY=1) contract on the systemd
-	// path so a Kubernetes readinessProbe or the OTel
-	// httpcheckreceiver never observes a green daemon before
-	// secrets exist on disk. Both probes are loopback-only and
-	// return JSON.
-	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
-
-	// API routes
-	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
-	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
-	s.mux.HandleFunc("GET /api/v1/rules", s.handleRules)
-	s.mux.HandleFunc("GET /api/v1/config", s.handleConfig)
-	s.mux.HandleFunc("GET /api/v1/config/download", s.handleConfigDownload)
-	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
-	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
-	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
-	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
-	// rationale (bare-curl consumer over a forwarded socket; nothing
-	// sensitive read or returned). Cross-site browser traffic is rejected
-	// by the handler's Origin check instead, and the side effect is limited
-	// by a strict http/https scheme allowlist.
-	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
@@ -276,32 +373,188 @@ func (s *Server) registerRoutes() {
 	s.mux.Handle("/", fileServer)
 }
 
-// Start begins serving HTTP. It signals WaitReady once the listener is bound,
-// or sends the bind error so the caller can fail fast.
+// registerAPIRoutes wires the surface served on every listener — TCP, the
+// local API socket, or both.
+func (s *Server) registerAPIRoutes() {
+	// Health probes. /healthz reports liveness — the daemon is
+	// running and able to serve HTTP. /readyz reports readiness:
+	// 200 only after BOTH a Vault token is present AND the
+	// daemon has marked its initial sync complete (via
+	// MarkInitialSyncComplete, called from the sync engine's
+	// AfterInitialSync hook after the initial RunOnce returns).
+	// This mirrors the sd_notify(READY=1) contract on the systemd
+	// path so a Kubernetes readinessProbe or the OTel
+	// httpcheckreceiver never observes a green daemon before
+	// secrets exist on disk. Both probes are loopback-only and
+	// return JSON.
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// API routes
+	s.mux.HandleFunc("GET /api/v1/csrf", s.csrf.IssueHandler())
+	s.mux.HandleFunc("GET /api/v1/status", s.handleStatus)
+	s.mux.HandleFunc("GET /api/v1/rules", s.handleRules)
+	s.mux.HandleFunc("GET /api/v1/config", s.handleConfig)
+	s.mux.HandleFunc("GET /api/v1/config/download", s.handleConfigDownload)
+	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
+	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
+	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
+	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
+	// rationale (bare-curl consumer over a forwarded socket; nothing
+	// sensitive read or returned). Cross-site browser traffic is rejected
+	// by the handler's Origin check instead, and the side effect is limited
+	// by a strict http/https scheme allowlist.
+	s.mux.HandleFunc("POST /api/v1/remote/browse", s.handleRemoteBrowse)
+	// Sibling of remote/browse — same forwarded-socket consumer and same
+	// no-CSRF / Origin-check posture (see handleRemoteNotify).
+	s.mux.HandleFunc("POST /api/v1/remote/notify", s.handleRemoteNotify)
+	// Third peer action, same posture again (see handleRemoteClipboard).
+	s.mux.HandleFunc("POST /api/v1/remote/clipboard", s.handleRemoteClipboard)
+}
+
+// Start begins serving HTTP on every configured listener. It signals
+// WaitReady once all of them are bound, or sends the bind error so the caller
+// can fail fast.
+//
+// There may be one or two: the loopback TCP listener (web.enabled) and the
+// per-user Unix socket (api.enabled). They share one http.Server and one mux,
+// so a request means the same thing whichever way it arrived — the surfaces
+// differ in who can reach them, not in what they do.
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.cfg.Listen)
+	lns, err := s.listen()
 	if err != nil {
 		s.readyCh <- err
 		return err
 	}
-	// Preserve the configured hostname (e.g. "localhost") and only take
-	// the port from the actual listener, so OIDC redirect URIs match
-	// what users configure in Vault's allowed_redirect_uris.
-	host, _, _ := net.SplitHostPort(s.cfg.Listen)
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	s.listenAddr = net.JoinHostPort(host, port)
 
+	s.startMu.Lock()
 	s.server = &http.Server{
 		Handler: s.middleware(s.mux),
 	}
+	srv := s.server
+	s.startMu.Unlock()
 
-	slog.Info("starting web UI", "listen", s.listenAddr)
 	s.readyCh <- nil // signal ready
 
-	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		return err
+	// One goroutine per listener. Shutdown closes all of them, so every Serve
+	// returns ErrServerClosed on a clean stop; anything else is a real
+	// failure.
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(lns))
+	for _, ln := range lns {
+		wg.Add(1)
+		go func(ln net.Listener) {
+			defer wg.Done()
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		}(ln)
 	}
-	return nil
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Report the first listener failure immediately rather than waiting for
+	// the others to finish. With two listeners, waiting would mean a dead TCP
+	// listener goes unreported for as long as the socket keeps serving — the
+	// daemon would look healthy while half its surface was gone. A failure on
+	// either listener takes the whole server down: the surfaces are two doors
+	// into one daemon, and limping along behind one of them hides the fault
+	// from whoever needs to fix it.
+	select {
+	case err := <-errCh:
+		srv.Close()
+		<-done
+		return err
+	case <-done:
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			return nil
+		}
+	}
+}
+
+// listen binds every configured listener, cleaning up the ones it already
+// opened if a later bind fails — a half-bound server would otherwise leave a
+// socket file behind that the next start would have to treat as stale.
+func (s *Server) listen() ([]net.Listener, error) {
+	var lns []net.Listener
+	closeAll := func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}
+
+	if s.webEnabled {
+		ln, err := net.Listen("tcp", s.cfg.Listen)
+		if err != nil {
+			return nil, err
+		}
+		// Preserve the configured hostname (e.g. "localhost") and only take
+		// the port from the actual listener, so OIDC redirect URIs match
+		// what users configure in Vault's allowed_redirect_uris.
+		host, _, _ := net.SplitHostPort(s.cfg.Listen)
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		s.listenAddr = net.JoinHostPort(host, port)
+		slog.Info("starting web UI", "listen", s.listenAddr)
+		lns = append(lns, ln)
+	}
+
+	if s.socketPath != "" {
+		// systemd socket activation first (Linux; inert elsewhere). An
+		// inherited fd means systemd bound the socket before we started and
+		// keeps it across our restarts, so borrowers queue instead of
+		// getting ECONNREFUSED while the daemon is down. An activation
+		// *error* is fatal, not a fallback: it means the fd exists but
+		// violates an invariant (mode wider than 0600, wrong socket type),
+		// and self-binding would both mask the unit misconfiguration and
+		// fail anyway, since systemd owns the path.
+		aln, actual, err := activatedAPIListener()
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("local API socket (systemd activation): %w", err)
+		}
+		if aln != nil {
+			if actual != s.socketPath {
+				// The socket unit's ListenStream=, not api.unix.path, decides
+				// where the socket lives under activation. Report the truth
+				// so status and clients looking at the config aren't misled.
+				slog.Warn("systemd-activated API socket path differs from api.unix.path; the socket unit wins", "activated", actual, "configured", s.socketPath)
+				s.socketPath = actual
+			}
+			slog.Info("serving local API socket from systemd activation", "path", actual)
+			// socketBound stays false: systemd owns the node, and our
+			// Shutdown must not unlink a socket it will keep using across
+			// our restarts.
+			lns = append(lns, aln)
+		} else {
+			ln, err := uds.Listen(s.socketPath)
+			if err != nil {
+				closeAll()
+				if errors.Is(err, uds.ErrAlreadyListening) {
+					return nil, fmt.Errorf("another dotvault is already serving the local API socket at %s", s.socketPath)
+				}
+				return nil, fmt.Errorf("local API socket: %w", err)
+			}
+			slog.Info("starting local API socket", "path", s.socketPath)
+			// Record that *this* Server owns the socket node. Shutdown
+			// consults this before unlinking — see socketBound.
+			s.startMu.Lock()
+			s.socketBound = true
+			s.startMu.Unlock()
+			lns = append(lns, ln)
+		}
+	}
+
+	if len(lns) == 0 {
+		return nil, fmt.Errorf("no listener configured")
+	}
+	return lns, nil
 }
 
 // WaitReady blocks until the web server is listening and returns any startup error.
@@ -315,10 +568,58 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.login != nil {
 		s.login.Close()
 	}
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
+	// Shutdown closes the listeners, and net.UnixListener unlinks the socket
+	// on close; Cleanup is the backstop for the paths that don't reach it
+	// (a Shutdown that timed out, or a partially-bound Start). A leftover
+	// node is not fatal — the next start detects it as stale — but leaving
+	// one behind means the next start has to prove nobody is serving it.
+	//
+	// Gated on socketBound: a Server that never bound the socket must not
+	// touch the node, because the reason it didn't bind is usually that
+	// another live daemon owns it.
+	s.startMu.Lock()
+	bound := s.socketBound
+	srv := s.server
+	s.startMu.Unlock()
+	if bound {
+		defer uds.Cleanup(s.socketPath)
+	}
+	if srv != nil {
+		return srv.Shutdown(ctx)
 	}
 	return nil
+}
+
+// activatedAPIListener claims the systemd-activated "api" socket, when one
+// exists. An injectable var (matching openBrowser and friends) so tests can
+// exercise the activated branch of listen() without a real systemd
+// environment — the activation snapshot is process-global and once-guarded,
+// which makes it unfakeable in-process.
+var activatedAPIListener = func() (net.Listener, string, error) {
+	return uds.ActivatedListener("api")
+}
+
+// reauthGateHolder wraps the gate so atomic.Value always stores the same
+// concrete type (a bare interface value would panic on a type change).
+type reauthGateHolder struct {
+	gate interface{ NeedsReauth() bool }
+}
+
+// SetReauthGate wires the daemon's token lifecycle manager so /api/v1/token
+// can decline to hand out a token the daemon already knows is dead. Safe to
+// call while requests are in flight; the daemon calls it once, after the
+// lifecycle manager is constructed.
+func (s *Server) SetReauthGate(g interface{ NeedsReauth() bool }) {
+	s.reauthGate.Store(reauthGateHolder{gate: g})
+}
+
+// needsReauth reports whether the daemon's token is known to be awaiting
+// re-authentication. False when no gate is wired (a hand-constructed Server
+// in tests, or the window before the daemon wires one), which preserves the
+// pre-gate behaviour of trusting the in-memory token.
+func (s *Server) needsReauth() bool {
+	h, ok := s.reauthGate.Load().(reauthGateHolder)
+	return ok && h.gate != nil && h.gate.NeedsReauth()
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
@@ -608,7 +909,9 @@ func routeLabel(p string) string {
 		p == "/api/v1/config/download",
 		p == "/api/v1/token",
 		p == "/api/v1/sync",
-		p == "/api/v1/remote/browse":
+		p == "/api/v1/remote/browse",
+		p == "/api/v1/remote/notify",
+		p == "/api/v1/remote/clipboard":
 		return p
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without
@@ -711,6 +1014,12 @@ func (s *Server) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 
 // URL returns the web UI root URL.
 func (s *Server) URL() string {
+	// A socket-only daemon has no browsable address. Return "" rather than a
+	// well-formed-looking "http:///" so callers (the daemon's browser-open on
+	// startup and on re-auth) can tell there is nowhere to point a browser.
+	if s.listenAddr == "" {
+		return ""
+	}
 	return fmt.Sprintf("http://%s/", s.listenAddr)
 }
 

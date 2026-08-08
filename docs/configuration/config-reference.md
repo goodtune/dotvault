@@ -45,6 +45,11 @@ web:
   secret_view_text: |
     These secrets are synchronised from Vault to your local machine.
 
+api:
+  enabled: true
+  unix:
+    path: ""    # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+
 rules:
   - name: gh
     vault_key: "gh"
@@ -155,16 +160,21 @@ The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows t
 
 On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
 
+!!! tip "This socket dies with the SSH session"
+    Everything above depends on the SSH connection being up. A process that outlives the session it was started in — a `tmux` job, a long-running service — will fail its next borrow once the forward is gone. Enable the [`api` section](#api-section) on the remote host so the long-lived daemon serves the borrow endpoint from a stable path, and local clients keep working across disconnects.
+
+One behaviour change for existing deployments: a peer's `/api/v1/token` now returns 401 once that peer's daemon knows its own token has gone invalid and is awaiting re-authentication, instead of handing out a credential it knows is dead. Borrowers already validate what they receive, so this only removes a known-bad answer earlier.
+
 The borrow is **best-effort and never fatal**: if the socket path is empty, the socket file is missing, the socket is stale (left over from a dead SSH session, no listener), the peer is reachable but holds no token, or the response is malformed, dotvault silently carries on with its normal auth flow. A leading `~` is expanded to the user's home directory. The borrowed token is held in memory only — it is not written to the local token file, so the peer remains the single owner and the remote re-borrows on its next login or recovery rather than caching a copy that could go stale.
 
 The same borrow is available to the **dotvault client libraries** (Go `client/` and the Python bindings): their cached-auth entry point (`AuthenticateCached`) borrows from the configured peer socket after the `DOTVAULT_TOKEN` env var and token file come up empty, before reporting that a login is required. Because it is a plain socket read with no browser or prompt, a Go or Python program on a host with no local token but a live peer socket reads secrets without an interactive login of its own.
 
-The socket carries traffic the other way too: [`dotvault browse <url>`](../cli.md#dotvault-browse) posts a URL to the peer's `POST /api/v1/remote/browse` endpoint so the browser opens on the workstation — the machine that actually has one — falling back to the local browser when the peer is unreachable. Set `BROWSER="dotvault browse"` on the headless host and OAuth login pages launched there land in the workstation's browser.
+The socket carries traffic the other way too. [`dotvault browse <url>`](../cli.md#dotvault-browse) posts a URL to the peer's `POST /api/v1/remote/browse` endpoint so the browser opens on the workstation — the machine that actually has one — falling back to the local browser when the peer is unreachable. Set `BROWSER="dotvault browse"` on the headless host and OAuth login pages launched there land in the workstation's browser. [`dotvault notify <level> <title> [description]`](../cli.md#dotvault-notify) is the same shape for desktop notifications (`POST /api/v1/remote/notify`), so a long-running job on the headless box can raise a toast/notification on the workstation where a human is looking. [`dotvault clipboard [text]`](../cli.md#dotvault-clipboard) completes the set (`POST /api/v1/remote/clipboard`): it puts a value — a one-time token, a device code — on the workstation's clipboard, so after `browse` opens a login page the user's paste is already loaded with what the page asks for.
 
 `dotvault status` reflects the borrow too. When no local token is present but the configured peer socket holds one, the auth line reports `authenticated` and adds a `source: borrowed from peer socket (<path>)` line, so a host that authenticates purely by borrowing — with no token file at rest — no longer misreports as `not authenticated`. If the socket is configured but the peer holds no token, status says so explicitly and prints the socket path rather than the bare `no token` message.
 
 !!! warning "The socket grants the token to anyone who can connect"
-    Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it — and, via `POST /api/v1/remote/browse`, open arbitrary web pages (including phishing pages) in the workstation's browser. dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
+    Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it — and, via `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard`, open arbitrary web pages (including phishing pages) in the workstation's browser, raise arbitrary desktop notifications on it, and replace the workstation's clipboard contents (a paste-hijacking primitive — e.g. swapping a copied wallet address or command). dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
 
 For example, with defaults and username `jane`, the rule `vault_key: "gh"` reads from `kv/data/users/jane/gh`.
 
@@ -187,6 +197,85 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
+
+## API section
+
+The `api` section serves dotvault's web API over a per-user **Unix domain socket**, in addition to (or instead of) the loopback TCP listener the [web section](#web-section) controls.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve the API over a Unix socket |
+| `unix.path` | string | `$XDG_RUNTIME_DIR/dotvault/api.sock` | Socket path; must be absolute (or `~`-relative). Falls back to the cache directory when `XDG_RUNTIME_DIR` is unset (typical on macOS) |
+
+```yaml
+api:
+  enabled: true
+  unix:
+    path: ""    # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+```
+
+### Why it exists: surviving a dropped SSH session
+
+[`vault.token_socket`](#token_socket-dotvault-to-dotvault-token-sharing) lets a headless host borrow a token from a workstation over an SSH `RemoteForward`. That socket **dies with the SSH session**. A process started inside that session but outliving it — a job in `tmux`, a long-running service — succeeds at first and then fails the moment it next needs a token, because the only socket it knew about is gone.
+
+Enabling `api` fixes that by putting a second, stable dotvault on the near side of the problem. The long-lived per-user daemon serves the same borrow endpoint from a path that no disconnect can take away, keeps its own token alive, and re-borrows across the forwarded socket whenever the SSH session comes back. Local clients borrow from the daemon instead of from the forward:
+
+```
+workstation (interactive login)
+   │  SSH RemoteForward → ~/.ssh/dotvault.sock   ← comes and goes with the session
+   ▼
+devbox: dotvault daemon (vault.token_socket + api.enabled)
+   │  $XDG_RUNTIME_DIR/dotvault/api.sock          ← always there while the daemon runs
+   ▼
+devbox: your tmux job, scripts, Python bindings
+```
+
+Configuration on the devbox is both settings together — borrow from the workstation, serve to everything local:
+
+```yaml
+vault:
+  token_socket: ~/.ssh/dotvault.sock   # borrow from the workstation
+api:
+  enabled: true                        # serve the borrow endpoint locally
+```
+
+Clients on that host need no extra configuration: they read the same config and derive the same socket path.
+
+### Borrow order
+
+When both are configured, a token borrow tries the **local API socket first**, then `vault.token_socket`. The local socket is preferred because it is the more stable of the two, which is the entire point. This ordering applies to the daemon, the CLI, the Go `client/` facade and the Python bindings alike. The daemon excludes its *own* socket from its list — it serves that one.
+
+The [peer actions](../cli.md#dotvault-browse) (`browse`, `notify`, `clipboard`) deliberately keep using `vault.token_socket` **only**. Their purpose is to reach the workstation where a human is looking; sending them to the local daemon would open a browser on the headless host nobody is sitting at.
+
+### Separate from `web.enabled`
+
+The two surfaces are enabled independently because they have different audiences and different exposure. The TCP listener serves a browser UI and is reachable by **every user on the machine**; the Unix socket is created `0600` inside a `0700` directory and is reachable only by its owner. A headless host should not have to stand up a web UI to get the borrow endpoint, and turning the socket on does not widen anything `web.enabled` already exposes — if anything it is the tighter of the two.
+
+With `web.enabled: false`, the socket serves the API routes (`/api/v1/token`, `/api/v1/status`, `/healthz`, `/readyz`, the peer actions, …) but **not** the browser-facing routes. The SPA and the interactive login flows build redirect URIs from a bound TCP address that does not exist in that mode, so they are not registered at all rather than being published as a login flow that cannot complete.
+
+### systemd socket activation
+
+On Linux, the packaged `dotvault-api.socket` unit (optional, not enabled by default) lets **systemd bind this socket and hold the fd across daemon restarts**, so borrowers queue instead of getting connection-refused while the daemon is down. `api.enabled` remains the master switch — the socket unit decides who binds, not whether the surface exists — and under activation the unit's `ListenStream=` path wins over `unix.path`, with the daemon logging any divergence and refusing an inherited socket whose mode is wider than `0600`. See [Socket activation](../admin/deployment.md#socket-activation-optional) in the deployment guide.
+
+### Running as a service
+
+The socket lives in `$XDG_RUNTIME_DIR`, which systemd tears down when the user's last session ends — **unless lingering is enabled**:
+
+```sh
+loginctl enable-linger $USER
+```
+
+This is required for any user service meant to outlive an SSH session, which is exactly the case here. The packaged `dotvault.service` also declares `RuntimeDirectory=dotvault`, so systemd creates `$XDG_RUNTIME_DIR/dotvault` at `0700` before the daemon starts and removes it on stop — a killed daemon leaves no stale socket behind.
+
+`dotvault status` reports the socket path and whether it is currently present, which is the first thing to check when a client on the host cannot get a token.
+
+!!! warning "The socket grants the token to anyone who can open it"
+    Any process that can `connect()` to the socket can read the Vault token. The `0600`/`0700` permissions restrict that to the owning user, and dotvault enforces them on every bind (refusing to clobber a socket a live instance already owns). Do not relax them, and do not forward this socket onward unless you intend the far end to hold your token.
+
+!!! note "Unix only"
+    `api.enabled` has no effect on Windows: the daemon logs a warning and serves nothing, so a config shared across a mixed-platform fleet is safe. The Windows analogue would be a named pipe with a protected DACL, as the [SSH agent](../guide/ssh-agent.md) already serves; it is not implemented yet.
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\API`, and the section round-trips through `reg-import`/`reg-export` like every other.
 
 ## Remote config section
 
@@ -211,3 +300,4 @@ dotvault validates the configuration on startup and exits with an error if:
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
 - `web.listen` resolves to a non-loopback address (when web is enabled)
 - An enrolment entry has an empty `engine` field
+- `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)

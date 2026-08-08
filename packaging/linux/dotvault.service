@@ -13,9 +13,34 @@ ExecStart=/usr/bin/dotvault run
 # SIGHUP is the daemon's reload trigger: it re-reads ~/.dotvault-token and
 # immediately re-runs the config loader, applying the dynamic sections
 # (rules, enrolments, sync interval, remote_config) in place. Static
-# sections (vault, web, agent, observability, bypass_system_config) are
-# logged as needing a restart.
+# sections (vault, web, agent, api, observability, bypass_system_config)
+# are logged as needing a restart.
 ExecReload=/bin/kill -HUP $MAINPID
+
+# %t/dotvault (i.e. $XDG_RUNTIME_DIR/dotvault), created 0700 and owned by
+# this unit, is where the SSH agent socket and the local API socket
+# (api.enabled) live. Declaring it here means systemd creates it before
+# ExecStart. Note that $XDG_RUNTIME_DIR itself is torn down when the
+# user's last session ends unless lingering is enabled
+# (`loginctl enable-linger <user>`) — which is required anyway for a user
+# service that is meant to outlive an SSH session, the exact case the local
+# API socket exists to serve.
+#
+# Preserve= is load-bearing, not housekeeping preference. Without it,
+# systemd removes %t/dotvault on every service stop — including
+# Restart=on-failure cycles — and that directory holds the socket nodes the
+# optional dotvault-api.socket / dotvault-agent.socket units are listening
+# on. Deleting them leaves the socket units holding fds for unlinked inodes
+# (clients get ENOENT, not the promised backlog queueing) and makes the
+# restarted daemon's activation check fail on the missing node: socket
+# activation would break itself on the first restart, the exact event it
+# exists to smooth over. The cost is that a *self-bound* socket's node can
+# outlive a killed daemon, which the daemon's own bind path already handles
+# (live-instance probe, stale-node removal). The directory itself is still
+# removed with the runtime dir at session end.
+RuntimeDirectory=dotvault
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 Restart=on-failure
 RestartSec=5s

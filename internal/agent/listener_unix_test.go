@@ -145,3 +145,97 @@ func TestListenerCloseIdempotent(t *testing.T) {
 		t.Errorf("second Close: %v", err)
 	}
 }
+
+// fakeAgentActivation installs a stand-in for systemd socket activation for
+// the agent name, mimicking the retained-master model: one real listener,
+// duplicated per claim, unlink-on-close disabled as FileListener-derived
+// listeners have.
+func fakeAgentActivation(t *testing.T, path string) {
+	t.Helper()
+	master, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	master.(*net.UnixListener).SetUnlinkOnClose(false)
+
+	orig := activatedAgentListener
+	activatedAgentListener = func() (net.Listener, string, error) {
+		f, err := master.(*net.UnixListener).File()
+		if err != nil {
+			return nil, "", err
+		}
+		ln, err := net.FileListener(f)
+		f.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		return ln, path, nil
+	}
+	t.Cleanup(func() {
+		activatedAgentListener = orig
+		master.Close()
+	})
+}
+
+// TestUnixListenerActivatedLifecycle pins the three activated-mode
+// behaviours the self-bind path must not leak into: the configured path is
+// never bound (the socket unit's path wins and Addr reports it), Close does
+// not unlink the systemd-owned node, and a second Serve — the supervision
+// loop's restart — claims a working listener again instead of self-binding
+// against the node and failing with "already running".
+func TestUnixListenerActivatedLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	activatedPath := filepath.Join(dir, "systemd.sock")
+	configuredPath := filepath.Join(dir, "configured.sock")
+	fakeAgentActivation(t, activatedPath)
+
+	_, _, pub, signer := genEd25519(t, "a")
+	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pub, Comment: "a"}}, signer: signer}
+	b := NewBackend([]Source{src})
+
+	runOnce := func() {
+		ln := NewListener(configuredPath, b)
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() { errCh <- ln.Serve(ctx) }()
+
+		// The activated path is dialable the moment the fake master exists,
+		// which is before Serve has reached platformListen — so wait for
+		// the observable effect of the claim (the Addr adoption), not for
+		// connectability.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && ln.Addr() != activatedPath {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if got := ln.Addr(); got != activatedPath {
+			t.Errorf("Addr() = %q, want the activated path %q", got, activatedPath)
+		}
+		if _, err := os.Stat(configuredPath); !os.IsNotExist(err) {
+			t.Errorf("configured path %s was bound despite activation", configuredPath)
+		}
+
+		conn, err := net.Dial("unix", activatedPath)
+		if err != nil {
+			t.Fatalf("dial activated agent socket: %v", err)
+		}
+		client := agent.NewClient(conn)
+		if keys, err := client.List(); err != nil || len(keys) != 1 {
+			t.Fatalf("List over activated socket: keys=%d err=%v", len(keys), err)
+		}
+		conn.Close()
+
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+		// systemd owns the node: shutdown must not unlink it.
+		if _, err := os.Stat(activatedPath); err != nil {
+			t.Fatalf("activated node removed on shutdown: %v", err)
+		}
+	}
+
+	runOnce()
+	// The restart: a fresh Listener (as service.go's supervision loop
+	// builds) must come up on the activated socket again.
+	runOnce()
+}

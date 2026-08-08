@@ -407,6 +407,39 @@ func TestApplyRegistryLayerAgent(t *testing.T) {
 	}
 }
 
+func TestApplyRegistryLayerAPI(t *testing.T) {
+	cfg := &Config{}
+	enabled := uint32(1)
+	applyRegistryLayer(cfg, registryLayer{
+		APIEnabled:  &enabled,
+		APIUnixPath: "/run/user/1000/dotvault/api.sock",
+	})
+
+	if !cfg.API.Enabled {
+		t.Errorf("API.Enabled = false, want true")
+	}
+	if cfg.API.Unix.Path != "/run/user/1000/dotvault/api.sock" {
+		t.Errorf("API.Unix.Path = %q", cfg.API.Unix.Path)
+	}
+}
+
+// TestApplyRegistryLayerAPIDefaultPath covers the common policy shape: enable
+// the socket and let the per-user runtime default supply the path. An absent
+// UnixPath value must leave the field empty (which resolves to the default at
+// bind time) rather than being treated as a configured value.
+func TestApplyRegistryLayerAPIDefaultPath(t *testing.T) {
+	cfg := &Config{}
+	enabled := uint32(1)
+	applyRegistryLayer(cfg, registryLayer{APIEnabled: &enabled})
+
+	if !cfg.API.Enabled {
+		t.Errorf("API.Enabled = false, want true")
+	}
+	if cfg.API.Unix.Path != "" {
+		t.Errorf("API.Unix.Path = %q, want empty (resolved to the runtime default)", cfg.API.Unix.Path)
+	}
+}
+
 // TestApplyRegistryLayerAgentPutty confirms an explicit WindowsPutty DWORD
 // maps onto the tri-state pointer (0 => &false, non-zero => &true).
 func TestApplyRegistryLayerAgentPutty(t *testing.T) {

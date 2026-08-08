@@ -63,7 +63,7 @@ func (p *recordingLogProcessor) Enabled(context.Context, sdklog.EnabledParameter
 	return true
 }
 
-func (p *recordingLogProcessor) Shutdown(context.Context) error  { return nil }
+func (p *recordingLogProcessor) Shutdown(context.Context) error   { return nil }
 func (p *recordingLogProcessor) ForceFlush(context.Context) error { return nil }
 
 func (p *recordingLogProcessor) Snapshot() []sdklog.Record {

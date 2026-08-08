@@ -146,10 +146,16 @@ func TestRunConfigRefreshManualReload(t *testing.T) {
 // digest even though the snapshot does not retain the header values.
 func TestChangedStaticSections(t *testing.T) {
 	base := &config.Config{
-		Vault:         config.VaultConfig{Address: "https://vault.example.com:8200"},
-		Sync:          config.SyncConfig{Interval: time.Hour},
-		Web:           config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
-		Observability: config.ObservabilityConfig{Enabled: true, Endpoint: "https://otel.example", Headers: map[string]string{"Authorization": "Bearer s3cret"}},
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Web:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
+		Observability: config.ObservabilityConfig{
+			Enabled:  true,
+			Endpoint: "https://otel.example",
+			Headers:  map[string]string{"Authorization": "Bearer s3cret"},
+			Metrics:  config.ObservabilitySignalConfig{Headers: map[string]string{"X-Metrics-Key": "m3trics"}},
+			Logs:     config.ObservabilitySignalConfig{Headers: map[string]string{"X-Logs-Key": "l0gs"}},
+		},
 		Rules: []config.Rule{
 			{Name: "r", VaultKey: "k", Target: config.Target{Path: "/tmp/r", Format: "text"}},
 		},
@@ -158,6 +164,9 @@ func TestChangedStaticSections(t *testing.T) {
 	snap := staticSectionsOf(base)
 	if snap.Observability.Headers != nil {
 		t.Fatal("staticSectionsOf must not retain observability header values")
+	}
+	if snap.Observability.Metrics.Headers != nil || snap.Observability.Logs.Headers != nil {
+		t.Fatal("staticSectionsOf must not retain the per-signal observability header values either")
 	}
 	if snap.HeadersDigest == ([32]byte{}) {
 		t.Fatal("non-empty headers must produce a non-zero digest")
@@ -186,6 +195,12 @@ func TestChangedStaticSections(t *testing.T) {
 		{"api", func(c *config.Config) { c.API.Enabled = true }, "api"},
 		{"observability scalar", func(c *config.Config) { c.Observability.Endpoint = "https://elsewhere.example" }, "observability"},
 		{"observability headers", func(c *config.Config) { c.Observability.Headers = map[string]string{"Authorization": "Bearer rotated"} }, "observability"},
+		{"observability metrics headers", func(c *config.Config) {
+			c.Observability.Metrics.Headers = map[string]string{"X-Metrics-Key": "rotated"}
+		}, "observability"},
+		{"observability logs headers", func(c *config.Config) {
+			c.Observability.Logs.Headers = map[string]string{"X-Logs-Key": "rotated"}
+		}, "observability"},
 		{"bypass_system_config", func(c *config.Config) { c.BypassSystemConfig = true }, "bypass_system_config"},
 	}
 	for _, tc := range cases {
@@ -204,6 +219,125 @@ func TestChangedStaticSections(t *testing.T) {
 		})
 	}
 }
+
+// TestDigestObservabilityHeadersDomainSeparation pins that the header digest
+// distinguishes WHICH map a header lives in, not just the multiset of
+// key/value pairs: moving a credential from the shared map to a per-signal
+// map redirects which backend receives it, which is a real config change the
+// restart-required diff must see.
+func TestDigestObservabilityHeadersDomainSeparation(t *testing.T) {
+	shared := config.ObservabilityConfig{
+		Headers: map[string]string{"Authorization": "Bearer tok"},
+	}
+	moved := config.ObservabilityConfig{
+		Metrics: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	if digestObservabilityHeaders(shared) == digestObservabilityHeaders(moved) {
+		t.Error("moving a header from the shared map to metrics must change the digest")
+	}
+
+	metricsOnly := config.ObservabilityConfig{
+		Metrics: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	logsOnly := config.ObservabilityConfig{
+		Logs: config.ObservabilitySignalConfig{Headers: map[string]string{"Authorization": "Bearer tok"}},
+	}
+	if digestObservabilityHeaders(metricsOnly) == digestObservabilityHeaders(logsOnly) {
+		t.Error("the same header under metrics vs logs must digest differently")
+	}
+
+	if digestObservabilityHeaders(shared) != digestObservabilityHeaders(shared) {
+		t.Error("digest must be deterministic within a process")
+	}
+}
+
+// TestWarnSharedHeadersToOverriddenEndpoint covers the cross-backend
+// credential warning: it fires only for an enabled signal that redirects the
+// endpoint while inheriting (nil) headers under a non-empty shared map, and
+// an explicit per-signal headers map — empty included — silences it.
+func TestWarnSharedHeadersToOverriddenEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  config.ObservabilityConfig
+		want bool
+	}{
+		{
+			name: "overridden endpoint with inherited headers warns",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs:     config.ObservabilitySignalConfig{Endpoint: "logs.vendor.example:4317"},
+			},
+			want: true,
+		},
+		{
+			name: "explicit empty per-signal headers silences",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs: config.ObservabilitySignalConfig{
+					Endpoint: "logs.vendor.example:4317",
+					Headers:  map[string]string{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no shared headers, nothing to leak",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Logs:     config.ObservabilitySignalConfig{Endpoint: "logs.vendor.example:4317"},
+			},
+			want: false,
+		},
+		{
+			name: "disabled signal cannot leak",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Logs: config.ObservabilitySignalConfig{
+					Enabled:  boolPtrTest(false),
+					Endpoint: "logs.vendor.example:4317",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "same endpoint restated is not an override",
+			cfg: config.ObservabilityConfig{
+				Enabled:  true,
+				Endpoint: "shared:4317",
+				Headers:  map[string]string{"Authorization": "Bearer shared"},
+				Metrics:  config.ObservabilitySignalConfig{Endpoint: "shared:4317"},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logBuf := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			warnSharedHeadersToOverriddenEndpoint(tc.cfg)
+
+			got := strings.Contains(logBuf.String(), "inherits the shared headers")
+			if got != tc.want {
+				t.Errorf("warned = %v, want %v (log: %q)", got, tc.want, logBuf.String())
+			}
+			if strings.Contains(logBuf.String(), "Bearer shared") {
+				t.Error("warning must never carry header values")
+			}
+		})
+	}
+}
+
+func boolPtrTest(b bool) *bool { return &b }
 
 // TestStaticSectionsCoverConfig guards the static/dynamic split against
 // drift: every top-level config.Config field must be explicitly classified

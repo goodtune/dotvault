@@ -258,23 +258,42 @@ There is no file-based logging — integrate with your platform's log collection
 
 ## Observability
 
-dotvault can export OpenTelemetry **metrics and logs** to a local OTel collector — a single `observability:` block in `config.yaml` drives both signals against the same endpoint. Disabled by default; enable with:
+dotvault can export OpenTelemetry **metrics and logs** to an OTel collector. The top-level fields of the `observability:` block are shared defaults driving both signals against one endpoint — the common deployment — and the nested `metrics:` / `logs:` blocks override them per signal, so the two can go to **separate backends** or one can be switched off. Disabled by default; enable with:
 
 ```yaml
 observability:
   enabled: true
-  endpoint: "127.0.0.1:4317"  # local OTel collector
+  endpoint: "127.0.0.1:4317"  # shared default for both signals
   protocol: "grpc"            # or "http/protobuf"
   insecure: true              # disable TLS for the local hop
-  export_interval: "15s"
+  export_interval: "15s"      # metric export cadence
   # headers:
   #   authorization: "Bearer …"
 ```
 
-For `http/protobuf`, set `endpoint` to a *base* URL like `https://otel.example` — the SDK appends `/v1/metrics` and `/v1/logs` itself. A URL that already includes a signal-specific path (e.g. ending in `/v1/metrics`) routes both signals to the same wrong route.
+Per-signal overrides layer onto those shared fields — the model deliberately mirrors the OTel SDK's own env-var convention (generic `OTEL_EXPORTER_OTLP_*` plus signal-specific `OTEL_EXPORTER_OTLP_METRICS_*` / `_LOGS_*`), so an operator who knows one knows both:
+
+```yaml
+observability:
+  enabled: true
+  endpoint: "127.0.0.1:4317"          # metrics keep using this…
+  insecure: true
+  logs:                                # …while logs go to a vendor backend
+    endpoint: "https://logs.vendor.example"
+    protocol: "http/protobuf"
+    insecure: false
+    headers:
+      X-Api-Key: "logs-backend-key"
+```
+
+Field semantics: `enabled` (unset = on whenever `observability.enabled` is; explicit `false` switches that signal off — the top-level flag remains the master switch and a per-signal `true` cannot resurrect a disabled subsystem), `endpoint` / `protocol` (non-empty overrides), `insecure` (set overrides), and `headers`, which **replace the shared map wholesale** rather than merging — merging credential maps invites sending one backend's bearer token to the other. An explicitly empty `headers: {}` therefore means "this signal sends no headers" even when the shared map is populated. Watch the inverse case, too: a signal that overrides `endpoint` but leaves `headers` unset inherits the shared map — shared bearer token included — and sends it to the new backend. The daemon warns at startup when it sees that combination; set an explicit per-signal `headers:` (`{}` for none) to state the intent and silence it. Enabling `observability.enabled` with both signals explicitly off is rejected at config load as the contradiction it is.
+
+For `http/protobuf`, set `endpoint` to a *base* URL like `https://otel.example` — the SDK appends `/v1/metrics` and `/v1/logs` itself. A URL that already includes a signal-specific path (e.g. ending in `/v1/metrics`) routes that signal to the wrong route.
+
+Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op implementation, so the `Log*` helpers emit nothing for that daemon — `metrics.enabled` alone gives you series without shipping any log records.
 
 !!! note "Windows Group Policy"
-    The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`). Header values round-trip too (as REG_SZ values under `Observability\Headers`), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.
+    The `observability` block round-trips through the GPO/registry layer like every other section — author it under `SOFTWARE\Policies\goodtune\dotvault\Observability` (or generate the values with `dotvault reg-import`), with the per-signal overrides as `Observability\Metrics` / `Observability\Logs` subkeys (tri-state `Enabled`/`Insecure` DWORDs, and their own `Headers` subkeys — a present-but-empty per-signal `Headers` key means "no headers for this signal", distinct from an absent key meaning inherit). Header values round-trip too (as REG_SZ values under the respective `Headers` keys), so a `.reg` export carries the live tokens — treat the artefact as a secret. To keep tokens out of the policy hive and out of any exported config, leave `headers` empty and set them via the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable (through a machine-wide environment policy) instead. See [Windows Group Policy](windows-gpo.md#registry-schema) for the full registry schema.
 
 The standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, …) are also honoured by the SDK, so the `endpoint`/`headers` fields can be left empty and managed centrally via `/etc/default/dotvault`.
 

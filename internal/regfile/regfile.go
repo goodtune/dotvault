@@ -197,19 +197,67 @@ func (e *emitter) writeObservability(o config.ObservabilityConfig) {
 	// Always pre-delete the Headers subtree so removals round-trip. No-op on
 	// a registry that never had it.
 	e.writeKeyDeletion(rootKey + `\Observability\Headers`)
-	if len(o.Headers) == 0 {
-		return
+	if len(o.Headers) > 0 {
+		e.writeKey(rootKey + `\Observability\Headers`)
+		e.writeHeaderValues(o.Headers)
+		e.WriteString("\r\n")
 	}
-	e.writeKey(rootKey + `\Observability\Headers`)
-	names := make([]string, 0, len(o.Headers))
-	for n := range o.Headers {
+
+	e.writeObservabilitySignal("Metrics", o.Metrics)
+	e.writeObservabilitySignal("Logs", o.Logs)
+}
+
+// writeObservabilitySignal emits one per-signal override block as an
+// Observability subkey. The tri-state Enabled/Insecure DWORDs are emitted
+// only when explicitly set, following the Agent WindowsPutty pattern — an
+// unset value must round-trip as "inherit", not be pinned to whatever the
+// export observed.
+//
+// The Headers subtree distinguishes nil from explicitly-empty by KEY
+// PRESENCE: an empty-but-present key means "this signal sends no headers"
+// (suppressing the shared credentials), while an absent key means inherit.
+// Collapsing the two — as is harmless for the shared map, where they mean
+// the same thing — would silently re-attach the shared bearer token to a
+// signal the operator explicitly excluded it from.
+func (e *emitter) writeObservabilitySignal(name string, sig config.ObservabilitySignalConfig) {
+	sigKey := rootKey + `\Observability\` + name
+	// Pre-delete the whole signal subtree (Headers included) before
+	// recreation. The tri-state DWORDs are emitted only when set, so
+	// without the deletion a value cleared in the source would linger in
+	// the registry across a re-import — and a stale Insecure=1 silently
+	// keeping plaintext transport is exactly the kind of leftover this
+	// idempotency pattern exists to prevent.
+	e.writeKeyDeletion(sigKey)
+	e.writeKey(sigKey)
+	if sig.Enabled != nil {
+		e.writeBool("Enabled", *sig.Enabled)
+	}
+	e.writeString("Endpoint", sig.Endpoint)
+	e.writeString("Protocol", sig.Protocol)
+	if sig.Insecure != nil {
+		e.writeBool("Insecure", *sig.Insecure)
+	}
+	e.WriteString("\r\n")
+
+	if sig.Headers != nil {
+		e.writeKey(sigKey + `\Headers`)
+		e.writeHeaderValues(sig.Headers)
+		e.WriteString("\r\n")
+	}
+}
+
+// writeHeaderValues emits a header map's entries sorted by name, case
+// preserved (HTTP folds case, but a faithful round-trip keeps the authored
+// form).
+func (e *emitter) writeHeaderValues(headers map[string]string) {
+	names := make([]string, 0, len(headers))
+	for n := range headers {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		e.writeString(n, o.Headers[n])
+		e.writeString(n, headers[n])
 	}
-	e.WriteString("\r\n")
 }
 
 // writeRemoteConfig emits the RemoteConfig section: the scalar fields, then

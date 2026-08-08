@@ -115,35 +115,117 @@ func readRegistryRemoteConfigHeaders(root registry.Key, basePath string) (map[st
 // directly under headersPath, keyed by value name. Returns (nil, nil) when
 // the key does not exist or holds no values.
 func readRegistryHeaderMap(root registry.Key, headersPath string) (map[string]string, error) {
+	headers, present, err := readRegistryHeaderMapPresence(root, headersPath)
+	if err != nil || !present || len(headers) == 0 {
+		return nil, err
+	}
+	return headers, nil
+}
+
+// readRegistryHeaderMapPresence is the presence-aware variant: it reports
+// whether the key exists at all, and returns a non-nil (possibly empty) map
+// when it does. The distinction carries meaning for the per-signal
+// observability headers, where an empty-but-present key means "this signal
+// sends no headers" — suppressing the shared credentials — while an absent
+// key means inherit them.
+func readRegistryHeaderMapPresence(root registry.Key, headersPath string) (map[string]string, bool, error) {
 	key, err := registry.OpenKey(root, headersPath, registry.READ)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotExist) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("open headers key at %s: %w", headersPath, err)
+		return nil, false, fmt.Errorf("open headers key at %s: %w", headersPath, err)
 	}
 	defer key.Close()
 
 	info, err := key.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat headers key %s: %w", headersPath, err)
+		return nil, true, fmt.Errorf("stat headers key %s: %w", headersPath, err)
 	}
 	if info.ValueCount == 0 {
-		return nil, nil
+		return map[string]string{}, true, nil
 	}
 
 	names, err := key.ReadValueNames(int(info.ValueCount))
 	if err != nil {
-		return nil, fmt.Errorf("read header value names at %s: %w", headersPath, err)
+		return nil, true, fmt.Errorf("read header value names at %s: %w", headersPath, err)
 	}
 
 	headers := make(map[string]string, len(names))
 	for _, name := range names {
 		if v, ok := readRegString(key, name); ok {
 			headers[name] = v
+		} else {
+			// A header value of the wrong registry type (e.g. a REG_DWORD)
+			// cannot be a header string. Warn rather than silently dropping
+			// it — a vanished credential header is a confusing 401 at the
+			// collector otherwise. Only the name is logged; the value may
+			// be a token.
+			slog.Warn("ignoring registry header value with non-string type", "key", headersPath, "name", name)
 		}
 	}
-	return headers, nil
+	return headers, true, nil
+}
+
+// registrySignalLayer holds one signal's override values from an
+// Observability\Metrics or Observability\Logs subkey.
+type registrySignalLayer struct {
+	Enabled  *uint32
+	Endpoint string
+	Protocol string
+	Insecure *uint32
+	Headers  map[string]string
+}
+
+// readRegistrySignal reads one per-signal observability subkey. An absent
+// subkey yields the zero layer (inherit everything).
+func readRegistrySignal(root registry.Key, basePath, name string) (registrySignalLayer, error) {
+	var l registrySignalLayer
+	sigPath := basePath + `\Observability\` + name
+	key, err := registry.OpenKey(root, sigPath, registry.READ)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return l, nil
+		}
+		return l, fmt.Errorf("open %s policy key: %w", sigPath, err)
+	}
+	l.Enabled = readRegDWORD(key, "Enabled")
+	l.Endpoint, _ = readRegString(key, "Endpoint")
+	l.Protocol, _ = readRegString(key, "Protocol")
+	l.Insecure = readRegDWORD(key, "Insecure")
+	key.Close()
+
+	headers, present, err := readRegistryHeaderMapPresence(root, sigPath+`\Headers`)
+	if err != nil {
+		return l, err
+	}
+	if present {
+		l.Headers = headers
+	}
+	return l, nil
+}
+
+// applySignalLayer copies a per-signal registry layer onto the config
+// struct, preserving the tri-states (absent DWORD = nil = inherit) and the
+// headers presence semantics.
+func applySignalLayer(dst *ObservabilitySignalConfig, l registrySignalLayer) {
+	if l.Enabled != nil {
+		b := *l.Enabled != 0
+		dst.Enabled = &b
+	}
+	if l.Endpoint != "" {
+		dst.Endpoint = l.Endpoint
+	}
+	if l.Protocol != "" {
+		dst.Protocol = l.Protocol
+	}
+	if l.Insecure != nil {
+		b := *l.Insecure != 0
+		dst.Insecure = &b
+	}
+	if l.Headers != nil {
+		dst.Headers = l.Headers
+	}
 }
 
 // registryLayer holds the flat values read from a single registry hive.
@@ -198,6 +280,13 @@ type registryLayer struct {
 	ObservabilityProtocol string
 	ObservabilityInsecure *uint32
 	ObservabilityInterval string
+
+	// Per-signal observability overrides (Observability\Metrics and
+	// Observability\Logs subkeys), including each signal's Headers map —
+	// non-nil iff the Headers subkey exists, since key presence encodes the
+	// "explicitly no headers" state (see readRegistryHeaderMapPresence).
+	ObsMetrics registrySignalLayer
+	ObsLogs    registrySignalLayer
 
 	// Agent (scalar transport settings; the ordered Keys list is read
 	// separately by readRegistryAgentKeys).
@@ -327,6 +416,14 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.ObservabilityProtocol, _ = readRegString(obk, "Protocol")
 		layer.ObservabilityInsecure = readRegDWORD(obk, "Insecure")
 		layer.ObservabilityInterval, _ = readRegString(obk, "ExportInterval")
+	}
+
+	// Per-signal observability overrides.
+	if layer.ObsMetrics, err = readRegistrySignal(root, registryPolicyPath, "Metrics"); err != nil {
+		return layer, false, err
+	}
+	if layer.ObsLogs, err = readRegistrySignal(root, registryPolicyPath, "Logs"); err != nil {
+		return layer, false, err
 	}
 
 	// Read Agent subkey (scalar transport settings only).
@@ -493,6 +590,8 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.ObservabilityInterval != "" {
 		cfg.Observability.RawInterval = layer.ObservabilityInterval
 	}
+	applySignalLayer(&cfg.Observability.Metrics, layer.ObsMetrics)
+	applySignalLayer(&cfg.Observability.Logs, layer.ObsLogs)
 	if layer.AgentEnabled != nil {
 		cfg.Agent.Enabled = *layer.AgentEnabled != 0
 	}

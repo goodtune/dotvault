@@ -277,6 +277,45 @@ This is required for any user service meant to outlive an SSH session, which is 
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\API`, and the section round-trips through `reg-import`/`reg-export` like every other.
 
+## Observability section
+
+Exports OpenTelemetry **metrics and logs** over OTLP. The top-level fields are shared defaults driving both signals against one collector; the nested `metrics:` and `logs:` blocks override them per signal, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for both signals. A per-signal `enabled: true` cannot resurrect a disabled subsystem |
+| `endpoint` | string | — | OTLP collector endpoint. For `http/protobuf` this must be a *base* URL (the exporters append `/v1/metrics` and `/v1/logs` themselves) |
+| `protocol` | string | — | `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
+| `insecure` | bool | `false` | Disable transport TLS |
+| `headers` | map | — | OTLP headers, typically a vendor bearer token — treat as a credential |
+| `export_interval` | string | SDK default | Metric export cadence as a Go duration (e.g. `30s`) |
+| `metrics` / `logs` | block | — | Per-signal overrides, fields below |
+
+Per-signal override block (`metrics:` / `logs:`):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | inherit | Tri-state: unset inherits the master switch, explicit `false` turns this signal off |
+| `endpoint` | string | inherit | Non-empty overrides the shared endpoint (separate backend) |
+| `protocol` | string | inherit | Non-empty overrides the shared protocol |
+| `insecure` | bool | inherit | Tri-state: unset inherits the shared value |
+| `headers` | map | inherit | **Replaces** the shared map wholesale — never merged, so one backend's token is not sent to the other. An explicitly empty `headers: {}` means "this signal sends no headers", distinct from omitting the field (inherit) |
+
+```yaml
+observability:
+  enabled: true
+  endpoint: https://otel.internal.example      # metrics stay here
+  protocol: http/protobuf
+  headers:
+    authorization: "Bearer metrics-token"
+  logs:
+    endpoint: https://logs.vendor.example      # logs go elsewhere
+    headers:                                   # and carry their own credentials
+      x-api-key: "logs-token"
+```
+
+A signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
+
 ## Remote config section
 
 See [Remote Configuration](remote-config.md) for details. When `remote_config.url` is set, the local file/registry config becomes a base that is overlaid with dynamic sections (`rules`, `enrolments`, `sync`) fetched from a `dotvault-config` service.

@@ -106,8 +106,9 @@ func TestRecordReachesActiveMeterProvider(t *testing.T) {
 // rather than at first export.
 func TestInitBadProtocol(t *testing.T) {
 	_, err := Init(context.Background(), Config{
-		Enabled:  true,
-		Protocol: "smoke-signals",
+		Enabled: true,
+		Metrics: Signal{Enabled: true, Protocol: "smoke-signals"},
+		Logs:    Signal{Enabled: true, Protocol: "smoke-signals"},
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported protocol")
@@ -190,9 +191,9 @@ func TestInitBuildsResource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	p, err := Init(ctx, Config{
-		Enabled:  true,
-		Endpoint: "127.0.0.1:0",
-		Insecure: true,
+		Enabled: true,
+		Metrics: Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		Logs:    Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
@@ -234,9 +235,9 @@ func TestProtocolFallthroughToEnv(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	p, err := Init(ctx, Config{
-		Enabled:  true,
-		Endpoint: "127.0.0.1:0",
-		Insecure: true,
+		Enabled: true,
+		Metrics: Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		Logs:    Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
@@ -248,12 +249,99 @@ func TestProtocolFallthroughToEnv(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
 	p, err = Init(ctx, Config{
-		Enabled:  true,
-		Endpoint: "127.0.0.1:0",
-		Insecure: true,
+		Enabled: true,
+		Metrics: Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+		Logs:    Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
 	})
 	if err != nil {
 		t.Fatalf("Init (generic env): %v", err)
 	}
 	_ = p.Shutdown(ctx)
+}
+
+// TestInitSignalSelective pins the per-signal contract: initialising with
+// one signal disabled must leave that signal's process-wide global
+// untouched, so its call sites (metric instruments, or the Log* helpers)
+// stay backed by the OTel no-op implementation exactly as
+// if observability were off for that signal — while the enabled signal gets
+// a real provider.
+func TestInitSignalSelective(t *testing.T) {
+	prevMP := otel.GetMeterProvider()
+	prevLP := global.GetLoggerProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		global.SetLoggerProvider(prevLP)
+		rebindInstruments()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Logs only: the MeterProvider global must not move.
+	p, err := Init(ctx, Config{
+		Enabled: true,
+		Logs:    Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+	})
+	if err != nil {
+		t.Fatalf("Init (logs only): %v", err)
+	}
+	if got := otel.GetMeterProvider(); got != prevMP {
+		t.Error("logs-only Init replaced the global MeterProvider; metrics should have stayed no-op")
+	}
+	if got := global.GetLoggerProvider(); got == prevLP {
+		t.Error("logs-only Init did not install a LoggerProvider")
+	}
+	_ = p.Shutdown(ctx)
+	global.SetLoggerProvider(prevLP)
+
+	// Metrics only: the LoggerProvider global must not move.
+	p, err = Init(ctx, Config{
+		Enabled: true,
+		Metrics: Signal{Enabled: true, Endpoint: "127.0.0.1:0", Insecure: true},
+	})
+	if err != nil {
+		t.Fatalf("Init (metrics only): %v", err)
+	}
+	if got := global.GetLoggerProvider(); got != prevLP {
+		t.Error("metrics-only Init replaced the global LoggerProvider; logs should have stayed no-op")
+	}
+	if got := otel.GetMeterProvider(); got == prevMP {
+		t.Error("metrics-only Init did not install a MeterProvider")
+	}
+	_ = p.Shutdown(ctx)
+	otel.SetMeterProvider(prevMP)
+	rebindInstruments()
+
+	// Master on, both signals off: inactive provider, neither global moves.
+	p, err = Init(ctx, Config{Enabled: true})
+	if err != nil {
+		t.Fatalf("Init (both disabled): %v", err)
+	}
+	if otel.GetMeterProvider() != prevMP || global.GetLoggerProvider() != prevLP {
+		t.Error("Init with both signals disabled must leave both globals untouched")
+	}
+	_ = p.Shutdown(ctx)
+}
+
+// TestInsecureHeaderFootgun pins the warning predicate: it must fire only
+// for the plaintext-transport-plus-auth-headers combination, per signal.
+func TestInsecureHeaderFootgun(t *testing.T) {
+	cases := []struct {
+		name string
+		sig  Signal
+		want bool
+	}{
+		{"insecure with headers", Signal{Insecure: true, Headers: map[string]string{"Authorization": "Bearer x"}}, true},
+		{"insecure without headers", Signal{Insecure: true}, false},
+		{"insecure with empty headers map", Signal{Insecure: true, Headers: map[string]string{}}, false},
+		{"tls with headers", Signal{Headers: map[string]string{"Authorization": "Bearer x"}}, false},
+		{"neither", Signal{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := insecureHeaderFootgun(tc.sig); got != tc.want {
+				t.Errorf("insecureHeaderFootgun = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

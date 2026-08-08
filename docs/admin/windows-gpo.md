@@ -74,14 +74,20 @@ Every YAML field has a registry equivalent. The tables below give the value name
 
 | Registry value | Type | Description |
 |---------------|------|-------------|
-| `Observability\Enabled` | REG_DWORD | Enable the OTLP metrics exporter (0/1) |
+| `Observability\Enabled` | REG_DWORD | Master switch for the OTLP exporters, both signals (0/1) |
 | `Observability\Endpoint` | REG_SZ | OTLP collector endpoint |
 | `Observability\Protocol` | REG_SZ | `grpc` or `http/protobuf` |
 | `Observability\Insecure` | REG_DWORD | Disable transport TLS (0/1) |
 | `Observability\ExportInterval` | REG_SZ | Export interval (e.g. `30s`, `1m`) |
 | `Observability\Headers\<name>` | REG_SZ | OTLP header value (see note) |
+| `Observability\Metrics\Enabled` | REG_DWORD | Tri-state: absent = inherit, 0 = signal off, 1 = on |
+| `Observability\Metrics\Endpoint` | REG_SZ | Metrics-only endpoint override (separate backend) |
+| `Observability\Metrics\Protocol` | REG_SZ | Metrics-only protocol override |
+| `Observability\Metrics\Insecure` | REG_DWORD | Tri-state: absent = inherit shared |
+| `Observability\Metrics\Headers\<name>` | REG_SZ | Metrics-only headers; the subkey's presence replaces the shared map wholesale (present-but-empty = no headers) |
+| `Observability\Logs\…` | — | Same five values for the log signal |
 
-The block drives both signals (metrics and logs) against the same collector. For `http/protobuf`, `Endpoint` must be a *base* URL like `https://otel.example` — the exporters append `/v1/metrics` and `/v1/logs` themselves; a URL that already ends in a signal-specific path routes both signals to the wrong route.
+The top-level values are shared defaults driving both signals (metrics and logs) against one collector; the `Metrics\` / `Logs\` subkeys override them per signal so the two can go to separate backends or one can be switched off — same layering as the YAML `metrics:` / `logs:` blocks. For `http/protobuf`, `Endpoint` must be a *base* URL like `https://otel.example` — the exporters append `/v1/metrics` and `/v1/logs` themselves; a URL that already ends in a signal-specific path routes that signal to the wrong route.
 
 !!! warning "Observability headers carry credentials"
     OTLP `headers` typically hold bearer tokens (Datadog / Grafana Cloud / Honeycomb, etc.). Config conversion is lossless in every direction, so `reg-export` and `reg-import` **do** round-trip header values verbatim (each as a REG_SZ value under `Observability\Headers`) — which means a generated `.reg` artefact contains the live tokens. Treat it as a secret: store it at restricted permissions and don't check it in. If you would rather keep tokens out of the policy hive and out of any exported artefact, leave `headers` empty and set them via the per-user `EnvironmentFile` (`OTEL_EXPORTER_OTLP_HEADERS`) instead — the SDK falls through to those env vars.

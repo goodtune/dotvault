@@ -406,10 +406,12 @@ func staticSectionsOf(c *config.Config) staticSections {
 		Agent:         c.Agent,
 		API:           c.API,
 		Observability: c.Observability,
-		HeadersDigest: digestHeaders(c.Observability.Headers),
+		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
 	}
 	s.Observability.Headers = nil
+	s.Observability.Metrics.Headers = nil
+	s.Observability.Logs.Headers = nil
 	return s
 }
 
@@ -427,6 +429,37 @@ var headerDigestSalt = func() []byte {
 	}
 	return b
 }()
+
+// digestObservabilityHeaders reduces every header map the observability
+// section can carry — the shared one plus the per-signal metrics/logs
+// overrides — to a single digest for the static-section comparison. Each
+// map is domain-separated by a label so moving a header between maps (a
+// real config change: it redirects which backend receives the token)
+// changes the digest even though the multiset of key/value pairs did not.
+func digestObservabilityHeaders(o config.ObservabilityConfig) [sha256.Size]byte {
+	d := sha256.New()
+	var lenBuf [8]byte
+	writeString := func(s string) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		d.Write(lenBuf[:])
+		d.Write([]byte(s))
+	}
+	for _, part := range []struct {
+		label   string
+		headers map[string]string
+	}{
+		{"shared", o.Headers},
+		{"metrics", o.Metrics.Headers},
+		{"logs", o.Logs.Headers},
+	} {
+		writeString(part.label)
+		sub := digestHeaders(part.headers)
+		d.Write(sub[:])
+	}
+	var out [sha256.Size]byte
+	copy(out[:], d.Sum(nil))
+	return out
+}
 
 // digestHeaders hashes a header map deterministically (sorted keys, each
 // key and value length-prefixed so no delimiter can be forged by the
@@ -742,6 +775,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// credential. The OTel SDK keeps its own copy internally; the web
 	// server (if enabled) holds obsCfgForWeb.
 	cfg.Observability.Headers = nil
+	cfg.Observability.Metrics.Headers = nil
+	cfg.Observability.Logs.Headers = nil
 
 	// Surface the registry-config notification through the OTel
 	// LoggerProvider now that it's installed. Deliberately not
@@ -1397,6 +1432,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// reason as the daemon path — keep credentials out of the
 	// heap-resident Config struct.
 	cfg.Observability.Headers = nil
+	cfg.Observability.Metrics.Headers = nil
+	cfg.Observability.Logs.Headers = nil
 
 	// Same rationale as runDaemon — emit the GPO-managed notification
 	// after the LoggerProvider is wired up. See emitConfigSourceLog.
@@ -2640,12 +2677,28 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *observability.Provider {
 	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// Layer the per-signal overrides onto the shared fields here — the
+	// config package owns those semantics (ResolveSignal) and the
+	// observability package deliberately consumes only resolved values.
+	warnSharedHeadersToOverriddenEndpoint(cfg)
+	metrics := cfg.MetricsSignal()
+	logs := cfg.LogsSignal()
 	provider, err := observability.Init(initCtx, observability.Config{
-		Enabled:        cfg.Enabled,
-		Endpoint:       cfg.Endpoint,
-		Protocol:       cfg.Protocol,
-		Insecure:       cfg.Insecure,
-		Headers:        cfg.Headers,
+		Enabled: cfg.Enabled,
+		Metrics: observability.Signal{
+			Enabled:  metrics.Enabled,
+			Endpoint: metrics.Endpoint,
+			Protocol: metrics.Protocol,
+			Insecure: metrics.Insecure,
+			Headers:  metrics.Headers,
+		},
+		Logs: observability.Signal{
+			Enabled:  logs.Enabled,
+			Endpoint: logs.Endpoint,
+			Protocol: logs.Protocol,
+			Insecure: logs.Insecure,
+			Headers:  logs.Headers,
+		},
 		ExportInterval: cfg.ExportInterval,
 		ServiceVersion: version,
 	})
@@ -2657,6 +2710,34 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 		return &observability.Provider{}
 	}
 	return provider
+}
+
+// warnSharedHeadersToOverriddenEndpoint flags the cross-backend credential
+// pitfall the wholesale-replace header semantics can't catch on their own: a
+// per-signal block that redirects the endpoint without setting its own
+// headers inherits the shared map — typically a bearer token minted for the
+// shared backend — and sends it to the new one. That can be intended (same
+// vendor, different route), so this warns rather than fails; an explicit
+// per-signal `headers:` (`{}` for none) states the intent and silences it.
+// The endpoint is loggable; the header values never are.
+func warnSharedHeadersToOverriddenEndpoint(cfg config.ObservabilityConfig) {
+	if !cfg.Enabled || len(cfg.Headers) == 0 {
+		return
+	}
+	for _, sig := range []struct {
+		name string
+		s    config.ObservabilitySignalConfig
+	}{
+		{"metrics", cfg.Metrics},
+		{"logs", cfg.Logs},
+	} {
+		enabled := sig.s.Enabled == nil || *sig.s.Enabled
+		if enabled && sig.s.Endpoint != "" && sig.s.Endpoint != cfg.Endpoint && sig.s.Headers == nil {
+			slog.Warn("observability signal overrides the endpoint but inherits the shared headers; the shared credentials will be sent to the overridden endpoint — set headers on the signal (an empty map sends none) if that is not intended",
+				"signal", sig.name,
+				"endpoint", sig.s.Endpoint)
+		}
+	}
 }
 
 // shutdownObservability flushes and tears down the MeterProvider

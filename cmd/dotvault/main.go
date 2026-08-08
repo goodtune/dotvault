@@ -35,6 +35,7 @@ import (
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
+	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
 	vaultapi "github.com/hashicorp/vault/api"
@@ -831,6 +832,24 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// it is both a surface this daemon serves and an entry the daemon must
 	// exclude from its own borrow list.
 	apiSocket := resolveAPISocket(cfg)
+
+	// systemd socket activation housekeeping (Linux; no-op elsewhere). Any
+	// activated fd no enabled surface will claim is drained now — accepted
+	// and closed immediately, so clients fail fast — with a warning naming
+	// the mismatch. Draining rather than closing our fd, because systemd
+	// retains its own copy of the listener: closing ours would refuse
+	// nobody, it would just leave clients hanging in a backlog no one
+	// accepts. The keep list names the surfaces that claim their fds
+	// themselves: the web server takes "api" when it starts (below), and
+	// the SSH agent takes "agent" after the first successful auth.
+	var keepActivated []string
+	if apiSocket != "" {
+		keepActivated = append(keepActivated, "api")
+	}
+	if cfg.Agent.Enabled {
+		keepActivated = append(keepActivated, "agent")
+	}
+	uds.DrainUnclaimedActivation(keepActivated...)
 	borrowSockets := daemonBorrowSockets(cfg, apiSocket)
 
 	// Peer-socket token borrow. If no local token was usable and a peer socket

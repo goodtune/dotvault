@@ -130,6 +130,25 @@ sudo systemctl --global enable dotvault.service
 
 `--global` enables the unit in every user's session; each user runs their own instance and authenticates with their own Vault identity.
 
+#### Socket activation (optional)
+
+The packages also ship two **socket units**, installed but not enabled: `dotvault-api.socket` (the [local API socket](../configuration/config-reference.md#api-section)) and `dotvault-agent.socket` (the [SSH agent](../guide/ssh-agent.md) socket). Without them the daemon binds its sockets itself, and each socket disappears whenever the daemon does — `systemctl --user restart dotvault.service` is a brief outage for anything borrowing a token or requesting a signature at that moment. With a socket unit enabled, **systemd binds the socket and holds the listening fd across daemon restarts**, so clients queue in the backlog and are served when the daemon returns; the socket also exists from `sockets.target` at session start, before the daemon has authenticated.
+
+```sh
+systemctl --user enable --now dotvault-api.socket
+systemctl --user enable --now dotvault-agent.socket   # optional, independent
+```
+
+Things to know:
+
+- **The config is still the master switch.** `api.enabled` / `agent.enabled` decide whether the surface exists; the socket unit only decides who binds it. If systemd passes a socket the daemon is not configured to serve, the daemon *drains* it — connections are accepted and closed immediately, so clients fail fast with EOF — and logs a warning naming the mismatch. (Merely closing the daemon's copy would refuse nobody: systemd retains its own listening fd, so clients would hang in a backlog no one accepts.) Enabling the socket unit is not a substitute for enabling the feature.
+- **This is fd-passing, not start-on-demand.** The service stays `WantedBy=default.target` and runs regardless of connections — it is syncing files and keeping a token alive. Enable both the `.socket` and the `.service`; enabling only one is a half-configured state.
+- **Owner-only is verified, not assumed.** The units set `SocketMode=0600`, and the daemon independently checks the inherited socket's filesystem mode and **refuses** anything wider — `SocketMode` defaults to `0666`, so a hand-edited unit that drops the line fails loudly instead of silently exposing the token endpoint to every uid on the box.
+- **The socket unit's path wins.** Under activation the socket lives wherever `ListenStream=` says; if that differs from `api.unix.path` / `agent.unix.path`, the daemon logs the divergence and reports the activated path in `dotvault status`.
+- **Owner-only covers the directory too.** Alongside the socket-node mode, the daemon verifies the parent directory is owner-only and owned by the same user (`DirectoryMode=0700` in the units) — a socket in a directory someone else can write to can be swapped for an impostor, which no node check catches.
+- Requires systemd ≥ 227 (`FileDescriptorName=` support). On older systemd the fds arrive unnamed, and the daemon drains them with a warning rather than serving them.
+- Not applicable on macOS (launchd has its own, incompatible mechanism) or Alpine/OpenRC; on those the daemon's self-bind path runs unchanged.
+
 !!! tip "Enable lingering if the daemon must outlive a login session"
     A `--user` service normally stops when the user's last session ends, and `$XDG_RUNTIME_DIR` (where the SSH agent and [local API socket](../configuration/config-reference.md#api-section) live) is torn down with it. For a machine people reach over SSH — where a `tmux` job or the local API socket is expected to survive a disconnect — enable lingering so the user manager keeps running:
 

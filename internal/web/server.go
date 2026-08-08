@@ -506,21 +506,49 @@ func (s *Server) listen() ([]net.Listener, error) {
 	}
 
 	if s.socketPath != "" {
-		ln, err := uds.Listen(s.socketPath)
+		// systemd socket activation first (Linux; inert elsewhere). An
+		// inherited fd means systemd bound the socket before we started and
+		// keeps it across our restarts, so borrowers queue instead of
+		// getting ECONNREFUSED while the daemon is down. An activation
+		// *error* is fatal, not a fallback: it means the fd exists but
+		// violates an invariant (mode wider than 0600, wrong socket type),
+		// and self-binding would both mask the unit misconfiguration and
+		// fail anyway, since systemd owns the path.
+		aln, actual, err := activatedAPIListener()
 		if err != nil {
 			closeAll()
-			if errors.Is(err, uds.ErrAlreadyListening) {
-				return nil, fmt.Errorf("another dotvault is already serving the local API socket at %s", s.socketPath)
-			}
-			return nil, fmt.Errorf("local API socket: %w", err)
+			return nil, fmt.Errorf("local API socket (systemd activation): %w", err)
 		}
-		slog.Info("starting local API socket", "path", s.socketPath)
-		// Record that *this* Server owns the socket node. Shutdown consults
-		// this before unlinking — see socketBound.
-		s.startMu.Lock()
-		s.socketBound = true
-		s.startMu.Unlock()
-		lns = append(lns, ln)
+		if aln != nil {
+			if actual != s.socketPath {
+				// The socket unit's ListenStream=, not api.unix.path, decides
+				// where the socket lives under activation. Report the truth
+				// so status and clients looking at the config aren't misled.
+				slog.Warn("systemd-activated API socket path differs from api.unix.path; the socket unit wins", "activated", actual, "configured", s.socketPath)
+				s.socketPath = actual
+			}
+			slog.Info("serving local API socket from systemd activation", "path", actual)
+			// socketBound stays false: systemd owns the node, and our
+			// Shutdown must not unlink a socket it will keep using across
+			// our restarts.
+			lns = append(lns, aln)
+		} else {
+			ln, err := uds.Listen(s.socketPath)
+			if err != nil {
+				closeAll()
+				if errors.Is(err, uds.ErrAlreadyListening) {
+					return nil, fmt.Errorf("another dotvault is already serving the local API socket at %s", s.socketPath)
+				}
+				return nil, fmt.Errorf("local API socket: %w", err)
+			}
+			slog.Info("starting local API socket", "path", s.socketPath)
+			// Record that *this* Server owns the socket node. Shutdown
+			// consults this before unlinking — see socketBound.
+			s.startMu.Lock()
+			s.socketBound = true
+			s.startMu.Unlock()
+			lns = append(lns, ln)
+		}
 	}
 
 	if len(lns) == 0 {
@@ -560,6 +588,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return srv.Shutdown(ctx)
 	}
 	return nil
+}
+
+// activatedAPIListener claims the systemd-activated "api" socket, when one
+// exists. An injectable var (matching openBrowser and friends) so tests can
+// exercise the activated branch of listen() without a real systemd
+// environment — the activation snapshot is process-global and once-guarded,
+// which makes it unfakeable in-process.
+var activatedAPIListener = func() (net.Listener, string, error) {
+	return uds.ActivatedListener("api")
 }
 
 // reauthGateHolder wraps the gate so atomic.Value always stores the same

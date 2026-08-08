@@ -404,3 +404,98 @@ func TestTokenEndpointDeclinesDuringReauth(t *testing.T) {
 		t.Errorf("status = %d during re-auth, want 401", resp.StatusCode)
 	}
 }
+
+// fakeActivatedListener installs a stand-in for systemd socket activation
+// that hands out listeners for path, mimicking the retained-master model:
+// each call binds is wrong — systemd's fd is one socket — so a single real
+// listener is created once and duplicated per claim via File(), exactly as
+// uds.ActivatedListener dups its retained master.
+func fakeActivatedListener(t *testing.T, path string) func() {
+	t.Helper()
+	master, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate FileListener-derived semantics: closing a claim must not
+	// unlink systemd's node.
+	master.(*net.UnixListener).SetUnlinkOnClose(false)
+
+	orig := activatedAPIListener
+	activatedAPIListener = func() (net.Listener, string, error) {
+		f, err := master.(*net.UnixListener).File()
+		if err != nil {
+			return nil, "", err
+		}
+		ln, err := net.FileListener(f)
+		f.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		return ln, path, nil
+	}
+	return func() {
+		activatedAPIListener = orig
+		master.Close()
+	}
+}
+
+// TestSocketActivatedAPIServesAndSurvivesShutdown covers the activated
+// branch of Server.listen end to end: the daemon serves the API over the
+// inherited listener, adopts the activated path as its own, and — because
+// systemd owns the node — its Shutdown must not unlink it. Reverting the
+// socketBound skip or the activated branch fails this test.
+func TestSocketActivatedAPIServesAndSurvivesShutdown(t *testing.T) {
+	dir := t.TempDir()
+	activatedPath := filepath.Join(dir, "systemd.sock")
+	restore := fakeActivatedListener(t, activatedPath)
+	defer restore()
+
+	ts := httptest.NewServer(http.HandlerFunc(fakeVaultHandler))
+	defer ts.Close()
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "peer-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	configuredPath := filepath.Join(dir, "configured.sock")
+	s, err := NewServer(ServerConfig{
+		WebCfg:        config.WebConfig{Enabled: false},
+		VaultCfg:      config.VaultConfig{Address: ts.URL, KVMount: "kv", UserPrefix: "users/"},
+		APICfg:        config.APIConfig{Enabled: true},
+		APISocketPath: configuredPath, // deliberately differs: the socket unit's path must win
+		Vault:         vc,
+		Username:      "testuser",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go s.Start()
+	if err := s.WaitReady(); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+
+	// Served over the activated socket, at the activated path.
+	resp, err := socketClient(activatedPath).Get("http://localhost/api/v1/token")
+	if err != nil {
+		t.Fatalf("GET token over activated socket: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	// The configured path was never bound: nothing self-bound while an
+	// activated fd was available.
+	if _, err := os.Stat(configuredPath); !os.IsNotExist(err) {
+		t.Errorf("configured path %s exists; the activated socket should have pre-empted self-binding", configuredPath)
+	}
+
+	// Shutdown must leave systemd's node alone.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if _, err := os.Stat(activatedPath); err != nil {
+		t.Errorf("activated socket node removed by Shutdown; systemd owns it: %v", err)
+	}
+}

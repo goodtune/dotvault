@@ -38,6 +38,33 @@ func TestBackoffJitterStaysWithinTwentyPercent(t *testing.T) {
 			t.Errorf("rnd=%v: Next() = %v, want within [%v, %v]", r, got, lo, hi)
 		}
 	}
+
+	// Direction: rnd=1 must produce a strictly greater delay than rnd=0.
+	// Catches reversed sign in the jitter formula.
+	b0 := NewBackoff()
+	b0.rnd = func() float64 { return 0 }
+	d0 := b0.Next()
+
+	b1 := NewBackoff()
+	b1.rnd = func() float64 { return 1 }
+	d1 := b1.Next()
+
+	if d1 <= d0 {
+		t.Errorf("jitter direction broken: rnd=1 (%v) must exceed rnd=0 (%v)", d1, d0)
+	}
+
+	// Magnitude: the edge values must be close to the expected bounds,
+	// not just inside them. Catches under-sized Jitter constant.
+	expectedMin := time.Duration(float64(500*time.Millisecond) * 0.8) // rnd=0 → 400ms
+	expectedMax := time.Duration(float64(500*time.Millisecond) * 1.2) // rnd=1 → 600ms
+	tolerance := 5 * time.Millisecond
+
+	if d0 < expectedMin-tolerance || d0 > expectedMin+tolerance {
+		t.Errorf("rnd=0: Next() = %v, want close to %v (±%v)", d0, expectedMin, tolerance)
+	}
+	if d1 < expectedMax-tolerance || d1 > expectedMax+tolerance {
+		t.Errorf("rnd=1: Next() = %v, want close to %v (±%v)", d1, expectedMax, tolerance)
+	}
 }
 
 func TestBackoffResetReturnsToBase(t *testing.T) {

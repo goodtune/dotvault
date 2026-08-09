@@ -362,13 +362,15 @@ func (r *ManagedRemote) run(ctx context.Context) {
 
 		slog.Debug("sshfwd: connecting to remote", "host", r.cfg.Host)
 
-		signers, err := r.deps.Signers()
+		signers, user, err := r.resolveIdentity(ctx)
 		if err != nil {
-			r.fail(ctx, err)
-			continue
-		}
-		user, err := r.deps.User()
-		if err != nil {
+			if ctx.Err() != nil {
+				// Shutdown while identity resolution was still in flight. The
+				// loop condition would exit next anyway; returning here avoids
+				// logging a connect failure and recording a failure metric for
+				// a teardown nobody asked to see counted.
+				return
+			}
 			r.fail(ctx, err)
 			continue
 		}
@@ -382,6 +384,12 @@ func (r *ManagedRemote) run(ctx context.Context) {
 			Timeout: DefaultDialTimeout,
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				// Cancelled mid-dial — Dial reports the cancellation directly.
+				// Same reasoning as the identity branch above: a requested
+				// teardown is not a connect failure.
+				return
+			}
 			r.fail(ctx, err)
 			continue
 		}
@@ -394,6 +402,51 @@ func (r *ManagedRemote) run(ctx context.Context) {
 		}
 
 		r.serveConnected(ctx, client, socket)
+	}
+}
+
+// identityResult carries one bounded identity resolution's outcome across the
+// goroutine boundary resolveIdentity puts it behind.
+type identityResult struct {
+	signers []ssh.Signer
+	user    string
+	err     error
+}
+
+// resolveIdentity resolves this attempt's signers and username, returning
+// early if ctx is cancelled while the resolution is still in flight.
+//
+// The bound is load-bearing at shutdown. Deps.Signers is wired to
+// sshfwd.Signers over the SSH agent backend, whose List() resolves identities
+// under a hardcoded context.Background() (internal/agent/backend.go) — so a
+// Vault KV listing it triggers is not cancellable and runs to the Vault
+// client's own timeout. Calling it inline meant stop()'s wg.Wait() sat behind
+// that timeout, making Ctrl-C take tens of seconds and then log a
+// `context deadline exceeded` listing error against a daemon already on its
+// way out. Deps.User is resolved on the same goroutine because it is the same
+// per-attempt identity resolution and shares the same exposure.
+//
+// The result channel is buffered, mirroring keepaliveOnce (dial.go): the
+// resolution goroutine can always deliver its outcome and exit even after this
+// call has returned via the cancellation branch, so it cannot leak. The value
+// it delivers is simply discarded — the process is shutting down.
+func (r *ManagedRemote) resolveIdentity(ctx context.Context) ([]ssh.Signer, string, error) {
+	res := make(chan identityResult, 1)
+	go func() {
+		signers, err := r.deps.Signers()
+		if err != nil {
+			res <- identityResult{err: err}
+			return
+		}
+		user, err := r.deps.User()
+		res <- identityResult{signers: signers, user: user, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	case out := <-res:
+		return out.signers, out.user, out.err
 	}
 }
 

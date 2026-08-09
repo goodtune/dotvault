@@ -209,6 +209,14 @@ func (m *Manager) Status() []RemoteStatus {
 // is not reusable after Close: a subsequent Reconcile is rejected rather than
 // resurrecting remotes into a manager whose owner has already been told
 // shutdown is complete.
+//
+// The remotes are stopped concurrently, not one after another. Each stop() is
+// independent — it cancels that remote's own context and waits on that
+// remote's own WaitGroup — so serialising them made shutdown cost the sum of
+// every remote's teardown when it need only cost the slowest one. That is
+// visible on any real machine with more than one configured remote, since a
+// teardown is never instant (an in-flight dial, an identity resolution, a
+// connection's forwarding goroutines winding down).
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
@@ -219,7 +227,13 @@ func (m *Manager) Close() {
 	}
 	m.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, mr := range remotes {
-		mr.stop()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mr.stop()
+		}()
 	}
+	wg.Wait()
 }

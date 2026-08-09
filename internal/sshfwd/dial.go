@@ -89,9 +89,43 @@ func Dial(ctx context.Context, c DialConfig) (*ssh.Client, error) {
 		_ = conn.SetDeadline(time.Now().Add(timeout))
 	}
 
+	// ssh.NewClientConn takes no context and blocks for the whole handshake, so
+	// ctx cancellation would otherwise only be *noticed* after it returned —
+	// bounded by the conn deadline set above, i.e. up to Timeout (20s). That is
+	// not hypothetical at shutdown: against a host that accepts the TCP
+	// connection but never completes the handshake (a wedged sshd, a
+	// black-holed route — the same failure Keepalive exists to catch), the run
+	// loop spends most of its time right here, so a Ctrl-C lands inside the
+	// handshake and stop() waits the full dial timeout out.
+	//
+	// Closing the underlying conn is what actually interrupts it; net.Conn is
+	// safe to Close concurrently with the reads NewClientConn is performing.
+	// The watcher is torn down as this function returns, so a cancellation
+	// arriving after a successful dial does not touch the returned client — its
+	// lifetime belongs to the caller from that point on. A cancel racing a
+	// just-completed handshake may close a conn that is about to be returned;
+	// that is benign, since the caller's ctx is dead and its very next act is
+	// to abandon the connection anyway.
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-handshakeDone:
+		}
+	}()
+
 	sc, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 	if err != nil {
 		conn.Close()
+		// A handshake the watcher above aborted reports whatever the closed
+		// conn produced ("use of closed network connection"), which is not a
+		// useful classification. Report the cancellation itself so the caller
+		// can tell a shutdown from a genuine handshake failure.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if errors.Is(err, ErrHostKeyUnknown) {
 			return nil, err
 		}

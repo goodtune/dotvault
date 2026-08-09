@@ -139,6 +139,91 @@ func TestSSHListRendersDaemonState(t *testing.T) {
 	}
 }
 
+// TestSSHListRendersEmptyLiveTable covers the "ssh" key present but empty
+// case: a daemon that does have managed forwards wired up, with zero
+// remotes configured. This must print just the header row like a genuine
+// empty registry — not fall back to ssh.yaml, and not be confused with the
+// "ssh" key being absent entirely (TestSSHListFallsBackWhenSSHNotConfigured
+// below).
+func TestSSHListRendersEmptyLiveTable(t *testing.T) {
+	sock := shortSocketPath(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ssh": []}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHListCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetContext(context.Background())
+	if err := runSSHList(cmd, nil); err != nil {
+		t.Fatalf("runSSHList: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "HOST") {
+		t.Errorf("output = %q, want just the header row for a live, empty registry", out.String())
+	}
+}
+
+// TestSSHListFallsBackWhenSSHNotConfigured covers the "ssh" key absent
+// case: the daemon is reachable but its status response omits "ssh"
+// entirely (agent disabled, or the status query never wired up). This must
+// fall back to ssh.yaml — reporting the user's actual configured remotes as
+// "unavailable" rather than an empty table that hides them — and explain
+// why, since the daemon already told us as much by omitting the key.
+func TestSSHListFallsBackWhenSSHNotConfigured(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+
+	sshPath, err := paths.SSHConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &sshfwd.File{Remotes: []sshfwd.Remote{
+		{Host: "unconfigured-agent.example.com", Port: 22, RemoteSocket: sshfwd.DefaultRemoteSocket},
+	}}
+	if err := sshfwd.Save(sshPath, f); err != nil {
+		t.Fatal(err)
+	}
+
+	sock := shortSocketPath(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// No "ssh" key at all — the daemon reports other status fields but
+		// nothing about managed forwards.
+		_, _ = w.Write([]byte(`{"authenticated": true}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHListCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetContext(context.Background())
+	if err := runSSHList(cmd, nil); err != nil {
+		t.Fatalf("runSSHList: %v, want a fallback to ssh.yaml instead of an error", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "unconfigured-agent.example.com") {
+		t.Errorf("output = %q, want the host read from ssh.yaml even though the daemon is reachable", got)
+	}
+	if !strings.Contains(got, "unavailable") {
+		t.Errorf("output = %q, want \"unavailable\" in the STATUS column", got)
+	}
+	if !strings.Contains(got, "not configured on this daemon") {
+		t.Errorf("output = %q, want an explanation that managed forwards aren't configured, not a bare fallback", got)
+	}
+}
+
 func TestSSHListDegradesWhenDaemonDown(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

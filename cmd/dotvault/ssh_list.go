@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,15 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
+
+// errSSHNotConfigured is returned by sshFetchLiveRows when the daemon's
+// status response omits the "ssh" key entirely, meaning managed forwards
+// are not wired up on this daemon (the SSH agent surface is disabled, or
+// no status query was ever registered — see Server.sshStatusSnapshot).
+// This is distinct from a registry that is live but empty ([]), which
+// must render as an empty table, not a fallback. Distinguishing the two
+// requires reading presence, not just length, out of the JSON body.
+var errSSHNotConfigured = errors.New("managed SSH forwards are not configured on this daemon")
 
 // sshListRow is one line of `dotvault ssh list` output, sourced either from
 // the daemon's live status (the common path) or, when the daemon cannot be
@@ -62,6 +72,12 @@ func runSSHList(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("dotvault daemon unreachable (%v); local ssh.yaml fallback also failed: %w", liveErr, ferr)
 		}
 		rows = fallback
+		// The daemon is reachable but doesn't know about managed forwards
+		// at all (as opposed to a transport failure) — say so, since the
+		// daemon already told us as much by omitting the "ssh" key.
+		if errors.Is(liveErr, errSSHNotConfigured) {
+			fmt.Fprintln(cmd.OutOrStdout(), "managed SSH forwards are not configured on this daemon; listing ssh.yaml directly")
+		}
 	}
 
 	printSSHTable(cmd.OutOrStdout(), rows)
@@ -87,15 +103,23 @@ func sshFetchLiveRows(cmd *cobra.Command, cfg *config.Config) ([]sshListRow, err
 		return nil, fmt.Errorf("dotvault daemon: %s", sshAPIErrorMessage(status, body))
 	}
 
+	// SSH is a pointer to a slice, not a plain slice, so a JSON body that
+	// omits the key entirely (envelope.SSH == nil) can be told apart from
+	// one that includes it as an empty array (envelope.SSH != nil, len 0) —
+	// the former means managed forwards aren't configured on this daemon,
+	// the latter means they are and there's simply nothing there yet.
 	var envelope struct {
-		SSH []sshfwd.RemoteStatus `json:"ssh"`
+		SSH *[]sshfwd.RemoteStatus `json:"ssh"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil, fmt.Errorf("dotvault daemon: decode status response: %w", err)
 	}
+	if envelope.SSH == nil {
+		return nil, errSSHNotConfigured
+	}
 
-	rows := make([]sshListRow, len(envelope.SSH))
-	for i, st := range envelope.SSH {
+	rows := make([]sshListRow, len(*envelope.SSH))
+	for i, st := range *envelope.SSH {
 		rows[i] = sshListRow{
 			Host:         st.Host,
 			Status:       st.State,

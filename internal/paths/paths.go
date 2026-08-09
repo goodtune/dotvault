@@ -138,6 +138,52 @@ func ExpandHome(path string) (string, error) {
 	return path, nil
 }
 
+// UserConfigDir returns the per-user configuration directory for dotvault.
+//
+// This is deliberately distinct from SystemConfigPath's directory. The system
+// config is admin-owned (root on Linux, %ProgramData% on Windows, and on a GPO
+// machine superseded entirely by HKLM policy), and dotvault deliberately does
+// not read user-writable policy. Files here are the opposite: owned by the
+// user, never consulted for policy, and never resolved from a system location.
+//
+// On Linux this is the same directory the packaged systemd unit already uses
+// for its per-user EnvironmentFile (~/.config/dotvault/env).
+func UserConfigDir() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		return filepath.Join(home, "Library", "Application Support", "dotvault"), nil
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return filepath.Join(appData, "dotvault"), nil
+		}
+		return "", fmt.Errorf("APPDATA is not set")
+	default:
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			return filepath.Join(xdg, "dotvault"), nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		return filepath.Join(home, ".config", "dotvault"), nil
+	}
+}
+
+// SSHConfigPath returns the path to the user-level managed-SSH-forward
+// configuration (ssh.yaml). It is a sibling of the per-user env file and is
+// never resolved from a system location — see UserConfigDir.
+func SSHConfigPath() (string, error) {
+	dir, err := UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ssh.yaml"), nil
+}
+
 // ValidateLoopback checks that addr (host:port) resolves to a loopback address.
 func ValidateLoopback(addr string) error {
 	host, _, err := net.SplitHostPort(addr)

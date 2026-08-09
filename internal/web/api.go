@@ -87,6 +87,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Managed SSH forward state (per-remote connection condition), parallel
+	// to the per-rule sync state above. Not secret — a host key fingerprint
+	// and a socket path are not credentials — so served unauthenticated
+	// like the rest of this block.
+	if s.sshStatus != nil {
+		status["ssh"] = s.sshStatus()
+	}
+
 	writeJSON(w, status)
 }
 

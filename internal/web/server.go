@@ -25,6 +25,7 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -148,6 +149,15 @@ type Server struct {
 	// so only one write runs at a time.
 	clipboardMu sync.Mutex
 
+	// sshRegistry is the single service layer through which the SSH CRUD
+	// endpoints mutate ssh.yaml. Nil when managed forwards are not
+	// configured, in which case the four handlers return 503 rather than
+	// panic.
+	sshRegistry *sshfwd.Registry
+	// sshStatus, when non-nil, reports the live condition of every managed
+	// remote for /api/v1/status's "ssh" block.
+	sshStatus func() []sshfwd.RemoteStatus
+
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
 	// a borrowing client is told "not authenticated" rather than handed a
@@ -224,6 +234,13 @@ type ServerConfig struct {
 	// endpoint writes to this host's clipboard (tests inject a fake). Nil
 	// selects the real clipboard.Set.
 	SetClipboard clipboard.Setter
+	// SSHRegistry, when non-nil, backs the /api/v1/ssh/remotes CRUD
+	// endpoints. Nil (managed forwards not configured) makes those
+	// endpoints return 503.
+	SSHRegistry *sshfwd.Registry
+	// SSHStatus, when non-nil, reports the live condition of every managed
+	// remote for /api/v1/status's "ssh" block.
+	SSHStatus func() []sshfwd.RemoteStatus
 }
 
 // NewServer creates a new web server.
@@ -285,6 +302,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		openBrowser:        sc.OpenBrowser,
 		sendNotification:   sc.SendNotification,
 		setClipboard:       sc.SetClipboard,
+		sshRegistry:        sc.SSHRegistry,
+		sshStatus:          sc.SSHStatus,
 	}
 	if s.openBrowser == nil {
 		s.openBrowser = browser.OpenURL
@@ -410,6 +429,14 @@ func (s *Server) registerAPIRoutes() {
 	s.mux.HandleFunc("POST /api/v1/remote/notify", s.handleRemoteNotify)
 	// Third peer action, same posture again (see handleRemoteClipboard).
 	s.mux.HandleFunc("POST /api/v1/remote/clipboard", s.handleRemoteClipboard)
+
+	// Managed SSH forward CRUD — ordinary CSRF protection, not the
+	// peer-action Origin-check exemption above (see ssh.go's header
+	// comment for why).
+	s.mux.HandleFunc("GET /api/v1/ssh/remotes", s.handleSSHList)
+	s.mux.HandleFunc("POST /api/v1/ssh/remotes", s.requireCSRF(s.handleSSHAdd))
+	s.mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", s.requireCSRF(s.handleSSHPatch))
+	s.mux.HandleFunc("DELETE /api/v1/ssh/remotes/{host}", s.requireCSRF(s.handleSSHDelete))
 }
 
 // Start begins serving HTTP on every configured listener. It signals

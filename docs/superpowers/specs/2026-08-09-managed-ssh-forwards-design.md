@@ -24,7 +24,7 @@ Explicitly **not** in scope: local forwards (`direct-streamlocal`, local TCP lis
 
 Two, and both are hard:
 
-- **`web.enabled`** — the forward's target is the web listener. Without it there is nothing on the other end of the socket, and `GET /api/v1/token` and the peer actions are the entire point.
+- **A local API surface** — `api.enabled` (a per-user Unix socket, owner-only, Unix hosts) or `web.enabled` (the loopback TCP listener). The forward's target is dotvault's own web API; without one there is nothing on the other end of the socket, and `GET /api/v1/token` and the peer actions are the entire point. When both are present the **API socket is preferred**: it is 0600 in a 0700 directory, whereas the TCP listener is reachable by every uid on the box.
 - **`agent.enabled`** with at least one usable key source — the SSH identity comes from the agent backend.
 
 Neither is fatal to the daemon. A configured remote whose preconditions are unmet resolves to a terminal `disabled` state carrying the reason, in the same spirit as the agent's `errSource` and the enrolment picker's `error: …` rows.
@@ -46,7 +46,7 @@ web/CLI mutation ────┘             │
                                    │
                                    └── forward supervisor
                                          client.ListenUnix(remoteSocket)
-                                         accept ──► dial web.listen ──► pump
+                                         accept ──► dial local API ──► pump
 ```
 
 Reconciliation is deliberately isolated from every trigger that can cause it, so startup, the config tick, an API mutation, and a test all enter through the same door.
@@ -130,6 +130,8 @@ Storing `~` rather than resolving it at `add` time keeps the entry portable if t
 
 This falls out of two facts rather than being a preference. The identity lives in the daemon's agent backend, so the CLI cannot perform the verifying login on its own without standing up a second Vault client and a second cert source. And a single writer removes the CLI-versus-daemon write race outright — no advisory lock, no lost-update window, no second serialization path to keep consistent.
 
+The CLI reaches the daemon over the same surface the forward targets: the API socket when `api.enabled` (reusing `auth.PeerSocketClient`, which already dials a Unix socket over an `http.Transport` and sends `Host: localhost`), else the loopback web listener. On Windows only the latter exists today, so `dotvault ssh add` there requires `web.enabled` — worth stating in the docs, since Windows is the likely workstation.
+
 Consequences, stated plainly:
 
 - `dotvault ssh add` / `remove` require a running daemon and fail with a clear "dotvault daemon is not running" otherwise. This is honest: without the daemon the operation cannot be verified, and an unverified entry is what the next section exists to prevent.
@@ -200,7 +202,7 @@ States surfaced to the CLI and UI: `connecting`, `connected`, `reconnecting`, `o
 
 **Keepalives** are SSH-level, not TCP: `keepalive@openssh.com` via `SendRequest` with `wantReply` every 15 s, three consecutive failures invalidating the client. TCP keepalive alone does not detect a wedged `sshd`, and a laptop resuming from sleep needs the failure surfaced in seconds rather than after the OS TCP timeout.
 
-**Forwarding.** On `CONNECTED` the remote calls `client.ListenUnix(path)` and serves an accept loop, dialling `web.listen` per accepted connection and copying both directions with half-close where the transport supports it. Because `x/crypto/ssh` does not unlink a stale socket and `sshd` will not bind over one, a bind failure triggers **one** `rm -f <path>` over an exec channel and a single retry. Bind-first is the ordering that matters: unlinking pre-emptively would destroy a live socket belonging to a real `ssh -R` session the user is currently using.
+**Forwarding.** On `CONNECTED` the remote calls `client.ListenUnix(path)` and serves an accept loop, dialling the local API surface per accepted connection — the API socket when `api.enabled`, else `web.listen` — and copying both directions with half-close where the transport supports it. Because `x/crypto/ssh` does not unlink a stale socket and `sshd` will not bind over one, a bind failure triggers **one** `rm -f <path>` over an exec channel and a single retry. Bind-first is the ordering that matters: unlinking pre-emptively would destroy a live socket belonging to a real `ssh -R` session the user is currently using.
 
 **Concurrency.** Forwarding goroutines never own or mutate the client. The connection manager holds the current `*ssh.Client`; handlers ask for it through `remote.WaitForClient(ctx)`, which blocks up to a 10 s grace period while a reconnect is in flight rather than failing a connection that arrives during a Wi-Fi handover. Session-manager internals are not exposed.
 
@@ -216,7 +218,7 @@ States surfaced to the CLI and UI: `connecting`, `connected`, `reconnecting`, `o
         "host": "foo.example.com",
         "state": "connected",
         "remote_socket": "/home/me/.ssh/dotvault.sock",
-        "target": "127.0.0.1:9000",
+        "target": "unix:/run/user/1000/dotvault/api.sock",
         "connected_since": "2026-08-09T12:00:00+10:00",
         "reconnects": 2,
         "active_connections": 1,
@@ -241,8 +243,8 @@ dotvault ssh remove <host>
 
 ```
 HOST                 STATUS         REMOTE SOCKET                    TARGET
-foo.example.com      connected      /home/me/.ssh/dotvault.sock      127.0.0.1:9000
-bar.example.com      reconnecting   /home/me/.ssh/dotvault.sock      127.0.0.1:9000
+foo.example.com      connected      /home/me/.ssh/dotvault.sock      unix:…/api.sock
+bar.example.com      reconnecting   /home/me/.ssh/dotvault.sock      unix:…/api.sock
 baz.example.com      host-key-error /home/me/.ssh/dotvault.sock      —
 ```
 

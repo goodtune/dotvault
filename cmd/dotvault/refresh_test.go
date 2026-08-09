@@ -662,7 +662,7 @@ func TestRunConfigRefreshAppliesSSHConfigDynamically(t *testing.T) {
 	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
 	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
 
-	sshMgr := sshfwd.NewManager(sshfwd.Deps{})
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
 	t.Cleanup(sshMgr.Close)
 	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
 	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
@@ -735,7 +735,7 @@ func TestRunConfigRefreshAppliesSSHConfigDynamically(t *testing.T) {
 func TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit(t *testing.T) {
 	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
 
-	sshMgr := sshfwd.NewManager(sshfwd.Deps{})
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
 	t.Cleanup(sshMgr.Close)
 	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
 
@@ -825,7 +825,7 @@ func TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit(t *testing.T) {
 func TestRunConfigRefreshSSHResyncSerializedAgainstRegistryMutation(t *testing.T) {
 	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
 
-	sshMgr := sshfwd.NewManager(sshfwd.Deps{})
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
 	t.Cleanup(sshMgr.Close)
 	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
 

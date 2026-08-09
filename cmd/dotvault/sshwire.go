@@ -170,7 +170,7 @@ func startSSHForwards(ctx context.Context, cfg *config.Config, backend sshfwd.Si
 		return nil, nil, ""
 	}
 
-	mgr = sshfwd.NewManager(deps)
+	mgr = sshfwd.NewManager(ctx, deps)
 	if err := mgr.Reconcile(ctx, file.Remotes); err != nil {
 		mgr.Close()
 		slog.Warn("managed SSH forwards disabled: initial reconcile failed", "error", err)

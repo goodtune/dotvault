@@ -64,7 +64,7 @@ func testHostKey(t *testing.T) (key, fingerprint string) {
 // file-mutation and confirmation-gate behaviour, not real connections.
 func newSSHRegistry(t *testing.T, v sshfwd.Verifier) *sshfwd.Registry {
 	t.Helper()
-	mgr := sshfwd.NewManager(sshfwd.Deps{})
+	mgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
 	t.Cleanup(mgr.Close)
 	path := filepath.Join(t.TempDir(), "ssh.yaml")
 	return sshfwd.NewRegistry(path, mgr, v)

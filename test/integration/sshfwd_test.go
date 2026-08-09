@@ -440,7 +440,7 @@ func TestForwardReconnectsAfterTransportLoss(t *testing.T) {
 	remoteSocket := fmt.Sprintf("~/.ssh/dv-test-%s.sock", randSuffix(t))
 	remote := sshfwd.Remote{Host: "127.0.0.1", Port: 2222, RemoteSocket: remoteSocket}
 
-	mgr := sshfwd.NewManager(testDeps(t, targetSocket))
+	mgr := sshfwd.NewManager(context.Background(), testDeps(t, targetSocket))
 	t.Cleanup(mgr.Close)
 
 	poller := startStatePoller(mgr, remote.Host)
@@ -569,7 +569,7 @@ func TestVerifyRefusesWhenForwardingDisabled(t *testing.T) {
 		User:    func() (string, error) { return sshdUser, nil },
 		Policy:  insecurePolicy,
 	}
-	mgr := sshfwd.NewManager(deps)
+	mgr := sshfwd.NewManager(context.Background(), deps)
 	t.Cleanup(mgr.Close)
 
 	dir := shortTempDir(t)
@@ -624,7 +624,7 @@ func TestVerifyReturnsFingerprintForUnknownHost(t *testing.T) {
 
 	dir := shortTempDir(t)
 	sshYAML := filepath.Join(dir, "ssh.yaml")
-	mgr := sshfwd.NewManager(deps)
+	mgr := sshfwd.NewManager(context.Background(), deps)
 	t.Cleanup(mgr.Close)
 	registry := sshfwd.NewRegistry(sshYAML, mgr, v)
 

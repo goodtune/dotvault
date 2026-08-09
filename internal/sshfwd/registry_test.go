@@ -94,7 +94,7 @@ func testHostKey(t *testing.T) (key, fingerprint string) {
 func newTestRegistry(t *testing.T, v Verifier) (*Registry, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ssh.yaml")
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = func(string) func(context.Context) {
 		return func(ctx context.Context) { <-ctx.Done() }
 	}

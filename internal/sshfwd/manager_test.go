@@ -13,7 +13,7 @@ import (
 func stubManager(t *testing.T) (*Manager, *runRecorder) {
 	t.Helper()
 	rec := &runRecorder{started: map[string]int{}, stopped: map[string]int{}}
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = rec.runner
 	t.Cleanup(m.Close)
 	return m, rec
@@ -281,7 +281,7 @@ func (r *exclusiveResource) waitStarts(t *testing.T, want int) {
 // forced it to fully exit (and release the resource) first.
 func TestReconcileStopsOldInstanceBeforeStartingReplacement(t *testing.T) {
 	res := &exclusiveResource{}
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = res.runner
 	t.Cleanup(m.Close)
 	ctx := context.Background()
@@ -340,7 +340,7 @@ func TestReconcileRejectsInvalidRemote(t *testing.T) {
 
 func TestCloseStopsEverything(t *testing.T) {
 	rec := &runRecorder{started: map[string]int{}, stopped: map[string]int{}}
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = rec.runner
 
 	if err := m.Reconcile(context.Background(), []Remote{remote("a.example.com"), remote("b.example.com")}); err != nil {
@@ -357,7 +357,7 @@ func TestCloseStopsEverything(t *testing.T) {
 // stop again.
 func TestReconcileAfterCloseIsRejected(t *testing.T) {
 	rec := &runRecorder{started: map[string]int{}, stopped: map[string]int{}}
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = rec.runner
 
 	if err := m.Reconcile(context.Background(), []Remote{remote("foo.example.com")}); err != nil {
@@ -446,7 +446,7 @@ func TestStatusIsOrderedByHost(t *testing.T) {
 // concurrent Close, must not race (run under -race) or panic.
 func TestReconcileConcurrentWithItselfAndClose(t *testing.T) {
 	rec := &runRecorder{started: map[string]int{}, stopped: map[string]int{}}
-	m := NewManager(Deps{})
+	m := NewManager(context.Background(), Deps{})
 	m.newRunner = rec.runner
 	ctx := context.Background()
 
@@ -483,4 +483,43 @@ func TestReconcileConcurrentWithItselfAndClose(t *testing.T) {
 		t.Error("Reconcile() after a concurrent Close settled succeeded; want it rejected")
 	}
 	m.Close() // idempotent; must not panic or deadlock a second time
+}
+
+// TestReconcileRunnersOutliveCallerContext is the regression test for the
+// API-mutation blocker: Registry.Add/Patch/Remove reconcile under the HTTP
+// request's context, which Go cancels as soon as the handler returns. When
+// runner lifetimes were derived from that context, every remote a
+// `dotvault ssh add` started died immediately — and stayed dead, because the
+// entry remained in m.remotes with cfg.sameAs matching, so every later
+// Reconcile saw it as unchanged and never restarted it.
+//
+// Both halves matter: the runner must still be alive after the caller's
+// context is cancelled, AND a subsequent Reconcile with the same desired set
+// must not restart it (proving it was never stopped, rather than silently
+// resurrected).
+func TestReconcileRunnersOutliveCallerContext(t *testing.T) {
+	m, rec := stubManager(t)
+
+	callerCtx, cancel := context.WithCancel(context.Background())
+	if err := m.Reconcile(callerCtx, []Remote{remote("foo.example.com")}); err != nil {
+		t.Fatalf("Reconcile() = %v", err)
+	}
+	rec.waitStarted(t, "foo.example.com", 1)
+	cancel()
+
+	// Give a wrongly-parented runner ample time to observe the cancellation
+	// and record its stop. A fixed wait is acceptable here because the
+	// assertion is a negative one: any non-zero value is a failure, and a
+	// longer wait can only make a real defect more likely to be caught.
+	time.Sleep(200 * time.Millisecond)
+	if started, stopped := rec.counts("foo.example.com"); stopped != 0 {
+		t.Fatalf("runner died with the caller's context: started=%d stopped=%d, want stopped=0", started, stopped)
+	}
+
+	if err := m.Reconcile(context.Background(), []Remote{remote("foo.example.com")}); err != nil {
+		t.Fatalf("second Reconcile() = %v", err)
+	}
+	if started, stopped := rec.counts("foo.example.com"); started != 1 || stopped != 0 {
+		t.Errorf("unchanged remote restarted after the caller's context was cancelled: started=%d stopped=%d, want 1/0", started, stopped)
+	}
 }

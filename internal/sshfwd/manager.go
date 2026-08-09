@@ -35,6 +35,18 @@ type Deps struct {
 type Manager struct {
 	deps Deps
 
+	// base is the lifetime every runner's context derives from. It is
+	// captured once, at construction, and is deliberately NOT the context a
+	// caller passes to Reconcile: an API mutation reconciles under the HTTP
+	// request's context, which Go cancels the moment the handler returns, so
+	// deriving runner lifetimes from it killed every remote a `dotvault ssh
+	// add` (or web add) started — permanently, because the entry stayed in
+	// m.remotes with cfg.sameAs matching and every later Reconcile therefore
+	// saw it as unchanged and never restarted it. The daemon's own context is
+	// the correct parent: shutdown still stops everything, and no shorter-lived
+	// caller can truncate a connection that is meant to outlive its request.
+	base context.Context
+
 	mu      sync.Mutex
 	remotes map[string]*ManagedRemote
 	closed  bool
@@ -44,9 +56,16 @@ type Manager struct {
 	newRunner func(host string) func(context.Context)
 }
 
-// NewManager returns a Manager with no remotes running.
-func NewManager(d Deps) *Manager {
-	m := &Manager{deps: d, remotes: map[string]*ManagedRemote{}}
+// NewManager returns a Manager with no remotes running. base is the lifetime
+// every managed connection is bound to — pass the daemon's context, not a
+// per-request one; see Manager.base. A nil base is treated as
+// context.Background(), so a Manager built without one never starts a runner
+// under an already-cancelled context.
+func NewManager(base context.Context, d Deps) *Manager {
+	if base == nil {
+		base = context.Background()
+	}
+	m := &Manager{deps: d, base: base, remotes: map[string]*ManagedRemote{}}
 	return m
 }
 
@@ -59,6 +78,12 @@ func normalizeHost(host string) string { return strings.ToLower(host) }
 // running untouched, new ones start, removed ones stop, changed ones restart.
 // A disabled entry is treated as removed but retains a status row so the user
 // can see it is configured-but-off rather than missing.
+//
+// ctx bounds Reconcile's own work only — it is NOT the lifetime of the
+// connections it starts. Those derive from the Manager's base context (see
+// Manager.base), so an API mutation reconciling under an HTTP request context
+// does not hand every remote it starts a lifetime that ends when the handler
+// returns.
 //
 // Safe to call concurrently with itself, with Status, and with Close: a
 // Reconcile that arrives after Close has run is rejected outright rather than
@@ -160,7 +185,7 @@ func (m *Manager) Reconcile(ctx context.Context, remotes []Remote) error {
 		if m.newRunner != nil {
 			run = m.newRunner(r.Host)
 		}
-		mr.start(ctx, run)
+		mr.start(m.base, run)
 		m.remotes[key] = mr
 	}
 	return nil

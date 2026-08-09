@@ -166,7 +166,7 @@ func TestRegistryAddPromptsForConfirmationAgainstLiveVerifier(t *testing.T) {
 		User:    func() (string, error) { return "test", nil },
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
 	}
-	mgr := NewManager(deps)
+	mgr := NewManager(context.Background(), deps)
 	t.Cleanup(mgr.Close)
 	reg := NewRegistry(t.TempDir()+"/ssh.yaml", mgr, NewVerifier(deps))
 

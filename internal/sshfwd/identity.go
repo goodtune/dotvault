@@ -6,8 +6,6 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
-
-	dvagent "github.com/goodtune/dotvault/internal/agent"
 )
 
 // SignerSource is the slice of agent.ExtendedAgent the forwarder needs.
@@ -99,7 +97,3 @@ type ErrUnsupportedAlgorithm struct {
 func (e *ErrUnsupportedAlgorithm) Error() string {
 	return fmt.Sprintf("unsupported signature algorithm %q for key type %q", e.algorithm, e.keyType)
 }
-
-// Compile-time proof the daemon's real backend satisfies SignerSource, so a
-// change to either side breaks the build rather than the daemon at runtime.
-var _ SignerSource = (*dvagent.Backend)(nil)

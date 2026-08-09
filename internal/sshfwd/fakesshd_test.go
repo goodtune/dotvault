@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -50,8 +51,10 @@ type fakeSSHDConfig struct {
 	// sawExec is incremented, if non-nil, for every "exec" request this
 	// connection serves — used to assert that a caller's flow never runs a
 	// remote command it has no business running (e.g. Verify's contract 5:
-	// no stale-socket rm -f on a bind failure).
-	sawExec *int
+	// no stale-socket rm -f on a bind failure). It is atomic because the
+	// increment happens on a server goroutine and the assertion on the test
+	// goroutine.
+	sawExec *atomic.Int64
 }
 
 // serveFakeSSHDConn serves one accepted connection as an in-memory sshd
@@ -126,7 +129,7 @@ func serveFakeSSHDConn(conn net.Conn, cfg fakeSSHDConfig) {
 				for r := range chReqs {
 					if r.Type == "exec" {
 						if cfg.sawExec != nil {
-							*cfg.sawExec++
+							cfg.sawExec.Add(1)
 						}
 						if r.WantReply {
 							r.Reply(true, nil)

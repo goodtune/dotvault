@@ -386,7 +386,7 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 // TestVerifierBindFailureDiagnosticNeverMutatesRemote below covers that one
 // specifically, since it used to reach a mutating fallback).
 func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
-	var execCount int
+	var execCount atomic.Int64
 	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
 		home:                     "/home/test",
 		refuseStreamlocalForward: true,
@@ -406,8 +406,8 @@ func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
-	if execCount != 1 {
-		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount)
+	if execCount.Load() != 1 {
+		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount.Load())
 	}
 }
 
@@ -468,7 +468,7 @@ func TestVerifierSkipsBindProofWhenRequested(t *testing.T) {
 // something on the real path. Only then does directStreamLocalWorks reach
 // its own cleanup and attempt the rm -f this test asserts never happens.
 func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
-	var execCount int
+	var execCount atomic.Int64
 	var directCalls int32
 	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
 		home: "/home/test",
@@ -509,7 +509,7 @@ func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
-	if execCount != 1 {
-		t.Errorf("saw %d exec requests after a ConnectionFailed bind diagnostic, want exactly 1 (the $HOME probe); the old liveListenerAt fallback would bind a scratch socket and rm -f it here", execCount)
+	if execCount.Load() != 1 {
+		t.Errorf("saw %d exec requests after a ConnectionFailed bind diagnostic, want exactly 1 (the $HOME probe); the old liveListenerAt fallback would bind a scratch socket and rm -f it here", execCount.Load())
 	}
 }

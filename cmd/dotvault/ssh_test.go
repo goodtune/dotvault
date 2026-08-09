@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -209,14 +210,18 @@ func TestSSHListDegradesWhenDaemonDownAndNoSSHYAML(t *testing.T) {
 func TestSSHAddPromptsOnFingerprint409(t *testing.T) {
 	sock := shortSocketPath(t)
 	mux := http.NewServeMux()
-	var posts int
-	var lastAcceptFingerprint string
+	// Both counters are written from the fake daemon's handler goroutine and
+	// read from the test goroutine, so they are atomic rather than plain
+	// values.
+	var posts atomic.Int64
+	var lastAcceptFingerprint atomic.Value
+	lastAcceptFingerprint.Store("")
 	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
 	mux.HandleFunc("POST /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
-		posts++
+		posts.Add(1)
 		var req sshAddRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		lastAcceptFingerprint = req.AcceptFingerprint
+		lastAcceptFingerprint.Store(req.AcceptFingerprint)
 		w.Header().Set("Content-Type", "application/json")
 		if req.AcceptFingerprint == "" {
 			w.WriteHeader(http.StatusConflict)
@@ -240,11 +245,11 @@ func TestSSHAddPromptsOnFingerprint409(t *testing.T) {
 		t.Fatalf("runSSHAdd: %v", err)
 	}
 
-	if posts != 2 {
-		t.Fatalf("daemon received %d POSTs, want 2 (initial + fingerprint-confirmed re-POST)", posts)
+	if posts.Load() != 2 {
+		t.Fatalf("daemon received %d POSTs, want 2 (initial + fingerprint-confirmed re-POST)", posts.Load())
 	}
-	if lastAcceptFingerprint != "SHA256:abc123" {
-		t.Errorf("re-POST accept_fingerprint = %q, want the echoed fingerprint", lastAcceptFingerprint)
+	if got := lastAcceptFingerprint.Load().(string); got != "SHA256:abc123" {
+		t.Errorf("re-POST accept_fingerprint = %q, want the echoed fingerprint", got)
 	}
 	if !strings.Contains(errOut.String(), "SHA256:abc123") {
 		t.Errorf("stderr = %q, want the fingerprint printed for the user to see", errOut.String())
@@ -254,10 +259,10 @@ func TestSSHAddPromptsOnFingerprint409(t *testing.T) {
 func TestSSHAddNonTTYRequiresAcceptFlag(t *testing.T) {
 	sock := shortSocketPath(t)
 	mux := http.NewServeMux()
-	var posts int
+	var posts atomic.Int64
 	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
 	mux.HandleFunc("POST /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
-		posts++
+		posts.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"host":"new.example.com","fingerprint":"SHA256:abc123"}`))
@@ -276,8 +281,8 @@ func TestSSHAddNonTTYRequiresAcceptFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("runSSHAdd() = nil, want an error: a 409 on a non-interactive session without --accept-host-key must not succeed")
 	}
-	if posts != 1 {
-		t.Errorf("daemon received %d POSTs, want exactly 1 (no blind re-POST)", posts)
+	if posts.Load() != 1 {
+		t.Errorf("daemon received %d POSTs, want exactly 1 (no blind re-POST)", posts.Load())
 	}
 }
 
@@ -294,14 +299,14 @@ func withInteractiveSSHAdd(t *testing.T) {
 // newSSHAddFingerprintServer starts a fake daemon that returns 409 until a
 // POST arrives with accept_fingerprint == "SHA256:abc123", then 201. It
 // reports the number of POSTs received.
-func newSSHAddFingerprintServer(t *testing.T) (sock string, posts *int) {
+func newSSHAddFingerprintServer(t *testing.T) (sock string, posts *atomic.Int64) {
 	t.Helper()
 	sock = shortSocketPath(t)
-	posts = new(int)
+	posts = new(atomic.Int64)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
 	mux.HandleFunc("POST /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
-		*posts++
+		posts.Add(1)
 		var req sshAddRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
@@ -337,8 +342,8 @@ func TestSSHAddInteractiveAccepts(t *testing.T) {
 				t.Fatalf("runSSHAdd: %v", err)
 			}
 
-			if *posts != 2 {
-				t.Fatalf("daemon received %d POSTs, want 2 (initial + confirmed re-POST)", *posts)
+			if posts.Load() != 2 {
+				t.Fatalf("daemon received %d POSTs, want 2 (initial + confirmed re-POST)", posts.Load())
 			}
 			fpIdx := strings.Index(errOut.String(), "SHA256:abc123")
 			promptIdx := strings.Index(errOut.String(), "Trust this host key")
@@ -374,8 +379,8 @@ func TestSSHAddInteractiveDeclines(t *testing.T) {
 			if !strings.Contains(err.Error(), "was not accepted") {
 				t.Errorf("error = %q, want it to say the host key was not accepted", err.Error())
 			}
-			if *posts != 1 {
-				t.Errorf("daemon received %d POSTs, want exactly 1 (a decline must never re-POST)", *posts)
+			if posts.Load() != 1 {
+				t.Errorf("daemon received %d POSTs, want exactly 1 (a decline must never re-POST)", posts.Load())
 			}
 		})
 	}
@@ -403,8 +408,8 @@ func TestSSHAddInteractiveStdinReadErrorDeclines(t *testing.T) {
 	if err == nil {
 		t.Fatal("runSSHAdd() = nil, want an error when stdin cannot be read")
 	}
-	if *posts != 1 {
-		t.Errorf("daemon received %d POSTs, want exactly 1 (a stdin read error must never re-POST)", *posts)
+	if posts.Load() != 1 {
+		t.Errorf("daemon received %d POSTs, want exactly 1 (a stdin read error must never re-POST)", posts.Load())
 	}
 }
 

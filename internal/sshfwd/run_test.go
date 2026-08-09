@@ -89,7 +89,11 @@ func TestArmStableResetResetsBackoffAfterThreshold(t *testing.T) {
 	}
 
 	stop := mr.armStableReset(context.Background(), 20*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
+	// Poll for the reset rather than sleeping a fixed multiple of the
+	// threshold: a loaded CI box can delay a 20ms timer well past any margin
+	// worth hard-coding, and the poll is both faster in the ordinary case and
+	// unflakeable in the slow one.
+	waitForBackoffReset(t, mr.backoff)
 	stop()
 
 	if d := mr.backoff.Next(); d != 500*time.Millisecond {
@@ -147,4 +151,24 @@ func TestRunFailsClosedOnIncompleteDeps(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("run() did not exit after ctx cancellation")
 	}
+}
+
+// waitForBackoffReset blocks until b's schedule has been returned to its base
+// delay, or the deadline passes. It reads the attempt counter directly (under
+// b's own mutex) because the public observation — Next() — advances the
+// schedule, so polling through it would destroy the very state the caller is
+// about to assert on.
+func waitForBackoffReset(t *testing.T, b *Backoff) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		b.mu.Lock()
+		n := b.n
+		b.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("backoff was not reset after the stable-connection threshold elapsed")
 }

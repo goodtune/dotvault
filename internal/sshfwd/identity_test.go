@@ -2,8 +2,10 @@ package sshfwd
 
 import (
 	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -286,8 +288,55 @@ func TestSignWithAlgorithmHandshake(t *testing.T) {
 	}
 }
 
+// testRSAKey returns a real RSA signer. It is cached across tests because
+// generating a 2048-bit key is the most expensive thing in this file, and
+// every caller only needs *an* RSA key, not a distinct one.
+//
+// It exists because the RSA tests below used to build their "RSA" fixtures
+// from testKey, which is hard-coded Ed25519 — so the only thing RSA about
+// them was the flag constant, and the RSA-cert plus cert-stripping
+// interaction they claim to cover was never exercised.
+func testRSAKey(t *testing.T) (ssh.Signer, ssh.PublicKey) {
+	t.Helper()
+	rsaKeyOnce.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			rsaKeyErr = err
+			return
+		}
+		rsaSigner, rsaKeyErr = ssh.NewSignerFromKey(key)
+	})
+	if rsaKeyErr != nil {
+		t.Fatal(rsaKeyErr)
+	}
+	return rsaSigner, rsaSigner.PublicKey()
+}
+
+var (
+	rsaKeyOnce sync.Once
+	rsaSigner  ssh.Signer
+	rsaKeyErr  error
+)
+
+// rsaCertKey returns an RSA user certificate signed by its own RSA key.
+func rsaCertKey(t *testing.T) (*ssh.Certificate, ssh.Signer) {
+	t.Helper()
+	s, pub := testRSAKey(t)
+	cert := &ssh.Certificate{
+		Key:             pub,
+		CertType:        ssh.UserCert,
+		KeyId:           "test-rsa-cert",
+		ValidPrincipals: []string{"testuser"},
+		ValidBefore:     ssh.CertTimeInfinity,
+	}
+	if err := cert.SignCert(rand.Reader, s); err != nil {
+		t.Fatal(err)
+	}
+	return cert, s
+}
+
 // TestSignWithAlgorithmRSAFlags verifies that RSA signature algorithm flags
-// are correctly mapped and passed to the backend.
+// are correctly mapped and passed to the backend, using a real RSA identity.
 func TestSignWithAlgorithmRSAFlags(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -311,7 +360,7 @@ func TestSignWithAlgorithmRSAFlags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, pub := testKey(t)
+			s, pub := testRSAKey(t)
 			var capturedFlags sshagent.SignatureFlags
 
 			fb := &fakeBackend{
@@ -341,16 +390,17 @@ func TestSignWithAlgorithmRSAFlags(t *testing.T) {
 	}
 }
 
-// TestSignWithAlgorithmRSACertificateFlags verifies that RSA certificates
-// with RSA flags work correctly — the interaction between certificate type
-// extraction and flag mapping.
+// TestSignWithAlgorithmRSACertificateFlags verifies that a real RSA
+// certificate with RSA flags works — the interaction between certificate
+// type extraction and flag mapping, which is where an RSA identity behaves
+// differently from an Ed25519 one.
 func TestSignWithAlgorithmRSACertificateFlags(t *testing.T) {
-	rsaCert, rsaSigner := certKey(t) // Certificate-backed signer
+	rsaCert, certSigner := rsaCertKey(t)
 
 	var capturedFlags sshagent.SignatureFlags
 	fb := &fakeBackend{
 		keys:   []*sshagent.Key{{Format: rsaCert.Type(), Blob: rsaCert.Marshal(), Comment: "cert"}},
-		signer: rsaSigner,
+		signer: certSigner,
 		onSignWithFlags: func(flags sshagent.SignatureFlags) {
 			capturedFlags = flags
 		},
@@ -381,6 +431,29 @@ func TestSignWithAlgorithmRSACertificateFlags(t *testing.T) {
 	}
 	if capturedFlags != sshagent.SignatureFlagRsaSha512 {
 		t.Errorf("rsa-sha2-512 cert: backend received flags = %d, want %d", capturedFlags, sshagent.SignatureFlagRsaSha512)
+	}
+
+	// The cert-stripping half: x/crypto calls SignWithAlgorithm with the
+	// underlying algorithm name, never the -cert-v01@openssh.com form, so
+	// "ssh-rsa" must be accepted for an RSA certificate. Comparing against
+	// the certificate's own Type() would reject it.
+	capturedFlags = 0
+	if _, err := algSigner.SignWithAlgorithm(rand.Reader, []byte("payload"), ssh.KeyAlgoRSA); err != nil {
+		t.Fatalf("SignWithAlgorithm(ssh-rsa) on an RSA certificate = %v, want it accepted", err)
+	}
+	if capturedFlags != 0 {
+		t.Errorf("ssh-rsa cert: backend received flags = %d, want 0 (no rsa-sha2 preference)", capturedFlags)
+	}
+
+	// And the negative: an algorithm that is neither a flag nor the
+	// underlying key type is rejected, naming the underlying type.
+	var unsupported *ErrUnsupportedAlgorithm
+	_, err = algSigner.SignWithAlgorithm(rand.Reader, []byte("payload"), ssh.KeyAlgoED25519)
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("SignWithAlgorithm(ssh-ed25519) on an RSA certificate = %v, want ErrUnsupportedAlgorithm", err)
+	}
+	if unsupported.keyType != ssh.KeyAlgoRSA {
+		t.Errorf("rejection named key type %q, want %q (the certificate's underlying key)", unsupported.keyType, ssh.KeyAlgoRSA)
 	}
 }
 

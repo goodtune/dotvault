@@ -9,6 +9,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	dvagent "github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/sshfwd"
@@ -27,6 +28,14 @@ import (
 // sshfwd.Deps' doc comment), so reading through this indirection on every
 // call is exactly what makes that true.
 var sshPolicyConfig atomic.Value // holds config.SSHConfig
+
+// Compile-time proof the daemon's real SSH-agent backend satisfies
+// sshfwd.SignerSource, so a change to either side breaks the build rather
+// than the daemon at runtime. It lives here, next to the wiring that
+// actually passes the backend in, rather than in internal/sshfwd: asserting
+// it there would drag internal/agent — and transitively vault and config —
+// into sshfwd's dependency graph for nothing but a compile-time check.
+var _ sshfwd.SignerSource = (*dvagent.Backend)(nil)
 
 // updateSSHPolicyConfig stores a freshly (re)loaded SSH config section for
 // sshForwardDeps' Policy closure to pick up on the next connection attempt.

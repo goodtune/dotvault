@@ -1120,6 +1120,55 @@ rules:
 	})
 }
 
+func TestSSHSectionParsesFromYAML(t *testing.T) {
+	yamlData := `
+vault:
+  address: https://vault.example.com
+ssh:
+  certificate_authorities:
+    - "@cert-authority *.example.com ssh-ed25519 AAAAC3Nz"
+  insecure_ignore_host_key: true
+rules:
+  - name: test
+    vault_key: t
+    target:
+      path: /tmp/t
+      format: json
+`
+	path := writeTemp(t, yamlData)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if len(cfg.SSH.CertificateAuthorities) != 1 {
+		t.Fatalf("CertificateAuthorities = %v, want 1 entry", cfg.SSH.CertificateAuthorities)
+	}
+	if !cfg.SSH.InsecureIgnoreHostKey {
+		t.Error("InsecureIgnoreHostKey = false, want true")
+	}
+}
+
+func TestSSHSectionDefaultsSecure(t *testing.T) {
+	yamlData := `
+vault:
+  address: https://vault.example.com
+rules:
+  - name: test
+    vault_key: t
+    target:
+      path: /tmp/t
+      format: json
+`
+	path := writeTemp(t, yamlData)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.SSH.InsecureIgnoreHostKey {
+		t.Error("InsecureIgnoreHostKey defaulted to true; host-key checking must be on by default")
+	}
+}
+
 func writeTemp(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

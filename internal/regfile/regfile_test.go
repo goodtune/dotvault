@@ -1208,3 +1208,33 @@ func TestHexLineWrapping(t *testing.T) {
 		}
 	}
 }
+
+// TestSSHSectionRegfileRoundTrip guards the system SSH host-CA trust
+// material (config.SSHConfig) through Generate/Parse. Unlike the user-level
+// ssh.yaml remotes list (internal/sshfwd), this section is admin policy and
+// must round-trip like every other registry-backed field.
+func TestSSHSectionRegfileRoundTrip(t *testing.T) {
+	in := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com"},
+		SSH: config.SSHConfig{
+			CertificateAuthorities: []string{
+				"@cert-authority *.example.com ssh-ed25519 AAAAC3Nz",
+				"@cert-authority *.corp ssh-rsa AAAAB3Nz",
+			},
+			InsecureIgnoreHostKey: true,
+		},
+		Rules: []config.Rule{{
+			Name:     "t",
+			VaultKey: "t",
+			Target:   config.Target{Path: "/tmp/t", Format: "json"},
+		}},
+	}
+
+	got, err := Parse([]byte(mustGenerate(t, in)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !reflect.DeepEqual(got.SSH, in.SSH) {
+		t.Errorf("SSH round trip:\n got %+v\nwant %+v", got.SSH, in.SSH)
+	}
+}

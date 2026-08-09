@@ -84,3 +84,92 @@ func TestExpandRemotePathRejectsTildeUser(t *testing.T) {
 		t.Fatalf("err = %v, want a ~user/ rejection", err)
 	}
 }
+
+// Test traversal prevention: .. segments must be rejected by ValidateRemoteSocket.
+func TestValidateRemoteSocketRejectsTraversalInTildePath(t *testing.T) {
+	tests := []string{
+		"~/../../etc/dotvault.sock",
+		"~/a/../../b.sock",
+		"~/../x.sock",
+	}
+	for _, p := range tests {
+		if err := ValidateRemoteSocket(p); err == nil {
+			t.Errorf("ValidateRemoteSocket(%q) accepted a .. segment; must reject", p)
+		}
+	}
+}
+
+// Test that filenames containing two dots are still accepted (false-positive guard).
+func TestValidateRemoteSocketAcceptsDoublesInFilenames(t *testing.T) {
+	tests := []string{
+		"~/.ssh/my..sock",
+		"~/..hidden/x.sock",
+		"~/my.backup.sock",
+	}
+	for _, p := range tests {
+		if err := ValidateRemoteSocket(p); err != nil {
+			t.Errorf("ValidateRemoteSocket(%q) rejected a legitimate filename; must accept. Error: %v", p, err)
+		}
+	}
+}
+
+// Test traversal prevention in absolute paths.
+func TestValidateRemoteSocketRejectsTraversalInAbsolutePath(t *testing.T) {
+	tests := []string{
+		"/home/../etc/dotvault.sock",
+		"/tmp/a/../../etc/passwd",
+		"/../etc/passwd",
+	}
+	for _, p := range tests {
+		if err := ValidateRemoteSocket(p); err == nil {
+			t.Errorf("ValidateRemoteSocket(%q) accepted a .. segment; must reject", p)
+		}
+	}
+}
+
+// Test control character rejection in probe output.
+func TestExpandRemotePathRejectsInteriorNewlineInHome(t *testing.T) {
+	r := &fakeRunner{out: "/home/me\n/evil"}
+	_, err := ExpandRemotePath(context.Background(), r, "~/x.sock")
+	if err == nil {
+		t.Fatal("accepted a $HOME with an interior newline; must reject")
+	}
+}
+
+func TestExpandRemotePathRejectsCarriageReturnInHome(t *testing.T) {
+	r := &fakeRunner{out: "/home/me\r/evil"}
+	_, err := ExpandRemotePath(context.Background(), r, "~/x.sock")
+	if err == nil {
+		t.Fatal("accepted a $HOME with a carriage return; must reject")
+	}
+}
+
+// Tab and other control characters must also be rejected.
+func TestExpandRemotePathRejectsTabInHome(t *testing.T) {
+	r := &fakeRunner{out: "/home/me\t/evil"}
+	_, err := ExpandRemotePath(context.Background(), r, "~/x.sock")
+	if err == nil {
+		t.Fatal("accepted a $HOME with a tab; must reject")
+	}
+}
+
+// A trailing newline (the normal echo output) must still be accepted after TrimSpace.
+func TestExpandRemotePathAcceptsTrailingNewlineInHome(t *testing.T) {
+	r := &fakeRunner{out: "/home/me\n"}
+	got, err := ExpandRemotePath(context.Background(), r, "~/x.sock")
+	if err != nil {
+		t.Fatalf("rejected a trailing newline (normal echo output): %v", err)
+	}
+	if want := "/home/me/x.sock"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// DEL character (0x7f) must also be rejected.
+func TestExpandRemotePathRejectsDELInHome(t *testing.T) {
+	r := &fakeRunner{out: "/home/me\x7f/evil"}
+	_, err := ExpandRemotePath(context.Background(), r, "~/x.sock")
+	if err == nil {
+		t.Fatal("accepted a $HOME with a DEL character; must reject")
+	}
+}

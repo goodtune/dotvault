@@ -46,5 +46,29 @@ func ExpandRemotePath(ctx context.Context, r CommandRunner, p string) (string, e
 	if !strings.HasPrefix(home, "/") {
 		return "", fmt.Errorf("remote $HOME %q is not an absolute path", home)
 	}
-	return path.Join(home, strings.TrimPrefix(p, "~/")), nil
+	// Reject control characters in the probe result. An interior newline or other
+	// control character in $HOME is a sign the remote returned extra output (MOTD,
+	// banner, shell startup noise) — either a misconfiguration or an injection
+	// attempt. The later shell-command consumer must never see such a value.
+	if hasControlChar(home) {
+		return "", fmt.Errorf("remote $HOME %q contains control characters", home)
+	}
+	expanded := path.Join(home, strings.TrimPrefix(p, "~/"))
+	// Re-validate the final path: it must still be absolute and control-character
+	// free, as a belt-and-braces layer in case a future edit weakens the checks above.
+	if !strings.HasPrefix(expanded, "/") || hasControlChar(expanded) {
+		return "", fmt.Errorf("expanded remote socket path %q is invalid", expanded)
+	}
+	return expanded, nil
+}
+
+// hasControlChar reports whether s contains an ASCII control character
+// (< 0x20 or == 0x7f), a sign of extra or hostile output in the probe result.
+func hasControlChar(s string) bool {
+	for _, b := range s {
+		if b < 0x20 || b == 0x7f {
+			return true
+		}
+	}
+	return false
 }

@@ -173,7 +173,8 @@ func Save(path string, f *File) error {
 // ValidateRemoteSocket enforces the socket-path rules. Only an absolute path
 // or a "~/"-prefixed one is accepted: "~user/" would require resolving another
 // account's home on the remote, which dotvault cannot do, and silently
-// mishandling it would bind somewhere the user did not intend.
+// mishandling it would bind somewhere the user did not intend. Paths containing
+// .. segments are rejected to prevent escape to parent directories.
 func ValidateRemoteSocket(p string) error {
 	switch {
 	case p == "":
@@ -181,10 +182,23 @@ func ValidateRemoteSocket(p string) error {
 	case strings.ContainsRune(p, 0):
 		return errors.New("remote_socket must not contain a NUL byte")
 	case strings.HasPrefix(p, "~/"):
+		// Check for .. segments that could escape the home directory.
+		rest := strings.TrimPrefix(p, "~/")
+		for _, segment := range strings.Split(rest, "/") {
+			if segment == ".." {
+				return errors.New("remote_socket must not contain .. path segments")
+			}
+		}
 		return nil
 	case strings.HasPrefix(p, "~"):
 		return errors.New(`~user/ is not supported; use an absolute path or ~/`)
 	case strings.HasPrefix(p, "/"):
+		// Absolute paths also need .. checking to be safe.
+		for _, segment := range strings.Split(p, "/") {
+			if segment == ".." {
+				return errors.New("remote_socket must not contain .. path segments")
+			}
+		}
 		return nil
 	default:
 		return errors.New(`must be absolute or start with ~/`)

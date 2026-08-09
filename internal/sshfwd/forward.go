@@ -2,6 +2,7 @@ package sshfwd
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -38,7 +39,7 @@ func ServeForward(ctx context.Context, cl *ssh.Client, socket string, target Dia
 		bindErr := err
 		slog.Debug("remote socket bind failed; checking whether a live listener already owns it", "socket", socket, "error", bindErr)
 
-		live, probeErr := liveListenerAt(cl, socket)
+		live, probeErr := liveListenerAt(ctx, cl, socket)
 		if probeErr != nil {
 			return fmt.Errorf("%w: %s: %w (stale-socket probe was inconclusive: %v)", ErrBind, socket, bindErr, probeErr)
 		}
@@ -66,31 +67,103 @@ func ServeForward(ctx context.Context, cl *ssh.Client, socket string, target Dia
 
 // liveListenerAt reports whether something is actively listening at socket on
 // the remote, by attempting a direct-streamlocal dial through the same SSH
-// connection. Two outcomes are conclusive:
+// connection.
 //
-//   - The dial succeeds: something answered the connection. That alone is
-//     proof of a live listener (the probe connection is closed immediately —
-//     this only asks the question, it never uses the answer).
-//   - sshd rejects the channel open with ssh.ConnectionFailed: sshd itself
-//     tried to connect() to the path on our behalf and got refused, meaning
-//     nothing is listening. The path is safe to treat as stale.
+// A successful dial is conclusive on its own: something answered, so a live
+// listener is running (the probe connection is closed immediately — this only
+// asks the question, it never uses the answer).
 //
-// Any other outcome — a different rejection reason (e.g. Prohibited, which is
-// what an sshd with AllowStreamLocalForwarding disallowing client-initiated
-// direct-streamlocal returns) or a transport error — is inconclusive and must
-// not be read as "safe to unlink": ConnectionFailed is the only reason that
-// specifically means "I tried to connect and there was nobody there".
-func liveListenerAt(cl *ssh.Client, socket string) (live bool, err error) {
-	conn, dialErr := cl.Dial("unix", socket)
+// A rejection with ssh.ConnectionFailed is NOT conclusive on its own, despite
+// looking like it should be. OpenSSH's server_input_channel_open initialises
+// its rejection reason to SSH2_OPEN_CONNECT_FAILED and only its
+// direct-tcpip handler ever overrides it — the direct-streamlocal handler
+// never does — so "nobody is listening at this path" and
+// "AllowStreamLocalForwarding disallows client-initiated direct-streamlocal
+// entirely" are indistinguishable on the wire: both surface as
+// ConnectionFailed. Treating it as proof would make a genuine `ssh -R`
+// session's live socket, under AllowStreamLocalForwarding remote, read as
+// stale and get unlinked out from under the user.
+//
+// So a ConnectionFailed on the real path only becomes trustworthy once
+// directStreamLocalWorks confirms the mechanism itself functions against this
+// sshd at all, via a differential probe against a path this call controls.
+// Any other rejection reason (Prohibited, UnknownChannelType, ...) or a
+// transport error is inconclusive on its own and must not be read as "safe to
+// unlink" either.
+func liveListenerAt(ctx context.Context, cl *ssh.Client, socket string) (live bool, err error) {
+	conn, dialErr := cl.DialContext(ctx, "unix", socket)
 	if dialErr == nil {
 		conn.Close()
 		return true, nil
 	}
 	var openErr *ssh.OpenChannelError
-	if errors.As(dialErr, &openErr) && openErr.Reason == ssh.ConnectionFailed {
+	if !errors.As(dialErr, &openErr) || openErr.Reason != ssh.ConnectionFailed {
+		return false, dialErr
+	}
+
+	works, probeErr := directStreamLocalWorks(ctx, cl, socket)
+	if probeErr != nil {
+		return false, fmt.Errorf("could not confirm whether ConnectionFailed on %s is meaningful: %w", socket, probeErr)
+	}
+	if !works {
+		return false, fmt.Errorf("sshd rejects client-initiated direct-streamlocal opens entirely, so ConnectionFailed on %s does not prove it is stale", socket)
+	}
+	return false, nil
+}
+
+// directStreamLocalWorks binds a scratch path this call alone controls,
+// dials it, and reports whether the dial succeeded — i.e. whether
+// client-initiated direct-streamlocal opens can reach a live listener on this
+// sshd at all. If they cannot (any rejection, including a ConnectionFailed
+// against a path we ourselves just bound), a ConnectionFailed on the real
+// socket path proves nothing, and the caller must not unlink on its basis.
+//
+// The scratch listener is always torn down, on every path including a probe
+// dial failure: this call owns that name, so a leftover is always safe to
+// remove. A failure to *bind* the scratch path answers nothing either way —
+// it is not treated as permission to trust the real probe's ConnectionFailed.
+func directStreamLocalWorks(ctx context.Context, cl *ssh.Client, socket string) (bool, error) {
+	scratch, err := scratchProbePath(socket)
+	if err != nil {
+		return false, fmt.Errorf("generate scratch probe path: %w", err)
+	}
+
+	ln, err := cl.ListenUnix(scratch)
+	if err != nil {
+		return false, fmt.Errorf("bind scratch probe path %s: %w", scratch, err)
+	}
+	defer func() {
+		ln.Close()
+		if rmErr := removeRemoteFile(ctx, cl, scratch); rmErr != nil {
+			slog.Debug("failed to remove scratch probe socket", "socket", scratch, "error", rmErr)
+		}
+	}()
+
+	conn, dialErr := cl.DialContext(ctx, "unix", scratch)
+	if dialErr == nil {
+		conn.Close()
+		return true, nil
+	}
+	var openErr *ssh.OpenChannelError
+	if errors.As(dialErr, &openErr) {
+		// A rejection dialing a path we just bound ourselves — including
+		// ConnectionFailed — means client-initiated direct-streamlocal opens
+		// don't work here at all, not that this particular path is unlucky.
 		return false, nil
 	}
 	return false, dialErr
+}
+
+// scratchProbePath derives a probe-only path from socket, namespaced under
+// the same directory so it exercises the same sshd policy and filesystem
+// permissions, with a random suffix so concurrent probes (or a probe racing
+// its own retry) don't collide.
+func scratchProbePath(socket string) (string, error) {
+	var suffix [4]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s.dotvault-probe-%x", socket, suffix), nil
 }
 
 // serveListener is the transport-agnostic accept loop, split out so it is
@@ -163,9 +236,21 @@ func serveListener(ctx context.Context, ln net.Listener, target Dialer, onConn f
 // connTracker tracks the connections currently being relayed so they can be
 // force-closed on cancellation instead of waiting for both directions to
 // reach EOF on their own.
+//
+// closeAll runs exactly once, at cancel. Without the closed flag, a
+// connection registered *after* that moment — the narrow window between
+// Accept returning and add(conn), or the wide window spanning the whole
+// target dial, where conn is tracked but local is only added once the dial
+// returns — would never be closed by anyone: Pump only returns once both
+// directions EOF, so serveListener's deferred wg.Wait() would block forever,
+// taking ServeForward, the caller's reconnect, and shutdown down with it.
+// Recording closed under the same lock and having add close-on-arrival once
+// it is set collapses both windows without serveListener needing to depend on
+// target's own ctx-awareness for its shutdown guarantee.
 type connTracker struct {
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
 }
 
 func newConnTracker() *connTracker {
@@ -175,6 +260,10 @@ func newConnTracker() *connTracker {
 func (t *connTracker) add(c net.Conn) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		_ = c.Close()
+		return
+	}
 	t.conns[c] = struct{}{}
 }
 
@@ -187,6 +276,7 @@ func (t *connTracker) remove(c net.Conn) {
 func (t *connTracker) closeAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.closed = true
 	for c := range t.conns {
 		_ = c.Close()
 	}

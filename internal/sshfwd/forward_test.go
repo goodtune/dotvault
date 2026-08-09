@@ -305,6 +305,83 @@ func TestServeListenerClosesInFlightConnectionOnCancel(t *testing.T) {
 	}
 }
 
+// TestServeListenerClosesConnectionRegisteredDuringTargetDial is the N1
+// regression test: a connection accepted just before cancel, whose target
+// dial is still in flight when cancel fires, must still be torn down once the
+// dial eventually completes — it must not be silently orphaned because
+// closeAll already ran before tracker.add(local) got a chance to register it.
+//
+// Real TCP throughout, deliberately not net.Pipe: net.Pipe conns have no
+// CloseWrite, so copyDir's own EOF-triggered fallback close happens to close
+// the untracked side by accident and masks exactly this race — the same
+// substitution that hid the Pump close bug in an earlier round.
+func TestServeListenerClosesConnectionRegisteredDuringTargetDial(t *testing.T) {
+	newTCPPair := func(t *testing.T) (client, server net.Conn) {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err == nil {
+				accepted <- c
+			}
+		}()
+		cl, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case sv := <-accepted:
+			return cl, sv
+		case <-time.After(5 * time.Second):
+			t.Fatal("accept timed out")
+		}
+		return nil, nil
+	}
+
+	ln := newFakeListener()
+	t.Cleanup(func() { ln.Close() })
+
+	// The "remote" end: a real, idle, never-closed TCP connection standing in
+	// for the accepted forwarded connection.
+	remoteClient, remoteAccepted := newTCPPair(t)
+	t.Cleanup(func() { remoteClient.Close() })
+
+	// The target dial is slow and NOT ctx-aware — it ignores ctx entirely and
+	// always completes on its own schedule. This is deliberate: the fix under
+	// test must not depend on the Dialer cooperating with cancellation.
+	dialStarted := make(chan struct{})
+	target := func(ctx context.Context) (net.Conn, error) {
+		close(dialStarted)
+		time.Sleep(300 * time.Millisecond)
+		targetClient, _ := newTCPPair(t)
+		return targetClient, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveListener(ctx, ln, target, func(int) {}) }()
+
+	ln.conns <- remoteAccepted
+
+	<-dialStarted
+	time.Sleep(50 * time.Millisecond) // land cancel while the 300ms dial is still in flight
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("serveListener returned %v, want nil/Canceled/ErrClosed", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("serveListener did not return after cancel; a connection registered after closeAll drained the tracker was never closed")
+	}
+}
+
 func TestPumpClosesBothEndsFullyOnRealSockets(t *testing.T) {
 	// net.Pipe cannot exercise this: its conns do not implement CloseWrite, so
 	// copyDir's own EOF-triggered fallback close already fully closes both

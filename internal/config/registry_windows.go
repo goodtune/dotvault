@@ -304,8 +304,12 @@ type registryLayer struct {
 	APIEnabled  *uint32
 	APIUnixPath string
 
-	// SSH (admin-owned host-CA trust material; the remotes list lives in the
-	// user-level ssh.yaml and has no registry surface — see config.SSHConfig).
+	// SSH: the certificate_authorities list and insecure_ignore_host_key flag
+	// are admin-owned policy, so — like every other config section — they
+	// round-trip through this registry loader, .reg, and YAML alike. The
+	// remotes themselves are deliberately excluded: they live only in the
+	// user-level ssh.yaml (see config.SSHConfig), because that file is
+	// user-writable and must never be treated as policy.
 	SSHCertificateAuthorities []string
 	SSHInsecureIgnoreHostKey  *uint32
 

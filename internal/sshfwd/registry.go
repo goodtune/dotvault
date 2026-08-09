@@ -165,31 +165,67 @@ func (e *HostKeyConfirmation) Unwrap() error { return ErrConfirmHostKey }
 // validation and the host-key confirmation gesture cannot drift between the
 // two surfaces.
 //
-// A sync.RWMutex serialises every read-modify-write. The daemon is the sole
-// writer of ssh.yaml — the CLI reaches it through the web API, not the
-// filesystem — so no cross-process lock is needed, but two concurrent web
-// requests are entirely possible and must not race each other's Load/Save.
-// Each mutation re-loads the file under the write lock (rather than
-// trusting an in-memory copy) so a concurrent Add from another request is
-// never clobbered, and calls Manager.Reconcile inside the same critical
-// section as the Save so the on-disk file and the daemon's running set
-// cannot diverge. List, and Add's read of the stored pin before it dials
-// out (see Add), take only the read lock, so a slow or unreachable host
-// never wedges every other Registry call behind it.
+// Two locks, with distinct jobs.
+//
+// txMu serialises whole mutations. Every mutation (Add's write phase,
+// Patch, Remove) and Resync holds it across its own Load -> Save ->
+// Reconcile, so the on-disk file and the daemon's running set cannot
+// diverge: a caller cannot read the file before another's removal is saved
+// and then reconcile after that removal's own Reconcile has run,
+// resurrecting a just-removed remote. That divergence was a real bug on
+// this branch, and this lock is what closes it.
+//
+// mu guards only the file read and the file write, and is held for exactly
+// as long as each takes. The daemon is the sole writer of ssh.yaml — the
+// CLI reaches it through the web API, not the filesystem — so no
+// cross-process lock is needed, but two concurrent web requests are
+// entirely possible and must not race each other's Load/Save.
+//
+// The split exists because Manager.Reconcile's stop phase can block for a
+// while: it waits for each victim runner to exit, and a runner sitting
+// inside ssh.NewClientConn is bounded only by the 20s dial deadline (see
+// dial.go). Under a single lock, one Patch touching N changed remotes would
+// wedge List — a read-only status call — for up to N x 20s. It cannot be
+// fixed by moving Reconcile out of the transaction without reopening the
+// divergence above, so the fix is to keep the transaction serialised and
+// take the *file* lock out of it. List and Add's pre-dial read of the
+// stored pin therefore never queue behind a slow or unreachable host.
+//
+// The residual, deliberately accepted: List can observe a file a
+// still-in-flight Reconcile has not yet applied to the running set. That
+// window is inherent — Save necessarily precedes Reconcile — and List is
+// informational; the divergence that mattered was between two concurrent
+// mutations, and txMu still prevents it.
 type Registry struct {
 	path string
 	mgr  *Manager
 	v    Verifier
 
-	mu sync.RWMutex
+	txMu sync.Mutex
+	mu   sync.RWMutex
 
 	// resyncDelay, when set, is invoked by Resync between its Load and
-	// Reconcile calls, still holding the write lock. Production code never
-	// sets it; it exists purely so a test can widen the window a concurrent
-	// Add/Patch/Remove would need to sneak into, to prove they genuinely
-	// block on this same lock rather than merely losing a fast race by
-	// luck. Set via SetResyncDelayForTest.
+	// Reconcile calls, still holding the transaction lock. Production code
+	// never sets it; it exists purely so a test can widen the window a
+	// concurrent Add/Patch/Remove would need to sneak into, to prove they
+	// genuinely block on this same lock rather than merely losing a fast
+	// race by luck. Set via SetResyncDelayForTest.
 	resyncDelay func()
+}
+
+// loadFile and saveFile are the only paths that touch ssh.yaml. They hold
+// the file lock for the duration of the I/O and nothing more — in
+// particular, never across a Reconcile. See Registry's doc comment.
+func (g *Registry) loadFile() (*File, error) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return Load(g.path)
+}
+
+func (g *Registry) saveFile(f *File) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return Save(g.path, f)
 }
 
 // NewRegistry returns a Registry backed by the ssh.yaml at path, reconciling
@@ -200,10 +236,7 @@ func NewRegistry(path string, mgr *Manager, v Verifier) *Registry {
 
 // List returns every configured remote.
 func (g *Registry) List() ([]Remote, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return nil, err
 	}
@@ -214,10 +247,7 @@ func (g *Registry) List() ([]Remote, error) {
 // host is not configured yet. Read-locked only: it is consulted before
 // Verify's network dial, not as part of the write transaction — see Add.
 func (g *Registry) storedHostKey(host string) (string, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return "", err
 	}
@@ -348,8 +378,17 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 		switch {
 		case !result.Verified:
 			// Not authenticated against anything (e.g. an insecure
-			// policy): never pin, no matter what HostKey/Fingerprint say.
-			r.HostKey = ""
+			// policy): never pin what this connection observed, no matter
+			// what HostKey/Fingerprint say. Keep the existing pin rather
+			// than blanking it — same reasoning as the Fingerprint == ""
+			// case below. Blanking would mean an ordinary re-Add under a
+			// temporarily-enabled insecure_ignore_host_key destroys a
+			// verified pin, so that turning the flag back off leaves the
+			// host unpinned and an MITM meets a confirmable first-use
+			// prompt instead of ErrHostKeyMismatch. Nothing unverified is
+			// written either way: existingHostKey is a value that was
+			// itself verified before it was stored.
+			r.HostKey = existingHostKey
 		case result.Fingerprint == "":
 			// Verified with nothing new to confirm: CA-covered (HostKey
 			// legitimately empty), or the offered key already matched the
@@ -374,15 +413,30 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 		}
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.txMu.Lock()
+	defer g.txMu.Unlock()
 
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return nil, err
 	}
+
+	// Compare-and-swap on the pin. existingHostKey was read before the dial,
+	// outside this transaction — deliberately, so a slow or offline host
+	// cannot wedge every other mutation behind its handshake. That leaves a
+	// window in which another Add could commit a re-pin for the same host,
+	// which this Add would then silently revert to the older key. Refusing,
+	// and telling the caller to retry, is the only correct resolution: this
+	// Add's verification decision was made against a pin that is no longer
+	// current, so committing it would mean writing a trust anchor nobody
+	// verified against the file as it now stands.
+	if i, ok := f.Find(r.Host); ok && f.Remotes[i].HostKey != existingHostKey {
+		return nil, fmt.Errorf(
+			"host key for %s changed concurrently while this request was verifying it; retry", r.Host)
+	}
+
 	f.Upsert(r)
-	if err := Save(g.path, f); err != nil {
+	if err := g.saveFile(f); err != nil {
 		return nil, err
 	}
 	if rerr := g.mgr.Reconcile(ctx, f.Remotes); rerr != nil {
@@ -402,10 +456,10 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 // returns an error, and leaves ssh.yaml untouched, if host is not
 // configured or the patched entry fails validation.
 func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.txMu.Lock()
+	defer g.txMu.Unlock()
 
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +483,7 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 	}
 
 	f.Remotes[i] = r
-	if err := Save(g.path, f); err != nil {
+	if err := g.saveFile(f); err != nil {
 		return nil, err
 	}
 	if rerr := g.mgr.Reconcile(ctx, f.Remotes); rerr != nil {
@@ -445,17 +499,17 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 // Removing an unknown host is not an error: Remove is idempotent, matching
 // File.Remove.
 func (g *Registry) Remove(ctx context.Context, host string) (bool, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.txMu.Lock()
+	defer g.txMu.Unlock()
 
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return false, err
 	}
 	if !f.Remove(host) {
 		return false, nil
 	}
-	if err := Save(g.path, f); err != nil {
+	if err := g.saveFile(f); err != nil {
 		return false, err
 	}
 	if rerr := g.mgr.Reconcile(ctx, f.Remotes); rerr != nil {
@@ -478,10 +532,10 @@ func (g *Registry) Remove(ctx context.Context, host string) (bool, error) {
 // resurrecting the just-removed remote until the next call closes the
 // window. Resync closes that window by taking the identical lock.
 func (g *Registry) Resync(ctx context.Context) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.txMu.Lock()
+	defer g.txMu.Unlock()
 
-	f, err := Load(g.path)
+	f, err := g.loadFile()
 	if err != nil {
 		return err
 	}
@@ -498,7 +552,7 @@ func (g *Registry) Resync(ctx context.Context) error {
 // racing fast enough not to notice), by giving it a reliable window in which
 // to attempt, and observe blocked, a concurrent mutation.
 func (g *Registry) SetResyncDelayForTest(f func()) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.txMu.Lock()
+	defer g.txMu.Unlock()
 	g.resyncDelay = f
 }

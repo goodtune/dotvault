@@ -675,3 +675,96 @@ func TestConcurrentAddDoesNotLoseUpdates(t *testing.T) {
 		t.Fatalf("persisted %d remotes, want %d (lost update under concurrency)", len(f.Remotes), len(hosts))
 	}
 }
+
+// TestAddUnderInsecurePolicyPreservesExistingPin is S1's test. Under
+// insecure_ignore_host_key the verifier reports Verified:false, and Add used
+// to blank the stored key — so an ordinary re-Add destroyed a pin that had
+// been properly verified earlier. Turning the flag back off would then leave
+// the host unpinned, and an active MITM would meet a confirmable first-use
+// prompt instead of ErrHostKeyMismatch.
+func TestAddUnderInsecurePolicyPreservesExistingPin(t *testing.T) {
+	key, fp := testHostKey(t)
+	v := &stepVerifier{steps: []VerifyResult{
+		{Verified: true, HostKey: key, Fingerprint: fp}, // initial Add: pins the key
+		{Verified: false}, // re-Add under an insecure policy
+	}}
+	g, path := newTestRegistry(t, v)
+	ctx := context.Background()
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, AddOptions{AcceptFingerprint: fp}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := g.Add(ctx, Remote{Host: "foo.example.com", Port: 2222}, AddOptions{})
+	if err != nil {
+		t.Fatalf("re-Add under an insecure policy = %v", err)
+	}
+	if got.HostKey != key {
+		t.Errorf("returned entry lost its pin: HostKey = %q, want %q", got.HostKey, key)
+	}
+
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Remotes) != 1 || f.Remotes[0].HostKey != key {
+		t.Fatalf("re-Add under an insecure policy destroyed the stored pin: %+v", f.Remotes)
+	}
+}
+
+// TestAddRefusesWhenPinChangedDuringVerification is the R2 TOCTOU test. Add
+// reads the stored pin before its network dial, deliberately outside the
+// transaction so a slow host cannot wedge every other mutation. A re-pin
+// committed by another caller during that dial must not be silently reverted
+// by this Add: it must refuse and tell the caller to retry.
+//
+// The concurrent commit is staged from inside the verifier — the one seam
+// that runs at exactly the right moment — rather than by racing two
+// goroutines and hoping for the interleaving.
+func TestAddRefusesWhenPinChangedDuringVerification(t *testing.T) {
+	key, fp := testHostKey(t)
+	otherKey, _ := testHostKey(t)
+
+	var g *Registry
+	var path string
+	v := &fakeVerifierFunc{fn: func(ctx context.Context, r Remote, _ VerifyOptions) (VerifyResult, error) {
+		// Stand in for another request committing a re-pin while this
+		// Add's dial is in flight.
+		f, err := Load(path)
+		if err != nil {
+			return VerifyResult{}, err
+		}
+		f.Upsert(Remote{Host: r.Host, RemoteSocket: DefaultRemoteSocket, HostKey: otherKey})
+		if err := Save(path, f); err != nil {
+			return VerifyResult{}, err
+		}
+		return VerifyResult{Verified: true, HostKey: key, Fingerprint: fp}, nil
+	}}
+	g, path = newTestRegistry(t, v)
+
+	_, err := g.Add(context.Background(), Remote{Host: "foo.example.com"}, AddOptions{AcceptFingerprint: fp})
+	if err == nil {
+		t.Fatal("Add() succeeded despite a concurrent re-pin; want a retry error")
+	}
+	if !strings.Contains(err.Error(), "changed concurrently") {
+		t.Fatalf("Add() = %v, want a 'changed concurrently' retry error", err)
+	}
+
+	f, loadErr := Load(path)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(f.Remotes) != 1 || f.Remotes[0].HostKey != otherKey {
+		t.Fatalf("the concurrent re-pin was clobbered: %+v", f.Remotes)
+	}
+}
+
+// fakeVerifierFunc adapts a func to Verifier for tests that need to act at
+// the exact moment verification runs.
+type fakeVerifierFunc struct {
+	fn func(context.Context, Remote, VerifyOptions) (VerifyResult, error)
+}
+
+func (f *fakeVerifierFunc) Verify(ctx context.Context, r Remote, o VerifyOptions) (VerifyResult, error) {
+	return f.fn(ctx, r, o)
+}

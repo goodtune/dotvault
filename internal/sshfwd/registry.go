@@ -118,6 +118,15 @@ type Patch struct {
 // something a fingerprint could confirm past.
 var ErrConfirmHostKey = errors.New("host key requires confirmation")
 
+// ErrHostNotFound is returned by Patch when the given host has no configured
+// entry. A sentinel (rather than a bare fmt.Errorf, which Remove still uses
+// for its own not-found case — Remove reports absence via its bool return,
+// not an error) lets a caller distinguish "no such host" from a genuine
+// validation failure via errors.Is, the same pattern ErrConfirmHostKey
+// establishes for Add. The web API maps this to 404, and everything else
+// Patch can return to 400.
+var ErrHostNotFound = errors.New("host not configured")
+
 // HostKeyConfirmation carries the fingerprint a caller must echo back to
 // commit an Add for a previously-unpinned host.
 type HostKeyConfirmation struct {
@@ -357,7 +366,7 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 	}
 	i, ok := f.Find(host)
 	if !ok {
-		return nil, fmt.Errorf("no remote configured for host %q", host)
+		return nil, fmt.Errorf("no remote configured for host %q: %w", host, ErrHostNotFound)
 	}
 
 	r := f.Remotes[i]

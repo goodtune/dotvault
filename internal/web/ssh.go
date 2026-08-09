@@ -17,6 +17,15 @@ import (
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
 
+// sshBodyLimit caps the request body for the SSH CRUD endpoints. These
+// payloads are a handful of short fields (a hostname, a socket path, a
+// fingerprint); 64 KiB is generous and matches the cap the peer-action
+// endpoints use for their own, comparably small bodies (browseBodyLimit in
+// browse.go). Without it, json.Decode buffers string tokens as it scans, so
+// an unbounded body — a single huge "host" value, say — can force a large
+// allocation before the decoder gets anywhere near rejecting it.
+const sshBodyLimit = 1 << 16 // 64 KiB
+
 // sshRemoteView is the wire shape for a Remote. sshfwd.Remote carries only
 // yaml tags (it round-trips ssh.yaml, not JSON), so this package owns its own
 // JSON projection rather than reaching into that struct's tags — the same
@@ -71,7 +80,10 @@ func (s *Server) handleSSHList(w http.ResponseWriter, r *http.Request) {
 
 	remotes, err := s.sshRegistry.List()
 	if err != nil {
-		writeError(w, err.Error(), http.StatusBadRequest)
+		// A List failure means ssh.yaml itself is unreadable or corrupt —
+		// not a caller error, so 500 rather than the 400 the other three
+		// handlers use for a rejected request.
+		writeError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -93,6 +105,7 @@ func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, sshBodyLimit)
 	var req sshRemoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, "invalid JSON body", http.StatusBadRequest)
@@ -119,7 +132,15 @@ func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sshfwd.ErrConfirmHostKey) {
 			var confirm *sshfwd.HostKeyConfirmation
-			errors.As(err, &confirm)
+			if !errors.As(err, &confirm) {
+				// registry.go only ever raises ErrConfirmHostKey by
+				// returning a *HostKeyConfirmation literal, so this can't
+				// happen today — but trusting that invariant silently
+				// would mean a future change to how it's wrapped turns
+				// into a nil-pointer panic here instead of a clean error.
+				writeError(w, "internal error handling host key confirmation", http.StatusInternalServerError)
+				return
+			}
 			writeJSONStatus(w, http.StatusConflict, map[string]string{
 				"host":        confirm.Host,
 				"fingerprint": confirm.Fingerprint,
@@ -140,12 +161,19 @@ func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// {host} is a mux wildcard, not a value ValidateRemote has already
+	// checked — Go's mux matches it against the escaped path segment but
+	// hands PathValue the unescaped result, so "foo%2Fbar" and "foo%00bar"
+	// arrive here as "foo/bar" and "foo\x00bar" rather than being rejected
+	// as an invalid route. Reject the same shapes ValidateRemote itself
+	// would reject for Host before this ever reaches Registry.
 	host := r.PathValue("host")
-	if host == "" {
-		writeError(w, "host is required", http.StatusBadRequest)
+	if err := sshfwd.ValidateHost(host); err != nil {
+		writeError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, sshBodyLimit)
 	var req sshPatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, "invalid JSON body", http.StatusBadRequest)
@@ -158,6 +186,10 @@ func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 		Port:         req.Port,
 	})
 	if err != nil {
+		if errors.Is(err, sshfwd.ErrHostNotFound) {
+			writeError(w, err.Error(), http.StatusNotFound)
+			return
+		}
 		writeError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -176,9 +208,12 @@ func (s *Server) handleSSHDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// See handleSSHPatch's comment: {host} arrives unescaped from the mux
+	// wildcard and must be validated the same way ValidateRemote validates
+	// a Host before it reaches Registry.
 	host := r.PathValue("host")
-	if host == "" {
-		writeError(w, "host is required", http.StatusBadRequest)
+	if err := sshfwd.ValidateHost(host); err != nil {
+		writeError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

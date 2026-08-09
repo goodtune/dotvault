@@ -233,34 +233,50 @@ func ValidateRemoteSocket(p string) error {
 	}
 }
 
-// ValidateRemote checks a single entry. The host validation guards against
-// injection attacks: ssh(1) will be invoked with this host string as a load-bearing
-// argument, so a leading dash or embedded @ must be rejected to prevent option-injection
-// or user-field manipulation.
-func ValidateRemote(r Remote) error {
-	if r.Host == "" {
+// ValidateHost checks a bare host string in isolation — the piece of
+// ValidateRemote that guards against injection attacks: ssh(1) will be
+// invoked with this string as a load-bearing argument, so a leading dash or
+// embedded @ must be rejected to prevent option-injection or user-field
+// manipulation.
+//
+// Exported separately from ValidateRemote so a caller that only has a host
+// string in hand — the web API's {host} path parameter, in particular,
+// which arrives with no accompanying Remote to validate as a whole — can
+// apply the identical rule rather than duplicating it. Two divergent
+// host-validation rules is exactly the drift the single-service-layer
+// design (Registry) exists to prevent.
+func ValidateHost(host string) error {
+	if host == "" {
 		return errors.New("host is required")
 	}
 	// Embedded @ is a user-field injection vector: "user@host" is the SSH login syntax,
 	// and the user comes from dotvault's agent identity, not this field.
 	// Leading dash is an option-injection vector: ssh treats "-oProxyCommand=..." as an option.
-	if strings.HasPrefix(r.Host, "-") {
-		return fmt.Errorf("invalid host %q: must not start with -", r.Host)
+	if strings.HasPrefix(host, "-") {
+		return fmt.Errorf("invalid host %q: must not start with -", host)
 	}
 	// Embedded @ is a user-field injection vector: "user@host" is the SSH login syntax,
 	// and the user comes from dotvault's agent identity, not this field.
-	if strings.ContainsRune(r.Host, '@') {
-		return fmt.Errorf("invalid host %q: must not contain @", r.Host)
+	if strings.ContainsRune(host, '@') {
+		return fmt.Errorf("invalid host %q: must not contain @", host)
 	}
 	// Reject control characters (< 0x20 and DEL 0x7f) that have no place in a hostname.
-	for _, b := range r.Host {
+	for _, b := range host {
 		if b < 0x20 || b == 0x7f {
-			return fmt.Errorf("invalid host %q: must not contain control characters", r.Host)
+			return fmt.Errorf("invalid host %q: must not contain control characters", host)
 		}
 	}
 	// Reject other problematic characters that could confuse shell parsing or path handling.
-	if strings.ContainsAny(r.Host, " \t\r\n/\\") {
-		return fmt.Errorf("invalid host %q", r.Host)
+	if strings.ContainsAny(host, " \t\r\n/\\") {
+		return fmt.Errorf("invalid host %q", host)
+	}
+	return nil
+}
+
+// ValidateRemote checks a single entry.
+func ValidateRemote(r Remote) error {
+	if err := ValidateHost(r.Host); err != nil {
+		return err
 	}
 	if r.Port < 0 || r.Port > 65535 {
 		return fmt.Errorf("port %d out of range 1-65535", r.Port)

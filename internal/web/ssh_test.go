@@ -278,6 +278,112 @@ func TestSSHRemotesDeleteUnknownHost(t *testing.T) {
 	}
 }
 
+func TestSSHRemotesPatchUnknownHost(t *testing.T) {
+	// The sibling of TestSSHRemotesDeleteUnknownHost: PATCH on a host with
+	// no configured entry must also be 404, distinguishable from a
+	// malformed patch body (400) via sshfwd.ErrHostNotFound.
+	s := sshTestServer(t, noopVerifier)
+
+	req := httptest.NewRequest("PATCH", "/api/v1/ssh/remotes/nope.example.com", jsonBody(t, map[string]any{"enabled": false}))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("host", "nope.example.com")
+	w := httptest.NewRecorder()
+	s.handleSSHPatch(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSSHRemotesAddOversizeBody(t *testing.T) {
+	// A body past sshBodyLimit must produce a 400 via MaxBytesReader, not a
+	// hang, a success, or an unbounded allocation.
+	s := sshTestServer(t, noopVerifier)
+
+	big := `{"host":"` + strings.Repeat("a", sshBodyLimit+1) + `"}`
+	req := httptest.NewRequest("POST", "/api/v1/ssh/remotes", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleSSHAdd(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an oversize body; body = %s", w.Code, w.Body.String())
+	}
+
+	remotes, err := s.sshRegistry.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(remotes) != 0 {
+		t.Errorf("List() = %v, want empty — an oversize body must not persist anything", remotes)
+	}
+}
+
+func TestSSHRemotesHostPathValueRejectsUnsafeShapes(t *testing.T) {
+	// {host} arrives from a mux wildcard, unescaped — a value that only
+	// PathValue's decoding produces (an embedded "/", a NUL byte) or a
+	// leading "-" (an ssh(1) option-injection vector) must never reach
+	// Registry. Exercised against both PATCH and DELETE, the two handlers
+	// that take host from the URL path rather than a validated request body.
+	cases := []struct {
+		name string
+		host string
+	}{
+		{"embedded slash from %2F", "foo/bar"},
+		{"embedded NUL from %00", "foo\x00bar"},
+		{"leading dash", "-oProxyCommand=x"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/PATCH", func(t *testing.T) {
+			s := sshTestServer(t, noopVerifier)
+			if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{}); err != nil {
+				t.Fatalf("seeding Add: %v", err)
+			}
+
+			req := httptest.NewRequest("PATCH", "/api/v1/ssh/remotes/x", jsonBody(t, map[string]any{"enabled": false}))
+			req.Header.Set("Content-Type", "application/json")
+			req.SetPathValue("host", tc.host)
+			w := httptest.NewRecorder()
+			s.handleSSHPatch(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+			}
+			remotes, err := s.sshRegistry.List()
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(remotes) != 1 || !remotes[0].EnabledOrDefault() {
+				t.Errorf("List() = %v, want the seeded remote untouched", remotes)
+			}
+		})
+
+		t.Run(tc.name+"/DELETE", func(t *testing.T) {
+			s := sshTestServer(t, noopVerifier)
+			if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{}); err != nil {
+				t.Fatalf("seeding Add: %v", err)
+			}
+
+			req := httptest.NewRequest("DELETE", "/api/v1/ssh/remotes/x", nil)
+			req.SetPathValue("host", tc.host)
+			w := httptest.NewRecorder()
+			s.handleSSHDelete(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+			}
+			remotes, err := s.sshRegistry.List()
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(remotes) != 1 {
+				t.Errorf("List() = %v, want the seeded remote still present", remotes)
+			}
+		})
+	}
+}
+
 func TestSSHEndpointsDisabledWithoutRegistry(t *testing.T) {
 	s := testServer(t) // sshRegistry left nil
 

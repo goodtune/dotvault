@@ -42,7 +42,14 @@ set (Unix only), or otherwise over its loopback web listener when web.enabled
 is set. On Windows only the web listener exists today, so web.enabled must be
 set there. "ssh list" degrades gracefully when neither is reachable (it falls
 back to reading ssh.yaml directly); "ssh add" and "ssh remove" cannot — a
-mutation always requires the daemon.`,
+mutation always requires the daemon.
+
+If a request happens to arrive over the very forward it is about to change —
+"ssh remove" run against a host reached only through the forward being
+removed, or a config edit that restarts it — the change still commits, but
+the connection carrying the request is dropped mid-response as that forward's
+old connection is torn down. Re-run over a different path (directly, or a
+different managed forward) to confirm the result.`,
 	}
 	cmd.AddCommand(newSSHAddCmd(), newSSHListCmd(), newSSHRemoveCmd())
 	return cmd

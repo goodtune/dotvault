@@ -66,9 +66,27 @@ func currentSSHPolicyConfig() config.SSHConfig {
 // 0600 inside a 0700 directory, while the TCP listener accepts connections
 // from any uid on the box. Getting this backwards would be a real exposure
 // regression, not a cosmetic default — see TestSSHForwardDepsPrefersAPISocket.
+//
+// This function is deliberately a pure construction: it does not itself call
+// updateSSHPolicyConfig. An earlier version did, which made it a "builder"
+// with a hidden global side effect — every caller (including every test)
+// silently rewrote package state, which prevented t.Parallel() and left at
+// least one test unable to tell whether a value it observed came from its
+// own argument or from the global the same call had just set. startSSHForwards,
+// the one production caller, owns seeding sshPolicyConfig instead.
 func sshForwardDeps(cfg *config.Config, backend sshfwd.SignerSource, username string) (sshfwd.Deps, error) {
 	if !cfg.Agent.Enabled {
 		return sshfwd.Deps{}, fmt.Errorf("managed SSH forwards require agent.enabled (the SSH identity is drawn from the agent backend)")
+	}
+	if backend == nil {
+		// Unreachable in production today — main.go only calls this with a
+		// non-nil backend when agent.Enabled is true (agentSvc.Backend is
+		// constructed alongside it) — but a nil backend reaching
+		// sshfwd.Signers would call List() on a nil interface: a panic
+		// inside a background reconnect goroutine, i.e. a process crash.
+		// Checking here makes the agent.enabled <-> non-nil-backend coupling
+		// structural instead of relying on main.go never getting it wrong.
+		return sshfwd.Deps{}, fmt.Errorf("managed SSH forwards require a non-nil agent backend (agent.enabled is true but no backend was supplied)")
 	}
 
 	apiSocketPath, err := cfg.APISocketPath()
@@ -102,14 +120,17 @@ func sshForwardDeps(cfg *config.Config, backend sshfwd.SignerSource, username st
 		return sshfwd.Deps{}, fmt.Errorf("managed SSH forwards require a local API surface: enable api.enabled (preferred) or web.enabled")
 	}
 
-	updateSSHPolicyConfig(cfg.SSH)
-
 	return sshfwd.Deps{
 		Signers:    func() ([]ssh.Signer, error) { return sshfwd.Signers(backend) },
 		User:       func() (string, error) { return username, nil },
 		Target:     target,
 		TargetName: targetName,
 		Policy: func(r sshfwd.Remote) *sshfwd.HostKeyPolicy {
+			// A fresh *HostKeyPolicy every call deliberately does not reuse
+			// HostKeyPolicy's own CA-parse cache across dials (see its doc
+			// comment in hostkey.go): a cached policy could not pick up a
+			// reloaded CA list, and re-parsing on each attempt is cheap at
+			// dial frequency.
 			cur := currentSSHPolicyConfig()
 			return &sshfwd.HostKeyPolicy{
 				CAs:      cur.CertificateAuthorities,
@@ -135,6 +156,7 @@ func startSSHForwards(ctx context.Context, cfg *config.Config, backend sshfwd.Si
 		slog.Warn("managed SSH forwards disabled", "error", err)
 		return nil, nil, ""
 	}
+	updateSSHPolicyConfig(cfg.SSH)
 
 	sshConfigPath, err = paths.SSHConfigPath()
 	if err != nil {

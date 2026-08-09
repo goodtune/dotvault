@@ -604,6 +604,14 @@ type APIUnixConfig struct {
 // AgentConfig: an exported config must re-emit cleared optional values so a
 // re-import can blank a previously-set list. The top-level SSH field keeps
 // `omitempty` so operators who do not use managed forwards see no empty block.
+//
+// The daemon applies a config-refresh-loop change to this section without a
+// restart (see cmd/dotvault's updateSSHPolicyConfig), but only on a remote's
+// *next* connection attempt: an already-established forward keeps using the
+// HostKeyPolicy it dialled with. Removing a CA, or turning
+// InsecureIgnoreHostKey back off, does not retroactively drop or re-verify a
+// forward that is already connected — it only takes effect on the next
+// reconnect.
 type SSHConfig struct {
 	// CertificateAuthorities lists trusted SSH host CAs in known_hosts
 	// @cert-authority form. A host whose certificate one of these signed

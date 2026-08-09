@@ -182,6 +182,14 @@ type Registry struct {
 	v    Verifier
 
 	mu sync.RWMutex
+
+	// resyncDelay, when set, is invoked by Resync between its Load and
+	// Reconcile calls, still holding the write lock. Production code never
+	// sets it; it exists purely so a test can widen the window a concurrent
+	// Add/Patch/Remove would need to sneak into, to prove they genuinely
+	// block on this same lock rather than merely losing a fast race by
+	// luck. Set via SetResyncDelayForTest.
+	resyncDelay func()
 }
 
 // NewRegistry returns a Registry backed by the ssh.yaml at path, reconciling
@@ -454,4 +462,43 @@ func (g *Registry) Remove(ctx context.Context, host string) (bool, error) {
 		return true, fmt.Errorf("removed from %s but could not apply it to the running set: %w", g.path, rerr)
 	}
 	return true, nil
+}
+
+// Resync re-reads ssh.yaml and reconciles the Manager against it, under the
+// same write lock Add/Patch/Remove use.
+//
+// This is what the daemon's config-refresh loop calls to pick up a hand-edit
+// of ssh.yaml on its periodic tick, instead of calling sshfwd.Load and
+// Manager.Reconcile directly. The lock matters: every other mutation
+// (Add/Patch/Remove) holds g.mu across its own Load -> Save -> Reconcile so
+// the file and the running set can never be observed to disagree. A caller
+// that read the file and reconciled outside that lock could race a
+// concurrent Add/Patch/Remove — read the file before a removal is saved,
+// then reconcile after the removal's own Reconcile has already run,
+// resurrecting the just-removed remote until the next call closes the
+// window. Resync closes that window by taking the identical lock.
+func (g *Registry) Resync(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	f, err := Load(g.path)
+	if err != nil {
+		return err
+	}
+	if g.resyncDelay != nil {
+		g.resyncDelay()
+	}
+	return g.mgr.Reconcile(ctx, f.Remotes)
+}
+
+// SetResyncDelayForTest installs a hook Resync invokes — still holding its
+// write lock — between reading ssh.yaml and reconciling the Manager against
+// it. Test-only seam: it exists so a test can deterministically prove Resync
+// serializes against a concurrent Add/Patch/Remove (rather than merely
+// racing fast enough not to notice), by giving it a reliable window in which
+// to attempt, and observe blocked, a concurrent mutation.
+func (g *Registry) SetResyncDelayForTest(f func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.resyncDelay = f
 }

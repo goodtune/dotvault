@@ -385,14 +385,16 @@ type refreshDeps struct {
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
-	// sshManager and sshConfigPath are set only when the managed-SSH-forward
-	// subsystem is running (see startSSHForwards). sshManager is nil
-	// whenever the daemon started without it — agent.enabled false, or
-	// neither a local API socket nor the web UI configured — in which case
-	// the loop skips both the ssh.yaml reload and the SSH-config-section
-	// dynamic update below.
-	sshManager    *sshfwd.Manager
-	sshConfigPath string
+	// sshRegistry is set only when the managed-SSH-forward subsystem is
+	// running (see startSSHForwards). Nil whenever the daemon started
+	// without it — agent.enabled false, or neither a local API socket nor
+	// the web UI configured — in which case the loop skips both the
+	// ssh.yaml resync and the SSH-config-section dynamic update below. The
+	// loop calls Registry.Resync rather than sshfwd.Load + Manager.Reconcile
+	// directly, so ssh.yaml's read-reconcile pair is always serialised
+	// against a concurrent Registry.Add/Patch/Remove under the same lock —
+	// see Resync's doc comment.
+	sshRegistry *sshfwd.Registry
 }
 
 // staticSections snapshots the config sections the daemon cannot apply
@@ -625,23 +627,25 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 		// admin-owned SSH config section (CAs, insecure flag), which is
 		// dynamic — see TestStaticSectionsCoverConfig — and reaches every
 		// future connection attempt via updateSSHPolicyConfig's atomic
-		// value rather than anything captured at startup. Both go through
-		// the Manager directly, not the Registry: the Registry's own
-		// mutations (Add/Patch/Remove) already reconcile inside their own
-		// write lock, and Manager.Reconcile is itself safe to call
-		// concurrently with those and with itself (see its doc comment),
-		// so this needs no extra locking here.
-		if d.sshManager != nil {
+		// value rather than anything captured at startup.
+		//
+		// The ssh.yaml side goes through Registry.Resync, not a direct
+		// sshfwd.Load + Manager.Reconcile: Resync takes the same write lock
+		// Add/Patch/Remove hold across their own Load->Save->Reconcile, so a
+		// concurrent API mutation can never be raced and then reverted by
+		// this tick reconciling a file read before the mutation's Save. The
+		// SSH-config-section update below does go through the Manager's
+		// (well, the package-level atomic's) own synchronisation, since it
+		// touches no file.
+		if d.sshRegistry != nil {
 			if !reflect.DeepEqual(reloaded.SSH, lastSSH) {
 				changed = true
 				slog.Info("ssh config section changed, applying to future connection attempts")
 				updateSSHPolicyConfig(reloaded.SSH)
 				lastSSH = reloaded.SSH
 			}
-			if file, err := sshfwd.Load(d.sshConfigPath); err != nil {
-				slog.Warn("failed to reload ssh.yaml", "path", d.sshConfigPath, "error", err)
-			} else if err := d.sshManager.Reconcile(ctx, file.Remotes); err != nil {
-				slog.Warn("failed to reconcile managed SSH forwards", "error", err)
+			if err := d.sshRegistry.Resync(ctx); err != nil {
+				slog.Warn("failed to resync managed SSH forwards from ssh.yaml", "error", err)
 			}
 		}
 
@@ -1184,7 +1188,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if agentSvc != nil {
 		sshBackend = agentSvc.Backend
 	}
-	sshManager, sshRegistry, sshConfigPath := startSSHForwards(ctx, cfg, sshBackend, username)
+	sshManager, sshRegistry, _ := startSSHForwards(ctx, cfg, sshBackend, username)
 	if sshManager != nil {
 		defer sshManager.Close()
 		if webServer != nil {
@@ -1385,8 +1389,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		watchManager:   wm,
 		web:            webServer,
 		enrolManager:   enrolMgr,
-		sshManager:     sshManager,
-		sshConfigPath:  sshConfigPath,
+		sshRegistry:    sshRegistry,
 	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)

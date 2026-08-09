@@ -9,6 +9,23 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/goodtune/dotvault/internal/observability"
+)
+
+// recordSSHConnState, recordSSHReconnect, recordSSHConnectFailure, and
+// recordSSHKeepaliveFailure are observability.RecordSSH* indirected through
+// package-level vars — the same seam dialRemote/forwardRemote/keepaliveRemote
+// below use — so a test can substitute a spy and assert exactly what a call
+// site recorded (in particular, that the connect-failure class is the fixed
+// ErrorClass string and not an error's free-form message) without standing
+// up a real OTel reader.
+var (
+	recordSSHConnState        = observability.RecordSSHConnState
+	recordSSHReconnect        = observability.RecordSSHReconnect
+	recordSSHConnectFailure   = observability.RecordSSHConnectFailure
+	recordSSHKeepaliveFailure = observability.RecordSSHKeepaliveFailure
+	recordSSHForwardConn      = observability.RecordSSHForwardConn
 )
 
 // ClientWaitTimeout bounds how long WaitForClient blocks for a connection to
@@ -170,11 +187,17 @@ func (r *ManagedRemote) teardownConnection(closeFn func() error) {
 }
 
 // onConn adjusts the active-connection count reported in status; wired as
-// ServeForward's onConn callback.
+// ServeForward's onConn callback. It also drives the forward-connection
+// metrics: onConn has no context of its own (it is a plain func(int)
+// callback threaded through the transport-agnostic serveListener, which
+// carries no host identity to label with), so the record calls use
+// context.Background() — these are fire-and-forget counters, not requests
+// that need trace correlation.
 func (r *ManagedRemote) onConn(delta int) {
 	r.mu.Lock()
 	r.activeConns += delta
 	r.mu.Unlock()
+	recordSSHForwardConn(context.Background(), r.cfg.Host, delta)
 }
 
 // status returns a snapshot of this remote's condition, with target filled
@@ -292,6 +315,7 @@ func stateForClass(class ErrorClass, generic State) State {
 func (r *ManagedRemote) fail(ctx context.Context, err error) {
 	class := Classify(err)
 	slog.Warn("sshfwd: connection attempt failed", "host", r.cfg.Host, "class", class, "error", err)
+	recordSSHConnectFailure(ctx, r.cfg.Host, string(class))
 	r.setState(stateForClass(class, StateOffline), err)
 	r.sleep(ctx, r.backoffDelay(class))
 }
@@ -409,6 +433,7 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	r.connectedSince = &now
 	r.mu.Unlock()
 	r.setState(StateConnected, nil)
+	recordSSHConnState(ctx, r.cfg.Host, true)
 	slog.Info("sshfwd: connected to remote", "host", r.cfg.Host)
 
 	// A connection that stays up for StableConnectionThreshold has proven
@@ -434,7 +459,16 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	}()
 	go func() {
 		defer connWG.Done()
-		errCh <- keepaliveRemote(connCtx, client, keepaliveInterval, keepaliveStrikes)
+		kerr := keepaliveRemote(connCtx, client, keepaliveInterval, keepaliveStrikes)
+		// connCtx.Err() != nil means this returned because ServeForward failed
+		// first (or the outer ctx was cancelled) and cancelConn() tore down the
+		// keepalive loop out from under it — an ordinary shutdown, not a
+		// keepalive failure, so only a genuine strike-threshold error (returned
+		// while connCtx is still live) counts here.
+		if kerr != nil && connCtx.Err() == nil {
+			recordSSHKeepaliveFailure(ctx, r.cfg.Host)
+		}
+		errCh <- kerr
 	}()
 
 	err := <-errCh
@@ -456,6 +490,7 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	r.mu.Lock()
 	r.connectedSince = nil
 	r.mu.Unlock()
+	recordSSHConnState(ctx, r.cfg.Host, false)
 
 	if ctx.Err() != nil {
 		// Shutdown, not a failure: run's loop condition will exit next, and
@@ -467,6 +502,7 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	r.mu.Lock()
 	r.reconnects++
 	r.mu.Unlock()
+	recordSSHReconnect(ctx, r.cfg.Host)
 
 	class := Classify(err)
 	slog.Warn("sshfwd: remote connection lost; reconnecting", "host", r.cfg.Host, "class", class, "error", err)

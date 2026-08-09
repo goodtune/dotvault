@@ -14,7 +14,14 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/goodtune/dotvault/internal/observability"
 )
+
+// recordSSHForwardFailure is observability.RecordSSHForwardFailure indirected
+// through a package-level var, mirroring the seam remote.go uses for its own
+// Record* calls, so a test can substitute a spy.
+var recordSSHForwardFailure = observability.RecordSSHForwardFailure
 
 // ErrBind marks a failure to bind the remote Unix socket. The usual causes are
 // AllowStreamLocalForwarding being off on the remote sshd, an unwritable
@@ -269,6 +276,7 @@ func serveListener(ctx context.Context, ln net.Listener, target Dialer, onConn f
 				// The local API surface being momentarily unavailable must not
 				// stop the accept loop: the forward outlives any one request.
 				slog.Warn("forward target dial failed", "error", err)
+				recordSSHForwardFailure(ctx)
 				conn.Close()
 				return
 			}

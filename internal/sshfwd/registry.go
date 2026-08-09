@@ -40,7 +40,14 @@ type Verifier interface {
 type VerifyResult struct {
 	// HostKey is the remote's key in authorized_keys form, ready to store on
 	// Remote.HostKey. Empty when a configured certificate authority covers
-	// the host instead, or when Verified is false.
+	// the host instead, when Verified is false, or when the offered key
+	// matched the pin Add passed in as the Remote's HostKey (see Add) — a
+	// successful match confirms nothing new, so there is no fresh key to
+	// report. Add falls back to the pin it already had on file in that
+	// last case, so a Verifier must NOT echo the pin back defensively "to
+	// be safe": doing so is harmless (it is the same value), but leaving
+	// HostKey empty on a matched pin is the expected, supported way to say
+	// "no change" and must not be read as "unpin this host".
 	HostKey string
 
 	// Fingerprint is the SHA256 fingerprint of HostKey, present exactly when
@@ -212,6 +219,14 @@ func (g *Registry) storedHostKey(host string) (string, error) {
 // into a fresh, confirmable "first use" prompt instead of a rejected
 // mismatch, exactly what ErrConfirmHostKey's doc comment says must never
 // happen.
+//
+// The stored pin also protects the write on the way out: a Verify success
+// that reports no HostKey (a match against the pin it was handed, or a
+// CA-covered host) falls back to the existing pin rather than blanking it —
+// see VerifyResult.HostKey. Without that fallback, every ordinary re-Add of
+// an already-pinned host would silently unpin it the moment a Verifier
+// implementation chose the natural "nothing changed, nothing to report"
+// shape for a match.
 func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote, error) {
 	if r.RemoteSocket == "" {
 		r.RemoteSocket = DefaultRemoteSocket
@@ -282,9 +297,18 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 			// policy): never pin, no matter what HostKey/Fingerprint say.
 			r.HostKey = ""
 		case result.Fingerprint == "":
-			// Verified with nothing new to confirm: CA-covered, or already
-			// matched the stored pin.
-			r.HostKey = result.HostKey
+			// Verified with nothing new to confirm: CA-covered (HostKey
+			// legitimately empty), or the offered key already matched the
+			// stored pin (HostKey empty per the "no change" convention
+			// documented on VerifyResult.HostKey — see R1). Falling back to
+			// existingHostKey rather than blanking means a bare
+			// "it matched" result can never unpin an already-trusted host,
+			// on the everyday re-Add path and not just under Force.
+			if result.HostKey != "" {
+				r.HostKey = result.HostKey
+			} else {
+				r.HostKey = existingHostKey
+			}
 		case opts.AcceptFingerprint == "":
 			return nil, &HostKeyConfirmation{Host: r.Host, Fingerprint: result.Fingerprint}
 		case opts.AcceptFingerprint != result.Fingerprint:

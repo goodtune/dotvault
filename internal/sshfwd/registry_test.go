@@ -47,6 +47,27 @@ func (c *capturingVerifier) Verify(ctx context.Context, r Remote) (VerifyResult,
 	return c.result, c.err
 }
 
+// stepVerifier returns a different VerifyResult on each successive call, so a
+// test can simulate a verifier's behaviour changing between an initial Add
+// and a later re-Add of the same host (e.g. "new key, needs confirmation"
+// followed by "matched the pin, nothing new to report").
+type stepVerifier struct {
+	mu    sync.Mutex
+	steps []VerifyResult
+	n     int
+}
+
+func (s *stepVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.n
+	if i >= len(s.steps) {
+		i = len(s.steps) - 1
+	}
+	s.n++
+	return s.steps[i], nil
+}
+
 // testHostKey generates a fresh, self-consistent (authorized-key, SHA256
 // fingerprint) pair. Add now independently re-derives a reported key's
 // fingerprint and refuses to pin if the two disagree, so any test whose
@@ -480,6 +501,40 @@ func TestAddForcePreservesExistingPin(t *testing.T) {
 	}
 	if f.Remotes[0].Port != 2222 {
 		t.Fatalf("Force re-add did not apply the config change: %+v", f.Remotes)
+	}
+}
+
+// TestAddPreservesStoredPinWhenVerifyReportsNoKey is R1's test: the everyday
+// re-Add path, not just Force, must not unpin an already-trusted host when
+// Verify reports success with no HostKey — the natural shape for "the
+// offered key matched the pin you handed me, nothing new to confirm" (see
+// VerifyResult.HostKey's doc comment).
+func TestAddPreservesStoredPinWhenVerifyReportsNoKey(t *testing.T) {
+	key, fp := testHostKey(t)
+	v := &stepVerifier{steps: []VerifyResult{
+		{Verified: true, HostKey: key, Fingerprint: fp}, // initial Add: new key, needs confirmation
+		{Verified: true}, // re-Add: matched the stored pin, nothing new
+	}}
+	g, path := newTestRegistry(t, v)
+	ctx := context.Background()
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, AddOptions{AcceptFingerprint: fp}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com", Port: 2222}, AddOptions{}); err != nil {
+		t.Fatalf("re-Add() = %v", err)
+	}
+
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Remotes) != 1 || f.Remotes[0].HostKey != key {
+		t.Fatalf("re-Add unpinned an already-trusted host: %+v", f.Remotes)
+	}
+	if f.Remotes[0].Port != 2222 {
+		t.Fatalf("re-Add did not apply the config change: %+v", f.Remotes)
 	}
 }
 

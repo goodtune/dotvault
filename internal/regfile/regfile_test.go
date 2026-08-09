@@ -1238,3 +1238,65 @@ func TestSSHSectionRegfileRoundTrip(t *testing.T) {
 		t.Errorf("SSH round trip:\n got %+v\nwant %+v", got.SSH, in.SSH)
 	}
 }
+
+// TestEmptySSHCertificateAuthoritiesEmitsEmptyMultiSZ guards the
+// explicit-empty-list case: a CertificateAuthorities key present in YAML as
+// `[]` must still emit an empty REG_MULTI_SZ (not be omitted), and parsing
+// that back must produce a non-nil empty slice — the same explicit-empty
+// vs. absent distinction TestNilSSHCertificateAuthoritiesOmitted below
+// checks from the other side. Collapsing the two would make "explicitly no
+// trusted CAs" indistinguishable from "policy doesn't mention CAs at all".
+func TestEmptySSHCertificateAuthoritiesEmitsEmptyMultiSZ(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		SSH:   config.SSHConfig{CertificateAuthorities: []string{}},
+	}
+	got := mustGenerate(t, cfg)
+	// Empty REG_MULTI_SZ is just the trailing NUL pair: 00,00.
+	if !strings.Contains(got, `"CertificateAuthorities"=hex(7):00,00`) {
+		t.Errorf("expected empty REG_MULTI_SZ for empty CertificateAuthorities; got:\n%s", got)
+	}
+
+	parsed, err := Parse([]byte(got))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if parsed.SSH.CertificateAuthorities == nil {
+		t.Error("CertificateAuthorities parsed back as nil, want non-nil empty slice")
+	}
+	if len(parsed.SSH.CertificateAuthorities) != 0 {
+		t.Errorf("CertificateAuthorities = %v, want empty", parsed.SSH.CertificateAuthorities)
+	}
+}
+
+// TestNilSSHCertificateAuthoritiesOmitted guards the absent case: when
+// CertificateAuthorities is nil (not mentioned in YAML), the value must be
+// omitted from the rendered output rather than emitted as an empty
+// REG_MULTI_SZ, matching the OAuth Scopes / Vault Policies treatment.
+func TestNilSSHCertificateAuthoritiesOmitted(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		// SSH.CertificateAuthorities left nil.
+	}
+	got := mustGenerate(t, cfg)
+	if strings.Contains(got, `"CertificateAuthorities"=`) {
+		t.Errorf("nil CertificateAuthorities should be omitted from output; got:\n%s", got)
+	}
+}
+
+// TestSSHSectionEmitsDeletionStanza is the regression test for the
+// highest-consequence failure mode of this section: if the SSH key were not
+// pre-deleted before being recreated, a certificate authority removed from
+// the source YAML would survive a re-import and stay trusted in the
+// registry — a silent trust escalation. This asserts the deletion stanza is
+// present even when the section carries nothing to re-create, mirroring
+// TestEmptyRulesEmitsOnlyDeletion.
+func TestSSHSectionEmitsDeletionStanza(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+	}
+	got := mustGenerate(t, cfg)
+	if !strings.Contains(got, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\SSH]`) {
+		t.Errorf("expected SSH deletion stanza even with no SSH config:\n%s", got)
+	}
+}

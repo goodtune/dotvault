@@ -206,7 +206,7 @@ services:
   # disabled" cases would mean toggling and reloading sshd mid-suite, which
   # is both slower and less deterministic than two fixed, independent servers.
   sshd:
-    image: lscr.io/linuxserver/openssh-server:latest
+    image: lscr.io/linuxserver/openssh-server:10.3_p1-r0-ls233
     container_name: dotvault-sshd
     profiles: ["sshfwd"]
     environment:
@@ -227,7 +227,7 @@ services:
 
   # AllowStreamLocalForwarding no — see TestVerifyRefusesWhenForwardingDisabled.
   sshd-noforward:
-    image: lscr.io/linuxserver/openssh-server:latest
+    image: lscr.io/linuxserver/openssh-server:10.3_p1-r0-ls233
     container_name: dotvault-sshd-noforward
     profiles: ["sshfwd"]
     environment:

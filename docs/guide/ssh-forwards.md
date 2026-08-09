@@ -10,7 +10,7 @@ dotvault is already a long-lived daemon with its own SSH identity (the [SSH agen
 
 ## Preconditions
 
-Two, and both are hard requirements — a remote whose preconditions aren't met is not an error, it just never connects (see [States](#states) below):
+Two, and both are hard requirements — a remote whose preconditions aren't met is not an error, it just never connects (see [Runtime state](#runtime-state) below):
 
 - **A local API surface.** The forward's target is dotvault's own web API, so something has to be listening: `api.enabled` (the per-user API socket) or `web.enabled` (the loopback web listener). When both are configured the **API socket is preferred** — it is `0600` inside a `0700` directory, whereas the TCP listener `web.enabled` controls is reachable by every uid on the box.
 - **`agent.enabled`**, with at least one usable key source. The SSH identity used to authenticate to each remote is drawn from the same [agent backend](ssh-agent.md) that serves `ssh-add -l` — there is no separate credential to configure.
@@ -119,7 +119,9 @@ ssh:
 
 ## Stale sockets
 
-Because `x/crypto/ssh` doesn't unlink a stale socket for you and `sshd` won't bind over an existing path, a bind failure on the remote doesn't automatically mean the path is free. dotvault proves nothing is actually listening there before reclaiming it — a live `ssh -R` session using that same path is never evicted out from under whoever is using it. Only once that's confirmed does dotvault attempt one `rm -f` on the remote and retry the bind, once.
+Because `x/crypto/ssh` doesn't unlink a stale socket for you and `sshd` won't bind over an existing path, a bind failure on the remote doesn't automatically mean the path is free. dotvault proves nothing it could otherwise dial is actually listening there before reclaiming it, so a live `ssh -R` session it can freely reach is never evicted out from under it. Only once that's confirmed does dotvault attempt one `rm -f` on the remote and retry the bind, once.
+
+That probe cannot distinguish "nothing is listening" from "something is listening that this account cannot reach": a permission-restricted socket left at the same absolute path by a *different* local account would look identical to an empty path and get reclaimed. This is not currently guarded against — it's why `remote_socket` defaults under the connecting account's own home rather than a shared location, where such a collision can't arise in the first place.
 
 ## Runtime state
 

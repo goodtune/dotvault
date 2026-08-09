@@ -149,13 +149,22 @@ type Server struct {
 	// so only one write runs at a time.
 	clipboardMu sync.Mutex
 
+	// sshMu guards sshRegistry and sshStatus, mirroring rulesMu: the daemon
+	// wires the managed-SSH-forward subsystem in after NewServer returns —
+	// it needs an authenticated Vault client to resolve the agent's SSH
+	// identities, so it is only built once the daemon's first auth succeeds
+	// — concurrently with requests already being served (a web-enabled
+	// daemon starts routes before authentication completes, so it can serve
+	// the login page).
+	sshMu sync.RWMutex
 	// sshRegistry is the single service layer through which the SSH CRUD
 	// endpoints mutate ssh.yaml. Nil when managed forwards are not
 	// configured, in which case the four handlers return 503 rather than
-	// panic.
+	// panic. Guarded by sshMu; read through sshRegistrySnapshot.
 	sshRegistry *sshfwd.Registry
 	// sshStatus, when non-nil, reports the live condition of every managed
-	// remote for /api/v1/status's "ssh" block.
+	// remote for /api/v1/status's "ssh" block. Guarded by sshMu; read
+	// through sshStatusSnapshot.
 	sshStatus func() []sshfwd.RemoteStatus
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
@@ -647,6 +656,37 @@ func (s *Server) SetReauthGate(g interface{ NeedsReauth() bool }) {
 func (s *Server) needsReauth() bool {
 	h, ok := s.reauthGate.Load().(reauthGateHolder)
 	return ok && h.gate != nil && h.gate.NeedsReauth()
+}
+
+// SetSSHRegistry wires the managed-SSH-forward Registry and live-status
+// query in after construction, once the daemon has built them (which
+// requires an authenticated Vault client — see the daemon's startup
+// sequencing). Guarded by sshMu because the server may already be serving
+// requests (a socket/web-enabled daemon starts routes before authentication
+// completes, so it can serve the login page) concurrently with this call.
+func (s *Server) SetSSHRegistry(reg *sshfwd.Registry, status func() []sshfwd.RemoteStatus) {
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
+	s.sshRegistry = reg
+	s.sshStatus = status
+}
+
+// sshRegistrySnapshot returns the currently wired SSH registry, or nil if
+// none is configured. Handlers must read through this rather than the raw
+// field, which SetSSHRegistry can mutate concurrently.
+func (s *Server) sshRegistrySnapshot() *sshfwd.Registry {
+	s.sshMu.RLock()
+	defer s.sshMu.RUnlock()
+	return s.sshRegistry
+}
+
+// sshStatusSnapshot returns the currently wired SSH status query, or nil if
+// none is configured. Handlers must read through this rather than the raw
+// field, which SetSSHRegistry can mutate concurrently.
+func (s *Server) sshStatusSnapshot() func() []sshfwd.RemoteStatus {
+	s.sshMu.RLock()
+	defer s.sshMu.RUnlock()
+	return s.sshStatus
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {

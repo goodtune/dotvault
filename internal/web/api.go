@@ -91,8 +91,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// to the per-rule sync state above. Not secret — a host key fingerprint
 	// and a socket path are not credentials — so served unauthenticated
 	// like the rest of this block.
-	if s.sshStatus != nil {
-		status["ssh"] = s.sshStatus()
+	if sshStatus := s.sshStatusSnapshot(); sshStatus != nil {
+		status["ssh"] = sshStatus()
 	}
 
 	writeJSON(w, status)

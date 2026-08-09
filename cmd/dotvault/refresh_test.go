@@ -15,6 +15,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/observability"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/sync"
 )
 
@@ -449,6 +450,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",
+		"SSH":                "dynamic", // certificate_authorities/insecure_ignore_host_key applied via updateSSHPolicyConfig's atomic value
 		"BypassSystemConfig": "static",
 		"Managed":            "derived", // set by the loader from the config source, not a section
 	}
@@ -627,4 +629,174 @@ func TestRunConfigRefreshCadenceFollowsReload(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestRunConfigRefreshAppliesSSHConfigDynamically proves the SSH section's
+// "dynamic" classification (see TestStaticSectionsCoverConfig) is actually
+// implemented, not merely asserted: a reloaded certificate_authorities list
+// must reach a HostKeyPolicy built *after* the reload, via
+// updateSSHPolicyConfig's atomic value, with no daemon restart.
+func TestRunConfigRefreshAppliesSSHConfigDynamically(t *testing.T) {
+	oldCA := "@cert-authority * ssh-ed25519 AAAAOLD old-ca"
+	newCA := "@cert-authority * ssh-ed25519 AAAANEW new-ca"
+
+	// Isolate this test from sshPolicyConfig's package-level state.
+	updateSSHPolicyConfig(config.SSHConfig{CertificateAuthorities: []string{oldCA}})
+	t.Cleanup(func() { updateSSHPolicyConfig(config.SSHConfig{}) })
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		SSH:   config.SSHConfig{CertificateAuthorities: []string{oldCA}},
+	}
+
+	edited := *initial
+	edited.SSH = config.SSHConfig{CertificateAuthorities: []string{newCA}}
+
+	var current atomic.Pointer[config.Config]
+	current.Store(initial)
+	loader := func() (*config.Config, error) { return current.Load(), nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	sshMgr := sshfwd.NewManager(sshfwd.Deps{})
+	t.Cleanup(sshMgr.Close)
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour,
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+			sshManager:     sshMgr,
+			sshConfigPath:  sshConfigPath,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	if got := currentSSHPolicyConfig().CertificateAuthorities; len(got) != 1 || got[0] != oldCA {
+		t.Fatalf("before any reload, currentSSHPolicyConfig = %v, want [%q]", got, oldCA)
+	}
+
+	current.Store(&edited)
+	reloadCh <- struct{}{}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := currentSSHPolicyConfig().CertificateAuthorities; len(got) == 1 && got[0] == newCA {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reloaded SSH config section was not applied; currentSSHPolicyConfig = %v, want [%q]",
+				currentSSHPolicyConfig().CertificateAuthorities, newCA)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// A HostKeyPolicy built via sshForwardDeps after the reload must see the
+	// new CA list, not whatever was current when the daemon started. The
+	// config passed here only needs a valid local-API-surface + agent
+	// precondition; Policy's CA source is currentSSHPolicyConfig, already
+	// proven above to carry the reloaded value.
+	built, err := sshForwardDeps(&config.Config{
+		Web:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
+		Agent: config.AgentConfig{Enabled: true},
+		SSH:   edited.SSH,
+	}, nil, "user")
+	if err != nil {
+		t.Fatalf("sshForwardDeps: %v", err)
+	}
+	got := built.Policy(sshfwd.Remote{Host: "example.com"})
+	if len(got.CAs) != 1 || got.CAs[0] != newCA {
+		t.Errorf("policy built after reload has CAs = %v, want [%q]", got.CAs, newCA)
+	}
+}
+
+// TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit proves the stated
+// hand-edit-converges-without-restart requirement: editing ssh.yaml directly
+// (as a human, bypassing the Registry/web API entirely) must be picked up by
+// the next refresh pass.
+func TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit(t *testing.T) {
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
+
+	sshMgr := sshfwd.NewManager(sshfwd.Deps{})
+	t.Cleanup(sshMgr.Close)
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+	}
+	loader := func() (*config.Config, error) { c := *initial; return &c, nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour,
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+			sshManager:     sshMgr,
+			sshConfigPath:  sshConfigPath,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	reloadCh <- struct{}{} // pass 1: no ssh.yaml yet -> zero remotes
+	if got := sshMgr.Status(); len(got) != 0 {
+		t.Fatalf("Status = %v, want empty before ssh.yaml exists", got)
+	}
+
+	// Hand-edit ssh.yaml directly, the way a human editing the file (or an
+	// older `dotvault ssh add` run against a stopped daemon) would — not
+	// through the Registry.
+	f := &sshfwd.File{Remotes: []sshfwd.Remote{{Host: "example.com", RemoteSocket: sshfwd.DefaultRemoteSocket}}}
+	if err := sshfwd.Save(sshConfigPath, f); err != nil {
+		t.Fatal(err)
+	}
+
+	reloadCh <- struct{}{} // pass 2: should pick up the new remote
+
+	deadline := time.After(2 * time.Second)
+	for {
+		st := sshMgr.Status()
+		if len(st) == 1 && st[0].Host == "example.com" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("hand-edited ssh.yaml was not reconciled into the running manager; status=%v", st)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }

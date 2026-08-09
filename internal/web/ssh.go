@@ -73,12 +73,13 @@ type sshPatchRequest struct {
 
 // handleSSHList returns every configured remote.
 func (s *Server) handleSSHList(w http.ResponseWriter, r *http.Request) {
-	if s.sshRegistry == nil {
+	reg := s.sshRegistrySnapshot()
+	if reg == nil {
 		writeError(w, "managed SSH forwards are not configured", http.StatusServiceUnavailable)
 		return
 	}
 
-	remotes, err := s.sshRegistry.List()
+	remotes, err := reg.List()
 	if err != nil {
 		// A List failure means ssh.yaml itself is unreadable or corrupt —
 		// not a caller error, so 500 rather than the 400 the other three
@@ -100,7 +101,8 @@ func (s *Server) handleSSHList(w http.ResponseWriter, r *http.Request) {
 // same confirmation gesture the CLI uses, so a browser session cannot
 // degrade the trust decision into blind trust-on-first-use.
 func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
-	if s.sshRegistry == nil {
+	reg := s.sshRegistrySnapshot()
+	if reg == nil {
 		writeError(w, "managed SSH forwards are not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -128,7 +130,7 @@ func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
 		AcceptFingerprint: req.AcceptFingerprint,
 	}
 
-	got, err := s.sshRegistry.Add(r.Context(), remote, opts)
+	got, err := reg.Add(r.Context(), remote, opts)
 	if err != nil {
 		if errors.Is(err, sshfwd.ErrConfirmHostKey) {
 			var confirm *sshfwd.HostKeyConfirmation
@@ -156,7 +158,8 @@ func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
 
 // handleSSHPatch applies a partial update to an existing remote.
 func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
-	if s.sshRegistry == nil {
+	reg := s.sshRegistrySnapshot()
+	if reg == nil {
 		writeError(w, "managed SSH forwards are not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -180,7 +183,7 @@ func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	got, err := s.sshRegistry.Patch(r.Context(), host, sshfwd.Patch{
+	got, err := reg.Patch(r.Context(), host, sshfwd.Patch{
 		Enabled:      req.Enabled,
 		RemoteSocket: req.RemoteSocket,
 		Port:         req.Port,
@@ -203,7 +206,8 @@ func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 // "no such entry" (unlike Registry.Remove's internal callers, which want
 // idempotency to make retries safe).
 func (s *Server) handleSSHDelete(w http.ResponseWriter, r *http.Request) {
-	if s.sshRegistry == nil {
+	reg := s.sshRegistrySnapshot()
+	if reg == nil {
 		writeError(w, "managed SSH forwards are not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -217,7 +221,7 @@ func (s *Server) handleSSHDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	found, err := s.sshRegistry.Remove(r.Context(), host)
+	found, err := reg.Remove(r.Context(), host)
 	if err != nil {
 		writeError(w, err.Error(), http.StatusBadRequest)
 		return

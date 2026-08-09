@@ -32,6 +32,7 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
@@ -384,6 +385,14 @@ type refreshDeps struct {
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
+	// sshManager and sshConfigPath are set only when the managed-SSH-forward
+	// subsystem is running (see startSSHForwards). sshManager is nil
+	// whenever the daemon started without it — agent.enabled false, or
+	// neither a local API socket nor the web UI configured — in which case
+	// the loop skips both the ssh.yaml reload and the SSH-config-section
+	// dynamic update below.
+	sshManager    *sshfwd.Manager
+	sshConfigPath string
 }
 
 // staticSections snapshots the config sections the daemon cannot apply
@@ -550,6 +559,7 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastInterval := d.initial.Sync.Interval
 	lastCadence := d.interval
 	lastStatic := d.initialStatic
+	lastSSH := d.initial.SSH
 
 	refresh := func() {
 		reloaded, err := d.load()
@@ -607,6 +617,32 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 			changed = true
 			ticker.Reset(cadence)
 			lastCadence = cadence
+		}
+
+		// The managed-SSH-forward subsystem, when running, applies two
+		// independent things on every pass: the ssh.yaml remotes list (a
+		// hand-edit, or an API mutation that raced this tick) and the
+		// admin-owned SSH config section (CAs, insecure flag), which is
+		// dynamic — see TestStaticSectionsCoverConfig — and reaches every
+		// future connection attempt via updateSSHPolicyConfig's atomic
+		// value rather than anything captured at startup. Both go through
+		// the Manager directly, not the Registry: the Registry's own
+		// mutations (Add/Patch/Remove) already reconcile inside their own
+		// write lock, and Manager.Reconcile is itself safe to call
+		// concurrently with those and with itself (see its doc comment),
+		// so this needs no extra locking here.
+		if d.sshManager != nil {
+			if !reflect.DeepEqual(reloaded.SSH, lastSSH) {
+				changed = true
+				slog.Info("ssh config section changed, applying to future connection attempts")
+				updateSSHPolicyConfig(reloaded.SSH)
+				lastSSH = reloaded.SSH
+			}
+			if file, err := sshfwd.Load(d.sshConfigPath); err != nil {
+				slog.Warn("failed to reload ssh.yaml", "path", d.sshConfigPath, "error", err)
+			} else if err := d.sshManager.Reconcile(ctx, file.Remotes); err != nil {
+				slog.Warn("failed to reconcile managed SSH forwards", "error", err)
+			}
 		}
 
 		// Static sections can't be applied in place, so a change is a
@@ -1135,6 +1171,27 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
+	// Build and start the managed-SSH-forward subsystem now that we hold a
+	// Vault token: its SSH identity (the agent backend's Signers) may need
+	// to mint a Vault-CA certificate or read a KV-stored key, either of
+	// which requires an authenticated Vault client. Deferred to this point
+	// rather than constructed alongside agentSvc above so a remote's first
+	// connection attempt never races startup and lands in the 5-minute
+	// auth-failure backoff floor over what would otherwise resolve within
+	// seconds. Neither precondition (agent.enabled, a local API surface) is
+	// fatal — see startSSHForwards.
+	var sshBackend sshfwd.SignerSource
+	if agentSvc != nil {
+		sshBackend = agentSvc.Backend
+	}
+	sshManager, sshRegistry, sshConfigPath := startSSHForwards(ctx, cfg, sshBackend, username)
+	if sshManager != nil {
+		defer sshManager.Close()
+		if webServer != nil {
+			webServer.SetSSHRegistry(sshRegistry, sshManager.Status)
+		}
+	}
+
 	// Watch the token file for replacement and nudge the lifecycle
 	// manager to re-read it immediately. This is the in-process
 	// analogue of the old systemd `.path` unit (which SIGHUP'd the
@@ -1328,6 +1385,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		watchManager:   wm,
 		web:            webServer,
 		enrolManager:   enrolMgr,
+		sshManager:     sshManager,
+		sshConfigPath:  sshConfigPath,
 	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)

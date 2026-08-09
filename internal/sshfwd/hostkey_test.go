@@ -56,6 +56,9 @@ func TestHostKeyPolicyRejectsChangedKey(t *testing.T) {
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("changed key reported as unknown, not mismatched: %v", err)
 	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("changed key error does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
+	}
 }
 
 func TestHostKeyPolicyRejectsUnknownAndReportsIt(t *testing.T) {
@@ -122,6 +125,9 @@ func TestHostKeyPolicyRejectsCertFromUnknownCA(t *testing.T) {
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("cert from an unconfigured CA reported as unknown, not rejected: %v", err)
 	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("cert from an unconfigured CA does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
+	}
 }
 
 // TestHostKeyPolicyRejectsUserCertAsHostCert pins the single most
@@ -144,6 +150,9 @@ func TestHostKeyPolicyRejectsUserCertAsHostCert(t *testing.T) {
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("user-cert-as-host-cert reported as unknown, not rejected: %v", err)
 	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("user-cert-as-host-cert does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
+	}
 }
 
 func TestHostKeyPolicyRejectsExpiredCert(t *testing.T) {
@@ -164,6 +173,9 @@ func TestHostKeyPolicyRejectsExpiredCert(t *testing.T) {
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("expired certificate reported as unknown, not rejected: %v", err)
 	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("expired certificate does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
+	}
 }
 
 func TestHostKeyPolicyRejectsWrongPrincipalCert(t *testing.T) {
@@ -180,6 +192,9 @@ func TestHostKeyPolicyRejectsWrongPrincipalCert(t *testing.T) {
 	}
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("wrong-principal certificate reported as unknown, not rejected: %v", err)
+	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Fatalf("wrong-principal certificate does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
 	}
 }
 

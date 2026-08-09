@@ -68,6 +68,11 @@ func Classify(err error) ErrorClass {
 	switch {
 	case errors.Is(err, ErrHostKeyUnknown):
 		return ClassHostKey
+	case errors.Is(err, ErrHostKeyMismatch):
+		// Checked ahead of ErrHandshake: Dial wraps every unclassified
+		// handshake failure in ErrHandshake too, so a mismatched host key
+		// would otherwise be masked by that broader case below.
+		return ClassHostKey
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return ClassRefused
 	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):

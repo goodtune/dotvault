@@ -19,6 +19,14 @@ import (
 // key, and the CLI turns it into a fingerprint prompt rather than an error.
 var ErrHostKeyUnknown = errors.New("host key is not pinned and no configured CA signed it")
 
+// ErrHostKeyMismatch reports a host that presented a key or certificate
+// different from what was pinned or that a configured CA rejected — the
+// possible-MITM case, as opposed to ErrHostKeyUnknown's normal
+// not-yet-pinned state. Kept distinct so Classify maps it to ClassHostKey
+// rather than the generic handshake class: a changed host key must surface as
+// a host-key problem in status, not blend into ordinary transport churn.
+var ErrHostKeyMismatch = errors.New("host key or certificate rejected")
+
 // HostKeyPolicy decides whether to trust a remote's host key.
 //
 // There is deliberately no runtime trust-on-first-use. Pinning happens exactly
@@ -99,8 +107,8 @@ func (p *HostKeyPolicy) Callback(observed *ssh.PublicKey) ssh.HostKeyCallback {
 			if string(pinned.Marshal()) == string(key.Marshal()) {
 				return nil
 			}
-			return fmt.Errorf("host key for %s changed: pinned %s, offered %s",
-				hostname, ssh.FingerprintSHA256(pinned), ssh.FingerprintSHA256(key))
+			return fmt.Errorf("host key for %s changed: pinned %s, offered %s: %w",
+				hostname, ssh.FingerprintSHA256(pinned), ssh.FingerprintSHA256(key), ErrHostKeyMismatch)
 		}
 
 		return fmt.Errorf("%s: %w (offered %s)", hostname, ErrHostKeyUnknown, ssh.FingerprintSHA256(key))
@@ -138,7 +146,7 @@ func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Ce
 	// bad-signature and expired certificates in with it, since knownhosts
 	// reports both as the same "no authorities for hostname" error.
 	if err := cb(hostname, remote, cert); err != nil {
-		return fmt.Errorf("%s: host certificate rejected: %w", hostname, err)
+		return fmt.Errorf("%s: host certificate rejected: %w: %w", hostname, ErrHostKeyMismatch, err)
 	}
 	return nil
 }

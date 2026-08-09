@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -157,6 +158,23 @@ func TestServeListenerRelaysToTarget(t *testing.T) {
 
 	remote.Close()
 	targetSrv.Close()
+
+	// onConn(-1) must fire once Pump finishes, or the active-connection gauge
+	// in `dotvault ssh list` / status climbs monotonically and never comes
+	// back down.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		active.Lock()
+		cur := active.cur
+		active.Unlock()
+		if cur == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("active connection gauge stuck at %d after the connection closed; onConn(-1) did not fire", cur)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestServeListenerStopsOnContextCancel(t *testing.T) {
@@ -214,4 +232,142 @@ func TestServeListenerSurvivesTargetDialFailure(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("serveListener stopped accepting after a target dial failure")
+}
+
+// errorListener always fails Accept, simulating a died transport (sshd
+// restart, connection drop) — a return path distinct from ctx cancellation.
+type errorListener struct{ err error }
+
+func (e errorListener) Accept() (net.Conn, error) { return nil, e.err }
+func (e errorListener) Close() error              { return nil }
+func (e errorListener) Addr() net.Addr            { return fakeAddr{} }
+
+func TestServeListenerReleasesWatcherGoroutineOnAcceptFailure(t *testing.T) {
+	runtime.GC()
+	base := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // best-effort cleanup even if the assertion below fails
+
+	ln := errorListener{err: errors.New("transport died")}
+	if err := serveListener(ctx, ln, func(context.Context) (net.Conn, error) {
+		return nil, errors.New("unused")
+	}, func(int) {}); err == nil {
+		t.Fatal("serveListener returned nil for a failing Accept; want the wrapped error")
+	}
+
+	// The ctx-watcher goroutine parks on <-ctx.Done() until releasing it; a
+	// return caused by Accept failing on its own (not ctx cancellation) must
+	// still release it via serveListener's own done channel, not depend on
+	// this test's later cancel() to reap it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		runtime.Gosched()
+		if n := runtime.NumGoroutine(); n <= base {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutine count did not settle back to the pre-call baseline (%d) within 2s after serveListener returned via a non-context Accept failure; the ctx-watcher goroutine leaked", base)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestServeListenerClosesInFlightConnectionOnCancel(t *testing.T) {
+	ln := newFakeListener()
+	t.Cleanup(func() { ln.Close() })
+
+	targetSrv, targetCli := net.Pipe()
+	t.Cleanup(func() { targetSrv.Close() })
+	target := func(ctx context.Context) (net.Conn, error) { return targetCli, nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- serveListener(ctx, ln, target, func(int) {}) }()
+
+	// The "remote" end is deliberately never written to or closed: absent
+	// cancellation-driven teardown, Pump would block forever waiting for EOF
+	// on this connection, and serveListener would never return.
+	_, forwarded := net.Pipe()
+	ln.conns <- forwarded
+
+	time.Sleep(50 * time.Millisecond) // let the accept goroutine register the connection
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("serveListener returned %v, want nil/Canceled/ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveListener did not return after cancel; an in-flight relayed connection was not torn down")
+	}
+}
+
+func TestPumpClosesBothEndsFullyOnRealSockets(t *testing.T) {
+	// net.Pipe cannot exercise this: its conns do not implement CloseWrite, so
+	// copyDir's own EOF-triggered fallback close already fully closes both
+	// ends regardless of Pump's trailing Close calls (see
+	// TestPumpClosesBothWhenOneSideEnds). A real TCP pair does implement
+	// CloseWrite, so ending one direction only half-closes it — this is the
+	// only way to observe whether the trailing Close is actually load-bearing.
+	newPair := func(t *testing.T) (client, server net.Conn) {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+
+		accepted := make(chan net.Conn, 1)
+		acceptErr := make(chan error, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			accepted <- c
+		}()
+
+		cl, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case sv := <-accepted:
+			return cl, sv
+		case err := <-acceptErr:
+			t.Fatal(err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("accept timed out")
+		}
+		return nil, nil
+	}
+
+	c1, s1 := newPair(t)
+	c2, s2 := newPair(t)
+
+	// s1 and s2 stand in for the two ends Pump relays between — the accepted
+	// forwarded connection and the local target dial, in production.
+	done := make(chan struct{})
+	go func() { Pump(s1, s2); close(done) }()
+
+	// End both directions so both copyDir loops reach EOF and Pump returns.
+	c1.Close()
+	c2.Close()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pump did not return after both real peers closed")
+	}
+
+	if _, err := s1.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("s1.Read after Pump returned = %v, want net.ErrClosed — the trailing Close is load-bearing on CloseWrite-capable sockets and net.Pipe cannot express this", err)
+	}
+	if _, err := s2.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("s2.Read after Pump returned = %v, want net.ErrClosed", err)
+	}
 }

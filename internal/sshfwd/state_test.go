@@ -22,6 +22,8 @@ func TestClassify(t *testing.T) {
 	}{
 		{"nil", nil, ClassNone},
 		{"host key unknown", fmt.Errorf("wrap: %w", ErrHostKeyUnknown), ClassHostKey},
+		{"host key mismatch", fmt.Errorf("wrap: %w", ErrHostKeyMismatch), ClassHostKey},
+		{"host key mismatch wrapped in handshake", fmt.Errorf("%w: %w", ErrHandshake, ErrHostKeyMismatch), ClassHostKey},
 		{"dns", &net.DNSError{Err: "no such host", IsNotFound: true}, ClassDNS},
 		{"refused", fmt.Errorf("dial tcp: %w", errConnRefusedStub), ClassRefused},
 		{"auth", fmt.Errorf("wrap: %w", ErrAuth), ClassAuth},

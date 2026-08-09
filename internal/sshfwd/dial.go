@@ -32,6 +32,13 @@ type DialConfig struct {
 
 	// Observed receives the presented host key even when the dial is rejected,
 	// so `dotvault ssh add` can report a fingerprint to confirm. May be nil.
+	//
+	// x/crypto invokes the HostKeyCallback on every key exchange, including a
+	// server-initiated rekey, not just the initial handshake — so *Observed is
+	// written by the transport's own goroutine for the life of the connection.
+	// Safe for the short-lived dial `ssh add` performs to fetch a fingerprint;
+	// a caller that holds a long-lived *ssh.Client and reads Observed later
+	// races with that goroutine.
 	Observed *ssh.PublicKey
 
 	Timeout time.Duration
@@ -47,6 +54,11 @@ const DefaultDialTimeout = 20 * time.Second
 func Dial(ctx context.Context, c DialConfig) (*ssh.Client, error) {
 	if len(c.Signers) == 0 {
 		return nil, fmt.Errorf("%w: no SSH identities available from the agent backend", ErrAuth)
+	}
+	if c.HostKey == nil {
+		// c.HostKey.Callback below would otherwise panic inside x/crypto's own
+		// handshake goroutine — a process crash rather than a returned error.
+		return nil, fmt.Errorf("%w: no host key policy configured", ErrHandshake)
 	}
 	timeout := c.Timeout
 	if timeout == 0 {
@@ -107,20 +119,53 @@ func Dial(ctx context.Context, c DialConfig) (*ssh.Client, error) {
 // offered credential was rejected. There is no exported sentinel for it, so
 // this is the one place a message is inspected — kept narrow and commented so
 // a future x/crypto change is easy to find.
+//
+// The matched text can include a server-supplied disconnect message, so a
+// hostile server could in principle induce this classification on a failure
+// that isn't really an auth rejection. The blast radius is limited to which
+// backoff floor Classify applies (ClassAuth vs. ClassHandshake), not to any
+// security decision, so that is acceptable.
 func isAuthFailure(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "unable to authenticate") ||
-		strings.Contains(msg, "no supported methods remain") ||
-		strings.Contains(msg, "handshake failed: ssh: unable to authenticate")
+		strings.Contains(msg, "no supported methods remain")
 }
 
-// Keepalive sends keepalive@openssh.com until the context is cancelled or the
-// strike limit is reached, returning the failure that tripped it.
+// requestSender is the one method Keepalive needs from an SSH transport,
+// narrowed from *ssh.Client so the strike state machine is unit-testable
+// without a live SSH connection.
+type requestSender interface {
+	SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error)
+}
+
+// errKeepaliveTimeout marks a keepalive request that received no reply within
+// one interval — treated as a strike, mirroring OpenSSH's ServerAliveCountMax.
+var errKeepaliveTimeout = errors.New("keepalive request timed out")
+
+// Keepalive sends keepalive@openssh.com every interval until the context is
+// cancelled or strikes consecutive requests fail (including timing out),
+// returning the failure that tripped it.
 //
 // SSH-level rather than TCP: TCP keepalive does not detect a wedged sshd, and
 // a laptop resuming from sleep needs the dead transport surfaced in seconds
 // rather than after the OS TCP timeout.
-func Keepalive(ctx context.Context, cl *ssh.Client, interval time.Duration, strikes int) error {
+//
+// Each request is bounded to at most one interval and run on its own
+// goroutine. Both are load-bearing: SendRequest is a blocking call, so
+// against a wedged sshd (TCP alive, requests unserviced) or a black-holed
+// route (VPN drop, Wi-Fi handover, a laptop's lid closing) it would otherwise
+// block on this function's own goroutine until the OS TCP timeout — minutes —
+// during which neither the strike counter nor ctx cancellation would be
+// observed at all. Bounding the wait turns "unanswered" into a strike instead
+// of a silent stall.
+func Keepalive(ctx context.Context, cl requestSender, interval time.Duration, strikes int) error {
+	if interval <= 0 {
+		return fmt.Errorf("keepalive interval must be positive, got %s", interval)
+	}
+	if strikes <= 0 {
+		return fmt.Errorf("keepalive strikes must be positive, got %d", strikes)
+	}
+
 	t := time.NewTicker(interval)
 	defer t.Stop()
 
@@ -130,15 +175,43 @@ func Keepalive(ctx context.Context, cl *ssh.Client, interval time.Duration, stri
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
+			err := keepaliveOnce(ctx, cl, interval)
 			if err == nil {
 				consecutive = 0
 				continue
+			}
+			// A request that failed because ctx was cancelled while it was in
+			// flight is a shutdown, not a strike: report the cancellation
+			// directly rather than folding it into the failure count.
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			consecutive++
 			if consecutive >= strikes {
 				return fmt.Errorf("keepalive failed %d times: %w", consecutive, err)
 			}
 		}
+	}
+}
+
+// keepaliveOnce sends one keepalive request, bounded to at most timeout and
+// also returning early on ctx cancellation. The result channel is buffered so
+// the request goroutine can always deliver its outcome and exit even after
+// this call has already returned via the timeout or cancellation branch —
+// it cannot leak.
+func keepaliveOnce(ctx context.Context, cl requestSender, timeout time.Duration) error {
+	res := make(chan error, 1)
+	go func() {
+		_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
+		res <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-res:
+		return err
+	case <-time.After(timeout):
+		return errKeepaliveTimeout
 	}
 }

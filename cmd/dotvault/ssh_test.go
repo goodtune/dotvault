@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -277,6 +278,175 @@ func TestSSHAddNonTTYRequiresAcceptFlag(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Errorf("daemon received %d POSTs, want exactly 1 (no blind re-POST)", posts)
+	}
+}
+
+// withInteractiveSSHAdd forces sshIsInteractive() to report true for the
+// duration of the test, so the interactive confirm-prompt branch of
+// runSSHAdd runs instead of the --accept-host-key-required branch.
+func withInteractiveSSHAdd(t *testing.T) {
+	t.Helper()
+	prev := sshIsInteractive
+	sshIsInteractive = func() bool { return true }
+	t.Cleanup(func() { sshIsInteractive = prev })
+}
+
+// newSSHAddFingerprintServer starts a fake daemon that returns 409 until a
+// POST arrives with accept_fingerprint == "SHA256:abc123", then 201. It
+// reports the number of POSTs received.
+func newSSHAddFingerprintServer(t *testing.T) (sock string, posts *int) {
+	t.Helper()
+	sock = shortSocketPath(t)
+	posts = new(int)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("POST /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
+		*posts++
+		var req sshAddRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.AcceptFingerprint != "SHA256:abc123" {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"host":"new.example.com","fingerprint":"SHA256:abc123"}`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"host":"new.example.com","port":22,"remote_socket":"~/.ssh/dotvault.sock","enabled":true}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	return sock, posts
+}
+
+// TestSSHAddInteractiveAccepts covers the primary path the whole 409 design
+// exists to protect: a human at a terminal, typing "y" or "yes", must have
+// their answer actually reach the daemon as the confirmed fingerprint — and
+// must have seen that fingerprint printed before being asked to confirm it.
+func TestSSHAddInteractiveAccepts(t *testing.T) {
+	for _, answer := range []string{"y\n", "Y\n", "yes\n", "YES\n"} {
+		t.Run(answer, func(t *testing.T) {
+			sock, posts := newSSHAddFingerprintServer(t)
+			useSSHDaemonConfig(t, sock)
+			withInteractiveSSHAdd(t)
+
+			cmd := newSSHAddCmd()
+			var errOut bytes.Buffer
+			cmd.SetErr(&errOut)
+			cmd.SetIn(strings.NewReader(answer))
+			cmd.SetContext(context.Background())
+			if err := runSSHAdd(cmd, []string{"new.example.com"}); err != nil {
+				t.Fatalf("runSSHAdd: %v", err)
+			}
+
+			if *posts != 2 {
+				t.Fatalf("daemon received %d POSTs, want 2 (initial + confirmed re-POST)", *posts)
+			}
+			fpIdx := strings.Index(errOut.String(), "SHA256:abc123")
+			promptIdx := strings.Index(errOut.String(), "Trust this host key")
+			if fpIdx == -1 || promptIdx == -1 || fpIdx > promptIdx {
+				t.Errorf("stderr = %q, want the fingerprint displayed before the prompt asking to confirm it", errOut.String())
+			}
+		})
+	}
+}
+
+// TestSSHAddInteractiveDeclines is the other half: "n", a bare Enter, or any
+// other input must decline and — critically — must NOT send a second POST.
+// Asserting the request count is what would catch an inverted
+// answer == "y" check; asserting only the returned error would not, since an
+// inverted check that still errors out for an unrelated reason could pass a
+// message-only assertion.
+func TestSSHAddInteractiveDeclines(t *testing.T) {
+	for _, answer := range []string{"n\n", "no\n", "\n", "whatever\n"} {
+		t.Run(answer, func(t *testing.T) {
+			sock, posts := newSSHAddFingerprintServer(t)
+			useSSHDaemonConfig(t, sock)
+			withInteractiveSSHAdd(t)
+
+			cmd := newSSHAddCmd()
+			var errOut bytes.Buffer
+			cmd.SetErr(&errOut)
+			cmd.SetIn(strings.NewReader(answer))
+			cmd.SetContext(context.Background())
+			err := runSSHAdd(cmd, []string{"new.example.com"})
+			if err == nil {
+				t.Fatal("runSSHAdd() = nil, want a decline error")
+			}
+			if !strings.Contains(err.Error(), "was not accepted") {
+				t.Errorf("error = %q, want it to say the host key was not accepted", err.Error())
+			}
+			if *posts != 1 {
+				t.Errorf("daemon received %d POSTs, want exactly 1 (a decline must never re-POST)", *posts)
+			}
+		})
+	}
+}
+
+// erroringReader always fails, simulating a broken stdin.
+type erroringReader struct{}
+
+func (erroringReader) Read([]byte) (int, error) { return 0, errors.New("stdin broken") }
+
+// TestSSHAddInteractiveStdinReadErrorDeclines: a read error must be treated
+// as a failure to confirm, never as acceptance — the failure mode that
+// matters is a broken/closed stdin silently behaving like a "yes".
+func TestSSHAddInteractiveStdinReadErrorDeclines(t *testing.T) {
+	sock, posts := newSSHAddFingerprintServer(t)
+	useSSHDaemonConfig(t, sock)
+	withInteractiveSSHAdd(t)
+
+	cmd := newSSHAddCmd()
+	var errOut bytes.Buffer
+	cmd.SetErr(&errOut)
+	cmd.SetIn(erroringReader{})
+	cmd.SetContext(context.Background())
+	err := runSSHAdd(cmd, []string{"new.example.com"})
+	if err == nil {
+		t.Fatal("runSSHAdd() = nil, want an error when stdin cannot be read")
+	}
+	if *posts != 1 {
+		t.Errorf("daemon received %d POSTs, want exactly 1 (a stdin read error must never re-POST)", *posts)
+	}
+}
+
+// TestSSHAddFlagsReachRequestBody proves --force/--port/--socket actually
+// reach the POST body, not just that Registry.Add (tested separately in
+// internal/sshfwd) honours them once they arrive.
+func TestSSHAddFlagsReachRequestBody(t *testing.T) {
+	sock := shortSocketPath(t)
+	var got sshAddRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("POST /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"host":"flagged.example.com","port":2200,"remote_socket":"/custom/sock","enabled":true}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHAddCmd()
+	cmd.SetContext(context.Background())
+	for flag, value := range map[string]string{"port": "2200", "socket": "/custom/sock", "force": "true"} {
+		if err := cmd.Flags().Set(flag, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runSSHAdd(cmd, []string{"flagged.example.com"}); err != nil {
+		t.Fatalf("runSSHAdd: %v", err)
+	}
+
+	if got.Host != "flagged.example.com" {
+		t.Errorf("request Host = %q, want flagged.example.com", got.Host)
+	}
+	if got.Port != 2200 {
+		t.Errorf("request Port = %d, want 2200 (from --port)", got.Port)
+	}
+	if got.RemoteSocket != "/custom/sock" {
+		t.Errorf("request RemoteSocket = %q, want /custom/sock (from --socket)", got.RemoteSocket)
+	}
+	if !got.Force {
+		t.Error("request Force = false, want true (from --force)")
 	}
 }
 

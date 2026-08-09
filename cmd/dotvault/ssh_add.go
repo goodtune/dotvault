@@ -119,6 +119,20 @@ func runSSHAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	if status != http.StatusCreated {
+		if status == http.StatusConflict {
+			// A 409 surviving the one confirmed re-POST means the daemon's
+			// view of the key changed again between the two requests (a
+			// genuine race, not the ordinary flow) — say so specifically
+			// rather than falling through to the generic "request failed
+			// with status 409", which names neither the host nor the new
+			// fingerprint the user would need to confirm.
+			var again sshHostKeyConfirmation
+			if jerr := json.Unmarshal(body, &again); jerr == nil && again.Fingerprint != "" {
+				return fmt.Errorf(
+					"dotvault daemon: host key confirmation required again for %s (fingerprint %s); the daemon's view of the key changed since it was last displayed — re-run ssh add to confirm the new one",
+					again.Host, again.Fingerprint)
+			}
+		}
 		return fmt.Errorf("dotvault daemon: %s", sshAPIErrorMessage(status, body))
 	}
 	// Silent on success, matching this repo's other daemon-mutating CLIs.
@@ -139,12 +153,15 @@ var sshIsInteractive = func() bool {
 }
 
 // sshConfirmPrompt asks a yes/no question on stderr (matching the fingerprint
-// line above it) and reads the answer from stdin. Only "y"/"yes"
+// line above it) and reads the answer from cmd.InOrStdin() (os.Stdin in
+// production; a test supplies canned input via cmd.SetIn). Only "y"/"yes"
 // (case-insensitive) count as acceptance; anything else, including a bare
-// Enter, declines.
+// Enter, declines. A read error also declines — surfaced as an error rather
+// than treated as an empty answer, so a broken stdin can never be silently
+// read as acceptance.
 func sshConfirmPrompt(cmd *cobra.Command, question string) (bool, error) {
 	fmt.Fprintf(cmd.ErrOrStderr(), "%s [y/N]: ", question)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, fmt.Errorf("read confirmation: %w", err)
 	}

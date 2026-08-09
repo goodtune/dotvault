@@ -1,6 +1,7 @@
 package sshfwd
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -77,6 +78,47 @@ func TestBackoffResetReturnsToBase(t *testing.T) {
 	if got := b.Next(); got != 500*time.Millisecond {
 		t.Errorf("after Reset(), Next() = %v, want 500ms", got)
 	}
+}
+
+// TestBackoffConcurrentNextAndReset is the regression test for the C2 data
+// race: ManagedRemote's run loop calls Next() from its own goroutine while a
+// separate stable-connection timer goroutine calls Reset(), with no
+// synchronisation of their own — Backoff itself must provide it. Run under
+// `go test -race`; without Backoff's internal mutex this reliably reports a
+// race on the shared n field.
+func TestBackoffConcurrentNextAndReset(t *testing.T) {
+	b := NewBackoff()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				b.Next()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				b.Reset()
+			}
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestBackoffNeverExceedsMax(t *testing.T) {

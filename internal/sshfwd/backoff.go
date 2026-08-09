@@ -2,6 +2,7 @@ package sshfwd
 
 import (
 	"math/rand/v2"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,11 @@ const StableConnectionThreshold = 60 * time.Second
 const AuthFailureFloor = 5 * time.Minute
 
 // Backoff produces the jittered exponential reconnect delay.
+//
+// Safe for concurrent use: a ManagedRemote's run loop calls Next() from its
+// own goroutine while a separate stable-connection timer goroutine calls
+// Reset() once a connection has proven itself, with no other synchronisation
+// between them.
 type Backoff struct {
 	Base   time.Duration
 	Max    time.Duration
@@ -26,7 +32,8 @@ type Backoff struct {
 	// rnd returns a value in [0,1). Injected so tests are deterministic.
 	rnd func() float64
 
-	n int
+	mu sync.Mutex
+	n  int
 }
 
 // NewBackoff returns the reconnect schedule: 500ms doubling to a 30s ceiling,
@@ -43,15 +50,19 @@ func NewBackoff() *Backoff {
 
 // Next returns the next delay and advances the schedule.
 func (b *Backoff) Next() time.Duration {
+	b.mu.Lock()
+	n := b.n
+	b.n++
+	b.mu.Unlock()
+
 	d := b.Base
-	for i := 0; i < b.n; i++ {
+	for i := 0; i < n; i++ {
 		d *= 2
 		if d >= b.Max {
 			d = b.Max
 			break
 		}
 	}
-	b.n++
 
 	// rnd in [0,1) maps to a multiplier in [1-Jitter, 1+Jitter).
 	factor := 1 + b.Jitter*(2*b.rnd()-1)
@@ -60,4 +71,8 @@ func (b *Backoff) Next() time.Duration {
 
 // Reset returns the schedule to its base delay, called once a connection has
 // stayed up for StableConnectionThreshold.
-func (b *Backoff) Reset() { b.n = 0 }
+func (b *Backoff) Reset() {
+	b.mu.Lock()
+	b.n = 0
+	b.mu.Unlock()
+}

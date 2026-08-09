@@ -2,7 +2,9 @@ package sshfwd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -28,8 +30,10 @@ const (
 // forward, keepalive, and reconnect-with-backoff, reporting its condition
 // through status() and its live transport through WaitForClient.
 //
-// cfg is compared with == by Manager.Reconcile to detect a changed entry, so
-// every field must stay a comparable type (see Remote).
+// Manager.Reconcile decides whether cfg has "changed" via cfg.sameAs, a
+// semantic comparison — not ==, because Remote.Enabled is a *bool and two
+// otherwise-identical configs loaded on separate occasions never share a
+// pointer.
 type ManagedRemote struct {
 	cfg  Remote
 	deps Deps
@@ -50,6 +54,12 @@ type ManagedRemote struct {
 	// looked, without missing a client that arrives concurrently.
 	clientReady chan struct{}
 
+	// clientWaitTimeout is ClientWaitTimeout by default; a field rather than
+	// using the constant directly so a test can shrink it and turn
+	// WaitForClient's timeout path into a fast, still-genuine wait instead of
+	// a 10-second sleep asserted on the wall clock.
+	clientWaitTimeout time.Duration
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -57,36 +67,42 @@ type ManagedRemote struct {
 // newManagedRemote returns a ManagedRemote for r, not yet started.
 func newManagedRemote(r Remote, deps Deps) *ManagedRemote {
 	return &ManagedRemote{
-		cfg:         r,
-		deps:        deps,
-		backoff:     NewBackoff(),
-		clientReady: make(chan struct{}),
+		cfg:               r,
+		deps:              deps,
+		backoff:           NewBackoff(),
+		clientReady:       make(chan struct{}),
+		clientWaitTimeout: ClientWaitTimeout,
 	}
 }
 
-// start runs body in a tracked goroutine under a context derived from ctx,
-// so stop() can cancel and wait for it deterministically. body is a
-// parameter (rather than always r.run) so Manager can substitute a stub for
-// testing without an SSH server.
+// isRunning reports whether start has been called on this remote. cancel is
+// set exactly once, by start, and never cleared, so a nil cancel identifies a
+// disabled entry that has only ever existed as a status-row placeholder.
+func (r *ManagedRemote) isRunning() bool { return r.cancel != nil }
+
+// start runs body in a tracked goroutine under a context derived from ctx, so
+// stop() can cancel and wait for it deterministically. body is a parameter
+// (rather than always r.run) so Manager can substitute a stub for testing
+// without an SSH server.
 //
-// start does not return until the goroutine has actually begun executing —
-// spawning it with a bare `go` and returning immediately would let Reconcile
-// hand control back to the caller (or the next iteration of its own loop)
-// before the new goroutine ever got a turn from the scheduler, which is
-// observable as a flaky "not started yet" from a caller (or a test) that
-// checks state right after Reconcile returns with no synchronization of its
-// own.
+// start returns as soon as the goroutine is launched — it does not wait for
+// body to have begun running. An earlier version blocked on a rendezvous
+// channel closed as the goroutine's first statement, intending to guarantee
+// the goroutine had started before start (and therefore Reconcile) returned;
+// it didn't actually provide that guarantee (closing a channel doesn't
+// create a happens-before edge to the *next* statement in the goroutine that
+// closed it, so a concurrent scheduler could still run the caller past that
+// point first) and no production caller needs it — only a test did, and the
+// test has its own poll-based wait for that (see runRecorder.waitStarted in
+// manager_test.go).
 func (r *ManagedRemote) start(ctx context.Context, body func(context.Context)) {
 	runCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	running := make(chan struct{})
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		close(running)
 		body(runCtx)
 	}()
-	<-running
 }
 
 // stop cancels the running goroutine, if any, and waits for it to exit. Safe
@@ -116,6 +132,12 @@ func (r *ManagedRemote) setState(s State, err error) {
 
 // setClient installs the live transport and wakes every WaitForClient caller
 // blocked on the previous clientReady channel.
+//
+// Must not be called twice without an intervening clearClient: closing an
+// already-closed channel panics. run's single dial-then-serve sequence per
+// attempt (one setClient, always paired with exactly one later clearClient
+// before the next dial) is what keeps that invariant true; a future change
+// to run's control flow must preserve the pairing.
 func (r *ManagedRemote) setClient(c *ssh.Client) {
 	r.mu.Lock()
 	r.client = c
@@ -130,6 +152,21 @@ func (r *ManagedRemote) clearClient() {
 	r.client = nil
 	r.clientReady = make(chan struct{})
 	r.mu.Unlock()
+}
+
+// teardownConnection clears the live client pointer and then closes the
+// underlying transport via closeFn, in that order. The order is the whole
+// point of this being its own function rather than two inline statements: a
+// WaitForClient call racing this teardown takes its fast path whenever
+// r.client is still non-nil, so closing the transport first (and clearing
+// the pointer only afterwards) would leave a window where a caller can be
+// handed a *ssh.Client this function is already in the middle of closing.
+// Clearing first closes that window — any WaitForClient racing this call
+// either sees the pointer before it's cleared (a client that is about to be
+// closed but is not yet) or takes the slow path and waits for the next one.
+func (r *ManagedRemote) teardownConnection(closeFn func() error) {
+	r.clearClient()
+	_ = closeFn()
 }
 
 // onConn adjusts the active-connection count reported in status; wired as
@@ -161,8 +198,16 @@ func (r *ManagedRemote) status(target string) RemoteStatus {
 // WaitForClient returns the current live SSH client, blocking up to
 // ClientWaitTimeout for one to arrive if a reconnect is in progress.
 // Forwarding code that needs the transport asks here rather than reading a
-// client field directly, so it never observes — let alone mutates — a
-// client mid-teardown: run() owns the client's lifetime end to end.
+// client field directly, so a lookup made mid-reconnect blocks for the grace
+// period instead of failing immediately.
+//
+// The returned client is not guaranteed to stay open after it is returned:
+// there is no refcount linking a caller's use of it to serveConnected's
+// teardown, so a client obtained here can be closed by the next reconnect a
+// moment later. Callers must already tolerate "use of closed connection"
+// from any operation against it, exactly as they would for a client obtained
+// any other way — this function only removes the "no client at all yet"
+// class of failure, not races with a live connection's own end of life.
 func (r *ManagedRemote) WaitForClient(ctx context.Context) (*ssh.Client, error) {
 	r.mu.Lock()
 	if r.client != nil {
@@ -171,9 +216,10 @@ func (r *ManagedRemote) WaitForClient(ctx context.Context) (*ssh.Client, error) 
 		return c, nil
 	}
 	ready := r.clientReady
+	timeout := r.clientWaitTimeout
 	r.mu.Unlock()
 
-	timer := time.NewTimer(ClientWaitTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
@@ -191,7 +237,7 @@ func (r *ManagedRemote) WaitForClient(ctx context.Context) (*ssh.Client, error) 
 		}
 		return c, nil
 	case <-timer.C:
-		return nil, fmt.Errorf("timed out after %s waiting for a connection to %s", ClientWaitTimeout, r.cfg.Host)
+		return nil, fmt.Errorf("timed out after %s waiting for a connection to %s", timeout, r.cfg.Host)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -225,20 +271,39 @@ func (r *ManagedRemote) backoffDelay(class ErrorClass) time.Duration {
 	return d
 }
 
+// stateForClass maps a failure's class to the reported State. It is the only
+// mapping the state vocabulary in state.go supports: auth and host-key
+// failures get their own dedicated states because a human or Vault action is
+// what clears them, everything else collapses to the generic offline/
+// reconnecting state its caller already picked.
+func stateForClass(class ErrorClass, generic State) State {
+	switch class {
+	case ClassAuth:
+		return StateAuthError
+	case ClassHostKey:
+		return StateHostKeyError
+	default:
+		return generic
+	}
+}
+
 // fail records a connection-attempt failure, maps it to the reported state,
 // and sleeps the appropriate backoff before the run loop retries.
 func (r *ManagedRemote) fail(ctx context.Context, err error) {
 	class := Classify(err)
-	state := StateOffline
-	switch class {
-	case ClassAuth:
-		state = StateAuthError
-	case ClassHostKey:
-		state = StateHostKeyError
-	}
-	r.setState(state, err)
+	slog.Warn("sshfwd: connection attempt failed", "host", r.cfg.Host, "class", class, "error", err)
+	r.setState(stateForClass(class, StateOffline), err)
 	r.sleep(ctx, r.backoffDelay(class))
 }
+
+// errIncompleteDeps is returned when a ManagedRemote is run with a Deps that
+// is missing a required func. Production remotes are always constructed by
+// Manager with a fully-populated Deps; this guards a wiring mistake (or a
+// test's intentionally bare Deps{}, which several in this package's test
+// suite construct without ever expecting run to be reached) so it surfaces
+// as a failed connection attempt instead of a nil-func panic inside a
+// background goroutine.
+var errIncompleteDeps = errors.New("incomplete Deps: Signers, User, Policy, and Target must all be set")
 
 // run is the per-remote connection lifecycle: dial, forward, keepalive,
 // reconnect with backoff — until ctx is cancelled by stop().
@@ -250,6 +315,13 @@ func (r *ManagedRemote) fail(ctx context.Context, err error) {
 func (r *ManagedRemote) run(ctx context.Context) {
 	for ctx.Err() == nil {
 		r.setState(StateConnecting, nil)
+
+		if r.deps.Signers == nil || r.deps.User == nil || r.deps.Policy == nil || r.deps.Target == nil {
+			r.fail(ctx, errIncompleteDeps)
+			continue
+		}
+
+		slog.Debug("sshfwd: connecting to remote", "host", r.cfg.Host)
 
 		signers, err := r.deps.Signers()
 		if err != nil {
@@ -286,6 +358,31 @@ func (r *ManagedRemote) run(ctx context.Context) {
 	}
 }
 
+// armStableReset starts a goroutine that resets r.backoff once threshold has
+// elapsed, unless the returned stop func is called first. Extracted from
+// serveConnected so the stable-connection-resets-backoff behaviour is
+// testable on its own, with a short threshold, rather than only reachable by
+// waiting out the real StableConnectionThreshold (60s) inside a live
+// connection.
+//
+// The goroutine always exits via one of its two select cases — the timer
+// firing or stableCtx being cancelled — so calling stop (which cancels
+// stableCtx) is both how a caller declines the reset and how it guarantees
+// the goroutine does not outlive the connection that started it.
+func (r *ManagedRemote) armStableReset(ctx context.Context, threshold time.Duration) (stop func()) {
+	stableCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		timer := time.NewTimer(threshold)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			r.backoff.Reset()
+		case <-stableCtx.Done():
+		}
+	}()
+	return cancel
+}
+
 // serveConnected runs one established connection until ServeForward or
 // Keepalive reports an error (or ctx is cancelled), then tears it down and
 // sleeps the reconnect backoff. It returns once that backoff has elapsed (or
@@ -297,55 +394,67 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	r.connectedSince = &now
 	r.mu.Unlock()
 	r.setState(StateConnected, nil)
+	slog.Info("sshfwd: connected to remote", "host", r.cfg.Host)
 
 	// A connection that stays up for StableConnectionThreshold has proven
 	// itself, so the backoff schedule resets — otherwise a host that flaps
 	// after being healthy for hours would reconnect at whatever multiplier
 	// its very first, long-ago failure left behind.
-	stableCtx, stopStable := context.WithCancel(ctx)
-	go func() {
-		timer := time.NewTimer(StableConnectionThreshold)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			r.backoff.Reset()
-		case <-stableCtx.Done():
-		}
-	}()
+	stopStable := r.armStableReset(ctx, StableConnectionThreshold)
 
 	// ServeForward and Keepalive share this connection's lifetime: whichever
-	// fails first ends the other via connCtx, and errCh is sized so both
+	// fails first ends the other via connCtx. errCh is sized so both
 	// goroutines can always deliver their result and exit even though only
-	// the first is read.
+	// the first is read; connWG additionally lets this function wait for
+	// *both* to actually finish before tearing the client down, rather than
+	// racing ahead the moment the first one reports — see the connWG.Wait()
+	// call below for why that matters.
 	connCtx, cancelConn := context.WithCancel(ctx)
 	errCh := make(chan error, 2)
-	go func() { errCh <- ServeForward(connCtx, client, socket, r.deps.Target, r.onConn) }()
-	go func() { errCh <- Keepalive(connCtx, client, keepaliveInterval, keepaliveStrikes) }()
+	var connWG sync.WaitGroup
+	connWG.Add(2)
+	go func() {
+		defer connWG.Done()
+		errCh <- ServeForward(connCtx, client, socket, r.deps.Target, r.onConn)
+	}()
+	go func() {
+		defer connWG.Done()
+		errCh <- Keepalive(connCtx, client, keepaliveInterval, keepaliveStrikes)
+	}()
 
 	err := <-errCh
 	cancelConn()
 	stopStable()
-	client.Close()
-	r.clearClient()
+
+	// Wait for the loser of the race, too: stop()/Manager.Close() promise to
+	// wait for a remote's work to finish, and returning after only the first
+	// errCh value would let ServeForward's in-flight relays (or a pending
+	// Keepalive round-trip) keep running after this function has already
+	// moved on to redial. It also means activeConns has already been
+	// decremented back to zero by ServeForward's own accept-loop teardown by
+	// the time the next connection starts, so it can't be seen to undercount
+	// or go transiently negative from a straggling connection's onConn(-1).
+	connWG.Wait()
+
+	r.teardownConnection(client.Close)
 
 	r.mu.Lock()
 	r.connectedSince = nil
-	r.reconnects++
 	r.mu.Unlock()
 
 	if ctx.Err() != nil {
-		// Shutdown, not a failure: run's loop condition will exit next.
+		// Shutdown, not a failure: run's loop condition will exit next, and
+		// this teardown was requested, not a reconnect the operator needs to
+		// see counted.
 		return
 	}
 
+	r.mu.Lock()
+	r.reconnects++
+	r.mu.Unlock()
+
 	class := Classify(err)
-	state := StateReconnecting
-	switch class {
-	case ClassAuth:
-		state = StateAuthError
-	case ClassHostKey:
-		state = StateHostKeyError
-	}
-	r.setState(state, err)
+	slog.Warn("sshfwd: remote connection lost; reconnecting", "host", r.cfg.Host, "class", class, "error", err)
+	r.setState(stateForClass(class, StateReconnecting), err)
 	r.sleep(ctx, r.backoffDelay(class))
 }

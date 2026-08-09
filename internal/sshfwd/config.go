@@ -56,6 +56,27 @@ func (r Remote) PortOrDefault() int {
 	return r.Port
 }
 
+// sameAs reports whether r and o describe the same managed connection, for
+// deciding whether Manager.Reconcile can leave a running remote untouched.
+//
+// This must not be struct equality (==): Enabled is a *bool, and Load
+// re-decodes YAML fresh on every call, producing a new pointer for the same
+// boolean value each time it's invoked. A pointer-address comparison would
+// read an unchanged, explicitly `enabled: true` remote as "changed" on every
+// single reconcile pass — tearing down and re-dialling a live connection,
+// its bound remote socket, and every in-flight relay through it, forever.
+// Comparing EnabledOrDefault() instead compares the resolved boolean, not
+// the pointer, and folds "explicitly true" and "unset" into one state as
+// they already are everywhere else. Host is compared case-insensitively to
+// match File.Find's identity rule.
+func (r Remote) sameAs(o Remote) bool {
+	return strings.EqualFold(r.Host, o.Host) &&
+		r.Port == o.Port &&
+		r.RemoteSocket == o.RemoteSocket &&
+		r.HostKey == o.HostKey &&
+		r.EnabledOrDefault() == o.EnabledOrDefault()
+}
+
 // File is the parsed ssh.yaml document.
 //
 // unknown retains any top-level key this build does not recognise so a rewrite

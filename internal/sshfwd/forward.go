@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -29,10 +31,10 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // StreamLocalBindUnlink=no makes bind() fail EADDRINUSE for *any* existing
 // path entry — a stale socket left by a crashed session and a live socket a
 // real `ssh -R` session is using right now are indistinguishable from the
-// filesystem alone. So a bind failure triggers liveListenerAt, which answers
-// the actual question by dialing through the connection: only a path sshd
-// proves nothing is listening on (ConnectionFailed) is treated as stale, and
-// only then is it unlinked — at most once, with one retry.
+// filesystem alone. So a bind failure triggers liveListenerAt, which decides
+// whether the path is actually safe to reclaim — see its doc for the full
+// rule, which is more subtle than "dial it and see" — and only when it says
+// yes is the path unlinked, at most once, with one retry.
 func ServeForward(ctx context.Context, cl *ssh.Client, socket string, target Dialer, onConn func(delta int)) error {
 	ln, err := cl.ListenUnix(socket)
 	if err != nil {
@@ -142,6 +144,15 @@ func directStreamLocalWorks(ctx context.Context, cl *ssh.Client, socket string) 
 	conn, dialErr := cl.DialContext(ctx, "unix", scratch)
 	if dialErr == nil {
 		conn.Close()
+		// Dialing our own scratch listener makes sshd connect to the socket it
+		// is listening on for us, which in turn delivers a matching
+		// forwarded-streamlocal@openssh.com channel-open back to this ln — a
+		// second, independent notification of the same connection, mirroring
+		// what a real peer's connection would deliver. If nothing ever calls
+		// Accept on it, x/crypto leaves that channel-open permanently
+		// unanswered (no confirmation or rejection is ever sent back to
+		// sshd), so it must be drained before ln.Close() discards the queue.
+		drainPendingForward(ln)
 		return true, nil
 	}
 	var openErr *ssh.OpenChannelError
@@ -154,16 +165,52 @@ func directStreamLocalWorks(ctx context.Context, cl *ssh.Client, socket string) 
 	return false, dialErr
 }
 
-// scratchProbePath derives a probe-only path from socket, namespaced under
-// the same directory so it exercises the same sshd policy and filesystem
-// permissions, with a random suffix so concurrent probes (or a probe racing
-// its own retry) don't collide.
+// drainPendingForwardTimeout bounds drainPendingForward's wait. The
+// corresponding forwarded-streamlocal channel-open, when one arrives, is a
+// round trip over the SSH connection we already have open — no new network
+// hop — so it should arrive promptly; this is a safety bound against it
+// never materialising, not a real budget.
+const drainPendingForwardTimeout = 500 * time.Millisecond
+
+// drainPendingForward accepts and immediately closes one pending connection
+// on ln, if one is already waiting or arrives promptly. Bounded so a forward
+// that (unexpectedly) never materialises cannot hang the caller; the
+// subsequent ln.Close() discards anything still queued regardless.
+func drainPendingForward(ln net.Listener) {
+	done := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			done <- c
+		} else {
+			done <- nil
+		}
+	}()
+	select {
+	case c := <-done:
+		if c != nil {
+			c.Close()
+		}
+	case <-time.After(drainPendingForwardTimeout):
+	}
+}
+
+// scratchProbePath derives a probe-only path from socket, in the same
+// directory (so it exercises the same sshd policy and filesystem
+// permissions) but with the basename replaced rather than suffixed: a
+// suffixed name grows with the original basename's length, and a legitimate
+// but already-long remote_socket could push the combined path over the
+// sun_path budget (108 bytes on Linux, 104 on the BSDs) — turning a working
+// stale-socket reclaim into a probe failure that blames the wrong thing. A
+// replaced, fixed-length basename keeps the scratch path's length governed by
+// the directory portion alone, the same as the original path. The random
+// suffix is so concurrent probes (or a probe racing its own retry) don't
+// collide.
 func scratchProbePath(socket string) (string, error) {
 	var suffix [4]byte
 	if _, err := rand.Read(suffix[:]); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s.dotvault-probe-%x", socket, suffix), nil
+	return path.Join(path.Dir(socket), fmt.Sprintf(".dotvault-probe-%x", suffix)), nil
 }
 
 // serveListener is the transport-agnostic accept loop, split out so it is
@@ -323,18 +370,25 @@ func Pump(a, b net.Conn) {
 // nothing is listening there — the guard here is a second, independent line
 // of defence against deleting the wrong kind of file: a remote_socket that
 // (via typo or a stale config edit) happens to name an existing regular file
-// must never be silently destroyed. If path is not a socket the whole command
-// fails and the caller treats this as an ordinary bind failure rather than
-// retrying against a file it just deleted.
-func removeRemoteFile(ctx context.Context, cl *ssh.Client, path string) error {
+// must never be silently destroyed. If path exists and is not a socket the
+// whole command fails and the caller treats this as an ordinary bind failure
+// rather than retrying against a file it just deleted.
+//
+// A path that is already absent is success, not failure: sshd itself
+// typically unlinks a streamlocal forward's socket when the client cancels it
+// (Close), so by the time a caller gets here to clean up a scratch probe path
+// it has often already vanished — and callers should not report that as
+// "cleanup failed" (see directStreamLocalWorks, whose deferred cleanup would
+// otherwise log an error on every successful probe).
+func removeRemoteFile(ctx context.Context, cl *ssh.Client, remotePath string) error {
 	sess, err := cl.NewSession()
 	if err != nil {
 		return fmt.Errorf("open session: %w", err)
 	}
 	defer sess.Close()
 
-	q := shellQuote(path)
-	cmd := "[ -S " + q + " ] && rm -f -- " + q
+	q := shellQuote(remotePath)
+	cmd := "[ -e " + q + " ] || exit 0; [ -S " + q + " ] && rm -f -- " + q
 
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(cmd) }()
@@ -344,7 +398,7 @@ func removeRemoteFile(ctx context.Context, cl *ssh.Client, path string) error {
 		return ctx.Err()
 	case err := <-done:
 		if err != nil {
-			return fmt.Errorf("rm -f %s: %w", path, err)
+			return fmt.Errorf("rm -f %s: %w", remotePath, err)
 		}
 		return nil
 	}

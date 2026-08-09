@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"path"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,5 +199,72 @@ func TestLiveListenerAtRefusesToUnlinkWhenMechanismItselfIsBroken(t *testing.T) 
 	if err == nil {
 		t.Fatal("liveListenerAt returned nil error when its own differential probe could not confirm direct-streamlocal works; " +
 			"a ConnectionFailed under AllowStreamLocalForwarding=remote or =no must not be trusted as proof of a stale socket")
+	}
+}
+
+// closeTrackingConn wraps a net.Conn and records whether Close was called,
+// without needing a real ssh server round trip — this is what makes
+// drainPendingForward directly testable rather than only observable
+// indirectly (and slowly) through the fake sshd's inability to reproduce
+// sshd's self-connect-triggers-a-second-channel-open behaviour.
+type closeTrackingConn struct {
+	net.Conn
+	closed *int32
+}
+
+func (c closeTrackingConn) Close() error {
+	atomic.StoreInt32(c.closed, 1)
+	return c.Conn.Close()
+}
+
+func TestDrainPendingForwardAcceptsAndClosesQueuedConnection(t *testing.T) {
+	ln := newFakeListener()
+	t.Cleanup(func() { ln.Close() })
+
+	serverSide, clientSide := net.Pipe()
+	t.Cleanup(func() { clientSide.Close() })
+	var closed int32
+	// Sent from a goroutine: fakeListener.conns is unbuffered, and nothing
+	// reads it until drainPendingForward's own internal Accept() call does.
+	go func() { ln.conns <- closeTrackingConn{Conn: serverSide, closed: &closed} }()
+
+	drainPendingForward(ln)
+
+	if atomic.LoadInt32(&closed) == 0 {
+		t.Error("drainPendingForward did not close the queued connection; the corresponding SSH channel-open would be left permanently unanswered")
+	}
+}
+
+func TestDrainPendingForwardReturnsPromptlyWhenNothingIsQueued(t *testing.T) {
+	ln := newFakeListener()
+	t.Cleanup(func() { ln.Close() })
+
+	start := time.Now()
+	drainPendingForward(ln)
+	if elapsed := time.Since(start); elapsed < drainPendingForwardTimeout {
+		t.Errorf("drainPendingForward returned after %s with nothing queued; expected it to wait out the full %s bound", elapsed, drainPendingForwardTimeout)
+	} else if elapsed > drainPendingForwardTimeout+time.Second {
+		t.Errorf("drainPendingForward took %s, want close to the %s bound", elapsed, drainPendingForwardTimeout)
+	}
+}
+
+func TestScratchProbePathStaysWithinOriginalPathLength(t *testing.T) {
+	// A legitimate but long basename must not make the scratch path exceed
+	// the original path's length — a suffixed name would grow with it and
+	// risk ENAMETOOLONG against the sun_path budget (108 bytes on Linux, 104
+	// on the BSDs); a replaced basename does not.
+	longBase := "a-very-descriptive-dotvault-remote-socket-name-for-this-particular-host"
+	socket := "/run/user/1000/" + longBase + ".sock"
+
+	scratch, err := scratchProbePath(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scratch) > len(socket) {
+		t.Errorf("scratchProbePath(%q) = %q (%d bytes), longer than the original path (%d bytes)",
+			socket, scratch, len(scratch), len(socket))
+	}
+	if path.Dir(scratch) != path.Dir(socket) {
+		t.Errorf("scratchProbePath(%q) = %q, want it in the same directory (%q)", socket, scratch, path.Dir(socket))
 	}
 }

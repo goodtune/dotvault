@@ -72,6 +72,12 @@ func Classify(err error) ErrorClass {
 		return ClassRefused
 	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
 		return ClassUnreachable
+	case errors.Is(err, ErrAuth):
+		return ClassAuth
+	case errors.Is(err, ErrBind):
+		return ClassBind
+	case errors.Is(err, ErrHandshake):
+		return ClassHandshake
 	}
 
 	var dnsErr *net.DNSError

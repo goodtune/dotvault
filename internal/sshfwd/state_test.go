@@ -24,6 +24,9 @@ func TestClassify(t *testing.T) {
 		{"host key unknown", fmt.Errorf("wrap: %w", ErrHostKeyUnknown), ClassHostKey},
 		{"dns", &net.DNSError{Err: "no such host", IsNotFound: true}, ClassDNS},
 		{"refused", fmt.Errorf("dial tcp: %w", errConnRefusedStub), ClassRefused},
+		{"auth", fmt.Errorf("wrap: %w", ErrAuth), ClassAuth},
+		{"bind", fmt.Errorf("wrap: %w", ErrBind), ClassBind},
+		{"handshake", fmt.Errorf("wrap: %w", ErrHandshake), ClassHandshake},
 		{"other", errors.New("something else"), ClassOther},
 	}
 	for _, tt := range tests {

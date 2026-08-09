@@ -116,10 +116,46 @@ func (p *HostKeyPolicy) Callback(observed *ssh.PublicKey) ssh.HostKeyCallback {
 }
 
 // checkCert validates a host certificate against the configured CAs.
+//
+// A certificate always reaches this function — see Callback's type switch,
+// which checks for *ssh.Certificate before the pinned-raw-key comparison —
+// and never the comparison itself, because a certificate also satisfies
+// ssh.PublicKey and would always fail a byte-wise comparison against a
+// pinned raw key. That means an existing pin offers a certificate-presenting
+// host no protection unless this function itself refuses to treat the
+// certificate as confirmable when there is nothing to validate it against;
+// see the len(p.CAs)==0 branch below, which is where that used to go wrong.
 func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Certificate) error {
 	if len(p.CAs) == 0 {
-		return fmt.Errorf("%s: %w (offered host certificate, no certificate_authorities configured)",
-			hostname, ErrHostKeyUnknown)
+		if p.Pinned != "" {
+			// This host is already pinned to a raw key. A certificate can
+			// never be compared against that pin (only a non-certificate
+			// key reaches the comparison in Callback), so with no CA to
+			// validate it against there is nothing that makes the
+			// certificate trustworthy. Reporting ErrHostKeyUnknown here —
+			// the pre-fix behaviour — would let a certificate silently
+			// stand in for the key that was actually promised, turning what
+			// must be a hard ErrHostKeyMismatch into a human-clickable
+			// "new host, please confirm" prompt: exactly the MITM downgrade
+			// ErrConfirmHostKey's doc comment (registry.go) forbids.
+			return fmt.Errorf("%s: %w (host is pinned to a raw key, but presented a certificate instead and no certificate_authorities are configured to validate it)",
+				hostname, ErrHostKeyMismatch)
+		}
+		// No pin either, so in principle this could be a brand-new host
+		// whose certificate is genuinely fine — but with zero CAs configured
+		// there is still nothing to validate it against, and no deployment
+		// configures certificate_authorities without also intending to rely
+		// on it. Reporting ErrHostKeyUnknown here (the pre-fix behaviour)
+		// made *every* certificate confirmable by default: an expired one,
+		// a wrong-principal one, a user certificate presented as a host
+		// certificate, or one from a CA nobody configured — none of that is
+		// checked before returning "unknown, please confirm". Refusing
+		// outright and naming the missing configuration is the safe
+		// default; an operator who wants certificate-authenticated hosts
+		// sets certificate_authorities, and one who does not should have
+		// the host present a plain key instead.
+		return fmt.Errorf("%s: %w (offered a host certificate, but no certificate_authorities are configured to validate it)",
+			hostname, ErrHostKeyMismatch)
 	}
 
 	cb, err := p.cachedCACallback()
@@ -134,17 +170,15 @@ func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Ce
 	// change away from knownhosts.New (e.g. hand-rolling the host-pattern
 	// match) would silently drop all four checks.
 	//
-	// On this path ErrHostKeyUnknown covers exactly one situation: no CAs
-	// configured at all (the len(p.CAs)==0 branch above). Everything cb can
+	// Every certificate that reaches this function without a nil error above
+	// has at least one configured CA to be checked against, so
+	// ErrHostKeyUnknown never appears past this point: everything cb can
 	// reject — a host not covered by any configured CA's pattern, a bad
 	// signature, an expired certificate, a wrong principal, a certificate
-	// presented with the wrong CertType — is a hard rejection below, never
-	// folded into ErrHostKeyUnknown. That is deliberate: those are operator
-	// configuration errors or invalid certificates, not the "haven't pinned
-	// this host yet" case `ssh add`'s fingerprint prompt exists for. Widening
-	// ErrHostKeyUnknown to also cover "no matching CA pattern" would drag
-	// bad-signature and expired certificates in with it, since knownhosts
-	// reports both as the same "no authorities for hostname" error.
+	// presented with the wrong CertType — is a hard rejection below. That is
+	// deliberate: those are operator configuration errors or invalid
+	// certificates, not the "haven't pinned this host yet" case `ssh add`'s
+	// fingerprint prompt exists for.
 	if err := cb(hostname, remote, cert); err != nil {
 		return fmt.Errorf("%s: host certificate rejected: %w: %w", hostname, ErrHostKeyMismatch, err)
 	}

@@ -2,8 +2,9 @@ package sshfwd
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
-	"net"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -47,88 +48,27 @@ func TestVerifierPropagatesUserError(t *testing.T) {
 	}
 }
 
-// startFakeSSHD stands up an in-memory sshd (real TCP loopback, no external
-// process) good enough for Verify's own needs: NoClientAuth (Verify's dial
-// carries a real publickey offer, but nothing here needs to check it),
-// "echo $HOME" over a session channel (ExpandRemotePath's "~/" probe), and
-// streamlocal-forward/cancel-streamlocal-forward global requests (ListenUnix
-// and its Close). It intentionally does not implement
-// direct-streamlocal@openssh.com — Verify never dials the socket it binds,
-// only binds and releases it — so unlike liveprobe_test.go's fake server
-// this one needs no channel-open decision table.
-func startFakeSSHD(t *testing.T, home string) (host string, port int, hostSigner ssh.Signer) {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+func TestVerifierRejectsIncompleteDeps(t *testing.T) {
+	tests := []struct {
+		name string
+		deps Deps
+	}{
+		{"nil Signers", Deps{User: func() (string, error) { return "me", nil }, Policy: func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} }}},
+		{"nil User", Deps{Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil }, Policy: func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} }}},
+		{"nil Policy", Deps{Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil }, User: func() (string, error) { return "me", nil }}},
+		{"zero-value Deps", Deps{}},
 	}
-	t.Cleanup(func() { ln.Close() })
-
-	signer, _ := testKey(t)
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewVerifier(tt.deps)
+			// The point of this test is that Verify returns an error instead
+			// of panicking on a nil func call; a panic would fail the test
+			// on its own, so there is nothing else to assert beyond reaching
+			// this line.
+			if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}); err == nil {
+				t.Error("Verify() = nil error for incomplete Deps, want an error")
 			}
-			go serveFakeSSHDConn(conn, signer, home)
-		}
-	}()
-
-	addr := ln.Addr().(*net.TCPAddr)
-	return "127.0.0.1", addr.Port, signer
-}
-
-func serveFakeSSHDConn(conn net.Conn, signer ssh.Signer, home string) {
-	config := &ssh.ServerConfig{NoClientAuth: true}
-	config.AddHostKey(signer)
-
-	_, chans, reqs, err := ssh.NewServerConn(conn, config)
-	if err != nil {
-		return
-	}
-
-	go func() {
-		for req := range reqs {
-			switch req.Type {
-			case "streamlocal-forward@openssh.com", "cancel-streamlocal-forward@openssh.com":
-				if req.WantReply {
-					req.Reply(true, nil)
-				}
-			default:
-				if req.WantReply {
-					req.Reply(false, nil)
-				}
-			}
-		}
-	}()
-
-	for newCh := range chans {
-		switch newCh.ChannelType() {
-		case "session":
-			ch, chReqs, err := newCh.Accept()
-			if err != nil {
-				continue
-			}
-			go func() {
-				for r := range chReqs {
-					if r.Type == "exec" {
-						if r.WantReply {
-							r.Reply(true, nil)
-						}
-						ch.Write([]byte(home + "\n"))
-						ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{0}))
-						ch.Close()
-					} else if r.WantReply {
-						r.Reply(false, nil)
-					}
-				}
-			}()
-		default:
-			newCh.Reject(ssh.UnknownChannelType, "unsupported in this fake server")
-		}
+		})
 	}
 }
 
@@ -138,13 +78,54 @@ func fakeSigners(t *testing.T) []ssh.Signer {
 	return []ssh.Signer{s}
 }
 
+// hostCertSigner builds a signed host certificate — the same shape as
+// hostkey_test.go's hostCert — and wraps it in an ssh.Signer suitable for
+// ssh.ServerConfig.AddHostKey (via fakeSSHDConfig.signer), so a fake sshd can
+// present a certificate instead of a raw key as its host key. hostCert itself
+// can't be reused directly here: it deliberately discards the host
+// certificate's own private key, since hostkey_test.go only ever feeds the
+// resulting *ssh.Certificate into HostKeyPolicy.Callback directly and never
+// needs to sign a real handshake with it.
+func hostCertSigner(t *testing.T, caSigner ssh.Signer, opts ...func(*ssh.Certificate)) ssh.Signer {
+	t.Helper()
+	hostSigner, hostPub := testKey(t)
+	cert := &ssh.Certificate{
+		Key:         hostPub,
+		CertType:    ssh.HostCert,
+		KeyId:       "fake-sshd",
+		ValidAfter:  0,
+		ValidBefore: ssh.CertTimeInfinity,
+	}
+	for _, opt := range opts {
+		opt(cert)
+	}
+	if err := cert.SignCert(rand.Reader, caSigner); err != nil {
+		t.Fatal(err)
+	}
+	certSigner, err := ssh.NewCertSigner(cert, hostSigner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certSigner
+}
+
 // TestVerifierReturnsConfirmableResultForUnknownHostKey is the primary happy
 // path Verify exists for: a host with no pin and no configured CA dials
 // clean, and the result is exactly what Registry.Add needs to run its
 // fingerprint-confirmation gate — a nil error, carrying the key and its
-// fingerprint.
+// fingerprint, with Verified true.
+//
+// Verified must be true here even though nothing has been confirmed yet:
+// VerifyResult.Verified's doc comment (registry.go) defines "an actual
+// check" to include reaching Add's own fingerprint-confirmation gate for a
+// brand-new key. Registry.Add's switch reads Verified in the opposite sense
+// — its first case, !Verified, is reserved for "nothing was checked at all"
+// (the insecure policy) — so Verified: false here would make Add swallow
+// the result before ErrConfirmHostKey is ever raised, silently persisting a
+// brand-new host with no pin and no confirmation. This was Critical finding
+// #1 in the round-1 review.
 func TestVerifierReturnsConfirmableResultForUnknownHostKey(t *testing.T) {
-	host, port, signer := startFakeSSHD(t, "/home/test")
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test"})
 
 	v := NewVerifier(Deps{
 		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
@@ -163,8 +144,45 @@ func TestVerifierReturnsConfirmableResultForUnknownHostKey(t *testing.T) {
 	if result.HostKey == "" {
 		t.Error("HostKey is empty for an unpinned host; Registry.Add has nothing to offer for confirmation")
 	}
-	if result.Verified {
-		t.Error("Verified = true for an unconfirmed, brand-new host key; confirmation has not happened yet")
+	if !result.Verified {
+		t.Error("Verified = false for the confirmable unknown-key result; Registry.Add's !Verified case would swallow it and never raise ErrConfirmHostKey")
+	}
+}
+
+// TestRegistryAddPromptsForConfirmationAgainstLiveVerifier drives a full
+// Registry.Add against the live Verifier end to end — not a fake Verifier —
+// against a brand-new, unpinned host. This is the exact end-to-end path the
+// round-1 review used to prove Critical finding #1: with Verified left false
+// on the confirmable branch, Add's `case !result.Verified` swallowed the
+// result and persisted the host with an empty HostKey, no prompt ever
+// raised. With the fix, Add must return ErrConfirmHostKey instead.
+func TestRegistryAddPromptsForConfirmationAgainstLiveVerifier(t *testing.T) {
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test"})
+
+	deps := Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
+	}
+	mgr := NewManager(deps)
+	t.Cleanup(mgr.Close)
+	reg := NewRegistry(t.TempDir()+"/ssh.yaml", mgr, NewVerifier(deps))
+
+	_, err := reg.Add(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, AddOptions{})
+	var confirm *HostKeyConfirmation
+	if !errors.As(err, &confirm) {
+		t.Fatalf("Registry.Add() = %v, want a *HostKeyConfirmation for a brand-new host", err)
+	}
+	if confirm.Fingerprint == "" {
+		t.Error("HostKeyConfirmation.Fingerprint is empty; nothing for the caller to echo back")
+	}
+
+	list, err := reg.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Errorf("Registry.List() = %+v after an unconfirmed Add, want no entry persisted", list)
 	}
 }
 
@@ -174,7 +192,7 @@ func TestVerifierReturnsConfirmableResultForUnknownHostKey(t *testing.T) {
 // came back as a VerifyResult with a nil error, a user could click through
 // what might be an active MITM.
 func TestVerifierReturnsErrorForHostKeyMismatch(t *testing.T) {
-	host, port, _ := startFakeSSHD(t, "/home/test")
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test"})
 
 	other, _ := testKey(t)
 	wrongPin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(other.PublicKey())))
@@ -194,6 +212,110 @@ func TestVerifierReturnsErrorForHostKeyMismatch(t *testing.T) {
 	}
 }
 
+// TestVerifierRejectsCertificateOnPinnedHostWithNoConfiguredCA is Critical
+// finding #2 from the round-1 review, reproduced end to end: a host already
+// pinned to a raw key presents a certificate instead (no configured CA can
+// validate it either way). Before the hostkey.go fix, checkCert's
+// len(p.CAs)==0 branch returned ErrHostKeyUnknown unconditionally — without
+// even looking at the pin — turning what must be a hard ErrHostKeyMismatch
+// (an attacker presenting a certificate to bypass the pinned raw key) into a
+// human-clickable "new host, please confirm" prompt.
+func TestVerifierRejectsCertificateOnPinnedHostWithNoConfiguredCA(t *testing.T) {
+	caSigner, _ := testKey(t)
+	certSigner := hostCertSigner(t, caSigner)
+
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test", signer: certSigner})
+
+	_, pinned := testKey(t)
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pinned)))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} }, // no CAs configured
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	if errors.Is(err, ErrHostKeyUnknown) {
+		t.Fatalf("Verify() reported the certificate as confirmable (wraps ErrHostKeyUnknown) on an already-pinned host: result=%+v err=%v", result, err)
+	}
+	if err == nil {
+		t.Fatalf("Verify() = (%+v, nil), want an error: a certificate must never silently satisfy an existing raw-key pin", result)
+	}
+	if !errors.Is(err, ErrHostKeyMismatch) {
+		t.Errorf("Verify() error does not wrap ErrHostKeyMismatch, so Classify cannot map it to ClassHostKey: %v", err)
+	}
+	if result != (VerifyResult{}) {
+		t.Errorf("Verify() returned a non-zero result alongside an error: %+v", result)
+	}
+}
+
+// TestVerifierRejectsCertificateWithNoConfiguredCA is the benign-looking half
+// of Critical finding #2: an unpinned host offers a certificate, but no
+// certificate_authorities are configured to validate it against. Before the
+// fix this was confirmable too — any certificate was, on any deployment that
+// had not configured CAs at all, which is the default. It must instead be
+// refused outright: there is nothing that makes an unvalidated certificate
+// safe to ask a human to confirm.
+func TestVerifierRejectsCertificateWithNoConfiguredCA(t *testing.T) {
+	caSigner, _ := testKey(t)
+	certSigner := hostCertSigner(t, caSigner)
+
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test", signer: certSigner})
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} }, // no pin, no CAs
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	if errors.Is(err, ErrHostKeyUnknown) {
+		t.Fatalf("Verify() reported an unvalidatable certificate as confirmable (wraps ErrHostKeyUnknown): result=%+v err=%v", result, err)
+	}
+	if err == nil {
+		t.Fatalf("Verify() = (%+v, nil), want an error: a certificate with no configured CA to check it against must never be confirmable", result)
+	}
+	if result != (VerifyResult{}) {
+		t.Errorf("Verify() returned a non-zero result alongside an error: %+v", result)
+	}
+}
+
+// TestVerifierAcceptsCASignedCertificate is the CA-covered success shape:
+// the one outcome the round-1 report itself flagged as untested. A
+// certificate signed by a configured CA, with no ValidPrincipals set (valid
+// for any principal — see ssh.CertChecker.CheckCert), must verify cleanly
+// with Verified true and no new key to report.
+func TestVerifierAcceptsCASignedCertificate(t *testing.T) {
+	caSigner, caPub := testKey(t)
+	certSigner := hostCertSigner(t, caSigner)
+
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test", signer: certSigner})
+
+	// knownhosts.hostPattern matches the host part with a glob but the port
+	// exactly (see hostPattern.match); an unqualified "*" defaults to port
+	// "22", so the pattern must name this fake sshd's actual (ephemeral)
+	// port explicitly.
+	caLine := fmt.Sprintf("@cert-authority *:%d %s", port, string(ssh.MarshalAuthorizedKey(caPub)))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{CAs: []string{caLine}} },
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	if err != nil {
+		t.Fatalf("Verify() returned an error for a CA-signed certificate: %v", err)
+	}
+	if !result.Verified {
+		t.Error("Verified = false for a certificate covered by a configured CA")
+	}
+	if result.HostKey != "" {
+		t.Errorf("HostKey = %q for a CA-covered host, want empty: nothing new to pin", result.HostKey)
+	}
+}
+
 // TestVerifierInsecurePolicyReportsNoKeyMaterial is contract 2. Under an
 // insecure policy, HostKeyPolicy.Callback records the observed key before
 // its own Insecure short-circuit, so Verify is holding a fully-populated
@@ -201,7 +323,7 @@ func TestVerifierReturnsErrorForHostKeyMismatch(t *testing.T) {
 // not be reported: if it reached Registry.Add it would be persisted as a
 // pin that outlives the insecure flag.
 func TestVerifierInsecurePolicyReportsNoKeyMaterial(t *testing.T) {
-	host, port, _ := startFakeSSHD(t, "/home/test")
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test"})
 
 	v := NewVerifier(Deps{
 		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
@@ -229,7 +351,7 @@ func TestVerifierInsecurePolicyReportsNoKeyMaterial(t *testing.T) {
 // echoed back, and Verified true because the pin genuinely was checked.
 // Registry.Add owns the fallback to the pin already on file.
 func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
-	host, port, signer := startFakeSSHD(t, "/home/test")
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{home: "/home/test"})
 	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
 
 	v := NewVerifier(Deps{
@@ -250,5 +372,46 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 	}
 	if result.ResolvedSocket != "/home/test/.ssh/dotvault.sock" {
 		t.Errorf("ResolvedSocket = %q, want the ~ expansion against the fake sshd's $HOME", result.ResolvedSocket)
+	}
+}
+
+// TestVerifierReturnsErrBindOnBindFailure proves the ListenUnix failure path
+// wraps ErrBind, and that Verify does not attempt to work around the
+// failure by any means other than reporting it — the fake sshd here also
+// counts "exec" requests, so this doubles as the contract-5 regression test
+// below.
+func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
+	var execCount int
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		home:                     "/home/test",
+		refuseStreamlocalForward: true,
+		sawExec:                  &execCount,
+	})
+	// Pinned so the dial itself succeeds and Verify reaches the bind step —
+	// this test is about ListenUnix's failure, not the host-key path.
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	if !errors.Is(err, ErrBind) {
+		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
+	}
+
+	// Contract 5: `ssh add` must never delete a file on a host it does not
+	// yet manage. removeRemoteFile (forward.go) — the only thing in this
+	// package that ever runs "rm -f" — issues its command over a "session"
+	// exec, same as ExpandRemotePath's "echo $HOME" probe. The fake sshd
+	// counted every exec it served; exactly one (the $HOME probe that ran
+	// before the bind failure) proves no stale-socket reclaim attempt
+	// followed the failed bind. A future edit wiring liveListenerAt's
+	// read-only probe (added for the re-Add-while-forwarding diagnostic) to
+	// also call removeRemoteFile would trip this by adding a second exec.
+	if execCount != 1 {
+		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount)
 	}
 }

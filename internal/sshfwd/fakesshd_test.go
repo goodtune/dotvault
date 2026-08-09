@@ -1,0 +1,150 @@
+package sshfwd
+
+import (
+	"net"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// fakeSSHDConfig configures the in-memory sshd (real TCP loopback, no
+// external process) shared by liveprobe_test.go and verify_test.go. Both
+// need a fake sshd for a different reason — one to script
+// direct-streamlocal@openssh.com channel-open decisions, the other to dial
+// through Verify's real Dial()+HostKeyPolicy path — so only what actually
+// differs between them is parameterised here; everything else (auth,
+// session/exec, the streamlocal-forward/cancel-streamlocal-forward global
+// requests ListenUnix/Close send) is identical and was previously
+// duplicated between the two files.
+type fakeSSHDConfig struct {
+	// signer is the host key (or a certificate wrapping one, via
+	// ssh.NewCertSigner) presented during the handshake. Nil generates a
+	// fresh ed25519 key per call.
+	signer ssh.Signer
+
+	// home is written as the sole line of stdout for every "exec" session,
+	// satisfying ExpandRemotePath's "echo $HOME" probe. Empty is fine for a
+	// caller that only runs commands whose output is never read (e.g.
+	// liveprobe_test.go's rm -f probes).
+	home string
+
+	// onDirectStreamLocal handles a direct-streamlocal@openssh.com
+	// channel-open. Nil rejects every one with UnknownChannelType, matching
+	// an sshd this package never dials the bound socket through.
+	onDirectStreamLocal func(newCh ssh.NewChannel)
+
+	// refuseStreamlocalForward makes the streamlocal-forward@openssh.com
+	// global request (ListenUnix) fail, simulating AllowStreamLocalForwarding
+	// no or an unwritable remote path — the failure *shape* ListenUnix sees,
+	// not the real sshd directive (that needs Task 17's live server).
+	refuseStreamlocalForward bool
+
+	// sawExec is incremented, if non-nil, for every "exec" request this
+	// connection serves — used to assert that a caller's flow never runs a
+	// remote command it has no business running (e.g. Verify's contract 5:
+	// no stale-socket rm -f on a bind failure).
+	sawExec *int
+}
+
+// serveFakeSSHDConn serves one accepted connection as an in-memory sshd
+// configured by cfg. NoClientAuth: nothing in this package checks the
+// offered credential server-side; Dial's own auth-method wiring is what's
+// under test, not sshd's acceptance of it.
+func serveFakeSSHDConn(conn net.Conn, cfg fakeSSHDConfig) {
+	signer := cfg.signer
+
+	config := &ssh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+
+	_, chans, reqs, err := ssh.NewServerConn(conn, config)
+	if err != nil {
+		return
+	}
+
+	go func() {
+		for req := range reqs {
+			switch req.Type {
+			case "streamlocal-forward@openssh.com":
+				if req.WantReply {
+					req.Reply(!cfg.refuseStreamlocalForward, nil)
+				}
+			case "cancel-streamlocal-forward@openssh.com":
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+			default:
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+			}
+		}
+	}()
+
+	for newCh := range chans {
+		switch newCh.ChannelType() {
+		case "direct-streamlocal@openssh.com":
+			if cfg.onDirectStreamLocal != nil {
+				cfg.onDirectStreamLocal(newCh)
+				continue
+			}
+			newCh.Reject(ssh.UnknownChannelType, "unsupported in this fake server")
+		case "session":
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			go func() {
+				for r := range chReqs {
+					if r.Type == "exec" {
+						if cfg.sawExec != nil {
+							*cfg.sawExec++
+						}
+						if r.WantReply {
+							r.Reply(true, nil)
+						}
+						if cfg.home != "" {
+							ch.Write([]byte(cfg.home + "\n"))
+						}
+						ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{0}))
+						ch.Close()
+					} else if r.WantReply {
+						r.Reply(false, nil)
+					}
+				}
+			}()
+		default:
+			newCh.Reject(ssh.UnknownChannelType, "unsupported in this fake server")
+		}
+	}
+}
+
+// startFakeSSHD stands up serveFakeSSHDConn on a loopback TCP listener,
+// accepting connections until the test ends, and returns the host/port to
+// dial plus the signer actually presented (generated when cfg.signer is
+// nil) so callers can assert against it (e.g. the fingerprint offered).
+func startFakeSSHD(t *testing.T, cfg fakeSSHDConfig) (host string, port int, hostSigner ssh.Signer) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	if cfg.signer == nil {
+		cfg.signer, _ = testKey(t)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveFakeSSHDConn(conn, cfg)
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	return "127.0.0.1", addr.Port, cfg.signer
+}

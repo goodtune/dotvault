@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
@@ -33,6 +34,17 @@ func NewVerifier(d Deps) Verifier {
 // socket. Nothing about the connection survives the call: the client is
 // always closed before Verify returns, on every path.
 func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+	if v.deps.Signers == nil || v.deps.User == nil || v.deps.Policy == nil {
+		// Verify doesn't need Target/TargetName (it never relays anything),
+		// so this is deliberately narrower than ManagedRemote.run's
+		// errIncompleteDeps check (remote.go) rather than sharing it
+		// verbatim — but the reasoning is the same: a wiring mistake should
+		// surface as a returned error, not a nil-func panic, and here that
+		// panic would happen inside an interactive `ssh add` rather than a
+		// background goroutine.
+		return VerifyResult{}, errors.New("sshfwd: incomplete Deps passed to Verify: Signers, User, and Policy must all be set")
+	}
+
 	signers, err := v.deps.Signers()
 	if err != nil {
 		return VerifyResult{}, err
@@ -67,7 +79,9 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error
 			// expired or wrong-principal certificate, or a certificate from
 			// an unconfigured CA — falls through to the plain-error return
 			// below and must never be mistaken for something a fingerprint
-			// could confirm past.
+			// could confirm past. hostkey.go's checkCert is what keeps a
+			// certificate out of this branch except for the one case where
+			// there is genuinely nothing to validate it against.
 			if observed == nil {
 				// Callback always records into *Observed before returning
 				// ErrHostKeyUnknown (see hostkey.go), so this should not
@@ -75,9 +89,25 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error
 				// fabricating a result with no key.
 				return VerifyResult{}, err
 			}
+			// Verified is true here even though nothing has confirmed the
+			// key yet: VerifyResult.Verified's doc comment defines "an
+			// actual check" to include reaching Add's own
+			// fingerprint-confirmation gate for a brand-new key, precisely
+			// because that gate — not this call — is where the human
+			// decision happens. Registry.Add's switch (registry.go) reads
+			// Verified in the opposite sense: its first case, !Verified,
+			// is reserved for "nothing was checked at all" (the insecure
+			// policy, contract 2) and would otherwise swallow this result
+			// before ErrConfirmHostKey is ever raised — silently persisting
+			// a brand-new host with no pin and no confirmation. The two
+			// cases stay distinguishable because the insecure path never
+			// reaches here: HostKeyPolicy.Callback accepts unconditionally
+			// under Insecure, so Dial returns no error and this branch is
+			// never taken for it.
 			return VerifyResult{
 				HostKey:     strings.TrimSpace(string(ssh.MarshalAuthorizedKey(observed))),
 				Fingerprint: ssh.FingerprintSHA256(observed),
+				Verified:    true,
 			}, nil
 		}
 		return VerifyResult{}, err
@@ -111,10 +141,39 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error
 	// caller tries again once whatever is occupying the path is resolved.
 	ln, err := cl.ListenUnix(resolved)
 	if err != nil {
+		// A bind failure here is not necessarily "this host can never be
+		// forwarded to" — the same path re-verified while this daemon (or
+		// another `ssh -R` session) already holds a live forward on it will
+		// also fail to bind, since sshd's default StreamLocalBindUnlink=no
+		// makes bind() fail EADDRINUSE for any existing path entry (see
+		// ServeForward's doc comment in forward.go). liveListenerAt answers
+		// that question without unlinking anything — it only dials, never
+		// removes — so it stays inside contract 5 (no stale-socket unlink
+		// here) while turning "bind remote socket failed" into an
+		// actionable message for a re-`ssh add` of a host already being
+		// forwarded to, instead of a confusing failure on a healthy host. A
+		// probe error (inconclusive) is folded into the same message rather
+		// than surfaced separately: either way the caller's actionable next
+		// step is the same "resolve the bind failure and retry".
+		live, probeErr := liveListenerAt(ctx, cl, resolved)
+		if probeErr == nil && live {
+			return VerifyResult{}, fmt.Errorf(
+				"%w: %s: %w (something is already listening at this path — if this host is already managed by a running dotvault daemon, verification is expected to fail here; stop that forward first, or re-add with AddOptions.Force to skip verification)",
+				ErrBind, resolved, err)
+		}
 		return VerifyResult{}, fmt.Errorf("%w: %s: %w", ErrBind, resolved, err)
 	}
 	if err := ln.Close(); err != nil {
-		return VerifyResult{}, fmt.Errorf("close verification listener for %s: %w", resolved, err)
+		// Not escalated to a hard failure: the dry run already proved the
+		// bind itself works, which is what this step exists to check, and
+		// the deferred cl.Close() above tears the whole transport (and
+		// therefore this listener) down regardless of whether the explicit
+		// Close here succeeded. Refusing the verification over a flaky
+		// cancel-streamlocal-forward reply — a transient global-request
+		// hiccup, not evidence the socket can't be bound — would be a false
+		// negative on an otherwise-healthy host.
+		slog.Warn("closing verification listener failed; continuing since the deferred client Close tears it down regardless",
+			"socket", resolved, "error", err)
 	}
 
 	// A successful Dial never falls through with a *new* key to report:

@@ -40,75 +40,34 @@ func dialFakeStreamlocalServer(t *testing.T, decisions []streamlocalDecision) *s
 
 	serverSigner, _ := testKey(t)
 
+	var n int32
+	onDirectStreamLocal := func(newCh ssh.NewChannel) {
+		i := int(atomic.AddInt32(&n, 1)) - 1
+		d := streamlocalDecision{reason: ssh.ConnectionFailed}
+		if i < len(decisions) {
+			d = decisions[i]
+		}
+		if d.accept {
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				return
+			}
+			go ssh.DiscardRequests(chReqs)
+			go io.Copy(io.Discard, ch) // keep the channel draining until the client closes it
+		} else {
+			newCh.Reject(d.reason, "rejected")
+		}
+	}
+
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		config := &ssh.ServerConfig{NoClientAuth: true}
-		config.AddHostKey(serverSigner)
-
-		_, chans, reqs, err := ssh.NewServerConn(conn, config)
-		if err != nil {
-			return
-		}
-
-		go func() {
-			for req := range reqs {
-				switch req.Type {
-				case "streamlocal-forward@openssh.com", "cancel-streamlocal-forward@openssh.com":
-					if req.WantReply {
-						req.Reply(true, nil)
-					}
-				default:
-					if req.WantReply {
-						req.Reply(false, nil)
-					}
-				}
-			}
-		}()
-
-		var n int32
-		for newCh := range chans {
-			switch newCh.ChannelType() {
-			case "direct-streamlocal@openssh.com":
-				i := int(atomic.AddInt32(&n, 1)) - 1
-				d := streamlocalDecision{reason: ssh.ConnectionFailed}
-				if i < len(decisions) {
-					d = decisions[i]
-				}
-				if d.accept {
-					ch, chReqs, err := newCh.Accept()
-					if err != nil {
-						continue
-					}
-					go ssh.DiscardRequests(chReqs)
-					go io.Copy(io.Discard, ch) // keep the channel draining until the client closes it
-				} else {
-					newCh.Reject(d.reason, "rejected")
-				}
-			case "session":
-				ch, chReqs, err := newCh.Accept()
-				if err != nil {
-					continue
-				}
-				go func() {
-					for r := range chReqs {
-						if r.Type == "exec" {
-							if r.WantReply {
-								r.Reply(true, nil)
-							}
-							_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(&struct{ Status uint32 }{0}))
-							ch.Close()
-						} else if r.WantReply {
-							r.Reply(false, nil)
-						}
-					}
-				}()
-			default:
-				newCh.Reject(ssh.UnknownChannelType, "unsupported in this fake server")
-			}
-		}
+		serveFakeSSHDConn(conn, fakeSSHDConfig{
+			signer:              serverSigner,
+			onDirectStreamLocal: onDirectStreamLocal,
+		})
 	}()
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())

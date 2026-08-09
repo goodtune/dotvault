@@ -234,10 +234,23 @@ function SSHAddForm({ onAdded }) {
   // what was shown to the user and nothing else.
   const [confirm, setConfirm] = useState(null);
 
+  // parsedPort validates the raw port field against the same range the Go
+  // side enforces (ValidateRemote: 0/unset for the default, else 1-65535)
+  // and — unlike parseInt, which would silently truncate "22abc" to 22 —
+  // rejects any trailing garbage rather than mangling it into a different
+  // port with no indication to the user.
+  function parsedPort() {
+    const trimmed = port.trim();
+    if (!trimmed) return { value: undefined, valid: true };
+    const n = Number(trimmed);
+    if (!Number.isInteger(n) || n <= 0 || n > 65535) return { value: undefined, valid: false };
+    return { value: n, valid: true };
+  }
+
   function buildRemote() {
     const remote = { host: host.trim() };
-    const portNum = parseInt(port, 10);
-    if (!Number.isNaN(portNum) && portNum > 0) remote.port = portNum;
+    const { value: portNum } = parsedPort();
+    if (portNum !== undefined) remote.port = portNum;
     if (socket.trim()) remote.remote_socket = socket.trim();
     return remote;
   }
@@ -271,6 +284,10 @@ function SSHAddForm({ onAdded }) {
     e.preventDefault();
     if (!host.trim()) {
       setError('host is required');
+      return;
+    }
+    if (!parsedPort().valid) {
+      setError('port must be a whole number between 1 and 65535');
       return;
     }
     submit(buildRemote());

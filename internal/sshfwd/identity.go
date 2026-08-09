@@ -61,6 +61,10 @@ func (s *backendSigner) Sign(_ io.Reader, data []byte) (*ssh.Signature, error) {
 // SignWithAlgorithm satisfies ssh.AlgorithmSigner so an RSA identity can be
 // used with rsa-sha2-256/512 rather than the deprecated ssh-rsa. The backend
 // already honours these flags.
+//
+// For certificates, the algorithm argument is always the underlying (non-cert)
+// algorithm name — x/crypto/ssh strips the -cert-v01@openssh.com suffix before
+// calling SignWithAlgorithm. The comparison must account for this.
 func (s *backendSigner) SignWithAlgorithm(_ io.Reader, data []byte, algorithm string) (*ssh.Signature, error) {
 	var flags sshagent.SignatureFlags
 	switch algorithm {
@@ -71,11 +75,29 @@ func (s *backendSigner) SignWithAlgorithm(_ io.Reader, data []byte, algorithm st
 	case "":
 		// Caller has no preference.
 	default:
-		if algorithm != s.pub.Type() {
-			return nil, fmt.Errorf("unsupported signature algorithm %q for key type %q", algorithm, s.pub.Type())
+		// For a certificate, compare against the underlying key type, not the
+		// full certificate type. The library calls SignWithAlgorithm with the
+		// stripped algorithm name (e.g. ssh-ed25519, not ssh-ed25519-cert-v01@openssh.com).
+		expectedType := s.pub.Type()
+		if cert, ok := s.pub.(*ssh.Certificate); ok {
+			expectedType = cert.Key.Type()
+		}
+		if algorithm != expectedType {
+			return nil, &ErrUnsupportedAlgorithm{algorithm, expectedType}
 		}
 	}
 	return s.src.SignWithFlags(s.pub, data, flags)
+}
+
+// ErrUnsupportedAlgorithm distinguishes an unsupported algorithm rejection
+// from a backend signing failure.
+type ErrUnsupportedAlgorithm struct {
+	algorithm string
+	keyType   string
+}
+
+func (e *ErrUnsupportedAlgorithm) Error() string {
+	return fmt.Sprintf("unsupported signature algorithm %q for key type %q", e.algorithm, e.keyType)
 }
 
 // Compile-time proof the daemon's real backend satisfies SignerSource, so a

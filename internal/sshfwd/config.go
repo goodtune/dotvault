@@ -279,7 +279,7 @@ func ValidateRemote(r Remote) error {
 		return err
 	}
 	if r.Port < 0 || r.Port > 65535 {
-		return fmt.Errorf("port %d out of range 1-65535", r.Port)
+		return fmt.Errorf("port %d out of range: must be 0 (default) or 1-65535", r.Port)
 	}
 	return ValidateRemoteSocket(r.RemoteSocket)
 }

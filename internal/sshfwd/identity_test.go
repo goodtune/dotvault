@@ -12,16 +12,20 @@ import (
 )
 
 type fakeBackend struct {
-	keys     []*sshagent.Key
-	signer   ssh.Signer
-	signErr  error
-	signCall int
+	keys            []*sshagent.Key
+	signer          ssh.Signer
+	signErr         error
+	signCall        int
+	onSignWithFlags func(sshagent.SignatureFlags)
 }
 
 func (f *fakeBackend) List() ([]*sshagent.Key, error) { return f.keys, nil }
 
 func (f *fakeBackend) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent.SignatureFlags) (*ssh.Signature, error) {
 	f.signCall++
+	if f.onSignWithFlags != nil {
+		f.onSignWithFlags(flags)
+	}
 	if f.signErr != nil {
 		return nil, f.signErr
 	}
@@ -279,6 +283,104 @@ func TestSignWithAlgorithmHandshake(t *testing.T) {
 	// Wait for server to finish.
 	if err := <-done; err != nil {
 		t.Fatalf("server error: %v", err)
+	}
+}
+
+// TestSignWithAlgorithmRSAFlags verifies that RSA signature algorithm flags
+// are correctly mapped and passed to the backend.
+func TestSignWithAlgorithmRSAFlags(t *testing.T) {
+	tests := []struct {
+		name        string
+		algorithm   string
+		wantFlags   sshagent.SignatureFlags
+		description string
+	}{
+		{
+			name:        "rsa-sha2-256",
+			algorithm:   ssh.KeyAlgoRSASHA256,
+			wantFlags:   sshagent.SignatureFlagRsaSha256,
+			description: "RSA with SHA256",
+		},
+		{
+			name:        "rsa-sha2-512",
+			algorithm:   ssh.KeyAlgoRSASHA512,
+			wantFlags:   sshagent.SignatureFlagRsaSha512,
+			description: "RSA with SHA512",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, pub := testKey(t)
+			var capturedFlags sshagent.SignatureFlags
+
+			fb := &fakeBackend{
+				keys:   []*sshagent.Key{{Format: pub.Type(), Blob: pub.Marshal(), Comment: "test"}},
+				signer: s,
+				// Capture the flags passed to SignWithFlags
+				onSignWithFlags: func(flags sshagent.SignatureFlags) {
+					capturedFlags = flags
+				},
+			}
+
+			signers, err := Signers(fb)
+			if err != nil {
+				t.Fatalf("Signers() = %v", err)
+			}
+
+			algSigner := signers[0].(ssh.AlgorithmSigner)
+			_, err = algSigner.SignWithAlgorithm(rand.Reader, []byte("payload"), tt.algorithm)
+			if err != nil {
+				t.Fatalf("SignWithAlgorithm(%s) = %v", tt.algorithm, err)
+			}
+
+			if capturedFlags != tt.wantFlags {
+				t.Errorf("backend received flags = %d, want %d (%s)", capturedFlags, tt.wantFlags, tt.description)
+			}
+		})
+	}
+}
+
+// TestSignWithAlgorithmRSACertificateFlags verifies that RSA certificates
+// with RSA flags work correctly — the interaction between certificate type
+// extraction and flag mapping.
+func TestSignWithAlgorithmRSACertificateFlags(t *testing.T) {
+	rsaCert, rsaSigner := certKey(t) // Certificate-backed signer
+
+	var capturedFlags sshagent.SignatureFlags
+	fb := &fakeBackend{
+		keys:   []*sshagent.Key{{Format: rsaCert.Type(), Blob: rsaCert.Marshal(), Comment: "cert"}},
+		signer: rsaSigner,
+		onSignWithFlags: func(flags sshagent.SignatureFlags) {
+			capturedFlags = flags
+		},
+	}
+
+	signers, err := Signers(fb)
+	if err != nil {
+		t.Fatalf("Signers() = %v", err)
+	}
+
+	algSigner := signers[0].(ssh.AlgorithmSigner)
+
+	// Test rsa-sha2-256 with certificate
+	capturedFlags = 0
+	_, err = algSigner.SignWithAlgorithm(rand.Reader, []byte("payload"), ssh.KeyAlgoRSASHA256)
+	if err != nil {
+		t.Fatalf("SignWithAlgorithm(rsa-sha2-256) = %v", err)
+	}
+	if capturedFlags != sshagent.SignatureFlagRsaSha256 {
+		t.Errorf("rsa-sha2-256 cert: backend received flags = %d, want %d", capturedFlags, sshagent.SignatureFlagRsaSha256)
+	}
+
+	// Test rsa-sha2-512 with certificate
+	capturedFlags = 0
+	_, err = algSigner.SignWithAlgorithm(rand.Reader, []byte("payload"), ssh.KeyAlgoRSASHA512)
+	if err != nil {
+		t.Fatalf("SignWithAlgorithm(rsa-sha2-512) = %v", err)
+	}
+	if capturedFlags != sshagent.SignatureFlagRsaSha512 {
+		t.Errorf("rsa-sha2-512 cert: backend received flags = %d, want %d", capturedFlags, sshagent.SignatureFlagRsaSha512)
 	}
 }
 

@@ -26,7 +26,7 @@ type fixedVerifier struct {
 	err    error
 }
 
-func (f fixedVerifier) Verify(ctx context.Context, r sshfwd.Remote) (sshfwd.VerifyResult, error) {
+func (f fixedVerifier) Verify(ctx context.Context, r sshfwd.Remote, opts sshfwd.VerifyOptions) (sshfwd.VerifyResult, error) {
 	return f.result, f.err
 }
 

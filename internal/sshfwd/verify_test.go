@@ -19,7 +19,7 @@ func TestVerifierFailsWithoutSigners(t *testing.T) {
 		User:    func() (string, error) { return "me", nil },
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
 	})
-	_, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket})
+	_, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if !errors.Is(err, ErrAuth) {
 		t.Fatalf("Verify() = %v, want ErrAuth when the agent has no identities", err)
 	}
@@ -32,7 +32,7 @@ func TestVerifierPropagatesSignerError(t *testing.T) {
 		User:    func() (string, error) { return "me", nil },
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
 	})
-	if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}); !errors.Is(err, want) {
+	if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}, VerifyOptions{}); !errors.Is(err, want) {
 		t.Fatalf("Verify() = %v, want %v", err, want)
 	}
 }
@@ -45,7 +45,7 @@ func TestVerifierPropagatesUserError(t *testing.T) {
 		User:    func() (string, error) { return "", want },
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
 	})
-	if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}); !errors.Is(err, want) {
+	if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}, VerifyOptions{}); !errors.Is(err, want) {
 		t.Fatalf("Verify() = %v, want %v", err, want)
 	}
 }
@@ -67,7 +67,7 @@ func TestVerifierRejectsIncompleteDeps(t *testing.T) {
 			// of panicking on a nil func call; a panic would fail the test
 			// on its own, so there is nothing else to assert beyond reaching
 			// this line.
-			if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}); err == nil {
+			if _, err := v.Verify(context.Background(), Remote{Host: "192.0.2.1", RemoteSocket: DefaultRemoteSocket}, VerifyOptions{}); err == nil {
 				t.Error("Verify() = nil error for incomplete Deps, want an error")
 			}
 		})
@@ -135,7 +135,7 @@ func TestVerifierReturnsConfirmableResultForUnknownHostKey(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("Verify() returned an error for an unpinned host: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestVerifierReturnsErrorForHostKeyMismatch(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: wrongPin} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if !errors.Is(err, ErrHostKeyMismatch) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrHostKeyMismatch", result, err)
 	}
@@ -237,7 +237,7 @@ func TestVerifierRejectsCertificateOnPinnedHostWithNoConfiguredCA(t *testing.T) 
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} }, // no CAs configured
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("Verify() reported the certificate as confirmable (wraps ErrHostKeyUnknown) on an already-pinned host: result=%+v err=%v", result, err)
 	}
@@ -271,7 +271,7 @@ func TestVerifierRejectsCertificateWithNoConfiguredCA(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} }, // no pin, no CAs
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("Verify() reported an unvalidatable certificate as confirmable (wraps ErrHostKeyUnknown): result=%+v err=%v", result, err)
 	}
@@ -306,7 +306,7 @@ func TestVerifierAcceptsCASignedCertificate(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{CAs: []string{caLine}} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("Verify() returned an error for a CA-signed certificate: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestVerifierInsecurePolicyReportsNoKeyMaterial(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Insecure: true} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("Verify() returned an error under an insecure policy: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("Verify() returned an error for a key matching the stored pin: %v", err)
 	}
@@ -402,12 +402,42 @@ func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
 	if execCount != 1 {
 		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount)
+	}
+}
+
+// TestVerifierSkipsBindProofWhenRequested is the liveVerifier half of
+// Registry.Add's SkipBindProof handling: with the flag set, a host whose
+// ListenUnix would otherwise fail (simulating the running daemon's own live
+// forward already occupying that exact path, which makes a fresh bind fail
+// with EADDRINUSE for reasons that have nothing to do with trust) must still
+// verify successfully — dial, auth, and the host-key check all still ran,
+// only the bind-and-release side effect was skipped.
+func TestVerifierSkipsBindProofWhenRequested(t *testing.T) {
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		home:                     "/home/test",
+		refuseStreamlocalForward: true,
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket},
+		VerifyOptions{SkipBindProof: true})
+	if err != nil {
+		t.Fatalf("Verify(SkipBindProof) = %v, want success despite the bind failure it was told to skip", err)
+	}
+	if !result.Verified {
+		t.Error("Verified = false, want true: the pinned-key dial still ran and matched")
 	}
 }
 
@@ -475,7 +505,7 @@ func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
 		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
 	})
 
-	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{})
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}

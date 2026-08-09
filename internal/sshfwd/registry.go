@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -33,7 +34,26 @@ import (
 // documented here — see the Verified check and the HostKey/Fingerprint
 // consistency check inside Add.
 type Verifier interface {
-	Verify(ctx context.Context, r Remote) (VerifyResult, error)
+	Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error)
+}
+
+// VerifyOptions modifies how Verify checks a candidate remote. The zero value
+// runs every check.
+type VerifyOptions struct {
+	// SkipBindProof skips the bind-and-release proof of the remote socket
+	// path (see liveVerifier.Verify). Registry.Add sets this when
+	// Manager.Status() already reports the host as connected: the daemon
+	// itself owns that live forward, so a fresh bind attempt would race its
+	// own listener and fail with EADDRINUSE (sshd's default
+	// StreamLocalBindUnlink=no makes bind() fail for any existing path
+	// entry — see ServeForward's doc comment) — a false verification
+	// failure on a perfectly healthy host, not evidence anything is wrong.
+	// Dial, auth, and host-key/certificate verification still run
+	// unconditionally, so the trust decision Verify exists to make is
+	// unchanged; only the socket-bind side effect is skipped, and only
+	// because the running Manager is already live proof that the path
+	// works.
+	SkipBindProof bool
 }
 
 // VerifyResult carries what a Verifier observed about a remote.
@@ -199,6 +219,21 @@ func (g *Registry) storedHostKey(host string) (string, error) {
 	return "", nil
 }
 
+// alreadyConnected reports whether the running Manager already shows host as
+// connected, so Add can tell Verify to skip the bind proof (see
+// VerifyOptions.SkipBindProof). It reads the Manager's own live status
+// rather than the file, so a host that is merely configured but not
+// currently connected — including one this daemon has never reconciled yet —
+// still gets the full bind check.
+func (g *Registry) alreadyConnected(host string) bool {
+	for _, st := range g.mgr.Status() {
+		if strings.EqualFold(st.Host, host) && st.State == string(StateConnected) {
+			return true
+		}
+	}
+	return false
+}
+
 // Add registers r, or updates the existing entry for r.Host (Add is
 // idempotent on host — see Remote's doc comment).
 //
@@ -264,7 +299,9 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 			verifyInput.HostKey = existingHostKey
 		}
 
-		result, verr := g.v.Verify(ctx, verifyInput)
+		// A re-Add of a host the running Manager already reports connected
+		// skips only the bind-and-release proof — see VerifyOptions.SkipBindProof.
+		result, verr := g.v.Verify(ctx, verifyInput, VerifyOptions{SkipBindProof: g.alreadyConnected(r.Host)})
 		if verr != nil {
 			// Every verification failure other than "unpinned, needs
 			// confirmation" surfaces here as a plain error — see Verifier's

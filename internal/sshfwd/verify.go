@@ -30,10 +30,11 @@ func NewVerifier(d Deps) Verifier {
 }
 
 // Verify dials r, checks its host key or certificate against the policy d.Policy
-// returns for it, and — once connected — resolves and bind-tests the remote
-// socket. Nothing about the connection survives the call: the client is
-// always closed before Verify returns, on every path.
-func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+// returns for it, and — once connected — resolves and, unless
+// opts.SkipBindProof is set, bind-tests the remote socket. Nothing about the
+// connection survives the call: the client is always closed before Verify
+// returns, on every path.
+func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	if v.deps.Signers == nil || v.deps.User == nil || v.deps.Policy == nil {
 		// Verify doesn't need Target/TargetName (it never relays anything),
 		// so this is deliberately narrower than ManagedRemote.run's
@@ -121,6 +122,20 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error
 	resolved, err := ExpandRemotePath(ctx, sshRunner{cl: cl}, socket)
 	if err != nil {
 		return VerifyResult{}, err
+	}
+
+	if opts.SkipBindProof {
+		// The running Manager already reports this host connected — see
+		// VerifyOptions.SkipBindProof — so a fresh bind here would race the
+		// daemon's own live listener on the same path and fail with
+		// EADDRINUSE, not because anything is actually wrong. Dial, auth,
+		// and the host-key/certificate check above already ran
+		// unconditionally, so the trust decision is unaffected; only this
+		// bind-and-release side effect is skipped.
+		return VerifyResult{
+			Verified:       !policy.Insecure,
+			ResolvedSocket: resolved,
+		}, nil
 	}
 
 	// Bind-and-immediately-release, never bind-and-serve: this is a dry run

@@ -26,24 +26,29 @@ type fakeVerifier struct {
 // Adds can call it concurrently. The mutex here guards the fake's own call
 // counter; it says nothing about Registry's locking, which TestConcurrentAddDoesNotLoseUpdates
 // exercises separately.
-func (f *fakeVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+func (f *fakeVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
 	return f.result, f.err
 }
 
-// capturingVerifier records the Remote it was called with, so a test can
-// assert what Add handed to Verify (in particular, whether a stored pin was
-// folded in on a re-Add — see TestAddPassesStoredPinToVerifierOnReAdd).
+// capturingVerifier records the Remote (and VerifyOptions) it was called
+// with, so a test can assert what Add handed to Verify — in particular,
+// whether a stored pin was folded in on a re-Add (see
+// TestAddPassesStoredPinToVerifierOnReAdd) or whether the bind proof was
+// skipped for an already-connected host (see
+// TestAddSkipsBindProofWhenAlreadyConnected).
 type capturingVerifier struct {
-	calls  []Remote
-	result VerifyResult
-	err    error
+	calls     []Remote
+	optsCalls []VerifyOptions
+	result    VerifyResult
+	err       error
 }
 
-func (c *capturingVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+func (c *capturingVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	c.calls = append(c.calls, r)
+	c.optsCalls = append(c.optsCalls, opts)
 	return c.result, c.err
 }
 
@@ -57,7 +62,7 @@ type stepVerifier struct {
 	n     int
 }
 
-func (s *stepVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error) {
+func (s *stepVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	i := s.n
@@ -599,6 +604,42 @@ func TestAddReconcilesManager(t *testing.T) {
 	statuses := g.mgr.Status()
 	if len(statuses) != 1 || statuses[0].Host != "foo.example.com" {
 		t.Fatalf("Manager.Status() = %+v, want the added remote reconciled into the running set", statuses)
+	}
+}
+
+// TestAddSkipsBindProofWhenAlreadyConnected: a re-Add of a host the running
+// Manager already reports connected must tell Verify to skip the bind proof
+// (VerifyOptions.SkipBindProof) — binding the remote socket again would race
+// the daemon's own live listener and fail with EADDRINUSE, a false
+// verification failure on a perfectly healthy host. The very first Add, with
+// nothing yet running, must still request the full check.
+func TestAddSkipsBindProofWhenAlreadyConnected(t *testing.T) {
+	key, fp := testHostKey(t)
+	v := &capturingVerifier{result: VerifyResult{Verified: true, HostKey: key, Fingerprint: fp}}
+	g, _ := newTestRegistry(t, v)
+	ctx := context.Background()
+	opts := AddOptions{AcceptFingerprint: fp}
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.optsCalls) != 1 || v.optsCalls[0].SkipBindProof {
+		t.Fatalf("initial Add() requested SkipBindProof = %+v, want false (nothing running yet)", v.optsCalls)
+	}
+
+	// Mark the reconciled remote as connected, the way the running Manager
+	// would once ServeForward actually establishes the connection.
+	mr := g.mgr.remotes[normalizeHost("foo.example.com")]
+	if mr == nil {
+		t.Fatal("Add() did not reconcile a managed remote for foo.example.com")
+	}
+	mr.setState(StateConnected, nil)
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com", Port: 2222}, opts); err != nil {
+		t.Fatalf("re-Add() = %v", err)
+	}
+	if len(v.optsCalls) != 2 || !v.optsCalls[1].SkipBindProof {
+		t.Fatalf("re-Add() of a connected host requested SkipBindProof = %+v, want true", v.optsCalls)
 	}
 }
 

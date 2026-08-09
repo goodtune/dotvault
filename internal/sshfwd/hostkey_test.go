@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +198,37 @@ func TestHostKeyPolicyRejectsCertWhenCAsLineIsNotACertAuthority(t *testing.T) {
 	}
 	if errors.Is(err, ErrHostKeyUnknown) {
 		t.Fatalf("missing-marker rejection reported as unknown: %v", err)
+	}
+}
+
+// TestHostKeyPolicyCARetriesAfterTransientTempFileFailure guards the round-2
+// review fix: cachedCACallback must cache a successful build but NOT a
+// failed one, so a one-off temp-file I/O error (a momentarily full or
+// read-only TMPDIR, fd exhaustion) doesn't permanently wedge the policy.
+// Injects a failure via the createTempFile seam, confirms it surfaces on the
+// first attempt, restores the seam, and confirms the very next attempt
+// succeeds — i.e. the failure was not cached.
+func TestHostKeyPolicyCARetriesAfterTransientTempFileFailure(t *testing.T) {
+	caSigner, caPub := testKey(t)
+	cert := hostCert(t, caSigner)
+	caLine := "@cert-authority *.example.com " + string(ssh.MarshalAuthorizedKey(caPub))
+	p := HostKeyPolicy{CAs: []string{caLine}}
+
+	prev := createTempFile
+	injectedErr := errors.New("injected: no space left on device")
+	createTempFile = func(dir, pattern string) (*os.File, error) {
+		return nil, injectedErr
+	}
+	t.Cleanup(func() { createTempFile = prev })
+
+	if err := p.Callback(nil)("foo.example.com:22", addr(t), cert); !errors.Is(err, injectedErr) {
+		t.Fatalf("expected the injected temp-file error to surface, got: %v", err)
+	}
+
+	createTempFile = prev
+
+	if err := p.Callback(nil)("foo.example.com:22", addr(t), cert); err != nil {
+		t.Fatalf("verification did not retry after a transient failure was cleared: %v", err)
 	}
 }
 

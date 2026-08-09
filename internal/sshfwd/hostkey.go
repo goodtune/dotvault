@@ -35,12 +35,21 @@ type HostKeyPolicy struct {
 	// Insecure disables verification entirely (system config opt-in).
 	Insecure bool
 
-	// caOnce/caCB/caErr cache the knownhosts callback built from CAs. Parsing
-	// happens at most once per HostKeyPolicy value, on first use, rather than
-	// on every certificate-bearing handshake — see buildCACallback.
-	caOnce sync.Once
-	caCB   ssh.HostKeyCallback
-	caErr  error
+	// caMu/caCB cache the knownhosts callback built from CAs, so parsing
+	// doesn't happen on every certificate-bearing handshake — see
+	// cachedCACallback. Only a *successful* build is cached: caCB stays nil
+	// after a failure, so the next verification attempt retries rather than
+	// being permanently poisoned by one bad attempt. That distinction matters
+	// because buildCACallback can fail two very different ways — a
+	// knownhosts parse error is deterministic (CAs is static config, so
+	// caching that failure forever would be correct and desirable), but a
+	// temp-file I/O error can be transient (a momentarily full or read-only
+	// TMPDIR, fd exhaustion) — and a cache that can't tell them apart would
+	// wedge a policy that hit a passing filesystem hiccup on its first
+	// verification, on a daemon whose entire purpose is resilient
+	// reconnection.
+	caMu sync.Mutex
+	caCB ssh.HostKeyCallback
 }
 
 // Callback returns the ssh.HostKeyCallback implementing the policy. When
@@ -58,8 +67,9 @@ type HostKeyPolicy struct {
 // observed is non-nil: the SSH client invokes it on its own goroutine, and
 // concurrent dials sharing one *observed would race. Call Callback fresh
 // (with its own observed, or nil) for each connection attempt; the
-// HostKeyPolicy value itself may be reused, since the CA callback cache below
-// is populated at most once regardless of how many times Callback is called.
+// HostKeyPolicy value itself may be reused across dials — its CA callback
+// cache (see the caMu/caCB fields) is shared and survives across calls to
+// Callback, so a successfully-parsed CA set is only ever parsed once.
 func (p *HostKeyPolicy) Callback(observed *ssh.PublicKey) ssh.HostKeyCallback {
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		if observed != nil {
@@ -134,17 +144,41 @@ func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Ce
 }
 
 // cachedCACallback lazily builds and caches the knownhosts callback for
-// p.CAs. Parsing the CA lines happens at most once per HostKeyPolicy value
-// (protected by caOnce), not on every certificate-bearing handshake: without
-// this, a background daemon reconnecting on a poll loop would create, write,
-// parse, and unlink a temp file on every single attempt, making host-key
-// verification depend on a writable TMPDIR and a free fd at handshake time.
+// p.CAs. A successful build is cached so parsing the CA lines happens at
+// most once per HostKeyPolicy value, not on every certificate-bearing
+// handshake: without this, a background daemon reconnecting on a poll loop
+// would create, write, parse, and unlink a temp file on every single
+// attempt, making host-key verification depend on a writable TMPDIR and a
+// free fd at handshake time.
+//
+// A failed build is deliberately NOT cached, so the next call retries
+// buildCACallback from scratch. Caching failure would be correct for a
+// deterministic error (a malformed CA line in static config always fails the
+// same way), but buildCACallback's temp-file I/O can also fail transiently —
+// and there's no way to tell the two apart here — so retrying is the safe
+// default: a config error keeps failing (at the cost of re-parsing on every
+// attempt, bounded by the caller's reconnect backoff, same as before this
+// cache existed), while a passing filesystem hiccup heals on the very next
+// verification instead of wedging this policy until a new one is
+// constructed.
 func (p *HostKeyPolicy) cachedCACallback() (ssh.HostKeyCallback, error) {
-	p.caOnce.Do(func() {
-		p.caCB, p.caErr = p.buildCACallback()
-	})
-	return p.caCB, p.caErr
+	p.caMu.Lock()
+	defer p.caMu.Unlock()
+	if p.caCB != nil {
+		return p.caCB, nil
+	}
+	cb, err := p.buildCACallback()
+	if err != nil {
+		return nil, err
+	}
+	p.caCB = cb
+	return cb, nil
 }
+
+// createTempFile is os.CreateTemp behind a variable so tests can inject a
+// transient failure and verify cachedCACallback retries after one, rather
+// than wedging (see hostkey_test.go).
+var createTempFile = os.CreateTemp
 
 // buildCACallback parses p.CAs into an ssh.HostKeyCallback.
 //
@@ -163,7 +197,7 @@ func (p *HostKeyPolicy) cachedCACallback() (ssh.HostKeyCallback, error) {
 // *ssh.Certificate (see the type assertion in Callback), so HostKeyFallback
 // is dead code in this wiring and a stray non-CA line in p.CAs grants nothing.
 func (p *HostKeyPolicy) buildCACallback() (ssh.HostKeyCallback, error) {
-	f, err := os.CreateTemp("", "dotvault-sshfwd-ca-*")
+	f, err := createTempFile("", "dotvault-sshfwd-ca-*")
 	if err != nil {
 		return nil, err
 	}

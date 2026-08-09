@@ -67,7 +67,7 @@ func installMetricsSpy(t *testing.T) *metricsSpy {
 		defer s.mu.Unlock()
 		s.forwardConn = append(s.forwardConn, delta)
 	}
-	recordSSHForwardFailure = func(_ context.Context) {
+	recordSSHForwardFailure = func(_ context.Context, _ string) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.forwardFailure++
@@ -175,6 +175,15 @@ func TestConnStateRecordedOnlyOnTransition(t *testing.T) {
 	if got.reconnects != 1 {
 		t.Errorf("RecordSSHReconnect called %d times, want exactly 1 (one drop, one reconnect)", got.reconnects)
 	}
+	// This scenario is also the false-positive case the keepalive goroutine's
+	// `connCtx.Err() == nil` guard exists for: forwardRemote (dropOnce) fails
+	// first, cancelConn() tears connCtx down, and blockingKeepalive then
+	// returns ctx.Err() — a non-nil error, but a shutdown of the losing side
+	// of the race, not a genuine keepalive strike failure. Without the guard
+	// this would be miscounted as a keepalive failure.
+	if got.keepaliveFailure != 0 {
+		t.Errorf("RecordSSHKeepaliveFailure called %d times, want 0 — forwardRemote's drop lost the race, so blockingKeepalive's ctx.Err() return must not count as a keepalive failure", got.keepaliveFailure)
+	}
 }
 
 // TestConnectFailureClassNotErrorMessage pins the cardinality guarantee at
@@ -230,7 +239,7 @@ func TestKeepaliveFailureRecordedOnlyOnRealStrikeFailure(t *testing.T) {
 	closeRemoteClient = func(c *ssh.Client) error { return nil }
 	// forwardRemote blocks forever (until connCtx is cancelled by the
 	// keepalive side losing first, or by the outer ctx/stop).
-	forwardRemote = func(ctx context.Context, cl *ssh.Client, socket string, target Dialer, onConn func(int)) error {
+	forwardRemote = func(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(int)) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}

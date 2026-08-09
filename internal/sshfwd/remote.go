@@ -455,7 +455,7 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	connWG.Add(2)
 	go func() {
 		defer connWG.Done()
-		errCh <- forwardRemote(connCtx, client, socket, r.deps.Target, r.onConn)
+		errCh <- forwardRemote(connCtx, client, r.cfg.Host, socket, r.deps.Target, r.onConn)
 	}()
 	go func() {
 		defer connWG.Done()

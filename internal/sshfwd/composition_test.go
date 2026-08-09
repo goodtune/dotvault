@@ -32,9 +32,9 @@ func fakeTransport(t *testing.T) {
 // first call, then blocks on ctx thereafter — so a test can force exactly
 // one drop-and-reconnect and then let the following connection sit healthy
 // until the test cancels it.
-func dropOnce(err error) func(ctx context.Context, cl *ssh.Client, socket string, target Dialer, onConn func(int)) error {
+func dropOnce(err error) func(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(int)) error {
 	var dropped int32
-	return func(ctx context.Context, cl *ssh.Client, socket string, target Dialer, onConn func(int)) error {
+	return func(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(int)) error {
 		if atomic.CompareAndSwapInt32(&dropped, 0, 1) {
 			return err
 		}

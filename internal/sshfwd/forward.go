@@ -32,7 +32,10 @@ var ErrBind = errors.New("bind remote socket failed")
 type Dialer func(ctx context.Context) (net.Conn, error)
 
 // ServeForward binds socket on the remote and relays every accepted connection
-// to target, returning when ctx is cancelled or the transport dies.
+// to target, returning when ctx is cancelled or the transport dies. host
+// labels the forward-failure metric recorded for a target dial that fails
+// mid-accept-loop (see serveListener) — it is otherwise unused here, so a
+// caller with no meaningful host identity may pass "".
 //
 // A bind failure alone does not prove the path is stale. sshd's default
 // StreamLocalBindUnlink=no makes bind() fail EADDRINUSE for *any* existing
@@ -42,7 +45,7 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // whether the path is actually safe to reclaim — see its doc for the full
 // rule, which is more subtle than "dial it and see" — and only when it says
 // yes is the path unlinked, at most once, with one retry.
-func ServeForward(ctx context.Context, cl *ssh.Client, socket string, target Dialer, onConn func(delta int)) error {
+func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(delta int)) error {
 	ln, err := cl.ListenUnix(socket)
 	if err != nil {
 		bindErr := err
@@ -71,7 +74,7 @@ func ServeForward(ctx context.Context, cl *ssh.Client, socket string, target Dia
 	}
 	defer ln.Close()
 
-	return serveListener(ctx, ln, target, onConn)
+	return serveListener(ctx, ln, host, target, onConn)
 }
 
 // liveListenerAt reports whether something is actively listening at socket on
@@ -221,8 +224,10 @@ func scratchProbePath(socket string) (string, error) {
 }
 
 // serveListener is the transport-agnostic accept loop, split out so it is
-// testable without an SSH server.
-func serveListener(ctx context.Context, ln net.Listener, target Dialer, onConn func(delta int)) error {
+// testable without an SSH server. host labels dotvault.ssh.forward_failure_total
+// (see the target-dial-failure branch below) — it carries no other meaning
+// here, so a caller with nothing meaningful to label with may pass "".
+func serveListener(ctx context.Context, ln net.Listener, host string, target Dialer, onConn func(delta int)) error {
 	if onConn == nil {
 		onConn = func(int) {}
 	}
@@ -275,8 +280,8 @@ func serveListener(ctx context.Context, ln net.Listener, target Dialer, onConn f
 			if err != nil {
 				// The local API surface being momentarily unavailable must not
 				// stop the accept loop: the forward outlives any one request.
-				slog.Warn("forward target dial failed", "error", err)
-				recordSSHForwardFailure(ctx)
+				slog.Warn("forward target dial failed", "host", host, "error", err)
+				recordSSHForwardFailure(ctx, host)
 				conn.Close()
 				return
 			}

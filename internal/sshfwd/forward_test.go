@@ -130,7 +130,7 @@ func TestServeListenerRelaysToTarget(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go serveListener(ctx, ln, target, onConn)
+	go serveListener(ctx, ln, "test-host", target, onConn)
 
 	remote, forwarded := net.Pipe()
 	ln.conns <- forwarded
@@ -183,7 +183,7 @@ func TestServeListenerStopsOnContextCancel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- serveListener(ctx, ln, func(context.Context) (net.Conn, error) {
+		done <- serveListener(ctx, ln, "test-host", func(context.Context) (net.Conn, error) {
 			return nil, errors.New("unused")
 		}, func(int) {})
 	}()
@@ -214,7 +214,7 @@ func TestServeListenerSurvivesTargetDialFailure(t *testing.T) {
 		calls++
 		return nil, errors.New("target down")
 	}
-	go serveListener(ctx, ln, target, func(int) {})
+	go serveListener(ctx, ln, "test-host", target, func(int) {})
 
 	for i := 0; i < 2; i++ {
 		_, forwarded := net.Pipe()
@@ -250,7 +250,7 @@ func TestServeListenerReleasesWatcherGoroutineOnAcceptFailure(t *testing.T) {
 	defer cancel() // best-effort cleanup even if the assertion below fails
 
 	ln := errorListener{err: errors.New("transport died")}
-	if err := serveListener(ctx, ln, func(context.Context) (net.Conn, error) {
+	if err := serveListener(ctx, ln, "test-host", func(context.Context) (net.Conn, error) {
 		return nil, errors.New("unused")
 	}, func(int) {}); err == nil {
 		t.Fatal("serveListener returned nil for a failing Accept; want the wrapped error")
@@ -284,7 +284,7 @@ func TestServeListenerClosesInFlightConnectionOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
-	go func() { done <- serveListener(ctx, ln, target, func(int) {}) }()
+	go func() { done <- serveListener(ctx, ln, "test-host", target, func(int) {}) }()
 
 	// The "remote" end is deliberately never written to or closed: absent
 	// cancellation-driven teardown, Pump would block forever waiting for EOF
@@ -364,7 +364,7 @@ func TestServeListenerClosesConnectionRegisteredDuringTargetDial(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveListener(ctx, ln, target, func(int) {}) }()
+	go func() { done <- serveListener(ctx, ln, "test-host", target, func(int) {}) }()
 
 	ln.conns <- remoteAccepted
 

@@ -55,7 +55,7 @@ func TestRecordWithoutInit(t *testing.T) {
 	RecordSSHConnectFailure(ctx, "example.com", "dns")
 	RecordSSHKeepaliveFailure(ctx, "example.com")
 	RecordSSHForwardConn(ctx, "example.com", 1)
-	RecordSSHForwardFailure(ctx)
+	RecordSSHForwardFailure(ctx, "example.com")
 }
 
 // TestRecordReachesActiveMeterProvider is the behavioural test for
@@ -141,7 +141,7 @@ func TestSSHInstrumentsReachActiveMeterProvider(t *testing.T) {
 	RecordSSHForwardConn(ctx, "a.example.com", 1)
 	RecordSSHForwardConn(ctx, "a.example.com", 1)
 	RecordSSHForwardConn(ctx, "a.example.com", -1)
-	RecordSSHForwardFailure(ctx)
+	RecordSSHForwardFailure(ctx, "a.example.com")
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(ctx, &rm); err != nil {
@@ -149,9 +149,10 @@ func TestSSHInstrumentsReachActiveMeterProvider(t *testing.T) {
 	}
 
 	var (
-		gotConnGauge     bool
-		gotForwardActive int64
-		counters         = map[string]int64{}
+		gotConnGauge          bool
+		gotForwardActive      int64
+		forwardFailureHasHost bool
+		counters              = map[string]int64{}
 	)
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
@@ -168,6 +169,11 @@ func TestSSHInstrumentsReachActiveMeterProvider(t *testing.T) {
 				var total int64
 				for _, dp := range data.DataPoints {
 					total += dp.Value
+					if m.Name == "dotvault.ssh.forward_failure_total" {
+						if v, ok := dp.Attributes.Value(attribute.Key("host")); ok && v.AsString() == "a.example.com" {
+							forwardFailureHasHost = true
+						}
+					}
 				}
 				if m.Name == "dotvault.ssh.forward_connections_active" {
 					gotForwardActive = total
@@ -176,6 +182,13 @@ func TestSSHInstrumentsReachActiveMeterProvider(t *testing.T) {
 				}
 			}
 		}
+	}
+
+	// forward_failure_total must carry the host label like every other SSH
+	// instrument — an operator managing several forwards needs to tell them
+	// apart on this counter, not just in an adjacent log line.
+	if !forwardFailureHasHost {
+		t.Error(`dotvault.ssh.forward_failure_total datapoint lacks the host="a.example.com" attribute`)
 	}
 
 	if !gotConnGauge {

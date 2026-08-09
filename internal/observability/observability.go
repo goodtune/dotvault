@@ -33,7 +33,13 @@
 //     RecordXxx godoc for the exact set each instrument emits.
 //   - We never attach usernames, Vault paths, secret keys, repo URLs,
 //     or JFrog server hostnames to instruments — the same scrubbing
-//     discipline the slog handlers follow.
+//     discipline the slog handlers follow. The one deliberate exception is
+//     the `host` label on the SSH forward instruments (dotvault.ssh.*):
+//     unlike a JFrog server URL, it names an entry in the operator's own
+//     small, statically-configured remote list — see
+//     docs/superpowers/specs/2026-08-09-managed-ssh-forwards-design.md — so
+//     the cardinality bound holds for the same reason a Vault path's does
+//     not.
 package observability
 
 import (
@@ -742,7 +748,7 @@ func rebindInstruments() {
 	)
 	sshForwardFailures, _ = meter.Int64Counter(
 		"dotvault.ssh.forward_failure_total",
-		metric.WithDescription("Managed SSH remote forward-target dial failures (the local API surface could not be reached for an accepted connection)"),
+		metric.WithDescription("Managed SSH remote forward-target dial failures by host (the local API surface could not be reached for an accepted connection)"),
 	)
 
 	// dotvault.build_info follows the Prometheus *_build_info convention: a
@@ -1037,22 +1043,20 @@ func RecordSSHForwardConn(ctx context.Context, host string, delta int) {
 	}
 }
 
-// RecordSSHForwardFailure increments dotvault.ssh.forward_failure_total.
-// Recorded when an accepted forward connection cannot be relayed because
-// the local target dial failed — the forward's own accept loop keeps
-// running, so this is a per-attempt failure count, not a fatal condition.
-// No host label: the failure happens deep in serveListener, which is
-// transport-agnostic and deliberately does not carry a host identity (see
-// its doc) — the accompanying "forward target dial failed" slog line already
-// carries host-adjacent context (the socket path) for anyone correlating.
-func RecordSSHForwardFailure(ctx context.Context) {
+// RecordSSHForwardFailure increments dotvault.ssh.forward_failure_total,
+// labelled by host (bounded by the user's configured remote list, like every
+// other SSH instrument's host label). Recorded when an accepted forward
+// connection cannot be relayed because the local target dial failed — the
+// forward's own accept loop keeps running, so this is a per-attempt failure
+// count, not a fatal condition.
+func RecordSSHForwardFailure(ctx context.Context, host string) {
 	instrMu.RLock()
 	c := sshForwardFailures
 	instrMu.RUnlock()
 	if c == nil {
 		return
 	}
-	c.Add(ctx, 1)
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
 }
 
 // LogRegistryConfigManaged emits a WARN-severity OTel log record

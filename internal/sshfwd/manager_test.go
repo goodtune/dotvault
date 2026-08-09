@@ -199,6 +199,113 @@ func TestReconcileRestartsModifiedRemote(t *testing.T) {
 	rec.waitStarted(t, "foo.example.com", 2)
 }
 
+// exclusiveResource models a resource only one running instance may hold at
+// a time — standing in for the remote socket a real ManagedRemote binds via
+// ListenUnix. violated records whether a second instance ever acquired it
+// while a first instance still held it, which is exactly the failure mode
+// N1 produces: two live connections to the same host contending for the
+// same remote socket.
+type exclusiveResource struct {
+	mu       sync.Mutex
+	held     bool
+	starts   int
+	violated bool
+}
+
+func (r *exclusiveResource) runner(host string) func(context.Context) {
+	return func(ctx context.Context) {
+		r.mu.Lock()
+		if r.held {
+			r.violated = true
+		}
+		r.held = true
+		r.starts++
+		r.mu.Unlock()
+
+		<-ctx.Done()
+
+		// A real teardown takes real time (closing a listener, draining
+		// in-flight relays — see ServeForward). Modelling that here, rather
+		// than releasing the instant ctx is cancelled, is what makes this
+		// test's outcome deterministic rather than a coin flip: without a
+		// deliberate delay, a start-before-stop bug and a correct
+		// stop-before-start ordering both "usually" avoid an observed
+		// overlap, because a freshly-spawned goroutine and an
+		// about-to-exit one are simply too fast relative to each other for
+		// scheduling alone to reliably expose the difference (confirmed
+		// empirically: an earlier version of this test without the delay
+		// caught the reverted ordering only 2 times in 10 runs). With the
+		// delay, a start-before-stop bug's replacement goroutine always gets
+		// scheduled and runs its check well inside this window, while the
+		// fixed ordering's stop() unconditionally waits out the full delay
+		// (via wg.Wait()) before any replacement is even constructed.
+		time.Sleep(50 * time.Millisecond)
+
+		r.mu.Lock()
+		r.held = false
+		r.mu.Unlock()
+	}
+}
+
+func (r *exclusiveResource) waitStarts(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := r.starts
+		r.mu.Unlock()
+		if n >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("resource acquired %d times, want %d", r.starts, want)
+}
+
+// TestReconcileStopsOldInstanceBeforeStartingReplacement is the regression
+// test for N1: Reconcile must fully stop a changed remote's outgoing
+// instance before starting its replacement. A start-before-stop ordering
+// leaves the outgoing connection still bound to the remote socket while the
+// replacement begins dialling, which — for an unchanged host/socket, e.g. a
+// host_key re-pin — surfaces in production as a spurious "a live listener
+// already owns this path" bind failure.
+//
+// A plain start/stop count can't see this ordering defect (both are 1
+// either way regardless of order), and a start/stop event log can't either
+// once start() is a bare `go` (see I1): which goroutine's event lands first
+// in a log is an artefact of scheduling, not of which was *invoked* first.
+// What differs deterministically between the two orderings is whether the
+// replacement's goroutine ever observes the resource as still held at the
+// moment it starts running — true if and only if the outgoing instance had
+// not yet been asked to stop, false if stop()'s wg.Wait() had already
+// forced it to fully exit (and release the resource) first.
+func TestReconcileStopsOldInstanceBeforeStartingReplacement(t *testing.T) {
+	res := &exclusiveResource{}
+	m := NewManager(Deps{})
+	m.newRunner = res.runner
+	t.Cleanup(m.Close)
+	ctx := context.Background()
+
+	if err := m.Reconcile(ctx, []Remote{remote("foo.example.com")}); err != nil {
+		t.Fatal(err)
+	}
+	res.waitStarts(t, 1)
+
+	changed := remote("foo.example.com")
+	changed.Port = 2222
+	if err := m.Reconcile(ctx, []Remote{changed}); err != nil {
+		t.Fatal(err)
+	}
+	res.waitStarts(t, 2)
+
+	res.mu.Lock()
+	violated := res.violated
+	res.mu.Unlock()
+	if violated {
+		t.Error("the replacement instance acquired the resource while the outgoing instance still held it; want the outgoing instance fully stopped (and the resource released) first")
+	}
+}
+
 func TestReconcileTreatsDisabledAsRemoved(t *testing.T) {
 	m, rec := stubManager(t)
 	ctx := context.Background()

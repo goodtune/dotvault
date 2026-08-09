@@ -67,11 +67,18 @@ func (r Remote) PortOrDefault() int {
 // its bound remote socket, and every in-flight relay through it, forever.
 // Comparing EnabledOrDefault() instead compares the resolved boolean, not
 // the pointer, and folds "explicitly true" and "unset" into one state as
-// they already are everywhere else. Host is compared case-insensitively to
-// match File.Find's identity rule.
+// they already are everywhere else. Port is compared via PortOrDefault() for
+// the same reason: writing an explicit `port: 22` onto an entry that
+// previously omitted it is not a change to reconcile over. Host is compared
+// case-insensitively to match File.Find's identity rule.
+//
+// If a field is ever added to Remote, it must be added here too — the
+// TestRemoteFieldCountMatchesSameAs guard in config_test.go exists
+// specifically to catch a silent miss, since C1 (the bug sameAs itself
+// fixes) was exactly this class of drift.
 func (r Remote) sameAs(o Remote) bool {
 	return strings.EqualFold(r.Host, o.Host) &&
-		r.Port == o.Port &&
+		r.PortOrDefault() == o.PortOrDefault() &&
 		r.RemoteSocket == o.RemoteSocket &&
 		r.HostKey == o.HostKey &&
 		r.EnabledOrDefault() == o.EnabledOrDefault()

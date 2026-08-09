@@ -80,19 +80,34 @@ func (m *Manager) Reconcile(ctx context.Context, remotes []Remote) error {
 		desired[key] = r
 	}
 
+	// Reconcile is three phases, not two, specifically so a changed remote's
+	// outgoing connection is fully stopped before its replacement starts:
+	//
+	//  1. Lock, decide which remotes are victims (removed, disabled, or
+	//     changed), delete them from the map, unlock.
+	//  2. Stop the victims — outside the lock, since a stuck dial handshake
+	//     (Dial's is not ctx-interruptible — see dial.go) can hold this up
+	//     for a while, and Status() must not be blocked behind it.
+	//  3. Lock again, re-check closed (Close or another Reconcile may have
+	//     run during phase 2), start the additions — new remotes and the
+	//     replacements for anything phase 1 removed — unlock.
+	//
+	// An earlier two-phase version stopped victims after unlocking but
+	// started additions inside the same first critical section, so a
+	// changed remote's replacement began dialling — and, for an unchanged
+	// host/socket, tried to bind the same remote socket — while the outgoing
+	// connection was still live. That surfaced as a spurious "a live
+	// listener already owns this path" failure (Task 9's stale-socket probe
+	// correctly refusing to unlink a socket a real listener still owns) on
+	// every config edit that changed a running remote, self-healing on the
+	// next backoff tick but never something a user should see for an
+	// ordinary re-pin.
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return fmt.Errorf("sshfwd: Reconcile called after Close")
 	}
 
-	// Stopping a remote can block for as long as its in-flight dial attempt
-	// (Dial's handshake is not ctx-interruptible — see dial.go), so the
-	// victims are collected and removed from the map here, under the lock,
-	// but actually stopped below after it is released. Otherwise a stuck
-	// handshake would hold m.mu for that whole window and every Status()
-	// call — the thing an operator reaches for to diagnose a stuck
-	// handshake — would hang behind it.
 	var toStop []*ManagedRemote
 	for key, mr := range m.remotes {
 		want, ok := desired[key]
@@ -116,7 +131,21 @@ func (m *Manager) Reconcile(ctx context.Context, remotes []Remote) error {
 			delete(m.remotes, key)
 		}
 	}
+	m.mu.Unlock()
 
+	for _, mr := range toStop {
+		mr.stop()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		// Close ran while phase 2 was stopping victims. There is nothing to
+		// resurrect: the victims are already stopped and stay out of the
+		// map, and starting the additions now would be exactly the
+		// resurrection-after-Close case the closed flag exists to prevent.
+		return fmt.Errorf("sshfwd: Reconcile called after Close")
+	}
 	for key, r := range desired {
 		if _, ok := m.remotes[key]; ok {
 			continue
@@ -133,11 +162,6 @@ func (m *Manager) Reconcile(ctx context.Context, remotes []Remote) error {
 		}
 		mr.start(ctx, run)
 		m.remotes[key] = mr
-	}
-	m.mu.Unlock()
-
-	for _, mr := range toStop {
-		mr.stop()
 	}
 	return nil
 }

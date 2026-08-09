@@ -3,9 +3,24 @@ package sshfwd
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// TestRemoteFieldCountMatchesSameAs guards against a field silently added to
+// Remote without a matching comparison added to sameAs. A miss here doesn't
+// fail loudly — it reads as a config edit that never takes effect, with a
+// live connection that "looks fine" in `ssh list`, which is exactly the
+// class of bug sameAs itself was written to fix (see C1 in the task-10
+// review). If this test fails after adding a field, update sameAs and bump
+// the expected count together.
+func TestRemoteFieldCountMatchesSameAs(t *testing.T) {
+	const wantFields = 5 // Host, Port, RemoteSocket, HostKey, Enabled
+	if got := reflect.TypeOf(Remote{}).NumField(); got != wantFields {
+		t.Errorf("Remote has %d fields, want %d — update sameAs (config.go) to cover the new/removed field, then update this constant", got, wantFields)
+	}
+}
 
 func TestValidateRemoteSocket(t *testing.T) {
 	tests := []struct {

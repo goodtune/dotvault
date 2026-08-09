@@ -305,6 +305,21 @@ func (r *ManagedRemote) fail(ctx context.Context, err error) {
 // background goroutine.
 var errIncompleteDeps = errors.New("incomplete Deps: Signers, User, Policy, and Target must all be set")
 
+// dialRemote, forwardRemote, keepaliveRemote, and closeRemoteClient are
+// Dial, ServeForward, Keepalive, and (*ssh.Client).Close respectively,
+// indirected through package-level vars — the same seam createTempFile
+// (hostkey.go) uses — so run's and serveConnected's composition (the
+// dial→serve→keepalive→teardown→backoff→redial cycle, and the per-attempt
+// re-resolution of Signers/User/Policy) is testable end to end without a
+// live SSH connection. Production code always uses the defaults below;
+// tests restore them via t.Cleanup after overriding.
+var (
+	dialRemote        = Dial
+	forwardRemote     = ServeForward
+	keepaliveRemote   = Keepalive
+	closeRemoteClient = func(c *ssh.Client) error { return c.Close() }
+)
+
 // run is the per-remote connection lifecycle: dial, forward, keepalive,
 // reconnect with backoff — until ctx is cancelled by stop().
 //
@@ -334,7 +349,7 @@ func (r *ManagedRemote) run(ctx context.Context) {
 			continue
 		}
 
-		client, err := Dial(ctx, DialConfig{
+		client, err := dialRemote(ctx, DialConfig{
 			Host:    r.cfg.Host,
 			Port:    r.cfg.PortOrDefault(),
 			User:    user,
@@ -349,7 +364,7 @@ func (r *ManagedRemote) run(ctx context.Context) {
 
 		socket, err := ExpandRemotePath(ctx, sshRunner{cl: client}, r.cfg.RemoteSocket)
 		if err != nil {
-			client.Close()
+			_ = closeRemoteClient(client)
 			r.fail(ctx, err)
 			continue
 		}
@@ -415,11 +430,11 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	connWG.Add(2)
 	go func() {
 		defer connWG.Done()
-		errCh <- ServeForward(connCtx, client, socket, r.deps.Target, r.onConn)
+		errCh <- forwardRemote(connCtx, client, socket, r.deps.Target, r.onConn)
 	}()
 	go func() {
 		defer connWG.Done()
-		errCh <- Keepalive(connCtx, client, keepaliveInterval, keepaliveStrikes)
+		errCh <- keepaliveRemote(connCtx, client, keepaliveInterval, keepaliveStrikes)
 	}()
 
 	err := <-errCh
@@ -436,7 +451,7 @@ func (r *ManagedRemote) serveConnected(ctx context.Context, client *ssh.Client, 
 	// or go transiently negative from a straggling connection's onConn(-1).
 	connWG.Wait()
 
-	r.teardownConnection(client.Close)
+	r.teardownConnection(func() error { return closeRemoteClient(client) })
 
 	r.mu.Lock()
 	r.connectedSince = nil

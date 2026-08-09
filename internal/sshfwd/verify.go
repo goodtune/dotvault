@@ -146,22 +146,26 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote) (VerifyResult, error
 		// another `ssh -R` session) already holds a live forward on it will
 		// also fail to bind, since sshd's default StreamLocalBindUnlink=no
 		// makes bind() fail EADDRINUSE for any existing path entry (see
-		// ServeForward's doc comment in forward.go). liveListenerAt answers
-		// that question without unlinking anything — it only dials, never
-		// removes — so it stays inside contract 5 (no stale-socket unlink
-		// here) while turning "bind remote socket failed" into an
-		// actionable message for a re-`ssh add` of a host already being
-		// forwarded to, instead of a confusing failure on a healthy host. A
-		// probe error (inconclusive) is folded into the same message rather
-		// than surfaced separately: either way the caller's actionable next
-		// step is the same "resolve the bind failure and retry".
-		live, probeErr := liveListenerAt(ctx, cl, resolved)
-		if probeErr == nil && live {
+		// ServeForward's doc comment in forward.go). A direct dial to the
+		// path answers that question with zero remote side effects: a
+		// successful dial proves something is genuinely listening there
+		// right now. This is deliberately NOT liveListenerAt (forward.go):
+		// on a ConnectionFailed rejection that helper falls through to
+		// directStreamLocalWorks, which binds a scratch socket on the
+		// remote and rm -f's it in cleanup — a real mutation, on a host
+		// `ssh add` has not yet been told to manage, that contract 5 exists
+		// to forbid. A plain rejection here is reported as inconclusive
+		// rather than investigated further, on purpose: only a caller that
+		// already owns this remote (Manager.Reconcile, via ServeForward)
+		// may spend a mutating probe to tell "stale" from "disallowed"
+		// apart.
+		if conn, dialErr := cl.DialContext(ctx, "unix", resolved); dialErr == nil {
+			conn.Close()
 			return VerifyResult{}, fmt.Errorf(
 				"%w: %s: %w (something is already listening at this path — if this host is already managed by a running dotvault daemon, verification is expected to fail here; stop that forward first, or re-add with AddOptions.Force to skip verification)",
 				ErrBind, resolved, err)
 		}
-		return VerifyResult{}, fmt.Errorf("%w: %s: %w", ErrBind, resolved, err)
+		return VerifyResult{}, fmt.Errorf("%w: %s: %w (could not determine whether something is already listening there)", ErrBind, resolved, err)
 	}
 	if err := ln.Close(); err != nil {
 		// Not escalated to a hard failure: the dry run already proved the

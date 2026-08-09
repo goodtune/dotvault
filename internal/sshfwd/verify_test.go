@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -378,8 +380,11 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 // TestVerifierReturnsErrBindOnBindFailure proves the ListenUnix failure path
 // wraps ErrBind, and that Verify does not attempt to work around the
 // failure by any means other than reporting it — the fake sshd here also
-// counts "exec" requests, so this doubles as the contract-5 regression test
-// below.
+// counts "exec" requests, so this doubles as a contract-5 regression test
+// for the common case where the bind-failure diagnostic's own dial is
+// rejected outright (not the ConnectionFailed shape —
+// TestVerifierBindFailureDiagnosticNeverMutatesRemote below covers that one
+// specifically, since it used to reach a mutating fallback).
 func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
 	var execCount int
 	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
@@ -401,17 +406,80 @@ func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
-
-	// Contract 5: `ssh add` must never delete a file on a host it does not
-	// yet manage. removeRemoteFile (forward.go) — the only thing in this
-	// package that ever runs "rm -f" — issues its command over a "session"
-	// exec, same as ExpandRemotePath's "echo $HOME" probe. The fake sshd
-	// counted every exec it served; exactly one (the $HOME probe that ran
-	// before the bind failure) proves no stale-socket reclaim attempt
-	// followed the failed bind. A future edit wiring liveListenerAt's
-	// read-only probe (added for the re-Add-while-forwarding diagnostic) to
-	// also call removeRemoteFile would trip this by adding a second exec.
 	if execCount != 1 {
 		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount)
+	}
+}
+
+// TestVerifierBindFailureDiagnosticNeverMutatesRemote is the round-2 review's
+// regression test. Verify's bind-failure diagnostic used to call
+// liveListenerAt (forward.go) to give an actionable "already forwarded"
+// message. On a ConnectionFailed rejection — exactly what an sshd returns
+// for "nobody is listening at this path" as well as for
+// "AllowStreamLocalForwarding disallows this entirely" (see liveListenerAt's
+// own doc comment) — that helper falls through to directStreamLocalWorks,
+// which binds a scratch socket on the remote and rm -f's it in its own
+// cleanup. That is a real mutation of a host `ssh add` has not yet been told
+// to manage: exactly what contract 5 forbids, and what liveVerifier's own
+// doc comment ("without ... mutating anything on the remote") promises does
+// not happen. The fix replaced liveListenerAt with a single, non-mutating
+// cl.DialContext probe that treats any dial error — ConnectionFailed
+// included — as merely inconclusive.
+//
+// To exercise the path the old code actually took, this fake must let the
+// full liveListenerAt→directStreamLocalWorks sequence run to completion, not
+// dead-end early: the real path's streamlocal-forward bind fails (as any
+// bind-failure diagnostic scenario starts), the real path's
+// direct-streamlocal probe dial gets the ambiguous ConnectionFailed
+// rejection, and — the part a same-shaped-for-every-call fake would get
+// wrong — the *second*, scratch-path streamlocal-forward bind and its
+// direct-streamlocal self-dial must both succeed, exactly as they would
+// against a real sshd that permits forwarding in general but already has
+// something on the real path. Only then does directStreamLocalWorks reach
+// its own cleanup and attempt the rm -f this test asserts never happens.
+func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
+	var execCount int
+	var directCalls int32
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		home: "/home/test",
+		// Refuses only the first (real-path) bind; the second (scratch-path)
+		// bind directStreamLocalWorks issues must succeed — see
+		// refuseStreamlocalForward's doc comment.
+		refuseStreamlocalForward: true,
+		sawExec:                  &execCount,
+		onDirectStreamLocal: func(newCh ssh.NewChannel) {
+			if atomic.AddInt32(&directCalls, 1) == 1 {
+				// liveListenerAt's own real-path probe: ambiguous rejection,
+				// the shape that makes it consult directStreamLocalWorks.
+				newCh.Reject(ssh.ConnectionFailed, "nothing is listening")
+				return
+			}
+			// directStreamLocalWorks dialling the scratch path it just
+			// bound: accept, proving (falsely, from this test's point of
+			// view) that the mechanism works — which is what makes the old
+			// code trust the real path's ConnectionFailed as "stale" and
+			// proceed to unlink it.
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				return
+			}
+			go ssh.DiscardRequests(chReqs)
+			go io.Copy(io.Discard, ch)
+		},
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket})
+	if !errors.Is(err, ErrBind) {
+		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
+	}
+	if execCount != 1 {
+		t.Errorf("saw %d exec requests after a ConnectionFailed bind diagnostic, want exactly 1 (the $HOME probe); the old liveListenerAt fallback would bind a scratch socket and rm -f it here", execCount)
 	}
 }

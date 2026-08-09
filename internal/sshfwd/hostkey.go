@@ -154,12 +154,20 @@ func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Ce
 		// default; an operator who wants certificate-authenticated hosts
 		// sets certificate_authorities, and one who does not should have
 		// the host present a plain key instead.
-		return fmt.Errorf("%s: %w (offered a host certificate, but no certificate_authorities are configured to validate it)",
+		// "a certificate", not "a host certificate": CertType hasn't been
+		// inspected yet at this point, so this could equally be a user
+		// certificate mistakenly presented as a host key.
+		return fmt.Errorf("%s: %w (offered a certificate, but no certificate_authorities are configured to validate it)",
 			hostname, ErrHostKeyMismatch)
 	}
 
 	cb, err := p.cachedCACallback()
 	if err != nil {
+		// Also a hard rejection, not confirmable: a malformed configured CA
+		// line is a static config error (deterministic, see
+		// cachedCACallback's doc comment), and even the transient temp-file
+		// failure case is "try again", never "ask a human to trust this
+		// certificate".
 		return fmt.Errorf("%s: load configured certificate authorities: %w", hostname, err)
 	}
 
@@ -170,15 +178,16 @@ func (p *HostKeyPolicy) checkCert(hostname string, remote net.Addr, cert *ssh.Ce
 	// change away from knownhosts.New (e.g. hand-rolling the host-pattern
 	// match) would silently drop all four checks.
 	//
-	// Every certificate that reaches this function without a nil error above
-	// has at least one configured CA to be checked against, so
-	// ErrHostKeyUnknown never appears past this point: everything cb can
-	// reject — a host not covered by any configured CA's pattern, a bad
-	// signature, an expired certificate, a wrong principal, a certificate
-	// presented with the wrong CertType — is a hard rejection below. That is
-	// deliberate: those are operator configuration errors or invalid
-	// certificates, not the "haven't pinned this host yet" case `ssh add`'s
-	// fingerprint prompt exists for.
+	// Everything from here down (cb's own rejection, immediately below) is
+	// also a hard rejection, never confirmable, same as the two returns
+	// above it and the len(p.CAs)==0 branch earlier in this function:
+	// ErrHostKeyUnknown never appears past this function's opening
+	// len(p.CAs)==0 check. A host not covered by any configured CA's
+	// pattern, a bad signature, an expired certificate, a wrong principal, a
+	// certificate presented with the wrong CertType — all of that is a hard
+	// rejection below. That is deliberate: those are operator configuration
+	// errors or invalid certificates, not the "haven't pinned this host yet"
+	// case `ssh add`'s fingerprint prompt exists for.
 	if err := cb(hostname, remote, cert); err != nil {
 		return fmt.Errorf("%s: host certificate rejected: %w: %w", hostname, ErrHostKeyMismatch, err)
 	}

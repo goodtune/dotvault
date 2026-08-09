@@ -1,6 +1,8 @@
 package sshfwd
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"net"
 	"testing"
 
@@ -33,10 +35,16 @@ type fakeSSHDConfig struct {
 	// an sshd this package never dials the bound socket through.
 	onDirectStreamLocal func(newCh ssh.NewChannel)
 
-	// refuseStreamlocalForward makes the streamlocal-forward@openssh.com
+	// refuseStreamlocalForward makes the FIRST streamlocal-forward@openssh.com
 	// global request (ListenUnix) fail, simulating AllowStreamLocalForwarding
-	// no or an unwritable remote path — the failure *shape* ListenUnix sees,
-	// not the real sshd directive (that needs Task 17's live server).
+	// no or an unwritable remote path for the caller's own socket — the
+	// failure *shape* ListenUnix sees, not the real sshd directive (that
+	// needs Task 17's live server). Every later streamlocal-forward request
+	// on the same connection succeeds: a diagnostic that reacts to the first
+	// failure by binding a second, scratch path (liveListenerAt's
+	// directStreamLocalWorks, forward.go) needs that second bind to work so
+	// its own behaviour — including whatever cleanup it runs — can be
+	// observed and asserted on.
 	refuseStreamlocalForward bool
 
 	// sawExec is incremented, if non-nil, for every "exec" request this
@@ -52,6 +60,24 @@ type fakeSSHDConfig struct {
 // under test, not sshd's acceptance of it.
 func serveFakeSSHDConn(conn net.Conn, cfg fakeSSHDConfig) {
 	signer := cfg.signer
+	if signer == nil {
+		// Every current caller supplies a signer (startFakeSSHD defaults it
+		// when cfg.signer is nil before ever reaching here;
+		// dialFakeStreamlocalServer always passes its own), but
+		// ServerConfig.AddHostKey panics on a nil Signer rather than
+		// returning an error — defend here too so a future caller's mistake
+		// fails the specific test cleanly instead of taking down the whole
+		// run.
+		var err error
+		_, priv, kerr := ed25519.GenerateKey(rand.Reader)
+		if kerr != nil {
+			return
+		}
+		signer, err = ssh.NewSignerFromSigner(priv)
+		if err != nil {
+			return
+		}
+	}
 
 	config := &ssh.ServerConfig{NoClientAuth: true}
 	config.AddHostKey(signer)
@@ -62,11 +88,14 @@ func serveFakeSSHDConn(conn net.Conn, cfg fakeSSHDConfig) {
 	}
 
 	go func() {
+		var forwardCalls int
 		for req := range reqs {
 			switch req.Type {
 			case "streamlocal-forward@openssh.com":
+				forwardCalls++
+				ok := !(cfg.refuseStreamlocalForward && forwardCalls == 1)
 				if req.WantReply {
-					req.Reply(!cfg.refuseStreamlocalForward, nil)
+					req.Reply(ok, nil)
 				}
 			case "cancel-streamlocal-forward@openssh.com":
 				if req.WantReply {

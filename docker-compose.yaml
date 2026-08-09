@@ -211,10 +211,8 @@ services:
     profiles: ["sshfwd"]
     environment:
       - USER_NAME=dotvault
-      - PUBLIC_KEY_FILE=/keys/authorized.pub
       - DOCKER_MODS=linuxserver/mods:openssh-server-ssh-tunnel
     volumes:
-      - ./test/integration/testdata/sshd/keys:/keys:ro
       - ./test/integration/testdata/sshd/sshd_config.d/allow:/config/sshd/sshd_config.d:ro
     ports:
       - "127.0.0.1:2222:2222"
@@ -232,9 +230,7 @@ services:
     profiles: ["sshfwd"]
     environment:
       - USER_NAME=dotvault
-      - PUBLIC_KEY_FILE=/keys/authorized.pub
     volumes:
-      - ./test/integration/testdata/sshd/keys:/keys:ro
       - ./test/integration/testdata/sshd/sshd_config.d/deny:/config/sshd/sshd_config.d:ro
     ports:
       - "127.0.0.1:2223:2222"

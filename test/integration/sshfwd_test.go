@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -29,16 +30,17 @@ import (
 // out to be wrong — see docker-compose.yaml's "sshfwd" profile for the two
 // server containers and testdata/sshd for their fixtures.
 const (
-	sshdAddr      = "127.0.0.1:2222" // AllowStreamLocalForwarding yes
-	sshdNoFwdAddr = "127.0.0.1:2223" // AllowStreamLocalForwarding no
-	sshdContainer = "dotvault-sshd"
-	sshdUser      = "dotvault"
+	sshdAddr           = "127.0.0.1:2222" // AllowStreamLocalForwarding yes
+	sshdNoFwdAddr      = "127.0.0.1:2223" // AllowStreamLocalForwarding no
+	sshdContainer      = "dotvault-sshd"
+	sshdNoFwdContainer = "dotvault-sshd-noforward"
+	sshdUser           = "dotvault"
 
-	// testKeyPath is the fixture keypair's private half. Not a secret: it
-	// only grants access to the throwaway, loopback-only sshd containers
-	// these tests bring up locally, and its public half is baked into the
-	// container image at compose-up time (see docker-compose.yaml).
-	testKeyPath = "testdata/sshd/keys/dotvault_test_ed25519"
+	// authorizedKeysPath is where the sshd image's login user keeps its
+	// authorized_keys: the image's $HOME is /config, not the login user's
+	// Unix home directory (docker exec defaults to root, which has its own,
+	// unrelated /root).
+	authorizedKeysPath = "/config/.ssh/authorized_keys"
 )
 
 // skipIfNoSSHD dials addr and skips the test if nothing answers, mirroring
@@ -68,19 +70,103 @@ func skipIfNoDockerCLI(t *testing.T) {
 	}
 }
 
-// testSigner parses the fixture keypair's private half, checked in at
-// testKeyPath (see its doc comment for why that's fine).
+// testKeyOnce generates the suite's throwaway ed25519 keypair exactly once,
+// in memory. Nothing is written to disk: the private half never leaves this
+// process, and the public half is installed into the sshd containers'
+// authorized_keys at runtime by ensureAuthorizedKey. Generating it fresh per
+// run (rather than committing a fixture keypair) means there is no static
+// private key sitting in the repository for a suite that only ever talks to
+// throwaway, loopback-only containers.
+var (
+	testKeyOnce     sync.Once
+	testKeySigner   ssh.Signer
+	testKeyAuthLine string
+)
+
+func generateTestKey() (ssh.Signer, string) {
+	testKeyOnce.Do(func() {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			panic(fmt.Sprintf("generate test ssh key: %v", err))
+		}
+		signer, err := ssh.NewSignerFromKey(priv)
+		if err != nil {
+			panic(fmt.Sprintf("build ssh signer: %v", err))
+		}
+		sshPub, err := ssh.NewPublicKey(pub)
+		if err != nil {
+			panic(fmt.Sprintf("build ssh public key: %v", err))
+		}
+		testKeySigner = signer
+		testKeyAuthLine = strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub)))
+	})
+	return testKeySigner, testKeyAuthLine
+}
+
+// testSigner returns the suite's in-memory throwaway keypair. Callers that
+// dial an sshd container must have already installed the matching public
+// half there via ensureAuthorizedKey, or authentication fails.
 func testSigner(t *testing.T) ssh.Signer {
 	t.Helper()
-	data, err := os.ReadFile(testKeyPath)
-	if err != nil {
-		t.Fatalf("read test key: %v", err)
-	}
-	signer, err := ssh.ParsePrivateKey(data)
-	if err != nil {
-		t.Fatalf("parse test key: %v", err)
-	}
+	signer, _ := generateTestKey()
 	return signer
+}
+
+// keyInstall tracks the result of installing the test key into one
+// container, so concurrent/repeated ensureAuthorizedKey calls for the same
+// container install it exactly once and share the outcome (success or
+// error) rather than racing separate installs.
+type keyInstall struct {
+	once sync.Once
+	err  error
+}
+
+var keyInstalls sync.Map // container name (string) -> *keyInstall
+
+// ensureAuthorizedKey installs the suite's generated public key into
+// container's authorized_keys, idempotently across the whole test binary
+// run. It requires the docker CLI (that is how the key gets in), so every
+// test that dials an sshd container over SSH must call this — or
+// skipIfNoDockerCLI directly — before relying on testSigner authenticating.
+func ensureAuthorizedKey(t *testing.T, container string) {
+	t.Helper()
+	skipIfNoDockerCLI(t)
+
+	v, _ := keyInstalls.LoadOrStore(container, &keyInstall{})
+	ki := v.(*keyInstall)
+	ki.once.Do(func() {
+		_, authLine := generateTestKey()
+		ki.err = installAuthorizedKey(container, authLine)
+	})
+	if ki.err != nil {
+		t.Fatalf("install authorized_keys on %s: %v", container, ki.err)
+	}
+}
+
+// installAuthorizedKey writes authLine as the sole entry in container's
+// authorized_keys, via `docker exec`. The public key is passed as a
+// positional shell parameter ($1), not interpolated into the script text, so
+// nothing about its content matters to the shell.
+//
+// Ownership matters as much as content: sshd silently refuses a key file it
+// considers unsafe (wrong owner, group/world-writable), and the symptom is
+// an auth failure that looks unrelated to permissions. The image's login
+// user is named the same as sshdUser with a same-named group (verified
+// against the running container), and its $HOME is /config, not a Unix
+// home directory under /home — see authorizedKeysPath's doc comment.
+func installAuthorizedKey(container, authLine string) error {
+	script := fmt.Sprintf(`set -e
+mkdir -p %[1]q
+printf '%%s\n' "$1" > %[2]q
+chown -R %[3]s:%[3]s %[1]q
+chmod 700 %[1]q
+chmod 600 %[2]q
+`, filepath.Dir(authorizedKeysPath), authorizedKeysPath, sshdUser)
+	out, err := exec.Command("docker", "exec", container, "sh", "-c", script, "_", authLine).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // randSuffix returns a short random hex string so concurrent/successive
@@ -384,7 +470,7 @@ func containsState(hist []sshfwd.State, want sshfwd.State) bool {
 // dialing back through the same *ssh.Client this test happens to hold.
 func TestForwardReachesLocalTarget(t *testing.T) {
 	skipIfNoSSHD(t, sshdAddr)
-	skipIfNoDockerCLI(t)
+	ensureAuthorizedKey(t, sshdContainer)
 
 	const body = "hello from the local target"
 	targetSocket := newUnixTarget(t, body)
@@ -428,7 +514,7 @@ func TestForwardReachesLocalTarget(t *testing.T) {
 // backoff run loop, not on ServeForward in isolation.
 func TestForwardReconnectsAfterTransportLoss(t *testing.T) {
 	skipIfNoSSHD(t, sshdAddr)
-	skipIfNoDockerCLI(t)
+	ensureAuthorizedKey(t, sshdContainer)
 
 	const body = "hello after reconnect"
 	targetSocket := newUnixTarget(t, body)
@@ -501,7 +587,7 @@ func TestForwardReconnectsAfterTransportLoss(t *testing.T) {
 // to notice nothing is listening and reclaim the path.
 func TestForwardReclaimsStaleSocket(t *testing.T) {
 	skipIfNoSSHD(t, sshdAddr)
-	skipIfNoDockerCLI(t)
+	ensureAuthorizedKey(t, sshdContainer)
 
 	socket := fmt.Sprintf("/config/dv-test-%s.sock", randSuffix(t))
 	t.Cleanup(func() { removeRemoteSocket(sshdContainer, socket) })
@@ -563,6 +649,7 @@ func TestForwardReclaimsStaleSocket(t *testing.T) {
 // confirms end to end.
 func TestVerifyRefusesWhenForwardingDisabled(t *testing.T) {
 	skipIfNoSSHD(t, sshdNoFwdAddr)
+	ensureAuthorizedKey(t, sshdNoFwdContainer)
 
 	deps := sshfwd.Deps{
 		Signers: func() ([]ssh.Signer, error) { return []ssh.Signer{testSigner(t)}, nil },
@@ -597,6 +684,7 @@ func TestVerifyRefusesWhenForwardingDisabled(t *testing.T) {
 // fingerprint being echoed back.
 func TestVerifyReturnsFingerprintForUnknownHost(t *testing.T) {
 	skipIfNoSSHD(t, sshdAddr)
+	ensureAuthorizedKey(t, sshdContainer)
 
 	deps := sshfwd.Deps{
 		Signers: func() ([]ssh.Signer, error) { return []ssh.Signer{testSigner(t)}, nil },

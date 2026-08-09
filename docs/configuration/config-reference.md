@@ -218,6 +218,9 @@ api:
 
 [`vault.token_socket`](#token_socket-dotvault-to-dotvault-token-sharing) lets a headless host borrow a token from a workstation over an SSH `RemoteForward`. That socket **dies with the SSH session**. A process started inside that session but outliving it — a job in `tmux`, a long-running service — succeeds at first and then fails the moment it next needs a token, because the only socket it knew about is gone.
 
+!!! tip "Recommended: let dotvault maintain the forward itself"
+    The `RemoteForward` wiring below is a manual, external `ssh` process — it only exists while a human is sitting in the session that started it, which is the root cause of the problem this section exists to solve. Where the near-side host also runs dotvault (with `agent.enabled`), [managed SSH forwards](../guide/ssh-forwards.md) let the daemon maintain the connection itself instead: `dotvault ssh add <host>` registers the far end once, and the daemon reconnects with backoff on its own from then on, with no external process to babysit. The manual wiring below remains the right choice for a remote host that doesn't run a dotvault daemon at all.
+
 Enabling `api` fixes that by putting a second, stable dotvault on the near side of the problem. The long-lived per-user daemon serves the same borrow endpoint from a path that no disconnect can take away, keeps its own token alive, and re-borrows across the forwarded socket whenever the SSH session comes back. Local clients borrow from the daemon instead of from the forward:
 
 ```

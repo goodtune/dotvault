@@ -224,6 +224,20 @@ The command is silent on success (exit `0`). Config-load failures degrade to the
 !!! note "Clipboard history managers"
     A value placed on the clipboard is readable by any application in the user's session, and clipboard-history managers may persist it to disk. On Windows, dotvault marks the write as excluded from the built-in Clipboard History (Win+V) and from Cloud Clipboard cross-device sync; third-party managers on any platform may not honour such hints. dotvault does not auto-clear the clipboard after a delay; paste the value, then overwrite it (copy something else) when it is sensitive and long-lived. One-time codes and short-TTL tokens are the intended payload.
 
+### `dotvault ssh`
+
+Manage the SSH remote forwards the running daemon maintains — see the [Managed SSH Forwards guide](guide/ssh-forwards.md) for the full picture (preconditions, `ssh.yaml`, and the host-key trust model).
+
+```sh
+dotvault ssh add <host> [--force] [--accept-host-key] [--socket <path>] [--port N]
+dotvault ssh list
+dotvault ssh remove <host>
+```
+
+`add` and `remove` are thin clients of the daemon's own web API — nothing here edits `ssh.yaml` directly — reached over the local API socket (`api.enabled`) or the loopback web listener (`web.enabled`, required on Windows). They therefore require a running, reachable daemon; `list` degrades to reading `ssh.yaml` directly (reporting `unavailable` status) when the daemon can't be reached.
+
+`add` performs a live SSH dial, credential check, and host-key verification through the daemon's agent identity before persisting anything. An unpinned host's key is printed for confirmation: on a TTY you're prompted to accept it, otherwise pass `--accept-host-key` after verifying the printed fingerprint out of band. `--force` skips that verification dial for a host known to be offline right now.
+
 ### `dotvault version`
 
 Print the build version and exit.

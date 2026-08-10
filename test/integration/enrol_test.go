@@ -50,7 +50,7 @@ func TestEnrolmentFullFlow(t *testing.T) {
 
 	vc, err := vault.NewClient(vault.Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   rootToken(t),
 	})
 	if err != nil {
 		t.Fatal(err)

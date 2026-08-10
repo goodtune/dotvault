@@ -27,6 +27,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
+	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/passwd"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -1002,6 +1003,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
+			// Lets the SPA render the right login form for the one-time
+			// certificate bootstrap. Empty for every non-mtls method.
+			BootstrapMethod: bootstrapMethodForWeb(cfg),
+			BootstrapMount:  bootstrapMountForWeb(cfg),
 		}
 		if agentSvc != nil {
 			webCfg.Agent = agentSvc.Backend
@@ -1031,12 +1036,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if cfg.Vault.AuthMethod == "mtls" || cfg.Vault.AuthMethod == "mtls+tpm" {
+		if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 			// Certificate auth: the steady state (load credential → cert
 			// login) needs no human and works headlessly, so it takes
 			// precedence over the web/TTY branching. Only first-run bootstrap
-			// needs a TTY (or the configured BYO cert); the flow surfaces a
-			// clear error if neither is available.
+			// needs a human — and when the web UI is enabled that bootstrap
+			// runs through the SPA (see below) rather than requiring a
+			// browser dotvault can open or a TTY to prompt on.
 			mgr := &auth.Manager{
 				VaultClient:      vc,
 				TokenFilePath:    tokenPath,
@@ -1048,6 +1054,47 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
+			}
+			// Web-driven bootstrap. Only the first-run bootstrap needs a
+			// human; wiring the hook costs nothing when a credential already
+			// exists, because runBootstrap is never reached in that case.
+			// Without it a host with no browser dotvault can open and no TTY
+			// could not bootstrap at all even with the web UI up and serving.
+			//
+			// The hook hands back a RAW, un-downscoped token that the SPA
+			// login deliberately does not adopt: it carries pki/sign and is
+			// consumed immediately to mint the certificate. See
+			// web.Server.BootstrapLogin.
+			if webServer != nil {
+				mgr.BootstrapLogin = func(ctx context.Context) (string, error) {
+					// Opening the browser lives inside the hook, not beside
+					// it: the hook runs only when a bootstrap is genuinely
+					// needed, so the steady-state daemon start (credential
+					// present, straight to cert login) never pops a window.
+					//
+					// Launch is backgrounded so the wait below registers
+					// bootstrap mode immediately — the SPA polls
+					// /api/v1/status for it, and OpenURL can block while it
+					// spawns the browser process.
+					url := webServer.URL()
+					slog.Info("certificate bootstrap required; opening browser for login", "url", url)
+					go func() {
+						if err := browser.OpenURL(url); err != nil {
+							slog.Warn("failed to open browser, please visit URL manually", "url", url, "error", err)
+							// Under dotvaultw.exe (GUI subsystem) stderr goes
+							// nowhere and the tray is not installed until much
+							// later in startup, so the log line above would
+							// leave the user with a daemon blocking on a login
+							// they cannot reach. A desktop notification is the
+							// only channel available at this point; it carries
+							// the URL as a clickable action on Windows and in
+							// the body elsewhere. Best-effort by design — a
+							// notification failure must not fail the bootstrap.
+							notifyBootstrapURL(url)
+						}
+					}()
+					return webServer.BootstrapLogin(ctx)
+				}
 			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
@@ -1124,6 +1171,27 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// work. Wired here because the lifecycle manager does not exist when
 		// the server is constructed.
 		webServer.SetReauthGate(lm)
+	}
+	// Certificate auth recovers without a human: the credential that mints
+	// tokens is already on this host, so an expired or revoked token is fixable
+	// on the spot. Registering this is what keeps a cert-auth daemon headless
+	// in steady state — the startup cert login is otherwise the only one, and
+	// ReissueIfDue rotates the certificate rather than the token, so a token
+	// that expired mid-session would strand the daemon until a restart.
+	if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		recoverMgr := &auth.Manager{
+			VaultClient:   vc,
+			TokenFilePath: tokenPath,
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Policy:        vaultPolicyConstraint(cfg),
+			Username:      username,
+			MTLS:          mtlsParams(cfg, username),
+			// No BootstrapLogin: recovery must never start a bootstrap. See
+			// Manager.CertLoginFromStore.
+		}
+		lm.SetRecover(recoverMgr.CertLoginFromStore)
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
@@ -2543,10 +2611,11 @@ func stderrSupportsColour() bool {
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 // mtlsParams builds the cert-auth parameters for the auth.Manager. It returns
-// nil unless auth_method is "mtls" or "mtls+tpm", so the LDAP/OIDC/token paths
-// are unaffected. StorageDir defaults to {cache_dir}/mtls.
+// nil unless auth_method drives the cert-auth flow (mtls / mtls+tpm / mtls+os),
+// so the LDAP/OIDC/token paths are unaffected. StorageDir defaults to
+// {cache_dir}/mtls.
 func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
-	if cfg.Vault.AuthMethod != "mtls" && cfg.Vault.AuthMethod != "mtls+tpm" {
+	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return nil
 	}
 	m := cfg.Vault.MTLS
@@ -2566,6 +2635,7 @@ func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 		PKIMount:        m.PKIMount,
 		PKIRole:         m.PKIRole,
 		KeyType:         m.KeyType,
+		KeyBits:         m.KeyBits,
 		CommonName:      m.CommonName,
 		TTL:             m.TTL,
 		ReissueBefore:   m.ReissueBeforeDur,
@@ -2585,6 +2655,55 @@ func vaultPolicyConstraint(cfg *config.Config) auth.PolicyConstraint {
 		Policies:        cfg.Vault.Policies,
 		NoDefaultPolicy: cfg.Vault.NoDefaultPolicy,
 	}
+}
+
+// notifyBootstrapURL surfaces the web UI address as a desktop notification
+// when the browser could not be opened for a certificate bootstrap. It is the
+// last resort for a GUI-subsystem daemon (dotvaultw.exe), which has no stderr
+// a user will ever read and no tray icon yet at this point in startup.
+//
+// Every failure here is swallowed to a debug log: the bootstrap is already
+// usable by anyone who visits the URL, and a missing notification daemon must
+// not be the thing that stops a host enrolling.
+func notifyBootstrapURL(url string) {
+	msg, err := notify.NewMessage("attention", "dotvault: sign in to enrol this host",
+		"Open "+url+" to complete the one-time certificate enrolment.", url)
+	if err != nil {
+		slog.Debug("could not build bootstrap notification", "error", err)
+		return
+	}
+	if err := notify.Send(msg); err != nil {
+		slog.Debug("could not raise bootstrap notification", "error", err)
+	}
+}
+
+// bootstrapMethodForWeb reports the login method the web SPA should present
+// for the one-time mTLS certificate bootstrap ("ldap" or "oidc"), or "" when
+// the configured auth method is not certificate auth and no bootstrap exists.
+//
+// validateMTLS defaults BootstrapMethod to "oidc" and rejects anything other
+// than ldap/oidc, so a non-empty result here is always one the SPA can render.
+func bootstrapMethodForWeb(cfg *config.Config) string {
+	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		return ""
+	}
+	return cfg.Vault.MTLS.BootstrapMethod
+}
+
+// bootstrapMountForWeb reports the auth mount the certificate bootstrap logs in
+// against (vault.mtls.bootstrap_mount), or "" when the configured auth method is
+// not certificate auth.
+//
+// This is deliberately NOT vault.auth_mount: the CLI bootstrap logs in against
+// the bootstrap mount (runBootstrap sets AuthMount from MTLS.BootstrapMount), so
+// a deployment whose bootstrap mount differs from its operational one would
+// otherwise have the CLI and the SPA hitting different Vault paths for the same
+// config. Empty is fine — Server.loginMount falls back to the method default.
+func bootstrapMountForWeb(cfg *config.Config) string {
+	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		return ""
+	}
+	return cfg.Vault.MTLS.BootstrapMount
 }
 
 func isInteractive() bool {

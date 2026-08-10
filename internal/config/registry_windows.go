@@ -261,6 +261,7 @@ type registryLayer struct {
 	MTLSPKIMount        string
 	MTLSPKIRole         string
 	MTLSKeyType         string
+	MTLSKeyBits         *uint32
 	MTLSCommonName      string
 	MTLSTTL             string
 	MTLSReissueBefore   string
@@ -374,6 +375,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.MTLSPKIMount, _ = readRegString(mk, "PKIMount")
 		layer.MTLSPKIRole, _ = readRegString(mk, "PKIRole")
 		layer.MTLSKeyType, _ = readRegString(mk, "KeyType")
+		layer.MTLSKeyBits = readRegDWORD(mk, "KeyBits")
 		layer.MTLSCommonName, _ = readRegString(mk, "CommonName")
 		layer.MTLSTTL, _ = readRegString(mk, "TTL")
 		layer.MTLSReissueBefore, _ = readRegString(mk, "ReissueBefore")
@@ -563,6 +565,9 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.MTLSKeyType != "" {
 		cfg.Vault.MTLS.KeyType = layer.MTLSKeyType
+	}
+	if layer.MTLSKeyBits != nil {
+		cfg.Vault.MTLS.KeyBits = int(*layer.MTLSKeyBits)
 	}
 	if layer.MTLSCommonName != "" {
 		cfg.Vault.MTLS.CommonName = layer.MTLSCommonName

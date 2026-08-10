@@ -17,10 +17,12 @@ var hardwareAvailable = securestore.HardwareAvailable
 type Manager struct {
 	VaultClient   *vault.Client
 	TokenFilePath string
-	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls", or
-	// "mtls+tpm". A "+tpm" suffix on any base method (e.g. "oidc+tpm") also
-	// requests TPM-sealing of the cached token file at rest; for "mtls+tpm"
-	// that is in addition to the cert key the cert flow already seals.
+	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls",
+	// "mtls+tpm", or "mtls+os". A "+tpm" suffix on any base method (e.g.
+	// "oidc+tpm") also requests TPM-sealing of the cached token file at rest;
+	// for "mtls+tpm" that is in addition to the cert key the cert flow already
+	// seals. The "mtls+os" modifier instead stores the cert key in the OS-native
+	// certificate store (it does not seal the token).
 	AuthMethod string
 	AuthMount  string // auth mount path
 	AuthRole   string // optional role
@@ -46,6 +48,12 @@ type Manager struct {
 	Policy PolicyConstraint
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
+	// BootstrapLogin, when non-nil, supplies the transient bootstrap token for
+	// the mTLS certificate bootstrap instead of running the CLI oidc/ldap flow.
+	// It returns a raw Vault token that MUST NOT have been downscoped (the
+	// bootstrap needs pki/sign, which an operational policy set would strip) and
+	// MUST NOT have been adopted onto any shared client.
+	BootstrapLogin func(ctx context.Context) (string, error)
 }
 
 // Authenticate attempts to authenticate with Vault.

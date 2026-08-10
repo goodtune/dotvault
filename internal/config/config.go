@@ -86,12 +86,18 @@ const (
 	DefaultUserPrefix = "users/"
 
 	// mTLS / cert-auth defaults applied by validate() when auth_method is
-	// "mtls" or "mtls+tpm".
+	// "mtls", "mtls+tpm", or "mtls+os".
 	DefaultCertMount      = "cert"
 	DefaultPKIMount       = "pki"
 	DefaultMTLSKeyType    = "ec"
 	DefaultMTLSCommonName = "{{.user}}"
 	DefaultReissueBefore  = 168 * time.Hour // 7d
+	// DefaultMTLSOSTTL is the certificate TTL requested by mtls+os when ttl is
+	// unset. The OS-store credential is a general-purpose user identity (used by
+	// browsers, not just dotvault), so it defaults to a longer 30d lifetime than
+	// the unset "let the PKI role decide" behaviour of plain mtls/mtls+tpm. The
+	// Vault PKI role's max_ttl remains the authoritative cap.
+	DefaultMTLSOSTTL = "720h" // 30d
 
 	// DefaultAgentPipe is the Windows named pipe the SSH agent listens on
 	// when agent.windows.pipe is unset. dotvault claims its own pipe rather
@@ -466,14 +472,16 @@ type VaultConfig struct {
 	// flow proceeds — so the field is purely additive and needs no validation.
 	TokenSocket string `yaml:"token_socket"`
 	// MTLS configures the cert auth methods. It is consulted only when
-	// AuthMethod is "mtls" or "mtls+tpm".
+	// AuthMethod drives the cert-auth flow ("mtls", "mtls+tpm", "mtls+os").
 	MTLS MTLSConfig `yaml:"mtls"`
 }
 
-// MTLSConfig configures certificate-based Vault authentication (the "mtls" and
-// "mtls+tpm" auth methods). A TLS client certificate authenticates instead of
-// a human credential; LDAP/OIDC is demoted to a one-time bootstrap that mints
-// the first certificate via the Vault PKI engine.
+// MTLSConfig configures certificate-based Vault authentication (the "mtls",
+// "mtls+tpm", and "mtls+os" auth methods). A TLS client certificate
+// authenticates instead of a human credential; LDAP/OIDC is demoted to a
+// one-time bootstrap that mints the first certificate via the Vault PKI engine.
+// The key is held on disk ("mtls"), TPM-sealed ("mtls+tpm"), or in the
+// OS-native certificate store where browsers can present it ("mtls+os").
 type MTLSConfig struct {
 	// BootstrapMethod is the human-credential method used only to mint the
 	// first certificate ("ldap" or "oidc"). Default "oidc".
@@ -487,11 +495,23 @@ type MTLSConfig struct {
 	CertRole string `yaml:"cert_role"`
 	// PKIMount is the PKI secrets engine used to issue/sign. Default "pki".
 	PKIMount string `yaml:"pki_mount"`
-	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
+	// PKIRole is the PKI role. Always required: it signs both the bootstrap cert
+	// and every rotation (pki/sign/<role>), including for BYO, which only skips
+	// the first cert's issuance.
 	PKIRole string `yaml:"pki_role"`
-	// KeyType is "ec" (P-256) or "rsa" (2048). Default "ec". The mtls+tpm
-	// backend supports "ec" only.
+	// KeyType is "ec" (P-256) or "rsa". Default "ec". The mtls+tpm backend
+	// supports "ec" only; mtls/mtls+os accept both.
 	KeyType string `yaml:"key_type"`
+	// KeyBits is the RSA modulus size to generate: 2048, 3072, 4096 or 8192.
+	// Zero (the default) leaves it to the backend, which uses 2048.
+	//
+	// It exists because a Vault PKI role's key_bits is a *minimum*, not an
+	// exact match — SignCert rejects a CSR whose key is smaller than the role
+	// requires — so an operator whose role pins RSA at 4096 cannot use
+	// certificate auth at all unless dotvault generates a key at least that
+	// large. Only meaningful with key_type: rsa, and rejected under mtls+tpm,
+	// which is EC-only.
+	KeyBits int `yaml:"key_bits"`
 	// CommonName is a Go template (over {{.user}}) for the certificate CN.
 	// Default "{{.user}}".
 	CommonName string `yaml:"common_name"`
@@ -879,11 +899,25 @@ func (c *Config) Validate() error {
 	return c.validate()
 }
 
+// IsMTLSMethod reports whether an auth_method drives the certificate-auth flow:
+// "mtls" (key on disk), "mtls+tpm" (key TPM-sealed), or "mtls+os" (key + cert in
+// the OS-native certificate store). Every site that gates on the cert-auth path
+// (validation, MTLSParams construction) consults this so a new variant is wired
+// in one place rather than enumerated as string literals across the codebase.
+func IsMTLSMethod(method string) bool {
+	switch method {
+	case "mtls", "mtls+tpm", "mtls+os":
+		return true
+	default:
+		return false
+	}
+}
+
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
-// unless auth_method is "mtls" or "mtls+tpm".
+// unless auth_method drives the cert-auth flow (see IsMTLSMethod).
 func (c *Config) validateMTLS() error {
 	method := c.Vault.AuthMethod
-	if method != "mtls" && method != "mtls+tpm" {
+	if !IsMTLSMethod(method) {
 		return nil
 	}
 	m := &c.Vault.MTLS
@@ -918,6 +952,26 @@ func (c *Config) validateMTLS() error {
 	default:
 		return fmt.Errorf("vault.mtls.key_type %q: must be ec or rsa", m.KeyType)
 	}
+	// key_bits is RSA-only and, when set, must be a length Vault itself accepts
+	// (certutil.ValidateKeyTypeLength). Zero means "backend default".
+	//
+	// Both misuses are errors rather than silent no-ops: an operator who sets
+	// key_bits under an EC or TPM configuration believes they have changed the
+	// key size, and quietly ignoring it would leave them debugging a Vault
+	// rejection whose cause is in their own config.
+	if m.KeyBits != 0 {
+		if method == "mtls+tpm" {
+			return fmt.Errorf("vault.mtls.key_bits is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only, so there is no RSA modulus to size)")
+		}
+		if m.KeyType != "rsa" {
+			return fmt.Errorf("vault.mtls.key_bits is only valid with key_type rsa (got key_type %q); EC keys are fixed at P-256", m.KeyType)
+		}
+		switch m.KeyBits {
+		case 2048, 3072, 4096, 8192:
+		default:
+			return fmt.Errorf("vault.mtls.key_bits %d: must be one of 2048, 3072, 4096, 8192 (the RSA lengths Vault accepts)", m.KeyBits)
+		}
+	}
 	if m.CommonName == "" {
 		m.CommonName = DefaultMTLSCommonName
 	}
@@ -926,9 +980,22 @@ func (c *Config) validateMTLS() error {
 	if (m.BYO.Cert == "") != (m.BYO.Key == "") {
 		return fmt.Errorf("vault.mtls.byo: cert and key must be set together")
 	}
-	// PKI role is required whenever issuance might run (i.e. no BYO cert).
-	if m.BYO.Cert == "" && m.PKIRole == "" {
-		return fmt.Errorf("vault.mtls.pki_role is required unless a BYO certificate is supplied")
+	// mtls+os cannot import an external private key: the OS-native store
+	// (certtostore) installs certificates but offers no key-import path, so the
+	// key must be generated in the store. Reject BYO up front rather than failing
+	// at login time.
+	if method == "mtls+os" && m.BYO.Cert != "" {
+		return fmt.Errorf("vault.mtls.byo is not supported with auth_method mtls+os (the OS-native store cannot import an external key); use auth_method mtls for bring-your-own")
+	}
+	// PKI role is required whenever issuance can run — which is always, BYO
+	// included. BYO only skips the *first* certificate's bootstrap; steady-state
+	// rotation still runs pki/sign/<role> once the cert enters the reissue window
+	// (ReissueIfDue/reissue make no BYO exception, and reissue_before is always
+	// positive), and key_bits sizes the key that rotation generates. A BYO config
+	// without a role would therefore fail every rotation and expire unattended, so
+	// require it up front rather than trapping the operator at cert expiry.
+	if m.PKIRole == "" {
+		return fmt.Errorf("vault.mtls.pki_role is required (it rotates the certificate before expiry, including for BYO seeding)")
 	}
 
 	if m.ReissueBefore == "" {
@@ -944,6 +1011,13 @@ func (c *Config) validateMTLS() error {
 		m.ReissueBeforeDur = d
 	}
 
+	// mtls+os defaults the requested certificate TTL to 30d when unset (the
+	// OS-store credential doubles as a browser-presented user identity, so a
+	// longer-lived cert is the sensible default); plain mtls/mtls+tpm leave it
+	// unset and defer to the PKI role. Either way the role's max_ttl caps it.
+	if method == "mtls+os" && m.TTL == "" {
+		m.TTL = DefaultMTLSOSTTL
+	}
 	if m.TTL != "" {
 		if _, err := ParseDuration(m.TTL); err != nil {
 			return fmt.Errorf("vault.mtls.ttl %q: %w", m.TTL, err)

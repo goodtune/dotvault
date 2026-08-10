@@ -17,11 +17,14 @@ web:
 
 ### Authentication
 
-The web UI supports all three auth methods:
+The web UI supports every auth method:
 
 - **OIDC** — "Login with OIDC" button redirects to the identity provider
 - **LDAP** — username/password form with inline MFA handling (Duo push and TOTP)
 - **Token** — paste a Vault token to authenticate
+- **mTLS** (`mtls`, `mtls+tpm`, `mtls+os`) — certificate auth needs no credential in normal operation, so there is no recurring login. The one and only interactive moment is the **one-time certificate bootstrap** on a new host, which presents whichever of the LDAP or OIDC forms above `vault.mtls.bootstrap_method` names, framed as an enrolment. Because the daemon still has to sign and install the certificate after that login returns, the page then polls `/api/v1/status` until the daemon holds a token. This is what lets a host with no terminal bootstrap — notably `dotvaultw.exe`, the GUI-subsystem Windows binary with no console. *Before this was wired the SPA had no branch for certificate auth at all and rendered an "Unknown auth method: mtls" error card instead of a login page.*
+
+Note that `POST /auth/token/login` is refused with **403** under certificate auth: there the operational token comes from the certificate login alone, so pasting one would install a credential the certificate flow never sanctioned.
 
 ### Status dashboard
 
@@ -73,7 +76,7 @@ The web UI communicates with the dotvault daemon via a REST API:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/status` | Server status, auth state, token TTL, sync state |
+| `GET` | `/api/v1/status` | Server status, auth state, token TTL, sync state, certificate-bootstrap state |
 | `GET` | `/api/v1/rules` | Configured sync rules |
 | `GET` | `/api/v1/token` | Current Vault token (authenticated sessions only) |
 | `GET` | `/api/v1/secrets/{path}` | List or reveal a secret |
@@ -98,4 +101,4 @@ Auth endpoints:
 | `POST` | `/auth/ldap/login` | Start async LDAP login (CSRF-protected) |
 | `GET` | `/auth/ldap/status` | Poll login status |
 | `POST` | `/auth/ldap/totp` | Submit TOTP passcode (CSRF-protected) |
-| `POST` | `/auth/token/login` | Validate and set token (CSRF-protected) |
+| `POST` | `/auth/token/login` | Validate and set token (CSRF-protected; 403 under certificate auth) |

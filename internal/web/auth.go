@@ -35,10 +35,7 @@ func (s *Server) WaitForAuth(ctx context.Context) error {
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
-	}
+	mount := s.loginMount("oidc")
 
 	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)
 
@@ -89,10 +86,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
-	}
+	mount := s.loginMount("oidc")
 
 	callbackPath := fmt.Sprintf("auth/%s/oidc/callback", mount)
 	loginData := map[string][]string{
@@ -109,6 +103,26 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if loginSecret == nil || loginSecret.Auth == nil {
 		slog.Error("no auth data in OIDC callback response")
 		http.Error(w, "Authentication failed: no auth data", http.StatusInternalServerError)
+		return
+	}
+
+	// Bootstrap mode: hand the RAW token back to the waiting BootstrapLogin
+	// and adopt nothing. The mTLS bootstrap token carries pki/sign and is
+	// consumed immediately to mint a certificate — downscoping it would strip
+	// the very capability it exists for, and persisting or installing it would
+	// put a broad credential on disk and behind GET /api/v1/token.
+	if s.deliverBootstrapToken(loginSecret.Auth.ClientToken) {
+		slog.Info("OIDC bootstrap login successful via web UI")
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
+	// Under certificate auth a browser login is only ever a bootstrap, so it
+	// must not be adopted — see operationalAdoptionAllowed. Reached when a
+	// second callback arrives after the divert above consumed the first.
+	if !s.operationalAdoptionAllowed() {
+		slog.Debug("ignoring already-consumed bootstrap login on a repeat OIDC callback")
+		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 
@@ -157,10 +171,7 @@ func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mount := s.authMount
-	if mount == "" {
-		mount = "ldap"
-	}
+	mount := s.loginMount("ldap")
 
 	s.login.StartLogin(sessionID, mount, req.Username, req.Password)
 
@@ -189,6 +200,29 @@ func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
 
 	// If authenticated, consume the token server-side.
 	if status.State == "authenticated" && status.Token != "" {
+		// Bootstrap mode: hand the RAW token to the waiting BootstrapLogin
+		// and adopt nothing — see handleAuthCallback for the rationale. The
+		// response body is unchanged either way (LoginStatus.Token is
+		// json:"-", so the token never crosses the wire).
+		if s.deliverBootstrapToken(status.Token) {
+			s.login.Clear(sessionID)
+			slog.Info("LDAP bootstrap login successful via web UI")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(status)
+			return
+		}
+
+		// Under certificate auth a browser login is only ever a bootstrap, so
+		// it must not be adopted — see operationalAdoptionAllowed. Reached when
+		// a concurrent poll of this endpoint lost the race to the divert above.
+		if !s.operationalAdoptionAllowed() {
+			s.login.Clear(sessionID)
+			slog.Debug("ignoring already-consumed bootstrap login on a concurrent status poll")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(status)
+			return
+		}
+
 		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
 		if err != nil {
 			slog.Error("downscoping token to least privilege failed", "error", err)
@@ -247,6 +281,16 @@ func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
+	// Under certificate auth the operational token comes from the cert login
+	// alone — see operationalAdoptionAllowed. Pasting a token here would
+	// install a credential the cert flow never sanctioned, so refuse rather
+	// than enforcing the invariant at only some adoption sites. The SPA never
+	// renders this form under mtls; this closes the direct-POST path.
+	if !s.operationalAdoptionAllowed() {
+		writeError(w, "token login is not available under certificate authentication: this daemon obtains its Vault token from its client certificate", http.StatusForbidden)
+		return
+	}
+
 	var req struct {
 		Token string `json:"token"`
 	}

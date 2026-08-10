@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
 func skipIfNoVault(t *testing.T) {
@@ -23,7 +25,7 @@ func TestManagerAuthenticate_ExistingToken(t *testing.T) {
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")
-	os.WriteFile(tokenPath, []byte("dev-root-token"), 0600)
+	os.WriteFile(tokenPath, []byte(vaulttest.RootToken(t)), 0600)
 
 	m := &Manager{
 		VaultClient:   mustVaultClient(t),
@@ -36,14 +38,14 @@ func TestManagerAuthenticate_ExistingToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
-	if m.VaultClient.Token() != "dev-root-token" {
-		t.Errorf("token = %q, want %q", m.VaultClient.Token(), "dev-root-token")
+	if m.VaultClient.Token() != vaulttest.RootToken(t) {
+		t.Errorf("token = %q, want %q", m.VaultClient.Token(), vaulttest.RootToken(t))
 	}
 }
 
 func TestManagerAuthenticate_EnvToken(t *testing.T) {
 	skipIfNoVault(t)
-	t.Setenv("DOTVAULT_TOKEN", "dev-root-token")
+	t.Setenv("DOTVAULT_TOKEN", vaulttest.RootToken(t))
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, ".vault-token")

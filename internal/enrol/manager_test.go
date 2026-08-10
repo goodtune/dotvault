@@ -11,6 +11,8 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
 // testPrefix returns a per-test unique Vault prefix so tests are
@@ -67,7 +69,7 @@ func skipIfNoVault(t *testing.T) *vault.Client {
 	t.Helper()
 	vc, err := vault.NewClient(vault.Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   vaulttest.RootToken(t),
 	})
 	if err != nil {
 		t.Skip("vault not available")

@@ -13,6 +13,13 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
+// recoverTimeout bounds one unattended-recovery attempt. It runs on the
+// lifecycle goroutine, so an unbounded attempt against an unreachable Vault
+// would stall every other token this manager looks after. Comfortably longer
+// than a healthy secure-store open plus a TLS handshake and login, and short
+// enough that the ~10s recovery poll stays responsive.
+const recoverTimeout = 20 * time.Second
+
 // LifecycleManager manages token TTL checks and renewal.
 type LifecycleManager struct {
 	client         *vault.Client
@@ -49,6 +56,35 @@ type LifecycleManager struct {
 	// screen. Reset when a subsequent check succeeds, so the callback
 	// fires again on the next failure.
 	onReauth func()
+
+	// recover, when non-nil, mints a fresh token from a credential this host
+	// already holds, without any human interaction. It is tried during the
+	// recovery path — after the token-file/env/socket candidates and before
+	// declaring re-auth — and again on every recovery poll until it succeeds.
+	//
+	// Certificate auth is the motivating case and, today, the only one: the
+	// client certificate IS the credential, so an expired Vault token is
+	// recoverable on the spot. Without this the daemon would sit
+	// unauthenticated until someone restarted it, which defeats the point of
+	// a credential that needs no human. Auth methods whose credential is a
+	// human (oidc, ldap) leave this nil and still fall through to onReauth.
+	recover func(context.Context) error
+
+	// Backoff state for consecutive recovery failures. Without it the ~10s
+	// recovery poll would retry forever at full rate, and a recovery attempt
+	// is not cheap: for mtls+tpm, securestore.Open derives the SRK with a
+	// TPM2_CreatePrimary (hundreds of ms to seconds on real hardware) purely
+	// to verify the backend, and Load derives it again — so a Vault outage
+	// would mean hundreds of primary-key derivations an hour, contending on
+	// /dev/tpmrm0 with everything else using the chip. It also lets anyone who
+	// can revoke tokens sustain that churn indefinitely.
+	//
+	// The first failure is not delayed: the natural recovery poll IS the first
+	// retry, so a transient blip still heals promptly. Subsequent failures
+	// double from recoveryInterval up to maxDelay. Both fields are touched
+	// only from the lifecycle goroutine (via tryRecover).
+	recoverFailures int
+	nextRecoverAt   time.Time
 
 	// Recovery poll interval used while in the needs-reauth state. When
 	// the token is broken we want to pick up a freshly-minted token from
@@ -147,6 +183,91 @@ func (lm *LifecycleManager) SetOnReauth(fn func()) {
 	lm.onReauth = fn
 }
 
+// SetRecover registers an unattended recovery function that mints a fresh
+// token from a credential this host already holds. See the recover field.
+//
+// It must be safe to call repeatedly (it is retried on every recovery poll)
+// and must not block indefinitely — it runs on the lifecycle goroutine, so a
+// hung call stalls token management. It must not prompt: a background
+// goroutine has no user attached.
+func (lm *LifecycleManager) SetRecover(fn func(context.Context) error) {
+	lm.recover = fn
+}
+
+// tryRecover attempts unattended recovery and reports whether the client now
+// holds a working token. Failures are logged at debug and swallowed: the
+// caller falls through to the normal re-auth signal, and the recovery poll
+// tries again shortly.
+func (lm *LifecycleManager) tryRecover(ctx context.Context) bool {
+	if lm.recover == nil {
+		return false
+	}
+	// Still inside the backoff window from a previous failure — skip without
+	// touching the secure store or Vault. See recoverFailures.
+	if !lm.nextRecoverAt.IsZero() && time.Now().Before(lm.nextRecoverAt) {
+		return false
+	}
+	// Bound the attempt. The hook runs synchronously on the lifecycle
+	// goroutine and, for certificate auth, opens a secure store (TPM/CNG on
+	// some platforms) and performs a TLS handshake plus a Vault login. The
+	// Vault SDK's own default timeout is ~60s, which is long enough for an
+	// unreachable Vault to stall token management for every other token this
+	// manager looks after. Failing fast costs nothing: the recovery poll
+	// retries within ~10s anyway.
+	ctx, cancel := context.WithTimeout(ctx, recoverTimeout)
+	defer cancel()
+	if err := lm.recover(ctx); err != nil {
+		lm.backOffRecovery()
+		slog.Debug("unattended token recovery failed", "error", err, "next_attempt_after", lm.recoverBackoff())
+		return false
+	}
+	if lm.client.Token() == "" {
+		lm.backOffRecovery()
+		slog.Debug("unattended token recovery reported success but left no token")
+		return false
+	}
+	lm.resetRecoveryBackoff()
+	slog.Info("recovered vault token without re-authentication")
+	return true
+}
+
+// backOffRecovery records a failed recovery attempt and schedules the earliest
+// next one.
+func (lm *LifecycleManager) backOffRecovery() {
+	lm.recoverFailures++
+	if d := lm.recoverBackoff(); d > 0 {
+		lm.nextRecoverAt = time.Now().Add(d)
+	} else {
+		lm.nextRecoverAt = time.Time{}
+	}
+}
+
+// recoverBackoff returns how long to wait before the next recovery attempt,
+// given the number of consecutive failures so far.
+//
+// The first failure returns 0 on purpose: the recovery poll is already the
+// retry, so a transient blip (Vault restarting) heals at the normal ~10s
+// cadence rather than being penalised. Repeated failures double from
+// recoveryInterval up to maxDelay, which is what stops a sustained outage from
+// hammering the TPM. Scaling from recoveryInterval rather than a hardcoded
+// duration keeps the growth proportional to the manager's configured cadence.
+func (lm *LifecycleManager) recoverBackoff() time.Duration {
+	if lm.recoverFailures <= 1 {
+		return 0
+	}
+	// Cap the shift before it can overflow; anything past a few doublings is
+	// clamped to maxDelay regardless.
+	shift := lm.recoverFailures - 1
+	if shift > 16 {
+		shift = 16
+	}
+	d := lm.recoveryInterval << uint(shift)
+	if d <= 0 || d > lm.maxDelay {
+		d = lm.maxDelay
+	}
+	return d
+}
+
 // NeedsReauth returns true if the token is expired or needs re-authentication.
 func (lm *LifecycleManager) NeedsReauth() bool {
 	return lm.needsReauth.Load()
@@ -207,6 +328,21 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// reload yields a working token we treat the
 						// failure as transient.
 						if lm.tryReload(ctx) {
+							lm.clearReauth()
+							lm.currentDelay = lm.checkInterval
+							timer.Reset(lm.currentDelay)
+							continue
+						}
+						// No usable token anywhere, but this host may hold a
+						// credential that can mint one without a human —
+						// certificate auth being the case that matters. Tried
+						// before signalReauth deliberately: a successful
+						// recovery must not fire OnReauth, which would clear
+						// web state and bounce the SPA to a login screen for
+						// an outage the daemon just healed by itself. If it
+						// fails we fall through, and the recovery poll retries
+						// it every cycle.
+						if lm.tryRecover(ctx) {
 							lm.clearReauth()
 							lm.currentDelay = lm.checkInterval
 							timer.Reset(lm.currentDelay)
@@ -288,6 +424,22 @@ func (lm *LifecycleManager) signalReauth(ctx context.Context, errCh chan<- error
 // (either after a clean cycle or after picking up a fresh token from disk).
 func (lm *LifecycleManager) clearReauth() {
 	lm.needsReauth.Store(false)
+	// Any return to a valid token ends the current failure episode, not just a
+	// successful recovery hook. Without this, a run of failed recoveries
+	// followed by a token arriving from disk/env/socket (tryReload) or a check
+	// simply going healthy would leave the failure count standing, and the next
+	// unrelated outage would start at the 5-minute cap instead of being treated
+	// as a fresh first failure — turning a brief blip into a five-minute
+	// outage for reasons that were resolved long ago.
+	lm.resetRecoveryBackoff()
+}
+
+// resetRecoveryBackoff clears the consecutive-failure state so the next
+// recovery episode starts from scratch. Called from every transition back to a
+// valid token.
+func (lm *LifecycleManager) resetRecoveryBackoff() {
+	lm.recoverFailures = 0
+	lm.nextRecoverAt = time.Time{}
 }
 
 // tryReload re-reads the token file (and DOTVAULT_TOKEN env) and, if a

@@ -330,11 +330,7 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	// Resolve the username exactly as production does (paths.Username
 	// strips any DOMAIN\ prefix) so the fixture entry always matches
@@ -429,11 +425,7 @@ func TestLoginCheckSuppression_SubprocessRoundTrip(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	workDir := t.TempDir()
 	markerPath := filepath.Join(workDir, "marker")

@@ -1,15 +1,49 @@
 services:
+  # Generates the throwaway self-signed certificate the TLS listener needs.
+  # Runs to completion before Vault starts, because a listener cannot come up
+  # without its cert. The material lives in a volume and is never committed;
+  # an existing cert is reused so restarts do not invalidate a running client.
+  vault-tls:
+    image: alpine/openssl:latest
+    container_name: dotvault-vault-tls
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        if [ -s /tls/vault.crt ] && [ -s /tls/vault.key ]; then
+          echo "==> Reusing existing dev TLS certificate"
+          exit 0
+        fi
+        echo "==> Generating dev TLS certificate for the Vault cert-auth listener..."
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /tls/vault.key -out /tls/vault.crt -days 3650 \
+          -subj "/CN=localhost" \
+          -addext "subjectAltName=DNS:localhost,DNS:vault,IP:127.0.0.1"
+        chmod 644 /tls/vault.crt /tls/vault.key
+        echo "==> Dev TLS certificate ready"
+    volumes:
+      - vault-tls:/tls
+
   vault:
     image: hashicorp/vault:1.21
     container_name: dotvault-vault
+    depends_on:
+      vault-tls:
+        condition: service_completed_successfully
     ports:
       - "8200:8200"
+      # TLS cert-auth listener, host-published only for loopback integration
+      # tests (the daemon and tests dial 127.0.0.1:8300); loopback-bound so the
+      # dev Vault TLS endpoint isn't exposed to the LAN, matching the JFrog port.
+      - "127.0.0.1:8300:8300"
     environment:
       VAULT_ADDR: "http://127.0.0.1:8200"
     cap_add:
       - IPC_LOCK
     volumes:
       - vault-data:/vault/data
+      - vault-tls:/vault/tls:ro
       - ./vault-server.hcl:/vault/config/server.hcl:ro
     command: ["sh", "-c", "chown -R vault:vault /vault/data && su-exec vault vault server -config=/vault/config/server.hcl"]
     healthcheck:
@@ -93,6 +127,27 @@ services:
         path "kv/data/apps/+/keys/*" {
           capabilities = ["read"]
         }
+        # Token self-management. These matter specifically when
+        # no_default_policy is set: stripping the implicit `default` policy also
+        # strips these, and dotvault needs all three.
+        #
+        #   create      — Downscope exchanges the login token for a
+        #                 least-privilege child; without it login fails closed.
+        #   lookup-self — the lifecycle manager's health check every 5 minutes.
+        #                 A 403 here is read as "token invalid", so a policy
+        #                 lacking it puts the daemon in a permanent re-auth loop
+        #                 despite holding a perfectly good token.
+        #   renew-self  — renewal at 75% TTL; without it every token runs to
+        #                 expiry and forces an unnecessary re-auth.
+        path "auth/token/create" {
+          capabilities = ["create", "update"]
+        }
+        path "auth/token/lookup-self" {
+          capabilities = ["read"]
+        }
+        path "auth/token/renew-self" {
+          capabilities = ["update"]
+        }
         path "sys/events/subscribe/*" {
           capabilities = ["read"]
         }
@@ -124,6 +179,59 @@ services:
           user_claim="email" \
           oidc_scopes="openid,email" \
           token_policies="dotvault"
+
+        # --- Certificate auth (mtls / mtls+tpm / mtls+os) ---
+        #
+        # dotvault's cert-auth flow needs two Vault pieces: a PKI engine to sign
+        # the client CSR, and a cert auth method that trusts the resulting CA.
+        # Provisioning both here is what lets test/integration exercise a REAL
+        # mTLS token exchange — CSR to pki/sign, TLS client-cert handshake, then
+        # auth/cert/login — instead of a fake HTTP server.
+        echo "==> Enabling PKI secrets engine..."
+        vault secrets enable -path=pki pki 2>/dev/null || true
+        vault secrets tune -max-lease-ttl=87600h pki
+
+        echo "==> Generating PKI root CA..."
+        vault write -field=certificate pki/root/generate/internal \
+          common_name="dotvault-dev-ca" \
+          issuer_name="dotvault-dev" \
+          ttl=87600h > /vault/data/pki-ca.crt
+
+        echo "==> Creating PKI role for client certificates..."
+        # Client-auth certificates keyed on the OS username. require_cn is off
+        # and the CN is unconstrained so a test can request any identity;
+        # a production role would bind allowed_domains instead.
+        vault write pki/roles/dotvault-client \
+          allow_any_name=true \
+          allow_bare_domains=true \
+          allow_subdomains=true \
+          client_flag=true \
+          server_flag=false \
+          key_type=any \
+          max_ttl=720h \
+          ttl=720h
+
+        echo "==> Enabling cert auth method..."
+        vault auth enable cert 2>/dev/null || true
+
+        echo "==> Registering the PKI CA with cert auth..."
+        # The cert role trusts anything signed by our CA and issues tokens
+        # carrying the same dotvault policy the OIDC role does, so an
+        # integration test can assert the exchanged token actually works.
+        vault write auth/cert/certs/dotvault \
+          display_name=dotvault \
+          policies=dotvault \
+          certificate=@/vault/data/pki-ca.crt \
+          ttl=3600
+
+        # Broader policy for the bootstrap step: signing a CSR needs pki/sign,
+        # which the operational dotvault policy deliberately does not grant.
+        echo "==> Writing dotvault-bootstrap policy..."
+        vault policy write dotvault-bootstrap - <<'POLICY'
+        path "pki/sign/dotvault-client" {
+          capabilities = ["create", "update"]
+        }
+        POLICY
 
         # Write root token to shared volume for host access
         echo "$$ROOT_TOKEN" > /vault/data/root-token
@@ -242,6 +350,7 @@ services:
       start_period: 5s
 
 volumes:
+  vault-tls:
   vault-data:
   dex-data:
   artifactory-data:

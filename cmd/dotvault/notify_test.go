@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/notify"
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // newUnixNotifyServer starts an httptest server bound to a Unix socket at
@@ -79,6 +80,10 @@ func TestPostNotifyToSocket_PeerError(t *testing.T) {
 // --config override, returning the command error and the message (if any) the
 // local notifier received.
 func runNotifyWith(t *testing.T, cfgPath string, args ...string) (error, *notify.Message) {
+	// Run as though no system-wide config were installed: --config is
+	// refused whenever one exists without bypass_system_config, which is
+	// the case on any machine running the product.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	t.Helper()
 	prevCfg := flagConfig
 	flagConfig = cfgPath
@@ -121,6 +126,12 @@ func TestRunNotify_PrefersPeerSocket(t *testing.T) {
 }
 
 func TestRunNotify_ActionURLFlagReachesPeer(t *testing.T) {
+	// This test sets flagConfig directly (it needs the --action-url flag on the
+	// cmd, which runNotifyWith does not expose), so it must repeat the
+	// system-config override runNotifyWith applies: without it, a developer
+	// machine with a system config installed refuses --config, config load fails,
+	// and the peer sees an empty action_url.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	sock := filepath.Join(t.TempDir(), "p.sock")
 	var peerActionURL string
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {

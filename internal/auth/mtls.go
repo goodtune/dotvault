@@ -76,6 +76,14 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 	}
 	if cred != nil {
 		if reused, err := m.tryExistingCredential(ctx, store, cred); err != nil {
+			// A failure to honour no-token-at-rest is not a broken credential,
+			// so re-seeding is the wrong response: the certificate is fine and
+			// a fresh one would hit the same undeletable file. Falling through
+			// would cost an interactive bootstrap prompt and a wasted PKI
+			// issuance on every startup, and still fail.
+			if errors.Is(err, ErrTokenAtRest) {
+				return err
+			}
 			slog.Warn("existing mtls credential failed, re-seeding", "error", err)
 		} else if reused {
 			// Operational-login success: emit the transition notice exactly
@@ -144,6 +152,23 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 // inspecting the error alone — hence an explicit sentinel rather than a
 // heuristic. See client.AuthenticateCached.
 var ErrNoCertCredential = errors.New("no usable certificate credential on this host")
+
+// ErrTokenAtRest marks a login that succeeded at Vault but could not honour the
+// no-token-at-rest guarantee, because a token file already on disk could not be
+// removed (on Windows, typically a sharing violation from antivirus, backup, or
+// indexing holding it open).
+//
+// It exists so callers can tell this apart from "the credential on this host is
+// unusable". They look identical — both are just an error out of certLogin —
+// but they call for opposite responses: an unusable credential should be
+// re-seeded, whereas here the certificate is perfectly good and re-seeding
+// fixes nothing. Without the distinction authenticateMTLS treats an undeletable
+// file as a broken credential and falls through to a full interactive bootstrap
+// (an OIDC browser flow or an LDAP TTY prompt) plus a fresh PKI issuance, which
+// then hits the same undeletable file and fails anyway — so a file the OS
+// briefly will not unlink costs a human prompt and a wasted certificate on
+// every startup.
+var ErrTokenAtRest = errors.New("token file could not be removed")
 
 // CertLoginFromStore mints a fresh operational token by performing the
 // certificate login against the credential this host already holds. It is the
@@ -621,9 +646,26 @@ func (m *Manager) certLogin(ctx context.Context, cred *sealedCredential, signer 
 	if err != nil {
 		return err
 	}
+	// The two arms straddle adoption deliberately (see PersistTokenAtRest for
+	// which methods take which). Removal runs BEFORE the token is installed, so
+	// a login that cannot honour the no-token-at-rest guarantee installs no new
+	// token — adopting first and erroring afterwards would report a failed login
+	// while leaving a live token on the shared client, which in daemon+web mode
+	// GET /api/v1/token would serve. Ordering it first needs no rollback, and so
+	// has no rollback to forget. Unlike the write below, which only warns, a
+	// removal failure is fatal: a token that could not be removed is a token
+	// still on disk.
+	persist := PersistTokenAtRest(m.AuthMethod)
+	if !persist {
+		if err := RemoveTokenFile(m.TokenFilePath); err != nil {
+			return fmt.Errorf("auth_method %s requires no token at rest, but the existing token file could not be removed: %w: %w", m.AuthMethod, ErrTokenAtRest, err)
+		}
+	}
 	m.VaultClient.SetToken(token)
-	if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
-		slog.Warn("failed to write token file", "error", err)
+	if persist {
+		if err := WriteTokenFile(m.TokenFilePath, token, SealTokenAtRest(m.AuthMethod)); err != nil {
+			slog.Warn("failed to write token file", "error", err)
+		}
 	}
 	slog.Info("mtls authentication successful", "method", m.MTLS.Method, "serial", cred.Serial,
 		"not_after", cred.NotAfter.Format(time.RFC3339))

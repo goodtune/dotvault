@@ -59,8 +59,19 @@ type Manager struct {
 // Authenticate attempts to authenticate with Vault.
 // It first tries to reuse an existing token, then falls back to the configured method.
 func (m *Manager) Authenticate(ctx context.Context) error {
-	// Step 1: Try existing token
-	token := ResolveToken(m.TokenFilePath)
+	// Step 1: Try existing token.
+	//
+	// Under a method that keeps no token at rest (mtls+os) the file is excluded:
+	// anything found there is stale, and ADOPTING it is worse than merely
+	// leaving it — reuse returns before Login, so certLogin never runs and never
+	// removes it. A sync-only host would then use a plaintext token
+	// indefinitely, which is precisely the exposure this method exists to close.
+	// DOTVAULT_TOKEN still applies: it is operator-supplied in the environment,
+	// not something dotvault persisted.
+	token := ReadTokenEnv()
+	if PersistTokenAtRest(m.AuthMethod) {
+		token = ResolveToken(m.TokenFilePath)
+	}
 	if token != "" {
 		m.VaultClient.SetToken(token)
 		_, err := m.VaultClient.LookupSelf(ctx)

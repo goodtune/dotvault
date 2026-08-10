@@ -88,7 +88,39 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create vault client: %w", err)
 	}
 
-	token := auth.ResolveToken(paths.VaultTokenPath())
+	// Same exclusion as Manager.Authenticate: a file present under mtls+os is
+	// stale, and using it here would route around certLogin's removal.
+	token := resolveTokenForMethod(paths.VaultTokenPath(), auth.PersistTokenAtRest(cfg.Vault.AuthMethod))
+	if token == "" && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+		// mtls+os keeps no token at rest, so an absent file is the normal state
+		// rather than "not authenticated". Deriving one from the certificate is
+		// the right answer here: it needs no human, so it does not violate this
+		// command's rule against initiating a fresh *interactive* login, and
+		// refusing instead would tell the user to run `dotvault login` for a
+		// method where that is neither necessary nor meaningful.
+		mgr := &auth.Manager{
+			VaultClient: vc,
+			// Wired so certLogin can REMOVE a stale file, not so it can write
+			// one: this branch runs only when PersistTokenAtRest is false, so
+			// the write arm is unreachable here. Leaving it empty made
+			// RemoveTokenFile a no-op (an empty path means "do not persist"),
+			// so `dotvault enrol` on a host with a leftover plaintext token
+			// completed a successful mtls+os cert login and left that token
+			// sitting on disk — declining to *use* it, but not removing it.
+			TokenFilePath: paths.VaultTokenPath(),
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Policy:        vaultPolicyConstraint(cfg),
+			Username:      username,
+			MTLS:          mtlsParams(cfg, username),
+		}
+		if err := mgr.CertLoginFromStore(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "dotvault: certificate login failed (%v); this host may need enrolling\n", err)
+			os.Exit(1)
+		}
+		token = vc.Token()
+	}
 	if token == "" {
 		fmt.Fprintln(os.Stderr, "dotvault: not authenticated; run `dotvault login` first")
 		os.Exit(1)

@@ -82,6 +82,17 @@ dotvault login-check [flags]
   on macOS local accounts live in Open Directory rather than
   `/etc/passwd`, so the flag never matches a human account there and
   safely degrades to the normal check.
+- Under `mtls+os` (which keeps no token at rest): inspect the
+  certificate rather than a token, which is a local file read and so stays
+  within the shell-startup latency budget. While the certificate is valid,
+  exit clean immediately — no interactive login is possible or needed, since
+  the daemon re-derives an operational token from the certificate on demand.
+  If it is missing, expired, or unreadable, print the reason and run the
+  bootstrap: re-issuance requires a *still-valid* certificate, so a lapsed one
+  cannot renew itself, and under `mtls+os` there is no cached token to fall
+  back on either. Exiting clean there would report health on a host that
+  cannot authenticate at all. Plain `mtls` and `mtls+tpm` are unaffected — they
+  still cache a token, so this hook still renews it for them as before.
 - Otherwise: if the cached token is valid and still within the first
   half of its creation TTL, exit clean. Past halfway, attempt renewal;
   if renewal fails but the token is still valid, warn with the
@@ -110,6 +121,13 @@ dotvault login-check [flags]
 ### `dotvault status`
 
 Display authentication state, token TTL, and per-rule sync status.
+
+Under `mtls+os` there is deliberately no token at rest, so `status` reports the
+**certificate** instead — whether one is enrolled, its identity and backend, and
+its expiry — which is the credential that actually persists under that method.
+It does not perform a certificate login to obtain a token for display: `status`
+is an observation command, and minting a Vault token (with its lease) merely to
+answer "am I set up?" would make it a mutating one.
 
 ```sh
 dotvault status [flags]

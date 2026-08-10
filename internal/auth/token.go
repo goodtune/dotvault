@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/perms"
@@ -118,6 +119,36 @@ func WriteTokenFile(path string, token string, seal bool) error {
 	}
 	if err := os.WriteFile(path, payload, 0600); err != nil {
 		return fmt.Errorf("write token file: %w", err)
+	}
+	return nil
+}
+
+// RemoveTokenFile deletes a cached token file, treating an already-absent file
+// as success.
+//
+// It exists for auth methods that must not leave a token at rest ("mtls+os").
+// Simply declining to write is not enough: a host that previously ran plain
+// "mtls", or an older build of "mtls+os", still has a readable plaintext token
+// on disk, and it stays valid until its TTL runs out. Without an explicit
+// removal the no-plaintext-at-rest guarantee would hold only for hosts that had
+// never run anything else — which is not a guarantee worth stating.
+func RemoveTokenFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		// Windows has no POSIX unlink-while-open, and Go opens files without
+		// FILE_SHARE_DELETE, so an antivirus scanner, backup agent or search
+		// indexer holding a handle yields ERROR_SHARING_VIOLATION. Since the
+		// caller escalates this to a login failure, name the likely cause
+		// rather than surfacing a bare errno the operator has to decode. The
+		// hint is gated on the platform: mtls+os is Windows-only, but this
+		// helper is reachable in tests and by any future no-persist method, and
+		// a Unix EACCES explained in terms of antivirus would misdirect.
+		if runtime.GOOS == "windows" {
+			return fmt.Errorf("remove token file %s: %w (another process holding the file open — antivirus, backup or indexing — can block deletion on Windows)", path, err)
+		}
+		return fmt.Errorf("remove token file %s: %w", path, err)
 	}
 	return nil
 }

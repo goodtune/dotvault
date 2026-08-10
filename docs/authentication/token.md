@@ -38,7 +38,7 @@ When the web UI is enabled with token auth, users can paste a Vault token into t
 
 ## Token file permissions
 
-dotvault writes tokens to `~/.dotvault-token` with `0600` permissions and warns if the file has different permissions. This mirrors the `0600` convention of the Vault CLI's own `~/.vault-token`, but uses a dotvault-specific filename so running the upstream `vault` CLI in another context cannot overwrite (or be overwritten by) the daemon's cached token.
+dotvault writes tokens to `~/.dotvault-token` with `0600` permissions and warns if the file has different permissions. (The exception is `auth_method: mtls+os`, which writes no token file at all — see [mTLS](mtls.md#no-token-at-rest-mtlsos).) This mirrors the `0600` convention of the Vault CLI's own `~/.vault-token`, but uses a dotvault-specific filename so running the upstream `vault` CLI in another context cannot overwrite (or be overwritten by) the daemon's cached token.
 
 <!-- TRANSITIONAL: added in v0.20.0 for the ~/.vault-token -> ~/.dotvault-token move. Remove this section around v0.23.0 (≈3 minor releases) once upgrading installs are unlikely. -->
 ## Upgrading from earlier releases

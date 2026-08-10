@@ -74,6 +74,7 @@ nav:
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
   - SSH Agent: guide/ssh-agent.md
+  - Managed SSH Forwards: guide/ssh-forwards.md
   - Web UI: web-ui.md
   - Admin Guide:
       - Deployment: admin/deployment.md

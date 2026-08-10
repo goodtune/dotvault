@@ -15,6 +15,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/observability"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/sync"
 )
 
@@ -449,6 +450,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",
+		"SSH":                "dynamic", // certificate_authorities/insecure_ignore_host_key applied via updateSSHPolicyConfig's atomic value
 		"BypassSystemConfig": "static",
 		"Managed":            "derived", // set by the loader from the config source, not a section
 	}
@@ -627,4 +629,289 @@ func TestRunConfigRefreshCadenceFollowsReload(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestRunConfigRefreshAppliesSSHConfigDynamically proves the SSH section's
+// "dynamic" classification (see TestStaticSectionsCoverConfig) is actually
+// implemented, not merely asserted: a reloaded certificate_authorities list
+// must reach a HostKeyPolicy built *after* the reload, via
+// updateSSHPolicyConfig's atomic value, with no daemon restart.
+func TestRunConfigRefreshAppliesSSHConfigDynamically(t *testing.T) {
+	oldCA := "@cert-authority * ssh-ed25519 AAAAOLD old-ca"
+	newCA := "@cert-authority * ssh-ed25519 AAAANEW new-ca"
+
+	// Isolate this test from sshPolicyConfig's package-level state.
+	updateSSHPolicyConfig(config.SSHConfig{CertificateAuthorities: []string{oldCA}})
+	t.Cleanup(func() { updateSSHPolicyConfig(config.SSHConfig{}) })
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		SSH:   config.SSHConfig{CertificateAuthorities: []string{oldCA}},
+	}
+
+	edited := *initial
+	edited.SSH = config.SSHConfig{CertificateAuthorities: []string{newCA}}
+
+	var current atomic.Pointer[config.Config]
+	current.Store(initial)
+	loader := func() (*config.Config, error) { return current.Load(), nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
+	t.Cleanup(sshMgr.Close)
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
+	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
+
+	// Built once, before the daemon has ever seen the edited config —
+	// exactly the daemon's real situation: sshForwardDeps runs once at
+	// startup, and the Policy closure it returns is the one thing that
+	// must go on reading live state afterwards. Asserting against *this*
+	// object (rather than building a fresh one from the edited config, as
+	// an earlier version of this test did) is what makes the test fail if
+	// Policy is ever changed to read its captured cfg parameter instead of
+	// currentSSHPolicyConfig() — see the capture-mutation check in the
+	// task report.
+	deps, err := sshForwardDeps(&config.Config{
+		Web:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:9000"},
+		Agent: config.AgentConfig{Enabled: true},
+		SSH:   initial.SSH,
+	}, fakeSignerSource{}, "user")
+	if err != nil {
+		t.Fatalf("sshForwardDeps: %v", err)
+	}
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour,
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+			sshRegistry:    sshRegistry,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	if got := deps.Policy(sshfwd.Remote{Host: "example.com"}).CAs; len(got) != 1 || got[0] != oldCA {
+		t.Fatalf("before any reload, deps.Policy(...).CAs = %v, want [%q]", got, oldCA)
+	}
+
+	current.Store(&edited)
+	reloadCh <- struct{}{}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if got := deps.Policy(sshfwd.Remote{Host: "example.com"}).CAs; len(got) == 1 && got[0] == newCA {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reloaded SSH config section was not applied to the pre-existing Deps.Policy; got = %v, want [%q]",
+				deps.Policy(sshfwd.Remote{Host: "example.com"}).CAs, newCA)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit proves the stated
+// hand-edit-converges-without-restart requirement: editing ssh.yaml directly
+// (as a human, bypassing the Registry/web API entirely) must be picked up by
+// the next refresh pass.
+func TestRunConfigRefreshReconcilesSSHYAMLOnHandEdit(t *testing.T) {
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
+
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
+	t.Cleanup(sshMgr.Close)
+	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+	}
+	loader := func() (*config.Config, error) { c := *initial; return &c, nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour,
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+			sshRegistry:    sshRegistry,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	reloadCh <- struct{}{} // pass 1: no ssh.yaml yet -> zero remotes
+	if got := sshMgr.Status(); len(got) != 0 {
+		t.Fatalf("Status = %v, want empty before ssh.yaml exists", got)
+	}
+
+	// Hand-edit ssh.yaml directly, the way a human editing the file (or an
+	// older `dotvault ssh add` run against a stopped daemon) would — not
+	// through the Registry.
+	f := &sshfwd.File{Remotes: []sshfwd.Remote{{Host: "example.com", RemoteSocket: sshfwd.DefaultRemoteSocket}}}
+	if err := sshfwd.Save(sshConfigPath, f); err != nil {
+		t.Fatal(err)
+	}
+
+	reloadCh <- struct{}{} // pass 2: should pick up the new remote
+
+	deadline := time.After(2 * time.Second)
+	for {
+		st := sshMgr.Status()
+		if len(st) == 1 && st[0].Host == "example.com" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("hand-edited ssh.yaml was not reconciled into the running manager; status=%v", st)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestRunConfigRefreshSSHResyncSerializedAgainstRegistryMutation proves the
+// fix for the file-vs-running-set consistency gap: the refresh loop's
+// ssh.yaml pickup goes through Registry.Resync, which holds the same write
+// lock Registry.Add/Patch/Remove hold across their own Load->Save->Reconcile
+// — so a concurrent removal can never be raced-and-reverted by a refresh
+// pass that read the file a moment earlier.
+//
+// It uses Registry.SetResyncDelayForTest to force the interleaving that
+// would otherwise depend on getting unlucky with real goroutine scheduling:
+// the hook fires from inside Resync, after ssh.yaml has been read but before
+// the Manager is reconciled, still holding the write lock. While the refresh
+// loop's Resync call sits paused there, a concurrent Registry.Remove must
+// block until the lock is released — proving mutual exclusion, not just
+// most-of-the-time correctness — and the manager's final state must reflect
+// the removal.
+//
+// This test is meaningless against code that bypasses Registry.Resync (the
+// pre-fix shape: a direct sshfwd.Load + Manager.Reconcile in the refresh
+// loop) — that code never calls the hook, so it hangs waiting for
+// pausedInResync rather than silently passing; the deadline below turns that
+// into a clean failure instead of a hung test.
+func TestRunConfigRefreshSSHResyncSerializedAgainstRegistryMutation(t *testing.T) {
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh.yaml")
+
+	sshMgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
+	t.Cleanup(sshMgr.Close)
+	sshRegistry := sshfwd.NewRegistry(sshConfigPath, sshMgr, nil)
+
+	// Seed remote A. Force skips verification (no Verifier is wired above).
+	if _, err := sshRegistry.Add(context.Background(),
+		sshfwd.Remote{Host: "a.example.com", RemoteSocket: sshfwd.DefaultRemoteSocket},
+		sshfwd.AddOptions{Force: true},
+	); err != nil {
+		t.Fatalf("seed Add: %v", err)
+	}
+	if got := sshMgr.Status(); len(got) != 1 {
+		t.Fatalf("Status = %v, want 1 remote after seeding", got)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	initial := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+	}
+	loader := func() (*config.Config, error) { c := *initial; return &c, nil }
+
+	engine := sync.NewEngine(initial, nil, "user", statePath)
+	rm := enrol.NewRefreshManager(nil, "kv", "users/user/", nil, time.Minute)
+	wm := enrol.NewWatchManager(nil, "kv", "users/user/", "user", nil, time.Minute)
+
+	pausedInResync := make(chan struct{})
+	resumeResync := make(chan struct{})
+	sshRegistry.SetResyncDelayForTest(func() {
+		close(pausedInResync)
+		<-resumeResync
+	})
+
+	reloadCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runConfigRefresh(ctx, refreshDeps{
+			load:           loader,
+			interval:       time.Hour,
+			initial:        initial,
+			initialStatic:  staticSectionsOf(initial),
+			reload:         reloadCh,
+			engine:         engine,
+			refreshManager: rm,
+			watchManager:   wm,
+			sshRegistry:    sshRegistry,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	// Trigger the refresh pass whose Resync call will pause inside the hook.
+	go func() { reloadCh <- struct{}{} }()
+
+	select {
+	case <-pausedInResync:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh pass never reached Registry.Resync's paused hook — the loop is not calling Resync")
+	}
+
+	// While Resync holds the write lock, a concurrent Remove must block
+	// rather than complete.
+	removeDone := make(chan struct{})
+	go func() {
+		_, _ = sshRegistry.Remove(context.Background(), "a.example.com")
+		close(removeDone)
+	}()
+
+	select {
+	case <-removeDone:
+		t.Fatal("Remove completed while Resync held the write lock — the two are not serialized")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(resumeResync)
+
+	select {
+	case <-removeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Remove did not complete after Resync released the write lock")
+	}
+
+	if got := sshMgr.Status(); len(got) != 0 {
+		t.Fatalf("Status = %v, want empty — the removal must not be reverted by the concurrently-paused refresh pass", got)
+	}
 }

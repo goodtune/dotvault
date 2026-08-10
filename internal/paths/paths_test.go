@@ -158,3 +158,54 @@ func testHomeDir(t *testing.T) string {
 	}
 	return home
 }
+
+func TestSSHConfigPathIsUnderUserConfigDir(t *testing.T) {
+	dir, err := UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir() error = %v", err)
+	}
+	if dir == "" {
+		t.Fatal("UserConfigDir() returned empty string")
+	}
+	if !filepath.IsAbs(dir) {
+		t.Errorf("UserConfigDir() = %q, want absolute path", dir)
+	}
+
+	p, err := SSHConfigPath()
+	if err != nil {
+		t.Fatalf("SSHConfigPath() error = %v", err)
+	}
+	if got, want := filepath.Base(p), "ssh.yaml"; got != want {
+		t.Errorf("SSHConfigPath() basename = %q, want %q", got, want)
+	}
+	if filepath.Dir(p) != dir {
+		t.Errorf("SSHConfigPath() dir = %q, want %q", filepath.Dir(p), dir)
+	}
+}
+
+func TestUserConfigDirHonoursXDGOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("XDG_CONFIG_HOME is only consulted on linux")
+	}
+	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdg-test")
+	dir, err := UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir() error = %v", err)
+	}
+	if want := "/tmp/xdg-test/dotvault"; dir != want {
+		t.Errorf("UserConfigDir() = %q, want %q", dir, want)
+	}
+}
+
+func TestUserConfigDirIsNotSystemConfigDir(t *testing.T) {
+	// The user file must never resolve to the admin-owned system location.
+	// A regression here would let an unprivileged write land where policy
+	// lives (or, worse, silently fail and read the admin's file).
+	dir, err := UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir() error = %v", err)
+	}
+	if sys := filepath.Dir(SystemConfigPath()); dir == sys {
+		t.Errorf("UserConfigDir() = %q, must differ from system config dir", dir)
+	}
+}

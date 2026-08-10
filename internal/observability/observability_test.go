@@ -50,6 +50,12 @@ func TestRecordWithoutInit(t *testing.T) {
 	RecordWebRequest(ctx, "/api/v1/status", "2xx")
 	RecordConfigReload(ctx, "no_change")
 	RecordSIGHUP(ctx)
+	RecordSSHConnState(ctx, "example.com", true)
+	RecordSSHReconnect(ctx, "example.com")
+	RecordSSHConnectFailure(ctx, "example.com", "dns")
+	RecordSSHKeepaliveFailure(ctx, "example.com")
+	RecordSSHForwardConn(ctx, "example.com", 1)
+	RecordSSHForwardFailure(ctx, "example.com")
 }
 
 // TestRecordReachesActiveMeterProvider is the behavioural test for
@@ -115,6 +121,160 @@ func TestRecordReachesActiveMeterProvider(t *testing.T) {
 		if counters[name] < 1 {
 			t.Errorf("counter %q = %d, want ≥1 — rebindInstruments did not wire it to the active provider", name, counters[name])
 		}
+	}
+}
+
+// TestSSHInstrumentsReachActiveMeterProvider is the SSH-forward sibling of
+// TestRecordReachesActiveMeterProvider: it pins that rebindInstruments wires
+// every new instrument to the active provider, and that each one is the
+// instrument kind its doc promises — dotvault.ssh.connections and
+// dotvault.ssh.forward_connections_active must behave like gauges (an
+// absolute/net-current value), not accumulate like the *_total counters.
+func TestSSHInstrumentsReachActiveMeterProvider(t *testing.T) {
+	reader := newTestReader(t)
+	ctx := context.Background()
+
+	RecordSSHConnState(ctx, "a.example.com", true)
+	RecordSSHReconnect(ctx, "a.example.com")
+	RecordSSHConnectFailure(ctx, "a.example.com", "dns")
+	RecordSSHKeepaliveFailure(ctx, "a.example.com")
+	RecordSSHForwardConn(ctx, "a.example.com", 1)
+	RecordSSHForwardConn(ctx, "a.example.com", 1)
+	RecordSSHForwardConn(ctx, "a.example.com", -1)
+	RecordSSHForwardFailure(ctx, "a.example.com")
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+
+	var (
+		gotConnGauge          bool
+		gotForwardActive      int64
+		forwardFailureHasHost bool
+		counters              = map[string]int64{}
+	)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch data := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				if m.Name == "dotvault.ssh.connections" {
+					for _, dp := range data.DataPoints {
+						if dp.Value == 1 {
+							gotConnGauge = true
+						}
+					}
+				}
+			case metricdata.Sum[int64]:
+				var total int64
+				for _, dp := range data.DataPoints {
+					total += dp.Value
+					if m.Name == "dotvault.ssh.forward_failure_total" {
+						if v, ok := dp.Attributes.Value(attribute.Key("host")); ok && v.AsString() == "a.example.com" {
+							forwardFailureHasHost = true
+						}
+					}
+				}
+				if m.Name == "dotvault.ssh.forward_connections_active" {
+					gotForwardActive = total
+				} else {
+					counters[m.Name] = total
+				}
+			}
+		}
+	}
+
+	// forward_failure_total must carry the host label like every other SSH
+	// instrument — an operator managing several forwards needs to tell them
+	// apart on this counter, not just in an adjacent log line.
+	if !forwardFailureHasHost {
+		t.Error(`dotvault.ssh.forward_failure_total datapoint lacks the host="a.example.com" attribute`)
+	}
+
+	if !gotConnGauge {
+		t.Error("dotvault.ssh.connections did not report a datapoint of 1 — rebindInstruments did not wire the gauge to the active provider")
+	}
+	// Two accepted (+1, +1) and one closed (-1) nets to 1 active — an
+	// up-down counter, not a monotonic counter, so this would be 3 if the
+	// instrument kind regressed to a plain Int64Counter.
+	if gotForwardActive != 1 {
+		t.Errorf("dotvault.ssh.forward_connections_active = %d, want 1 (net of two accepts and one close)", gotForwardActive)
+	}
+	for _, name := range []string{
+		"dotvault.ssh.reconnect_total",
+		"dotvault.ssh.connect_failure_total",
+		"dotvault.ssh.keepalive_failure_total",
+		"dotvault.ssh.forward_connections_total",
+		"dotvault.ssh.forward_failure_total",
+	} {
+		if counters[name] < 1 {
+			t.Errorf("counter %q = %d, want ≥1 — rebindInstruments did not wire it to the active provider", name, counters[name])
+		}
+	}
+	// forward_connections_total must count only the two accepts, never the
+	// close (delta < 0) — a close is not a new connection.
+	if got := counters["dotvault.ssh.forward_connections_total"]; got != 2 {
+		t.Errorf("dotvault.ssh.forward_connections_total = %d, want 2 (only the two accepted deltas)", got)
+	}
+}
+
+// TestSSHConnectFailureClassAttributeBounded pins the cardinality guarantee
+// that makes dotvault.ssh.connect_failure_total safe to export: the `class`
+// attribute is exactly the string handed to RecordSSHConnectFailure, with no
+// hidden transformation that could leak free-form text through — the bound
+// itself is enforced by the caller (internal/sshfwd's fail(), which must
+// pass sshfwd.Classify(err)'s fixed result, never err.Error()) and is
+// exercised there; this test pins the attribute plumbing that guarantee
+// relies on.
+func TestSSHConnectFailureClassAttributeBounded(t *testing.T) {
+	reader := newTestReader(t)
+	ctx := context.Background()
+
+	// The fixed vocabulary sshfwd.ErrorClass defines (state.go), duplicated
+	// here as plain strings rather than importing internal/sshfwd — this
+	// package sits below sshfwd in the dependency graph (sshfwd imports
+	// observability to call these helpers) and must not import back up.
+	classes := []string{
+		"dns", "network-unreachable", "connection-refused", "handshake",
+		"authentication", "host-key", "remote-socket-bind", "home-probe",
+		"config", "other",
+	}
+	for _, c := range classes {
+		RecordSSHConnectFailure(ctx, "b.example.com", c)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "dotvault.ssh.connect_failure_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("dotvault.ssh.connect_failure_total: unexpected data type %T", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				v, ok := dp.Attributes.Value(attribute.Key("class"))
+				if !ok {
+					t.Fatal("connect-failure datapoint missing class attribute")
+				}
+				seen[v.AsString()] = true
+			}
+		}
+	}
+
+	for _, c := range classes {
+		if !seen[c] {
+			t.Errorf("class %q not recorded on dotvault.ssh.connect_failure_total", c)
+		}
+	}
+	if len(seen) != len(classes) {
+		t.Errorf("saw %d distinct class attribute values, want exactly %d — an unbounded or malformed label would show up as extra or missing values here", len(seen), len(classes))
 	}
 }
 

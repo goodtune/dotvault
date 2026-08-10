@@ -845,6 +845,17 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 
+	// SSH (admin-owned host-CA trust material).
+	sshKey := rootKey + `\SSH`
+	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {
+		return err
+	}
+	if v, ok, err := getMultiString(sshKey, "CertificateAuthorities"); err != nil {
+		return err
+	} else if ok {
+		cfg.SSH.CertificateAuthorities = v
+	}
+
 	// Agent.
 	agentKey := rootKey + `\Agent`
 	if err := applyBool(&cfg.Agent.Enabled, agentKey, "Enabled"); err != nil {

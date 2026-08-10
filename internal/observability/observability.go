@@ -33,7 +33,13 @@
 //     RecordXxx godoc for the exact set each instrument emits.
 //   - We never attach usernames, Vault paths, secret keys, repo URLs,
 //     or JFrog server hostnames to instruments — the same scrubbing
-//     discipline the slog handlers follow.
+//     discipline the slog handlers follow. The one deliberate exception is
+//     the `host` label on the SSH forward instruments (dotvault.ssh.*):
+//     unlike a JFrog server URL, it names an entry in the operator's own
+//     small, statically-configured remote list — see
+//     docs/superpowers/specs/2026-08-09-managed-ssh-forwards-design.md — so
+//     the cardinality bound holds for the same reason a Vault path's does
+//     not.
 package observability
 
 import (
@@ -613,6 +619,16 @@ var (
 	sighupAttempts  metric.Int64Counter
 	deprecatedUses  metric.Int64Counter
 
+	// SSH forward instruments (internal/sshfwd's managed remotes). See the
+	// Record* helpers below for the attribute contract each one accepts.
+	sshConnections       metric.Int64Gauge
+	sshReconnects        metric.Int64Counter
+	sshConnectFailures   metric.Int64Counter
+	sshKeepaliveFailures metric.Int64Counter
+	sshForwardActive     metric.Int64UpDownCounter
+	sshForwardConnsTotal metric.Int64Counter
+	sshForwardFailures   metric.Int64Counter
+
 	// buildVersion feeds the dotvault.build_info gauge's version attribute.
 	// Set by Init before it rebinds the instruments; empty (a test calling
 	// rebindInstruments directly, or a hand-rolled build) reports as "dev",
@@ -704,6 +720,35 @@ func rebindInstruments() {
 		// removal release can ship. Bounded cardinality — the attribute
 		// values are a fixed set of config paths, never user content.
 		metric.WithDescription("Deprecated configuration fields in active use, counted once per process start, by field"),
+	)
+
+	sshConnections, _ = meter.Int64Gauge(
+		"dotvault.ssh.connections",
+		metric.WithDescription("Managed SSH remote connection state by host: 1 while connected, 0 otherwise"),
+	)
+	sshReconnects, _ = meter.Int64Counter(
+		"dotvault.ssh.reconnect_total",
+		metric.WithDescription("Managed SSH remote reconnect attempts by host, counted once per dropped connection redial"),
+	)
+	sshConnectFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.connect_failure_total",
+		metric.WithDescription("Managed SSH remote connection-attempt failures by host and error class"),
+	)
+	sshKeepaliveFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.keepalive_failure_total",
+		metric.WithDescription("Managed SSH remote keepalive strike-threshold failures by host"),
+	)
+	sshForwardActive, _ = meter.Int64UpDownCounter(
+		"dotvault.ssh.forward_connections_active",
+		metric.WithDescription("Currently active relayed connections on a managed SSH remote's forward, by host"),
+	)
+	sshForwardConnsTotal, _ = meter.Int64Counter(
+		"dotvault.ssh.forward_connections_total",
+		metric.WithDescription("Total relayed connections accepted on a managed SSH remote's forward, by host"),
+	)
+	sshForwardFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.forward_failure_total",
+		metric.WithDescription("Managed SSH remote forward-target dial failures by host (the local API surface could not be reached for an accepted connection)"),
 	)
 
 	// dotvault.build_info follows the Prometheus *_build_info convention: a
@@ -904,6 +949,114 @@ func RecordDeprecatedConfig(ctx context.Context, field string) {
 		return
 	}
 	c.Add(ctx, 1, metric.WithAttributes(attribute.String("field", field)))
+}
+
+// RecordSSHConnState records a managed SSH remote's connected/disconnected
+// state for dotvault.ssh.connections, a synchronous gauge that reports the
+// instantaneous value (1 while connected, 0 otherwise) rather than a running
+// total. Call this only on an actual state transition — entering
+// StateConnected, or leaving it — never once per run-loop retry attempt, or
+// the series reads as flapping for a remote that is simply redialling a
+// still-dead connection.
+func RecordSSHConnState(ctx context.Context, host string, connected bool) {
+	instrMu.RLock()
+	g := sshConnections
+	instrMu.RUnlock()
+	if g == nil {
+		return
+	}
+	v := int64(0)
+	if connected {
+		v = 1
+	}
+	g.Record(ctx, v, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHReconnect increments dotvault.ssh.reconnect_total for host. Call
+// once per completed reconnect — when a previously established connection
+// has been torn down and the remote redials — not for the very first
+// connection attempt.
+func RecordSSHReconnect(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshReconnects
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHConnectFailure increments dotvault.ssh.connect_failure_total,
+// labelled by host and class. class must be one of sshfwd's fixed
+// ErrorClass values (dns, network-unreachable, connection-refused,
+// handshake, authentication, host-key, remote-socket-bind, home-probe,
+// config, other) — pass sshfwd.Classify(err)'s result converted to a
+// string, never an error message or any other free-form text, or the label
+// cardinality is unbounded.
+func RecordSSHConnectFailure(ctx context.Context, host, class string) {
+	instrMu.RLock()
+	c := sshConnectFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("host", host),
+		attribute.String("class", class),
+	))
+}
+
+// RecordSSHKeepaliveFailure increments dotvault.ssh.keepalive_failure_total
+// for host. Call once when Keepalive's consecutive-strike threshold is
+// reached and the connection is being torn down as a result — not once per
+// individual missed keepalive round-trip, and not for an ordinary shutdown
+// (ctx cancellation), which is not a keepalive failure.
+func RecordSSHKeepaliveFailure(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshKeepaliveFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHForwardConn records one forward connection accepted (delta > 0)
+// or closed (delta < 0) on a managed SSH remote's forward, by host. It
+// updates dotvault.ssh.forward_connections_active — an up-down counter, so
+// the exported series is the running sum of every delta this function has
+// ever recorded for that host, i.e. the current active count — and, for an
+// accepted connection, increments dotvault.ssh.forward_connections_total.
+// Intended as the direct backing for serveListener's per-connection onConn
+// callback, so it is called once per accept and once per close, not on a
+// timer or a loop.
+func RecordSSHForwardConn(ctx context.Context, host string, delta int) {
+	instrMu.RLock()
+	active := sshForwardActive
+	total := sshForwardConnsTotal
+	instrMu.RUnlock()
+	if active != nil {
+		active.Add(ctx, int64(delta), metric.WithAttributes(attribute.String("host", host)))
+	}
+	if delta > 0 && total != nil {
+		total.Add(ctx, int64(delta), metric.WithAttributes(attribute.String("host", host)))
+	}
+}
+
+// RecordSSHForwardFailure increments dotvault.ssh.forward_failure_total,
+// labelled by host (bounded by the user's configured remote list, like every
+// other SSH instrument's host label). Recorded when an accepted forward
+// connection cannot be relayed because the local target dial failed — the
+// forward's own accept loop keeps running, so this is a per-attempt failure
+// count, not a fatal condition.
+func RecordSSHForwardFailure(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshForwardFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
 }
 
 // LogRegistryConfigManaged emits a WARN-severity OTel log record

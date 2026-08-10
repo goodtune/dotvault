@@ -7,6 +7,7 @@ import { OAuthBanner } from './components/oauth-banner.jsx';
 import { LoginPage } from './components/login-page.jsx';
 import { EnrolPage } from './components/enrol-page.jsx';
 import { ConfigPage } from './components/config-page.jsx';
+import { SSHPage } from './components/ssh-page.jsx';
 import { getStatus, getRules, listSecrets } from './api.js';
 
 export function App() {
@@ -18,6 +19,7 @@ export function App() {
   const [enrolDismissed, setEnrolDismissed] = useState(false);
   const [enrolPageOpen, setEnrolPageOpen] = useState(false);
   const [configPageOpen, setConfigPageOpen] = useState(false);
+  const [sshPageOpen, setSSHPageOpen] = useState(false);
 
   useEffect(() => {
     loadStatus();
@@ -94,6 +96,7 @@ export function App() {
         setEnrolDismissed(true);
         setEnrolPageOpen(false);
         setConfigPageOpen(false);
+        setSSHPageOpen(false);
         loadData();
       },
       onUpdate: loadStatus,
@@ -113,9 +116,36 @@ export function App() {
           setConfigPageOpen(false);
         },
         onConfigClick: () => setConfigPageOpen(true),
+        onSSHClick: () => {
+          setConfigPageOpen(false);
+          setSSHPageOpen(true);
+        },
       }),
       error && h('div', { class: 'error-banner' }, error),
       h(ConfigPage, { onClose: () => setConfigPageOpen(false) }),
+    );
+  }
+
+  if (sshPageOpen) {
+    return h(Fragment, null,
+      h(StatusBar, {
+        status,
+        onSync: loadData,
+        pendingEnrolments: pendingEnrolments.length,
+        hasEnrolments: enrolments.length > 0,
+        onEnrolClick: () => {
+          setEnrolDismissed(false);
+          setEnrolPageOpen(true);
+          setSSHPageOpen(false);
+        },
+        onConfigClick: () => {
+          setSSHPageOpen(false);
+          setConfigPageOpen(true);
+        },
+        onSSHClick: () => setSSHPageOpen(true),
+      }),
+      error && h('div', { class: 'error-banner' }, error),
+      h(SSHPage, { status, onUpdate: loadStatus, onClose: () => setSSHPageOpen(false) }),
     );
   }
 
@@ -132,6 +162,7 @@ export function App() {
         setEnrolPageOpen(true);
       },
       onConfigClick: () => setConfigPageOpen(true),
+      onSSHClick: () => setSSHPageOpen(true),
     }),
     error && h('div', { class: 'error-banner' }, error),
     oauthRules.length > 0 && h(OAuthBanner, { rules: oauthRules }),

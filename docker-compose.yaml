@@ -193,6 +193,54 @@ services:
       retries: 30
       start_period: 120s
 
+  # Opt-in real sshd for the daemon-managed SSH forwards integration tests
+  # (internal/sshfwd is exercised elsewhere against an in-memory fake sshd;
+  # these two containers are what proves the real OpenSSH server behaves the
+  # way that fake models). Activated by `docker compose --profile sshfwd up
+  # -d`. Plain `up` skips both, like the jfrog profile above.
+  #
+  # Two containers, not one: AllowStreamLocalForwarding is a whole-server
+  # setting, and TestVerifyRefusesWhenForwardingDisabled needs a server that
+  # actually rejects the streamlocal-forward@openssh.com global request —
+  # sharing one server between the "forwarding works" and "forwarding is
+  # disabled" cases would mean toggling and reloading sshd mid-suite, which
+  # is both slower and less deterministic than two fixed, independent servers.
+  sshd:
+    image: lscr.io/linuxserver/openssh-server:10.3_p1-r0-ls233
+    container_name: dotvault-sshd
+    profiles: ["sshfwd"]
+    environment:
+      - USER_NAME=dotvault
+      - DOCKER_MODS=linuxserver/mods:openssh-server-ssh-tunnel
+    volumes:
+      - ./test/integration/testdata/sshd/sshd_config.d/allow:/config/sshd/sshd_config.d:ro
+    ports:
+      - "127.0.0.1:2222:2222"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2222"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # AllowStreamLocalForwarding no — see TestVerifyRefusesWhenForwardingDisabled.
+  sshd-noforward:
+    image: lscr.io/linuxserver/openssh-server:10.3_p1-r0-ls233
+    container_name: dotvault-sshd-noforward
+    profiles: ["sshfwd"]
+    environment:
+      - USER_NAME=dotvault
+    volumes:
+      - ./test/integration/testdata/sshd/sshd_config.d/deny:/config/sshd/sshd_config.d:ro
+    ports:
+      - "127.0.0.1:2223:2222"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2222"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
 volumes:
   vault-data:
   dex-data:

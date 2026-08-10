@@ -304,6 +304,15 @@ type registryLayer struct {
 	APIEnabled  *uint32
 	APIUnixPath string
 
+	// SSH: the certificate_authorities list and insecure_ignore_host_key flag
+	// are admin-owned policy, so — like every other config section — they
+	// round-trip through this registry loader, .reg, and YAML alike. The
+	// remotes themselves are deliberately excluded: they live only in the
+	// user-level ssh.yaml (see config.SSHConfig), because that file is
+	// user-writable and must never be treated as policy.
+	SSHCertificateAuthorities []string
+	SSHInsecureIgnoreHostKey  *uint32
+
 	// RemoteConfig (scalar fields; the Headers map is read separately by
 	// readRegistryRemoteConfigHeaders).
 	RemoteConfigURL             string
@@ -453,6 +462,17 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		defer apik.Close()
 		layer.APIEnabled = readRegDWORD(apik, "Enabled")
 		layer.APIUnixPath, _ = readRegString(apik, "UnixPath")
+	}
+
+	// Read SSH subkey (host-CA trust material).
+	sshk, err := registry.OpenKey(root, registryPolicyPath+`\SSH`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open SSH policy key: %w", err)
+	}
+	if err == nil {
+		defer sshk.Close()
+		layer.SSHCertificateAuthorities = readRegMultiString(sshk, "CertificateAuthorities")
+		layer.SSHInsecureIgnoreHostKey = readRegDWORD(sshk, "InsecureIgnoreHostKey")
 	}
 
 	// Read RemoteConfig subkey (scalar fields only; Headers is a nested
@@ -615,6 +635,14 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.APIUnixPath != "" {
 		cfg.API.Unix.Path = layer.APIUnixPath
+	}
+	// Present (non-nil), not non-empty, gates the merge — same rationale as
+	// VaultPolicies above.
+	if layer.SSHCertificateAuthorities != nil {
+		cfg.SSH.CertificateAuthorities = layer.SSHCertificateAuthorities
+	}
+	if layer.SSHInsecureIgnoreHostKey != nil {
+		cfg.SSH.InsecureIgnoreHostKey = *layer.SSHInsecureIgnoreHostKey != 0
 	}
 	if layer.RemoteConfigURL != "" {
 		cfg.RemoteConfig.URL = layer.RemoteConfigURL

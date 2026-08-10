@@ -709,3 +709,64 @@ body {
   letter-spacing: 0.5px;
   margin-bottom: 6px;
 }
+
+/* SSH remote-forwards page (reuses .config-page/.config-container/.enrol-*
+   for layout and buttons; these are only the parts that don't fit) */
+.ssh-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ssh-table th {
+  text-align: left;
+  font-weight: 600;
+  color: #666;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e0e0e0;
+}
+.ssh-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #ececec;
+  vertical-align: middle;
+}
+.ssh-table code {
+  background: #f0f0f0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 12px;
+}
+
+.ssh-pill {
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 12px;
+  background: #eceef1;
+  color: #4a5568;
+  white-space: nowrap;
+}
+.ssh-pill-ok { background: #d1fae5; color: #065f46; }
+.ssh-pill-info { background: #dbeafe; color: #1e40af; }
+.ssh-pill-err { background: #fee2e2; color: #991b1b; }
+.ssh-pill-muted { background: #f3f4f6; color: #6b7280; }
+
+.ssh-error-text { color: #c0392b; font-size: 12px; }
+.ssh-row-confirm { display: flex; gap: 6px; }
+
+.ssh-add-form { display: flex; flex-direction: column; gap: 4px; max-width: 360px; }
+
+/* The confirmation fingerprint: the one key-derived value this page ever
+   shows a user (the 409 body carries no host_key, only this). */
+.ssh-fingerprint {
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 13px;
+  background: #fff;
+  border: 1px solid #fed7aa;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  word-break: break-all;
+}

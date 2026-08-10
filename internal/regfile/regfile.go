@@ -50,6 +50,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeRemoteConfig(cfg.RemoteConfig)
 	e.writeAgent(cfg.Agent)
 	e.writeAPI(cfg.API)
+	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
 
@@ -337,6 +338,29 @@ func (e *emitter) writeAPI(a config.APIConfig) {
 	e.writeKey(rootKey + `\API`)
 	e.writeBool("Enabled", a.Enabled)
 	e.writeString("UnixPath", a.Unix.Path)
+	e.WriteString("\r\n")
+}
+
+// writeSSH emits the admin-owned SSH host-CA trust material. The remotes
+// list is deliberately absent — it lives in the user-level ssh.yaml, which
+// has no registry surface because it must never act as policy.
+//
+// InsecureIgnoreHostKey is always emitted (even false) so a re-import can
+// clear a previously-set downgrade rather than leaving it stuck. The key is
+// pre-deleted before recreation, matching the Rules/Enrolments/Agent\Keys
+// idempotency pattern, so a CertificateAuthorities list cleared at the
+// source round-trips as absent rather than lingering in the registry.
+func (e *emitter) writeSSH(s config.SSHConfig) {
+	sshKey := rootKey + `\SSH`
+	e.writeKeyDeletion(sshKey)
+	e.writeKey(sshKey)
+	e.writeBool("InsecureIgnoreHostKey", s.InsecureIgnoreHostKey)
+	// Emit whenever non-nil so an explicit empty list round-trips as an
+	// empty REG_MULTI_SZ rather than being silently dropped, matching the
+	// Vault Policies / OAuth Scopes treatment.
+	if s.CertificateAuthorities != nil {
+		e.writeMultiString("CertificateAuthorities", s.CertificateAuthorities)
+	}
 	e.WriteString("\r\n")
 }
 

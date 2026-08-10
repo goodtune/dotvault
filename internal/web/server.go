@@ -25,6 +25,7 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -148,6 +149,24 @@ type Server struct {
 	// so only one write runs at a time.
 	clipboardMu sync.Mutex
 
+	// sshMu guards sshRegistry and sshStatus, mirroring rulesMu: the daemon
+	// wires the managed-SSH-forward subsystem in after NewServer returns —
+	// it needs an authenticated Vault client to resolve the agent's SSH
+	// identities, so it is only built once the daemon's first auth succeeds
+	// — concurrently with requests already being served (a web-enabled
+	// daemon starts routes before authentication completes, so it can serve
+	// the login page).
+	sshMu sync.RWMutex
+	// sshRegistry is the single service layer through which the SSH CRUD
+	// endpoints mutate ssh.yaml. Nil when managed forwards are not
+	// configured, in which case the four handlers return 503 rather than
+	// panic. Guarded by sshMu; read through sshRegistrySnapshot.
+	sshRegistry *sshfwd.Registry
+	// sshStatus, when non-nil, reports the live condition of every managed
+	// remote for /api/v1/status's "ssh" block. Guarded by sshMu; read
+	// through sshStatusSnapshot.
+	sshStatus func() []sshfwd.RemoteStatus
+
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
 	// a borrowing client is told "not authenticated" rather than handed a
@@ -224,6 +243,13 @@ type ServerConfig struct {
 	// endpoint writes to this host's clipboard (tests inject a fake). Nil
 	// selects the real clipboard.Set.
 	SetClipboard clipboard.Setter
+	// SSHRegistry, when non-nil, backs the /api/v1/ssh/remotes CRUD
+	// endpoints. Nil (managed forwards not configured) makes those
+	// endpoints return 503.
+	SSHRegistry *sshfwd.Registry
+	// SSHStatus, when non-nil, reports the live condition of every managed
+	// remote for /api/v1/status's "ssh" block.
+	SSHStatus func() []sshfwd.RemoteStatus
 }
 
 // NewServer creates a new web server.
@@ -285,6 +311,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		openBrowser:        sc.OpenBrowser,
 		sendNotification:   sc.SendNotification,
 		setClipboard:       sc.SetClipboard,
+		sshRegistry:        sc.SSHRegistry,
+		sshStatus:          sc.SSHStatus,
 	}
 	if s.openBrowser == nil {
 		s.openBrowser = browser.OpenURL
@@ -410,6 +438,14 @@ func (s *Server) registerAPIRoutes() {
 	s.mux.HandleFunc("POST /api/v1/remote/notify", s.handleRemoteNotify)
 	// Third peer action, same posture again (see handleRemoteClipboard).
 	s.mux.HandleFunc("POST /api/v1/remote/clipboard", s.handleRemoteClipboard)
+
+	// Managed SSH forward CRUD — ordinary CSRF protection, not the
+	// peer-action Origin-check exemption above (see ssh.go's header
+	// comment for why).
+	s.mux.HandleFunc("GET /api/v1/ssh/remotes", s.handleSSHList)
+	s.mux.HandleFunc("POST /api/v1/ssh/remotes", s.requireCSRF(s.handleSSHAdd))
+	s.mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", s.requireCSRF(s.handleSSHPatch))
+	s.mux.HandleFunc("DELETE /api/v1/ssh/remotes/{host}", s.requireCSRF(s.handleSSHDelete))
 }
 
 // Start begins serving HTTP on every configured listener. It signals
@@ -620,6 +656,37 @@ func (s *Server) SetReauthGate(g interface{ NeedsReauth() bool }) {
 func (s *Server) needsReauth() bool {
 	h, ok := s.reauthGate.Load().(reauthGateHolder)
 	return ok && h.gate != nil && h.gate.NeedsReauth()
+}
+
+// SetSSHRegistry wires the managed-SSH-forward Registry and live-status
+// query in after construction, once the daemon has built them (which
+// requires an authenticated Vault client — see the daemon's startup
+// sequencing). Guarded by sshMu because the server may already be serving
+// requests (a socket/web-enabled daemon starts routes before authentication
+// completes, so it can serve the login page) concurrently with this call.
+func (s *Server) SetSSHRegistry(reg *sshfwd.Registry, status func() []sshfwd.RemoteStatus) {
+	s.sshMu.Lock()
+	defer s.sshMu.Unlock()
+	s.sshRegistry = reg
+	s.sshStatus = status
+}
+
+// sshRegistrySnapshot returns the currently wired SSH registry, or nil if
+// none is configured. Handlers must read through this rather than the raw
+// field, which SetSSHRegistry can mutate concurrently.
+func (s *Server) sshRegistrySnapshot() *sshfwd.Registry {
+	s.sshMu.RLock()
+	defer s.sshMu.RUnlock()
+	return s.sshRegistry
+}
+
+// sshStatusSnapshot returns the currently wired SSH status query, or nil if
+// none is configured. Handlers must read through this rather than the raw
+// field, which SetSSHRegistry can mutate concurrently.
+func (s *Server) sshStatusSnapshot() func() []sshfwd.RemoteStatus {
+	s.sshMu.RLock()
+	defer s.sshMu.RUnlock()
+	return s.sshStatus
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {

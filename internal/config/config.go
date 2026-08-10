@@ -108,6 +108,7 @@ type Config struct {
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	API           APIConfig            `yaml:"api,omitempty"`
+	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
@@ -592,6 +593,38 @@ type APIUnixConfig struct {
 	// at daemon-start time (see paths.DefaultAPISocket). A leading ~ is
 	// expanded, as it is for vault.token_socket.
 	Path string `yaml:"path"`
+}
+
+// SSHConfig holds the admin-owned trust material for daemon-managed SSH
+// forwards. The remotes themselves are deliberately *not* here: they live in
+// the user-level ssh.yaml (see paths.SSHConfigPath), which has no registry
+// surface because it is user-writable and must never act as policy.
+//
+// The inner fields omit `omitempty` for the same round-trip reason as
+// AgentConfig: an exported config must re-emit cleared optional values so a
+// re-import can blank a previously-set list. The top-level SSH field keeps
+// `omitempty` so operators who do not use managed forwards see no empty block.
+//
+// The daemon applies a config-refresh-loop change to this section without a
+// restart (see cmd/dotvault's updateSSHPolicyConfig), but only on a remote's
+// *next* connection attempt: an already-established forward keeps using the
+// HostKeyPolicy it dialled with. Removing a CA, or turning
+// InsecureIgnoreHostKey back off, does not retroactively drop or re-verify a
+// forward that is already connected — it only takes effect on the next
+// reconnect.
+type SSHConfig struct {
+	// CertificateAuthorities lists trusted SSH host CAs in known_hosts
+	// @cert-authority form. A host whose certificate one of these signed
+	// needs no per-host pin in ssh.yaml.
+	CertificateAuthorities []string `yaml:"certificate_authorities"`
+
+	// InsecureIgnoreHostKey disables host-key verification entirely.
+	//
+	// It lives in the system config rather than the user's ssh.yaml because
+	// it is a security downgrade; on a personal machine the user is the admin
+	// anyway. Every connection attempt made under it logs a WARN naming the
+	// host, so it cannot be set once and forgotten silently.
+	InsecureIgnoreHostKey bool `yaml:"insecure_ignore_host_key"`
 }
 
 // AgentUnixConfig holds the Unix-domain-socket transport settings.

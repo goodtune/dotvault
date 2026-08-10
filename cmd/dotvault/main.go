@@ -32,6 +32,7 @@ import (
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
@@ -128,6 +129,7 @@ but driven by dotvault's loaded configuration (YAML or Group Policy).`,
 		newBrowseCmd(),
 		newNotifyCmd(),
 		newClipboardCmd(),
+		newSSHCmd(),
 		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),
@@ -383,6 +385,16 @@ type refreshDeps struct {
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
+	// sshRegistry is set only when the managed-SSH-forward subsystem is
+	// running (see startSSHForwards). Nil whenever the daemon started
+	// without it — agent.enabled false, or neither a local API socket nor
+	// the web UI configured — in which case the loop skips both the
+	// ssh.yaml resync and the SSH-config-section dynamic update below. The
+	// loop calls Registry.Resync rather than sshfwd.Load + Manager.Reconcile
+	// directly, so ssh.yaml's read-reconcile pair is always serialised
+	// against a concurrent Registry.Add/Patch/Remove under the same lock —
+	// see Resync's doc comment.
+	sshRegistry *sshfwd.Registry
 }
 
 // staticSections snapshots the config sections the daemon cannot apply
@@ -549,6 +561,7 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastInterval := d.initial.Sync.Interval
 	lastCadence := d.interval
 	lastStatic := d.initialStatic
+	lastSSH := d.initial.SSH
 
 	refresh := func() {
 		reloaded, err := d.load()
@@ -606,6 +619,34 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 			changed = true
 			ticker.Reset(cadence)
 			lastCadence = cadence
+		}
+
+		// The managed-SSH-forward subsystem, when running, applies two
+		// independent things on every pass: the ssh.yaml remotes list (a
+		// hand-edit, or an API mutation that raced this tick) and the
+		// admin-owned SSH config section (CAs, insecure flag), which is
+		// dynamic — see TestStaticSectionsCoverConfig — and reaches every
+		// future connection attempt via updateSSHPolicyConfig's atomic
+		// value rather than anything captured at startup.
+		//
+		// The ssh.yaml side goes through Registry.Resync, not a direct
+		// sshfwd.Load + Manager.Reconcile: Resync takes the same write lock
+		// Add/Patch/Remove hold across their own Load->Save->Reconcile, so a
+		// concurrent API mutation can never be raced and then reverted by
+		// this tick reconciling a file read before the mutation's Save. The
+		// SSH-config-section update below does go through the Manager's
+		// (well, the package-level atomic's) own synchronisation, since it
+		// touches no file.
+		if d.sshRegistry != nil {
+			if !reflect.DeepEqual(reloaded.SSH, lastSSH) {
+				changed = true
+				slog.Info("ssh config section changed, applying to future connection attempts")
+				updateSSHPolicyConfig(reloaded.SSH)
+				lastSSH = reloaded.SSH
+			}
+			if err := d.sshRegistry.Resync(ctx); err != nil {
+				slog.Warn("failed to resync managed SSH forwards from ssh.yaml", "error", err)
+			}
 		}
 
 		// Static sections can't be applied in place, so a change is a
@@ -1134,6 +1175,27 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
+	// Build and start the managed-SSH-forward subsystem now that we hold a
+	// Vault token: its SSH identity (the agent backend's Signers) may need
+	// to mint a Vault-CA certificate or read a KV-stored key, either of
+	// which requires an authenticated Vault client. Deferred to this point
+	// rather than constructed alongside agentSvc above so a remote's first
+	// connection attempt never races startup and lands in the 5-minute
+	// auth-failure backoff floor over what would otherwise resolve within
+	// seconds. Neither precondition (agent.enabled, a local API surface) is
+	// fatal — see startSSHForwards.
+	var sshBackend sshfwd.SignerSource
+	if agentSvc != nil {
+		sshBackend = agentSvc.Backend
+	}
+	sshManager, sshRegistry, _ := startSSHForwards(ctx, cfg, sshBackend, username)
+	if sshManager != nil {
+		defer sshManager.Close()
+		if webServer != nil {
+			webServer.SetSSHRegistry(sshRegistry, sshManager.Status)
+		}
+	}
+
 	// Watch the token file for replacement and nudge the lifecycle
 	// manager to re-read it immediately. This is the in-process
 	// analogue of the old systemd `.path` unit (which SIGHUP'd the
@@ -1327,6 +1389,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		watchManager:   wm,
 		web:            webServer,
 		enrolManager:   enrolMgr,
+		sshRegistry:    sshRegistry,
 	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)

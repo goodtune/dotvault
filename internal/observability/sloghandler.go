@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 )
@@ -109,7 +110,7 @@ func (h *otelSlogHandler) emit(ctx context.Context, record slog.Record) {
 
 	var rec otellog.Record
 	rec.SetTimestamp(record.Time)
-	rec.SetBody(otellog.StringValue(record.Message))
+	rec.SetBody(attribute.StringValue(record.Message))
 	rec.SetSeverity(sev)
 	rec.SetSeverityText(sevText)
 
@@ -155,46 +156,46 @@ func addOTelAttr(rec *otellog.Record, prefix string, a slog.Attr) {
 	if a.Equal(slog.Attr{}) {
 		return
 	}
-	rec.AddAttributes(otellog.KeyValue{Key: prefix + a.Key, Value: slogValueToOTel(a.Value)})
+	rec.AddAttributes(attribute.KeyValue{Key: attribute.Key(prefix + a.Key), Value: slogValueToOTel(a.Value)})
 }
 
 // slogValueToOTel converts a resolved slog.Value into the equivalent
-// OTel log.Value. Kinds with no direct OTel counterpart (Duration, Time)
+// OTel attribute.Value. Kinds with no direct OTel counterpart (Duration, Time)
 // are rendered as their canonical string form rather than a numeric
 // encoding, matching what slog's own text/JSON handlers print.
-func slogValueToOTel(v slog.Value) otellog.Value {
+func slogValueToOTel(v slog.Value) attribute.Value {
 	switch v.Kind() {
 	case slog.KindBool:
-		return otellog.BoolValue(v.Bool())
+		return attribute.BoolValue(v.Bool())
 	case slog.KindDuration:
-		return otellog.StringValue(v.Duration().String())
+		return attribute.StringValue(v.Duration().String())
 	case slog.KindFloat64:
-		return otellog.Float64Value(v.Float64())
+		return attribute.Float64Value(v.Float64())
 	case slog.KindInt64:
-		return otellog.Int64Value(v.Int64())
+		return attribute.Int64Value(v.Int64())
 	case slog.KindString:
-		return otellog.StringValue(v.String())
+		return attribute.StringValue(v.String())
 	case slog.KindTime:
-		return otellog.StringValue(v.Time().Format(time.RFC3339Nano))
+		return attribute.StringValue(v.Time().Format(time.RFC3339Nano))
 	case slog.KindUint64:
 		u := v.Uint64()
 		if u <= math.MaxInt64 {
-			return otellog.Int64Value(int64(u))
+			return attribute.Int64Value(int64(u))
 		}
-		return otellog.StringValue(strconv.FormatUint(u, 10))
+		return attribute.StringValue(strconv.FormatUint(u, 10))
 	case slog.KindGroup:
 		group := v.Group()
-		kvs := make([]otellog.KeyValue, 0, len(group))
+		kvs := make([]attribute.KeyValue, 0, len(group))
 		for _, a := range group {
 			a.Value = a.Value.Resolve()
 			if a.Equal(slog.Attr{}) {
 				continue
 			}
-			kvs = append(kvs, otellog.KeyValue{Key: a.Key, Value: slogValueToOTel(a.Value)})
+			kvs = append(kvs, attribute.KeyValue{Key: attribute.Key(a.Key), Value: slogValueToOTel(a.Value)})
 		}
-		return otellog.MapValue(kvs...)
+		return attribute.MapValue(kvs...)
 	default:
-		return otellog.StringValue(anyToString(v.Any()))
+		return attribute.StringValue(anyToString(v.Any()))
 	}
 }
 

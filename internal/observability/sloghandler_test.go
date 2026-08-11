@@ -5,8 +5,10 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"reflect"
 	"testing"
 
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 	otelnoop "go.opentelemetry.io/otel/log/noop"
@@ -15,11 +17,11 @@ import (
 
 // findAttr returns the value for key in rec's attributes, failing the
 // test if the key is absent.
-func findAttr(t *testing.T, rec sdklog.Record, key string) otellog.Value {
+func findAttr(t *testing.T, rec sdklog.Record, key string) attribute.Value {
 	t.Helper()
-	var found *otellog.Value
-	rec.WalkAttributes(func(kv otellog.KeyValue) bool {
-		if kv.Key == key {
+	var found *attribute.Value
+	rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+		if string(kv.Key) == key {
 			v := kv.Value
 			found = &v
 			return false
@@ -219,14 +221,14 @@ func TestSlogValueToOTelUint64Overflow(t *testing.T) {
 	const big uint64 = math.MaxInt64 + 1 // 9223372036854775808
 
 	got := slogValueToOTel(slog.Uint64Value(big))
-	if got.Kind() != otellog.KindString {
-		t.Fatalf("kind = %v, want KindString", got.Kind())
+	if got.Type() != attribute.STRING {
+		t.Fatalf("kind = %v, want STRING", got.Type())
 	}
 	if want := "9223372036854775808"; got.AsString() != want {
 		t.Errorf("value = %q, want %q", got.AsString(), want)
 	}
 
-	if got := slogValueToOTel(slog.Uint64Value(math.MaxInt64)); got.Kind() != otellog.KindInt64 || got.AsInt64() != math.MaxInt64 {
+	if got := slogValueToOTel(slog.Uint64Value(math.MaxInt64)); got.Type() != attribute.INT64 || got.AsInt64() != math.MaxInt64 {
 		t.Errorf("in-range uint64 = %v, want Int64Value(%d)", got, int64(math.MaxInt64))
 	}
 }
@@ -252,24 +254,24 @@ func TestSlogHandlerRecordLevelGroup(t *testing.T) {
 		t.Fatalf("got %d records, want 1", len(records))
 	}
 	got := findAttr(t, records[0], "rule")
-	if got.Kind() != otellog.KindMap {
-		t.Fatalf("rule attr kind = %v, want KindMap", got.Kind())
+	if got.Type() != attribute.MAP {
+		t.Fatalf("rule attr kind = %v, want MAP", got.Type())
 	}
 	kvs := got.AsMap()
-	want := map[string]otellog.Value{
-		"name":    otellog.StringValue("gh-token"),
-		"version": otellog.Int64Value(3),
+	want := map[string]attribute.Value{
+		"name":    attribute.StringValue("gh-token"),
+		"version": attribute.Int64Value(3),
 	}
 	if len(kvs) != len(want) {
 		t.Fatalf("got %d nested keys, want %d", len(kvs), len(want))
 	}
 	for _, kv := range kvs {
-		wv, ok := want[kv.Key]
+		wv, ok := want[string(kv.Key)]
 		if !ok {
 			t.Errorf("unexpected nested key %q", kv.Key)
 			continue
 		}
-		if !kv.Value.Equal(wv) {
+		if !reflect.DeepEqual(kv.Value, wv) {
 			t.Errorf("nested key %q = %v, want %v", kv.Key, kv.Value, wv)
 		}
 	}

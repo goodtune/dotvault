@@ -333,7 +333,7 @@ func TestLogRegistryConfigManagedReachesActiveProvider(t *testing.T) {
 		t.Errorf("body = %q", body)
 	}
 	var foundPath bool
-	r.WalkAttributes(func(kv log.KeyValue) bool {
+	r.WalkAttributes(func(kv attribute.KeyValue) bool {
 		if kv.Key == "path" {
 			foundPath = true
 			if got := kv.Value.AsString(); got != path {

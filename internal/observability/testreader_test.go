@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -103,10 +103,10 @@ func newTestLogProcessor(t *testing.T) *recordingLogProcessor {
 
 // bodyString returns the record's body as a Go string, asserting the
 // stored Value is a string kind. Test-only helper.
-func bodyString(t *testing.T, v log.Value) string {
+func bodyString(t *testing.T, v attribute.Value) string {
 	t.Helper()
-	if v.Kind() != log.KindString {
-		t.Fatalf("body kind = %v, want String", v.Kind())
+	if v.Type() != attribute.STRING {
+		t.Fatalf("body kind = %v, want String", v.Type())
 	}
 	return v.AsString()
 }

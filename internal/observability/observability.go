@@ -1082,7 +1082,7 @@ func LogRegistryConfigManaged(ctx context.Context, path string) {
 	rec.SetTimestamp(time.Now())
 	rec.SetSeverity(log.SeverityWarn)
 	rec.SetSeverityText("WARN")
-	rec.SetBody(log.StringValue("configuration loaded from Windows Registry (Group Policy); file-based config is ignored"))
-	rec.AddAttributes(log.String("path", path))
+	rec.SetBody(attribute.StringValue("configuration loaded from Windows Registry (Group Policy); file-based config is ignored"))
+	rec.AddAttributes(attribute.String("path", path))
 	l.Emit(ctx, rec)
 }

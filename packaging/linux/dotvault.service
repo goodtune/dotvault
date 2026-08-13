@@ -2,6 +2,11 @@
 Description=dotvault — Vault-to-file secret synchronisation daemon
 Documentation=https://github.com/goodtune/dotvault
 
+# Per-user daemon: authenticates to Vault as the OS user, reads
+# ~/.dotvault-token from that user's $HOME, and syncs into
+# kv/users/<username>/. As root it would do all three as root.
+ConditionUser=!root
+
 [Service]
 Type=notify
 NotifyAccess=main

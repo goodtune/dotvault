@@ -112,7 +112,7 @@ Or use [Group Policy](windows-gpo.md) to manage configuration centrally via the 
 
     Behavioural change to be aware of: services declaring `After=dotvault.service` now block until dotvault completes its initial sync (the packaged unit uses `Type=notify` and delays `READY=1` until secrets are on disk). The previous hand-rolled unit had no readiness gate, so dependents started in parallel. If a dependent's startup ordering matters to you, this is the change to plan for.
 
-The RPM, DEB, and APK packages all ship a `dotvault.service` **user unit** (a `Type=notify` service with `WatchdogSec=120` and the OpenTelemetry-friendly logging settings) at the canonical `/usr/lib/systemd/user/` path. dotvault is a per-user daemon — it authenticates to Vault with the OS user's identity and writes secrets into that user's `$HOME` — so installing it as a system service that runs as root would write to root's `$HOME` and authenticate to Vault as root, which is almost never what you want.
+The RPM, DEB, and APK packages all ship a `dotvault.service` **user unit** (a `Type=notify` service with `WatchdogSec=120` and the OpenTelemetry-friendly logging settings) at the canonical `/usr/lib/systemd/user/` path. dotvault is a per-user daemon — it authenticates to Vault with the OS user's identity and writes secrets into that user's `$HOME` — so installing it as a system service that runs as root would write to root's `$HOME` and authenticate to Vault as root, which is almost never what you want. The unit carries `ConditionUser=!root`, so a root start is skipped rather than run — `systemctl status` names the failed condition.
 
 Enable per-user once the package is installed:
 

@@ -14,10 +14,15 @@ import (
 // real, over the network, and proves every precondition ServeForward will
 // later need — a working credential, an acceptable host key or certificate,
 // a resolvable remote socket path, and permission to bind it — then tears
-// the connection down again without leaving anything running or mutating
-// anything on the remote. `dotvault ssh add` runs this before Registry.Add
-// ever touches ssh.yaml, so a host that cannot actually be forwarded to
-// never gets persisted as if it could.
+// the connection down again without leaving anything running on the remote.
+// `dotvault ssh add` runs this before Registry.Add ever touches ssh.yaml, so
+// a host that cannot actually be forwarded to never gets persisted as if it
+// could.
+//
+// It makes exactly one durable change on the remote, and only one:
+// ensureRemoteSocketDir creates the socket's parent directory, mkdir -p
+// style. See Verify for why that mutation is in scope where the stale-socket
+// reclaim's is not.
 type liveVerifier struct {
 	deps Deps
 }
@@ -31,9 +36,23 @@ func NewVerifier(d Deps) Verifier {
 
 // Verify dials r, checks its host key or certificate against the policy d.Policy
 // returns for it, and — once connected — resolves and, unless
-// opts.SkipBindProof is set, bind-tests the remote socket. Nothing about the
-// connection survives the call: the client is always closed before Verify
-// returns, on every path.
+// opts.SkipBindProof is set, creates the socket's parent directory and
+// bind-tests the remote socket. Nothing about the connection survives the
+// call: the client is always closed before Verify returns, on every path.
+//
+// Creating the parent directory is a real mutation on a host nothing has yet
+// been persisted about, so it is worth saying why it belongs here when the
+// stale-socket reclaim (below) deliberately does not. Verify's job is to
+// prove the forward will work, and the default remote_socket lives under
+// ~/.ssh — a directory a freshly provisioned account need not have — so a
+// Verify that refused to create it would fail on precisely the out-of-the-box
+// configuration, and `ssh add` would reject hosts that are in fact perfectly
+// forwardable. The two mutations are not comparable in kind either: mkdir -p
+// only ever adds a directory the forward itself requires and leaves an
+// existing one, and its mode, alone, whereas the reclaim path rm -f's a file
+// on the strength of an inference about whether someone else is using it.
+// The first is convergent and destroys nothing; the second can destroy
+// another session's socket if the inference is wrong.
 func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	if v.deps.Signers == nil || v.deps.User == nil || v.deps.Policy == nil {
 		// Verify doesn't need Target/TargetName (it never relays anything),
@@ -154,6 +173,10 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) 
 	// it must never delete a file on that host on the strength of one failed
 	// bind. A plain bind failure here is reported as an error and the
 	// caller tries again once whatever is occupying the path is resolved.
+	if err := ensureRemoteSocketDir(ctx, cl, resolved); err != nil {
+		return VerifyResult{}, err
+	}
+
 	ln, err := cl.ListenUnix(resolved)
 	if err != nil {
 		// A bind failure here is not necessarily "this host can never be

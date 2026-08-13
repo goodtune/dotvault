@@ -28,6 +28,14 @@ var recordSSHForwardFailure = observability.RecordSSHForwardFailure
 // parent directory, or a stale socket left by a crashed session.
 var ErrBind = errors.New("bind remote socket failed")
 
+// ErrSocketDir marks a failure to create the remote socket's parent
+// directory. Kept distinct from ErrBind because the two need different
+// answers from a human: ErrBind's causes are sshd policy or something
+// already occupying the path, whereas this one is a directory that could not
+// be created — an unwritable home, a read-only filesystem, or a path
+// component that exists as a non-directory.
+var ErrSocketDir = errors.New("create remote socket directory failed")
+
 // Dialer opens a connection to the local API surface the forward targets.
 type Dialer func(ctx context.Context) (net.Conn, error)
 
@@ -45,7 +53,15 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // whether the path is actually safe to reclaim — see its doc for the full
 // rule, which is more subtle than "dial it and see" — and only when it says
 // yes is the path unlinked, at most once, with one retry.
+//
+// The socket's parent directory is created first (see ensureRemoteSocketDir):
+// the default remote_socket lives under ~/.ssh, which a fresh remote account
+// need not have, and sshd cannot bind into a directory that does not exist.
 func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(delta int)) error {
+	if err := ensureRemoteSocketDir(ctx, cl, socket); err != nil {
+		return err
+	}
+
 	ln, err := cl.ListenUnix(socket)
 	if err != nil {
 		bindErr := err
@@ -375,6 +391,62 @@ func Pump(a, b net.Conn) {
 
 	a.Close()
 	b.Close()
+}
+
+// ensureRemoteSocketDir creates the parent directory of remotePath on the
+// remote, over an exec channel, before anything tries to bind there. sshd's
+// bind() cannot create the directory itself, and the *default* remote_socket
+// (~/.ssh/dotvault.sock) sits in a directory a freshly provisioned account
+// need not have — so without this the out-of-the-box configuration fails, and
+// fails misleadingly: ServeForward's bind-failure path reads any failure as a
+// possibly-stale socket and reports a stale-socket cleanup error for what is
+// simply an absent directory.
+//
+// The parent is derived with path.Dir, not filepath.Dir: remotePath names a
+// location on the remote, which is POSIX regardless of the OS this daemon
+// runs on, so a Windows daemon must not split it on backslashes. remotePath
+// has already been through ExpandRemotePath, so it is absolute and any "~/"
+// prefix is gone.
+//
+// mkdir -p is deliberately the whole operation. It succeeds when the
+// directory already exists, which is the required behaviour on every run
+// after the first, and it creates missing intermediate components. The mode
+// is only ever applied to directories mkdir itself creates — POSIX defines
+// -m as applying to the final directory operand as created, and mkdir -p
+// short-circuits before that when the operand already exists — so a user's
+// deliberate permissions on an existing ~/.ssh are left untouched. 0700 is
+// the right mode to *create* it with: that directory conventionally holds
+// private keys, so anything wider would be poor hygiene, and a socket
+// dotvault forwards Vault tokens over does not want a group- or
+// world-traversable parent either.
+func ensureRemoteSocketDir(ctx context.Context, cl *ssh.Client, remotePath string) error {
+	dir := path.Dir(remotePath)
+	if dir == "" || dir == "." || dir == "/" {
+		// Nothing to create: a relative or root-level path has no parent this
+		// call could meaningfully make.
+		return nil
+	}
+
+	sess, err := cl.NewSession()
+	if err != nil {
+		return fmt.Errorf("%w: %s: open session: %w", ErrSocketDir, dir, err)
+	}
+	defer sess.Close()
+
+	cmd := "mkdir -p -m 700 -- " + shellQuote(dir)
+
+	done := make(chan error, 1)
+	go func() { done <- sess.Run(cmd) }()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("%w: %s: %w", ErrSocketDir, dir, err)
+		}
+		return nil
+	}
 }
 
 // removeRemoteFile unlinks path on the remote over an exec channel, guarded

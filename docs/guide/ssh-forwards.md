@@ -84,6 +84,8 @@ remotes:
 
 A leading `~/` in `remote_socket` is expanded **at connect time** against the remote account's home (probed once per connection via `echo $HOME` on an exec channel), not at `add` time — so the entry stays portable if the remote account's home ever moves. `~user/`-style paths are rejected at validation, as is any path that is neither absolute nor `~/`-prefixed.
 
+The socket's parent directory is created on the remote before the first bind, with `mkdir -p` semantics — `sshd` cannot create it as part of binding, and the default `~/.ssh` need not exist on a freshly provisioned account. A directory dotvault creates is created `0700`, since it holds a socket carrying Vault tokens (and, by default, is `~/.ssh`); a directory that already exists is left exactly as it is, permissions included. `dotvault ssh add` does the same thing, deliberately — it verifies by really binding the socket, so refusing to create the directory would make it reject hosts that are in fact perfectly forwardable. This is the only change `ssh add` makes on a remote it has not yet been told to manage.
+
 The file is written atomically at `0600` inside a `0700` directory, and unrecognised top-level keys are preserved across a rewrite so a future dotvault version's fields aren't silently dropped by an older one editing the same file. Hand-editing `ssh.yaml` is fully supported — the daemon picks up changes on the next config-refresh tick — but the daemon (via `Registry`) is the only writer dotvault itself uses; there's no lock to coordinate a second one.
 
 ## Host-key trust

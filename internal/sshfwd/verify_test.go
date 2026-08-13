@@ -380,17 +380,18 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 // TestVerifierReturnsErrBindOnBindFailure proves the ListenUnix failure path
 // wraps ErrBind, and that Verify does not attempt to work around the
 // failure by any means other than reporting it — the fake sshd here also
-// counts "exec" requests, so this doubles as a contract-5 regression test
+// records the "exec" commands it serves, so this doubles as a contract-5
+// regression test
 // for the common case where the bind-failure diagnostic's own dial is
 // rejected outright (not the ConnectionFailed shape —
 // TestVerifierBindFailureDiagnosticNeverMutatesRemote below covers that one
 // specifically, since it used to reach a mutating fallback).
 func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
-	var execCount atomic.Int64
+	var execLog execRecorder
 	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
 		home:                     "/home/test",
 		refuseStreamlocalForward: true,
-		sawExec:                  &execCount,
+		sawExec:                  &execLog,
 	})
 	// Pinned so the dial itself succeeds and Verify reaches the bind step —
 	// this test is about ListenUnix's failure, not the host-key path.
@@ -406,8 +407,8 @@ func TestVerifierReturnsErrBindOnBindFailure(t *testing.T) {
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
-	if execCount.Load() != 1 {
-		t.Errorf("saw %d exec requests after a bind failure, want exactly 1 (the $HOME probe); a stale-socket unlink must never run here", execCount.Load())
+	if rm := execLog.matching("rm "); len(rm) != 0 {
+		t.Errorf("ran %q after a bind failure; a stale-socket unlink must never run here", rm)
 	}
 }
 
@@ -468,7 +469,7 @@ func TestVerifierSkipsBindProofWhenRequested(t *testing.T) {
 // something on the real path. Only then does directStreamLocalWorks reach
 // its own cleanup and attempt the rm -f this test asserts never happens.
 func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
-	var execCount atomic.Int64
+	var execLog execRecorder
 	var directCalls int32
 	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
 		home: "/home/test",
@@ -476,7 +477,7 @@ func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
 		// bind directStreamLocalWorks issues must succeed — see
 		// refuseStreamlocalForward's doc comment.
 		refuseStreamlocalForward: true,
-		sawExec:                  &execCount,
+		sawExec:                  &execLog,
 		onDirectStreamLocal: func(newCh ssh.NewChannel) {
 			if atomic.AddInt32(&directCalls, 1) == 1 {
 				// liveListenerAt's own real-path probe: ambiguous rejection,
@@ -509,7 +510,68 @@ func TestVerifierBindFailureDiagnosticNeverMutatesRemote(t *testing.T) {
 	if !errors.Is(err, ErrBind) {
 		t.Fatalf("Verify() = (%+v, %v), want an error wrapping ErrBind", result, err)
 	}
-	if execCount.Load() != 1 {
-		t.Errorf("saw %d exec requests after a ConnectionFailed bind diagnostic, want exactly 1 (the $HOME probe); the old liveListenerAt fallback would bind a scratch socket and rm -f it here", execCount.Load())
+	if rm := execLog.matching("rm "); len(rm) != 0 {
+		t.Errorf("ran %q after a ConnectionFailed bind diagnostic; the old liveListenerAt fallback would bind a scratch socket and rm -f it here", rm)
+	}
+}
+
+// TestVerifierCreatesRemoteSocketDir covers the missing-parent-directory bug:
+// the default remote_socket lives under ~/.ssh, which a freshly provisioned
+// remote account need not have, and sshd cannot bind into a directory that
+// does not exist. Verify must create it — the one mutation liveVerifier's
+// doc comment now admits to — using the *resolved* path's parent, at 0700,
+// and with mkdir -p so an account that already has the directory is left
+// exactly as it was.
+func TestVerifierCreatesRemoteSocketDir(t *testing.T) {
+	var execLog execRecorder
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		home:    "/home/test",
+		sawExec: &execLog,
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	if _, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket}, VerifyOptions{}); err != nil {
+		t.Fatalf("Verify() = %v, want success", err)
+	}
+
+	mkdirs := execLog.matching("mkdir")
+	if len(mkdirs) != 1 {
+		t.Fatalf("mkdir commands = %q, want exactly one", mkdirs)
+	}
+	if want := "mkdir -p -m 700 -- '/home/test/.ssh'"; mkdirs[0] != want {
+		t.Errorf("mkdir command = %q, want %q", mkdirs[0], want)
+	}
+}
+
+// TestVerifierSkipsBindProofRunsNoMkdir pins the other half of that
+// decision: SkipBindProof means the daemon already holds a live forward on
+// this path, so the directory demonstrably exists and Verify has no reason
+// to touch the remote at all beyond the $HOME probe.
+func TestVerifierSkipsBindProofRunsNoMkdir(t *testing.T) {
+	var execLog execRecorder
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		home:    "/home/test",
+		sawExec: &execLog,
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	if _, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: DefaultRemoteSocket},
+		VerifyOptions{SkipBindProof: true}); err != nil {
+		t.Fatalf("Verify(SkipBindProof) = %v, want success", err)
+	}
+	if mkdirs := execLog.matching("mkdir"); len(mkdirs) != 0 {
+		t.Errorf("ran %q under SkipBindProof; nothing is being bound, so nothing needs creating", mkdirs)
 	}
 }

@@ -728,3 +728,105 @@ func TestVerifyReturnsFingerprintForUnknownHost(t *testing.T) {
 		t.Errorf("%s was created despite an unconfirmed host key", sshYAML)
 	}
 }
+
+// TestForwardCreatesMissingSocketDirectory covers the reported bug: a
+// remote_socket whose parent directory does not exist on the remote. This is
+// the *default* configuration's failure mode — remote_socket defaults to
+// ~/.ssh/dotvault.sock and a freshly provisioned account need not have a
+// ~/.ssh at all — and sshd cannot create the directory as part of binding, so
+// the streamlocal-forward request simply fails. Worse, it fails misleadingly:
+// ServeForward reads any bind failure as a possibly-stale socket and reports
+// a stale-socket cleanup error for what is only an absent directory.
+//
+// The missing directory is a nested path of the test's own making rather than
+// the real ~/.ssh: the suite installs its authorized_keys into /config/.ssh at
+// runtime (ensureAuthorizedKey), so removing that directory to create the
+// condition would break authentication and this would end up testing the
+// wrong failure entirely.
+func TestForwardCreatesMissingSocketDirectory(t *testing.T) {
+	skipIfNoSSHD(t, sshdAddr)
+	ensureAuthorizedKey(t, sshdContainer)
+
+	const body = "hello through a directory that did not exist"
+	targetSocket := newUnixTarget(t, body)
+
+	cl := dialSSHD(t, 2222)
+	defer cl.Close()
+
+	// Two levels deep, so this also proves the intermediate component is
+	// created and not just the leaf.
+	base := fmt.Sprintf("/config/dv-missing-%s", randSuffix(t))
+	socket := base + "/nested/dv-test.sock"
+	t.Cleanup(func() { dockerExecOutput(sshdContainer, "rm", "-rf", base) })
+
+	if _, err := dockerExecOutput(sshdContainer, "test", "-e", base); err == nil {
+		t.Fatalf("%s already exists on %s; this test requires it to be absent", base, sshdContainer)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sshfwd.ServeForward(ctx, cl, "test-host", socket, dialUnix(targetSocket), nil)
+	}()
+
+	waitForRemoteSocket(t, sshdContainer, socket)
+	curlUntil(t, sshdContainer, socket, body, 5*time.Second)
+
+	// The directory dotvault created holds a socket carrying Vault tokens and,
+	// in the default configuration, is ~/.ssh — so it must be created 0700,
+	// not left to the remote account's umask.
+	if mode, err := dockerExecOutput(sshdContainer, "stat", "-c", "%a", base+"/nested"); err != nil || mode != "700" {
+		t.Errorf("created directory mode = %q (err %v), want 700", mode, err)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ServeForward returned %v after cancel, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeForward did not return after context cancellation")
+	}
+}
+
+// TestVerifyCreatesMissingSocketDirectory is the `ssh add` half of the same
+// bug. Verify bind-tests the remote socket to prove the forward will work, so
+// it hits the missing directory exactly as ServeForward does — and a Verify
+// that refused to create it would reject hosts that are in fact perfectly
+// forwardable, on precisely the default configuration. Creating it is the one
+// mutation Verify makes on the remote (see liveVerifier's doc comment); this
+// pins that it happens and that the verification then succeeds.
+func TestVerifyCreatesMissingSocketDirectory(t *testing.T) {
+	skipIfNoSSHD(t, sshdAddr)
+	ensureAuthorizedKey(t, sshdContainer)
+
+	deps := sshfwd.Deps{
+		Signers: func() ([]ssh.Signer, error) { return []ssh.Signer{testSigner(t)}, nil },
+		User:    func() (string, error) { return sshdUser, nil },
+		Policy:  insecurePolicy,
+	}
+	v := sshfwd.NewVerifier(deps)
+
+	base := fmt.Sprintf("/config/dv-missing-%s", randSuffix(t))
+	t.Cleanup(func() { dockerExecOutput(sshdContainer, "rm", "-rf", base) })
+
+	remote := sshfwd.Remote{Host: "127.0.0.1", Port: 2222, RemoteSocket: base + "/nested/dv-test.sock"}
+	result, err := v.Verify(context.Background(), remote, sshfwd.VerifyOptions{})
+	if err != nil {
+		t.Fatalf("Verify() = %v, want success against a socket path whose parent does not exist", err)
+	}
+	// Verified is deliberately not asserted: this suite's policy is the
+	// insecure one, under which nothing about the host key is actually
+	// checked and VerifyResult.Verified is false by contract. What matters
+	// here is that the bind proof itself succeeded, which the nil error above
+	// and the resolved socket below establish.
+	if result.ResolvedSocket != remote.RemoteSocket {
+		t.Errorf("ResolvedSocket = %q, want %q", result.ResolvedSocket, remote.RemoteSocket)
+	}
+	if mode, err := dockerExecOutput(sshdContainer, "stat", "-c", "%a", base+"/nested"); err != nil || mode != "700" {
+		t.Errorf("created directory mode = %q (err %v), want 700", mode, err)
+	}
+}

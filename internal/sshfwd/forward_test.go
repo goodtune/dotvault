@@ -448,3 +448,58 @@ func TestPumpClosesBothEndsFullyOnRealSockets(t *testing.T) {
 		t.Errorf("s2.Read after Pump returned = %v, want net.ErrClosed", err)
 	}
 }
+
+// TestServeForwardCreatesSocketDir covers the missing-parent-directory bug at
+// the forward itself: the default remote_socket lives under ~/.ssh, which a
+// freshly provisioned remote account need not have. sshd cannot create it as
+// part of binding, so ServeForward must, before the first bind — and it must
+// not be conditional on a bind failure, since a bind failure is
+// indistinguishable from the stale-socket case ServeForward's retry path
+// exists for.
+func TestServeForwardCreatesSocketDir(t *testing.T) {
+	var execLog execRecorder
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{
+		home:    "/home/test",
+		sawExec: &execLog,
+	})
+
+	cl, err := Dial(context.Background(), DialConfig{
+		Host:    host,
+		Port:    port,
+		User:    "test",
+		Signers: fakeSigners(t),
+		HostKey: &HostKeyPolicy{Insecure: true},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer cl.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeForward(ctx, cl, "test-host", "/home/test/.ssh/dotvault.sock", nil, nil)
+	}()
+
+	waitFor(t, func() bool { return len(execLog.matching("mkdir")) == 1 })
+	cancel()
+	<-done
+
+	mkdirs := execLog.matching("mkdir")
+	if want := "mkdir -p -m 700 -- '/home/test/.ssh'"; mkdirs[0] != want {
+		t.Errorf("mkdir command = %q, want %q", mkdirs[0], want)
+	}
+}
+
+// waitFor polls cond until it holds or the test times out.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition never held within 5s")
+}

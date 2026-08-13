@@ -4,7 +4,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
-	"sync/atomic"
+	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -48,13 +49,48 @@ type fakeSSHDConfig struct {
 	// observed and asserted on.
 	refuseStreamlocalForward bool
 
-	// sawExec is incremented, if non-nil, for every "exec" request this
-	// connection serves — used to assert that a caller's flow never runs a
-	// remote command it has no business running (e.g. Verify's contract 5:
-	// no stale-socket rm -f on a bind failure). It is atomic because the
-	// increment happens on a server goroutine and the assertion on the test
-	// goroutine.
-	sawExec *atomic.Int64
+	// sawExec records, if non-nil, the command line of every "exec" request
+	// this connection serves — used to assert that a caller's flow never
+	// runs a remote command it has no business running (e.g. Verify's
+	// contract 5: no stale-socket rm -f on a bind failure). It records the
+	// commands rather than only counting them because a bare count cannot
+	// tell a command that is meant to run from one that is not: the count
+	// changes whenever a legitimate command is added to a flow, forcing the
+	// assertion to be relaxed and quietly weakening the guard it exists to
+	// be.
+	sawExec *execRecorder
+}
+
+// execRecorder collects the exec command lines a fake sshd connection
+// serves. Guarded by a mutex because the recording happens on a server
+// goroutine and the assertions on the test goroutine.
+type execRecorder struct {
+	mu   sync.Mutex
+	cmds []string
+}
+
+func (r *execRecorder) record(cmd string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cmds = append(r.cmds, cmd)
+}
+
+// commands returns a copy of what has been recorded so far.
+func (r *execRecorder) commands() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.cmds...)
+}
+
+// matching returns the recorded commands containing substr.
+func (r *execRecorder) matching(substr string) []string {
+	var out []string
+	for _, cmd := range r.commands() {
+		if strings.Contains(cmd, substr) {
+			out = append(out, cmd)
+		}
+	}
+	return out
 }
 
 // serveFakeSSHDConn serves one accepted connection as an in-memory sshd
@@ -129,7 +165,13 @@ func serveFakeSSHDConn(conn net.Conn, cfg fakeSSHDConfig) {
 				for r := range chReqs {
 					if r.Type == "exec" {
 						if cfg.sawExec != nil {
-							cfg.sawExec.Add(1)
+							var payload struct{ Command string }
+							// A malformed payload is recorded as "" rather
+							// than dropped: an exec that went unrecorded
+							// would be invisible to exactly the assertions
+							// this recorder exists for.
+							_ = ssh.Unmarshal(r.Payload, &payload)
+							cfg.sawExec.record(payload.Command)
 						}
 						if r.WantReply {
 							r.Reply(true, nil)

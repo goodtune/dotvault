@@ -36,6 +36,23 @@
 // host.name while the instrument rules forbid the same values as
 // labels.
 //
+// Cardinality is only half of the rule those values used to fall under,
+// though, and the other half is not waived by being on the resource: the
+// scrubbing discipline the slog handlers follow is about *disclosure*,
+// and user.name plainly crosses it — the OS account name and the machine
+// FQDN leave the host on every export, to whatever collector the operator
+// configured, third-party SaaS included. That trade was made
+// deliberately. dotvault is a per-user daemon, so the account it runs as
+// is the identity of the emitting process; attributing a series to a user
+// is the whole point of the attribute, and a fleet view without it cannot
+// answer "whose daemon is failing". The mitigations are that the operator
+// chooses the destination, that observability is off by default (Init
+// returns early when disabled, so nothing is emitted and no resolver call
+// is made), and that the exposure is the deployment's own identity rather
+// than any secret material — never a Vault path, key, or credential.
+// A deployment that cannot accept that disclosure turns observability off;
+// there is no per-attribute opt-out today.
+//
 //   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
 //     reauth_required, failed, completed, denied, …}) so the
 //     exported series stay bounded. See the per-instrument
@@ -352,6 +369,17 @@ var hostNameLookupTimeout = 2 * time.Second
 // 127.0.0.1, whose PTR is "localhost". Both failure shapes would replace
 // a correct short name with a wrong qualified one, which is worse than
 // not qualifying at all.
+//
+// Note what the answer is trusted for: the CNAME is chosen by whatever
+// resolver the host is pointed at, so a hostile or compromised one picks
+// the host.name every exported metric and log record carries. That is
+// attribution spoofing at the collector, not compromise of this process —
+// nothing is executed, connected to, or authorised on the strength of the
+// name. The guards below (must be qualified, must not be a localhost
+// alias) reject accidents, not deliberate answers, and are not intended
+// to. Treat host.name as discovered, not attested: a collector that needs
+// authenticated attribution must get it from the transport (mTLS, a
+// per-host token), not from a resource attribute.
 var (
 	lookupCNAME     = net.DefaultResolver.LookupCNAME
 	osHostname      = os.Hostname

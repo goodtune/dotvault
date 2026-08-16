@@ -351,6 +351,20 @@ observability:
       x-api-key: "logs-token"
 ```
 
+### Resource attributes
+
+Every exported metric **and** every exported log record carries the same OTel resource, because the MeterProvider and the LoggerProvider share one. It identifies the emitting daemon: `service.name` (always `dotvault`), `service.version`, `user.name`, `host.name`, `os.type`, `host.arch`, and the `process.runtime.*` pair. These are process constants, so they add no time series — a backend that surfaces `target_info` (Prometheus, for instance) exposes them as one info series per daemon.
+
+!!! warning "`user.name` and `host.name` leave the host"
+    `user.name` is the OS account the daemon runs as (`paths.Username()`, `DOMAIN\` prefix stripped) and `host.name` is this machine's fully-qualified name. Both are sent to whichever collector you configure, a third-party SaaS included. dotvault is a per-user daemon, so attributing a series to a user is the point of the attribute — a fleet view cannot otherwise answer "whose daemon is failing" — but it is a genuine disclosure of who is running the software and where. **There is no per-attribute opt-out**: the control is `observability.enabled`, which is `false` by default. A disabled deployment emits nothing at all and, per the note below, makes no DNS call either. Neither attribute ever carries secret material — no Vault path, key, or credential. If the account name is itself sensitive in your environment, run the daemon under a non-identifying service account or leave observability off.
+
+`host.name` is resolved once at startup: `os.Hostname()`, and — only when that name has no dot — a single forward `LookupCNAME` to qualify it, the same mechanism `hostname -f` uses. **This is an outbound DNS query at daemon startup**, which matters on a locked-down or air-gapped network. It is bounded at two seconds and never fails startup: a resolver error, a timeout, an unqualified answer, or a `localhost.` alias all fall back to the short name, and an empty hostname omits the attribute entirely (as a failed user lookup omits `user.name`). No lookup happens when `os.Hostname()` is already qualified, and none happens at all when observability is disabled.
+
+!!! note "macOS often stays unqualified"
+    dotvault ships as a pure-Go `CGO_ENABLED=0` binary, so it uses Go's own resolver rather than the system one. On macOS that means `scutil`-managed search domains — the ones a VPN or corporate split-DNS profile installs — are not consulted, so `host.name` can stay the short name even where `hostname -f` in a shell returns the FQDN. The value is still correct, just less specific; treat `host.name` as possibly-short on macOS fleets.
+
+Treat `host.name` as discovered, not attested. The CNAME answer comes from whatever resolver the host is pointed at, so a hostile or compromised one chooses the name your collector attributes the data to. Nothing is executed or connected to on the strength of it, and the guards above reject accidents rather than deliberate answers — a collector that needs trustworthy attribution should take it from the transport (mTLS, a per-host token), not from a resource attribute.
+
 While the deprecated shared fields remain in play, a signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
 
 ## Remote config section

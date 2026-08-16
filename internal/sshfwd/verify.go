@@ -21,8 +21,8 @@ import (
 //
 // It makes exactly one durable change on the remote, and only one:
 // ensureRemoteSocketDir creates the socket's parent directory, mkdir -p
-// style. See Verify for why that mutation is in scope where the stale-socket
-// reclaim's is not.
+// style, best-effort. See Verify for why that mutation is in scope where the
+// stale-socket reclaim's is not.
 type liveVerifier struct {
 	deps Deps
 }
@@ -53,6 +53,11 @@ func NewVerifier(d Deps) Verifier {
 // on the strength of an inference about whether someone else is using it.
 // The first is convergent and destroys nothing; the second can destroy
 // another session's socket if the inference is wrong.
+//
+// Creating it is best-effort, exactly as in ServeForward: a remote that
+// permits streamlocal forwarding but not command execution verified fine
+// before dotvault ran any mkdir, so a mkdir failure only ever surfaces
+// folded into a subsequent bind failure, never on its own.
 func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) (VerifyResult, error) {
 	if v.deps.Signers == nil || v.deps.User == nil || v.deps.Policy == nil {
 		// Verify doesn't need Target/TargetName (it never relays anything),
@@ -173,9 +178,8 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) 
 	// it must never delete a file on that host on the strength of one failed
 	// bind. A plain bind failure here is reported as an error and the
 	// caller tries again once whatever is occupying the path is resolved.
-	if err := ensureRemoteSocketDir(ctx, cl, resolved); err != nil {
-		return VerifyResult{}, err
-	}
+	dirErr := ensureRemoteSocketDir(ctx, cl, resolved)
+	fail := withSocketDirCause(dirErr)
 
 	ln, err := cl.ListenUnix(resolved)
 	if err != nil {
@@ -199,11 +203,17 @@ func (v liveVerifier) Verify(ctx context.Context, r Remote, opts VerifyOptions) 
 		// apart.
 		if conn, dialErr := cl.DialContext(ctx, "unix", resolved); dialErr == nil {
 			conn.Close()
-			return VerifyResult{}, fmt.Errorf(
+			return VerifyResult{}, fail(fmt.Errorf(
 				"%w: %s: %w (something is already listening at this path — if this host is already managed by a running dotvault daemon, verification is expected to fail here; stop that forward first, or re-add with AddOptions.Force to skip verification)",
-				ErrBind, resolved, err)
+				ErrBind, resolved, err))
 		}
-		return VerifyResult{}, fmt.Errorf("%w: %s: %w (could not determine whether something is already listening there)", ErrBind, resolved, err)
+		return VerifyResult{}, fail(fmt.Errorf("%w: %s: %w (could not determine whether something is already listening there)", ErrBind, resolved, err))
+	}
+	if dirErr != nil {
+		// See ServeForward: the bind is the only thing the directory was
+		// needed for, and it worked.
+		slog.Debug("creating the remote socket's parent directory failed, but the verification bind succeeded anyway",
+			"host", r.Host, "socket", resolved, "error", dirErr)
 	}
 	if err := ln.Close(); err != nil {
 		// Not escalated to a hard failure: the dry run already proved the

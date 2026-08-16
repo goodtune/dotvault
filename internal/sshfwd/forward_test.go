@@ -5,10 +5,16 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 func TestPumpCopiesBothDirections(t *testing.T) {
@@ -488,6 +494,191 @@ func TestServeForwardCreatesSocketDir(t *testing.T) {
 	mkdirs := execLog.matching("mkdir")
 	if want := "mkdir -p -m 700 -- '/home/test/.ssh'"; mkdirs[0] != want {
 		t.Errorf("mkdir command = %q, want %q", mkdirs[0], want)
+	}
+}
+
+// dialFakeSSHD dials a fake sshd started by startFakeSSHD, with the host key
+// unchecked — every caller here is testing what happens after the connection
+// is up, not the trust decision.
+func dialFakeSSHD(t *testing.T, host string, port int) *ssh.Client {
+	t.Helper()
+	cl, err := Dial(context.Background(), DialConfig{
+		Host:    host,
+		Port:    port,
+		User:    "test",
+		Signers: fakeSigners(t),
+		HostKey: &HostKeyPolicy{Insecure: true},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { cl.Close() })
+	return cl
+}
+
+// TestServeForwardBindsWhenRemoteRefusesExec is the regression test for the
+// directory-creation fix's own worst failure mode. An absolute remote_socket
+// needs no exec channel at all — ExpandRemotePath only probes for a "~/"
+// prefix, deliberately, because an exec channel is a reason to fail on a host
+// that restricts commands — so a remote that permits streamlocal forwarding
+// but not command execution (an authorized_keys command= restriction,
+// ForceCommand, a restricted shell, a Windows OpenSSH account running
+// cmd.exe) forwarded perfectly well before the mkdir existed. Making the
+// mkdir mandatory would have broken every one of those hosts, including when
+// the directory was already there and the bind would have succeeded
+// untouched.
+func TestServeForwardBindsWhenRemoteRefusesExec(t *testing.T) {
+	var execLog, forwardLog execRecorder
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{
+		home:       "/home/test",
+		sawExec:    &execLog,
+		sawForward: &forwardLog,
+		onExec:     func(string) execOutcome { return execOutcome{reject: true} },
+	})
+	cl := dialFakeSSHD(t, host, port)
+
+	const socket = "/home/test/.ssh/dotvault.sock"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServeForward(ctx, cl, "test-host", socket, nil, nil) }()
+
+	// The bind is what proves the point: the forward is up despite the mkdir
+	// having been refused outright.
+	waitFor(t, func() bool { return len(forwardLog.matching(socket)) == 1 })
+	if mkdirs := execLog.matching("mkdir"); len(mkdirs) != 1 {
+		t.Errorf("mkdir attempts = %q, want exactly one (attempted, refused, and carried on)", mkdirs)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeForward = %v, want nil: the bind succeeded, so the refused mkdir is not a failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeForward did not return after cancellation")
+	}
+}
+
+// TestServeForwardReportsSocketDirCauseWhenBindFails is the other half of
+// that rule: a mkdir failure is not fatal on its own, but when the bind then
+// fails too it is very likely why, and it is the half a human can act on. So
+// it must be visible in the error, findable with errors.Is, and — since both
+// sentinels are present — must be what Classify reports.
+func TestServeForwardReportsSocketDirCauseWhenBindFails(t *testing.T) {
+	const stderrLine = "mkdir: cannot create directory '/home/test/.ssh': Read-only file system"
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{
+		home:                     "/home/test",
+		refuseStreamlocalForward: true,
+		onExec: func(cmd string) execOutcome {
+			if strings.Contains(cmd, "mkdir") {
+				return execOutcome{stderr: stderrLine + "\n", status: 1}
+			}
+			return execOutcome{stdout: "/home/test\n"}
+		},
+	})
+	cl := dialFakeSSHD(t, host, port)
+
+	err := ServeForward(context.Background(), cl, "test-host", "/home/test/.ssh/dotvault.sock", nil, nil)
+	if err == nil {
+		t.Fatal("ServeForward = nil, want an error: neither the mkdir nor the bind succeeded")
+	}
+	if !errors.Is(err, ErrSocketDir) {
+		t.Errorf("ServeForward error = %v, want it to wrap ErrSocketDir", err)
+	}
+	if !errors.Is(err, ErrBind) {
+		t.Errorf("ServeForward error = %v, want it to wrap ErrBind too", err)
+	}
+	if got := Classify(err); got != ClassSocketDir {
+		t.Errorf("Classify = %q, want %q: the directory is the actionable cause", got, ClassSocketDir)
+	}
+	// The remote said exactly why; an exit status alone would not have.
+	if !strings.Contains(err.Error(), "Read-only file system") {
+		t.Errorf("ServeForward error = %v, want the remote's stderr in the message", err)
+	}
+}
+
+// TestRemoteSocketDirCommandLeavesExistingDirectoryAlone checks it against a
+// real mkdir.
+func TestServeForwardSucceedsWhenSocketDirExists(t *testing.T) {
+	var execLog, forwardLog execRecorder
+	host, port, _ := startFakeSSHD(t, fakeSSHDConfig{
+		home:       "/home/test",
+		sawExec:    &execLog,
+		sawForward: &forwardLog,
+		onExec:     func(string) execOutcome { return execOutcome{} },
+	})
+	cl := dialFakeSSHD(t, host, port)
+
+	const socket = "/home/test/.ssh/dotvault.sock"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServeForward(ctx, cl, "test-host", socket, nil, nil) }()
+
+	waitFor(t, func() bool { return len(forwardLog.matching(socket)) == 1 })
+	if mkdirs := execLog.matching("mkdir"); len(mkdirs) != 1 {
+		t.Errorf("mkdir attempts = %q, want exactly one", mkdirs)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeForward = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeForward did not return after cancellation")
+	}
+}
+
+// TestRemoteSocketDirCommandLeavesExistingDirectoryAlone runs the exact
+// command ensureRemoteSocketDir sends, through a real shell and a real mkdir,
+// against a directory that already exists with a deliberately wider mode. The
+// remote is POSIX and the command is the whole of what dotvault controls, so
+// this is where the two claims made about it are actually checked: -p makes
+// an existing directory a success rather than EEXIST, and -m applies only to
+// a directory mkdir itself creates, so a user's permissions on an existing
+// ~/.ssh survive.
+//
+// Skipped where there is no POSIX shell to run it in — the assertion is about
+// the remote's mkdir, not the daemon's OS, and a Windows *daemon* talking to
+// a POSIX remote is precisely why the path is built with path.Dir.
+func TestRemoteSocketDirCommandLeavesExistingDirectoryAlone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell and mkdir")
+	}
+
+	base := t.TempDir()
+	existing := filepath.Join(base, "existing")
+	if err := os.Mkdir(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(dir string) {
+		t.Helper()
+		out, err := exec.Command("/bin/sh", "-c", remoteSocketDirCommand(dir)).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s = %v (%s), want success", remoteSocketDirCommand(dir), err, out)
+		}
+	}
+
+	run(existing)
+	info, err := os.Stat(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("existing directory mode = %04o after the command, want 0755 unchanged", got)
+	}
+
+	created := filepath.Join(base, "created")
+	run(created)
+	info, err = os.Stat(created)
+	if err != nil {
+		t.Fatalf("directory was not created: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("created directory mode = %04o, want 0700", got)
 	}
 }
 

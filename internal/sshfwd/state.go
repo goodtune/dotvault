@@ -37,6 +37,7 @@ const (
 	ClassAuth        ErrorClass = "authentication"
 	ClassHostKey     ErrorClass = "host-key"
 	ClassBind        ErrorClass = "remote-socket-bind"
+	ClassSocketDir   ErrorClass = "remote-socket-dir"
 	ClassHomeProbe   ErrorClass = "home-probe"
 	ClassConfig      ErrorClass = "config"
 	ClassOther       ErrorClass = "other"
@@ -79,6 +80,14 @@ func Classify(err error) ErrorClass {
 		return ClassUnreachable
 	case errors.Is(err, ErrAuth):
 		return ClassAuth
+	case errors.Is(err, ErrSocketDir):
+		// Checked ahead of ErrBind: a socket-dir failure only ever reaches a
+		// caller folded into a bind failure (see withSocketDirCause,
+		// forward.go), so both sentinels are present and the order here is
+		// what decides which one is reported. The directory is the one a
+		// human can act on — an unwritable home or a path component that is a
+		// file — where "bind failed" merely restates the symptom.
+		return ClassSocketDir
 	case errors.Is(err, ErrBind):
 		return ClassBind
 	case errors.Is(err, ErrHandshake):

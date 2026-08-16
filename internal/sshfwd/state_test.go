@@ -28,6 +28,13 @@ func TestClassify(t *testing.T) {
 		{"refused", fmt.Errorf("dial tcp: %w", errConnRefusedStub), ClassRefused},
 		{"auth", fmt.Errorf("wrap: %w", ErrAuth), ClassAuth},
 		{"bind", fmt.Errorf("wrap: %w", ErrBind), ClassBind},
+		{"socket dir", fmt.Errorf("wrap: %w", ErrSocketDir), ClassSocketDir},
+		// The shape withSocketDirCause actually produces (forward.go): both
+		// sentinels present, because a socket-dir failure only ever surfaces
+		// folded into the bind failure it caused. The socket-dir cause must
+		// win — it is the one a human can act on, where "bind failed" merely
+		// restates the symptom.
+		{"socket dir folded into bind", fmt.Errorf("%w: %w", ErrBind, ErrSocketDir), ClassSocketDir},
 		{"handshake", fmt.Errorf("wrap: %w", ErrHandshake), ClassHandshake},
 		{"other", errors.New("something else"), ClassOther},
 	}

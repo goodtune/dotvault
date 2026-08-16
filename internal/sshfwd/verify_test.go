@@ -575,3 +575,67 @@ func TestVerifierSkipsBindProofRunsNoMkdir(t *testing.T) {
 		t.Errorf("ran %q under SkipBindProof; nothing is being bound, so nothing needs creating", mkdirs)
 	}
 }
+
+// TestVerifierVerifiesWhenRemoteRefusesExec is Verify's half of the
+// best-effort rule (see TestServeForwardBindsWhenRemoteRefusesExec for the
+// reasoning): an absolute remote_socket needs no exec channel, so a host that
+// permits streamlocal forwarding but not command execution verified fine
+// before the mkdir existed. Verify must still bind-prove it and report
+// success, not reject a host that is in fact perfectly forwardable.
+func TestVerifierVerifiesWhenRemoteRefusesExec(t *testing.T) {
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		onExec: func(string) execOutcome { return execOutcome{reject: true} },
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	// An absolute path: ExpandRemotePath never probes for one, so the refused
+	// exec is only ever the mkdir.
+	const socket = "/run/user/1000/dotvault/api.sock"
+	result, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: socket}, VerifyOptions{})
+	if err != nil {
+		t.Fatalf("Verify() = %v, want success: the bind proof passed, so a refused mkdir is not a failure", err)
+	}
+	if result.ResolvedSocket != socket {
+		t.Errorf("ResolvedSocket = %q, want %q", result.ResolvedSocket, socket)
+	}
+}
+
+// TestVerifierReportsSocketDirCauseWhenBindFails mirrors
+// TestServeForwardReportsSocketDirCauseWhenBindFails on the `ssh add` path:
+// when both the mkdir and the bind fail, `ssh add` must tell the user about
+// the directory, not just that the bind failed.
+func TestVerifierReportsSocketDirCauseWhenBindFails(t *testing.T) {
+	host, port, signer := startFakeSSHD(t, fakeSSHDConfig{
+		refuseStreamlocalForward: true,
+		onExec: func(string) execOutcome {
+			return execOutcome{stderr: "mkdir: cannot create directory '/run/nope': Permission denied\n", status: 1}
+		},
+	})
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	v := NewVerifier(Deps{
+		Signers: func() ([]ssh.Signer, error) { return fakeSigners(t), nil },
+		User:    func() (string, error) { return "test", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{Pinned: pin} },
+	})
+
+	_, err := v.Verify(context.Background(), Remote{Host: host, Port: port, RemoteSocket: "/run/nope/dv.sock"}, VerifyOptions{})
+	if !errors.Is(err, ErrSocketDir) {
+		t.Errorf("Verify() = %v, want it to wrap ErrSocketDir", err)
+	}
+	if !errors.Is(err, ErrBind) {
+		t.Errorf("Verify() = %v, want it to wrap ErrBind too", err)
+	}
+	if got := Classify(err); got != ClassSocketDir {
+		t.Errorf("Classify = %q, want %q", got, ClassSocketDir)
+	}
+	if err != nil && !strings.Contains(err.Error(), "Permission denied") {
+		t.Errorf("Verify() = %v, want the remote's stderr in the message", err)
+	}
+}

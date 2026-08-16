@@ -26,13 +26,39 @@
 // newTestLogProcessor) without also serialising through a sync.Once
 // or test-scoped lock.
 //
-// Attribute conventions:
+// Attribute conventions. The rules below are about *instrument*
+// attributes — the per-record labels passed to a Record* helper, which
+// multiply the exported time series. Resource attributes are a
+// different thing and are governed separately: a resource attribute is
+// one fixed value for the whole process, attached once to every metric
+// and log record, and adds no series at all. That is why the resource
+// built in Init legitimately carries user.name and a fully-qualified
+// host.name while the instrument rules forbid the same values as
+// labels.
+//
+// Cardinality is only half of the rule those values used to fall under,
+// though, and the other half is not waived by being on the resource: the
+// scrubbing discipline the slog handlers follow is about *disclosure*,
+// and user.name plainly crosses it — the OS account name and the machine
+// FQDN leave the host on every export, to whatever collector the operator
+// configured, third-party SaaS included. That trade was made
+// deliberately. dotvault is a per-user daemon, so the account it runs as
+// is the identity of the emitting process; attributing a series to a user
+// is the whole point of the attribute, and a fleet view without it cannot
+// answer "whose daemon is failing". The mitigations are that the operator
+// chooses the destination, that observability is off by default (Init
+// returns early when disabled, so nothing is emitted and no resolver call
+// is made), and that the exposure is the deployment's own identity rather
+// than any secret material — never a Vault path, key, or credential.
+// A deployment that cannot accept that disclosure turns observability off;
+// there is no per-attribute opt-out today.
+//
 //   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
 //     reauth_required, failed, completed, denied, …}) so the
 //     exported series stay bounded. See the per-instrument
 //     RecordXxx godoc for the exact set each instrument emits.
 //   - We never attach usernames, Vault paths, secret keys, repo URLs,
-//     or JFrog server hostnames to instruments — the same scrubbing
+//     or JFrog server hostnames to *instruments* — the same scrubbing
 //     discipline the slog handlers follow. The one deliberate exception is
 //     the `host` label on the SSH forward instruments (dotvault.ssh.*):
 //     unlike a JFrog server URL, it names an entry in the operator's own
@@ -40,6 +66,13 @@
 //     docs/superpowers/specs/2026-08-09-managed-ssh-forwards-design.md — so
 //     the cardinality bound holds for the same reason a Vault path's does
 //     not.
+//   - The identity attributes on the resource (service.name,
+//     service.version, user.name, host.name, os.type, host.arch, the
+//     process runtime pair) are process constants, so they identify the
+//     emitting daemon without inflating cardinality. They ride every
+//     exported metric *and* every exported log record, because the
+//     MeterProvider and the LoggerProvider share one resource — see
+//     buildResource.
 package observability
 
 import (
@@ -47,12 +80,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/paths"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
@@ -238,38 +273,7 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 		}
 	}
 
-	hostname, _ := os.Hostname()
-
-	// The supplementary resource is deliberately created with an empty
-	// schema URL rather than semconv.SchemaURL. resource.Merge errors with
-	// "conflicting Schema URL" when both operands carry a non-empty but
-	// differing schema, and resource.Default() tracks whichever semconv
-	// version the installed otel/sdk embeds — which advances independently
-	// of the semconv package this file imports. Hard-coding our schema here
-	// reintroduces that conflict on every SDK bump that moves the default
-	// schema (e.g. sdk v1.44.0 moved it to 1.41.0 while we import v1.40.0).
-	// Leaving it empty lets Merge adopt Default()'s schema, so the
-	// attribute keys stay canonical without coupling us to the SDK's
-	// semconv revision.
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			"",
-			semconv.ServiceName("dotvault"),
-			semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
-			semconv.HostName(hostname),
-			semconv.OSTypeKey.String(runtime.GOOS),
-			// Raw GOARCH coincides with semconv's host.arch well-known
-			// values for every target this project ships (amd64, arm64).
-			// They diverge on 32-bit targets (GOARCH "386"/"arm" vs
-			// semconv "x86"/"arm32") — host.arch is an open enum so raw
-			// values remain legal, but add a mapping here before ever
-			// shipping a 32-bit build.
-			semconv.HostArchKey.String(runtime.GOARCH),
-			semconv.ProcessRuntimeName("go"),
-			semconv.ProcessRuntimeVersion(runtime.Version()),
-		),
-	)
+	res, err := buildResource(ctx, cfg)
 	if err != nil {
 		// The built exporters are open — clean them up so the process
 		// isn't left with background dialers pointing at a collector for
@@ -336,6 +340,137 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 			return errors.Join(mErr, lErr)
 		},
 	}, nil
+}
+
+// hostNameLookupTimeout bounds the FQDN resolver call made once at Init.
+// The daemon's startup is behind this, so a laptop on a captive-portal
+// network with a black-holed resolver must not stall it: two seconds is
+// generous for a nameserver that is going to answer at all, and the
+// fallback (the short os.Hostname value) is perfectly usable.
+//
+// A var rather than a const purely so the timeout path can be tested
+// without a test that really sleeps for two seconds; production never
+// assigns it.
+var hostNameLookupTimeout = 2 * time.Second
+
+// Test seams. Package-level vars rather than parameters so the resource
+// stays buildable from cfg alone; tests swap them and restore with
+// t.Cleanup.
+//
+// lookupCNAME resolves the canonical name of a host. LookupCNAME is
+// chosen over the LookupIP+LookupAddr (PTR) route deliberately: it is a
+// single *forward* lookup, so it goes through the same search-domain
+// list the host already uses to resolve its own name — which is exactly
+// what qualifies a short hostname, and what `hostname -f` relies on.
+// The reverse route depends on a PTR record that DHCP-addressed laptops
+// and cloud instances frequently do not have, and when one does exist it
+// is often an ISP- or provider-generated name unrelated to the host's
+// identity; worse, a short name in /etc/hosts commonly resolves to
+// 127.0.0.1, whose PTR is "localhost". Both failure shapes would replace
+// a correct short name with a wrong qualified one, which is worse than
+// not qualifying at all.
+//
+// Note what the answer is trusted for: the CNAME is chosen by whatever
+// resolver the host is pointed at, so a hostile or compromised one picks
+// the host.name every exported metric and log record carries. That is
+// attribution spoofing at the collector, not compromise of this process —
+// nothing is executed, connected to, or authorised on the strength of the
+// name. The guards below (must be qualified, must not be a localhost
+// alias) reject accidents, not deliberate answers, and are not intended
+// to. Treat host.name as discovered, not attested: a collector that needs
+// authenticated attribution must get it from the transport (mTLS, a
+// per-host token), not from a resource attribute.
+var (
+	lookupCNAME     = net.DefaultResolver.LookupCNAME
+	osHostname      = os.Hostname
+	currentUsername = paths.Username
+)
+
+// resolveHostName returns the value for the host.name resource
+// attribute: the FQDN when one can be established, else whatever
+// os.Hostname reported.
+//
+// A name that already contains a dot is treated as qualified and
+// returned as-is — no lookup. Otherwise a single bounded LookupCNAME
+// runs; its result is accepted only if it is actually qualified (has a
+// dot) and is not a localhost alias, since a resolver that answers the
+// short name from /etc/hosts can return exactly that. Every other
+// outcome — resolver error, timeout, empty hostname, unqualified or
+// loopback answer — falls back to the short name. This never returns an
+// error: observability must not fail because DNS did not answer.
+func resolveHostName(ctx context.Context) string {
+	hostname, _ := osHostname()
+	if hostname == "" || strings.Contains(hostname, ".") {
+		return hostname
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, hostNameLookupTimeout)
+	defer cancel()
+
+	cname, err := lookupCNAME(lookupCtx, hostname)
+	if err != nil {
+		slog.Debug("could not qualify hostname for the host.name resource attribute; using the short name", "hostname", hostname, "error", err)
+		return hostname
+	}
+	cname = strings.TrimSuffix(cname, ".")
+	if !strings.Contains(cname, ".") || hasPrefixFold(cname, "localhost.") {
+		return hostname
+	}
+	return cname
+}
+
+// buildResource assembles the OTel resource shared by the MeterProvider
+// and the LoggerProvider, so every exported metric and log record
+// carries the same process identity.
+func buildResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName("dotvault"),
+		semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
+		semconv.OSTypeKey.String(runtime.GOOS),
+		// Raw GOARCH coincides with semconv's host.arch well-known
+		// values for every target this project ships (amd64, arm64).
+		// They diverge on 32-bit targets (GOARCH "386"/"arm" vs
+		// semconv "x86"/"arm32") — host.arch is an open enum so raw
+		// values remain legal, but add a mapping here before ever
+		// shipping a 32-bit build.
+		semconv.HostArchKey.String(runtime.GOARCH),
+		semconv.ProcessRuntimeName("go"),
+		semconv.ProcessRuntimeVersion(runtime.Version()),
+	}
+
+	// host.name is omitted rather than attached empty when os.Hostname
+	// reports nothing usable, symmetric with user.name below: an empty
+	// string is not a host identity, and a present-but-blank attribute is
+	// harder to reason about at the collector than an absent one.
+	if hostname := resolveHostName(ctx); hostname != "" {
+		attrs = append(attrs, semconv.HostName(hostname))
+	}
+
+	// user.name identifies which per-user daemon emitted a series — the
+	// unit dotvault is deployed as. Omitted rather than fatal when the
+	// OS lookup fails: observability is never allowed to stop the daemon
+	// starting, matching the ignored error on os.Hostname above.
+	if username, err := currentUsername(); err != nil {
+		slog.Debug("could not resolve the current user for the user.name resource attribute; omitting it", "error", err)
+	} else if username != "" {
+		attrs = append(attrs, semconv.UserName(username))
+	}
+
+	// The supplementary resource is deliberately created with an empty
+	// schema URL rather than semconv.SchemaURL. resource.Merge errors with
+	// "conflicting Schema URL" when both operands carry a non-empty but
+	// differing schema, and resource.Default() tracks whichever semconv
+	// version the installed otel/sdk embeds — which advances independently
+	// of the semconv package this file imports. Hard-coding our schema here
+	// reintroduces that conflict on every SDK bump that moves the default
+	// schema (e.g. sdk v1.44.0 moved it to 1.41.0 while we import v1.40.0).
+	// Leaving it empty lets Merge adopt Default()'s schema, so the
+	// attribute keys stay canonical without coupling us to the SDK's
+	// semconv revision.
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("", attrs...),
+	)
 }
 
 func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, error) {

@@ -367,6 +367,12 @@ func TestInitBuildsResource(t *testing.T) {
 
 	t.Cleanup(func() { setBuildVersion("") })
 
+	// Pin the host.name seams so this test never makes a real resolver
+	// call — buildResource qualifies the hostname during Init, and an
+	// unbounded-looking DNS round trip has no business in a unit test.
+	fakeHostname(t, "box")
+	fakeCNAME(t, func(_ context.Context, host string) (string, error) { return host + ".example.com.", nil })
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	p, err := Init(ctx, Config{

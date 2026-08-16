@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 // newTestReader installs a test-local MeterProvider backed by a
@@ -23,9 +24,20 @@ import (
 // `observabilitytest` subpackage rather than promoting it back into
 // the production tree.
 func newTestReader(t *testing.T) *sdkmetric.ManualReader {
+	return newTestReaderWithResource(t, nil)
+}
+
+// newTestReaderWithResource is newTestReader with an explicit resource
+// attached to the provider, so a Collect() observes exactly the
+// attributes the daemon would export. Pass nil for the SDK default.
+func newTestReaderWithResource(t *testing.T, res *resource.Resource) *sdkmetric.ManualReader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	opts := []sdkmetric.Option{sdkmetric.WithReader(reader)}
+	if res != nil {
+		opts = append(opts, sdkmetric.WithResource(res))
+	}
+	provider := sdkmetric.NewMeterProvider(opts...)
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(provider)
 	rebindInstruments()

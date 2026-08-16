@@ -55,9 +55,34 @@ func attrValue(t *testing.T, set attribute.Set, key string) (string, bool) {
 // cannot decide whether the qualifying path is exercised.
 func fakeHostname(t *testing.T, name string) {
 	t.Helper()
+	fakeHostnameErr(t, name, nil)
+}
+
+// fakeHostnameErr is fakeHostname for the cases that need os.Hostname to
+// report a failure — including the real-world shape where a name comes
+// back alongside a non-nil error.
+func fakeHostnameErr(t *testing.T, name string, err error) {
+	t.Helper()
 	prev := osHostname
-	osHostname = func() (string, error) { return name, nil }
+	osHostname = func() (string, error) { return name, err }
 	t.Cleanup(func() { osHostname = prev })
+}
+
+func fakeUsername(t *testing.T, name string, err error) {
+	t.Helper()
+	prev := currentUsername
+	currentUsername = func() (string, error) { return name, err }
+	t.Cleanup(func() { currentUsername = prev })
+}
+
+// shrinkLookupTimeout collapses the production FQDN-lookup bound so a
+// test exercising the timeout path finishes immediately instead of really
+// waiting two seconds per run. The seam is a var for this reason alone.
+func shrinkLookupTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := hostNameLookupTimeout
+	hostNameLookupTimeout = d
+	t.Cleanup(func() { hostNameLookupTimeout = prev })
 }
 
 func fakeCNAME(t *testing.T, fn func(context.Context, string) (string, error)) {
@@ -67,11 +92,13 @@ func fakeCNAME(t *testing.T, fn func(context.Context, string) (string, error)) {
 	t.Cleanup(func() { lookupCNAME = prev })
 }
 
+// TestResourceCarriesUserName pins the value to the currentUsername seam
+// via a sentinel, not to whatever paths.Username happens to return on the
+// test host — comparing against paths.Username() would pass just as well
+// if the production code read os.Getenv("USER") instead, so it would
+// prove presence without pinning provenance.
 func TestResourceCarriesUserName(t *testing.T) {
-	want, err := paths.Username()
-	if err != nil {
-		t.Skipf("paths.Username unavailable on this host: %v", err)
-	}
+	fakeUsername(t, "seam-user", nil)
 	fakeHostname(t, "box")
 	fakeCNAME(t, func(_ context.Context, host string) (string, error) { return host + ".example.com.", nil })
 
@@ -79,15 +106,30 @@ func TestResourceCarriesUserName(t *testing.T) {
 	if !ok {
 		t.Fatal("user.name absent from the exported resource")
 	}
+	if got != "seam-user" {
+		t.Errorf("user.name = %q, want the currentUsername seam's value %q", got, "seam-user")
+	}
+}
+
+// TestResourceUserNameIsPathsUsername is the companion wiring check: the
+// seam must default to paths.Username, which is the identity the
+// kv/users/<user>/… layout is built from.
+func TestResourceUserNameIsPathsUsername(t *testing.T) {
+	want, err := paths.Username()
+	if err != nil {
+		t.Skipf("paths.Username unavailable on this host: %v", err)
+	}
+	got, err := currentUsername()
+	if err != nil {
+		t.Fatalf("currentUsername: %v", err)
+	}
 	if got != want {
-		t.Errorf("user.name = %q, want %q (paths.Username)", got, want)
+		t.Errorf("currentUsername() = %q, want paths.Username() %q", got, want)
 	}
 }
 
 func TestResourceUserNameOmittedWhenLookupFails(t *testing.T) {
-	prev := currentUsername
-	currentUsername = func() (string, error) { return "", errors.New("no such user") }
-	t.Cleanup(func() { currentUsername = prev })
+	fakeUsername(t, "", errors.New("no such user"))
 	fakeHostname(t, "box")
 	fakeCNAME(t, func(_ context.Context, host string) (string, error) { return host + ".example.com.", nil })
 
@@ -159,17 +201,6 @@ func TestResolveHostNameFallbacks(t *testing.T) {
 			},
 		},
 		{
-			name: "timeout",
-			lookup: func(ctx context.Context, _ string) (string, error) {
-				// Outlive the bounded lookup: block until the derived
-				// context's deadline fires, then report it as the
-				// resolver would. If resolveHostName did not bound the
-				// call this would hang the test rather than fall back.
-				<-ctx.Done()
-				return "", ctx.Err()
-			},
-		},
-		{
 			name:   "unqualified answer",
 			lookup: func(_ context.Context, host string) (string, error) { return host + ".", nil },
 		},
@@ -188,15 +219,93 @@ func TestResolveHostNameFallbacks(t *testing.T) {
 			fakeHostname(t, "box")
 			fakeCNAME(t, tc.lookup)
 
-			start := time.Now()
-			got := resolveHostName(context.Background())
-			if got != "box" {
+			if got := resolveHostName(context.Background()); got != "box" {
 				t.Errorf("resolveHostName = %q, want the os.Hostname fallback %q", got, "box")
 			}
-			if elapsed := time.Since(start); elapsed > hostNameLookupTimeout+2*time.Second {
-				t.Errorf("resolveHostName took %s, want it bounded near %s", elapsed, hostNameLookupTimeout)
-			}
 		})
+	}
+}
+
+// TestResolveHostNameBoundsTheLookup covers the resolver that never
+// answers. The production two-second bound is shrunk to a few
+// milliseconds first — the assertion is that resolveHostName imposes
+// *its own* deadline (the caller's context here has none), and that
+// holds at any value, so there is no reason for the suite to sit out the
+// real one. The upper bound is deliberately tight, a small multiple of
+// the shrunk timeout rather than seconds of slack: with seconds of slack
+// the check could only ever fail by the test hanging, which the package
+// timeout would have caught anyway.
+func TestResolveHostNameBoundsTheLookup(t *testing.T) {
+	const bound = 20 * time.Millisecond
+	shrinkLookupTimeout(t, bound)
+	fakeHostname(t, "box")
+	fakeCNAME(t, func(ctx context.Context, _ string) (string, error) {
+		// Outlive the bounded lookup: block until the derived context's
+		// deadline fires, then report it as the resolver would.
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+
+	start := time.Now()
+	got := resolveHostName(context.Background())
+	elapsed := time.Since(start)
+
+	if got != "box" {
+		t.Errorf("resolveHostName = %q, want the os.Hostname fallback %q", got, "box")
+	}
+	if elapsed > 10*bound {
+		t.Errorf("resolveHostName took %s, want it bounded near %s", elapsed, bound)
+	}
+}
+
+// TestResolveHostNameEmptyHostname is the one path where the short-name
+// fallback is itself useless: os.Hostname reported nothing, so there is
+// no name to fall back to and no point asking a resolver about "".
+func TestResolveHostNameEmptyHostname(t *testing.T) {
+	fakeHostnameErr(t, "", errors.New("hostname unavailable"))
+	fakeCNAME(t, func(context.Context, string) (string, error) {
+		t.Error("lookupCNAME called for an empty hostname")
+		return "", errors.New("must not be called")
+	})
+
+	if got := resolveHostName(context.Background()); got != "" {
+		t.Errorf("resolveHostName = %q, want %q", got, "")
+	}
+}
+
+// TestResourceOmitsEmptyHostName is the collector-facing half: an empty
+// host.name must be left off the resource entirely, symmetric with
+// user.name, not attached as a blank string.
+func TestResourceOmitsEmptyHostName(t *testing.T) {
+	fakeHostnameErr(t, "", errors.New("hostname unavailable"))
+	fakeUsername(t, "seam-user", nil)
+
+	set := collectResourceAttrs(t)
+	if v, ok := attrValue(t, set, "host.name"); ok {
+		t.Errorf("host.name present as %q despite an empty hostname; want it omitted", v)
+	}
+	// The rest of the resource is intact — an absent hostname is not
+	// allowed to derail the build.
+	if v, ok := attrValue(t, set, "service.name"); !ok || v != "dotvault" {
+		t.Errorf("service.name = %q (present=%v), want \"dotvault\"", v, ok)
+	}
+	if v, ok := attrValue(t, set, "user.name"); !ok || v != "seam-user" {
+		t.Errorf("user.name = %q (present=%v), want %q", v, ok, "seam-user")
+	}
+}
+
+// TestResolveHostNameUsesNameDespiteError covers os.Hostname returning a
+// usable name alongside a non-nil error. The error is deliberately
+// ignored — the name is what the attribute needs, and a caller that has
+// one has nothing better to do with the error than drop it.
+func TestResolveHostNameUsesNameDespiteError(t *testing.T) {
+	fakeHostnameErr(t, "box", errors.New("partial failure"))
+	fakeCNAME(t, func(_ context.Context, host string) (string, error) {
+		return host + ".corp.example.com.", nil
+	})
+
+	if got := resolveHostName(context.Background()); got != "box.corp.example.com" {
+		t.Errorf("resolveHostName = %q, want %q", got, "box.corp.example.com")
 	}
 }
 

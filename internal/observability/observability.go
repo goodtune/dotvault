@@ -330,7 +330,11 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 // network with a black-holed resolver must not stall it: two seconds is
 // generous for a nameserver that is going to answer at all, and the
 // fallback (the short os.Hostname value) is perfectly usable.
-const hostNameLookupTimeout = 2 * time.Second
+//
+// A var rather than a const purely so the timeout path can be tested
+// without a test that really sleeps for two seconds; production never
+// assigns it.
+var hostNameLookupTimeout = 2 * time.Second
 
 // Test seams. Package-level vars rather than parameters so the resource
 // stays buildable from cfg alone; tests swap them and restore with
@@ -394,7 +398,6 @@ func buildResource(ctx context.Context, cfg Config) (*resource.Resource, error) 
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName("dotvault"),
 		semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
-		semconv.HostName(resolveHostName(ctx)),
 		semconv.OSTypeKey.String(runtime.GOOS),
 		// Raw GOARCH coincides with semconv's host.arch well-known
 		// values for every target this project ships (amd64, arm64).
@@ -405,6 +408,14 @@ func buildResource(ctx context.Context, cfg Config) (*resource.Resource, error) 
 		semconv.HostArchKey.String(runtime.GOARCH),
 		semconv.ProcessRuntimeName("go"),
 		semconv.ProcessRuntimeVersion(runtime.Version()),
+	}
+
+	// host.name is omitted rather than attached empty when os.Hostname
+	// reports nothing usable, symmetric with user.name below: an empty
+	// string is not a host identity, and a present-but-blank attribute is
+	// harder to reason about at the collector than an absent one.
+	if hostname := resolveHostName(ctx); hostname != "" {
+		attrs = append(attrs, semconv.HostName(hostname))
 	}
 
 	// user.name identifies which per-user daemon emitted a series — the

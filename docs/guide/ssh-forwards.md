@@ -84,8 +84,6 @@ remotes:
 
 A leading `~/` in `remote_socket` is expanded **at connect time** against the remote account's home (probed once per connection via `echo $HOME` on an exec channel), not at `add` time — so the entry stays portable if the remote account's home ever moves. `~user/`-style paths are rejected at validation, as is any path that is neither absolute nor `~/`-prefixed.
 
-The socket's parent directory is created on the remote before the first bind, with `mkdir -p` semantics — `sshd` cannot create it as part of binding, and the default `~/.ssh` need not exist on a freshly provisioned account. A directory dotvault creates is created `0700`, since it holds a socket carrying Vault tokens (and, by default, is `~/.ssh`); a directory that already exists is left exactly as it is, permissions included. `dotvault ssh add` does the same thing, deliberately — it verifies by really binding the socket, so refusing to create the directory would make it reject hosts that are in fact perfectly forwardable. This is the only change `ssh add` makes on a remote it has not yet been told to manage.
-
 The file is written atomically at `0600` inside a `0700` directory, and unrecognised top-level keys are preserved across a rewrite so a future dotvault version's fields aren't silently dropped by an older one editing the same file. Hand-editing `ssh.yaml` is fully supported — the daemon picks up changes on the next config-refresh tick — but the daemon (via `Registry`) is the only writer dotvault itself uses; there's no lock to coordinate a second one.
 
 ## Host-key trust
@@ -118,6 +116,14 @@ ssh:
 ```
 
 `insecure_ignore_host_key` (default `false`) disables host-key verification entirely — a security downgrade, which is exactly why it's admin-owned rather than something a user's `ssh.yaml` could flip. On a personal machine you're the admin anyway. It applies per connection attempt, so a change takes effect on the next reconnect with no daemon restart, and every single connection made under it **logs a WARN naming the host** — it can't be set once and quietly forgotten.
+
+## The remote socket's directory
+
+The socket's parent directory is created on the remote before the first bind, by running `mkdir -p -m 700` over an exec channel — `sshd` cannot create it as part of binding, and the default `~/.ssh` need not exist on a freshly provisioned account. A directory dotvault creates is created `0700`, since it holds a socket carrying Vault tokens (and, by default, is `~/.ssh`); a directory that already exists is left exactly as it is, permissions included. `dotvault ssh add` does the same thing, deliberately — it verifies by really binding the socket, so refusing to create the directory would make it reject hosts that are in fact perfectly forwardable. This is the only change `ssh add` makes on a remote it has not yet been told to manage.
+
+Creating it is **best-effort**: an absolute `remote_socket` needs no exec channel at all, so a remote that permits streamlocal forwarding but forbids command execution — an `authorized_keys` `command="…"` restriction, `ForceCommand`, a restricted shell, a Windows OpenSSH account whose shell is `cmd.exe` — keeps working exactly as it did. A `mkdir` that fails is retained, not raised: the bind is attempted regardless, and if the bind succeeds the forward is healthy and the failure is only a debug log. Only when the bind *also* fails is the `mkdir` failure reported, folded into the bind error as the likely root cause (with whatever the remote wrote to stderr), and the remote's error class is `remote-socket-dir` rather than `remote-socket-bind`.
+
+One caveat worth knowing if you nest the socket deeper than one directory: POSIX applies `-m` to the *final* operand only, so intermediate directories `-p` creates get the remote account's umask instead of `0700`. For the default `~/.ssh/dotvault.sock` there are no intermediates and the point is moot, but a `remote_socket` of, say, `~/a/b/dotvault.sock` can leave `~/a` group- or world-traversable. If that matters to you, create and mode the intermediate directories yourself; dotvault deliberately doesn't chmod path components it may not have created.
 
 ## Stale sockets
 

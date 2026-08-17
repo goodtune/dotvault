@@ -81,6 +81,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -521,7 +522,7 @@ func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, e
 			// than fed to WithEndpointURL, where its non-https scheme
 			// would silently select plaintext).
 			if hasHTTPScheme(sig.Endpoint) {
-				opts = append(opts, otlpmetrichttp.WithEndpointURL(sig.Endpoint))
+				opts = append(opts, otlpmetrichttp.WithEndpointURL(ensureSignalPath(sig.Endpoint, "/v1/metrics")))
 			} else {
 				opts = append(opts, otlpmetrichttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}
@@ -643,6 +644,7 @@ func hasPrefixFold(s, prefix string) bool {
 // prefix (not a URL scheme) that enables the DNS resolver for
 // multi-address service discovery / load balancing. Stripping it
 // would change the dial-target semantics and break those setups.
+
 func stripScheme(s string) string {
 	for _, prefix := range []string{"https://", "http://", "grpc://"} {
 		if hasPrefixFold(s, prefix) {
@@ -650,6 +652,30 @@ func stripScheme(s string) string {
 		}
 	}
 	return s
+}
+
+// ensureSignalPath upholds the documented endpoint contract on the
+// http/protobuf path: a full URL with an explicit path is used verbatim,
+// and a path-less URL gets the OTLP-standard signal path ("/v1/metrics" /
+// "/v1/logs") appended. Through OTel SDK v1.44 the exporter itself supplied
+// the default (WithEndpointURL left an empty URLPath for its cleanPath step
+// to fill in); v1.45 changed WithEndpointURL to pin a path-less URL to "/",
+// which silently pointed `endpoint: http://host:4318`-style configs at the
+// collector root instead of the signal path. Appending here keeps the
+// contract independent of that SDK behaviour. A bare "/" counts as path-less
+// — OTLP serves nothing at the root, so a trailing slash on a host is spelling,
+// not intent. Unparsable input passes through for WithEndpointURL to report,
+// keeping one error path.
+func ensureSignalPath(endpoint, signalPath string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = signalPath
+		return u.String()
+	}
+	return endpoint
 }
 
 func stringOr(s, fallback string) string {
@@ -718,7 +744,7 @@ func buildLogExporter(ctx context.Context, sig Signal) (sdklog.Exporter, error) 
 			// full URL, anything else a dial target with stray schemes
 			// stripped.
 			if hasHTTPScheme(sig.Endpoint) {
-				opts = append(opts, otlploghttp.WithEndpointURL(sig.Endpoint))
+				opts = append(opts, otlploghttp.WithEndpointURL(ensureSignalPath(sig.Endpoint, "/v1/logs")))
 			} else {
 				opts = append(opts, otlploghttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}

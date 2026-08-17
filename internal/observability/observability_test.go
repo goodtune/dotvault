@@ -2,6 +2,8 @@ package observability
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -746,5 +749,98 @@ func TestInsecureHeaderFootgun(t *testing.T) {
 				t.Errorf("insecureHeaderFootgun = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestEnsureSignalPath(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		want     string
+	}{
+		// Path-less URLs get the signal path appended — the documented
+		// contract, upheld here since OTel v1.45 stopped defaulting it.
+		{"http://127.0.0.1:4318", "http://127.0.0.1:4318/v1/metrics"},
+		{"https://collector.example", "https://collector.example/v1/metrics"},
+		// A bare trailing slash is spelling, not intent.
+		{"http://127.0.0.1:4318/", "http://127.0.0.1:4318/v1/metrics"},
+		// Explicit paths are used verbatim — no assumed mount path.
+		{"https://collector.example/tenant/v1/metrics", "https://collector.example/tenant/v1/metrics"},
+		{"https://collector.example/custom", "https://collector.example/custom"},
+		// Query strings survive.
+		{"http://127.0.0.1:4318?x=1", "http://127.0.0.1:4318/v1/metrics?x=1"},
+	}
+	for _, tc := range cases {
+		if got := ensureSignalPath(tc.endpoint, "/v1/metrics"); got != tc.want {
+			t.Errorf("ensureSignalPath(%q) = %q, want %q", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+// TestHTTPExporterTargetsDefaultSignalPath is the end-to-end pin for the
+// path-less-endpoint contract: an http/protobuf exporter built from a URL
+// with no path must POST to the OTLP-standard signal path, not the root.
+// This regressed when OTel v1.45.0 changed WithEndpointURL to pin a
+// path-less URL's request path to "/"; ensureSignalPath now supplies the
+// default on our side of the seam.
+func TestHTTPExporterTargetsDefaultSignalPath(t *testing.T) {
+	paths := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+
+	me, err := buildMetricExporter(ctx, Signal{Enabled: true, Endpoint: srv.URL, Protocol: "http/protobuf"})
+	if err != nil {
+		t.Fatalf("buildMetricExporter: %v", err)
+	}
+	t.Cleanup(func() { _ = me.Shutdown(context.Background()) })
+	if err := me.Export(ctx, &metricdata.ResourceMetrics{}); err != nil {
+		t.Fatalf("metric export: %v", err)
+	}
+	select {
+	case p := <-paths:
+		if p != "/v1/metrics" {
+			t.Errorf("metric export path = %q, want /v1/metrics", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no metric export request arrived")
+	}
+
+	le, err := buildLogExporter(ctx, Signal{Enabled: true, Endpoint: srv.URL, Protocol: "http/protobuf"})
+	if err != nil {
+		t.Fatalf("buildLogExporter: %v", err)
+	}
+	t.Cleanup(func() { _ = le.Shutdown(context.Background()) })
+	if err := le.Export(ctx, make([]sdklog.Record, 1)); err != nil {
+		t.Fatalf("log export: %v", err)
+	}
+	select {
+	case p := <-paths:
+		if p != "/v1/logs" {
+			t.Errorf("log export path = %q, want /v1/logs", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no log export request arrived")
+	}
+
+	// An explicit path must be used verbatim — the append is only for
+	// path-less URLs.
+	me2, err := buildMetricExporter(ctx, Signal{Enabled: true, Endpoint: srv.URL + "/tenant/v1/metrics", Protocol: "http/protobuf"})
+	if err != nil {
+		t.Fatalf("buildMetricExporter: %v", err)
+	}
+	t.Cleanup(func() { _ = me2.Shutdown(context.Background()) })
+	if err := me2.Export(ctx, &metricdata.ResourceMetrics{}); err != nil {
+		t.Fatalf("metric export: %v", err)
+	}
+	select {
+	case p := <-paths:
+		if p != "/tenant/v1/metrics" {
+			t.Errorf("explicit-path export path = %q, want /tenant/v1/metrics", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no explicit-path export request arrived")
 	}
 }

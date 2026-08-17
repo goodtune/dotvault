@@ -1,0 +1,51 @@
+{{define "content"}}
+<div data-signals="{showAdd: {{if .FormOpen}}true{{else}}false{{end}}}">
+  <div class="config-header">
+    <h2 class="ui-page-heading">Remotes</h2>
+    <div class="config-header-actions">
+      {{if not .Unavailable}}<button class="enrol-btn-primary" data-on:click="$showAdd = !$showAdd">Add remote</button>{{end}}
+    </div>
+  </div>
+  <p class="ui-page-subheading">Hosts the daemon maintains a persistent SSH remote forward to, exposing its own web API there as a Unix socket.</p>
+  {{if .FormError}}<div class="error-banner">{{.FormError}}</div>{{end}}
+  {{if .Unavailable}}
+  <div class="config-section"><p class="config-empty">Managed SSH forwards are not configured on this daemon.</p></div>
+  {{else}}
+  {{if .Confirm}}
+  <div class="enrol-card">
+    <div class="enrol-warn">
+      <p class="enrol-warn-text">The host key for {{.Confirm.Host}} is not yet trusted.</p>
+      <p class="ssh-fingerprint">{{.Confirm.Fingerprint}}</p>
+      <p class="enrol-warn-text">Verify this fingerprint out of band before trusting it &mdash; accepting the wrong key lets an impersonating host read this daemon&#8217;s web API over the forward.</p>
+      <div class="enrol-warn-actions">
+        <form class="ui-inline-form" method="post" action="/ui/remotes/add">
+          <input type="hidden" name="host" value="{{.Confirm.Candidate.Host}}">
+          <input type="hidden" name="port" value="{{.Confirm.Candidate.PortRaw}}">
+          <input type="hidden" name="remote_socket" value="{{.Confirm.Candidate.RemoteSocket}}">
+          <input type="hidden" name="accept_fingerprint" value="{{.Confirm.Fingerprint}}">
+          <button class="enrol-btn-danger">Trust and add</button>
+        </form>
+        <a class="enrol-btn-secondary" href="/ui/remotes/">Cancel</a>
+      </div>
+    </div>
+  </div>
+  {{end}}
+  {{if not .Confirm}}
+  <div class="enrol-card" data-show="$showAdd" {{if not .FormOpen}}style="display: none"{{end}}>
+    <form class="ssh-add-form" method="post" action="/ui/remotes/add">
+      <label class="enrol-prompt-label" for="ssh-host">Host</label>
+      <input id="ssh-host" name="host" class="enrol-prompt-input" placeholder="example.com" value="{{.FormHost}}">
+      <label class="enrol-prompt-label" for="ssh-port">Port (default 22)</label>
+      <input id="ssh-port" name="port" class="enrol-prompt-input" placeholder="22" inputmode="numeric" value="{{.FormPort}}">
+      <label class="enrol-prompt-label" for="ssh-socket">Remote socket (default ~/.ssh/dotvault.sock)</label>
+      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.sock" value="{{.FormSocket}}">
+      <div class="enrol-prompt-actions">
+        <button type="submit" class="enrol-btn-primary">Add</button>
+      </div>
+    </form>
+  </div>
+  {{end}}
+  {{template "remotes-panel" .Remotes}}
+  {{end}}
+</div>
+{{end}}

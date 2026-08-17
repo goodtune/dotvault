@@ -1,0 +1,101 @@
+{{define "content"}}
+<div class="config-container">
+  <div class="config-header">
+    <h2 class="config-heading">Effective Configuration</h2>
+    <div class="config-header-actions">
+      <a class="enrol-btn-secondary" href="/api/v1/config/download?format=yaml" download="dotvault-config.yaml" title="Download the effective config as YAML">Download YAML</a>
+      <a class="enrol-btn-secondary" href="/api/v1/config/download?format=reg" download="dotvault-config.reg" title="Download the effective config as a Windows .reg file">Download REG</a>
+    </div>
+  </div>
+  <p class="config-subheading">Read-only view of the running daemon&#8217;s configuration. To change anything, edit the config file and restart the service.</p>
+  {{with .Config}}
+  <section class="config-section">
+    <h3 class="config-section-title">Vault</h3>
+    <table class="config-kv"><tbody>
+      <tr><th>Address</th><td>{{orDash .Vault.Address}}</td></tr>
+      <tr><th>KV mount</th><td>{{orDash .Vault.KVMount}}</td></tr>
+      <tr><th>User prefix</th><td>{{orDash .Vault.UserPrefix}}</td></tr>
+      <tr><th>Auth method</th><td>{{orDash .Vault.AuthMethod}}</td></tr>
+      <tr><th>Auth mount</th><td>{{orDash .Vault.AuthMount}}</td></tr>
+      <tr><th>Auth role</th><td>{{orDash .Vault.AuthRole}}</td></tr>
+      <tr><th>TLS skip verify</th><td>{{yesNo .Vault.TLSSkipVerify}}</td></tr>
+      <tr><th>CA certificate</th><td>{{if .Vault.HasCACert}}Configured{{else}}Not configured{{end}}</td></tr>
+      <tr><th>Token renewal</th><td>{{if .Vault.DisableTokenRenewal}}Disabled{{else}}Enabled{{end}}</td></tr>
+    </tbody></table>
+  </section>
+  <section class="config-section">
+    <h3 class="config-section-title">Sync</h3>
+    <table class="config-kv"><tbody>
+      <tr><th>Interval</th><td>{{orDash .Sync.Interval}}</td></tr>
+    </tbody></table>
+  </section>
+  <section class="config-section">
+    <h3 class="config-section-title">Web UI</h3>
+    <table class="config-kv"><tbody>
+      <tr><th>Enabled</th><td>{{yesNo .Web.Enabled}}</td></tr>
+      <tr><th>Listen address</th><td>{{orDash .Web.Listen}}</td></tr>
+      {{if and .Web.ListenEffective (ne .Web.ListenEffective .Web.Listen)}}<tr><th>Listen address (effective)</th><td>{{.Web.ListenEffective}}</td></tr>{{end}}
+    </tbody></table>
+  </section>
+  <section class="config-section">
+    <h3 class="config-section-title">Managed Files<span class="config-count">{{len .Rules}}</span></h3>
+    {{if .Rules}}<div class="config-cards">
+      {{range .Rules}}
+      <div class="config-card">
+        <div class="config-card-title">
+          <strong>{{.Name}}</strong>
+          {{if .Target.Format}}<span class="config-tag">{{.Target.Format}}</span>{{end}}
+          {{if .Target.HasTemplate}}<span class="config-tag config-tag-info">templated</span>{{end}}
+          {{if .OAuth}}<span class="config-tag config-tag-warn">oauth: {{.OAuth.Provider}}</span>{{end}}
+        </div>
+        {{if .Description}}<p class="config-card-desc">{{.Description}}</p>{{end}}
+        <table class="config-kv"><tbody>
+          <tr><th>Target path</th><td><code>{{orDash .Target.Path}}</code></td></tr>
+          <tr><th>Format</th><td>{{orDash .Target.Format}}</td></tr>
+          <tr><th>Vault key</th><td><code>{{.VaultKey}}</code></td></tr>
+          {{if .Target.Merge}}<tr><th>Merge</th><td>{{.Target.Merge}}</td></tr>{{end}}
+          {{if .OAuth}}{{if .OAuth.Scopes}}<tr><th>OAuth scopes</th><td>{{join .OAuth.Scopes ", "}}</td></tr>{{end}}{{if .OAuth.EnginePath}}<tr><th>OAuth engine</th><td>{{.OAuth.EnginePath}}</td></tr>{{end}}{{end}}
+        </tbody></table>
+      </div>
+      {{end}}
+    </div>{{else}}<p class="config-empty">No sync rules configured.</p>{{end}}
+  </section>
+  <section class="config-section">
+    <h3 class="config-section-title">Active Enrolments<span class="config-count">{{len .Enrolments}}</span></h3>
+    {{if .Enrolments}}<div class="config-cards">
+      {{range .Enrolments}}
+      <div class="config-card">
+        <div class="config-card-title">
+          <strong>{{.Key}}</strong>
+          <span class="config-tag">{{if .EngineName}}{{.EngineName}}{{else}}{{.Engine}}{{end}}</span>
+          {{if .Status}}<span class="config-tag {{enrolStatusTag .Status}}">{{.Status}}</span>{{end}}
+        </div>
+        <table class="config-kv"><tbody>
+          <tr><th>Engine</th><td>{{.Engine}}</td></tr>
+          <tr><th>Vault path</th><td><code>{{.Key}}</code></td></tr>
+          {{if .Fields}}<tr><th>Fields</th><td>{{join .Fields ", "}}</td></tr>{{end}}
+        </tbody></table>
+        {{if .Settings}}<div class="config-subsection">
+          <div class="config-subsection-title">Settings</div>
+          <table class="config-kv"><tbody>
+            {{range settingRows .Settings}}<tr><th>{{.Key}}</th><td>{{if .JSON}}<pre class="config-json">{{.Value}}</pre>{{else if .Code}}<code>{{.Value}}</code>{{else}}{{.Value}}{{end}}</td></tr>{{end}}
+          </tbody></table>
+        </div>{{end}}
+      </div>
+      {{end}}
+    </div>{{else}}<p class="config-empty">No enrolments configured.</p>{{end}}
+  </section>
+  {{if .RemoteConfig}}
+  <section class="config-section">
+    <h3 class="config-section-title">Remote Config</h3>
+    <table class="config-kv"><tbody>
+      <tr><th>URL</th><td>{{.RemoteConfig.URL}}</td></tr>
+      <tr><th>Refresh interval</th><td>{{orDash .RemoteConfig.RefreshInterval}}</td></tr>
+      <tr><th>CA certificate</th><td>{{if .RemoteConfig.HasCACert}}Configured{{else}}Not configured{{end}}</td></tr>
+      {{if .RemoteConfig.HeaderNames}}<tr><th>Headers</th><td>{{join .RemoteConfig.HeaderNames ", "}}</td></tr>{{end}}
+    </tbody></table>
+  </section>
+  {{end}}
+  {{end}}
+</div>
+{{end}}

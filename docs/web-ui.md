@@ -1,6 +1,6 @@
 # Web UI
 
-dotvault includes an optional web-based dashboard built as a Preact single-page application. It provides browser-based authentication, status monitoring, and secret inspection.
+dotvault includes an optional web-based dashboard built as a Preact single-page application. It provides browser-based authentication, status monitoring, and secret inspection. Alongside the SPA, the same daemon serves a **server-rendered UI at `/ui/`** with bookmarkable URLs — see [Server-rendered UI](#server-rendered-ui-ui) below.
 
 ## Enabling the web UI
 
@@ -63,10 +63,22 @@ web:
     if you need additional credentials provisioned.
 ```
 
+## Server-rendered UI (`/ui/`)
+
+Browsing to `http://127.0.0.1:9000/ui/` (whatever your `web.listen` is) serves a parallel, server-rendered surface with real, bookmarkable URLs. It reuses the SPA's stylesheet so the look and feel matches, but navigation moves into a left-hand accordion — **Enrolments**, **Remotes**, **Secrets** — where each section expands when its route is active:
+
+- `/ui/` — the index page: the SPA-style header (version, connection state, Vault link on the left; live "Updated" time, Config, copy-token, and Sync Now on the right) plus the configured `secret_view_text` markdown in the content column. The "Updated" time is a live value streamed over Server-Sent Events.
+- `/ui/secrets/` — Secrets panel expanded; `/ui/secrets/<key>` shows a secret (heading linked to the secret in the Vault UI, revision subheading, and a field/value/actions table). Values are masked until the eye icon reveals them — the reveal auto-hides after 30 seconds — and the clipboard icon copies the value **server-side**: the secret never travels to the browser at all.
+- `/ui/enrolments/` — Enrolments panel expanded, grouped by engine (an engine nests into a folder only when it has more than one enrolment) with a status dot per entry: green = enrolled, orange = in progress, red = error, grey = not started. `/ui/enrolments/<engine>/<key>/` is where the enrolment itself runs.
+- `/ui/remotes/` — managed SSH forwards with the same status-dot vocabulary (green = connected, orange = connecting, red = enabled but disconnected, grey = disabled) and an add form revealed by the Add button; `/ui/remotes/<host>/` edits one remote (port, remote socket, enabled switch, delete) and shows its pinned host key — the SHA256 fingerprint with the full key revealable on demand, or a note when trust comes from a configured certificate authority instead. Adding an unpinned host presents the same fingerprint-confirmation gesture as the SPA and CLI. Both pages subscribe to a live state stream (`/ui/sse/ssh`), so state and configuration changes — a forward connecting or dropping, a remote edited, added, or removed, including asynchronously by `dotvault ssh` or the daemon's own reconnect loop — appear without refreshing the page.
+- `/ui/config/` — the Effective Configuration view, with the left navigation kept in place.
+
+Interactivity comes from [datastar](https://data-star.dev) patching server-rendered fragments over SSE; there is no client-side application state. An unauthenticated visit to any `/ui/` page redirects to the SPA at `/`, which owns all login flows.
+
 ## Security
 
-- **CSRF protection** — all mutating API endpoints require a CSRF token (obtained from `GET /api/v1/csrf`), with three deliberate exceptions: the peer-action endpoints `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard` (see below)
-- **Content Security Policy** — `default-src 'self'` prevents XSS via injected scripts
+- **CSRF protection** — all mutating SPA API endpoints require a CSRF token (obtained from `GET /api/v1/csrf`), with three deliberate exceptions: the peer-action endpoints `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard` (see below). The server-rendered `/ui/` surface uses a different but equivalent control for its POSTs: a **required same-origin `Origin` header** — browsers attach one to every POST, so a cross-site request (or one with no Origin at all) is rejected, which suits server-rendered forms and multi-tab use better than a one-shot token
+- **Content Security Policy** — `default-src 'self'; frame-ancestors 'none'` prevents XSS via injected scripts and clickjacking via framing. `/ui/` responses additionally allow `'unsafe-eval'` for scripts (datastar compiles its `data-*` attribute expressions with the Function constructor) and inline styles; inline scripts remain forbidden on both surfaces
 - **X-Content-Type-Options** — `nosniff` header on all responses
 - **Loopback binding** — enforced at startup; non-loopback addresses are rejected
 

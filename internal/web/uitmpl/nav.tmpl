@@ -1,0 +1,32 @@
+{{define "nav"}}<nav class="sidebar">
+  {{range .Sections}}
+  <a class="ui-nav-section-header{{if .Active}} ui-nav-active{{end}}" href="{{.Href}}" aria-expanded="{{if .Expanded}}true{{else}}false{{end}}">{{.Label}} <span class="key-chevron">{{if .Expanded}}&#9662;{{else}}&#9656;{{end}}</span></a>
+  {{if .Expanded}}
+    {{if .Note}}<div class="ui-nav-note{{if .NoteIsError}} ui-nav-error{{end}}">{{.Note}}</div>{{end}}
+    {{if .ItemsID}}{{template "nav-remotes-list" .Items}}{{else}}<ul class="key-list">
+      {{range .Items}}{{template "navitem" .}}{{end}}
+    </ul>{{end}}
+  {{end}}
+  {{end}}
+</nav>{{end}}
+
+{{/* nav-remotes-list re-renders the Remotes section's item list as a
+     standalone fragment for the /ui/sse/ssh stream. Its id matches the
+     ItemsID the nav template gives that section's <ul>. */}}
+{{define "nav-remotes-list"}}<ul class="key-list" id="ui-nav-remotes">
+  {{range .}}{{template "navitem" .}}{{end}}
+</ul>{{end}}
+
+{{define "navitem"}}{{if .Folder}}<li class="key-folder">
+  <a class="key-item key-folder-header" href="{{.Href}}" aria-expanded="{{if .Expanded}}true{{else}}false{{end}}">
+    <span class="key-icon">&#128193;</span><span class="key-name">{{.Name}}</span>
+    <span class="key-chevron">{{if .Expanded}}&#9662;{{else}}&#9656;{{end}}</span>
+  </a>
+  {{if .Expanded}}<ul class="key-sublist">
+    {{if .Note}}<li class="key-subnote{{if .NoteIsError}} key-suberror{{end}}">{{.Note}}</li>{{end}}
+    {{range .Children}}{{template "navitem" .}}{{end}}
+  </ul>{{end}}
+</li>{{else}}<li><a class="key-item{{if .Selected}} selected{{end}}" href="{{.Href}}">
+  <span class="key-icon">{{.Icon}}</span><span class="key-name">{{.Name}}</span>
+  {{if .Dot}}<span class="ui-dot ui-dot-{{.Dot}}" title="{{.DotTitle}}"></span>{{end}}
+</a></li>{{end}}{{end}}

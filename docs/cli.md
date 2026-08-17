@@ -248,13 +248,16 @@ Manage the SSH remote forwards the running daemon maintains — see the [Managed
 
 ```sh
 dotvault ssh add <host> [--force] [--accept-host-key] [--socket <path>] [--port N]
+dotvault ssh edit <host> [--port N] [--socket <path>] [--enable|--disable]
 dotvault ssh list
 dotvault ssh remove <host>
 ```
 
-`add` and `remove` are thin clients of the daemon's own web API — nothing here edits `ssh.yaml` directly — reached over the local API socket (`api.enabled`) or the loopback web listener (`web.enabled`, required on Windows). They therefore require a running, reachable daemon; `list` degrades to reading `ssh.yaml` directly (reporting `unavailable` status) when the daemon can't be reached.
+`add`, `edit`, and `remove` are thin clients of the daemon's own web API — nothing here edits `ssh.yaml` directly — reached over the local API socket (`api.enabled`) or the loopback web listener (`web.enabled`, required on Windows). They therefore require a running, reachable daemon; `list` degrades to reading `ssh.yaml` directly (reporting `unavailable` status) when the daemon can't be reached.
 
 `add` performs a live SSH dial, credential check, and host-key verification through the daemon's agent identity before persisting anything. An unpinned host's key is printed for confirmation: on a TTY you're prompted to accept it, otherwise pass `--accept-host-key` after verifying the printed fingerprint out of band. `--force` skips that verification dial for a host known to be offline right now.
+
+`edit` is the CLI counterpart of the web UI's per-remote edit form: only the flags you pass change (`--port 0` resets the port to the default 22; `--socket` replaces the remote socket path; `--enable`/`--disable` flip the forward without removing it), everything else keeps its current value, and the daemon reconciles the forward immediately — no restart needed. It prints the resulting entry with defaults applied.
 
 ### `dotvault version`
 

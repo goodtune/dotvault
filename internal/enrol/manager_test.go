@@ -3,6 +3,7 @@ package enrol
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,11 +16,20 @@ import (
 	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
-// testPrefix returns a per-test unique Vault prefix so tests are
-// idempotent against a long-lived dev server.
+// testPrefix returns a per-invocation KV prefix. The random suffix is what
+// makes these tests idempotent against a *persistent* dev Vault: a
+// name-derived prefix alone leaves the secrets a passing run wrote in place,
+// and the next run then finds "missing" enrolments already present and fails
+// (the dev stack's Vault keeps its data across `go test` runs; only CI gets
+// a fresh one). Leftover test paths accumulate under kv/test/ in the dev
+// container, which is ephemeral by design.
 func testPrefix(t *testing.T) string {
 	t.Helper()
-	return fmt.Sprintf("test/%s/", t.Name())
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return fmt.Sprintf("test/%s-%x/", t.Name(), b)
 }
 
 // enableKVv2 enables a KV v2 mount, ignoring "already in use" errors.

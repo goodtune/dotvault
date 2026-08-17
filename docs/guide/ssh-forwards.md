@@ -22,11 +22,12 @@ Two, and both are hard requirements — a remote whose preconditions aren't met 
 
 ```sh
 dotvault ssh add <host> [--force] [--accept-host-key] [--socket <path>] [--port N]
+dotvault ssh edit <host> [--port N] [--socket <path>] [--enable|--disable]
 dotvault ssh list
 dotvault ssh remove <host>
 ```
 
-These are thin clients of the running daemon's own web API — they do not write `ssh.yaml` directly. The identity used to verify a new remote lives in the daemon's agent backend, so only a running, authenticated daemon can perform the live dial `ssh add` requires; routing every mutation through the one service layer the web UI also uses removes any CLI-versus-daemon write race. `ssh add` and `ssh remove` therefore always require a reachable daemon and fail clearly when there isn't one. `ssh list` degrades gracefully: when the daemon can't be reached it falls back to reading `ssh.yaml` directly and reports `unavailable` in the status column, since reading the file is safe without a daemon but writing it is not.
+These are thin clients of the running daemon's own web API — they do not write `ssh.yaml` directly. The identity used to verify a new remote lives in the daemon's agent backend, so only a running, authenticated daemon can perform the live dial `ssh add` requires; routing every mutation through the one service layer the web UI also uses removes any CLI-versus-daemon write race. `ssh add`, `ssh edit`, and `ssh remove` therefore always require a reachable daemon and fail clearly when there isn't one. `ssh list` degrades gracefully: when the daemon can't be reached it falls back to reading `ssh.yaml` directly and reports `unavailable` in the status column, since reading the file is safe without a daemon but writing it is not.
 
 ### `dotvault ssh add`
 
@@ -35,6 +36,10 @@ These are thin clients of the running daemon's own web API — they do not write
 `add` is idempotent on the host: running it again updates the existing entry rather than creating a duplicate. `--port` and `--socket` override the SSH port (default `22`) and the remote Unix socket path (default `~/.ssh/dotvault.sock`) respectively. `--force` skips the verification dial and persists the entry as given — the documented escape for registering a host that happens to be offline right now; it does not bypass the host-key confirmation on a later re-add, only the verification dial itself.
 
 A remote whose `sshd` has `AllowStreamLocalForwarding no` cannot be managed at all — the verification dial's forward request fails outright, and `ssh add` refuses to persist the entry (`--force` doesn't help here either, since a persisted entry could never connect).
+
+### `dotvault ssh edit`
+
+`edit` is the CLI counterpart of the web UI's per-remote form. Only the flags you pass change — everything else keeps its current value: `--port 0` resets the port to the default `22`, `--socket ""` resets the remote socket path to the default `~/.ssh/dotvault.sock`, and `--enable`/`--disable` flip the forward without removing it. The daemon persists `ssh.yaml` and reconciles the forward immediately, so an enable or disable takes effect without a restart. Passing no change flags is refused before any request is made; on success the resulting entry is printed with defaults applied.
 
 ### `dotvault ssh list`
 
@@ -53,7 +58,7 @@ Idempotent: removing a host that isn't configured prints a message and exits `0`
 
 ### A wart worth knowing about
 
-If a request to `dotvault ssh remove` (or a config edit) arrives over the very forward it's about to change — for example, running `ssh remove` against a host reached only through the forward being removed — the change still commits, but the connection carrying the request is dropped mid-response as that forward's old connection is torn down. Re-run the command over a different path (directly, or through a different managed forward) to confirm the result. This is inherent to changing a connection out from under the request that's using it, not a bug.
+If a request to `dotvault ssh remove` or `dotvault ssh edit` (or a config edit) arrives over the very forward it's about to change — for example, running `ssh remove` against a host reached only through the forward being removed — the change still commits, but the connection carrying the request is dropped mid-response as that forward's old connection is torn down. Re-run the command over a different path (directly, or through a different managed forward) to confirm the result. This is inherent to changing a connection out from under the request that's using it, not a bug.
 
 ## The `ssh.yaml` file
 

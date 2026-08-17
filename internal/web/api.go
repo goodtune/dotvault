@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -147,147 +146,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type targetView struct {
-		Path        string `json:"path"`
-		Format      string `json:"format"`
-		Merge       string `json:"merge,omitempty"`
-		HasTemplate bool   `json:"has_template"`
-	}
-	type oauthView struct {
-		Provider   string   `json:"provider"`
-		EnginePath string   `json:"engine_path,omitempty"`
-		Scopes     []string `json:"scopes,omitempty"`
-	}
-	type ruleView struct {
-		Name        string     `json:"name"`
-		Description string     `json:"description,omitempty"`
-		VaultKey    string     `json:"vault_key"`
-		Target      targetView `json:"target"`
-		OAuth       *oauthView `json:"oauth,omitempty"`
-	}
-	type enrolmentView struct {
-		Key        string         `json:"key"`
-		Engine     string         `json:"engine"`
-		EngineName string         `json:"engine_name,omitempty"`
-		Fields     []string       `json:"fields,omitempty"`
-		Settings   map[string]any `json:"settings,omitempty"`
-		Status     string         `json:"status,omitempty"`
-	}
-
-	currentRules := s.getRules()
-	rules := make([]ruleView, len(currentRules))
-	for i, rule := range currentRules {
-		rules[i] = ruleView{
-			Name:        rule.Name,
-			Description: rule.Description,
-			VaultKey:    rule.VaultKey,
-			Target: targetView{
-				Path:        rule.Target.Path,
-				Format:      rule.Target.Format,
-				Merge:       rule.Target.Merge,
-				HasTemplate: rule.Target.Template != "",
-			},
-		}
-		if rule.OAuth != nil {
-			rules[i].OAuth = &oauthView{
-				Provider:   rule.OAuth.Provider,
-				EnginePath: rule.OAuth.EnginePath,
-				Scopes:     rule.OAuth.Scopes,
-			}
-		}
-	}
-
-	statuses := map[string]EnrolStateInfo{}
-	if runner := s.getEnrolRunner(); runner != nil {
-		for _, st := range runner.States() {
-			statuses[st.Key] = st
-		}
-	}
-
-	enrolmentMap := s.getEnrolments()
-	keys := make([]string, 0, len(enrolmentMap))
-	for k := range enrolmentMap {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	enrolments := make([]enrolmentView, 0, len(keys))
-	for _, k := range keys {
-		e := enrolmentMap[k]
-		ev := enrolmentView{
-			Key:      k,
-			Engine:   e.Engine,
-			Settings: redactEnrolmentSettings(e.Settings),
-		}
-		if st, ok := statuses[k]; ok {
-			ev.EngineName = st.EngineName
-			ev.Fields = st.Fields
-			ev.Status = st.Status
-		}
-		enrolments = append(enrolments, ev)
-	}
-
-	currentSync := s.getSyncCfg()
-	syncInterval := currentSync.RawInterval
-	if syncInterval == "" && currentSync.Interval > 0 {
-		syncInterval = formatDuration(currentSync.Interval)
-	}
-
-	web := map[string]any{
-		"enabled": s.cfg.Enabled,
-		"listen":  s.cfg.Listen,
-	}
-	// listen_effective surfaces the actually-bound address, which differs
-	// from the configured value when the user gave a port like ":0".
-	if s.listenAddr != "" {
-		web["listen_effective"] = s.listenAddr
-	}
-
-	resp := map[string]any{
-		"vault": map[string]any{
-			"address":     s.vaultCfg.Address,
-			"kv_mount":    s.kvMount,
-			"user_prefix": s.userPrefix,
-			// The effective-config view shows the raw configured method
-			// (including any "+tpm" suffix) so it matches the lossless
-			// config-download and honestly reflects token-sealing. Only the
-			// SPA login dispatch on /api/v1/status needs the base form.
-			"auth_method":           s.vaultCfg.AuthMethod,
-			"auth_mount":            s.authMount,
-			"auth_role":             s.authRole,
-			"tls_skip_verify":       s.vaultCfg.TLSSkipVerify,
-			"has_ca_cert":           s.vaultCfg.CACert != "",
-			"disable_token_renewal": s.vaultCfg.DisableTokenRenewal,
-		},
-		"sync": map[string]any{
-			"interval": syncInterval,
-		},
-		"web":        web,
-		"rules":      rules,
-		"enrolments": enrolments,
-	}
-
-	// Remote-config overlay summary. The redacted view exposes the header
-	// *names* only — values are operator-defined dimension labels and flow
-	// through the lossless download endpoint instead, mirroring how
-	// observability headers are handled.
-	if s.remoteCfg.URL != "" {
-		rc := map[string]any{
-			"url":              s.remoteCfg.URL,
-			"refresh_interval": s.remoteCfg.RawRefreshInterval,
-			"has_ca_cert":      s.remoteCfg.CACert != "",
-		}
-		if len(s.remoteCfg.Headers) > 0 {
-			names := make([]string, 0, len(s.remoteCfg.Headers))
-			for k := range s.remoteCfg.Headers {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			rc["header_names"] = names
-		}
-		resp["remote_config"] = rc
-	}
-	writeJSON(w, resp)
+	// The view assembly is shared with the server-rendered /ui/config/ page —
+	// see buildConfigViewModel in ui_config.go.
+	writeJSON(w, s.buildConfigViewModel())
 }
 
 // redactEnrolmentSettings returns a copy of settings with values masked for
@@ -687,23 +548,38 @@ func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.enrolPromptMu.Lock()
-	ch := s.enrolPromptCh
-	if ch == nil {
-		s.enrolPromptMu.Unlock()
-		writeError(w, "no pending prompt", http.StatusConflict)
+	if err := s.deliverEnrolPrompt(req.Value); err != nil {
+		writeError(w, err.Error(), http.StatusConflict)
 		return
 	}
+	writeJSON(w, map[string]any{"status": "accepted"})
+}
 
+// Sentinels for deliverEnrolPrompt; their text is the user-facing message on
+// both the JSON and the form-POST surface.
+var (
+	errNoPendingPrompt = fmt.Errorf("no pending prompt")
+	errPromptAnswered  = fmt.Errorf("prompt already answered")
+)
+
+// deliverEnrolPrompt hands a submitted secret value to the engine blocked in
+// EnrolPromptSecret. It owns the lock/select/clear protocol over
+// enrolPromptCh so the SPA's JSON endpoint and the /ui/ form endpoint cannot
+// drift.
+func (s *Server) deliverEnrolPrompt(value string) error {
+	s.enrolPromptMu.Lock()
+	defer s.enrolPromptMu.Unlock()
+	ch := s.enrolPromptCh
+	if ch == nil {
+		return errNoPendingPrompt
+	}
 	select {
-	case ch <- req.Value:
+	case ch <- value:
 		s.enrolPromptCh = nil
 		s.enrolPromptLabel = ""
-		s.enrolPromptMu.Unlock()
-		writeJSON(w, map[string]any{"status": "accepted"})
+		return nil
 	default:
-		s.enrolPromptMu.Unlock()
-		writeError(w, "prompt already answered", http.StatusConflict)
+		return errPromptAnswered
 	}
 }
 

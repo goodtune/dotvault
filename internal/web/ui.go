@@ -156,10 +156,14 @@ type uiNavItem struct {
 
 // uiNavSection is one accordion section (Enrolments / Remotes / Secrets).
 type uiNavSection struct {
-	Label       string
-	Href        string
-	Active      bool
-	Expanded    bool
+	Label    string
+	Href     string
+	Active   bool
+	Expanded bool
+	// ItemsID, when set, becomes the id of the section's <ul> so an SSE
+	// stream can re-patch the whole item list (the Remotes section uses
+	// "ui-nav-remotes").
+	ItemsID     string
 	Items       []uiNavItem
 	Note        string
 	NoteIsError bool
@@ -176,6 +180,12 @@ type uiPageData struct {
 	Error          string
 	Sections       []uiNavSection
 	SecretViewText template.HTML
+	// SSHStream, when non-empty, is the /ui/sse/ssh subscription URL the
+	// layout opens for this page, so managed-forward state (nav dots, the
+	// remotes table, a remote's detail state line) live-updates — including
+	// changes made asynchronously by the CLI or the reconnect loop. Set only
+	// on pages that render that state.
+	SSHStream string
 }
 
 // registerSSRUIRoutes wires the server-rendered /ui/ surface. Called from
@@ -213,6 +223,7 @@ func (s *Server) registerSSRUIRoutes() {
 
 	// Live updates + datastar-patched fragments.
 	s.mux.HandleFunc("GET /ui/sse", s.handleUISSE)
+	s.mux.HandleFunc("GET /ui/sse/ssh", s.handleUISSHSSE)
 	s.mux.HandleFunc("GET /ui/fragments/sync-btn", s.handleUISyncBtnFragment)
 	s.mux.HandleFunc("GET /ui/fragments/copy-token-btn", s.handleUICopyTokenBtnFragment)
 	s.mux.HandleFunc("GET /ui/fragments/secrets/reveal", s.handleUISecretReveal)
@@ -400,6 +411,9 @@ func (s *Server) buildUINav(ctx context.Context, active, selected string) []uiNa
 		case "Remotes":
 			if active == "remotes" {
 				sections[i].Active, sections[i].Expanded = true, true
+				// The list carries an id so /ui/sse/ssh can re-patch it as
+				// live connection state changes (see nav-remotes-list).
+				sections[i].ItemsID = "ui-nav-remotes"
 				s.fillRemotesNav(&sections[i], selected)
 			}
 		case "Secrets":
@@ -580,8 +594,15 @@ func (s *Server) fillRemotesNav(sec *uiNavSection, selected string) {
 		sec.Note = "No remotes configured"
 		return
 	}
+	sec.Items = uiRemotesNavItems(rows, selected)
+}
+
+// uiRemotesNavItems builds the Remotes nav rows from remote state; shared by
+// the page-render nav and the /ui/sse/ssh live patch of the same list.
+func uiRemotesNavItems(rows []uiRemoteRow, selected string) []uiNavItem {
+	items := make([]uiNavItem, 0, len(rows))
 	for _, row := range rows {
-		sec.Items = append(sec.Items, uiNavItem{
+		items = append(items, uiNavItem{
 			Name:     row.Host,
 			Icon:     "🖥️",
 			Href:     row.Href,
@@ -590,6 +611,7 @@ func (s *Server) fillRemotesNav(sec *uiNavSection, selected string) {
 			Selected: row.Host == selected,
 		})
 	}
+	return items
 }
 
 // handleUIDashboard renders /ui/ — the index page. The content column shows

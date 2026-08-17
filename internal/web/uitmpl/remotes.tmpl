@@ -45,23 +45,7 @@
     </form>
   </div>
   {{end}}
-  {{if .Remotes}}
-  <table class="ssh-table">
-    <thead><tr><th>Host</th><th>Port</th><th>Remote socket</th><th>State</th><th>Reconnects</th><th>Last error</th></tr></thead>
-    <tbody>
-      {{range .Remotes}}<tr>
-        <td><a href="{{.Href}}">{{.Host}}</a></td>
-        <td>{{.Port}}</td>
-        <td><code>{{if .RemoteSocket}}{{.RemoteSocket}}{{else}}&mdash;{{end}}</code></td>
-        <td><span class="{{.PillClass}}">{{.StateLabel}}</span></td>
-        <td>{{.Reconnects}}</td>
-        <td>{{if .LastError}}<span class="ssh-error-text">{{.LastError}}</span>{{else}}&mdash;{{end}}</td>
-      </tr>{{end}}
-    </tbody>
-  </table>
-  {{else}}
-  <p class="config-empty">No SSH remotes configured yet.</p>
-  {{end}}
+  {{template "remotes-panel" .Remotes}}
   {{end}}
 </div>
 {{end}}

@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 )
 
 // uiTestVaultHandler fakes the two Vault KVv2 shapes the UI reads: LIST
@@ -631,5 +633,199 @@ func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
 	}
 	if !strings.Contains(frag, "fi%27eld%22na%5Cme") {
 		t.Errorf("expected percent-encoded field name in fragment: %s", frag)
+	}
+}
+
+// TestUISSHLiveRender pins the /ui/sse/ssh patch payload: the nav list plus
+// the view's content region, rendered from the same rows as the pages.
+func TestUISSHLiveRender(t *testing.T) {
+	if err := uiInitTemplates(); err != nil {
+		t.Fatal(err)
+	}
+	s := sshTestServer(t, noopVerifier)
+	if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetSSHRegistry(s.sshRegistry, func() []sshfwd.RemoteStatus {
+		return []sshfwd.RemoteStatus{{Host: "example.com", State: "connected", Reconnects: 3}}
+	})
+
+	frag, err := s.renderUISSHLive("index", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`id="ui-nav-remotes"`,
+		`id="ui-ssh-remotes-panel"`,
+		"example.com",
+		"Connected",
+		"ui-dot-green",
+	} {
+		if !strings.Contains(frag, want) {
+			t.Errorf("index payload missing %q:\n%s", want, frag)
+		}
+	}
+
+	frag, err = s.renderUISSHLive("detail", "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(frag, `id="ui-remote-state"`) || !strings.Contains(frag, "Connected") {
+		t.Errorf("detail payload missing state line:\n%s", frag)
+	}
+	// A host that vanished (removed via the CLI) renders a muted placeholder
+	// rather than erroring the stream.
+	frag, err = s.renderUISSHLive("detail", "gone.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(frag, "Removed") {
+		t.Errorf("missing-host detail payload should render Removed:\n%s", frag)
+	}
+}
+
+// TestUISSHSSE_PatchesOnStateChange drives the stream end to end: the current
+// state is patched immediately on subscribe, and a state flip (as the
+// reconnect loop or a CLI mutation would cause) is patched on a later tick.
+func TestUISSHSSE_PatchesOnStateChange(t *testing.T) {
+	oldInterval := uiSSHStreamInterval
+	uiSSHStreamInterval = 50 * time.Millisecond
+	t.Cleanup(func() { uiSSHStreamInterval = oldInterval })
+
+	s := testServerWithVault(t, uiTestVaultHandler(t))
+	s.cfg.Listen = "127.0.0.1:9000"
+	s.sshRegistry = newSSHRegistry(t, noopVerifier)
+	if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	var state atomic.Value
+	state.Store("connecting")
+	s.SetSSHRegistry(s.sshRegistry, func() []sshfwd.RemoteStatus {
+		return []sshfwd.RemoteStatus{{Host: "example.com", State: state.Load().(string)}}
+	})
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL+"/ui/sse/ssh?view=index", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "127.0.0.1:9000"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// The stream sends the current state immediately; wait for it, then flip
+	// the state and expect a follow-up patch reflecting the change.
+	readUntil := func(marker string) string {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		got := make(chan string, 1)
+		go func() {
+			buf := make([]byte, 1<<16)
+			var acc string
+			for {
+				n, err := resp.Body.Read(buf)
+				acc += string(buf[:n])
+				if strings.Contains(acc, marker) || err != nil {
+					got <- acc
+					return
+				}
+			}
+		}()
+		select {
+		case acc := <-got:
+			if !strings.Contains(acc, marker) {
+				t.Fatalf("stream ended before %q arrived; got: %s", marker, acc)
+			}
+			return acc
+		case <-deadline:
+			t.Fatalf("no patch containing %q arrived", marker)
+			return ""
+		}
+	}
+	initial := readUntil("Connecting")
+	if !strings.Contains(initial, "datastar-patch-elements") {
+		t.Errorf("expected a datastar patch event, got: %s", initial)
+	}
+	state.Store("connected")
+	followUp := readUntil("ui-dot-green")
+	if !strings.Contains(followUp, "Connected") {
+		t.Errorf("state-change patch missing the new label; got: %s", followUp)
+	}
+}
+
+// TestUISSHSSE_RejectsBadViews pins the stream's parameter validation.
+func TestUISSHSSE_RejectsBadViews(t *testing.T) {
+	_, ts := uiTestServer(t)
+	for _, path := range []string{
+		"/ui/sse/ssh",                        // missing view
+		"/ui/sse/ssh?view=bogus",             // unknown view
+		"/ui/sse/ssh?view=detail",            // detail without host
+		"/ui/sse/ssh?view=detail&host=a%2Fb", // host that fails ValidateHost
+	} {
+		resp := uiGet(t, ts, path)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestUIRemotesPages_SubscribeToSSHStream pins the wiring that makes the
+// live updates exist at all: the pages must embed the /ui/sse/ssh
+// subscription span — index and detail with their respective views, and NOT
+// the unavailable page, whose stream could never emit.
+func TestUIRemotesPages_SubscribeToSSHStream(t *testing.T) {
+	// Unavailable (no registry): no subscription.
+	_, tsNoReg := uiTestServer(t)
+	body := uiBody(t, uiGet(t, tsNoReg, "/ui/remotes/"))
+	if strings.Contains(body, "/ui/sse/ssh") {
+		t.Errorf("unavailable remotes page must not open the ssh stream")
+	}
+
+	// Registry configured: index subscribes with view=index, detail with
+	// view=detail and its host.
+	s := testServerWithVault(t, uiTestVaultHandler(t))
+	s.cfg.Listen = "127.0.0.1:9000"
+	s.sshRegistry = newSSHRegistry(t, noopVerifier)
+	if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+
+	body = uiBody(t, uiGet(t, ts, "/ui/remotes/"))
+	if !strings.Contains(body, `data-init="@get('/ui/sse/ssh?view=index')"`) {
+		t.Errorf("remotes index missing the ssh stream subscription")
+	}
+	body = uiBody(t, uiGet(t, ts, "/ui/remotes/example.com/"))
+	// The query string is HTML-attribute escaped (& -> &amp;), so match the
+	// two parameters separately.
+	if !strings.Contains(body, "/ui/sse/ssh?host=example.com") || !strings.Contains(body, "view=detail") {
+		t.Errorf("remote detail page missing the ssh stream subscription")
+	}
+}
+
+// TestUISSHSSE_Unauthenticated pins that the auth gate runs before view
+// validation: an unauthenticated request gets 401 even with a bad view.
+func TestUISSHSSE_Unauthenticated(t *testing.T) {
+	s := testServer(t)
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+	for _, path := range []string{"/ui/sse/ssh?view=index", "/ui/sse/ssh?view=bogus"} {
+		resp := uiGet(t, ts, path)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s unauthenticated: status = %d, want 401", path, resp.StatusCode)
+		}
 	}
 }

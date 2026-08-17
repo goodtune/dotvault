@@ -1,7 +1,7 @@
 {{define "content"}}
 <div data-signals="{confirmDelete: false}">
   <div class="secret-heading"><h2>{{.Remote.Host}}</h2></div>
-  <div class="secret-meta"><span class="ui-dot ui-dot-{{.Remote.Dot}} ui-dot-inline"></span><span class="{{.Remote.PillClass}}">{{.Remote.StateLabel}}</span>{{if .Remote.LastError}} <span class="ssh-error-text">{{.Remote.LastError}}</span>{{end}}</div>
+  {{template "remote-state" .Remote}}
   {{if .FormError}}<div class="error-banner">{{.FormError}}</div>{{end}}
   <div class="ui-content-card">
     <form class="ssh-add-form" method="post" action="{{.SaveAction}}">

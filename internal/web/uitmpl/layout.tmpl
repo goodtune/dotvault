@@ -22,6 +22,7 @@
       {{template "copy-token-btn" .}}
       {{template "sync-btn" .}}
       <span id="ui-live" data-init="@get('/ui/sse')" hidden></span>
+      {{if .SSHStream}}<span id="ui-ssh-stream" data-init="@get('{{.SSHStream}}')" hidden></span>{{end}}
     </div>
   </header>
   {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}

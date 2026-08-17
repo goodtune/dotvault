@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
+
+	datastar "github.com/starfederation/datastar-go/datastar"
 
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
@@ -149,6 +152,11 @@ func (s *Server) uiRemotesPage(r *http.Request) uiRemotesPageData {
 	if err != nil {
 		data.Error = err.Error()
 	}
+	if !unavailable {
+		// With managed forwards unconfigured the page is a static
+		// explanation — don't open a stream that could never emit.
+		data.SSHStream = uiSSHStreamURL("index", "")
+	}
 	return data
 }
 
@@ -264,6 +272,7 @@ func (s *Server) renderUIRemoteDetail(w http.ResponseWriter, r *http.Request, ro
 		SaveAction:   "/ui/remotes/" + url.PathEscape(row.Host) + "/save",
 		DeleteAction: "/ui/remotes/" + url.PathEscape(row.Host) + "/delete",
 	}
+	data.SSHStream = uiSSHStreamURL("detail", row.Host)
 	s.uiRenderPage(w, "remote_detail", data)
 }
 
@@ -340,4 +349,150 @@ func (s *Server) handleUIRemoteDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("ssh remote removed via web UI", "host", row.Host)
 	http.Redirect(w, r, "/ui/remotes/", http.StatusSeeOther)
+}
+
+// uiSSHStreamInterval is the cadence at which /ui/sse/ssh re-reads the
+// managed-forward state. Reads are cheap (Registry.List is a small file
+// read, the status query an in-memory snapshot), and patches only go out on
+// change. A var so tests can shorten it.
+var uiSSHStreamInterval = 2 * time.Second
+
+// uiSSHStreamMaxFailures is how many consecutive render failures the stream
+// tolerates (one is usually ssh.yaml mid-rewrite) before closing instead of
+// presenting stale state as live.
+const uiSSHStreamMaxFailures = 5
+
+// uiSSHStreamURL builds the /ui/sse/ssh subscription URL a page embeds. view
+// selects which content region the stream patches alongside the nav list:
+// "index" (the remotes table) or "detail" (one remote's state line).
+func uiSSHStreamURL(view, host string) string {
+	q := url.Values{"view": {view}}
+	if host != "" {
+		q.Set("host", host)
+	}
+	return "/ui/sse/ssh?" + q.Encode()
+}
+
+// renderUISSHLive renders the patch payload for one /ui/sse/ssh tick: the
+// nav Remotes list plus the view's content region. The caller diffs the
+// returned string against the last sent payload so unchanged state sends
+// nothing.
+func (s *Server) renderUISSHLive(view, host string) (string, error) {
+	rows, unavailable, err := s.uiRemoteRows()
+	if err != nil {
+		return "", err
+	}
+	if unavailable {
+		// No registry wired (managed forwards not configured): the pages
+		// render a static explanation and there is nothing to live-update.
+		return "", nil
+	}
+	selected := ""
+	if view == "detail" {
+		selected = host
+	}
+	nav, err := uiFragment("nav-remotes-list", uiRemotesNavItems(rows, selected))
+	if err != nil {
+		return "", err
+	}
+	switch view {
+	case "detail":
+		row := uiRemoteRow{
+			Host:       host,
+			State:      "disabled",
+			StateLabel: "Removed",
+			PillClass:  "ssh-pill ssh-pill-muted",
+			Dot:        "grey",
+		}
+		for _, r := range rows {
+			if r.Host == host {
+				row = r
+				break
+			}
+		}
+		state, err := uiFragment("remote-state", row)
+		if err != nil {
+			return "", err
+		}
+		return nav + state, nil
+	default: // index
+		panel, err := uiFragment("remotes-panel", rows)
+		if err != nil {
+			return "", err
+		}
+		return nav + panel, nil
+	}
+}
+
+// handleUISSHSSE is the managed-forward live stream: any page that renders
+// SSH forward state subscribes (via the layout's #ui-ssh-stream span) and
+// receives patches whenever a remote's connection state, configuration, or
+// membership changes — whether the change came from this page, another tab,
+// the CLI (which mutates through the daemon's API), or the daemon's own
+// reconnect loop. State is polled server-side and patches are sent only on
+// change, so an idle stream is silent.
+func (s *Server) handleUISSHSSE(w http.ResponseWriter, r *http.Request) {
+	if !s.requireUIRead(w) {
+		return
+	}
+	view := r.URL.Query().Get("view")
+	if view != "index" && view != "detail" {
+		writeError(w, "invalid view", http.StatusBadRequest)
+		return
+	}
+	host := r.URL.Query().Get("host")
+	if view == "detail" {
+		if err := sshfwd.ValidateHost(host); err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	sse := datastar.NewSSE(w, r)
+	ticker := time.NewTicker(uiSSHStreamInterval)
+	defer ticker.Stop()
+
+	last := ""
+	failures := 0
+	send := func() bool {
+		frag, err := s.renderUISSHLive(view, host)
+		if err != nil {
+			// A single failure is usually ssh.yaml mid-rewrite — retry. A
+			// run of them means the source is genuinely broken; close the
+			// stream rather than silently presenting stale state as live.
+			failures++
+			if failures >= uiSSHStreamMaxFailures {
+				slog.Warn("ui: ssh live stream closing after repeated render failures", "error", err)
+				return false
+			}
+			slog.Debug("ui: ssh live render failed", "error", err)
+			return true
+		}
+		failures = 0
+		if frag == "" || frag == last {
+			return true
+		}
+		last = frag
+		return sse.PatchElements(frag) == nil
+	}
+	// Send the current state immediately. It usually duplicates what the
+	// page just rendered (an idempotent patch, invisible to the user), but
+	// it closes the gap where state changed between the page render and the
+	// stream opening — silently priming the diff instead would swallow that
+	// first change.
+	if !send() {
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-s.shutdownCtx.Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
 }

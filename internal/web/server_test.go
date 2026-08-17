@@ -63,8 +63,8 @@ func TestServerIntegration(t *testing.T) {
 	defer resp.Body.Close()
 
 	csp := resp.Header.Get("Content-Security-Policy")
-	if csp != "default-src 'self'" {
-		t.Errorf("CSP header = %q, want %q", csp, "default-src 'self'")
+	if csp != "default-src 'self'; frame-ancestors 'none'" {
+		t.Errorf("CSP header = %q, want %q", csp, "default-src 'self'; frame-ancestors 'none'")
 	}
 
 	xcto := resp.Header.Get("X-Content-Type-Options")
@@ -456,6 +456,38 @@ func TestStatusRecorderWriteSendsImplicit200(t *testing.T) {
 	}
 }
 
+// TestStatusRecorderFlushSendsImplicit200 pins the Flush analogue of the
+// Write contract above: flushing before any explicit WriteHeader implies the
+// headers go out with status 200, and the recorder must both record that and
+// forward exactly one WriteHeader to the underlying writer. Without it, an
+// SSE handler's first flush left wroteHeader false, and the next Write's
+// implicit WriteHeader triggered net/http's "superfluous response.WriteHeader"
+// log on every stream.
+func TestStatusRecorderFlushSendsImplicit200(t *testing.T) {
+	rec := httptest.NewRecorder()
+	wrapped, sr := wrapResponseWriter(rec)
+
+	f, ok := wrapped.(http.Flusher)
+	if !ok {
+		t.Fatalf("wrapped writer over httptest.ResponseRecorder must expose Flusher")
+	}
+	f.Flush()
+	if !sr.wroteHeader {
+		t.Errorf("Flush must record the implicit WriteHeader")
+	}
+	if sr.status != http.StatusOK {
+		t.Errorf("recorded status = %d, want 200", sr.status)
+	}
+	// A subsequent Write must not forward a second WriteHeader (the
+	// superfluous-WriteHeader regression this pins).
+	if _, err := wrapped.Write([]byte("data: x\n\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("underlying recorder Code = %d, want 200", rec.Code)
+	}
+}
+
 // TestHealthAndReadyEndpoints verifies the two probes round-trip:
 // /healthz always returns 200 (the daemon is alive once it's serving
 // HTTP), /readyz flips to 200 only once BOTH the Vault token is
@@ -571,8 +603,8 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	// Security headers must apply to error responses too — without
 	// nosniff a 403 error page could be MIME-sniffed, and without CSP
 	// it could be framed by an attacker.
-	if csp := w.Header().Get("Content-Security-Policy"); csp != "default-src 'self'" {
-		t.Errorf("Content-Security-Policy on 403 = %q, want default-src 'self'", csp)
+	if csp := w.Header().Get("Content-Security-Policy"); csp != "default-src 'self'; frame-ancestors 'none'" {
+		t.Errorf("Content-Security-Policy on 403 = %q, want default-src 'self'; frame-ancestors 'none'", csp)
 	}
 	if xcto := w.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
 		t.Errorf("X-Content-Type-Options on 403 = %q, want nosniff", xcto)

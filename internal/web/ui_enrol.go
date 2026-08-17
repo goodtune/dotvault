@@ -1,7 +1,6 @@
 package web
 
 import (
-	"errors"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -219,7 +218,7 @@ func (s *Server) uiEnrolAction(w http.ResponseWriter, r *http.Request, act func(
 		return
 	}
 	target := uiEnrolPageURL(st.Engine, st.Key)
-	if err := act(runner, key); err != nil && !errors.Is(err, ErrEnrolNotFound) {
+	if err := act(runner, key); err != nil {
 		target += "?err=" + url.QueryEscape(err.Error())
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)
@@ -265,21 +264,8 @@ func (s *Server) handleUIEnrolSecret(w http.ResponseWriter, r *http.Request) {
 		target = uiEnrolPageURL(st.Engine, st.Key)
 	}
 
-	s.enrolPromptMu.Lock()
-	ch := s.enrolPromptCh
-	if ch == nil {
-		s.enrolPromptMu.Unlock()
-		http.Redirect(w, r, target+"?err="+url.QueryEscape("no pending prompt"), http.StatusSeeOther)
-		return
-	}
-	select {
-	case ch <- value:
-		s.enrolPromptCh = nil
-		s.enrolPromptLabel = ""
-		s.enrolPromptMu.Unlock()
-	default:
-		s.enrolPromptMu.Unlock()
-		http.Redirect(w, r, target+"?err="+url.QueryEscape("prompt already answered"), http.StatusSeeOther)
+	if err := s.deliverEnrolPrompt(value); err != nil {
+		http.Redirect(w, r, target+"?err="+url.QueryEscape(err.Error()), http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, target, http.StatusSeeOther)

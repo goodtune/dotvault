@@ -741,10 +741,16 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// which is the directive that matters for XSS — injected markup
 		// still cannot carry executable script, and datastar only evaluates
 		// expressions from attributes the server rendered.
+		// frame-ancestors 'none' on both surfaces: default-src does NOT
+		// fall back for it, and without it any https origin may iframe the
+		// loopback UI (127.0.0.1 is a potentially-trustworthy origin) and
+		// clickjack gestures like the host-key "Trust and add" or the
+		// copy-token button — the Origin CSRF check is blind to a framed
+		// page's own same-origin POSTs.
 		if strings.HasPrefix(r.URL.Path, "/ui/") {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 		} else {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 

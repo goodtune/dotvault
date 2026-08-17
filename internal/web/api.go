@@ -548,23 +548,38 @@ func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.enrolPromptMu.Lock()
-	ch := s.enrolPromptCh
-	if ch == nil {
-		s.enrolPromptMu.Unlock()
-		writeError(w, "no pending prompt", http.StatusConflict)
+	if err := s.deliverEnrolPrompt(req.Value); err != nil {
+		writeError(w, err.Error(), http.StatusConflict)
 		return
 	}
+	writeJSON(w, map[string]any{"status": "accepted"})
+}
 
+// Sentinels for deliverEnrolPrompt; their text is the user-facing message on
+// both the JSON and the form-POST surface.
+var (
+	errNoPendingPrompt = fmt.Errorf("no pending prompt")
+	errPromptAnswered  = fmt.Errorf("prompt already answered")
+)
+
+// deliverEnrolPrompt hands a submitted secret value to the engine blocked in
+// EnrolPromptSecret. It owns the lock/select/clear protocol over
+// enrolPromptCh so the SPA's JSON endpoint and the /ui/ form endpoint cannot
+// drift.
+func (s *Server) deliverEnrolPrompt(value string) error {
+	s.enrolPromptMu.Lock()
+	defer s.enrolPromptMu.Unlock()
+	ch := s.enrolPromptCh
+	if ch == nil {
+		return errNoPendingPrompt
+	}
 	select {
-	case ch <- req.Value:
+	case ch <- value:
 		s.enrolPromptCh = nil
 		s.enrolPromptLabel = ""
-		s.enrolPromptMu.Unlock()
-		writeJSON(w, map[string]any{"status": "accepted"})
+		return nil
 	default:
-		s.enrolPromptMu.Unlock()
-		writeError(w, "prompt already answered", http.StatusConflict)
+		return errPromptAnswered
 	}
 }
 

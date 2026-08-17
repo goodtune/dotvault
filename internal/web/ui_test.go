@@ -1,12 +1,14 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
 )
@@ -428,5 +430,206 @@ func TestUIConfigJSONShapeUnchanged(t *testing.T) {
 	}
 	if _, ok := resp["rules"].([]any); !ok {
 		t.Errorf("rules is %T, want array", resp["rules"])
+	}
+	webSection, ok := resp["web"].(map[string]any)
+	if !ok {
+		t.Fatalf("web section missing")
+	}
+	// listen_effective was conditionally present in the map-built JSON; the
+	// struct translation must keep it omitted while unbound.
+	if _, present := webSection["listen_effective"]; present {
+		t.Errorf("web.listen_effective must be omitted when no address is bound")
+	}
+	if _, present := resp["sync"].(map[string]any); !present {
+		t.Errorf("sync section missing")
+	}
+	if _, ok := resp["enrolments"].([]any); !ok {
+		t.Errorf("enrolments is %T, want array", resp["enrolments"])
+	}
+
+	// With a bound address and a remote-config overlay, both optional pieces
+	// must appear — including header *names* only.
+	s.listenAddr = "127.0.0.1:12345"
+	s.remoteCfg = config.RemoteConfig{
+		URL:                "https://cfg.example.com/dotvault.yaml",
+		RawRefreshInterval: "5m",
+		Headers:            map[string]string{"X-Dotvault-Env": "prod"},
+	}
+	w = httptest.NewRecorder()
+	s.handleConfig(w, req)
+	resp = map[string]any{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp["web"].(map[string]any)["listen_effective"]; got != "127.0.0.1:12345" {
+		t.Errorf("web.listen_effective = %v, want the bound address", got)
+	}
+	rc, ok := resp["remote_config"].(map[string]any)
+	if !ok {
+		t.Fatalf("remote_config missing when configured")
+	}
+	if rc["url"] != "https://cfg.example.com/dotvault.yaml" || rc["refresh_interval"] != "5m" {
+		t.Errorf("remote_config = %v", rc)
+	}
+	names, ok := rc["header_names"].([]any)
+	if !ok || len(names) != 1 || names[0] != "X-Dotvault-Env" {
+		t.Errorf("remote_config.header_names = %v, want [X-Dotvault-Env]", rc["header_names"])
+	}
+}
+
+// TestUIWrite_AllPostRoutesRequireOrigin pins requireUIWrite onto every /ui/
+// POST route: each handler calls the gate individually, so dropping it from
+// one would otherwise go undetected.
+func TestUIWrite_AllPostRoutesRequireOrigin(t *testing.T) {
+	_, ts := uiTestServer(t)
+	routes := []string{
+		"/ui/actions/sync",
+		"/ui/actions/copy-token",
+		"/ui/actions/copy-field?path=gh&field=oauth_token&id=0",
+		"/ui/enrol/start",
+		"/ui/enrol/skip",
+		"/ui/enrol/reset",
+		"/ui/enrol/secret",
+		"/ui/remotes/add",
+		"/ui/remotes/somehost/save",
+		"/ui/remotes/somehost/delete",
+	}
+	for _, route := range routes {
+		req, err := http.NewRequest("POST", ts.URL+route, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = "127.0.0.1:9000"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s without Origin: status = %d, want 403", route, resp.StatusCode)
+		}
+	}
+}
+
+// TestUISSE_StopsOnClientDisconnect pins the SSE loop's exit path: cancelling
+// the request context must end the handler rather than leak its goroutine.
+func TestUISSE_StopsOnClientDisconnect(t *testing.T) {
+	_, ts := uiTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL+"/ui/sse", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "127.0.0.1:9000"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// Read the first patch, then hang up; the server side must return.
+	buf := make([]byte, 1)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("first SSE byte: %v", err)
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck // error is the expected cancellation
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("SSE body did not close after context cancel")
+	}
+}
+
+func TestUIParsePort(t *testing.T) {
+	cases := []struct {
+		raw   string
+		want  int
+		valid bool
+	}{
+		{"", 0, true},
+		{"22", 22, true},
+		{"65535", 65535, true},
+		{"0", 0, false},
+		{"-1", 0, false},
+		{"65536", 0, false},
+		{"22abc", 0, false},
+		{"2.2", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := uiParsePort(tc.raw)
+		if got != tc.want || ok != tc.valid {
+			t.Errorf("uiParsePort(%q) = (%d, %v), want (%d, %v)", tc.raw, got, ok, tc.want, tc.valid)
+		}
+	}
+}
+
+// TestUIEnrolCard_SpentAndPromptStates covers the card states beyond the
+// active device/redirect flows: the post-auth "minting"/"exchanging" steps
+// collapse the action UI, and a pending passphrase prompt renders the form.
+func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
+	s := testServer(t)
+	card := s.buildUIEnrolCard(EnrolStateInfo{
+		Key: "jfrog", Engine: "jfrog", EngineName: "JFrog", Status: "running",
+		Output: []string{
+			"! First, copy your one-time code: XY12",
+			"✓ Opened https://jfrog.example.com/ui/login in browser",
+			"⠼ Minting dotvault-owned access token...",
+		},
+	}, false)
+	if !card.HasDeviceFlow || !card.CodeSpent {
+		t.Errorf("expected spent device flow, got %+v", card)
+	}
+
+	// Pending passphrase prompt attaches only to the running card.
+	s.enrolPromptMu.Lock()
+	s.enrolPromptLabel = "Enter passphrase"
+	s.enrolPromptCh = make(chan string, 1)
+	s.enrolPromptMu.Unlock()
+	card = s.buildUIEnrolCard(EnrolStateInfo{
+		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "running",
+	}, false)
+	if !card.PromptPending || card.PromptLabel != "Enter passphrase" {
+		t.Errorf("expected pending prompt on running card, got %+v", card)
+	}
+	card = s.buildUIEnrolCard(EnrolStateInfo{
+		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "pending",
+	}, false)
+	if card.PromptPending {
+		t.Errorf("non-running card must not show the prompt")
+	}
+	s.enrolPromptMu.Lock()
+	s.enrolPromptCh = nil
+	s.enrolPromptLabel = ""
+	s.enrolPromptMu.Unlock()
+}
+
+// TestUIFragmentURLsAreQueryEncoded pins the property the datastar attribute
+// interpolation relies on: fragment URLs are strictly url.Values-encoded, so
+// quotes, backslashes, and other JS-string metacharacters in a field or path
+// name can never appear raw inside a data-on:* / data-init attribute value.
+func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
+	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3)
+	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL} {
+		if strings.ContainsAny(u, `'"\`+"`") {
+			t.Errorf("fragment URL %q carries raw JS-string metacharacters", u)
+		}
+	}
+	frag, err := uiFragment("revealed-cell", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The @get('…') quoting is literal template text; what must never appear
+	// is the raw (unencoded) path or field value inside the attribute.
+	for _, raw := range []string{`we"ird`, `fi'eld`, `na\me`} {
+		if strings.Contains(frag, raw) {
+			t.Errorf("revealed-cell carries unencoded value %q: %s", raw, frag)
+		}
+	}
+	if !strings.Contains(frag, "fi%27eld%22na%5Cme") {
+		t.Errorf("expected percent-encoded field name in fragment: %s", frag)
 	}
 }

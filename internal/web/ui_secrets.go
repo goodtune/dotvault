@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	datastar "github.com/starfederation/datastar-go/datastar"
 )
 
 // uiSecretField is one row of the secret detail table plus the fragment URLs
@@ -238,8 +236,7 @@ func (s *Server) handleUISecretReveal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "failed to render fragment", http.StatusInternalServerError)
 		return
 	}
-	sse := datastar.NewSSE(w, r)
-	sse.PatchElements(cell + eye)
+	uiPatchElements(w, r, cell+eye)
 }
 
 // handleUISecretMask restores the masked cell and closed-eye button. No
@@ -260,8 +257,7 @@ func (s *Server) handleUISecretMask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "failed to render fragment", http.StatusInternalServerError)
 		return
 	}
-	sse := datastar.NewSSE(w, r)
-	sse.PatchElements(cell + eye)
+	uiPatchElements(w, r, cell+eye)
 }
 
 // handleUISecretCopy puts a secret field's value on this machine's clipboard

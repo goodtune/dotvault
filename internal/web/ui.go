@@ -24,15 +24,18 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	datastar "github.com/starfederation/datastar-go/datastar"
@@ -41,6 +44,14 @@ import (
 //go:embed uitmpl/*.tmpl
 var uiTmplFS embed.FS
 
+// uiAssetsFS embeds the /ui/ static assets. datastar.js is the vendored
+// Datastar v1.0.2 browser bundle, fetched from
+// https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js
+// — to re-vendor, download the new tag's bundle to uiassets/datastar.js and
+// re-verify the /ui/ pages. The Go SDK (github.com/starfederation/datastar-go,
+// in go.mod and covered by dependabot's gomod entry) versions independently
+// of the browser bundle; both speak the Datastar v1 SSE protocol.
+//
 //go:embed uiassets/*
 var uiAssetsFS embed.FS
 
@@ -85,27 +96,47 @@ var uiSharedTmpl = []string{
 	"uitmpl/enrol_card.tmpl",
 }
 
-// uiPages maps a page name to its parsed template set. Pages are parsed once
-// at init; a malformed template is a programmer error and panics at startup
-// rather than at first request.
-var uiPages = func() map[string]*template.Template {
-	names := []string{
-		"dashboard", "secret", "folder", "enrolments",
-		"enrol_detail", "remotes", "remote_detail", "config",
-	}
-	m := make(map[string]*template.Template, len(names))
-	for _, name := range names {
-		files := append(append([]string(nil), uiSharedTmpl...), "uitmpl/"+name+".tmpl")
-		m[name] = template.Must(template.New(name).Funcs(uiFuncs).ParseFS(uiTmplFS, files...))
-	}
-	return m
-}()
-
-// uiFragments serves the standalone fragments datastar patches into a page
-// (buttons, table cells, the enrolment card). Same shared file set, no page.
-var uiFragments = template.Must(
-	template.New("fragments").Funcs(uiFuncs).ParseFS(uiTmplFS, uiSharedTmpl...),
+// uiPages maps a page name to its parsed template set; uiFragments serves the
+// standalone fragments datastar patches into a page (buttons, table cells,
+// the enrolment card). Both are parsed by uiInitTemplates, called from
+// registerSSRUIRoutes — deliberately NOT at package init with template.Must,
+// which would panic every binary importing internal/web (the CLI included)
+// for a defect in a surface that only exists on a web-enabled daemon.
+// A parse failure disables the /ui/ routes and is logged, mirroring how
+// registerUIRoutes already treats an fs.Sub failure for the SPA.
+var (
+	uiPages     map[string]*template.Template
+	uiFragments *template.Template
+	uiTmplOnce  sync.Once
+	uiTmplErr   error
 )
+
+func uiInitTemplates() error {
+	uiTmplOnce.Do(func() {
+		frags, err := template.New("fragments").Funcs(uiFuncs).ParseFS(uiTmplFS, uiSharedTmpl...)
+		if err != nil {
+			uiTmplErr = err
+			return
+		}
+		names := []string{
+			"dashboard", "secret", "folder", "enrolments",
+			"enrol_detail", "remotes", "remote_detail", "config",
+		}
+		pages := make(map[string]*template.Template, len(names))
+		for _, name := range names {
+			files := append(append([]string(nil), uiSharedTmpl...), "uitmpl/"+name+".tmpl")
+			t, err := template.New(name).Funcs(uiFuncs).ParseFS(uiTmplFS, files...)
+			if err != nil {
+				uiTmplErr = err
+				return
+			}
+			pages[name] = t
+		}
+		uiFragments = frags
+		uiPages = pages
+	})
+	return uiTmplErr
+}
 
 // uiNavItem is one row in the sidebar accordion — a leaf link or an
 // expandable folder.
@@ -151,11 +182,22 @@ type uiPageData struct {
 // registerUIRoutes, so — like the SPA — it exists only when the loopback TCP
 // listener does.
 func (s *Server) registerSSRUIRoutes() {
+	if err := uiInitTemplates(); err != nil {
+		slog.Error("failed to parse ui templates; /ui/ routes disabled", "error", err)
+		return
+	}
 	assets, err := fs.Sub(uiAssetsFS, "uiassets")
 	if err != nil {
 		slog.Error("failed to create sub-filesystem for ui assets", "error", err)
 		return
 	}
+	// http.FileServer derives Content-Type from mime.TypeByExtension, which
+	// on Windows consults the registry — where installers routinely rewrite
+	// .js to text/plain, and the global nosniff header would then make the
+	// browser refuse the one script /ui/ depends on. Pin the two extensions
+	// the embedded assets use so the platform's MIME table can't break them.
+	mime.AddExtensionType(".js", "text/javascript; charset=utf-8")
+	mime.AddExtensionType(".css", "text/css; charset=utf-8")
 	s.mux.Handle("GET /ui/assets/", http.StripPrefix("/ui/assets/", http.FileServer(http.FS(assets))))
 
 	// Pages.
@@ -261,6 +303,16 @@ func uiFragment(name string, data any) (string, error) {
 	return b.String(), nil
 }
 
+// uiPatchElements sends rendered elements as a datastar patch-elements SSE
+// response. A write failure just means the client went away mid-patch, so it
+// is logged at debug and not surfaced.
+func uiPatchElements(w http.ResponseWriter, r *http.Request, elements string) {
+	sse := datastar.NewSSE(w, r)
+	if err := sse.PatchElements(elements); err != nil {
+		slog.Debug("patch elements failed", "error", err)
+	}
+}
+
 // uiPatchFragment renders one fragment and sends it as a datastar
 // patch-elements SSE response.
 func uiPatchFragment(w http.ResponseWriter, r *http.Request, name string, data any) {
@@ -270,10 +322,7 @@ func uiPatchFragment(w http.ResponseWriter, r *http.Request, name string, data a
 		writeError(w, "failed to render fragment", http.StatusInternalServerError)
 		return
 	}
-	sse := datastar.NewSSE(w, r)
-	if err := sse.PatchElements(frag); err != nil {
-		slog.Debug("patch elements failed", "fragment", name, "error", err)
-	}
+	uiPatchElements(w, r, frag)
 }
 
 // uiBase assembles the shared view model. active names the expanded nav
@@ -654,7 +703,7 @@ func (s *Server) uiCopyToClipboard(value string) error {
 		return s.setClipboard(value)
 	})
 	switch {
-	case err != nil && err == errLauncherBusy:
+	case errors.Is(err, errLauncherBusy):
 		return fmt.Errorf("a clipboard write is already in progress; try again shortly")
 	case timedOut:
 		return fmt.Errorf("timed out writing to the clipboard (it may still be set)")

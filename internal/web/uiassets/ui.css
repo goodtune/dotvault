@@ -86,3 +86,6 @@ a.config-btn { text-decoration: none; display: inline-flex; align-items: center;
 .ui-page-subheading { font-size: 13px; color: #888; margin: 4px 0 20px; }
 
 .ui-inline-form { display: inline; }
+
+/* Pinned host key on the remote detail page (revealed on demand). */
+.ui-hostkey { margin-top: 8px; }

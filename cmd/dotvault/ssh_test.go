@@ -578,3 +578,159 @@ func TestSSHRemoveIsIdempotent(t *testing.T) {
 		t.Errorf("output = %q, want a message naming the host", out.String())
 	}
 }
+
+func TestSSHEditFlagsReachRequestBody(t *testing.T) {
+	sock := shortSocketPath(t)
+	var got sshEditRequest
+	var gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"host":"edit.example.com","port":2201,"remote_socket":"/new/sock","enabled":false}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	for flag, value := range map[string]string{"port": "2201", "socket": "/new/sock", "disable": "true"} {
+		if err := cmd.Flags().Set(flag, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out strings.Builder
+	cmd.SetOut(&out)
+	if err := runSSHEdit(cmd, []string{"edit.example.com"}); err != nil {
+		t.Fatalf("runSSHEdit: %v", err)
+	}
+
+	if gotPath != "/api/v1/ssh/remotes/edit.example.com" {
+		t.Errorf("request path = %q", gotPath)
+	}
+	if got.Port == nil || *got.Port != 2201 {
+		t.Errorf("request Port = %v, want 2201 (from --port)", got.Port)
+	}
+	if got.RemoteSocket == nil || *got.RemoteSocket != "/new/sock" {
+		t.Errorf("request RemoteSocket = %v, want /new/sock (from --socket)", got.RemoteSocket)
+	}
+	if got.Enabled == nil || *got.Enabled {
+		t.Errorf("request Enabled = %v, want false (from --disable)", got.Enabled)
+	}
+	// The daemon's effective values are echoed, not the flags as passed.
+	if !strings.Contains(out.String(), "port 2201") || !strings.Contains(out.String(), "disabled") {
+		t.Errorf("output = %q, want the daemon's effective entry", out.String())
+	}
+}
+
+func TestSSHEditOmitsUnchangedFields(t *testing.T) {
+	sock := shortSocketPath(t)
+	var raw map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"host":"edit.example.com","port":22,"remote_socket":"~/.ssh/dotvault.sock","enabled":true}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Set("enable", "true"); err != nil {
+		t.Fatal(err)
+	}
+	cmd.SetOut(&strings.Builder{})
+	if err := runSSHEdit(cmd, []string{"edit.example.com"}); err != nil {
+		t.Fatalf("runSSHEdit: %v", err)
+	}
+	// PATCH semantics: fields the user didn't pass must be absent from the
+	// body, not sent as zero values that would clobber the daemon's config.
+	if _, present := raw["port"]; present {
+		t.Errorf("port sent without --port: %v", raw)
+	}
+	if _, present := raw["remote_socket"]; present {
+		t.Errorf("remote_socket sent without --socket: %v", raw)
+	}
+	if v, present := raw["enabled"]; !present || v != true {
+		t.Errorf("enabled = %v, want true", v)
+	}
+}
+
+func TestSSHEditRequiresAChange(t *testing.T) {
+	// No daemon needed: the validation runs before any request.
+	cmd := newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	err := runSSHEdit(cmd, []string{"edit.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "nothing to change") {
+		t.Errorf("err = %v, want the nothing-to-change refusal", err)
+	}
+
+	cmd = newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	for _, flag := range []string{"enable", "disable"} {
+		if err := cmd.Flags().Set(flag, "true"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = runSSHEdit(cmd, []string{"edit.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("err = %v, want the enable/disable exclusivity refusal", err)
+	}
+}
+
+func TestSSHEditUnknownHost(t *testing.T) {
+	sock := shortSocketPath(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"no remote configured for that host"}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Set("disable", "true"); err != nil {
+		t.Fatal(err)
+	}
+	err := runSSHEdit(cmd, []string{"ghost.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "no managed remote configured for ghost.example.com") {
+		t.Errorf("err = %v, want the unknown-host message", err)
+	}
+}
+
+func TestSSHEditEmptySocketResetsToDefault(t *testing.T) {
+	sock := shortSocketPath(t)
+	var got sshEditRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/csrf", sshCSRFHandler)
+	mux.HandleFunc("PATCH /api/v1/ssh/remotes/{host}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"host":"edit.example.com","port":22,"remote_socket":"~/.ssh/dotvault.sock","enabled":true}`))
+	})
+	newUnixSSHServer(t, sock, mux)
+	useSSHDaemonConfig(t, sock)
+
+	cmd := newSSHEditCmd()
+	cmd.SetContext(context.Background())
+	// An explicit empty --socket is a reset, mirroring --port 0: the CLI
+	// substitutes the default because the daemon's PATCH validation rejects
+	// an empty remote_socket rather than defaulting it.
+	if err := cmd.Flags().Set("socket", ""); err != nil {
+		t.Fatal(err)
+	}
+	cmd.SetOut(&strings.Builder{})
+	if err := runSSHEdit(cmd, []string{"edit.example.com"}); err != nil {
+		t.Fatalf("runSSHEdit: %v", err)
+	}
+	if got.RemoteSocket == nil || *got.RemoteSocket != sshfwd.DefaultRemoteSocket {
+		t.Errorf("request RemoteSocket = %v, want the default %q", got.RemoteSocket, sshfwd.DefaultRemoteSocket)
+	}
+}

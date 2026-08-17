@@ -1,5 +1,5 @@
 {{define "content"}}
-<div data-signals="{confirmDelete: false}">
+<div data-signals="{confirmDelete: false, showKey: false}">
   <div class="secret-heading"><h2>{{.Remote.Host}}</h2></div>
   {{template "remote-state" .Remote}}
   {{if .FormError}}<div class="error-banner">{{.FormError}}</div>{{end}}
@@ -25,6 +25,17 @@
         </form>
         <button type="button" class="enrol-btn-secondary" data-on:click="$confirmDelete = false">Cancel</button>
       </div>
+    </div>
+    <div class="config-subsection">
+      <div class="config-subsection-title">Host key</div>
+      {{if .Remote.HostKey}}
+        {{if .Remote.HostKeyFingerprint}}<p class="ssh-fingerprint">{{.Remote.HostKeyFingerprint}}</p>{{end}}
+        <button type="button" class="enrol-btn-secondary" data-on:click="$showKey = !$showKey" data-text="$showKey ? 'Hide key' : 'Reveal key'">Reveal key</button>
+        <pre class="config-json ui-hostkey" data-show="$showKey" style="display: none">{{.Remote.HostKey}}</pre>
+        <p class="config-empty">This is the host&#8217;s public key &mdash; safe to share; it identifies the host, it doesn&#8217;t grant access.</p>
+      {{else}}
+        <p class="config-empty">No pinned host key &mdash; trust comes from a configured certificate authority.</p>
+      {{end}}
     </div>
   </div>
 </div>

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -827,5 +828,64 @@ func TestUISSHSSE_Unauthenticated(t *testing.T) {
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s unauthenticated: status = %d, want 401", path, resp.StatusCode)
 		}
+	}
+}
+
+// TestUIRemoteDetail_ShowsHostKey pins the host-key section of the detail
+// page: a pinned key renders its SHA256 fingerprint plus the revealable full
+// key, and a CA-covered remote (no pin) renders the explanatory note.
+func TestUIRemoteDetail_ShowsHostKey(t *testing.T) {
+	key, fingerprint := testHostKey(t)
+	s := testServerWithVault(t, uiTestVaultHandler(t))
+	s.cfg.Listen = "127.0.0.1:9000"
+	s.sshRegistry = newSSHRegistry(t, fixedVerifier{result: sshfwd.VerifyResult{
+		Verified:    true,
+		HostKey:     key,
+		Fingerprint: fingerprint,
+	}})
+	if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "pinned.example.com"},
+		sshfwd.AddOptions{AcceptFingerprint: fingerprint}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "ca.example.com"},
+		sshfwd.AddOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+
+	// html/template escapes + as &#43; (UTF-7 XSS normalization), so compare
+	// against the entity-decoded page.
+	body := html.UnescapeString(uiBody(t, uiGet(t, ts, "/ui/remotes/pinned.example.com/")))
+	if !strings.Contains(body, fingerprint) {
+		t.Errorf("detail page missing host key fingerprint %q", fingerprint)
+	}
+	if !strings.Contains(body, strings.TrimSpace(key)) {
+		t.Errorf("detail page missing the revealable host key")
+	}
+	if !strings.Contains(body, "Reveal key") {
+		t.Errorf("detail page missing the reveal control")
+	}
+
+	body = html.UnescapeString(uiBody(t, uiGet(t, ts, "/ui/remotes/ca.example.com/")))
+	if !strings.Contains(body, "No pinned host key") {
+		t.Errorf("CA-covered remote missing the no-pin note")
+	}
+	if strings.Contains(body, "Reveal key") {
+		t.Errorf("CA-covered remote must not offer a key reveal")
+	}
+}
+
+func TestUIHostKeyFingerprint(t *testing.T) {
+	key, fingerprint := testHostKey(t)
+	if got := uiHostKeyFingerprint(key); got != fingerprint {
+		t.Errorf("uiHostKeyFingerprint = %q, want %q", got, fingerprint)
+	}
+	if got := uiHostKeyFingerprint(""); got != "" {
+		t.Errorf("empty key fingerprint = %q, want empty", got)
+	}
+	if got := uiHostKeyFingerprint("not a key"); got != "" {
+		t.Errorf("garbage key fingerprint = %q, want empty", got)
 	}
 }

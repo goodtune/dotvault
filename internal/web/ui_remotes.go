@@ -9,6 +9,7 @@ import (
 	"time"
 
 	datastar "github.com/starfederation/datastar-go/datastar"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
@@ -27,6 +28,13 @@ type uiRemoteRow struct {
 	Reconnects   string
 	LastError    string
 	Href         string
+	// HostKey is the pinned host key in authorized-key form ("" when trust
+	// comes from a configured certificate authority instead); the detail
+	// page shows its fingerprint and reveals the full key on demand. Not a
+	// credential — it is the host's public key, the same value `dotvault ssh
+	// list` and GET /api/v1/ssh/remotes already serve.
+	HostKey            string
+	HostKeyFingerprint string
 }
 
 // uiRemoteStateLabel mirrors the SPA's STATE_LABELS lookup.
@@ -88,12 +96,14 @@ func (s *Server) uiRemoteRows() (rows []uiRemoteRow, unavailable bool, err error
 	rows = make([]uiRemoteRow, 0, len(remotes))
 	for _, rem := range remotes {
 		row := uiRemoteRow{
-			Host:         rem.Host,
-			Port:         rem.PortOrDefault(),
-			RemoteSocket: rem.RemoteSocket,
-			Enabled:      rem.EnabledOrDefault(),
-			Reconnects:   "—",
-			Href:         "/ui/remotes/" + url.PathEscape(rem.Host) + "/",
+			Host:               rem.Host,
+			Port:               rem.PortOrDefault(),
+			RemoteSocket:       rem.RemoteSocket,
+			Enabled:            rem.EnabledOrDefault(),
+			Reconnects:         "—",
+			Href:               "/ui/remotes/" + url.PathEscape(rem.Host) + "/",
+			HostKey:            rem.HostKey,
+			HostKeyFingerprint: uiHostKeyFingerprint(rem.HostKey),
 		}
 		if st, ok := live[rem.Host]; ok {
 			row.State = st.State
@@ -112,6 +122,21 @@ func (s *Server) uiRemoteRows() (rows []uiRemoteRow, unavailable bool, err error
 		rows = append(rows, row)
 	}
 	return rows, false, nil
+}
+
+// uiHostKeyFingerprint derives the SHA256 fingerprint of a pinned host key
+// (authorized-key form). An empty or unparsable key yields "" — the template
+// then falls back to showing the raw value, so a hand-edited ssh.yaml entry
+// is still visible rather than hidden behind a parse error.
+func uiHostKeyFingerprint(authorizedKey string) string {
+	if authorizedKey == "" {
+		return ""
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorizedKey))
+	if err != nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(pub)
 }
 
 // uiHostKeyConfirm carries a pending host-key confirmation through a page

@@ -51,7 +51,7 @@ the connection carrying the request is dropped mid-response as that forward's
 old connection is torn down. Re-run over a different path (directly, or a
 different managed forward) to confirm the result.`,
 	}
-	cmd.AddCommand(newSSHAddCmd(), newSSHListCmd(), newSSHRemoveCmd())
+	cmd.AddCommand(newSSHAddCmd(), newSSHEditCmd(), newSSHListCmd(), newSSHRemoveCmd())
 	return cmd
 }
 

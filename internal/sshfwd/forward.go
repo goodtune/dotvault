@@ -1,6 +1,7 @@
 package sshfwd
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -28,6 +29,20 @@ var recordSSHForwardFailure = observability.RecordSSHForwardFailure
 // parent directory, or a stale socket left by a crashed session.
 var ErrBind = errors.New("bind remote socket failed")
 
+// ErrSocketDir marks a failure to create the remote socket's parent
+// directory. Kept distinct from ErrBind because the two need different
+// answers from a human: ErrBind's causes are sshd policy or something
+// already occupying the path, whereas this one is a directory that could not
+// be created — an unwritable home, a read-only filesystem, or a path
+// component that exists as a non-directory.
+//
+// It only ever reaches a caller alongside a bind failure, never on its own:
+// creating the directory is best-effort (see ensureRemoteSocketDir), so a
+// mkdir that fails on a host where the bind then succeeds is not an error at
+// all. When both fail the returned error wraps this and ErrBind together, and
+// Classify reports the socket-dir class — that is the one a human can act on.
+var ErrSocketDir = errors.New("create remote socket directory failed")
+
 // Dialer opens a connection to the local API surface the forward targets.
 type Dialer func(ctx context.Context) (net.Conn, error)
 
@@ -45,7 +60,17 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // whether the path is actually safe to reclaim — see its doc for the full
 // rule, which is more subtle than "dial it and see" — and only when it says
 // yes is the path unlinked, at most once, with one retry.
+//
+// The socket's parent directory is created first, best-effort (see
+// ensureRemoteSocketDir and withSocketDirCause): the default remote_socket
+// lives under ~/.ssh, which a fresh remote account need not have, and sshd
+// cannot bind into a directory that does not exist — but a host that forbids
+// command execution altogether forwarded perfectly well before dotvault ever
+// ran a mkdir, and must keep doing so.
 func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(delta int)) error {
+	dirErr := ensureRemoteSocketDir(ctx, cl, socket)
+	fail := withSocketDirCause(dirErr)
+
 	ln, err := cl.ListenUnix(socket)
 	if err != nil {
 		bindErr := err
@@ -53,26 +78,36 @@ func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, targ
 
 		live, probeErr := liveListenerAt(ctx, cl, socket)
 		if probeErr != nil {
-			return fmt.Errorf("%w: %s: %w (stale-socket probe was inconclusive: %v)", ErrBind, socket, bindErr, probeErr)
+			return fail(fmt.Errorf("%w: %s: %w (stale-socket probe was inconclusive: %v)", ErrBind, socket, bindErr, probeErr))
 		}
 		if live {
 			// A successful direct-streamlocal dial proves something is
 			// actively listening at this path right now. Unlinking here would
 			// silently hijack that session — exactly the outcome this probe
 			// exists to prevent.
-			return fmt.Errorf("%w: %s: %w (a live listener already owns this path)", ErrBind, socket, bindErr)
+			return fail(fmt.Errorf("%w: %s: %w (a live listener already owns this path)", ErrBind, socket, bindErr))
 		}
 
 		if rmErr := removeRemoteFile(ctx, cl, socket); rmErr != nil {
-			return fmt.Errorf("%w: %s: %w (stale-socket cleanup also failed: %v)", ErrBind, socket, bindErr, rmErr)
+			return fail(fmt.Errorf("%w: %s: %w (stale-socket cleanup also failed: %v)", ErrBind, socket, bindErr, rmErr))
 		}
 		ln, err = cl.ListenUnix(socket)
 		if err != nil {
-			return fmt.Errorf("%w: %s: %w", ErrBind, socket, err)
+			return fail(fmt.Errorf("%w: %s: %w", ErrBind, socket, err))
 		}
 		slog.Info("reclaimed stale remote socket", "socket", socket)
 	}
 	defer ln.Close()
+
+	if dirErr != nil {
+		// The bind is the only thing the directory was needed for, and it
+		// worked: the directory already existed, or the remote refused the
+		// mkdir for a reason (no exec channel, a non-POSIX shell) that has no
+		// bearing on a forward that is now running. Nothing is wrong, so this
+		// is not a warning.
+		slog.Debug("creating the remote socket's parent directory failed, but the bind succeeded anyway",
+			"host", host, "socket", socket, "error", dirErr)
+	}
 
 	return serveListener(ctx, ln, host, target, onConn)
 }
@@ -377,6 +412,85 @@ func Pump(a, b net.Conn) {
 	b.Close()
 }
 
+// remoteSocketDirCommand is the shell command ensureRemoteSocketDir runs to
+// create dir. Split out so a test can exercise the exact command against a
+// real POSIX mkdir rather than restating the flags it hopes are there.
+//
+// mkdir -p is deliberately the whole operation. It succeeds when the
+// directory already exists, which is the required behaviour on every run
+// after the first, and it creates missing intermediate components. The mode
+// is only ever applied to directories mkdir itself creates — POSIX defines
+// -m as applying to the final directory operand as created, and mkdir -p
+// short-circuits before that when the operand already exists — so a user's
+// deliberate permissions on an existing ~/.ssh are left untouched. 0700 is
+// the right mode to *create* it with: that directory conventionally holds
+// private keys, so anything wider would be poor hygiene, and a socket
+// dotvault forwards Vault tokens over does not want a group- or
+// world-traversable parent either.
+//
+// The known gap, stated rather than papered over: POSIX applies -m to the
+// final operand only, so intermediate directories -p creates get the remote
+// account's umask instead. That is invisible for the default
+// ~/.ssh/dotvault.sock (whose parent is the final operand), but a nested
+// remote_socket such as ~/a/b/c.sock can leave ~/a group- or
+// world-traversable. Closing it would mean a second command chmod'ing each
+// component, which would then also have to decide what to do about
+// components the user created deliberately — a worse trade than documenting
+// it, so an operator who cares about a nested path should create and mode
+// the intermediates themselves.
+func remoteSocketDirCommand(dir string) string {
+	return "mkdir -p -m 700 -- " + shellQuote(dir)
+}
+
+// ensureRemoteSocketDir creates the parent directory of remotePath on the
+// remote, over an exec channel, before anything tries to bind there. sshd's
+// bind() cannot create the directory itself, and the *default* remote_socket
+// (~/.ssh/dotvault.sock) sits in a directory a freshly provisioned account
+// need not have — so without this the out-of-the-box configuration fails, and
+// fails misleadingly: ServeForward's bind-failure path reads any failure as a
+// possibly-stale socket and reports a stale-socket cleanup error for what is
+// simply an absent directory.
+//
+// It is best-effort, and its error must never on its own fail a forward. An
+// absolute remote_socket needed no exec channel at all before this existed
+// (see ExpandRemotePath, which only probes for a "~/" prefix, and for the
+// same reason), so a remote that permits streamlocal forwarding but not
+// command execution — an authorized_keys command= restriction, ForceCommand,
+// a restricted shell, a Windows OpenSSH account whose shell is cmd.exe —
+// worked perfectly well and must keep working. Callers therefore retain this
+// error, attempt the bind regardless, and only surface it if the bind then
+// fails too (withSocketDirCause), where it is the actionable root cause.
+//
+// The parent is derived with path.Dir, not filepath.Dir: remotePath names a
+// location on the remote, which is POSIX regardless of the OS this daemon
+// runs on, so a Windows daemon must not split it on backslashes. remotePath
+// has already been through ExpandRemotePath, so it is absolute and any "~/"
+// prefix is gone.
+func ensureRemoteSocketDir(ctx context.Context, cl *ssh.Client, remotePath string) error {
+	dir := path.Dir(remotePath)
+	if _, err := (sshRunner{cl: cl}).Run(ctx, remoteSocketDirCommand(dir)); err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrSocketDir, dir, err)
+	}
+	return nil
+}
+
+// withSocketDirCause returns a decorator for a bind failure that folds in
+// dirErr, the earlier best-effort ensureRemoteSocketDir failure, when there
+// was one. A mkdir that failed on a host where the bind then succeeded is not
+// an error at all; a mkdir that failed on a host where the bind then failed
+// is very likely *why* it failed, and is the half a human can act on — so it
+// has to be visible in the message rather than swallowed. The two are joined
+// with a double %w so errors.Is finds both ErrSocketDir and ErrBind, and
+// Classify (state.go) reports the socket-dir class in preference.
+func withSocketDirCause(dirErr error) func(error) error {
+	if dirErr == nil {
+		return func(err error) error { return err }
+	}
+	return func(err error) error {
+		return fmt.Errorf("%w (creating the socket's parent directory failed first, which is the likely cause: %w)", err, dirErr)
+	}
+}
+
 // removeRemoteFile unlinks path on the remote over an exec channel, guarded
 // on the remote actually being a socket. Only ever called with the exact
 // configured socket path, and only once liveListenerAt has already proven
@@ -426,7 +540,14 @@ func shellQuote(s string) string {
 }
 
 // sshRunner runs a command over an SSH session, satisfying CommandRunner so
-// ExpandRemotePath (home.go) can resolve a "~/" remote_socket prefix.
+// ExpandRemotePath (home.go) can resolve a "~/" remote_socket prefix, and
+// serving ensureRemoteSocketDir's mkdir as well.
+//
+// Stderr is captured and folded into the returned error. Without it every
+// remote failure collapses to the exit status — "Process exited with status
+// 1" says nothing about whether the home is unwritable, the filesystem is
+// read-only, or a path component exists as a file, and the remote already
+// wrote exactly that distinction to stderr.
 type sshRunner struct{ cl *ssh.Client }
 
 func (r sshRunner) Run(ctx context.Context, cmd string) (string, error) {
@@ -435,6 +556,9 @@ func (r sshRunner) Run(ctx context.Context, cmd string) (string, error) {
 		return "", fmt.Errorf("open session: %w", err)
 	}
 	defer sess.Close()
+
+	var stderr bytes.Buffer
+	sess.Stderr = &stderr
 
 	type result struct {
 		out []byte
@@ -448,11 +572,42 @@ func (r sshRunner) Run(ctx context.Context, cmd string) (string, error) {
 
 	select {
 	case <-ctx.Done():
+		// Deliberately does not touch stderr: the session goroutine may still
+		// be writing into it, and there is nothing to report anyway.
 		return "", ctx.Err()
-	case r := <-done:
-		if r.err != nil {
-			return "", fmt.Errorf("run %q: %w", cmd, r.err)
+	case res := <-done:
+		if res.err != nil {
+			// Safe to read now: Output has returned, so nothing is still
+			// writing to the buffer.
+			return "", fmt.Errorf("run %q: %w%s", cmd, res.err, stderrDetail(stderr.String()))
 		}
-		return string(r.out), nil
+		return string(res.out), nil
 	}
+}
+
+// stderrDetailLimit bounds how much remote stderr is quoted into an error. A
+// remote can emit arbitrarily much (a shell startup file gone wrong, a
+// banner); the first line or two is where the cause is.
+const stderrDetailLimit = 200
+
+// stderrDetail renders remote stderr as a parenthesised suffix for an error
+// message, or "" when the remote said nothing. Control characters — newlines
+// included, but equally the terminal escapes a remote is perfectly capable of
+// emitting into a message this daemon will log — are folded to spaces, and
+// the result is capped: this is a diagnostic hint, not a transcript.
+func stderrDetail(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	if runes := []rune(s); len(runes) > stderrDetailLimit {
+		s = string(runes[:stderrDetailLimit]) + "…"
+	}
+	return " (stderr: " + s + ")"
 }

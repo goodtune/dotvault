@@ -1,0 +1,88 @@
+/* Styles specific to the server-rendered /ui/ surface. The base look and
+   feel comes from the SPA's /style.css, which is loaded first; this file
+   only adds what the SSR pages need on top (accordion navigation, status
+   dots, link-shaped rows) without touching the SPA's classes. */
+
+/* Sidebar accordion: each section header is a link-row styled like the
+   SPA's .sidebar-header, and section items reuse .key-item. */
+.ui-nav-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+  font-weight: 600;
+  font-size: 14px;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  text-decoration: none;
+  border-bottom: 1px solid #f0f0f0;
+}
+.ui-nav-section-header:hover { background: #f8f9fa; }
+.ui-nav-section-header .key-chevron { margin-left: auto; font-size: 11px; color: #888; }
+.ui-nav-section-header.ui-nav-active { color: #1a73e8; }
+
+/* Nav rows are real links on the SSR surface. */
+a.key-item { text-decoration: none; color: inherit; display: flex; }
+a.key-item.selected { color: #1a73e8; }
+
+/* Quick-glance status dot beside enrolment / remote names. */
+.ui-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+  margin-left: auto;
+}
+.ui-dot-green { background: #059669; }
+.ui-dot-orange { background: #f59e0b; }
+.ui-dot-red { background: #dc2626; }
+.ui-dot-grey { background: #c4c4c4; }
+/* A dot ahead of an inline label (remote detail page). */
+.ui-dot-inline { margin-left: 0; margin-right: 6px; }
+
+.ui-nav-note { padding: 8px 16px; font-size: 13px; color: #999; }
+.ui-nav-error { color: #c5221f; }
+
+/* Header buttons that are links (Config) reuse .config-btn metrics. */
+a.config-btn { text-decoration: none; display: inline-flex; align-items: center; }
+
+/* Secret folder listing (a /ui/secrets/<folder>/ page). */
+.ui-folder-list { list-style: none; margin-top: 16px; }
+.ui-folder-list li { margin-bottom: 4px; }
+.ui-folder-list a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  text-decoration: none;
+  color: #333;
+  font-size: 14px;
+  background: white;
+  border: 1px solid #e0e0e0;
+}
+.ui-folder-list a:hover { background: #f8f9fa; }
+
+/* Remotes table rows link to the per-remote page. */
+.ssh-table a { color: #1a73e8; text-decoration: none; }
+.ssh-table a:hover { text-decoration: underline; }
+
+/* Simple enabled/disabled switch on the remote detail form. */
+.ui-check-row { display: flex; align-items: center; gap: 8px; margin: 8px 0 12px; font-size: 14px; color: #333; }
+.ui-check-row input { width: 16px; height: 16px; }
+
+/* Content-column card wrapper so detail pages match the SPA's card look. */
+.ui-content-card {
+  background: white;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 20px;
+  max-width: 640px;
+}
+
+.ui-page-heading { font-size: 22px; font-weight: 700; color: #1a1a2e; }
+.ui-page-subheading { font-size: 13px; color: #888; margin: 4px 0 20px; }
+
+.ui-inline-form { display: inline; }

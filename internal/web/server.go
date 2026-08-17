@@ -424,6 +424,11 @@ func (s *Server) registerUIRoutes() {
 	s.mux.HandleFunc("GET /api/v1/enrol/{group}/{name}/status", s.handleEnrolStatus)
 	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
 
+	// Server-rendered UI under /ui/ — the parallel, bookmarkable surface
+	// alongside the SPA (see ui.go). Registered here because, like the SPA,
+	// it is a browser surface that only makes sense on the TCP listener.
+	s.registerSSRUIRoutes()
+
 	// Static SPA files
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -728,7 +733,19 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// including the 403 we may write below for a forbidden Host.
 		// Browsers honour these headers on error responses too — without
 		// them a 403 page could be MIME-sniffed or framed by an attacker.
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		// The server-rendered /ui/ surface additionally needs 'unsafe-eval'
+		// (datastar compiles data-* attribute expressions with the Function
+		// constructor) and inline *styles* (the style="display: none"
+		// anti-flicker idiom on datastar data-show elements). Inline scripts
+		// remain forbidden on both surfaces (no script 'unsafe-inline'),
+		// which is the directive that matters for XSS — injected markup
+		// still cannot carry executable script, and datastar only evaluates
+		// expressions from attributes the server rendered.
+		if strings.HasPrefix(r.URL.Path, "/ui/") {
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'")
+		} else {
+			w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
 		// Wrap the writer so the metrics middleware can read back the
@@ -848,9 +865,8 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// recordWriteHeader is the internal hook for the ReaderFrom variants
-// fired before they hand the io.Reader off to the underlying writer's
-// ReadFrom. It does the same WriteHeader(StatusOK) the standard
+// recordWriteHeader is the internal hook the ReaderFrom and Flusher
+// variants fire before delegating to the underlying writer. It does the same WriteHeader(StatusOK) the standard
 // net/http response would do at its first byte — going through
 // s.WriteHeader so the implicit 200 reaches the underlying writer
 // too (some ResponseWriter implementations skip header emission
@@ -901,7 +917,10 @@ func wrapResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *statusReco
 // statusRecorderF wraps a writer that implements http.Flusher only.
 type statusRecorderF struct{ *statusRecorder }
 
-func (s *statusRecorderF) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderF) Flush() {
+	s.recordWriteHeader()
+	s.ResponseWriter.(http.Flusher).Flush()
+}
 
 // statusRecorderH wraps a writer that implements http.Hijacker only.
 type statusRecorderH struct{ *statusRecorder }
@@ -921,7 +940,10 @@ func (s *statusRecorderR) ReadFrom(r io.Reader) (int64, error) {
 // statusRecorderFH wraps a writer that implements Flusher + Hijacker.
 type statusRecorderFH struct{ *statusRecorder }
 
-func (s *statusRecorderFH) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFH) Flush() {
+	s.recordWriteHeader()
+	s.ResponseWriter.(http.Flusher).Flush()
+}
 func (s *statusRecorderFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return s.ResponseWriter.(http.Hijacker).Hijack()
 }
@@ -929,7 +951,10 @@ func (s *statusRecorderFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // statusRecorderFR wraps a writer that implements Flusher + ReaderFrom.
 type statusRecorderFR struct{ *statusRecorder }
 
-func (s *statusRecorderFR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFR) Flush() {
+	s.recordWriteHeader()
+	s.ResponseWriter.(http.Flusher).Flush()
+}
 func (s *statusRecorderFR) ReadFrom(r io.Reader) (int64, error) {
 	s.recordWriteHeader()
 	return s.ResponseWriter.(io.ReaderFrom).ReadFrom(r)
@@ -950,7 +975,10 @@ func (s *statusRecorderHR) ReadFrom(r io.Reader) (int64, error) {
 // interfaces — the common case under net/http's standard server.
 type statusRecorderFHR struct{ *statusRecorder }
 
-func (s *statusRecorderFHR) Flush() { s.ResponseWriter.(http.Flusher).Flush() }
+func (s *statusRecorderFHR) Flush() {
+	s.recordWriteHeader()
+	s.ResponseWriter.(http.Flusher).Flush()
+}
 func (s *statusRecorderFHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return s.ResponseWriter.(http.Hijacker).Hijack()
 }
@@ -1013,6 +1041,11 @@ func routeLabel(p string) string {
 		p == "/api/v1/remote/notify",
 		p == "/api/v1/remote/clipboard":
 		return p
+	case strings.HasPrefix(p, "/ui/"):
+		// The whole server-rendered surface collapses to one label: its
+		// paths embed secret keys, enrolment keys, and hostnames, which
+		// must not become metric attributes.
+		return "/ui/*"
 	case strings.HasPrefix(p, "/api/v1/"):
 		// Defensive collapse: a future endpoint added without
 		// updating the explicit list above would otherwise leak

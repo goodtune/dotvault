@@ -808,6 +808,20 @@ Two preconditions, neither fatal to the daemon (`sshForwardDeps`, `cmd/dotvault/
 
 Preact SPA embedded via `embed.FS`. Disabled by default (`web.enabled: true` to enable). Loopback-only binding is a hard invariant — the daemon refuses to start if `web.listen` resolves to a non-loopback address.
 
+### Server-rendered UI (`/ui/`)
+
+A parallel, bookmarkable server-rendered surface alongside the SPA (which remains untouched at `/`). Every page is Go `html/template` (`internal/web/uitmpl/*.tmpl`, embedded) with real URLs; interactivity comes from [datastar](https://data-star.dev) (`internal/web/uiassets/datastar.js`, vendored + embedded; Go side uses `github.com/starfederation/datastar-go`) patching server-rendered fragments over SSE. The look and feel deliberately reuses the SPA's `/style.css` classes plus a small `/ui/assets/ui.css` overlay; layout differs by design — a left accordion nav (Enrolments / Remotes / Secrets, one section expanded per route) replaces the SPA's header-button navigation, and the config page keeps the nav instead of a "back to dashboard" button.
+
+Pages: `/ui/` (dashboard: header status bar + `secret_view_text` markdown), `/ui/secrets/` (+ `/ui/secrets/<key>` detail with reveal/copy, `/ui/secrets/<folder>/` listing; trailing-slash spellings accepted), `/ui/enrolments/` (+ `/ui/enrolments/<engine>/<key>/` where the enrolment runs — the card states port `enrol-card.jsx`'s output parsing to Go in `ui_enrol.go`, and a running card polls its own fragment every 2s), `/ui/remotes/` (+ `/ui/remotes/<host>/` edit form; add/save/delete are plain form POSTs through the same `sshfwd.Registry`, including the 409-fingerprint confirm gesture), `/ui/config/` (same `buildConfigViewModel` the JSON `/api/v1/config` serves — one builder, two surfaces).
+
+Conventions that must hold when extending it:
+
+- **Request posture.** Page GETs redirect unauthenticated browsers to the SPA at `/` (the SPA owns every login flow). Fragment GETs 401. All `/ui/` POSTs go through `requireUIWrite`: a **present, same-origin `Origin` header is required** — this is the surface's CSRF control (browsers attach Origin to every POST; server-rendered forms and multi-tab use make the SPA's one-shot CSRF store a poor fit). Unlike the peer-action endpoints, an absent Origin is rejected: these endpoints have no curl consumer.
+- **Secrets never ride in page HTML.** The detail table renders masked cells; the eye button `@get`s a reveal fragment (which re-masks itself after 30s via `data-init__delay.30s`), and the clipboard button copies **server-side** via the shared `guardedLaunch` + `clipboard.Set` path — the value never reaches the browser. The "copy token" header button works the same way.
+- **CSP.** `/ui/` responses get `script-src 'self' 'unsafe-eval'` (datastar compiles attribute expressions with the Function constructor) and `style-src 'self' 'unsafe-inline'` (the `style="display: none"` anti-flicker idiom on `data-show` elements). Inline *scripts* stay forbidden on both surfaces; do not use datastar's `ExecuteScript`/`Redirect` SSE helpers, which inject inline `<script>` tags the CSP blocks — use HTTP 303 redirects from form POSTs instead.
+- **Metrics.** All `/ui/` paths collapse to the `/ui/*` route label (they embed secret keys and hostnames).
+- html/template treats `data-on:*` attributes as JavaScript context and escapes interpolated URLs as JS strings (`\/`, `&`) — correct, since datastar evaluates them as JS; don't "fix" the escaping, and keep interpolations inside those attributes to URL-encoded values.
+
 The same server can additionally (or instead) serve its API over a per-user Unix socket when `api.enabled` — see "Local API socket" under Authentication for the route split, the Origin consequence, and why the two surfaces are enabled independently.
 
 ### Routes

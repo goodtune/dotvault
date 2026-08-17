@@ -1,0 +1,16 @@
+{{/* Secret field-table cell and button fragments. Each carries a stable id
+     so a datastar patch swaps exactly one element; the reveal cell re-masks
+     itself after 30 seconds via a delayed @get, matching the SPA's client-side
+     auto-hide. */}}
+
+{{define "masked-cell"}}<td id="ui-val-{{.ID}}" class="field-value"><span class="masked">&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;</span></td>{{end}}
+
+{{define "revealed-cell"}}<td id="ui-val-{{.ID}}" class="field-value" data-init__delay.30s="@get('{{.MaskURL}}')"><code>{{.Value}}</code></td>{{end}}
+
+{{define "eye-btn"}}<button id="ui-eye-{{.ID}}" class="reveal-btn" title="Reveal" data-on:click="@get('{{.RevealURL}}')">&#128065;</button>{{end}}
+
+{{define "eye-btn-open"}}<button id="ui-eye-{{.ID}}" class="reveal-btn" title="Hide" data-on:click="@get('{{.MaskURL}}')">&#128065;&#65039;</button>{{end}}
+
+{{define "copy-btn"}}<button id="ui-copy-{{.ID}}" class="copy-btn" title="Copy to this machine&#39;s clipboard" data-on:click="@post('{{.CopyURL}}')">&#128203;</button>{{end}}
+
+{{define "copy-btn-done"}}<button id="ui-copy-{{.ID}}" class="copy-btn copied" title="Copied!" data-init__delay.2s="@get('{{.CopyBtnURL}}')">&#9989;</button>{{end}}

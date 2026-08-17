@@ -1,0 +1,48 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{if .Title}}{{.Title}} · {{end}}.vault</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/ui/assets/ui.css">
+  <script type="module" src="/ui/assets/datastar.js"></script>
+</head>
+<body>
+  <header class="status-bar">
+    <div class="status-left">
+      <span class="app-title">.vault{{if .Version}} <span class="app-version">v{{.Version}}</span>{{end}}</span>
+      {{template "conn-pill" .Authenticated}}
+      {{if .VaultURL}}<a class="vault-link" href="{{.VaultURL}}" target="_blank" rel="noopener noreferrer">Vault &#8599;</a>{{end}}
+    </div>
+    <div class="status-right">
+      {{template "updated-span" .Updated}}
+      <a class="config-btn" href="/ui/config/" title="View effective configuration">Config</a>
+      {{template "copy-token-btn" .}}
+      {{template "sync-btn" .}}
+      <span id="ui-live" data-init="@get('/ui/sse')" hidden></span>
+    </div>
+  </header>
+  {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
+  <div class="main-layout">
+    {{template "nav" .}}
+    <main class="secret-panel">
+      {{block "content" .}}{{end}}
+    </main>
+  </div>
+</body>
+</html>
+{{end}}
+
+{{define "conn-pill"}}<span id="ui-conn" class="status-indicator {{if .}}status-ok{{else}}status-error{{end}}">{{if .}}Connected{{else}}Disconnected{{end}}</span>{{end}}
+
+{{define "updated-span"}}<span id="ui-updated" class="last-sync">Updated: {{.}}</span>{{end}}
+
+{{define "sync-btn"}}<button id="ui-sync-btn" class="sync-btn" data-on:click="@post('/ui/actions/sync')">Sync Now</button>{{end}}
+
+{{define "sync-btn-done"}}<button id="ui-sync-btn" class="sync-btn" disabled data-init__delay.2s="@get('/ui/fragments/sync-btn')">Sync triggered &#10003;</button>{{end}}
+
+{{define "copy-token-btn"}}<button id="ui-copy-token" class="copy-token-btn" title="Copy Vault token to this machine&#39;s clipboard" data-on:click="@post('/ui/actions/copy-token')">&#128203;</button>{{end}}
+
+{{define "copy-token-btn-done"}}<button id="ui-copy-token" class="copy-token-btn copied" title="Token copied!" data-init__delay.2s="@get('/ui/fragments/copy-token-btn')">&#9989;</button>{{end}}

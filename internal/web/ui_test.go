@@ -46,6 +46,15 @@ func uiTestVaultHandler(t *testing.T) http.Handler {
 			})
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/users/testuser/databricks") {
+			// A data GET on a folder path is a 40x on a real Vault — a KVv2
+			// data read and a metadata list are different capabilities, and
+			// list-only policies deny the read outright. Answer like one so
+			// a handler that blindly reads a folder URL fails loudly here.
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
 		w.WriteHeader(http.StatusNotFound)
 	})
 }
@@ -887,5 +896,26 @@ func TestUIHostKeyFingerprint(t *testing.T) {
 	}
 	if got := uiHostKeyFingerprint("not a key"); got != "" {
 		t.Errorf("garbage key fingerprint = %q, want empty", got)
+	}
+}
+
+// TestUIFolderURL_ListsWithoutReading pins the fix for the folder-URL 40x:
+// /ui/secrets/<folder>/ must resolve via LIST, not a blind data GET — the
+// fake Vault answers a data GET on the folder path with 403 exactly as a
+// list-only policy would, so a regression to read-first renders the error
+// banner instead of the folder page.
+func TestUIFolderURL_ListsWithoutReading(t *testing.T) {
+	_, ts := uiTestServer(t)
+
+	resp := uiGet(t, ts, "/ui/secrets/databricks/")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := uiBody(t, resp)
+	if strings.Contains(body, "failed to read secret") {
+		t.Fatalf("folder URL surfaced a read error — the handler must list first")
+	}
+	if !strings.Contains(body, `href="/ui/secrets/databricks/prod"`) {
+		t.Errorf("folder page missing child link")
 	}
 }

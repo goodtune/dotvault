@@ -73,9 +73,14 @@ func (s *Server) handleUISecretsIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUISecret renders /ui/secrets/<key> (secret detail) or
-// /ui/secrets/<folder>/ (folder listing). Trailing-slash URLs are accepted
-// for secrets too — the trimmed path is tried as a secret first, then as a
-// folder — so both spellings are bookmarkable.
+// /ui/secrets/<folder>/ (folder listing). The URL shape declares the
+// intent, and the first Vault operation follows it: a trailing slash means
+// LIST first — issuing a blind GET on a folder path is a 40x under real
+// Vault policies (a KVv2 data read and a metadata list are different
+// capabilities), and the previous read-first order surfaced that as an
+// error banner before the folder listing was ever attempted. Each shape
+// still falls back to the other interpretation afterwards, so both
+// spellings of either kind stay bookmarkable.
 func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 	if !s.requireUIPage(w, r) {
 		return
@@ -86,6 +91,7 @@ func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trimmed := strings.TrimSuffix(rawPath, "/")
+	isFolderURL := strings.HasSuffix(rawPath, "/")
 	if trimmed == "" {
 		http.Redirect(w, r, "/ui/secrets/", http.StatusSeeOther)
 		return
@@ -94,27 +100,44 @@ func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+trimmed)
-	if err != nil {
-		slog.Error("ui: read secret failed", "path", trimmed, "error", err)
-		data := struct{ uiPageData }{s.uiBase(ctx, trimmed, "secrets", rawPath)}
-		data.Error = "failed to read secret"
-		s.uiRenderPage(w, "dashboard", data)
-		return
+	list := func() bool {
+		children, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix()+trimmed+"/")
+		if err != nil {
+			// Fall through to the read, but leave a trace: a transient LIST
+			// failure here would otherwise be masked by whatever the read
+			// then reports as the cause.
+			slog.Warn("ui: list secrets failed", "path", trimmed, "error", err)
+			return false
+		}
+		if len(children) == 0 {
+			return false
+		}
+		s.renderUISecretFolder(w, ctx, trimmed, children)
+		return true
 	}
-	if secret != nil {
-		s.renderUISecretDetail(w, ctx, trimmed, secret.Version, secret.Data)
+
+	if isFolderURL && list() {
 		return
 	}
 
-	// Not a secret — try it as a folder.
-	children, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix()+trimmed+"/")
-	if err == nil && len(children) > 0 {
-		s.renderUISecretFolder(w, ctx, trimmed, children)
+	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+trimmed)
+	if err == nil && secret != nil {
+		s.renderUISecretDetail(w, ctx, trimmed, secret.Version, secret.Data)
 		return
 	}
-	data := struct{ uiPageData }{s.uiBase(ctx, trimmed, "secrets", "")}
-	data.Error = "secret not found"
+	// A slash-less URL naming a folder still resolves (the fallback in the
+	// other direction).
+	if !isFolderURL && list() {
+		return
+	}
+
+	data := struct{ uiPageData }{s.uiBase(ctx, trimmed, "secrets", rawPath)}
+	if err != nil {
+		slog.Error("ui: read secret failed", "path", trimmed, "error", err)
+		data.Error = "failed to read secret"
+	} else {
+		data.Error = "secret not found"
+	}
 	s.uiRenderPage(w, "dashboard", data)
 }
 

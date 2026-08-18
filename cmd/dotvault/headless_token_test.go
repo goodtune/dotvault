@@ -275,6 +275,10 @@ func TestWaitForHeadlessToken_RecordsRejectedToken(t *testing.T) {
 	if waitForHeadlessToken(ctx, vc, tokenPath, nil, denyList) {
 		t.Fatal("waitForHeadlessToken returned true for a token Vault refuses")
 	}
+	// One pass, one question. This bound is a guard rather than the
+	// load-bearing part — the idle loop's ticker is 10s, so a 300ms window
+	// holds one pass either way; the assertion below is what fails if the
+	// wiring is removed.
 	if got := calls.Load(); got != 1 {
 		t.Errorf("lookup-self called %d times, want 1", got)
 	}

@@ -33,6 +33,17 @@ import (
 // means "the credential situation changed" (a token-file write, a peer socket
 // reconnecting, SIGHUP) clears the cache outright, so the window is only ever
 // the fallback for changes dotvault cannot observe.
+//
+// The cost of the window, stated plainly: while a token is suppressed the
+// manager is not calling lookup-self, and so is not renewing either. For the
+// case this exists for that is no loss (a dead token cannot be renewed), but in
+// the "403 that was not about the token" case it means a token that was fine
+// can go up to this long without a renewal it might have needed. Renewal was
+// already unreachable on that path before this change — checkAndRenew returns
+// on the lookup error and never gets as far as RenewSelf — so the window
+// lengthens an existing gap rather than opening a new one. It is bounded well
+// under a typical Vault token TTL, and any of the clearing events closes it
+// immediately.
 const DenyProbeInterval = 15 * time.Minute
 
 // maxDeniedTokens bounds the cache. In practice it holds one or two entries
@@ -102,17 +113,20 @@ func (d *TokenDenylist) Denied(ctx context.Context, token string) bool {
 	}
 	key := tokenKey(token)
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	until, ok := d.denied[key]
-	if !ok {
-		return false
-	}
-	if !d.clock().Before(until) {
+	suppressed := ok && d.clock().Before(until)
+	if ok && !suppressed {
 		delete(d.denied, key)
-		return false
 	}
-	observability.RecordTokenDenylist(ctx, "suppressed")
-	return true
+	d.mu.Unlock()
+
+	// Recorded outside the lock: the mutex stays a leaf, so a future
+	// observability change (an exporter taking its own locks, a callback)
+	// cannot deadlock against it. Matches Clear.
+	if suppressed {
+		observability.RecordTokenDenylist(ctx, "suppressed")
+	}
+	return suppressed
 }
 
 // Deny suppresses token for the re-probe window and reports whether this was a
@@ -201,11 +215,22 @@ func (d *TokenDenylist) window() time.Duration {
 	return d.interval
 }
 
+// clock returns the current time with any monotonic reading stripped, so
+// comparisons against a stored deadline use the wall clock.
+//
+// This matters on a laptop. A monotonic reading freezes across suspend, so a
+// machine that slept eight hours would resume with the re-probe window barely
+// advanced and stay blind for up to another 15 minutes of uptime — when resume,
+// with its fresh network and possibly fresh credentials, is exactly the moment
+// a cheap re-probe pays. Wall-clock comparison means the window has genuinely
+// elapsed. The window is a heuristic backstop, not a security control, so the
+// usual wall-clock hazard (an NTP step lengthening or shortening it) costs at
+// most one lookup either way.
 func (d *TokenDenylist) clock() time.Time {
 	if d.now == nil {
-		return time.Now()
+		return time.Now().Round(0)
 	}
-	return d.now()
+	return d.now().Round(0)
 }
 
 // evictOldestLocked removes the entry whose suppression lapses soonest. Called

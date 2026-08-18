@@ -157,6 +157,9 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disa
 // populating, so a token those steps watched Vault reject is not re-presented
 // once the lifecycle manager takes over. A nil argument is ignored — the
 // manager always has a working cache.
+//
+// Call before Start: like the other Set* wiring, this is an unsynchronised
+// field write that the lifecycle goroutine reads.
 func (lm *LifecycleManager) SetTokenDenylist(d *TokenDenylist) {
 	if d == nil {
 		return
@@ -352,10 +355,11 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 					//     this branch the manager would slip into the
 					//     transient-error path, back off to 5m, and never
 					//     observe a fresh token written to disk.
-					// IsDenied is the cached form of the same verdict: the
-					// current token is suppressed, so checkAndRenew returned
-					// without asking Vault a question it has already answered.
-					if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
+					// IsDenied and IsNoToken are the cached forms of the same
+					// verdicts: checkAndRenew returned without asking Vault a
+					// question it had already answered (a suppressed token) or
+					// could answer itself (no token at all).
+					if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || IsNoToken(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
 						// Try reloading the token from disk/env before
 						// declaring re-auth — a parallel `dotvault login`
 						// may have already written a fresh token. If the
@@ -569,13 +573,34 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 	// errTokenDenied routes through the same recovery branch a live 403 does,
 	// so the manager still reloads, recovers and signals re-auth exactly as
 	// before, just without the round trip.
-	if tok := lm.client.Token(); lm.denied.Denied(ctx, tok) {
+	tok := lm.client.Token()
+
+	// No token at all. Vault answers "missing client token" (400) to that, and
+	// it is a question the client can answer about itself. This is not a corner
+	// case: in web mode signalReauth's OnReauth hook clears the in-memory token
+	// (web.Server.ForceReauth), so from the first re-auth signal onward EVERY
+	// recovery poll would send a tokenless lookup — the same 10s storm as a
+	// stale token, in 400s rather than 403s. The Start loop already treats an
+	// empty token as a first-class recovery input, so returning the sentinel
+	// reaches exactly the same reload/recover/re-auth handling.
+	if tok == "" {
+		return errNoToken
+	}
+
+	// The token on the client is one Vault has already rejected. Sending
+	// lookup-self again would ask an unchanged question and get the same
+	// answer; at the 10s recovery cadence that alone was tens of thousands of
+	// denied requests a week per host. Report the cached verdict instead —
+	// errTokenDenied routes through the same recovery branch a live 403 does,
+	// so the manager still reloads, recovers and signals re-auth exactly as
+	// before, just without the round trip.
+	if lm.denied.Denied(ctx, tok) {
 		return errTokenDenied
 	}
 
 	secret, err := lm.client.LookupSelf(ctx)
 	if err != nil {
-		lm.denied.NoteRejection(ctx, lm.client.Token(), err)
+		lm.denied.NoteRejection(ctx, tok, err)
 		return err
 	}
 
@@ -609,7 +634,7 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 		// expired token is as dead as a revoked one, and Vault answering
 		// lookup-self with expire_time in the past is as final a verdict as a
 		// 403. Without this the next poll would ask again.
-		lm.denied.NoteRejection(ctx, lm.client.Token(), errTokenExpired)
+		lm.denied.NoteRejection(ctx, tok, errTokenExpired)
 		return errTokenExpired
 	}
 
@@ -712,6 +737,26 @@ func (*expiredError) Error() string { return "vault token has expired" }
 // as a 403 response.
 func IsExpired(err error) bool {
 	_, ok := err.(*expiredError)
+	return ok
+}
+
+// errNoToken is returned by checkAndRenew when the client holds no token at
+// all — the state web mode enters as soon as OnReauth clears it. Vault answers
+// that with a 400 "missing client token", which tells the daemon nothing it did
+// not already know, so the question is not asked. The Start loop routes it
+// through the recovery branch (which tests for it explicitly, rather than
+// relying on re-reading the client's token and finding it still empty — a
+// concurrent web login landing in that window would otherwise divert a
+// recovery cycle into the transient-error backoff).
+var errNoToken = &noTokenError{}
+
+type noTokenError struct{}
+
+func (*noTokenError) Error() string { return "no vault token held" }
+
+// IsNoToken reports whether err is the no-token sentinel.
+func IsNoToken(err error) bool {
+	_, ok := err.(*noTokenError)
 	return ok
 }
 

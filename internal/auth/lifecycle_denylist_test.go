@@ -184,3 +184,95 @@ func TestLifecycleManager_ReloadRetriesThenReSuppresses(t *testing.T) {
 		t.Errorf("Reload() cost %d lookups, want <= 4 (one per token, then re-suppressed)", grew)
 	}
 }
+
+// TestLifecycleManager_NoTokenSendsNoLookup covers the web-mode variant of the
+// same storm, which pre-push review caught: signalReauth's OnReauth hook clears
+// the in-memory token (web.Server.ForceReauth), so from the first re-auth
+// signal onward the client holds nothing. A tokenless lookup-self is answered
+// "missing client token" (400) — a question the client can answer about itself
+// — and at the 10s recovery cadence that is the same request volume as a stale
+// token, merely in 400s rather than 403s. Suppressing on the token's value does
+// not cover it, because "" is deliberately not a denylist entry.
+func TestLifecycleManager_NoTokenSendsNoLookup(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	cv := newCountingVault(t)
+
+	vc, err := vault.NewClient(vault.Config{Address: cv.URL, Token: "doomed-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
+	// Model web mode: the re-auth callback clears the token, exactly as
+	// web.Server.ForceReauth does.
+	lm.SetOnReauth(func() { vc.SetToken("") })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lm.Start(ctx)
+
+	settled := waitForLookupsToSettle(t, cv, 300*time.Millisecond)
+	if settled > 2 {
+		t.Errorf("lookup-self called %d times before settling, want <= 2 (one for the token, none once it was cleared)", settled)
+	}
+	if got := vc.Token(); got != "" {
+		t.Fatalf("precondition: client token = %q, want empty (OnReauth should have cleared it)", got)
+	}
+
+	// The daemon must still be *watching* — a token appearing later is picked
+	// up. Not asking Vault is not the same as giving up.
+	cv.accept("fresh-token")
+	vc.SetToken("fresh-token")
+	deadline := time.Now().Add(2 * time.Second)
+	for lm.NeedsReauth() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() still true after a valid token was set; the poll must keep checking, it just must not ask about nothing")
+	}
+}
+
+// TestLifecycleManager_SuppressionLapsesAndRetries pins the re-probe backstop at
+// the manager level: a token suppressed after a 403 that was never really about
+// the token (a policy gap corrected at Vault, a failover completing) must be
+// tried again once the window elapses, with no file write, socket reconnect or
+// SIGHUP to clear it. Without that, a daemon would stay blind until restarted.
+func TestLifecycleManager_SuppressionLapsesAndRetries(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	cv := newCountingVault(t)
+
+	vc, err := vault.NewClient(vault.Config{Address: cv.URL, Token: "server-side-problem"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
+	// A window short enough to elapse during the test. Built directly rather
+	// than via NewTokenDenylist so the interval is injectable.
+	lm.SetTokenDenylist(&TokenDenylist{
+		denied:   make(map[string]time.Time),
+		interval: 100 * time.Millisecond,
+		now:      time.Now,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lm.Start(ctx)
+
+	// Let it suppress the token, then fix the "server side".
+	deadline := time.Now().Add(2 * time.Second)
+	for cv.lookups.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cv.accept("server-side-problem")
+
+	// No clearing event — only the window lapsing can get it retried.
+	for lm.NeedsReauth() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lm.NeedsReauth() {
+		t.Error("token never re-probed after the suppression window lapsed; a server-side fix must eventually heal without a restart")
+	}
+}

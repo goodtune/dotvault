@@ -185,3 +185,45 @@ func TestTokenDenylist_KeysAreHashed(t *testing.T) {
 		}
 	}
 }
+
+// TestTokenDenylist_EvictsClosestToReprobe pins the eviction choice the bound
+// documents. Entries are given distinct deadlines through the injected clock —
+// without that they share a near-identical expiry and any eviction order looks
+// correct, which is why an entry-count assertion alone does not cover this.
+func TestTokenDenylist_EvictsClosestToReprobe(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	d := &TokenDenylist{
+		denied:   make(map[string]time.Time),
+		interval: time.Hour,
+		now:      func() time.Time { return now },
+	}
+
+	// "oldest" is denied first and so re-probes soonest; fill the rest of the
+	// cache a minute apart.
+	d.Deny("oldest")
+	for i := 1; i < maxDeniedTokens; i++ {
+		now = now.Add(time.Minute)
+		d.Deny(fmt.Sprintf("token-%d", i))
+	}
+	if d.Len() != maxDeniedTokens {
+		t.Fatalf("precondition: Len() = %d, want %d", d.Len(), maxDeniedTokens)
+	}
+
+	// One more entry must displace the one whose suppression was worth least.
+	now = now.Add(time.Minute)
+	d.Deny("newcomer")
+
+	if d.Denied(ctx, "oldest") {
+		t.Error("evicted entry should have been the one closest to re-probing, but \"oldest\" is still suppressed")
+	}
+	if !d.Denied(ctx, "newcomer") {
+		t.Error("newly denied token was not retained")
+	}
+	if !d.Denied(ctx, "token-1") {
+		t.Error("a newer entry was evicted ahead of the oldest one")
+	}
+	if got := d.Len(); got > maxDeniedTokens {
+		t.Errorf("Len() = %d, want <= %d", got, maxDeniedTokens)
+	}
+}

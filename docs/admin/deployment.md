@@ -308,6 +308,7 @@ The exporter emits a bounded set of instruments:
 | `dotvault.vault.calls`          | counter   | `op={read,write,lookup_self,renew_self}`, `status`   |
 | `dotvault.token.renewals`       | counter   | `outcome={renewed,reauth_required,failed}`           |
 | `dotvault.token.ttl_remaining`  | histogram | (no attrs)                                           |
+| `dotvault.token.denylist`       | counter   | `event={denied,suppressed,cleared}` — a token Vault rejected entering suppression, a `lookup-self` skipped because of one, and a suppression dropped after the credential situation changed (token file written, peer socket reconnected, SIGHUP). A rising `suppressed` against a flat `denied` is a host sitting without a usable token; before suppression existed that same condition showed up as `dotvault.vault.calls{op="lookup_self",status="denied"}` climbing at one call per 10s indefinitely. See [Tokens Vault has already refused](../authentication/token.md#tokens-vault-has-already-refused) |
 | `dotvault.enrol.attempts`       | counter   | `engine`, `outcome={completed,error}`                |
 | `dotvault.web.requests`         | counter   | `route`, `status_class={1xx…5xx}`                    |
 | `dotvault.config.reloads`       | counter   | `outcome={no_change,applied,error}`                  |

@@ -42,6 +42,14 @@ type LifecycleManager struct {
 	// same stale value. Empty means no reload attempt is made.
 	tokenFilePath string
 
+	// denied suppresses tokens Vault has already rejected, so a dead token —
+	// the classic case being an expired one sitting in ~/.dotvault-token — is
+	// not re-presented to lookup-self on every recovery poll for the rest of
+	// the daemon's life. Never nil: NewLifecycleManager creates one, and
+	// SetTokenDenylist only replaces it (with the shared instance startup used
+	// before this manager existed). See TokenDenylist.
+	denied *TokenDenylist
+
 	// tokenSockets is an ordered list of peer dotvault web-API Unix sockets.
 	// When non-empty, tryReload also consults each peer for a fresh token
 	// (after the file and env candidates) so a daemon whose token has gone
@@ -139,7 +147,21 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disa
 		currentDelay:     checkInterval,
 		maxDelay:         5 * time.Minute,
 		reloadCh:         make(chan struct{}, 1),
+		denied:           NewTokenDenylist(),
 	}
+}
+
+// SetTokenDenylist replaces the manager's denied-token cache with a shared one.
+// The daemon uses this to hand over the cache its startup path (the initial
+// reuse check, the peer borrow, and the headless idle loop) has already been
+// populating, so a token those steps watched Vault reject is not re-presented
+// once the lifecycle manager takes over. A nil argument is ignored — the
+// manager always has a working cache.
+func (lm *LifecycleManager) SetTokenDenylist(d *TokenDenylist) {
+	if d == nil {
+		return
+	}
+	lm.denied = d
 }
 
 // Reload signals the lifecycle goroutine to perform an immediate
@@ -289,8 +311,17 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 			case <-ctx.Done():
 				return
 			case <-lm.reloadCh:
-				// External nudge (SIGHUP → Reload()). Try to swap to a
-				// fresh token from disk. On success, reset the timer to
+				// An external nudge means the credential situation may have
+				// changed under us: the token file was rewritten (the inotify
+				// watcher), a peer socket reconnected, or an operator sent
+				// SIGHUP. Drop every suppression first so a token we had given
+				// up on is tried again — including one whose bytes are
+				// unchanged, since the reason Vault rejected it may have been
+				// server-side. Vault denying it again re-suppresses it on the
+				// spot, so a pathological writer costs one lookup per write
+				// rather than one per poll.
+				lm.denied.Clear(ctx)
+				// Try to swap to a fresh token from disk. On success, reset the timer to
 				// the normal check interval so a recovery-mode 10s tick
 				// doesn't fire shortly after. On failure (no candidate,
 				// or all candidates invalid) leave the schedule alone —
@@ -321,7 +352,10 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 					//     this branch the manager would slip into the
 					//     transient-error path, back off to 5m, and never
 					//     observe a fresh token written to disk.
-					if vault.IsForbidden(err) || IsExpired(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
+					// IsDenied is the cached form of the same verdict: the
+					// current token is suppressed, so checkAndRenew returned
+					// without asking Vault a question it has already answered.
+					if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
 						// Try reloading the token from disk/env before
 						// declaring re-auth — a parallel `dotvault login`
 						// may have already written a fresh token. If the
@@ -349,7 +383,17 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 							continue
 						}
 						nextDelay := lm.recoveryInterval
-						slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
+						// Warn on the transition only. The recovery poll keeps
+						// running for as long as the daemon sits without a
+						// usable token, and re-stating the same fact every 10s
+						// buries the one line that mattered — the same
+						// repetition problem on the log side that the denylist
+						// fixes on the request side.
+						if lm.needsReauth.Load() {
+							slog.Debug("still awaiting a usable vault token", "error", err, "next_retry", nextDelay)
+						} else {
+							slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
+						}
 						lm.signalReauth(ctx, errCh, err)
 						lm.currentDelay = nextDelay
 					} else if IsRenewFailed(err) {
@@ -468,6 +512,14 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 		if tok == "" || tok == current {
 			return
 		}
+		// Vault has already answered for this one. Re-reading the same stale
+		// token file every poll and re-asking is exactly the loop this cache
+		// exists to break; Reload (token file rewritten, socket reconnected,
+		// SIGHUP) clears it when there is reason to think the answer changed.
+		if lm.denied.Denied(ctx, tok) {
+			slog.Debug("skipping token candidate vault has already rejected")
+			return
+		}
 		for _, c := range candidates {
 			if c == tok {
 				return
@@ -498,6 +550,10 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 			slog.Info("picked up fresh vault token")
 			return true
 		} else {
+			// A rejected candidate is suppressed so the next poll skips it
+			// outright; NoteRejection ignores transient failures (unreachable
+			// Vault, 5xx), which must stay retryable.
+			lm.denied.NoteRejection(ctx, candidate, err)
 			slog.Warn("attempted token reload, candidate is also invalid", "error", err)
 		}
 	}
@@ -506,8 +562,20 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 }
 
 func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
+	// The token on the client is one Vault has already rejected. Sending
+	// lookup-self again would ask an unchanged question and get the same
+	// answer; at the 10s recovery cadence that alone was tens of thousands of
+	// denied requests a week per host. Report the cached verdict instead —
+	// errTokenDenied routes through the same recovery branch a live 403 does,
+	// so the manager still reloads, recovers and signals re-auth exactly as
+	// before, just without the round trip.
+	if tok := lm.client.Token(); lm.denied.Denied(ctx, tok) {
+		return errTokenDenied
+	}
+
 	secret, err := lm.client.LookupSelf(ctx)
 	if err != nil {
+		lm.denied.NoteRejection(ctx, lm.client.Token(), err)
 		return err
 	}
 
@@ -537,7 +605,11 @@ func (lm *LifecycleManager) checkAndRenew(ctx context.Context) error {
 		}
 		// Token has expired — surface this as a tokenExpiredError so the
 		// goroutine runs the same recovery path (token-file reload, then
-		// signal re-auth) it uses for 403 responses.
+		// signal re-auth) it uses for 403 responses. Suppress it too: an
+		// expired token is as dead as a revoked one, and Vault answering
+		// lookup-self with expire_time in the past is as final a verdict as a
+		// 403. Without this the next poll would ask again.
+		lm.denied.NoteRejection(ctx, lm.client.Token(), errTokenExpired)
 		return errTokenExpired
 	}
 
@@ -640,6 +712,26 @@ func (*expiredError) Error() string { return "vault token has expired" }
 // as a 403 response.
 func IsExpired(err error) bool {
 	_, ok := err.(*expiredError)
+	return ok
+}
+
+// errTokenDenied is returned by checkAndRenew when the client's current token
+// is suppressed by the denylist — Vault already rejected it and nothing has
+// happened since that could change the answer, so no request was sent. It is
+// the cached form of a 403 and the Start loop treats it identically.
+var errTokenDenied = &deniedError{}
+
+type deniedError struct{}
+
+func (*deniedError) Error() string {
+	return "vault token was previously rejected by vault (lookup suppressed)"
+}
+
+// IsDenied reports whether err is the suppressed-token sentinel. Distinct from
+// IsTokenRejected, which classifies a live Vault error: this one says "we did
+// not ask", where that one says "we asked and were refused".
+func IsDenied(err error) bool {
+	_, ok := err.(*deniedError)
 	return ok
 }
 

@@ -36,6 +36,21 @@ For production desktop environments, [OIDC](oidc.md) or [LDAP](ldap-mfa.md) are 
 
 When the web UI is enabled with token auth, users can paste a Vault token into the login form. This is validated against the Vault server before being accepted.
 
+## Tokens Vault has already refused
+
+A cached token that Vault refuses is not retried on every poll. The first time Vault answers a lookup with `403 permission denied` — or reports the token as expired — dotvault records that answer and stops presenting *that token* until something changes. This applies wherever a token is tried: the startup reuse check, the peer-socket borrow, the headless idle loop, and the daemon's token-lifecycle poll.
+
+Without it, an expired `~/.dotvault-token` on a host nobody is logged into produced a lookup every ten seconds for as long as the daemon ran — tens of thousands of denied requests per host per week, and a Vault-side traffic problem once a fleet was in that state.
+
+The suppression is per token *value*, so a genuinely new token is never affected: rewrite the token file (`dotvault login`, or anything else that writes it) and the new value is picked up on the next poll on every platform. On Linux the file watcher additionally clears the record the moment the file is written, so even rewriting the *same* bytes gets one fresh attempt — useful when the refusal was server-side rather than a property of the token. `SIGHUP` (`systemctl --user reload dotvault.service`) and a peer socket reconnecting clear it the same way. If the token is refused again, it is suppressed again.
+
+As a backstop for changes dotvault cannot observe — a policy corrected at Vault, a failover completing — a suppressed token is re-probed once every 15 minutes regardless. So a daemon whose token becomes usable again heals on its own; it just does so at that cadence instead of every ten seconds.
+
+Nothing about which tokens are tried, or in what order, changes — only how often a refused one is re-asked about. `dotvault status` still reports the real state, and the daemon still signals that re-authentication is required.
+
+!!! tip "Watching this in a metrics backend"
+    The `dotvault.token.denylist` counter carries an `event` attribute: `denied` (a token entering suppression), `suppressed` (a lookup that was *not* sent), and `cleared` (suppression dropped after a token file write, socket reconnect, or SIGHUP). A rising `suppressed` against a flat `denied` is a host sitting without a usable token — the condition that used to show up as request volume on `dotvault.vault.calls`.
+
 ## Token file permissions
 
 dotvault writes tokens to `~/.dotvault-token` with `0600` permissions and warns if the file has different permissions. (The exception is `auth_method: mtls+os`, which writes no token file at all — see [mTLS](mtls.md#no-token-at-rest-mtlsos).) This mirrors the `0600` convention of the Vault CLI's own `~/.vault-token`, but uses a dotvault-specific filename so running the upstream `vault` CLI in another context cannot overwrite (or be overwritten by) the daemon's cached token.

@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -75,7 +77,7 @@ func TestWaitForHeadlessToken_BorrowsFromSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}) {
+	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}, auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrowed token")
 	}
 	if got := vc.Token(); got != "peer-token" {
@@ -136,7 +138,7 @@ func TestWaitForHeadlessToken_SocketMaterialisesLater(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}) {
+	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}, auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrow once the socket materialised")
 	}
 	if got := vc.Token(); got != "late-token" {
@@ -161,7 +163,7 @@ func TestWaitForHeadlessToken_CancelWithoutToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	if waitForHeadlessToken(ctx, vc, tokenPath, nil) {
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned true with no token source")
 	}
 }
@@ -219,10 +221,98 @@ func TestWaitForHeadlessTokenIgnoresFileWhenPathEmpty(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
-	if waitForHeadlessToken(ctx, vc, "", nil) {
+	if waitForHeadlessToken(ctx, vc, "", nil, nil) {
 		t.Fatal("waitForHeadlessToken adopted a token despite an empty token path — a file dropped on a no-persist host would become the daemon's credential")
 	}
 	if got := vc.Token(); got != "" {
 		t.Errorf("client is holding %q", got)
+	}
+}
+
+// countingMockVault is mockVaultAccepting plus a request counter, for asserting
+// what the idle loop does NOT send.
+func countingMockVault(t *testing.T, accepted string, calls *atomic.Int64) string {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if accepted != "" && r.Header.Get("X-Vault-Token") == accepted {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"ttl": json.Number("3600")},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+// TestWaitForHeadlessToken_RecordsRejectedToken pins the first half of the
+// denied-token contract on the startup idle: a token file Vault refuses costs
+// exactly one lookup, and the refusal is recorded in the shared cache so the
+// lifecycle manager that takes over later does not ask again.
+func TestWaitForHeadlessToken_RecordsRejectedToken(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	var calls atomic.Int64
+	vaultURL := countingMockVault(t, "", &calls) // accepts nothing
+	vc, err := vault.NewClient(vault.Config{Address: vaultURL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	tokenPath := filepath.Join(t.TempDir(), ".dotvault-token")
+	if err := os.WriteFile(tokenPath, []byte("stale-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	denyList := auth.NewTokenDenylist()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, denyList) {
+		t.Fatal("waitForHeadlessToken returned true for a token Vault refuses")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("lookup-self called %d times, want 1", got)
+	}
+	if !denyList.Denied(ctx, "stale-token") {
+		t.Error("rejected token was not recorded in the shared denylist; the lifecycle manager would re-present it")
+	}
+}
+
+// TestWaitForHeadlessToken_SkipsAlreadyDeniedToken is the second half: a token
+// an earlier startup step already watched Vault refuse must not be re-presented
+// here. Without the shared cache, the reuse check and this loop each asked
+// about the same expired ~/.dotvault-token, and the loop then kept asking for
+// as long as the daemon idled.
+func TestWaitForHeadlessToken_SkipsAlreadyDeniedToken(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	var calls atomic.Int64
+	vaultURL := countingMockVault(t, "", &calls)
+	vc, err := vault.NewClient(vault.Config{Address: vaultURL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	tokenPath := filepath.Join(t.TempDir(), ".dotvault-token")
+	if err := os.WriteFile(tokenPath, []byte("stale-token"), 0600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	denyList := auth.NewTokenDenylist()
+	denyList.Deny("stale-token") // as an earlier startup step would have
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, denyList) {
+		t.Fatal("waitForHeadlessToken returned true for a suppressed token")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("lookup-self called %d times for a token already known to be refused, want 0", got)
 	}
 }

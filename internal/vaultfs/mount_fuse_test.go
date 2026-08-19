@@ -6,8 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	gosync "sync"
 	"syscall"
 	"testing"
 	"time"
@@ -460,6 +463,96 @@ func TestMountFsyncAppliesThePendingWrite(t *testing.T) {
 	store.mu.Unlock()
 	if got != "gho_fsynced" {
 		t.Errorf("stored oauth_token = %v after fsync, want gho_fsynced", got)
+	}
+}
+
+// A document larger than the kernel's read buffer (128 KiB by default) is the
+// case that panicked the daemon: go-fuse does not clamp what Read returns, so
+// handing back the whole tail overran the reply buffer while serialising the
+// header. maxDocumentSize permits 1 MiB, so a read-write mount could create
+// the file that killed the daemon on the next `cat`.
+func TestMountReadsADocumentLargerThanTheKernelBuffer(t *testing.T) {
+	const fieldSize = 400 * 1024
+	store := newMemStore()
+	store.put("big", map[string]any{"v": strings.Repeat("x", fieldSize)})
+	mnt := mountForTest(t, store, Options{CacheTTL: time.Second})
+
+	path := filepath.Join(mnt, "big.json")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() < fieldSize {
+		t.Fatalf("stat size = %d, want at least %d", info.Size(), fieldSize)
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read a large document: %v", err)
+	}
+	if int64(len(b)) != info.Size() {
+		t.Errorf("read %d bytes, stat reported %d — a short read means Read is clamping wrong", len(b), info.Size())
+	}
+	var back map[string]any
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("large document did not survive the read: %v", err)
+	}
+	if s, _ := back["v"].(string); len(s) != fieldSize {
+		t.Errorf("field length = %d, want %d", len(s), fieldSize)
+	}
+}
+
+// Concurrent readers and a writer on the same file. The contract being tested
+// is that the daemon stays alive and -race stays clean — Read copies under the
+// lock, so go-fuse never serialises a buffer a Write is mutating.
+//
+// It deliberately does NOT assert that a reader always sees a complete
+// document: rewriting a file in place truncates it first, so a concurrent
+// reader observing a partial or empty file is ordinary POSIX behaviour, not a
+// defect. What must hold is that the final state is intact.
+func TestMountConcurrentReadersAndWriter(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"oauth_token": strings.Repeat("a", 4096)})
+	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: 10 * time.Millisecond})
+	path := filepath.Join(mnt, "gh.json")
+
+	var wg gosync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = os.ReadFile(path)
+			}
+		}()
+	}
+
+	const writes = 20
+	for i := range writes {
+		body := fmt.Appendf(nil, `{"oauth_token":%q}`, strings.Repeat("b", 1024+i))
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("final read: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("final document is not intact: %v", err)
+	}
+	if got, _ := back["oauth_token"].(string); len(got) != 1024+writes-1 {
+		t.Errorf("final oauth_token length = %d, want %d", len(got), 1024+writes-1)
 	}
 }
 

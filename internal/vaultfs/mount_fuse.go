@@ -689,6 +689,19 @@ type handle struct {
 	dirty bool
 }
 
+// Read copies into dest rather than handing back a slice of the buffer, which
+// is load-bearing twice over.
+//
+// The kernel's read buffer is finite (128 KiB by default) and go-fuse does not
+// clamp what it is given — fuse.ReadResultData returns the slice verbatim —
+// so returning the whole tail of a larger document overruns the reply buffer
+// and *panics the daemon* while serialising the header. maxDocumentSize
+// permits 1 MiB, so on a read-write mount a single oversized secret would kill
+// the daemon on the next `cat`.
+//
+// Copying under the lock also removes an aliasing race: go-fuse serialises the
+// result after this returns and h.mu is released, so a concurrent Write into
+// the same backing array would be read out from under it.
 func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -698,7 +711,8 @@ func (h *handle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadRes
 	if off >= int64(len(h.buf)) {
 		return fuse.ReadResultData(nil), 0
 	}
-	return fuse.ReadResultData(h.buf[off:]), 0
+	n := copy(dest, h.buf[off:])
+	return fuse.ReadResultData(dest[:n]), 0
 }
 
 func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {

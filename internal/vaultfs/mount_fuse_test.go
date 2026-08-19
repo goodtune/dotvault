@@ -20,11 +20,21 @@ import (
 // there, the test skips: everything these tests cover about *behaviour* is
 // also covered by the tree tests, which need no kernel. What is only
 // verifiable here is the FUSE binding itself.
+//
+// The skip is deliberately narrow. Service.Run does two things that can fail —
+// prepare the mountpoint, then mount — and only the second is the environment's
+// fault. Preparing the mountpoint is run here first and is fatal, so a
+// regression in prepareMountpoint fails loudly instead of being reported as
+// "FUSE is unavailable" on a machine where FUSE works fine. A skip that can
+// swallow a real bug is worse than no test.
 func mountForTest(t *testing.T, store Store, opts Options) string {
 	t.Helper()
 
 	dir := filepath.Join(t.TempDir(), "mnt")
 	opts.Mountpoint = dir
+	if err := prepareMountpoint(dir); err != nil {
+		t.Fatalf("prepareMountpoint: %v", err)
+	}
 	svc, err := NewService(store, opts)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -373,5 +383,82 @@ func TestReserveBufferEnforcesTheMountWideBudget(t *testing.T) {
 	}
 	if got := fsys.buffered.Load(); got != 20 {
 		t.Errorf("buffered = %d after shrinking to 20, want 20", got)
+	}
+}
+
+// A KV folder has no independent existence — it is implied by the secrets
+// beneath it — so rmdir on one reports ENOTEMPTY rather than pretending to
+// delete something. An ephemeral directory from mkdir is the only kind that
+// can actually be removed.
+func TestMountRmdir(t *testing.T) {
+	store := seededStore()
+	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: 10 * time.Millisecond})
+
+	if err := os.Remove(filepath.Join(mnt, "databricks")); err == nil {
+		t.Error("rmdir on a folder backed by secrets succeeded")
+	} else if !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Errorf("error = %v, want ENOTEMPTY", err)
+	}
+
+	group := filepath.Join(mnt, "ephemeral")
+	if err := os.Mkdir(group, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Remove(group); err != nil {
+		t.Errorf("rmdir on an empty ephemeral directory: %v", err)
+	}
+	if _, err := os.Stat(group); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat after rmdir = %v, want not-exist", err)
+	}
+
+	// Nothing about any of this may reach Vault: KVv2 has no directories.
+	if _, _, writes, deletes := store.counts(); writes != 0 || deletes != 0 {
+		t.Errorf("directory operations reached the store: %d writes, %d deletes", writes, deletes)
+	}
+}
+
+// IsMounted is what `dotvault status` reports from, and it runs in a separate
+// process from the daemon — so it has to be right about a live mount as well
+// as an ordinary directory.
+func TestIsMountedTracksTheMount(t *testing.T) {
+	plain := t.TempDir()
+	if mounted, err := IsMounted(plain); err != nil || mounted {
+		t.Errorf("IsMounted(%q) = %v, %v; want false for an ordinary directory", plain, mounted, err)
+	}
+
+	mnt := mountForTest(t, seededStore(), Options{CacheTTL: time.Second})
+	mounted, err := IsMounted(mnt)
+	if err != nil {
+		t.Fatalf("IsMounted: %v", err)
+	}
+	if !mounted {
+		t.Error("IsMounted reported false for a live mount")
+	}
+}
+
+// Fsync is what an editor calls before it renames its temp file into place;
+// it has to apply the pending write rather than silently succeed.
+func TestMountFsyncAppliesThePendingWrite(t *testing.T) {
+	store := seededStore()
+	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
+
+	f, err := os.OpenFile(filepath.Join(mnt, "gh"), os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte(`{"oauth_token":"gho_fsynced"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("fsync: %v", err)
+	}
+
+	// Before close: the write must already be in Vault.
+	store.mu.Lock()
+	got := store.secrets["gh"]["oauth_token"]
+	store.mu.Unlock()
+	if got != "gho_fsynced" {
+		t.Errorf("stored oauth_token = %v after fsync, want gho_fsynced", got)
 	}
 }

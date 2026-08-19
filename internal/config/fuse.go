@@ -107,13 +107,27 @@ func (c *Config) FUSEMountpoint() (string, error) {
 	return expanded, nil
 }
 
+// isAbsMountpoint reports whether p is a usable mountpoint spelling: ~-relative,
+// or absolute.
+//
+// A leading slash counts as absolute on every platform, not just where
+// filepath.IsAbs says so. This section only ever takes effect on Unix, but the
+// config carrying it is shared across a mixed fleet — and filepath.IsAbs is
+// host-relative, so a perfectly good "/home/gary/.dotvault" is "relative" to a
+// Windows binary. Judging it by the host would make a Windows daemon *exit* on
+// a config written for the Linux machines beside it, which is precisely what
+// the warn-and-mount-nothing gate elsewhere in this file exists to prevent.
+func isAbsMountpoint(p string) bool {
+	return strings.HasPrefix(p, "~") || strings.HasPrefix(p, "/") || filepath.IsAbs(p)
+}
+
 // validateFUSE checks the filesystem section and fills in CacheTTL.
 //
 // Like validateAPI, it runs whether or not the section is enabled: a relative
 // mountpoint or an unparseable duration is a mistake worth naming at load time
 // rather than at the moment someone flips `enabled: true`.
 func (c *Config) validateFUSE() error {
-	if p := c.FUSE.Mountpoint; p != "" && !strings.HasPrefix(p, "~") && !filepath.IsAbs(p) {
+	if p := c.FUSE.Mountpoint; p != "" && !isAbsMountpoint(p) {
 		// A relative mountpoint would be resolved against the daemon's
 		// working directory, so the daemon and anyone reading the config
 		// would disagree about where the secrets appeared.

@@ -40,11 +40,23 @@ func NewStore(client KVClient, kvMount, userPrefix, username string) (Store, err
 	if kvMount == "" {
 		return nil, fmt.Errorf("vaultfs: empty kv mount")
 	}
-	if username == "" {
-		return nil, fmt.Errorf("vaultfs: empty username")
+	// The prefix is what makes "a mounted filesystem cannot address another
+	// user's secrets" structural rather than a check somewhere above, so the
+	// two values it is built from are validated rather than assumed. A
+	// username carrying a slash or a ".." would let the composed prefix name
+	// a subtree other than this user's — paths.Username strips a DOMAIN\
+	// prefix but a directory service is not otherwise constrained in what it
+	// can return, and an explicit identity override is caller-supplied.
+	if err := validateName(username); err != nil {
+		return nil, fmt.Errorf("vaultfs: invalid username %q: %w", username, err)
 	}
-	if userPrefix != "" && !strings.HasSuffix(userPrefix, "/") {
-		userPrefix += "/"
+	if userPrefix != "" {
+		if _, err := cleanPath(userPrefix); err != nil {
+			return nil, fmt.Errorf("vaultfs: invalid user prefix %q: %w", userPrefix, err)
+		}
+		if !strings.HasSuffix(userPrefix, "/") {
+			userPrefix += "/"
+		}
 	}
 	return &vaultStore{
 		client: client,

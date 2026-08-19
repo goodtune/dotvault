@@ -134,3 +134,17 @@ func TestFUSEMountpointResolution(t *testing.T) {
 		t.Errorf("FUSEMountpoint() = %q, want it to end in .dotvault", p)
 	}
 }
+
+// filepath.IsAbs is host-relative, so a Unix mountpoint written for the Linux
+// machines in a fleet must not read as "relative" to a Windows binary — that
+// would make config.Load fail and the daemon exit, which is exactly what the
+// warn-and-mount-nothing gate exists to prevent.
+func TestFUSEUnixMountpointAcceptedOnEveryPlatform(t *testing.T) {
+	for _, p := range []string{"/home/gary/.dotvault", "/srv/secrets", "~/.dotvault", "~/secrets"} {
+		cfg := fuseBaseConfig()
+		cfg.FUSE = FUSEConfig{Enabled: true, Mountpoint: p}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() rejected mountpoint %q: %v", p, err)
+		}
+	}
+}

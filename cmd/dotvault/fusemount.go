@@ -102,7 +102,7 @@ func printFUSEStatus(cfg *config.Config) {
 		return
 	}
 	fmt.Printf("  mountpoint: %s\n", mountpoint)
-	fmt.Printf("  mode:       %s\n", fuseAccessMode(cfg.FUSE.ReadWrite))
+	fmt.Printf("  mode:       %s\n", vaultfs.AccessMode(cfg.FUSE.ReadWrite))
 	fmt.Printf("  cache ttl:  %s\n", cfg.FUSE.CacheTTL)
 
 	mounted, err := vaultfs.IsMounted(mountpoint)
@@ -115,11 +115,4 @@ func printFUSEStatus(cfg *config.Config) {
 		fmt.Println("  state:      not mounted")
 		fmt.Println("  (the filesystem is enabled but nothing is mounted — is `dotvault run` active?)")
 	}
-}
-
-func fuseAccessMode(rw bool) string {
-	if rw {
-		return "read-write"
-	}
-	return "read-only"
 }

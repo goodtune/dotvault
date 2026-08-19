@@ -134,7 +134,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.setState(StateMounted, nil)
 	slog.Info("filesystem mounted",
 		"mountpoint", s.opts.Mountpoint,
-		"mode", accessMode(s.opts.ReadWrite),
+		"mode", AccessMode(s.opts.ReadWrite),
 		"cache_ttl", s.opts.CacheTTL)
 
 	// Unmounting is what makes the mountpoint usable again, so it has to
@@ -142,14 +142,28 @@ func (s *Service) Run(ctx context.Context) error {
 	// mount can refuse it. Retry briefly, then leave the mount in place and
 	// say so — a stale mountpoint the operator can clear by hand is a better
 	// outcome than a daemon that will not exit.
+	//
+	// The watcher waits on the mount ending as well as on ctx, because the
+	// filesystem can go away without this daemon deciding to end it: an
+	// operator running `fusermount3 -u`, or a container teardown. Waiting on
+	// ctx alone would leave Run blocked until shutdown after such an
+	// unmount — reporting "mounted" from Status() for the rest of the
+	// daemon's life, and then spending the whole retry budget at shutdown
+	// unmounting something that is already gone.
+	served := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		<-ctx.Done()
-		s.unmount(srv)
+		select {
+		case <-ctx.Done():
+			s.unmount(srv)
+		case <-served:
+			// Already unmounted by something else; nothing to undo.
+		}
 	}()
 
 	srv.Wait()
+	close(served)
 	<-done
 	s.setState(StateStopped, nil)
 	slog.Info("filesystem unmounted", "mountpoint", s.opts.Mountpoint)
@@ -181,7 +195,10 @@ func (s *Service) unmount(srv mountedFS) {
 		"hint", "close anything under the mountpoint, then unmount it manually")
 }
 
-func accessMode(rw bool) string {
+// AccessMode renders a mount's read-write flag for humans. Exported so the
+// CLI's status output and this package's log lines cannot drift into
+// describing the same mount two different ways.
+func AccessMode(rw bool) string {
 	if rw {
 		return "read-write"
 	}
@@ -196,18 +213,28 @@ type mountedFS interface {
 	Unmount() error
 }
 
-// prepareMountpoint makes sure the mountpoint exists and is a directory we own.
+// prepareMountpoint makes sure the mountpoint exists and is a real directory.
 //
 // It is created rather than required to exist because the default (~/.dotvault)
 // is dotvault's own to manage, and requiring the user to mkdir it first is a
 // setup step with no purpose. It is created 0700: a mounted filesystem's
 // permissions come from the FUSE mount (owner-only by default), but between
 // unmounts the bare directory is visible, and a world-readable empty directory
-// where secrets are about to appear is the wrong default to leave behind.
+// where secrets are about to appear is the wrong default to leave behind. An
+// existing directory's mode is left alone — it is the operator's.
+//
+// The check is Lstat, not Stat, so a symlink is refused rather than followed.
+// mount(2) would resolve it and publish the secrets wherever it pointed, which
+// is a redirect worth failing loudly on even though only this uid could have
+// created it. The remaining stat-then-mkdir window is not closed: anything
+// that could exploit it already runs as this user.
 func prepareMountpoint(dir string) error {
-	info, err := os.Stat(dir)
+	info, err := os.Lstat(dir)
 	switch {
 	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("mountpoint %q is a symlink; point fuse.mountpoint at a real directory", dir)
+		}
 		if !info.IsDir() {
 			return fmt.Errorf("mountpoint %q exists and is not a directory", dir)
 		}

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // memStore is an in-memory Store standing in for Vault. It reproduces the two
@@ -140,3 +142,22 @@ func (m *memStore) Delete(ctx context.Context, relPath string) error {
 }
 
 var errDenied = errors.New("permission denied")
+
+// stubKVClient satisfies KVClient so NewStore's argument validation can be
+// exercised without tripping its nil-client check first — an assertion that
+// passed because the client was nil would not be testing what it claims to.
+type stubKVClient struct{}
+
+func (stubKVClient) ListKVv2(ctx context.Context, mount, path string) ([]string, error) {
+	return nil, nil
+}
+
+func (stubKVClient) ReadKVv2(ctx context.Context, mount, path string) (*vault.Secret, error) {
+	return nil, nil
+}
+
+func (stubKVClient) WriteKVv2(ctx context.Context, mount, path string, data map[string]any) error {
+	return nil
+}
+
+func (stubKVClient) DeleteKVv2(ctx context.Context, mount, path string) error { return nil }

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,6 +42,15 @@ const (
 type filesystem struct {
 	tree *Tree
 	opts Options
+
+	// buffered is the total bytes currently held in open write buffers,
+	// across every handle on the mount. maxDocumentSize caps one file; this
+	// caps the mount, because otherwise any process running as this user
+	// could open many descriptors at once and grow the daemon's heap without
+	// bound. That matters more here than it would in a standalone
+	// filesystem: the process being exhausted is also holding the Vault
+	// token, serving the API socket and running the SSH agent.
+	buffered atomic.Int64
 
 	// mountTime stands in for a missing created_time so stat never reports
 	// the zero time, which tools render as 1970 and staleness comparisons
@@ -101,10 +111,24 @@ func (n *node) removeHandle(h *handle) {
 	}
 }
 
-func (n *node) openHandles() []*handle {
+// writableHandles returns the open descriptions that were opened for writing.
+//
+// Only writable handles, deliberately. A handle-less truncate has to be
+// applied by searching the node (see the handles field), and a read-only
+// descriptor held by another process is registered there too — applying the
+// truncate to it would empty a buffer its owner never asked to change and
+// mark it dirty, so that reader's close() would push the result to Vault. A
+// process that opened a secret O_RDONLY must not be able to write one.
+func (n *node) writableHandles() []*handle {
 	n.hmu.Lock()
 	defer n.hmu.Unlock()
-	return append([]*handle(nil), n.handles...)
+	var out []*handle
+	for _, h := range n.handles {
+		if h.writable {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // Compile-time assertions for every FUSE interface node implements. Without
@@ -145,16 +169,26 @@ func mount(mountpoint string, tree *Tree, opts Options) (mountedFS, error) {
 		FsName: "dotvault",
 		Name:   "dotvault",
 		// DirectMount asks go-fuse to call mount(2) itself, falling back to
-		// the fusermount helper when that is not permitted. That ordering
-		// covers both deployments: an unprivileged user's daemon needs
-		// fusermount, while a container or service account with CAP_SYS_ADMIN
-		// but no fuse package installed can still mount.
+		// the fusermount helper when that is not permitted. It is a Linux
+		// mechanism (ignored on macOS and FreeBSD, which always shell out to
+		// their own helper), and there it covers both deployments: an
+		// unprivileged user's daemon needs fusermount, while a container or
+		// service account with CAP_SYS_ADMIN but no fuse package installed
+		// can still mount.
 		DirectMount: true,
-		// The default FUSE mount is already owner-only, and dotvault does not
-		// offer allow_other: the whole point of the per-user daemon is that
-		// the secrets it holds belong to one uid.
-		Options: []string{"nosuid", "nodev"},
 	}
+	// Options are passed through verbatim to whichever helper the platform
+	// uses — fusermount on Linux, mount_macfuse on macOS, mount_fusefs on
+	// FreeBSD — and an option one of them does not recognise is a hard mount
+	// failure. So only `ro`, which all three accept, is set here. nosuid and
+	// nodev are deliberately absent rather than merely portable-looking:
+	// Linux applies both by default on every mount path go-fuse takes, so
+	// naming them bought nothing and risked the mount on the platforms that
+	// cannot be exercised from CI.
+	//
+	// The mount is owner-only regardless: that is FUSE's default, and
+	// dotvault does not offer allow_other — the whole point of the per-user
+	// daemon is that the secrets it holds belong to one uid.
 	if !opts.ReadWrite {
 		// Belt and braces with the node-level guard: the kernel then rejects
 		// writes before they ever reach a handler.
@@ -317,15 +351,19 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if !n.fsys.opts.ReadWrite {
 			return syscall.EROFS
 		}
-		targets := []*handle{}
+		var targets []*handle
 		if h, ok := f.(*handle); ok {
+			if !h.writable {
+				return syscall.EBADF
+			}
 			targets = append(targets, h)
 		} else {
 			// `open(O_TRUNC)` arrives here with no handle attached (see the
 			// handles field), so the truncate has to be applied to every
-			// open description on this node — in practice the one the
-			// caller just opened and is about to write into.
-			targets = n.openHandles()
+			// the node — in practice finding the one the caller just
+			// opened and is about to write into. Read-only descriptors are
+			// excluded; see writableHandles.
+			targets = n.writableHandles()
 		}
 		if len(targets) == 0 {
 			// A bare truncate(2) on a path with nothing open. There is no
@@ -568,6 +606,9 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		}
 		// The handle owns its snapshot: a concurrent write through the same
 		// mount must not mutate bytes another reader is part-way through.
+		if !n.fsys.reserveBuffer(0, doc.Size()) {
+			return nil, 0, syscall.ENOMEM
+		}
 		h.buf = append([]byte(nil), doc.Bytes...)
 	}
 	n.addHandle(h)
@@ -664,6 +705,9 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 		return 0, syscall.EFBIG
 	}
 	if end > int64(len(h.buf)) {
+		if !h.node.fsys.reserveBuffer(int64(len(h.buf)), end) {
+			return 0, syscall.ENOMEM
+		}
 		grown := make([]byte, end)
 		copy(grown, h.buf)
 		h.buf = grown
@@ -672,6 +716,31 @@ func (h *handle) Write(ctx context.Context, data []byte, off int64) (uint32, sys
 	h.dirty = true
 	return uint32(len(data)), 0
 }
+
+// reserveBuffer accounts for a handle's buffer growing from old to size,
+// refusing the growth if it would take the mount over maxBufferedBytes.
+func (f *filesystem) reserveBuffer(old, size int64) bool {
+	delta := size - old
+	if delta <= 0 {
+		f.buffered.Add(delta)
+		return true
+	}
+	if total := f.buffered.Add(delta); total > maxBufferedBytes {
+		f.buffered.Add(-delta)
+		return false
+	}
+	return true
+}
+
+// releaseBuffer returns a closed handle's bytes to the budget.
+func (f *filesystem) releaseBuffer(size int64) {
+	f.buffered.Add(-size)
+}
+
+// maxBufferedBytes caps the total across all open write buffers on the mount.
+// Sixteen documents at the per-file limit is far more than any real use of a
+// secrets filesystem and still a trivial amount of memory to hold.
+const maxBufferedBytes = 16 * maxDocumentSize
 
 // maxDocumentSize caps what a single secret file can hold. Vault's own
 // default max request size is 32 MiB; this is far below it because a KV
@@ -688,8 +757,12 @@ func (h *handle) truncate(size int64) syscall.Errno {
 	defer h.mu.Unlock()
 	switch {
 	case size < int64(len(h.buf)):
+		h.node.fsys.reserveBuffer(int64(len(h.buf)), size)
 		h.buf = h.buf[:size]
 	case size > int64(len(h.buf)):
+		if !h.node.fsys.reserveBuffer(int64(len(h.buf)), size) {
+			return syscall.ENOMEM
+		}
 		grown := make([]byte, size)
 		copy(grown, h.buf)
 		h.buf = grown
@@ -716,7 +789,10 @@ func (h *handle) pendingSize() (int64, bool) {
 func (h *handle) Flush(ctx context.Context) syscall.Errno {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.dirty {
+	// The writable check is defence in depth alongside writableHandles: only
+	// a writable handle is ever marked dirty, and a read-only descriptor must
+	// never be the thing that produces a Vault write.
+	if !h.dirty || !h.writable {
 		return 0
 	}
 
@@ -742,6 +818,7 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	h.node.removeHandle(h)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.node.fsys.releaseBuffer(int64(len(h.buf)))
 	// Release cannot report an error to the caller, so it must not be where
 	// a write is attempted: Flush already ran on close and reported anything
 	// that went wrong. Dropping the buffer here just releases the memory.

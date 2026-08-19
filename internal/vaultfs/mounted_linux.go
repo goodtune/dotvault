@@ -2,7 +2,11 @@
 
 package vaultfs
 
-import "golang.org/x/sys/unix"
+import (
+	"errors"
+
+	"golang.org/x/sys/unix"
+)
 
 // fuseSuperMagic identifies a FUSE filesystem in statfs(2)'s f_type. Defined
 // here rather than taken from x/sys/unix so the constant does not depend on
@@ -24,7 +28,7 @@ func IsMounted(dir string) (bool, error) {
 		// ENOTCONN is a mount whose server died: something is mounted, and
 		// saying so is what lets status explain a mountpoint that reports
 		// "Transport endpoint is not connected".
-		if err == unix.ENOTCONN {
+		if errors.Is(err, unix.ENOTCONN) {
 			return true, nil
 		}
 		return false, err

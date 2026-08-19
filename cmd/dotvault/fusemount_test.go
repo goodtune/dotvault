@@ -42,15 +42,6 @@ func TestResolveFUSEMountpointExpandsHome(t *testing.T) {
 	}
 }
 
-func TestFUSEAccessMode(t *testing.T) {
-	if got := fuseAccessMode(false); got != "read-only" {
-		t.Errorf("fuseAccessMode(false) = %q, want read-only", got)
-	}
-	if got := fuseAccessMode(true); got != "read-write" {
-		t.Errorf("fuseAccessMode(true) = %q, want read-write", got)
-	}
-}
-
 // startFUSE must never take the daemon down. A store it cannot build (no
 // username here) has to resolve to "no filesystem" rather than an error the
 // caller is obliged to handle.

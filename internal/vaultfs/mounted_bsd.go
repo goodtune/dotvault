@@ -4,6 +4,7 @@ package vaultfs
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -19,7 +20,7 @@ import (
 func IsMounted(dir string) (bool, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(dir, &st); err != nil {
-		if err == unix.ENOTCONN {
+		if errors.Is(err, unix.ENOTCONN) {
 			return true, nil
 		}
 		return false, err

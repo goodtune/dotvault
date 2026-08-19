@@ -68,8 +68,8 @@ Grouped keys nest the way you would expect. An enrolment key of `databricks/prod
 
 The mount is owner-only. dotvault deliberately does not offer FUSE's `allow_other`: the whole premise of a per-user daemon is that the secrets it holds belong to one uid.
 
-!!! warning "Every read is a Vault read"
-    A file in this mount is not a cached copy on disk — reading it calls Vault. That is what keeps it live, and it is also why `grep -r` across the mount is a bad idea: it will read every secret you have, and each read shows up in Vault's audit log. Reach for a specific path.
+!!! warning "Reads reach Vault"
+    A file in this mount is not a copy on disk — a read that misses the cache calls Vault. That is what keeps it live, and it is why `grep -r` across the mount is a bad idea: it will read every secret you have, and each read shows up in Vault's audit log. Reach for a specific path.
 
 ## Caching
 
@@ -87,7 +87,7 @@ With it on:
 
 ```console
 # Replace a secret: the whole document is written as one new KVv2 version
-$ jq '.oauth_token = "gho_new"' ~/.dotvault/gh | sponge ~/.dotvault/gh
+$ jq '.oauth_token = "gho_new"' ~/.dotvault/gh > /tmp/gh.json && cat /tmp/gh.json > ~/.dotvault/gh
 
 # Create one
 $ echo '{"token":"abc123"}' > ~/.dotvault/scratch
@@ -100,13 +100,16 @@ $ echo '{"host":"https://x.cloud.databricks.com"}' > ~/.dotvault/databricks/prod
 $ rm ~/.dotvault/scratch
 ```
 
+!!! warning "Edit through a scratch file, not in place"
+    In-place editors and `sponge` write a temp file *beside* the target and `rename` it over. Rename is refused here, so the temp file is created as a real secret in Vault, written, and then unlinked — which deletes every version of it. It works, but it churns your KV store with a short-lived secret each time. Stage the edit outside the mount, as above.
+
 The rules:
 
 - **A file's contents must be a JSON object with at least one field.** The write is applied on `close()`, so invalid JSON surfaces as a failing `close` (`EINVAL`) rather than as a silently discarded edit. Numbers survive the round trip exactly — reading and rewriting a secret unchanged does not turn `1000000` into `1e+06`.
 - **A write replaces the whole document.** There is no field-level merge; the file *is* the secret's data section, and writing it creates one new KVv2 version.
 - **`rm` deletes every version**, not just the latest. There is no filesystem gesture that means "soft delete", so unlink is the destructive one.
 - **`mkdir` creates a directory that exists only in memory** until a secret is written inside it. KVv2 has no directories of its own — a folder exists because secrets exist beneath it — so there is nothing for `mkdir` to write. An empty one disappears at unmount. `rmdir` removes it while it is still empty; on a directory backed by real secrets it reports `ENOTEMPTY`, because emptying it is what removes it.
-- **`rename` is not supported** (`ENOSYS`). Renaming a secret means read, write elsewhere, delete — three Vault operations that cannot be made atomic, and a partial failure would leave you with two copies or none.
+- **`rename` is not supported** — `mv` reports "Operation not supported" (`ENOTSUP`). Renaming a secret means read, write elsewhere, delete: three Vault operations that cannot be made atomic, where a partial failure leaves you with two copies or none.
 - **Appending is refused** (`EINVAL` at open). Appending to a JSON document does not produce a JSON document, and failing at `open` is more useful than failing at `close`.
 - **`touch` on a new name fails.** A secret with no fields is not something KVv2 stores, so creating a file commits you to writing something valid to it. Use `echo '{...}' > file`.
 - Files are capped at 1 MiB. A KV secret holding a megabyte of JSON is a misuse of the mount; the cap mostly exists so a runaway redirect cannot grow the daemon's memory without bound.
@@ -127,7 +130,7 @@ A policy that grants `read` on specific paths without granting `list` on their p
 
 ## Troubleshooting
 
-**`Transport endpoint is not connected`** — a daemon died without unmounting. The next daemon start detects this and clears it automatically. To clear it by hand: `fusermount -u ~/.dotvault` (Linux) or `umount ~/.dotvault` (macOS).
+**`Transport endpoint is not connected`** — a daemon died without unmounting. The next daemon start detects this and clears it automatically. To clear it by hand: `fusermount3 -u ~/.dotvault` (Linux, or `fusermount -u` on older `fuse2` systems) or `umount ~/.dotvault` (macOS).
 
 **The daemon will not exit** — something is holding the mount busy, most often a shell whose working directory is inside it. dotvault retries the unmount for about three seconds, then leaves the mount in place and logs which mountpoint it could not release, rather than refusing to shut down. `cd` out and unmount by hand.
 

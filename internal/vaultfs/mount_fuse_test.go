@@ -312,3 +312,66 @@ func TestMountAppendIsRejected(t *testing.T) {
 		t.Errorf("error = %v, want EINVAL", err)
 	}
 }
+
+// A descriptor opened read-only must never become the thing that writes to
+// Vault. The kernel applies `open(O_TRUNC)` as a handle-less SETATTR, which
+// has to be resolved by searching the node's open handles — so without the
+// writable filter a reader holding the file open would have its buffer
+// emptied and marked dirty, and its close() would push that emptiness up.
+func TestMountReadOnlyHandleIsNotTruncatedByAWriter(t *testing.T) {
+	store := seededStore()
+	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
+	path := filepath.Join(mnt, "gh")
+
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"oauth_token":"gho_rotated"}`), 0o600); err != nil {
+		reader.Close()
+		t.Fatalf("write: %v", err)
+	}
+	// Closing the read-only descriptor must not produce a second write.
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close read-only descriptor: %v", err)
+	}
+
+	if _, _, writes, _ := store.counts(); writes != 1 {
+		t.Errorf("writes = %d, want exactly 1 — the read-only descriptor wrote too", writes)
+	}
+	store.mu.Lock()
+	got := store.secrets["gh"]["oauth_token"]
+	store.mu.Unlock()
+	if got != "gho_rotated" {
+		t.Errorf("stored oauth_token = %v, want gho_rotated", got)
+	}
+}
+
+func TestReserveBufferEnforcesTheMountWideBudget(t *testing.T) {
+	fsys := &filesystem{}
+
+	if !fsys.reserveBuffer(0, maxBufferedBytes) {
+		t.Fatal("reserving the whole budget was refused")
+	}
+	if fsys.reserveBuffer(0, 1) {
+		t.Error("a reservation past the budget was allowed")
+	}
+	// A refused reservation must not leave the counter inflated, or the
+	// mount would be permanently poisoned by one over-large write.
+	if got := fsys.buffered.Load(); got != maxBufferedBytes {
+		t.Errorf("buffered = %d after a refused reservation, want %d", got, int64(maxBufferedBytes))
+	}
+
+	fsys.releaseBuffer(maxBufferedBytes)
+	if got := fsys.buffered.Load(); got != 0 {
+		t.Errorf("buffered = %d after release, want 0", got)
+	}
+	// Shrinking is always allowed and gives the bytes back.
+	if !fsys.reserveBuffer(0, 100) || !fsys.reserveBuffer(100, 20) {
+		t.Fatal("shrinking a buffer was refused")
+	}
+	if got := fsys.buffered.Load(); got != 20 {
+		t.Errorf("buffered = %d after shrinking to 20, want 20", got)
+	}
+}

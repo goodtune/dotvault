@@ -282,3 +282,21 @@ func TestPutRejectsTheRoot(t *testing.T) {
 		t.Errorf("Remove of the root = %v, want ErrInvalidName", err)
 	}
 }
+
+// The prefix is what makes "a mounted filesystem cannot address another user's
+// secrets" structural, so the values it is composed from are validated rather
+// than assumed.
+func TestNewStoreRejectsAnEscapingIdentity(t *testing.T) {
+	for _, tc := range []struct{ name, username, prefix string }{
+		{"username with a slash", "gary/../root", "users/"},
+		{"username is dotdot", "..", "users/"},
+		{"username with a NUL", "gary\x00", "users/"},
+		{"prefix with a traversal", "gary", "users/../"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewStore(stubKVClient{}, "kv", tc.prefix, tc.username); err == nil {
+				t.Error("NewStore accepted an identity that escapes the user's prefix")
+			}
+		})
+	}
+}

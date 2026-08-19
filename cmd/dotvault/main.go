@@ -400,8 +400,8 @@ type refreshDeps struct {
 
 // staticSections snapshots the config sections the daemon cannot apply
 // in-place: they configure subsystems constructed once at startup (the Vault
-// client, the web listener, the local API socket, the SSH agent, the OTel
-// SDK). The refresh loop
+// client, the web listener, the local API socket, the SSH agent, the mounted
+// filesystem, the OTel SDK). The refresh loop
 // diffs them only to tell the operator a restart is needed. remote_config is
 // deliberately NOT here: the withRemote loader rebuilds the overlay fetcher
 // whenever the section changes and the refresh loop re-derives its cadence
@@ -415,6 +415,7 @@ type staticSections struct {
 	Web           config.WebConfig
 	Agent         config.AgentConfig
 	API           config.APIConfig
+	FUSE          config.FUSEConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
 	Bypass        bool
@@ -426,6 +427,7 @@ func staticSectionsOf(c *config.Config) staticSections {
 		Web:           c.Web,
 		Agent:         c.Agent,
 		API:           c.API,
+		FUSE:          c.FUSE,
 		Observability: c.Observability,
 		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
@@ -529,6 +531,9 @@ func changedStaticSections(a, b staticSections) []string {
 	}
 	if !reflect.DeepEqual(a.API, b.API) {
 		out = append(out, "api")
+	}
+	if !reflect.DeepEqual(a.FUSE, b.FUSE) {
+		out = append(out, "fuse")
 	}
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")
@@ -1280,6 +1285,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
+	// Mount the filesystem now that we hold a Vault token, for the same
+	// reason the agent listener waits: every read it serves is a Vault call,
+	// so a mount that came up first would answer errors to anything that
+	// happened to look at the directory. Never fatal — see startFUSE.
+	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
+		webServer.SetFUSEStatus(fuseSvc.Status)
+	}
+
 	// Build and start the managed-SSH-forward subsystem now that we hold a
 	// Vault token: its SSH identity (the agent backend's Signers) may need
 	// to mint a Vault-CA certificate or read a KV-stored key, either of
@@ -1774,6 +1787,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	printRemoteConfigStatus(remoteStatus)
 
 	printAgentStatus(ctx, cfg)
+
+	printFUSEStatus(cfg)
 
 	return nil
 }

@@ -447,6 +447,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"Observability":      "static",
 		"Agent":              "static",
 		"API":                "static",  // the socket listener is bound once at startup
+		"FUSE":               "static",  // the filesystem is mounted once, after the first successful auth
 		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",

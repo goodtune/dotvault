@@ -103,6 +103,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["ssh"] = sshStatus()
 	}
 
+	// Mounted-filesystem state (mountpoint, access mode, mount condition).
+	// Unauthenticated like the blocks above: it reports where the
+	// filesystem is mounted and whether it came up, never anything from
+	// inside it.
+	if fuseStatus := s.fuseStatusSnapshot(); fuseStatus != nil {
+		status["fuse"] = fuseStatus()
+	}
+
 	writeJSON(w, status)
 }
 

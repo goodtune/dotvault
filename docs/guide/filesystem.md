@@ -1,0 +1,142 @@
+# Filesystem
+
+dotvault can mount your Vault secrets as a filesystem. Each secret becomes a file whose contents are its `data` section rendered as JSON, and each KV folder becomes a directory:
+
+```console
+$ ls ~/.dotvault
+databricks  gh  jfrog
+
+$ jq . ~/.dotvault/gh
+{
+  "oauth_token": "gho_...",
+  "user": "gary"
+}
+
+$ jq -r .oauth_token ~/.dotvault/gh | gh auth login --with-token
+```
+
+It is disabled by default. Where [sync rules](../configuration/sync-rules.md) write specific fields into specific config files on a schedule, the filesystem is the opposite: a live, read-only view of everything under your own KV prefix, for the cases where writing a rule is more ceremony than the job deserves — a one-off script, an interactive shell, a tool that wants a value you have not templated anywhere.
+
+## Enabling it
+
+```yaml
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"   # default
+  read_write: false           # default
+  cache_ttl: "30s"            # default
+```
+
+The daemon mounts the filesystem after its first successful Vault authentication and unmounts it on shutdown. The mountpoint is created (mode `0700`) if it does not exist.
+
+`dotvault status` reports what is configured and whether anything is actually mounted:
+
+```console
+$ dotvault status
+...
+Filesystem:
+  mountpoint: /home/gary/.dotvault
+  mode:       read-only
+  cache ttl:  30s
+  state:      mounted
+```
+
+## Requirements
+
+| Platform | Requirement |
+|----------|-------------|
+| Linux | A FUSE-capable kernel (`/dev/fuse`) and the `fusermount3` helper, from the `fuse3` package on most distributions. A daemon with `CAP_SYS_ADMIN` can mount without the helper |
+| macOS | [macFUSE](https://macfuse.github.io/), installed separately. macOS requires approving its kernel extension in System Settings |
+| FreeBSD | The in-kernel `fusefs` module |
+| Windows | **Not supported.** Setting `fuse.enabled` logs a warning and mounts nothing |
+
+Windows has no FUSE. The nearest equivalent, WinFsp, is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries — so rather than carry a dependency it cannot build, the daemon treats the setting as inert there. A config shared across a mixed-platform fleet is safe: the Windows hosts ignore the section and start normally.
+
+Mounting is never fatal. If FUSE is unavailable the daemon logs the reason once and carries on syncing, serving its API socket and running its SSH agent. The failure is not retried — the causes (no `/dev/fuse`, no helper binary, macFUSE not installed, mountpoint occupied) do not clear on their own, and a retry loop would just log forever.
+
+## What you see
+
+The mount root is your own KV prefix, `{kv_mount}/{user_prefix}{username}/`, so a secret at `kv/users/gary/gh` is `~/.dotvault/gh`. It is not possible to reach another user's secrets through the mount: the prefix is bound at construction, not derived from the path you ask for.
+
+Grouped keys nest the way you would expect. An enrolment key of `databricks/prod` lives at `~/.dotvault/databricks/prod`, with `databricks` as a directory.
+
+`stat` reports:
+
+- **size** — the exact byte length of the rendered JSON, so `wc -c`, `mmap` and anything else that trusts `st_size` get the truth.
+- **mtime** — the current version's `created_time` from Vault. This is KVv2's nearest equivalent of a modification time, and it means `make`-style staleness checks and `ls -lt` do something meaningful.
+- **mode** — `0400` for files and `0500` for directories on a read-only mount, `0600`/`0700` when `read_write` is on, so `test -w` agrees with what a write would actually do.
+
+The mount is owner-only. dotvault deliberately does not offer FUSE's `allow_other`: the whole premise of a per-user daemon is that the secrets it holds belong to one uid.
+
+!!! warning "Every read is a Vault read"
+    A file in this mount is not a cached copy on disk — reading it calls Vault. That is what keeps it live, and it is also why `grep -r` across the mount is a bad idea: it will read every secret you have, and each read shows up in Vault's audit log. Reach for a specific path.
+
+## Caching
+
+`cache_ttl` (default 30s) is how long a directory listing or a rendered secret is reused before Vault is asked again.
+
+This is not really an optimisation. A filesystem asks far more questions than a person does: a single `ls -l` stats every entry, and stat needs the file's size, which can only be known by rendering the document. Without a cache, one `ls -l` is one Vault read per secret, every time. Lookups that find nothing are cached too — a miss is the most common request a mounted filesystem gets, from shell completion and from every tool probing for a config file it might have.
+
+Set `cache_ttl: "0"` to disable caching entirely and pay a Vault round trip per operation. Writes through the mount invalidate their own entries immediately, so a read straight after a write always sees what was just written; the only staleness you can observe is a secret changed by something *else* within the window.
+
+## Read-write mode
+
+`read_write: true` allows writes. It is off by default even though the daemon's token can usually write, because the token's write capability exists for dotvault's own sync and enrolment work — exposing it through a filesystem puts every process running as you, and every mistyped shell redirect, one `>` away from replacing a credential. Opting in is a separate decision from mounting.
+
+With it on:
+
+```console
+# Replace a secret: the whole document is written as one new KVv2 version
+$ jq '.oauth_token = "gho_new"' ~/.dotvault/gh | sponge ~/.dotvault/gh
+
+# Create one
+$ echo '{"token":"abc123"}' > ~/.dotvault/scratch
+
+# Create one under a new group
+$ mkdir ~/.dotvault/databricks
+$ echo '{"host":"https://x.cloud.databricks.com"}' > ~/.dotvault/databricks/prod
+
+# Delete one — every version of it
+$ rm ~/.dotvault/scratch
+```
+
+The rules:
+
+- **A file's contents must be a JSON object with at least one field.** The write is applied on `close()`, so invalid JSON surfaces as a failing `close` (`EINVAL`) rather than as a silently discarded edit. Numbers survive the round trip exactly — reading and rewriting a secret unchanged does not turn `1000000` into `1e+06`.
+- **A write replaces the whole document.** There is no field-level merge; the file *is* the secret's data section, and writing it creates one new KVv2 version.
+- **`rm` deletes every version**, not just the latest. There is no filesystem gesture that means "soft delete", so unlink is the destructive one.
+- **`mkdir` creates a directory that exists only in memory** until a secret is written inside it. KVv2 has no directories of its own — a folder exists because secrets exist beneath it — so there is nothing for `mkdir` to write. An empty one disappears at unmount. `rmdir` removes it while it is still empty; on a directory backed by real secrets it reports `ENOTEMPTY`, because emptying it is what removes it.
+- **`rename` is not supported** (`ENOSYS`). Renaming a secret means read, write elsewhere, delete — three Vault operations that cannot be made atomic, and a partial failure would leave you with two copies or none.
+- **Appending is refused** (`EINVAL` at open). Appending to a JSON document does not produce a JSON document, and failing at `open` is more useful than failing at `close`.
+- **`touch` on a new name fails.** A secret with no fields is not something KVv2 stores, so creating a file commits you to writing something valid to it. Use `echo '{...}' > file`.
+- Files are capped at 1 MiB. A KV secret holding a megabyte of JSON is a misuse of the mount; the cap mostly exists so a runaway redirect cannot grow the daemon's memory without bound.
+
+## Layout expectations
+
+**A KV path should be either a secret or a folder, never both.**
+
+Vault permits both — a secret at `users/you/databricks` alongside `users/you/databricks/prod` — because a KV path is just a string to Vault. A filesystem name cannot be both a file and a directory, so dotvault treats the overlap as unsupported. Lay your KV tree out so it does not arise; a Vault policy that separates leaf paths from container paths is the cleanest way to guarantee it.
+
+If it does happen, the behaviour is deterministic but the shadowed secret is not reachable through the mount: the directory wins (so grouped keys underneath stay visible), and the daemon logs a warning naming the path. Read that secret through the web UI or `vault kv get`.
+
+## Permissions
+
+The mount only shows what your Vault token can read, so a token scoped more tightly than your KV prefix simply sees less.
+
+A policy that grants `read` on specific paths without granting `list` on their parent is handled: `ls` reports the permission error, but opening a path you know the name of still works, because the lookup falls back to reading the path directly.
+
+## Troubleshooting
+
+**`Transport endpoint is not connected`** — a daemon died without unmounting. The next daemon start detects this and clears it automatically. To clear it by hand: `fusermount -u ~/.dotvault` (Linux) or `umount ~/.dotvault` (macOS).
+
+**The daemon will not exit** — something is holding the mount busy, most often a shell whose working directory is inside it. dotvault retries the unmount for about three seconds, then leaves the mount in place and logs which mountpoint it could not release, rather than refusing to shut down. `cd` out and unmount by hand.
+
+**`ls` hangs, then everything reports `ETIMEDOUT`** — Vault is unreachable. Each operation is bounded at 30 seconds; a filesystem call that never returns would leave the calling process in uninterruptible sleep.
+
+**Reads fail with `Permission denied`** — Vault rejected the request (an expired token, or a policy that does not cover the path). Check `dotvault status`.
+
+## See also
+
+- [Config File Reference](../configuration/config-reference.md#filesystem-section) — the full field table and the Windows GPO equivalents
+- [Sync Rules](../configuration/sync-rules.md) — writing specific fields into specific files, which is what you want for a tool that reads a fixed config path
+- [SSH Agent](ssh-agent.md) — the other live surface over the daemon's Vault token

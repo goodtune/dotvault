@@ -135,6 +135,8 @@ dotvault status [flags]
 
 When a token is not found locally but is borrowable from a peer socket, the auth line reports `authenticated` and names the socket it came from. With the [`api` section](configuration/config-reference.md#api-section) enabled, status also reports the local API socket path and whether it is currently present — the first thing to check when a client on this host cannot get a token.
 
+With the [`fuse` section](configuration/config-reference.md#filesystem-section) enabled, status adds a `Filesystem:` block naming the mountpoint, the access mode, the cache TTL, and whether anything is currently mounted there. The mount state is read from the kernel rather than from the daemon, deliberately: the question is usually asked *because* the directory looks empty, and an answer sourced from the daemon would report nothing at all when the daemon is the thing that is down.
+
 ### `dotvault browse`
 
 Open a URL in a browser, preferring a browser on the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.

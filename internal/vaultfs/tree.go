@@ -33,7 +33,63 @@ func (k Kind) String() string {
 	}
 }
 
-// Entry is one child of a directory.
+// FileExtension is appended to every secret's filename. A secret at
+// kv/users/gary/gh is ~/.dotvault/gh.json, not ~/.dotvault/gh.
+//
+// The contents are JSON, so the extension is simply true — and it is what
+// makes editors, IDEs and `vim` syntax-highlight, fold and lint the file
+// instead of treating it as unknown plain text. It also removes the
+// secret-versus-folder collision that a bare name creates: a secret named
+// `databricks` and a folder named `databricks` are `databricks.json` and
+// `databricks`, two distinct filenames, so both stay reachable.
+//
+// Directories carry no extension: a KV folder is not a JSON document.
+const FileExtension = ".json"
+
+// fileDisplayName is the filename a secret appears under.
+func fileDisplayName(kvName string) string { return kvName + FileExtension }
+
+// secretKVName maps a filename back to the KV key it names. ok is false when
+// the name is not a secret filename at all — a directory, or a bare name with
+// no extension, neither of which can address a secret.
+//
+// Exactly one extension is stripped, so the mapping is a bijection: a secret
+// genuinely named "config.json" in Vault appears as "config.json.json" and
+// reads back as "config.json".
+func secretKVName(display string) (string, bool) {
+	stem, ok := strings.CutSuffix(display, FileExtension)
+	if !ok || stem == "" {
+		return "", false
+	}
+	return stem, true
+}
+
+// kvPathForFile converts a mount-relative path naming a secret into the KV
+// path it addresses: only the final segment carries the extension, since
+// every segment before it is a directory.
+//
+// The leaf having no extension is ErrInvalidName rather than "not found":
+// callers that mutate (Put, Remove, Create) must refuse a bare name outright,
+// so a file created as `newthing` cannot appear as `newthing.json` on the
+// next listing — a file that renames itself the moment you look away.
+func kvPathForFile(displayPath string) (string, error) {
+	p, err := cleanPath(displayPath)
+	if err != nil {
+		return "", err
+	}
+	if p == "" {
+		return "", ErrInvalidName
+	}
+	dir, leaf := parentPath(p), leafName(p)
+	stem, ok := secretKVName(leaf)
+	if !ok {
+		return "", ErrInvalidName
+	}
+	return joinPath(dir, stem), nil
+}
+
+// Entry is one child of a directory. Name is the filename as it appears in
+// the mount — a secret's name therefore carries FileExtension.
 type Entry struct {
 	Name string
 	Kind Kind
@@ -107,10 +163,16 @@ func (t *Tree) Readdir(ctx context.Context, dir string) ([]Entry, error) {
 			slog.Warn("vaultfs: skipping unusable name in Vault listing", "path", displayPath(dir))
 			continue
 		}
+		if kind == KindFile {
+			name = fileDisplayName(name)
+		}
+		// The fold is in filename space, not KV space, which is why the
+		// extension shrinks the problem rather than merely moving it: a
+		// secret and a folder sharing a KV name now produce two different
+		// filenames and both stay reachable. What remains is the narrow
+		// case of a folder whose name already ends in the extension,
+		// colliding with the secret of the same stem.
 		if prev, dup := byName[name]; dup && prev != kind {
-			// A path that is both a secret and a folder. Unsupported by
-			// design (see the package doc): the directory wins so nested
-			// secrets stay reachable, and the shadowed secret has no path.
 			t.warnCollision(joinPath(dir, name))
 			kind = KindDir
 		}
@@ -132,8 +194,9 @@ func (t *Tree) warnCollision(path string) {
 	if _, seen := t.warned.LoadOrStore(path, struct{}{}); seen {
 		return
 	}
-	slog.Warn("vaultfs: KV path is both a secret and a folder; the folder is shown and the secret at that path is not reachable through the mount",
-		"path", displayPath(path))
+	slog.Warn("vaultfs: a folder and a secret claim the same filename; the folder is shown and the secret is not reachable through the mount",
+		"path", displayPath(path),
+		"cause", "a KV folder whose name ends in "+FileExtension+" collides with the secret of the same stem")
 }
 
 // Lookup resolves one name within dir.
@@ -183,16 +246,24 @@ func (t *Tree) Document(ctx context.Context, path string) (*Document, error) {
 		// The root is a directory, never a document.
 		return nil, nil
 	}
-	if doc, ok := t.cache.lookupDoc(path); ok {
+	// A path whose leaf carries no extension cannot name a secret. That is
+	// "nothing here" rather than an error: the speculative lookups a
+	// filesystem fields land here constantly, and Lookup's fallback asks
+	// about directory names too.
+	kvPath, err := kvPathForFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	if doc, ok := t.cache.lookupDoc(kvPath); ok {
 		return doc, nil
 	}
 
-	secret, err := t.store.Read(ctx, path)
+	secret, err := t.store.Read(ctx, kvPath)
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", displayPath(path), err)
 	}
 	if secret == nil {
-		t.cache.storeDoc(path, nil)
+		t.cache.storeDoc(kvPath, nil)
 		return nil, nil
 	}
 
@@ -200,33 +271,30 @@ func (t *Tree) Document(ctx context.Context, path string) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.cache.storeDoc(path, doc)
+	t.cache.storeDoc(kvPath, doc)
 	return doc, nil
 }
 
 // Put parses content as a JSON object and writes it to the secret at path,
 // creating it if absent.
 func (t *Tree) Put(ctx context.Context, path string, content []byte) error {
-	path, err := cleanPath(path)
-	if err != nil {
-		return err
-	}
-	if path == "" {
-		return ErrInvalidName
-	}
 	if !t.readWrite {
 		return ErrReadOnly
+	}
+	kvPath, err := kvPathForFile(path)
+	if err != nil {
+		return err
 	}
 	data, err := parseDocument(content)
 	if err != nil {
 		return err
 	}
-	if err := t.store.Write(ctx, path, data); err != nil {
+	if err := t.store.Write(ctx, kvPath, data); err != nil {
 		// The error comes from the Vault client, which formats paths but
 		// never secret values, so it is safe to wrap as-is.
-		return fmt.Errorf("write %q: %w", displayPath(path), err)
+		return fmt.Errorf("write %q: %w", displayPath(kvPath), err)
 	}
-	t.cache.invalidate(path)
+	t.cache.invalidate(kvPath)
 	return nil
 }
 
@@ -235,20 +303,17 @@ func (t *Tree) Put(ctx context.Context, path string, content []byte) error {
 // this is the destructive one, which is why it is reachable only in
 // read-write mode.
 func (t *Tree) Remove(ctx context.Context, path string) error {
-	path, err := cleanPath(path)
-	if err != nil {
-		return err
-	}
-	if path == "" {
-		return ErrInvalidName
-	}
 	if !t.readWrite {
 		return ErrReadOnly
 	}
-	if err := t.store.Delete(ctx, path); err != nil {
-		return fmt.Errorf("delete %q: %w", displayPath(path), err)
+	kvPath, err := kvPathForFile(path)
+	if err != nil {
+		return err
 	}
-	t.cache.invalidate(path)
+	if err := t.store.Delete(ctx, kvPath); err != nil {
+		return fmt.Errorf("delete %q: %w", displayPath(kvPath), err)
+	}
+	t.cache.invalidate(kvPath)
 	return nil
 }
 
@@ -288,6 +353,14 @@ func joinPath(dir, name string) string {
 		return name
 	}
 	return dir + "/" + name
+}
+
+// leafName returns the final segment of a path.
+func leafName(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 func parentPath(p string) string {

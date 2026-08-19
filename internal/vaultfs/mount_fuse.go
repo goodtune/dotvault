@@ -494,6 +494,13 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	if err := validateName(name); err != nil {
 		return nil, syscall.EINVAL
 	}
+	// A directory whose name ends in the file extension is the one filename
+	// collision the extension does not remove — it would shadow the secret of
+	// the same stem. Refuse to create one through the mount rather than let
+	// the mount manufacture the case its own docs call unsupported.
+	if _, ok := secretKVName(name); ok {
+		return nil, syscall.EINVAL
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
@@ -623,6 +630,13 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		return nil, nil, 0, syscall.EROFS
 	}
 	if err := validateName(name); err != nil {
+		return nil, nil, 0, syscall.EINVAL
+	}
+	// Refuse a name that cannot address a secret here rather than letting
+	// Put reject it on close: a file created as `newthing` would otherwise
+	// appear as `newthing.json` on the next listing, renaming itself the
+	// moment the caller looked away.
+	if _, ok := secretKVName(name); !ok {
 		return nil, nil, 0, syscall.EINVAL
 	}
 

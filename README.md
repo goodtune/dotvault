@@ -28,7 +28,7 @@ On desktop environments it can run a local web service. If the current session i
 - **Hybrid event + poll sync** — Subscribes to the Vault Events API on Enterprise for sub-second reaction to changes; falls back transparently to polling on Community Vault
 - **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
 - **Web UI** — Optional loopback-only dashboard to drive login, view sync status, inspect secrets, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file; a parallel server-rendered UI at `/ui/` offers bookmarkable pages for secrets, enrolments, and managed SSH remotes
-- **Filesystem view** — Optional FUSE mount (Linux/macOS) exposing every secret under your Vault prefix as a JSON file, so `jq . ~/.dotvault/gh` reads a live credential without a sync rule; read-only by default, with an opt-in read-write mode
+- **Filesystem view** — Optional FUSE mount (Linux/macOS) exposing every secret under your Vault prefix as a `.json` file, so `jq . ~/.dotvault/gh.json` reads a live credential without a sync rule and editors syntax-highlight it; read-only by default, with an opt-in read-write mode
 - **Windows integration** — System-tray icon for double-click launch, plus full Group Policy support via the machine policy registry (`HKLM\SOFTWARE\Policies\goodtune\dotvault`) that overrides the YAML config when present; author the policy with `reg-import`/`reg-export`
 - **Dry-run mode** — Preview what would change without writing any files
 - **Cross-platform** — Static, CGO-free binaries for Linux and macOS (amd64/arm64) and Windows (amd64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
@@ -136,7 +136,7 @@ web:
   listen: "127.0.0.1:9000"
 ```
 
-**`fuse`** — Mount your secrets as a filesystem, one JSON file per secret (Linux/macOS only; see the [filesystem guide](https://goodtune.github.io/dotvault/guide/filesystem/)):
+**`fuse`** — Mount your secrets as a filesystem, one `.json` file per secret (Linux/macOS only; see the [filesystem guide](https://goodtune.github.io/dotvault/guide/filesystem/)):
 
 ```yaml
 fuse:

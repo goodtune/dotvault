@@ -1,19 +1,21 @@
 # Filesystem
 
-dotvault can mount your Vault secrets as a filesystem. Each secret becomes a file whose contents are its `data` section rendered as JSON, and each KV folder becomes a directory:
+dotvault can mount your Vault secrets as a filesystem. Each secret becomes a `.json` file whose contents are its `data` section, and each KV folder becomes a directory:
 
 ```console
 $ ls ~/.dotvault
-databricks  gh  jfrog
+databricks  gh.json  jfrog.json
 
-$ jq . ~/.dotvault/gh
+$ jq . ~/.dotvault/gh.json
 {
   "oauth_token": "gho_...",
   "user": "gary"
 }
 
-$ jq -r .oauth_token ~/.dotvault/gh | gh auth login --with-token
+$ jq -r .oauth_token ~/.dotvault/gh.json | gh auth login --with-token
 ```
+
+The extension is not decoration: the contents really are JSON, and it is what makes an editor, an IDE or `vim` highlight, fold and lint the file instead of treating it as unknown plain text. Directories carry no extension — a KV folder is not a JSON document.
 
 It is disabled by default. Where [sync rules](../configuration/sync-rules.md) write specific fields into specific config files on a schedule, the filesystem is the opposite: a live, read-only view of everything under your own KV prefix, for the cases where writing a rule is more ceremony than the job deserves — a one-off script, an interactive shell, a tool that wants a value you have not templated anywhere.
 
@@ -56,9 +58,11 @@ Mounting is never fatal. If FUSE is unavailable the daemon logs the reason once 
 
 ## What you see
 
-The mount root is your own KV prefix, `{kv_mount}/{user_prefix}{username}/`, so a secret at `kv/users/gary/gh` is `~/.dotvault/gh`. It is not possible to reach another user's secrets through the mount: the prefix is bound at construction, not derived from the path you ask for.
+The mount root is your own KV prefix, `{kv_mount}/{user_prefix}{username}/`, so a secret at `kv/users/gary/gh` is `~/.dotvault/gh.json`. It is not possible to reach another user's secrets through the mount: the prefix is bound at construction, not derived from the path you ask for.
 
-Grouped keys nest the way you would expect. An enrolment key of `databricks/prod` lives at `~/.dotvault/databricks/prod`, with `databricks` as a directory.
+Grouped keys nest the way you would expect. An enrolment key of `databricks/prod` lives at `~/.dotvault/databricks/prod.json`, with `databricks` as a directory.
+
+Exactly one extension is added, so the mapping is reversible: a secret genuinely named `config.json` in Vault appears as `config.json.json`. That looks odd, and it is the honest spelling — anything cleverer would make two different secrets share one filename.
 
 `stat` reports:
 
@@ -69,7 +73,7 @@ Grouped keys nest the way you would expect. An enrolment key of `databricks/prod
 The mount is owner-only. dotvault deliberately does not offer FUSE's `allow_other`: the whole premise of a per-user daemon is that the secrets it holds belong to one uid.
 
 !!! warning "Reads reach Vault"
-    A file in this mount is not a copy on disk — a read that misses the cache calls Vault. That is what keeps it live, and it is why `grep -r` across the mount is a bad idea: it will read every secret you have, and each read shows up in Vault's audit log. Reach for a specific path.
+    A file in this mount is not a copy on disk — a read that misses the cache calls Vault. That is what keeps it live, and it is why `grep -r` across the mount is a bad idea: it will read every secret you have, and each read shows up in Vault's audit log. Reach for a specific path. The same goes for an editor or IDE that indexes your home directory in the background.
 
 ## Caching
 
@@ -87,17 +91,17 @@ With it on:
 
 ```console
 # Replace a secret: the whole document is written as one new KVv2 version
-$ jq '.oauth_token = "gho_new"' ~/.dotvault/gh > /tmp/gh.json && cat /tmp/gh.json > ~/.dotvault/gh
+$ jq '.oauth_token = "gho_new"' ~/.dotvault/gh.json > /tmp/gh.json && cat /tmp/gh.json > ~/.dotvault/gh.json
 
 # Create one
-$ echo '{"token":"abc123"}' > ~/.dotvault/scratch
+$ echo '{"token":"abc123"}' > ~/.dotvault/scratch.json
 
 # Create one under a new group
 $ mkdir ~/.dotvault/databricks
-$ echo '{"host":"https://x.cloud.databricks.com"}' > ~/.dotvault/databricks/prod
+$ echo '{"host":"https://x.cloud.databricks.com"}' > ~/.dotvault/databricks/prod.json
 
 # Delete one — every version of it
-$ rm ~/.dotvault/scratch
+$ rm ~/.dotvault/scratch.json
 ```
 
 !!! warning "Edit through a scratch file, not in place"
@@ -110,17 +114,16 @@ The rules:
 - **`rm` deletes every version**, not just the latest. There is no filesystem gesture that means "soft delete", so unlink is the destructive one.
 - **`mkdir` creates a directory that exists only in memory** until a secret is written inside it. KVv2 has no directories of its own — a folder exists because secrets exist beneath it — so there is nothing for `mkdir` to write. An empty one disappears at unmount. `rmdir` removes it while it is still empty; on a directory backed by real secrets it reports `ENOTEMPTY`, because emptying it is what removes it.
 - **`rename` is not supported** — `mv` reports "Operation not supported" (`ENOTSUP`). Renaming a secret means read, write elsewhere, delete: three Vault operations that cannot be made atomic, where a partial failure leaves you with two copies or none.
+- **A new file must be named `.json`, and a new directory must not be.** `echo ... > ~/.dotvault/thing` is refused (`EINVAL`): the file would appear as `thing.json` on the next listing, renaming itself the moment you looked away. `mkdir ~/.dotvault/thing.json` is refused for the mirror reason — it would shadow the secret `thing`, which is the one filename collision the extension does not otherwise remove.
 - **Appending is refused** (`EINVAL` at open). Appending to a JSON document does not produce a JSON document, and failing at `open` is more useful than failing at `close`.
 - **`touch` on a new name fails.** A secret with no fields is not something KVv2 stores, so creating a file commits you to writing something valid to it. Use `echo '{...}' > file`.
 - Files are capped at 1 MiB. A KV secret holding a megabyte of JSON is a misuse of the mount; the cap mostly exists so a runaway redirect cannot grow the daemon's memory without bound.
 
-## Layout expectations
+## Layout
 
-**A KV path should be either a secret or a folder, never both.**
+A secret and a folder may share a name. `users/you/databricks` and `users/you/databricks/prod` both exist happily: the first is `~/.dotvault/databricks.json`, the second is `~/.dotvault/databricks/prod.json`. Two different filenames, both reachable — which is the second thing the extension buys, after the syntax highlighting.
 
-Vault permits both — a secret at `users/you/databricks` alongside `users/you/databricks/prod` — because a KV path is just a string to Vault. A filesystem name cannot be both a file and a directory, so dotvault treats the overlap as unsupported. Lay your KV tree out so it does not arise; a Vault policy that separates leaf paths from container paths is the cleanest way to guarantee it.
-
-If it does happen, the behaviour is deterministic but the shadowed secret is not reachable through the mount: the directory wins (so grouped keys underneath stay visible), and the daemon logs a warning naming the path. Read that secret through the web UI or `vault kv get`.
+One collision survives, and it is narrow: **a KV folder whose name already ends in `.json`** competes with the secret of the same stem. A folder `report.json/` and a secret `report` both want the filename `report.json`. The behaviour is deterministic — the directory wins, so the secrets underneath stay reachable — and the daemon logs a warning naming the path, but the shadowed secret has no path in the mount. Read it through the web UI or `vault kv get`. The mount refuses to *create* such a directory, so it can only arise from a KV tree laid out that way already.
 
 ## Permissions
 

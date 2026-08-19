@@ -85,9 +85,9 @@ func TestMountReadsSecretAsJSON(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{CacheTTL: time.Second})
 
-	b, err := os.ReadFile(filepath.Join(mnt, "gh"))
+	b, err := os.ReadFile(filepath.Join(mnt, "gh.json"))
 	if err != nil {
-		t.Fatalf("read gh: %v", err)
+		t.Fatalf("read gh.json: %v", err)
 	}
 
 	var got map[string]any
@@ -108,7 +108,7 @@ func TestMountStatReportsSizeAndModTime(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{CacheTTL: time.Second})
 
-	path := filepath.Join(mnt, "gh")
+	path := filepath.Join(mnt, "gh.json")
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -145,16 +145,16 @@ func TestMountListsFoldersAsDirectories(t *testing.T) {
 	for _, e := range entries {
 		kinds[e.Name()] = e.IsDir()
 	}
-	if isDir, ok := kinds["gh"]; !ok || isDir {
-		t.Errorf("gh should be listed as a file, got dir=%v present=%v", isDir, ok)
+	if isDir, ok := kinds["gh.json"]; !ok || isDir {
+		t.Errorf("gh.json should be listed as a file, got dir=%v present=%v", isDir, ok)
 	}
 	if isDir, ok := kinds["databricks"]; !ok || !isDir {
 		t.Errorf("databricks should be listed as a directory, got dir=%v present=%v", isDir, ok)
 	}
 
 	// The grouped key is reachable at its nested path.
-	if _, err := os.ReadFile(filepath.Join(mnt, "databricks", "prod")); err != nil {
-		t.Errorf("read databricks/prod: %v", err)
+	if _, err := os.ReadFile(filepath.Join(mnt, "databricks", "prod.json")); err != nil {
+		t.Errorf("read databricks/prod.json: %v", err)
 	}
 }
 
@@ -162,14 +162,14 @@ func TestMountReadOnlyRejectsWrites(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{CacheTTL: time.Second})
 
-	err := os.WriteFile(filepath.Join(mnt, "gh"), []byte(`{"a":"b"}`), 0o600)
+	err := os.WriteFile(filepath.Join(mnt, "gh.json"), []byte(`{"a":"b"}`), 0o600)
 	if err == nil {
 		t.Fatal("write to a read-only mount succeeded")
 	}
 	if !errors.Is(err, syscall.EROFS) && !errors.Is(err, os.ErrPermission) {
 		t.Errorf("write error = %v, want EROFS/EPERM", err)
 	}
-	if err := os.Remove(filepath.Join(mnt, "gh")); err == nil {
+	if err := os.Remove(filepath.Join(mnt, "gh.json")); err == nil {
 		t.Error("unlink on a read-only mount succeeded")
 	}
 	if _, _, writes, deletes := store.counts(); writes != 0 || deletes != 0 {
@@ -181,7 +181,7 @@ func TestMountReadWriteReplacesSecret(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
 
-	path := filepath.Join(mnt, "gh")
+	path := filepath.Join(mnt, "gh.json")
 	if err := os.WriteFile(path, []byte(`{"oauth_token":"gho_rotated"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestMountReadWriteShorterReplacementTruncates(t *testing.T) {
 	})
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
 
-	path := filepath.Join(mnt, "gh")
+	path := filepath.Join(mnt, "gh.json")
 	if err := os.WriteFile(path, []byte(`{"k":"v"}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestMountReadWriteRejectsInvalidJSON(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
 
-	err := os.WriteFile(filepath.Join(mnt, "gh"), []byte("not json"), 0o600)
+	err := os.WriteFile(filepath.Join(mnt, "gh.json"), []byte("not json"), 0o600)
 	if err == nil {
 		t.Fatal("writing non-JSON succeeded")
 	}
@@ -259,7 +259,7 @@ func TestMountReadWriteCreateAndUnlink(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: 10 * time.Millisecond})
 
-	path := filepath.Join(mnt, "newsecret")
+	path := filepath.Join(mnt, "newsecret.json")
 	if err := os.WriteFile(path, []byte(`{"k":"v"}`), 0o600); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestMountReadWriteMkdirThenCreate(t *testing.T) {
 		t.Fatal("mkdir did not produce a directory")
 	}
 
-	if err := os.WriteFile(filepath.Join(group, "thing"), []byte(`{"a":"b"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(group, "thing.json"), []byte(`{"a":"b"}`), 0o600); err != nil {
 		t.Fatalf("create inside new directory: %v", err)
 	}
 	store.mu.Lock()
@@ -313,7 +313,7 @@ func TestMountAppendIsRejected(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
 
-	f, err := os.OpenFile(filepath.Join(mnt, "gh"), os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(filepath.Join(mnt, "gh.json"), os.O_WRONLY|os.O_APPEND, 0o600)
 	if err == nil {
 		f.Close()
 		t.Fatal("opening a secret for append succeeded")
@@ -331,7 +331,7 @@ func TestMountAppendIsRejected(t *testing.T) {
 func TestMountReadOnlyHandleIsNotTruncatedByAWriter(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
-	path := filepath.Join(mnt, "gh")
+	path := filepath.Join(mnt, "gh.json")
 
 	reader, err := os.Open(path)
 	if err != nil {
@@ -442,7 +442,7 @@ func TestMountFsyncAppliesThePendingWrite(t *testing.T) {
 	store := seededStore()
 	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: time.Second})
 
-	f, err := os.OpenFile(filepath.Join(mnt, "gh"), os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(filepath.Join(mnt, "gh.json"), os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -460,5 +460,33 @@ func TestMountFsyncAppliesThePendingWrite(t *testing.T) {
 	store.mu.Unlock()
 	if got != "gho_fsynced" {
 		t.Errorf("stored oauth_token = %v after fsync, want gho_fsynced", got)
+	}
+}
+
+// The extension is the filename convention, so names that contradict it are
+// refused rather than silently producing a file that renames itself.
+func TestMountRejectsNamesThatContradictTheExtension(t *testing.T) {
+	store := seededStore()
+	mnt := mountForTest(t, store, Options{ReadWrite: true, CacheTTL: 10 * time.Millisecond})
+
+	// A secret file must be created with the extension.
+	err := os.WriteFile(filepath.Join(mnt, "bare"), []byte(`{"a":"b"}`), 0o600)
+	if err == nil {
+		t.Error("creating a secret without the extension succeeded")
+	} else if !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("error = %v, want EINVAL", err)
+	}
+
+	// A directory must not be created with it: that is the one filename
+	// collision the extension does not remove.
+	err = os.Mkdir(filepath.Join(mnt, "group.json"), 0o700)
+	if err == nil {
+		t.Error("mkdir of a directory named with the extension succeeded")
+	} else if !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("mkdir error = %v, want EINVAL", err)
+	}
+
+	if _, _, writes, _ := store.counts(); writes != 0 {
+		t.Errorf("a refused name still reached the store (%d writes)", writes)
 	}
 }

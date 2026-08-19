@@ -12,7 +12,7 @@ func TestCacheServesRepeatedReadsWithoutHittingVault(t *testing.T) {
 	tree := NewTree(store, false, time.Hour)
 
 	for range 5 {
-		if _, err := tree.Document(context.Background(), "gh"); err != nil {
+		if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 			t.Fatalf("Document: %v", err)
 		}
 		if _, err := tree.Readdir(context.Background(), ""); err != nil {
@@ -36,7 +36,7 @@ func TestCacheRemembersMisses(t *testing.T) {
 	tree := NewTree(store, false, time.Hour)
 
 	for range 4 {
-		if doc, err := tree.Document(context.Background(), "nope"); err != nil || doc != nil {
+		if doc, err := tree.Document(context.Background(), "nope.json"); err != nil || doc != nil {
 			t.Fatalf("Document = %v, %v; want nil, nil", doc, err)
 		}
 	}
@@ -54,7 +54,7 @@ func TestCacheExpiresAfterTTL(t *testing.T) {
 	now := time.Now()
 	tree.cache.now = func() time.Time { return now }
 
-	if _, err := tree.Document(context.Background(), "gh"); err != nil {
+	if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("Document: %v", err)
 	}
 	if _, reads, _, _ := store.counts(); reads != 1 {
@@ -62,7 +62,7 @@ func TestCacheExpiresAfterTTL(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Minute)
-	if _, err := tree.Document(context.Background(), "gh"); err != nil {
+	if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("Document after expiry: %v", err)
 	}
 	if _, reads, _, _ := store.counts(); reads != 2 {
@@ -76,7 +76,7 @@ func TestZeroTTLDisablesCaching(t *testing.T) {
 	tree := NewTree(store, false, 0)
 
 	for range 3 {
-		if _, err := tree.Document(context.Background(), "gh"); err != nil {
+		if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 			t.Fatalf("Document: %v", err)
 		}
 	}
@@ -90,7 +90,7 @@ func TestInvalidateAllDropsEverything(t *testing.T) {
 	store.put("gh", map[string]any{"a": "1"})
 	tree := NewTree(store, false, time.Hour)
 
-	if _, err := tree.Document(context.Background(), "gh"); err != nil {
+	if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("Document: %v", err)
 	}
 	if _, err := tree.Readdir(context.Background(), ""); err != nil {
@@ -98,7 +98,7 @@ func TestInvalidateAllDropsEverything(t *testing.T) {
 	}
 	tree.InvalidateAll()
 
-	if _, err := tree.Document(context.Background(), "gh"); err != nil {
+	if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("Document: %v", err)
 	}
 	if _, err := tree.Readdir(context.Background(), ""); err != nil {

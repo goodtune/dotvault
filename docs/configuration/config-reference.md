@@ -315,7 +315,7 @@ On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ
 
 ## Filesystem section
 
-The `fuse` section mounts your Vault secrets as a filesystem: each secret becomes a file whose contents are its `data` section rendered as JSON, so `jq . ~/.dotvault/gh` works and `stat` reports the secret's version timestamp as the file's mtime. See the [Filesystem guide](../guide/filesystem.md) for the full write-up.
+The `fuse` section mounts your Vault secrets as a filesystem: each secret becomes a `.json` file whose contents are its `data` section, so `jq . ~/.dotvault/gh.json` works and `stat` reports the secret's version timestamp as the file's mtime. The extension is what makes editors and IDEs treat the file as JSON rather than unknown text; directories carry none. See the [Filesystem guide](../guide/filesystem.md) for the full write-up.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -337,13 +337,13 @@ The mount root is your own KV prefix (`{kv_mount}/{user_prefix}{username}/`), bo
 !!! warning "Read-only is the default for a reason"
     The daemon's token can usually write to Vault. That capability exists for dotvault's own sync and enrolment work — exposing it through a filesystem makes every process running as you, and every mistyped shell redirect, one `>` away from replacing a credential. `read_write: true` is a separate decision from mounting.
 
-!!! note "A KV path must be either a secret or a folder, never both"
-    Vault allows a secret at `users/you/databricks` alongside `users/you/databricks/prod`; a filesystem name cannot be both a file and a directory. Lay the KV tree out so this does not arise — a Vault policy separating leaf paths from container paths is the cleanest guarantee. The overlap is unsupported: the behaviour stays deterministic (the directory wins, so grouped keys stay reachable) and the daemon warns, but the shadowed secret has no path in the mount.
+!!! note "One narrow filename collision"
+    A secret and a folder sharing a KV name coexist fine — `users/you/databricks` is `databricks.json` and `users/you/databricks/prod` is `databricks/prod.json`. What does collide is a KV folder whose name already ends in `.json`, which competes with the secret of the same stem. The directory wins so the secrets underneath stay reachable, the daemon warns naming the path, and the shadowed secret has no path in the mount. The mount refuses to create such a directory, so it can only come from a KV tree already laid out that way.
 
 !!! note "Unix only"
     `fuse.enabled` has no effect on Windows: the daemon logs a warning and mounts nothing, so a config shared across a mixed-platform fleet is safe. There is no Windows equivalent planned — WinFsp is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries. Linux needs `/dev/fuse` and the `fusermount3` helper (`fuse3` package); macOS needs [macFUSE](https://macfuse.github.io/).
 
-Reading a file in the mount calls Vault, so `grep -r` across the mount reads every secret you have and puts each one in Vault's audit log. Reach for a specific path.
+Reading a file in the mount calls Vault, so `grep -r` across the mount — or an editor indexing your home directory — reads every secret you have and puts each one in Vault's audit log. Reach for a specific path.
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
 

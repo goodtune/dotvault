@@ -26,7 +26,7 @@ func TestReaddirClassifiesSecretsAndFolders(t *testing.T) {
 	}
 	want := []Entry{
 		{Name: "databricks", Kind: KindDir},
-		{Name: "gh", Kind: KindFile},
+		{Name: "gh.json", Kind: KindFile},
 	}
 	if len(entries) != len(want) {
 		t.Fatalf("entries = %v, want %v", entries, want)
@@ -41,15 +41,15 @@ func TestReaddirClassifiesSecretsAndFolders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Readdir nested: %v", err)
 	}
-	if len(nested) != 2 || nested[0].Name != "dev" || nested[1].Name != "prod" {
-		t.Errorf("nested = %v, want dev and prod as files", nested)
+	if len(nested) != 2 || nested[0].Name != "dev.json" || nested[1].Name != "prod.json" {
+		t.Errorf("nested = %v, want dev.json and prod.json as files", nested)
 	}
 }
 
-// A KV path that is both a secret and a folder is unsupported (see the package
-// doc). The behaviour still has to be deterministic, and the direction matters:
-// the folder wins so the grouped keys underneath stay reachable.
-func TestReaddirFolderWinsOverColliderSecret(t *testing.T) {
+// A secret and a folder sharing a KV name used to be an unsupported collision:
+// one filesystem name could not be both. The extension removes it — they
+// become two different filenames, and both stay reachable.
+func TestReaddirSecretAndFolderOfTheSameNameCoexist(t *testing.T) {
 	store := newMemStore()
 	store.put("databricks", map[string]any{"a": "1"})
 	store.put("databricks/prod", map[string]any{"a": "1"})
@@ -59,11 +59,47 @@ func TestReaddirFolderWinsOverColliderSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Readdir: %v", err)
 	}
+	want := []Entry{
+		{Name: "databricks", Kind: KindDir},
+		{Name: "databricks.json", Kind: KindFile},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("entries = %v, want %v", entries, want)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Errorf("entries[%d] = %v, want %v", i, entries[i], want[i])
+		}
+	}
+
+	// Both are genuinely readable, which is the whole point.
+	if doc, err := tree.Document(context.Background(), "databricks.json"); err != nil || doc == nil {
+		t.Errorf("Document(databricks.json) = %v, %v; want the shadowed secret to be reachable", doc, err)
+	}
+	nested, err := tree.Readdir(context.Background(), "databricks")
+	if err != nil || len(nested) != 1 || nested[0].Name != "prod.json" {
+		t.Errorf("Readdir(databricks) = %v, %v; want prod.json", nested, err)
+	}
+}
+
+// What the extension does not remove: a KV folder whose name already ends in
+// it collides with the secret of the same stem. The directory wins, so the
+// secrets underneath stay reachable, and the daemon warns.
+func TestReaddirFolderNamedWithTheExtensionShadowsTheSecret(t *testing.T) {
+	store := newMemStore()
+	store.put("report", map[string]any{"a": "1"})            // displays as report.json
+	store.put("report.json/child", map[string]any{"a": "1"}) // folder named report.json
+	tree := testTree(t, store, false, 0)
+
+	entries, err := tree.Readdir(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Readdir: %v", err)
+	}
 	if len(entries) != 1 {
 		t.Fatalf("entries = %v, want a single entry", entries)
 	}
-	if entries[0].Name != "databricks" || entries[0].Kind != KindDir {
-		t.Errorf("entries[0] = %v, want databricks as a directory", entries[0])
+	if entries[0].Name != "report.json" || entries[0].Kind != KindDir {
+		t.Errorf("entries[0] = %v, want report.json as a directory", entries[0])
 	}
 }
 
@@ -72,17 +108,17 @@ func TestLookupUsesTheParentListing(t *testing.T) {
 	store.put("gh", map[string]any{"a": "1"})
 	tree := testTree(t, store, false, 0)
 
-	kind, err := tree.Lookup(context.Background(), "", "gh")
+	kind, err := tree.Lookup(context.Background(), "", "gh.json")
 	if err != nil || kind != KindFile {
-		t.Fatalf("Lookup(gh) = %v, %v; want file", kind, err)
+		t.Fatalf("Lookup(gh.json) = %v, %v; want file", kind, err)
 	}
 
 	// A name a successful listing does not mention does not exist, and
 	// answering that from the listing must not cost a read.
 	_, readsBefore, _, _ := store.counts()
-	kind, err = tree.Lookup(context.Background(), "", "missing")
+	kind, err = tree.Lookup(context.Background(), "", "missing.json")
 	if err != nil || kind != KindNone {
-		t.Fatalf("Lookup(missing) = %v, %v; want none", kind, err)
+		t.Fatalf("Lookup(missing.json) = %v, %v; want none", kind, err)
 	}
 	if _, readsAfter, _, _ := store.counts(); readsAfter != readsBefore {
 		t.Errorf("a miss against a successful listing issued %d reads, want 0", readsAfter-readsBefore)
@@ -98,7 +134,7 @@ func TestLookupFallsBackToReadWhenListFails(t *testing.T) {
 	store.listErr = errDenied
 	tree := testTree(t, store, false, 0)
 
-	kind, err := tree.Lookup(context.Background(), "", "gh")
+	kind, err := tree.Lookup(context.Background(), "", "gh.json")
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -110,9 +146,9 @@ func TestLookupFallsBackToReadWhenListFails(t *testing.T) {
 	// absent — the read answered, it just answered "no" — so this reports
 	// not-found rather than the listing's failure. `ls` still surfaces the
 	// listing error, because Readdir returns it unchanged.
-	kind, err = tree.Lookup(context.Background(), "", "missing")
+	kind, err = tree.Lookup(context.Background(), "", "missing.json")
 	if err != nil || kind != KindNone {
-		t.Errorf("Lookup(missing) = %v, %v; want none with no error", kind, err)
+		t.Errorf("Lookup(missing.json) = %v, %v; want none with no error", kind, err)
 	}
 }
 
@@ -125,7 +161,7 @@ func TestLookupReportsListErrorWhenTheFallbackAlsoFails(t *testing.T) {
 	store.readErr = errDenied
 	tree := testTree(t, store, false, 0)
 
-	_, err := tree.Lookup(context.Background(), "", "gh")
+	_, err := tree.Lookup(context.Background(), "", "gh.json")
 	if err == nil {
 		t.Fatal("Lookup returned no error when both list and read failed")
 	}
@@ -139,7 +175,7 @@ func TestDocumentRendersDataAsIndentedJSON(t *testing.T) {
 	store.put("gh", map[string]any{"oauth_token": "gho_x", "user": "gary"})
 	tree := testTree(t, store, false, 0)
 
-	doc, err := tree.Document(context.Background(), "gh")
+	doc, err := tree.Document(context.Background(), "gh.json")
 	if err != nil {
 		t.Fatalf("Document: %v", err)
 	}
@@ -163,7 +199,7 @@ func TestDocumentRendersDataAsIndentedJSON(t *testing.T) {
 
 func TestDocumentMissingSecretIsNotAnError(t *testing.T) {
 	tree := testTree(t, newMemStore(), false, 0)
-	doc, err := tree.Document(context.Background(), "nope")
+	doc, err := tree.Document(context.Background(), "nope.json")
 	if err != nil {
 		t.Fatalf("Document: %v", err)
 	}
@@ -177,10 +213,10 @@ func TestReadOnlyTreeRefusesMutations(t *testing.T) {
 	store.put("gh", map[string]any{"a": "1"})
 	tree := testTree(t, store, false, 0)
 
-	if err := tree.Put(context.Background(), "gh", []byte(`{"a":"2"}`)); !errors.Is(err, ErrReadOnly) {
+	if err := tree.Put(context.Background(), "gh.json", []byte(`{"a":"2"}`)); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("Put error = %v, want ErrReadOnly", err)
 	}
-	if err := tree.Remove(context.Background(), "gh"); !errors.Is(err, ErrReadOnly) {
+	if err := tree.Remove(context.Background(), "gh.json"); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("Remove error = %v, want ErrReadOnly", err)
 	}
 	// The guard must stop the call before it reaches Vault, not merely
@@ -195,7 +231,7 @@ func TestReadOnlyTreeRefusesMutations(t *testing.T) {
 // going to write.
 func TestReadOnlyTreeRefusesBeforeParsing(t *testing.T) {
 	tree := testTree(t, newMemStore(), false, 0)
-	if err := tree.Put(context.Background(), "gh", []byte("not json")); !errors.Is(err, ErrReadOnly) {
+	if err := tree.Put(context.Background(), "gh.json", []byte("not json")); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("Put error = %v, want ErrReadOnly", err)
 	}
 }
@@ -206,13 +242,13 @@ func TestPutWritesAndInvalidatesCache(t *testing.T) {
 	tree := testTree(t, store, true, time.Hour)
 
 	// Warm the cache so a stale answer is possible if invalidation is missed.
-	if _, err := tree.Document(context.Background(), "gh"); err != nil {
+	if _, err := tree.Document(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
-	if err := tree.Put(context.Background(), "gh", []byte(`{"a":"2"}`)); err != nil {
+	if err := tree.Put(context.Background(), "gh.json", []byte(`{"a":"2"}`)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	doc, err := tree.Document(context.Background(), "gh")
+	doc, err := tree.Document(context.Background(), "gh.json")
 	if err != nil {
 		t.Fatalf("Document: %v", err)
 	}
@@ -234,15 +270,15 @@ func TestRemoveDeletesAndInvalidatesListing(t *testing.T) {
 	if _, err := tree.Readdir(context.Background(), ""); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
-	if err := tree.Remove(context.Background(), "gh"); err != nil {
+	if err := tree.Remove(context.Background(), "gh.json"); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 	entries, err := tree.Readdir(context.Background(), "")
 	if err != nil {
 		t.Fatalf("Readdir: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name != "other" {
-		t.Errorf("entries = %v, want only 'other' — the parent listing was not invalidated", entries)
+	if len(entries) != 1 || entries[0].Name != "other.json" {
+		t.Errorf("entries = %v, want only other.json — the parent listing was not invalidated", entries)
 	}
 }
 

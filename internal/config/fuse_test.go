@@ -43,10 +43,12 @@ func TestFUSECacheTTLParsing(t *testing.T) {
 		{"", DefaultFUSECacheTTL, false},
 		{"5s", 5 * time.Second, false},
 		{"2m", 2 * time.Minute, false},
-		{"0", 0, false},               // explicitly disables caching
-		{"1d", 24 * time.Hour, false}, // the project's day shorthand
+		{"0", 0, false},                 // explicitly disables caching
+		{"10m", MaxFUSECacheTTL, false}, // the ceiling itself is allowed
 		{"-1s", 0, true},
 		{"soon", 0, true},
+		{"11m", 0, true}, // past the ceiling
+		{"1d", 0, true},  // the day shorthand parses, then trips the ceiling
 	}
 	for _, tc := range tests {
 		t.Run(tc.raw, func(t *testing.T) {

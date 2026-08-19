@@ -1,13 +1,18 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -89,8 +94,20 @@ var userOverridableSections = map[string]bool{
 // Section matching is case-insensitive for the rejection check so `Vault:`
 // cannot slip past as merely unknown, mirroring ParsePartial's reasoning.
 func ParseUserConfig(data []byte) (*UserConfig, error) {
+	// yaml.Unmarshal reads the first document and silently discards the rest,
+	// so `fuse: …` followed by `---` and a `vault:` block would sail past the
+	// section check below having never been looked at. That is exactly the
+	// "the user believes it took effect" failure the check exists to prevent,
+	// so a multi-document stream is refused outright rather than truncated.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var probe map[string]any
-	if err := yaml.Unmarshal(data, &probe); err != nil {
+	if err := dec.Decode(&probe); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parse user config: %w", err)
+	}
+	var extra map[string]any
+	if err := dec.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("user config: contains more than one YAML document; put every setting in a single document")
+	} else if !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse user config: %w", err)
 	}
 
@@ -123,16 +140,36 @@ func ParseUserConfig(data []byte) (*UserConfig, error) {
 	return &uc, nil
 }
 
+// configSectionNames is the set of top-level keys Config actually declares,
+// derived from its yaml tags.
+//
+// Reflected rather than listed by hand on purpose. A hand-written list drifts
+// the moment someone adds a section and forgets this file, and it drifts
+// *toward permissive*: the new section stops being refused and becomes merely
+// "unknown", so a user setting it gets a warning they will not read and a
+// belief that it took effect. Deriving it means the question can only be
+// answered correctly.
+var configSectionNames = sync.OnceValue(func() map[string]bool {
+	out := make(map[string]bool)
+	t := reflect.TypeOf(Config{})
+	for i := range t.NumField() {
+		tag := t.Field(i).Tag.Get("yaml")
+		name, _, _ := strings.Cut(tag, ",")
+		// `yaml:"-"` marks a field that is never serialised (Managed), so it
+		// is not a section a user could name.
+		if name == "" || name == "-" {
+			continue
+		}
+		out[name] = true
+	}
+	return out
+})
+
 // isConfigSection reports whether key names a real top-level Config section.
 // A key that is neither user-overridable nor a known section is a typo or a
-// future section, and warns rather than failing.
+// section from a future release, and warns rather than failing.
 func isConfigSection(key string) bool {
-	switch key {
-	case "vault", "sync", "web", "observability", "agent", "api", "ssh",
-		"remote_config", "rules", "enrolments", "bypass_system_config", "fuse":
-		return true
-	}
-	return false
+	return configSectionNames()[key]
 }
 
 func sortedUserSections() []string {
@@ -156,14 +193,55 @@ func LoadUserConfig(path string) (*UserConfig, error) {
 		return nil, fmt.Errorf("read user config: %w", err)
 	}
 
-	// The file can turn the filesystem on and relocate where secrets appear,
-	// so another account being able to write it matters even though it is in
-	// the user's own directory.
-	if insecure, checkErr := perms.IsGroupWorldWritable(path); checkErr == nil && insecure {
-		slog.Warn("user config file is group or world writable", "path", path)
+	// Refused, not warned. This file turns a secrets mount on and chooses
+	// where the secrets appear, and dotvault already *refuses* a --config
+	// override whose system config is tamperable (config.go's bypass gate)
+	// for weaker stakes than that. A warning on a path someone else can
+	// rewrite is a control in name only.
+	//
+	// The directory is checked as well as the file: a writable parent lets
+	// the file be replaced wholesale, which is the half a mode check on the
+	// node alone misses — the same reasoning internal/uds applies to the
+	// 0600-in-0700 socket invariant.
+	for _, target := range []struct{ kind, path string }{
+		{"file", path},
+		{"directory", filepath.Dir(path)},
+	} {
+		insecure, checkErr := perms.IsGroupWorldWritable(target.path)
+		if checkErr != nil {
+			// Unreadable permissions are not a licence to proceed: the check
+			// exists precisely because the answer matters.
+			return nil, fmt.Errorf("user config: cannot check permissions on %s %q: %w", target.kind, target.path, checkErr)
+		}
+		if insecure {
+			return nil, fmt.Errorf("user config %s %q is writable by group or others; tighten it (chmod go-w) before dotvault will read it", target.kind, target.path)
+		}
 	}
 
-	return ParseUserConfig(data)
+	uc, err := ParseUserConfig(data)
+	if err != nil {
+		// The path is the single most useful thing in this message: on macOS
+		// and Windows the file lives somewhere a user would never guess, and
+		// without it they are told something is wrong with a file they cannot
+		// find.
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return uc, nil
+}
+
+// overruledWarned records the preferences already reported as overruled.
+//
+// The daemon re-runs the whole loader on every config-refresh tick (15m by
+// default), so without this the same warning repeats for the life of the
+// process. Once per field is the useful signal: the user is told their
+// preference did not take, and the log does not fill with it.
+var overruledWarned sync.Map
+
+func warnOverruledOnce(field, msg string) {
+	if _, seen := overruledWarned.LoadOrStore(field, struct{}{}); seen {
+		return
+	}
+	slog.Warn(msg, "section", field)
 }
 
 // ApplyUser merges a user configuration over c in place and re-validates the
@@ -185,8 +263,8 @@ func (c *Config) ApplyUser(u *UserConfig) error {
 
 	if f.Enabled != nil {
 		if !*f.Enabled && c.FUSE.Enabled {
-			slog.Warn("user config cannot disable the filesystem; the system configuration enables it",
-				"section", "fuse.enabled")
+			warnOverruledOnce("fuse.enabled",
+				"user config cannot disable the filesystem; the system configuration enables it")
 		}
 		// OR: the user may turn it on, never off.
 		c.FUSE.Enabled = c.FUSE.Enabled || *f.Enabled
@@ -194,8 +272,8 @@ func (c *Config) ApplyUser(u *UserConfig) error {
 
 	if f.ReadWrite != nil {
 		if *f.ReadWrite && !c.FUSE.ReadWrite {
-			slog.Warn("user config cannot enable filesystem writes; the system configuration disables them",
-				"section", "fuse.read_write")
+			warnOverruledOnce("fuse.read_write",
+				"user config cannot enable filesystem writes; the system configuration disables them")
 		}
 		// AND: the user may turn it off, never on.
 		c.FUSE.ReadWrite = c.FUSE.ReadWrite && *f.ReadWrite

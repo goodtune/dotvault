@@ -26,6 +26,17 @@ const DefaultFUSEMountpoint = "~/.dotvault"
 // write through the mount invalidates its own entries immediately.
 const DefaultFUSECacheTTL = 30 * time.Second
 
+// MaxFUSECacheTTL bounds how long the mount may serve a secret without asking
+// Vault again.
+//
+// The cache is what makes the filesystem usable, but it is also a window in
+// which a revoked or rotated secret stays readable — in this package's cache
+// and in the kernel's, since the entry/attr timeouts track the same value. Ten
+// minutes is far longer than the cache needs to do its job (its purpose is to
+// collapse the burst of stats a single `ls -l` produces) and short enough that
+// a revocation is never left standing for an appreciable time.
+const MaxFUSECacheTTL = 10 * time.Minute
+
 // FUSEConfig configures the filesystem view of the user's KV secrets: each
 // secret appears as a file whose contents are its data section rendered as
 // JSON, so `jq . ~/.dotvault/gh` works and stat reports the secret's version
@@ -69,6 +80,18 @@ type FUSEConfig struct {
 	// Empty means DefaultFUSECacheTTL; an explicit "0" disables caching so
 	// every operation reaches Vault.
 	RawCacheTTL string `yaml:"cache_ttl"`
+
+	// UserOverlayPath names the per-user file that contributed to this
+	// section, empty when none did. Set by the overlay loader, never
+	// serialised — the same treatment Config.Managed gets, and for the same
+	// reason: it records where the configuration came from rather than being
+	// part of it, so an exported config must not carry it back in.
+	//
+	// It exists so `dotvault status` can say that a mount came from the
+	// user's own preference. Without it, an administrator looking at a
+	// machine whose policy says the filesystem is off has only a startup
+	// WARN, long since scrolled past, to explain why one is mounted.
+	UserOverlayPath string `yaml:"-"`
 }
 
 // fuseMountpointCandidate returns the configured mountpoint — the operator's
@@ -144,6 +167,9 @@ func (c *Config) validateFUSE() error {
 		}
 		if d < 0 {
 			return fmt.Errorf("fuse.cache_ttl %q: must not be negative", c.FUSE.RawCacheTTL)
+		}
+		if d > MaxFUSECacheTTL {
+			return fmt.Errorf("fuse.cache_ttl %q: must not exceed %s (a longer window leaves a revoked secret readable)", c.FUSE.RawCacheTTL, MaxFUSECacheTTL)
 		}
 		c.FUSE.CacheTTL = d
 	}

@@ -8,6 +8,16 @@ dotvault uses a YAML configuration file. The file location depends on your platf
 | macOS    | `/Library/Application Support/dotvault/config.yaml` |
 | Windows  | `%ProgramData%\dotvault\config.yaml` |
 
+That file is **system-wide** and normally administrator-owned. There is also an optional **per-user** file, which may carry only the [`fuse`](#filesystem-section) section and is merged over the system configuration:
+
+| Platform | Path |
+|----------|------|
+| Linux    | `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` |
+| macOS    | `~/Library/Application Support/dotvault/config.yaml` |
+| Windows  | `%APPDATA%\dotvault\config.yaml` |
+
+Every other section is a hard error there, so the per-user file can never re-point the Vault, open a listener, or alter telemetry. See [Per-user preferences](#per-user-preferences).
+
 You can override the config path with `--config`:
 
 ```sh
@@ -322,7 +332,7 @@ The `fuse` section mounts your Vault secrets as a filesystem: each secret become
 | `enabled` | bool | `false` | Mount the filesystem |
 | `mountpoint` | string | `~/.dotvault` | Directory to mount on; must be absolute (or `~`-relative). Created at mode `0700` if absent |
 | `read_write` | bool | `false` | Allow writing through the mount (replace, create, delete). Read-only otherwise, regardless of what the Vault token could do |
-| `cache_ttl` | duration | `30s` | How long a listing or a rendered secret is reused before Vault is asked again. `0` disables caching |
+| `cache_ttl` | duration | `30s` | How long a listing or a rendered secret is reused before Vault is asked again. `0` disables caching; capped at 10 minutes, since the cache window is also how long a revoked secret stays readable |
 
 ```yaml
 fuse:
@@ -335,6 +345,8 @@ fuse:
 ### Per-user preferences
 
 Unusually for this file, the `fuse` section can also be set per-user, in `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`) — a sibling of the `env` file and `ssh.yaml`. It is merged over the system configuration, and it is the **only** file a user can use to influence dotvault's configuration: every other section is a hard error there, so it can never re-point the Vault, open a listener, or alter telemetry.
+
+The file must be a single YAML document, and dotvault refuses to read it if the file or its directory is group- or world-writable — it can turn a secrets mount on, so a path another account can rewrite is refused rather than warned about. A parse failure is fatal at startup and a skipped-with-warning overlay on later reloads, so a user's typo can never stop policy reaching the daemon.
 
 Each field ratchets rather than overwriting: `enabled` may be turned **on** but not off, `read_write` may be turned **off** but not on, and `mountpoint` / `cache_ttl` are preferences the user's value simply wins. An omitted key is not a preference — only an explicitly written one is. See the [Filesystem guide](../guide/filesystem.md#per-user-preferences) for the reasoning behind the two booleans ratcheting in opposite directions.
 

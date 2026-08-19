@@ -98,21 +98,27 @@ func printFUSEStatus(cfg *config.Config) {
 
 	mountpoint, err := cfg.FUSEMountpoint()
 	if err != nil {
-		fmt.Printf("  mountpoint: (unresolvable: %v)\n", err)
+		fmt.Printf("  mountpoint:  (unresolvable: %v)\n", err)
 		return
 	}
-	fmt.Printf("  mountpoint: %s\n", mountpoint)
-	fmt.Printf("  mode:       %s\n", vaultfs.AccessMode(cfg.FUSE.ReadWrite))
-	fmt.Printf("  cache ttl:  %s\n", cfg.FUSE.CacheTTL)
+	fmt.Printf("  mountpoint:  %s\n", mountpoint)
+	fmt.Printf("  mode:        %s\n", vaultfs.AccessMode(cfg.FUSE.ReadWrite))
+	fmt.Printf("  cache ttl:   %s\n", cfg.FUSE.CacheTTL)
+	if cfg.FUSE.UserOverlayPath != "" {
+		// Without this, an administrator looking at a machine whose policy
+		// says the filesystem is off has nothing but a startup WARN — long
+		// since scrolled past — to explain why one is mounted.
+		fmt.Printf("  preferences: %s\n", cfg.FUSE.UserOverlayPath)
+	}
 
 	mounted, err := vaultfs.IsMounted(mountpoint)
 	switch {
 	case err != nil:
-		fmt.Printf("  state:      unknown (%v)\n", err)
+		fmt.Printf("  state:       unknown (%v)\n", err)
 	case mounted:
-		fmt.Println("  state:      mounted")
+		fmt.Println("  state:       mounted")
 	default:
-		fmt.Println("  state:      not mounted")
+		fmt.Println("  state:       not mounted")
 		fmt.Println("  (the filesystem is enabled but nothing is mounted — is `dotvault run` active?)")
 	}
 }

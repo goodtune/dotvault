@@ -21,6 +21,8 @@ It is disabled by default. Where [sync rules](../configuration/sync-rules.md) wr
 
 ## Enabling it
 
+In the system configuration (see the [config reference](../configuration/config-reference.md) for its path on each platform):
+
 ```yaml
 fuse:
   enabled: true
@@ -37,11 +39,13 @@ The daemon mounts the filesystem after its first successful Vault authentication
 $ dotvault status
 ...
 Filesystem:
-  mountpoint: /home/gary/.dotvault
-  mode:       read-only
-  cache ttl:  30s
-  state:      mounted
+  mountpoint:  /home/gary/.dotvault
+  mode:        read-only
+  cache ttl:   30s
+  state:       mounted
 ```
+
+(A `preferences:` line appears when a [per-user file](#per-user-preferences) contributed to the section.)
 
 ## Per-user preferences
 
@@ -76,9 +80,32 @@ Each field merges by its own rule rather than simply overwriting policy:
 
 The two booleans ratchet in opposite directions, and that is deliberate rather than an inconsistency. Enabling a read-only mount grants nothing your Vault token could not already do, so an administrator's "off" is only a default. Read-write is a different kind of setting — it puts every process running as you one `>` away from replacing a credential — so there the administrator's "no" is binding, and you stay free to be more careful than policy requires.
 
+!!! note "The ratchet expresses intent; it is not a security control"
+    `mountpoint` is not ratcheted, so a user who wants no mount can point it somewhere that cannot be mounted and get one — a failed mount is logged and not retried. That is not a hole worth closing: anyone who can run `fusermount3 -u` on their own session can unmount it anyway, and a per-user daemon runs as them. What the ratchet does is stop opting out being a *silent, supported gesture* in a config file, and make the intent explicit on both sides. An administrator who needs the filesystem to be genuinely unavoidable needs something other than this file.
+
 An omitted key is not a preference. Writing only `mountpoint:` leaves `enabled` and `read_write` exactly as the system configuration set them; you have to write `enabled: false` to mean it, and even then it only takes effect if the system had not already enabled it. When a preference is overruled, the daemon logs a warning naming the field, so a mount you asked not to have is never silently there.
 
-A bad value is a startup error naming your file rather than a silent fallback — an unparseable `cache_ttl` stops the daemon instead of quietly reverting to 30s.
+A bad value is a startup error naming your file rather than a silent fallback — an unparseable `cache_ttl` stops the daemon instead of quietly reverting to 30s. Once the daemon is running, a later breakage in the file is downgraded to a warning and the overlay is skipped for that reload, so a stray character in your preferences can never stop the daemon picking up rules and enrolments.
+
+!!! warning "The file must not be writable by anyone else"
+    dotvault **refuses** to read it — and refuses to start — if either the file or its containing directory is group- or world-writable. It turns a secrets mount on and decides where the secrets appear, so a path another account can rewrite is not something to merely warn about. `chmod go-w ~/.config/dotvault ~/.config/dotvault/config.yaml` if you hit this.
+
+`cache_ttl` is capped at 10 minutes here and in the system config alike: the cache window is also the window in which a revoked secret stays readable, and a longer one is never worth it for a cache whose job is to absorb the burst of stats a single `ls -l` produces.
+
+`dotvault status` names the file when it contributed, so a mount that policy did not ask for can be explained:
+
+```console
+$ dotvault status
+...
+Filesystem:
+  mountpoint:  /home/gary/vault
+  mode:        read-only
+  cache ttl:   30s
+  preferences: /home/gary/.config/dotvault/config.yaml
+  state:       mounted
+```
+
+The file must be a single YAML document — a `---` separator is refused rather than having everything after it silently ignored.
 
 ## Requirements
 

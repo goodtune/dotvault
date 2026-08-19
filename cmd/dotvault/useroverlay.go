@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -23,31 +25,48 @@ var userConfigPath = paths.UserConfigPath
 // refuses it — so today the ordering is belt-and-braces rather than
 // load-bearing, which is exactly when it is cheapest to get right.)
 //
-// The merge re-validates the section it touched, so an unparseable
-// `cache_ttl` in the user's file is a startup error naming that file rather
-// than a value that silently falls back to a default.
+// The returned relax function switches the loader from strict to lenient, and
+// the daemon calls it once startup has succeeded. The two postures exist
+// because a broken user file means different things at the two moments:
+//
+//   - At startup it is the user's immediate mistake, and refusing to start
+//     with a message naming the file is how they find out.
+//   - On a refresh tick it must not be fatal to *everything else*. The
+//     refresh loop treats a loader error as "reload failed" and gives up on
+//     that pass, so a stray character in an unprivileged user's config.yaml
+//     would otherwise stop the daemon converging on remote rules and
+//     enrolments indefinitely — inverting the remote overlay's fail-open
+//     ladder, for a static section that cannot apply live anyway. So the
+//     overlay is dropped for that pass with a warning and policy still lands.
 //
 // A missing file is the common case and costs one failed stat.
-func withUserOverlay(load func() (*config.Config, error)) func() (*config.Config, error) {
-	return func() (*config.Config, error) {
+func withUserOverlay(load func() (*config.Config, error)) (loader func() (*config.Config, error), relax func()) {
+	var lenient atomic.Bool
+
+	loader = func() (*config.Config, error) {
 		cfg, err := load()
 		if err != nil {
 			return nil, err
 		}
 		if err := applyUserOverlay(cfg); err != nil {
-			return nil, err
+			if !lenient.Load() {
+				return nil, err
+			}
+			slog.Warn("ignoring the per-user configuration for this reload; policy still applied", "error", err)
+			return cfg, nil
 		}
 		return cfg, nil
 	}
+	return loader, func() { lenient.Store(true) }
 }
 
 // applyUserOverlay merges the user's config.yaml over cfg in place.
 //
-// A user config that cannot be *parsed* is a hard error: the user wrote it
-// deliberately, and starting with their preference silently discarded is
-// worse than refusing to start with a message naming the file. A path that
-// cannot be *resolved* (no home directory) is not the user's mistake and only
-// means there is no overlay to apply, so it warns and carries on.
+// A user config that cannot be parsed or applied is an error naming the file,
+// so someone told their configuration is wrong can open the thing that is
+// wrong — on macOS and Windows it lives somewhere they would never guess. A
+// path that cannot be *resolved* (no home directory) is not the user's mistake
+// and only means there is no overlay to apply, so it warns and carries on.
 func applyUserOverlay(cfg *config.Config) error {
 	path, err := userConfigPath()
 	if err != nil {
@@ -61,6 +80,14 @@ func applyUserOverlay(cfg *config.Config) error {
 	if uc == nil {
 		return nil
 	}
-	slog.Debug("applying per-user configuration preferences", "path", path)
-	return cfg.ApplyUser(uc)
+	if err := cfg.ApplyUser(uc); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if uc.FUSE != nil {
+		// Provenance for `dotvault status`: this file contributed to the
+		// section, so a mount that policy did not ask for can be explained.
+		cfg.FUSE.UserOverlayPath = path
+	}
+	slog.Debug("applied per-user configuration preferences", "path", path)
+	return nil
 }

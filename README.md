@@ -145,6 +145,8 @@ fuse:
   read_write: false
 ```
 
+This is the one section that can also be set per-user, in `~/.config/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`), so you can turn the filesystem on without editing a system config an administrator owns. Every other section is refused there.
+
 **`enrolments`** — Declare service enrolment engines so missing credentials are acquired interactively on first run and refreshed automatically thereafter. See the [service onboarding guides](https://goodtune.github.io/dotvault/services/overview/) for the supported engines.
 
 ## How it works

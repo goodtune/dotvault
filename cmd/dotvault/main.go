@@ -255,7 +255,10 @@ func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, er
 		return nil, path, nil, err
 	}
 	merged, status := withRemote(context.Background(), load)
-	cfg, err := withUserOverlay(merged)()
+	// One-shot commands load once, so they stay strict: a user whose own file
+	// is broken should be told, not silently given the policy defaults.
+	overlaid, _ := withUserOverlay(merged)
+	cfg, err := overlaid()
 	return cfg, path, status, err
 }
 
@@ -804,11 +807,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// per-user preference overlay wraps outside it so a remote refresh can
 	// never quietly undo the user's own choice.
 	remoteLoad, remoteStatus := withRemote(ctx, loadBase)
-	loadCfg := withUserOverlay(remoteLoad)
+	loadCfg, relaxUserOverlay := withUserOverlay(remoteLoad)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Startup accepted the user's file, so from here a later breakage in it
+	// must not stop policy reaching the daemon — see withUserOverlay.
+	relaxUserOverlay()
 	if rs := remoteStatus(); rs != nil {
 		slog.Info("remote config overlay active",
 			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)

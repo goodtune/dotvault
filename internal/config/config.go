@@ -114,6 +114,7 @@ type Config struct {
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	API           APIConfig            `yaml:"api,omitempty"`
+	FUSE          FUSEConfig           `yaml:"fuse,omitempty"`
 	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
@@ -1195,6 +1196,12 @@ func (c *Config) validate() error {
 	// above): a relative path is a mistake worth naming whether or not the
 	// section is currently enabled.
 	if err := c.validateAPI(); err != nil {
+		return err
+	}
+
+	// Filesystem (FUSE) section. Validated unconditionally for the same
+	// reason as the API socket above.
+	if err := c.validateFUSE(); err != nil {
 		return err
 	}
 

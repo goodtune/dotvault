@@ -846,6 +846,21 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 
+	// FUSE (the filesystem view of the user's secrets).
+	fuseKey := rootKey + `\FUSE`
+	if err := applyBool(&cfg.FUSE.Enabled, fuseKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.FUSE.Mountpoint, fuseKey, "Mountpoint"); err != nil {
+		return err
+	}
+	if err := applyBool(&cfg.FUSE.ReadWrite, fuseKey, "ReadWrite"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.FUSE.RawCacheTTL, fuseKey, "CacheTTL"); err != nil {
+		return err
+	}
+
 	// SSH (admin-owned host-CA trust material).
 	sshKey := rootKey + `\SSH`
 	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {

@@ -214,6 +214,21 @@ func UserConfigDir() (string, error) {
 	}
 }
 
+// UserConfigPath returns the path to the per-user preference overlay
+// (config.yaml), a sibling of the env file and ssh.yaml in UserConfigDir.
+//
+// Deliberately distinct from SystemConfigPath: that file is policy, this one
+// is preference. Only the sections config.ParseUserConfig allows may appear
+// here, and each merges by its own ratchet rather than overwriting policy —
+// see config.UserConfig.
+func UserConfigPath() (string, error) {
+	dir, err := UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
+}
+
 // SSHConfigPath returns the path to the user-level managed-SSH-forward
 // configuration (ssh.yaml). It is a sibling of the per-user env file and is
 // never resolved from a system location — see UserConfigDir.

@@ -332,6 +332,15 @@ fuse:
   cache_ttl: "30s"
 ```
 
+### Per-user preferences
+
+Unusually for this file, the `fuse` section can also be set per-user, in `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`) — a sibling of the `env` file and `ssh.yaml`. It is merged over the system configuration, and it is the **only** file a user can use to influence dotvault's configuration: every other section is a hard error there, so it can never re-point the Vault, open a listener, or alter telemetry.
+
+Each field ratchets rather than overwriting: `enabled` may be turned **on** but not off, `read_write` may be turned **off** but not on, and `mountpoint` / `cache_ttl` are preferences the user's value simply wins. An omitted key is not a preference — only an explicitly written one is. See the [Filesystem guide](../guide/filesystem.md#per-user-preferences) for the reasoning behind the two booleans ratcheting in opposite directions.
+
+!!! note "Downloads and exports carry the merged result"
+    `GET /api/v1/config/download` and the `/ui/config/` view show the *running* configuration, so a user preference that took effect appears there as though it were policy — the same way remote-config-merged rules do. Re-importing such a download as a system config would bake that preference in.
+
 The mount root is your own KV prefix (`{kv_mount}/{user_prefix}{username}/`), bound at construction — a path through the mount cannot reach another user's secrets. The daemon mounts after its first successful Vault authentication and unmounts on shutdown; a mount failure is logged once and is never fatal.
 
 !!! warning "Read-only is the default for a reason"

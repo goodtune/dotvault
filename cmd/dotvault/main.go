@@ -255,7 +255,7 @@ func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, er
 		return nil, path, nil, err
 	}
 	merged, status := withRemote(context.Background(), load)
-	cfg, err := merged()
+	cfg, err := withUserOverlay(merged)()
 	return cfg, path, status, err
 }
 
@@ -800,8 +800,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	// loadCfg is the loader the daemon holds for its lifetime: the reload
 	// loop re-runs it every tick, and the remote overlay (conditional GET +
-	// merge) lives inside it so reloads converge on the remote state.
-	loadCfg, remoteStatus := withRemote(ctx, loadBase)
+	// merge) lives inside it so reloads converge on the remote state. The
+	// per-user preference overlay wraps outside it so a remote refresh can
+	// never quietly undo the user's own choice.
+	remoteLoad, remoteStatus := withRemote(ctx, loadBase)
+	loadCfg := withUserOverlay(remoteLoad)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)

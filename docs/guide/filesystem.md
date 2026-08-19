@@ -43,6 +43,43 @@ Filesystem:
   state:      mounted
 ```
 
+## Per-user preferences
+
+The `fuse` section can also be set in your **own** configuration file, which is merged over the system configuration:
+
+| Platform | Path |
+|----------|------|
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` |
+| macOS | `~/Library/Application Support/dotvault/config.yaml` |
+| Windows | `%APPDATA%\dotvault\config.yaml` |
+
+```yaml
+# ~/.config/dotvault/config.yaml
+fuse:
+  enabled: true
+  mountpoint: "~/vault"
+  cache_ttl: "5s"
+```
+
+This is the file to use when your machine's system configuration does not mention the filesystem and you want it, without editing a config an administrator owns.
+
+**Only `fuse` may appear here.** Any other section — `vault`, `web`, `agent`, `api`, and the rest — is a hard error naming it, because that file is yours to write and configuration like where the daemon points its Vault is not. A section this build does not recognise is ignored with a warning, so a newer dotvault's config still starts on an older binary.
+
+Each field merges by its own rule rather than simply overwriting policy:
+
+| Field | Rule |
+|-------|------|
+| `enabled` | You may turn the filesystem **on** when the system leaves it off. You may **not** turn it off when the system enables it |
+| `read_write` | You may turn writes **off** when the system enables them. You may **not** turn them on |
+| `mountpoint` | Yours wins |
+| `cache_ttl` | Yours wins |
+
+The two booleans ratchet in opposite directions, and that is deliberate rather than an inconsistency. Enabling a read-only mount grants nothing your Vault token could not already do, so an administrator's "off" is only a default. Read-write is a different kind of setting — it puts every process running as you one `>` away from replacing a credential — so there the administrator's "no" is binding, and you stay free to be more careful than policy requires.
+
+An omitted key is not a preference. Writing only `mountpoint:` leaves `enabled` and `read_write` exactly as the system configuration set them; you have to write `enabled: false` to mean it, and even then it only takes effect if the system had not already enabled it. When a preference is overruled, the daemon logs a warning naming the field, so a mount you asked not to have is never silently there.
+
+A bad value is a startup error naming your file rather than a silent fallback — an unparseable `cache_ttl` stops the daemon instead of quietly reverting to 30s.
+
 ## Requirements
 
 | Platform | Requirement |

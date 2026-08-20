@@ -41,6 +41,7 @@ After successful authentication, dotvault manages the Vault token automatically:
 - **TTL monitoring** — checked every 5 minutes
 - **Automatic re-auth** — if the token expires or a `403 Forbidden` is received, dotvault triggers re-authentication
 - **Exponential backoff** — on renewal failure, retries with backoff from 1 second to 5 minutes
+- **No repeat lookups on a refused token** — a token Vault has already refused is not presented again until something changes, so a daemon left without a usable credential stops asking rather than polling Vault every 10 seconds indefinitely. Applies to every auth method; see [Tokens Vault has already refused](token.md#tokens-vault-has-already-refused)
 
 In web mode, re-authentication opens the browser to the web UI login page. In CLI mode, re-authentication uses the configured auth method directly.
 

@@ -773,6 +773,7 @@ var (
 	vaultCalls      metric.Int64Counter
 	tokenRenewals   metric.Int64Counter
 	tokenTTLSeconds metric.Float64Histogram
+	tokenDenylist   metric.Int64Counter
 	enrolAttempts   metric.Int64Counter
 	webRequests     metric.Int64Counter
 	configReloads   metric.Int64Counter
@@ -840,6 +841,19 @@ func rebindInstruments() {
 		"dotvault.token.ttl_remaining",
 		metric.WithUnit("s"),
 		metric.WithDescription("Vault token TTL remaining at each lifecycle check"),
+	)
+	tokenDenylist, _ = meter.Int64Counter(
+		"dotvault.token.denylist",
+		// The counterpart to dotvault.vault.calls for a token Vault has
+		// already rejected: "denied" is a token entering suppression,
+		// "suppressed" is one lookup-self that was NOT sent because of it,
+		// and "cleared" is the suppression being dropped after something
+		// changed the credential situation (token file rewritten, peer
+		// socket reconnected, SIGHUP). A rising `suppressed` on a flat
+		// `denied` is the fleet-wide measure of the request storm this
+		// replaced. Bounded cardinality — three fixed event names, and
+		// deliberately no token identity of any kind.
+		metric.WithDescription("Denied-token suppression events by event (denied, suppressed, cleared)"),
 	)
 	enrolAttempts, _ = meter.Int64Counter(
 		"dotvault.enrol.attempts",
@@ -1019,6 +1033,22 @@ func RecordTokenTTL(ctx context.Context, ttl time.Duration) {
 		return
 	}
 	h.Record(ctx, ttl.Seconds())
+}
+
+// RecordTokenDenylist records a denied-token suppression event. Events emitted
+// today: "denied" (a token Vault rejected entering suppression), "suppressed"
+// (a lookup-self skipped because the token is suppressed), and "cleared" (the
+// suppressions dropped after the credential situation changed). No token
+// material — not even a digest — is attached: the event name is the whole
+// signal, and the point of the cache is to stop being a place tokens live.
+func RecordTokenDenylist(ctx context.Context, event string) {
+	instrMu.RLock()
+	c := tokenDenylist
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("event", event)))
 }
 
 // RecordEnrolAttempt records an enrolment attempt by engine and outcome.

@@ -926,6 +926,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	tokenPath := paths.VaultTokenPath()
 
+	// One denied-token cache for the whole daemon, created before the first
+	// Vault call so every stage shares one verdict: the startup reuse check,
+	// the peer borrow, the headless idle loop, and (once it exists) the
+	// lifecycle manager. Without the sharing, each stage would independently
+	// re-present a token Vault had already rejected to an earlier one — which
+	// is how an expired ~/.dotvault-token turned into a permanent stream of
+	// denied lookup-self requests. See auth.TokenDenylist.
+	denyList := auth.NewTokenDenylist()
+
 	// Under mtls+os a token file found here is stale — left by plain mtls or an
 	// earlier build — and must not be adopted: reuse runs BEFORE any login, so
 	// otherwise the daemon would pick the stale credential up and certLogin's
@@ -950,6 +959,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			authenticated = true
 		} else {
 			slog.Warn("existing token invalid, proceeding to fresh auth", "error", err)
+			denyList.NoteRejection(ctx, token, err)
 			vc.SetToken("")
 		}
 	}
@@ -995,6 +1005,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				authenticated = true
 			} else {
 				slog.Warn("token from peer socket is not usable, proceeding to configured auth flow", "socket", source, "error", err)
+				denyList.NoteRejection(ctx, token, err)
 				vc.SetToken("")
 			}
 		}
@@ -1164,7 +1175,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from the peer socket")
-			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrowSockets) {
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrowSockets, denyList) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -1215,6 +1226,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		lm.SetTokenFilePath(tokenPath)
 	}
 	lm.SetTokenSockets(borrowSockets)
+	// Hand over the cache startup has been populating, so a token the reuse
+	// check or the headless idle already watched Vault reject is not presented
+	// again by the recovery poll.
+	lm.SetTokenDenylist(denyList)
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
 		// Let /api/v1/token decline once this daemon knows its own token is
@@ -2906,7 +2921,15 @@ func headlessTokenPath(method, tokenPath string) string {
 // false if ctx is cancelled first. The watches are registered synchronously
 // before the first read so a token written, or a socket created, during
 // startup cannot be missed.
-func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, socketPaths []string) bool {
+//
+// denyList suppresses candidates Vault has already rejected. Without it this
+// loop re-presented the same expired token file to lookup-self every 10s for as
+// long as the daemon idled — which, on a host whose token expired while nobody
+// was around to write a new one, is indefinitely. A watcher event clears the
+// suppression, so a rewritten file is retried immediately; a poll-only platform
+// (no inotify) still picks up a rewrite, because the cache is keyed on the
+// token's value and a new token is simply not in it. May be nil.
+func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, socketPaths []string, denyList *auth.TokenDenylist) bool {
 	// The watcher goroutines below can outlive a *successful* return: a token
 	// arrives while the parent ctx is still live, so cancellation can't be
 	// what stops them. Give them a child context we cancel on the way out, and
@@ -2920,6 +2943,13 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 
 	wake := make(chan struct{}, 1)
 	notify := func() {
+		// A watcher fired: the token file was written, or a peer socket
+		// appeared. Either way the credential situation may have changed, so
+		// drop the suppressions and let the retry below try everything again —
+		// including a token whose bytes are unchanged, since Vault's reason for
+		// rejecting it may have been server-side. A still-bad token is
+		// re-suppressed on the spot.
+		denyList.Clear(ctx)
 		select {
 		case wake <- struct{}{}:
 		default:
@@ -2972,10 +3002,16 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 		if candidate == "" || candidate == vc.Token() {
 			return false
 		}
+		if denyList.Denied(ctx, candidate) {
+			// Vault has already rejected exactly this token and nothing has
+			// happened since to suggest a different answer.
+			return false
+		}
 		previous := vc.Token()
 		vc.SetToken(candidate)
 		if _, lookupErr := vc.LookupSelf(ctx); lookupErr != nil {
 			vc.SetToken(previous)
+			denyList.NoteRejection(ctx, candidate, lookupErr)
 			// A cancelled parent ctx (clean shutdown) can race the wake /
 			// ticker select arms below and land here with a context.Canceled
 			// lookup error — select picks a ready case at random, so

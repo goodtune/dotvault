@@ -18,6 +18,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The vaultfs mount tests skip when FUSE is unusable, so without this
+      # the go-fuse binding would silently go untested in CI while every
+      # other package stayed green. Installing the helper makes the skip a
+      # real signal rather than the permanent state.
+      - name: Install FUSE (for the filesystem mount tests)
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+
       - name: Run tests
         run: go test ./...
 

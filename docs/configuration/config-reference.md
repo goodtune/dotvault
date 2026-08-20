@@ -8,6 +8,16 @@ dotvault uses a YAML configuration file. The file location depends on your platf
 | macOS    | `/Library/Application Support/dotvault/config.yaml` |
 | Windows  | `%ProgramData%\dotvault\config.yaml` |
 
+That file is **system-wide** and normally administrator-owned. There is also an optional **per-user** file, which may carry only the [`fuse`](#filesystem-section) section and is merged over the system configuration:
+
+| Platform | Path |
+|----------|------|
+| Linux    | `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` |
+| macOS    | `~/Library/Application Support/dotvault/config.yaml` |
+| Windows  | `%APPDATA%\dotvault\config.yaml` |
+
+Every other section is a hard error there, so the per-user file can never re-point the Vault, open a listener, or alter telemetry. See [Per-user preferences](#per-user-preferences).
+
 You can override the config path with `--config`:
 
 ```sh
@@ -49,6 +59,12 @@ api:
   enabled: true
   unix:
     path: ""    # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"
+  read_write: false
+  cache_ttl: "30s"
 
 rules:
   - name: gh
@@ -307,6 +323,51 @@ This is required for any user service meant to outlive an SSH session, which is 
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\API`, and the section round-trips through `reg-import`/`reg-export` like every other.
 
+## Filesystem section
+
+The `fuse` section mounts your Vault secrets as a filesystem: each secret becomes a `.json` file whose contents are its `data` section, so `jq . ~/.dotvault/gh.json` works and `stat` reports the secret's version timestamp as the file's mtime. The extension is what makes editors and IDEs treat the file as JSON rather than unknown text; directories carry none. See the [Filesystem guide](../guide/filesystem.md) for the full write-up.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Mount the filesystem |
+| `mountpoint` | string | `~/.dotvault` | Directory to mount on; must be absolute (or `~`-relative). Created at mode `0700` if absent |
+| `read_write` | bool | `false` | Allow writing through the mount (replace, create, delete). Read-only otherwise, regardless of what the Vault token could do |
+| `cache_ttl` | duration | `30s` | How long a listing or a rendered secret is reused before Vault is asked again. `0` disables caching; capped at 10 minutes, since the cache window is also how long a revoked secret stays readable |
+
+```yaml
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"
+  read_write: false
+  cache_ttl: "30s"
+```
+
+### Per-user preferences
+
+Unusually for this file, the `fuse` section can also be set per-user, in `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`) — a sibling of the `env` file and `ssh.yaml`. It is merged over the system configuration, and it is the **only** file a user can use to influence dotvault's configuration: every other section is a hard error there, so it can never re-point the Vault, open a listener, or alter telemetry.
+
+The file must be a single YAML document, and dotvault refuses to read it if the file or its directory is group- or world-writable — it can turn a secrets mount on, so a path another account can rewrite is refused rather than warned about. A parse failure is fatal at startup and a skipped-with-warning overlay on later reloads, so a user's typo can never stop policy reaching the daemon.
+
+Each field ratchets rather than overwriting: `enabled` may be turned **on** but not off, `read_write` may be turned **off** but not on, and `mountpoint` / `cache_ttl` are preferences the user's value simply wins. An omitted key is not a preference — only an explicitly written one is. See the [Filesystem guide](../guide/filesystem.md#per-user-preferences) for the reasoning behind the two booleans ratcheting in opposite directions.
+
+!!! note "Downloads and exports carry the merged result"
+    `GET /api/v1/config/download` and the `/ui/config/` view show the *running* configuration, so a user preference that took effect appears there as though it were policy — the same way remote-config-merged rules do. Re-importing such a download as a system config would bake that preference in.
+
+The mount root is your own KV prefix (`{kv_mount}/{user_prefix}{username}/`), bound at construction — a path through the mount cannot reach another user's secrets. The daemon mounts after its first successful Vault authentication and unmounts on shutdown; a mount failure is logged once and is never fatal.
+
+!!! warning "Read-only is the default for a reason"
+    The daemon's token can usually write to Vault. That capability exists for dotvault's own sync and enrolment work — exposing it through a filesystem makes every process running as you, and every mistyped shell redirect, one `>` away from replacing a credential. `read_write: true` is a separate decision from mounting.
+
+!!! note "One narrow filename collision"
+    A secret and a folder sharing a KV name coexist fine — `users/you/databricks` is `databricks.json` and `users/you/databricks/prod` is `databricks/prod.json`. What does collide is a KV folder whose name already ends in `.json`, which competes with the secret of the same stem. The directory wins so the secrets underneath stay reachable, the daemon warns naming the path, and the shadowed secret has no path in the mount. The mount refuses to create such a directory, so it can only come from a KV tree already laid out that way.
+
+!!! note "Unix only"
+    `fuse.enabled` has no effect on Windows: the daemon logs a warning and mounts nothing, so a config shared across a mixed-platform fleet is safe. There is no Windows equivalent planned — WinFsp is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries. Linux needs `/dev/fuse` and the `fusermount3` helper (`fuse3` package); macOS needs [macFUSE](https://macfuse.github.io/).
+
+Reading a file in the mount calls Vault, so `grep -r` across the mount — or an editor indexing your home directory — reads every secret you have and puts each one in Vault's audit log. Reach for a specific path.
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
+
 ## Observability section
 
 Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured in its own nested `metrics:` / `logs:` block, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
@@ -391,3 +452,5 @@ dotvault validates the configuration on startup and exits with an error if:
 - `web.listen` resolves to a non-loopback address (when web is enabled)
 - An enrolment entry has an empty `engine` field
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
+- `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)
+- `fuse.cache_ttl` does not parse as a duration, or is negative

@@ -50,6 +50,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeRemoteConfig(cfg.RemoteConfig)
 	e.writeAgent(cfg.Agent)
 	e.writeAPI(cfg.API)
+	e.writeFUSE(cfg.FUSE)
 	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -339,6 +340,26 @@ func (e *emitter) writeAPI(a config.APIConfig) {
 	e.writeKey(rootKey + `\API`)
 	e.writeBool("Enabled", a.Enabled)
 	e.writeString("UnixPath", a.Unix.Path)
+	e.WriteString("\r\n")
+}
+
+// writeFUSE emits the filesystem section. Flat scalars under one key, like
+// the API section: the YAML has no nesting to mirror here.
+//
+// Emitted on every platform, including a config exported from Windows where
+// nothing can mount a filesystem. The registry is the GPO surface for the
+// whole configuration, and an admin managing a mixed fleet sets the section
+// for the Linux and macOS machines the same policy covers.
+func (e *emitter) writeFUSE(f config.FUSEConfig) {
+	e.writeKey(rootKey + `\FUSE`)
+	e.writeBool("Enabled", f.Enabled)
+	e.writeString("Mountpoint", f.Mountpoint)
+	e.writeBool("ReadWrite", f.ReadWrite)
+	// The raw string, not the parsed duration: an operator who wrote "1m"
+	// must get "1m" back rather than "1m0s", and an unset value must stay
+	// unset rather than being frozen at whatever the default happened to be
+	// when the config was loaded.
+	e.writeString("CacheTTL", f.RawCacheTTL)
 	e.WriteString("\r\n")
 }
 

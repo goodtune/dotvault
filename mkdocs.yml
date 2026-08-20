@@ -73,6 +73,7 @@ nav:
       - ghp: services/ghp.md
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
+  - Filesystem: guide/filesystem.md
   - SSH Agent: guide/ssh-agent.md
   - Managed SSH Forwards: guide/ssh-forwards.md
   - Web UI: web-ui.md

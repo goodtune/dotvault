@@ -60,6 +60,29 @@ api:
     # being 9000 instead of the usual.
     path: "~/.cache/dotvault/api-dev.sock"
 
+# Filesystem view of the user's secrets. Each secret under
+# kv/users/<you>/ appears as a `.json` file whose contents are its data
+# section, so `jq . <mountpoint>/gh.json` works and editors treat it as JSON.
+#
+# Enabled here so a dev run exercises the surface, but pointed at a dev-only
+# mountpoint rather than the default ~/.dotvault — the same reasoning as the
+# API socket path above: a dev run must not fight an installed daemon for a
+# shared location, and mounting over a developer's real ~/.dotvault would be
+# a surprising side effect of `go run`.
+#
+# Needs a working FUSE stack (Linux: /dev/fuse plus the fusermount3 helper
+# from the fuse3 package; macOS: macFUSE). Without one the daemon logs the
+# reason once and carries on — nothing else is affected.
+fuse:
+  enabled: true
+  mountpoint: "~/.cache/dotvault/mnt-dev"
+  # Read-only by default. Flip to true to exercise the write path: writing
+  # JSON over a file replaces the secret, and `rm` deletes every version.
+  read_write: false
+  # Short so cache behaviour is observable during development; the shipped
+  # default is 30s.
+  cache_ttl: "5s"
+
 # SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
 # domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
 # live Vault token. Point SSH_AUTH_SOCK at the socket to use it.

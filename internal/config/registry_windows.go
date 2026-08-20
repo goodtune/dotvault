@@ -305,6 +305,16 @@ type registryLayer struct {
 	APIEnabled  *uint32
 	APIUnixPath string
 
+	// FUSE (the filesystem view of the user's secrets). Present here even
+	// though nothing mounts a FUSE filesystem on Windows: the registry is
+	// the GPO deployment surface for the whole config, and an admin managing
+	// a mixed fleet from one policy must be able to set the section for the
+	// Linux and macOS machines in it.
+	FUSEEnabled    *uint32
+	FUSEMountpoint string
+	FUSEReadWrite  *uint32
+	FUSECacheTTL   string
+
 	// SSH: the certificate_authorities list and insecure_ignore_host_key flag
 	// are admin-owned policy, so — like every other config section — they
 	// round-trip through this registry loader, .reg, and YAML alike. The
@@ -464,6 +474,19 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		defer apik.Close()
 		layer.APIEnabled = readRegDWORD(apik, "Enabled")
 		layer.APIUnixPath, _ = readRegString(apik, "UnixPath")
+	}
+
+	// Read FUSE subkey (the filesystem view).
+	fusek, err := registry.OpenKey(root, registryPolicyPath+`\FUSE`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open FUSE policy key: %w", err)
+	}
+	if err == nil {
+		defer fusek.Close()
+		layer.FUSEEnabled = readRegDWORD(fusek, "Enabled")
+		layer.FUSEMountpoint, _ = readRegString(fusek, "Mountpoint")
+		layer.FUSEReadWrite = readRegDWORD(fusek, "ReadWrite")
+		layer.FUSECacheTTL, _ = readRegString(fusek, "CacheTTL")
 	}
 
 	// Read SSH subkey (host-CA trust material).
@@ -640,6 +663,18 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.APIUnixPath != "" {
 		cfg.API.Unix.Path = layer.APIUnixPath
+	}
+	if layer.FUSEEnabled != nil {
+		cfg.FUSE.Enabled = *layer.FUSEEnabled != 0
+	}
+	if layer.FUSEMountpoint != "" {
+		cfg.FUSE.Mountpoint = layer.FUSEMountpoint
+	}
+	if layer.FUSEReadWrite != nil {
+		cfg.FUSE.ReadWrite = *layer.FUSEReadWrite != 0
+	}
+	if layer.FUSECacheTTL != "" {
+		cfg.FUSE.RawCacheTTL = layer.FUSECacheTTL
 	}
 	// Present (non-nil), not non-empty, gates the merge — same rationale as
 	// VaultPolicies above.

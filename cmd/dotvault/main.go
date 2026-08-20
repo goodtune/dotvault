@@ -255,7 +255,10 @@ func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, er
 		return nil, path, nil, err
 	}
 	merged, status := withRemote(context.Background(), load)
-	cfg, err := merged()
+	// One-shot commands load once, so they stay strict: a user whose own file
+	// is broken should be told, not silently given the policy defaults.
+	overlaid, _ := withUserOverlay(merged)
+	cfg, err := overlaid()
 	return cfg, path, status, err
 }
 
@@ -400,8 +403,8 @@ type refreshDeps struct {
 
 // staticSections snapshots the config sections the daemon cannot apply
 // in-place: they configure subsystems constructed once at startup (the Vault
-// client, the web listener, the local API socket, the SSH agent, the OTel
-// SDK). The refresh loop
+// client, the web listener, the local API socket, the SSH agent, the mounted
+// filesystem, the OTel SDK). The refresh loop
 // diffs them only to tell the operator a restart is needed. remote_config is
 // deliberately NOT here: the withRemote loader rebuilds the overlay fetcher
 // whenever the section changes and the refresh loop re-derives its cadence
@@ -415,6 +418,7 @@ type staticSections struct {
 	Web           config.WebConfig
 	Agent         config.AgentConfig
 	API           config.APIConfig
+	FUSE          config.FUSEConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
 	Bypass        bool
@@ -426,6 +430,7 @@ func staticSectionsOf(c *config.Config) staticSections {
 		Web:           c.Web,
 		Agent:         c.Agent,
 		API:           c.API,
+		FUSE:          c.FUSE,
 		Observability: c.Observability,
 		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
@@ -529,6 +534,9 @@ func changedStaticSections(a, b staticSections) []string {
 	}
 	if !reflect.DeepEqual(a.API, b.API) {
 		out = append(out, "api")
+	}
+	if !reflect.DeepEqual(a.FUSE, b.FUSE) {
+		out = append(out, "fuse")
 	}
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")
@@ -795,12 +803,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	// loadCfg is the loader the daemon holds for its lifetime: the reload
 	// loop re-runs it every tick, and the remote overlay (conditional GET +
-	// merge) lives inside it so reloads converge on the remote state.
-	loadCfg, remoteStatus := withRemote(ctx, loadBase)
+	// merge) lives inside it so reloads converge on the remote state. The
+	// per-user preference overlay wraps outside it so a remote refresh can
+	// never quietly undo the user's own choice.
+	remoteLoad, remoteStatus := withRemote(ctx, loadBase)
+	loadCfg, relaxUserOverlay := withUserOverlay(remoteLoad)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Startup accepted the user's file, so from here a later breakage in it
+	// must not stop policy reaching the daemon — see withUserOverlay.
+	relaxUserOverlay()
 	if rs := remoteStatus(); rs != nil {
 		slog.Info("remote config overlay active",
 			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)
@@ -1278,6 +1292,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		agentSvc.Backend.SetReauthGate(lm)
 		go agentSvc.Run(ctx)
 		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
+	}
+
+	// Mount the filesystem now that we hold a Vault token, for the same
+	// reason the agent listener waits: every read it serves is a Vault call,
+	// so a mount that came up first would answer errors to anything that
+	// happened to look at the directory. Never fatal — see startFUSE.
+	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
+		webServer.SetFUSEStatus(fuseSvc.Status)
 	}
 
 	// Build and start the managed-SSH-forward subsystem now that we hold a
@@ -1774,6 +1796,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	printRemoteConfigStatus(remoteStatus)
 
 	printAgentStatus(ctx, cfg)
+
+	printFUSEStatus(cfg)
 
 	return nil
 }

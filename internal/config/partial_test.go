@@ -186,3 +186,16 @@ func TestPartialValidate(t *testing.T) {
 		})
 	}
 }
+
+// A remote config service must not be able to mount a filesystem on the
+// machine, so `fuse` is a hard error in a remote document like every other
+// static section — not a warn-and-ignore.
+func TestParsePartialRejectsFUSE(t *testing.T) {
+	_, err := ParsePartial([]byte("fuse:\n  enabled: true\n  read_write: true\n"))
+	if err == nil {
+		t.Fatal("ParsePartial accepted a fuse section from a remote document")
+	}
+	if !strings.Contains(err.Error(), "fuse") {
+		t.Errorf("error = %v, want it to name the fuse section", err)
+	}
+}

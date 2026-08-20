@@ -29,6 +29,7 @@ import (
 	internalsync "github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
 // Server is the web UI HTTP server.
@@ -188,6 +189,16 @@ type Server struct {
 	// remote for /api/v1/status's "ssh" block. Guarded by sshMu; read
 	// through sshStatusSnapshot.
 	sshStatus func() []sshfwd.RemoteStatus
+
+	// fuseMu guards fuseStatus, for the same reason sshMu guards the SSH
+	// fields: the mounted filesystem is built after the first successful
+	// Vault auth, by which time this server may already be serving requests.
+	fuseMu sync.RWMutex
+	// fuseStatus reports the mounted filesystem's state for
+	// /api/v1/status's "fuse" block. Nil when no filesystem is configured
+	// (or the platform has none). Guarded by fuseMu; read through
+	// fuseStatusSnapshot.
+	fuseStatus func() vaultfs.Status
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
@@ -725,6 +736,25 @@ func (s *Server) sshStatusSnapshot() func() []sshfwd.RemoteStatus {
 	s.sshMu.RLock()
 	defer s.sshMu.RUnlock()
 	return s.sshStatus
+}
+
+// SetFUSEStatus wires the mounted filesystem's status query in after
+// construction, once the daemon has mounted it — which requires an
+// authenticated Vault client, so it cannot be passed to NewServer. Guarded by
+// fuseMu because the server may already be serving requests.
+func (s *Server) SetFUSEStatus(status func() vaultfs.Status) {
+	s.fuseMu.Lock()
+	defer s.fuseMu.Unlock()
+	s.fuseStatus = status
+}
+
+// fuseStatusSnapshot returns the currently wired filesystem status query, or
+// nil if none is configured. Handlers must read through this rather than the
+// raw field, which SetFUSEStatus can mutate concurrently.
+func (s *Server) fuseStatusSnapshot() func() vaultfs.Status {
+	s.fuseMu.RLock()
+	defer s.fuseMu.RUnlock()
+	return s.fuseStatus
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {

@@ -23,6 +23,7 @@ rules:
 | `target.path` | yes | Local file path (`~` is expanded to the user's home directory) |
 | `target.format` | yes | Output format: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, or `ssh_config` |
 | `target.template` | conditional | Go template to reshape secret data before writing. Required when `vault_key` is omitted (a keyless rule has no secret data to fall back on) |
+| `target.delete_nulls` | no | Default `false`. Treat a `null` in the rendered template as a tombstone that **removes** the key from the target file. See [Removing a field](#removing-a-field). `json` and `yaml` only |
 
 ## Rules without a Vault key
 
@@ -96,6 +97,49 @@ Host *
 keeps the `User` and the `RemoteForward` listen path stable across syncs (the `username` function resolves to the OS account dotvault runs as), so the forward is updated in place rather than duplicated each cycle. See [Templates](templates.md#template-functions) for the `username` function.
 
 > **Ordering note.** ssh_config takes the *first* obtained value for each parameter. Directives placed in the global section (no `Host` block) sit at the top of the file and therefore win over any host-specific value below them — keep that in mind when choosing whether a template targets the global section or a specific `Host`/`Match` block.
+
+## Removing a field
+
+The merge is additive: a rule writes the keys it manages and preserves everything else. That is the right default, but it means there is no way to *retire* a key. If a secret you used to publish into a file is no longer needed — say you have moved a client from a static credential to one it fetches dynamically through the Client API — writing nothing leaves the old value in the file, and deleting the rule stops managing the file altogether, which also leaves it there. Either way the credential stays on disk.
+
+`target.delete_nulls` closes that off. With it set, a `null` in the rendered template is a tombstone rather than a value: the matching key is deleted from the target file, the equivalent of `del(.KEY_I_USED_TO_FILL)` in `jq`.
+
+```yaml
+rules:
+  - name: app
+    vault_key: "app"
+    target:
+      path: "~/.config/app/config.json"
+      format: json
+      delete_nulls: true
+      template: |
+        {
+          "token": "{{ .token }}",
+          "KEY_I_USED_TO_FILL": null
+        }
+```
+
+On the next sync the file keeps its `token`, keeps anything else the user put there by hand, and loses `KEY_I_USED_TO_FILL` entirely.
+
+Deleting a key that is not there is a no-op, so a tombstone is safe to leave in the template permanently — which is what you want, since removing it would only mean the key comes back if anything ever re-adds it. It also costs nothing on subsequent syncs: the file stops changing once the key is gone.
+
+### Why it is opt-in
+
+`delete_nulls` defaults to `false` and has to be named on each rule that wants it, because a `null` is easy to render by accident. In YAML especially:
+
+```yaml
+password: {{ .password }}
+```
+
+over an empty or missing value renders `password:`, which parses as a null. Under always-on deletion that would silently delete a live credential instead of writing an empty one. Requiring the opt-in keeps that failure mode off every rule that has not asked for it.
+
+All three YAML spellings of null — `key: null`, `key: ~`, and a bare `key:` — are tombstones when the flag is on.
+
+### Supported formats
+
+`delete_nulls` is accepted for `json` and `yaml` only. Those are the two formats whose syntax has a null literal a template can render. The rest have no way to express one: TOML has no null in the spec, INI values are strings (`key =` is an empty string, not an absent one), `text` is a whole-file overwrite with no keys at all, and `netrc` and `ssh_config` are line-oriented directive formats.
+
+Setting `delete_nulls: true` on any of those is a **config error** at load time, naming the rule and the format. It is rejected rather than ignored on purpose: a flag that silently did nothing would leave you believing a credential had been removed while it sat in the file untouched — precisely the outcome the feature exists to prevent. Removal for those formats needs a different mechanism and is not yet designed.
 
 ## File permissions
 

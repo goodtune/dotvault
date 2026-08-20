@@ -146,3 +146,122 @@ func TestYAMLHandler_WriteAtomicAndPermissions(t *testing.T) {
 	}
 }
 
+// TestYAMLHandler_DeleteNulls mirrors the JSON contract on the node-based
+// merge path, where a tombstone splices the key/value pair out of the
+// mapping node. Assertions are made on the rendered output because that is
+// what lands on disk, and it also proves the pair is genuinely gone rather
+// than present-and-null.
+func TestYAMLHandler_DeleteNulls(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		existing   string
+		incoming   string
+		wantHas    []string
+		wantAbsent []string
+	}{
+		{
+			name:       "removes the tombstoned key and keeps the rest",
+			existing:   "keep: yes\nKEY_I_USED_TO_FILL: secret\n",
+			incoming:   "KEY_I_USED_TO_FILL: null\n",
+			wantHas:    []string{"keep"},
+			wantAbsent: []string{"KEY_I_USED_TO_FILL", "secret"},
+		},
+		{
+			// `key: ~` and the bare `key:` an empty template substitution
+			// produces both resolve to the null tag, so all three spellings
+			// must behave identically.
+			name:       "tilde spelling is a tombstone",
+			existing:   "gone: secret\n",
+			incoming:   "gone: ~\n",
+			wantAbsent: []string{"gone", "secret"},
+		},
+		{
+			name:       "bare key spelling is a tombstone",
+			existing:   "gone: secret\n",
+			incoming:   "gone:\n",
+			wantAbsent: []string{"gone", "secret"},
+		},
+		{
+			name:       "nested tombstone removes only that key",
+			existing:   "auth:\n  token: t\n  legacy: old\n",
+			incoming:   "auth:\n  legacy: null\n",
+			wantHas:    []string{"token"},
+			wantAbsent: []string{"legacy", "old"},
+		},
+		{
+			name:       "deleting an absent key is a no-op",
+			existing:   "keep: yes\n",
+			incoming:   "KEY_I_USED_TO_FILL: null\n",
+			wantHas:    []string{"keep"},
+			wantAbsent: []string{"KEY_I_USED_TO_FILL"},
+		},
+		{
+			name:       "tombstone under an absent parent is not created",
+			existing:   "other: 1\n",
+			incoming:   "auth:\n  token: t\n  legacy: null\n",
+			wantHas:    []string{"other", "token"},
+			wantAbsent: []string{"legacy", "null"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &YAMLHandler{DeleteNulls: true}
+			existing, err := h.Parse(tc.existing)
+			if err != nil {
+				t.Fatalf("Parse(existing): %v", err)
+			}
+			incoming, err := h.Parse(tc.incoming)
+			if err != nil {
+				t.Fatalf("Parse(incoming): %v", err)
+			}
+			merged, err := h.Merge(existing, incoming)
+			if err != nil {
+				t.Fatalf("Merge() error: %v", err)
+			}
+
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.yaml")
+			if err := h.Write(out, merged, 0600); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			got, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			for _, want := range tc.wantHas {
+				if !strings.Contains(string(got), want) {
+					t.Errorf("output missing %q:\n%s", want, got)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(string(got), absent) {
+					t.Errorf("output still contains %q:\n%s", absent, got)
+				}
+			}
+		})
+	}
+}
+
+// TestYAMLHandler_NullsWrittenWhenFlagOff pins the default. This is the
+// case that makes delete_nulls opt-in: `key: {{ .missing }}` renders a bare
+// `key:`, so always-on deletion would silently remove live credentials.
+func TestYAMLHandler_NullsWrittenWhenFlagOff(t *testing.T) {
+	h := &YAMLHandler{}
+
+	existing, _ := h.Parse("password: live\n")
+	incoming, _ := h.Parse("password:\n")
+
+	merged, err := h.Merge(existing, incoming)
+	if err != nil {
+		t.Fatalf("Merge() error: %v", err)
+	}
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.yaml")
+	if err := h.Write(out, merged, 0600); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if !strings.Contains(string(got), "password") {
+		t.Errorf("key was deleted without DeleteNulls set:\n%s", got)
+	}
+}

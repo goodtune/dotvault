@@ -755,6 +755,9 @@ func readSingleRule(root registry.Key, name string) (Rule, error) {
 	rule.Target.Format, _ = readRegString(key, "TargetFormat")
 	rule.Target.Template, _ = readRegString(key, "TargetTemplate")
 	rule.Target.Merge, _ = readRegString(key, "TargetMerge")
+	if v := readRegDWORD(key, "TargetDeleteNulls"); v != nil {
+		rule.Target.DeleteNulls = *v != 0
+	}
 
 	// Read optional OAuth settings.
 	oauthPath := path + `\OAuth`

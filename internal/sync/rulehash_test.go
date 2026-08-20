@@ -47,6 +47,10 @@ func TestRuleRenderHash_StableAndSensitive(t *testing.T) {
 		"path":      func(r *config.Rule) { r.Target.Path = "~/.ssh/other" },
 		"format":    func(r *config.Rule) { r.Target.Format = "text" },
 		"merge":     func(r *config.Rule) { r.Target.Merge = "deep" },
+		// Toggling delete_nulls changes the merged output of an otherwise
+		// identical rule — the same template stops writing a null and starts
+		// removing the key — so it must re-apply on an untouched secret.
+		"delete_nulls": func(r *config.Rule) { r.Target.DeleteNulls = true },
 	}
 	for field, mutate := range mutators {
 		r := base

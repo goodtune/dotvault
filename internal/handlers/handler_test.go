@@ -192,3 +192,59 @@ func TestTextRoundTrip(t *testing.T) {
 		t.Errorf("output = %q, want 'replaced key content'", string(got))
 	}
 }
+
+// TestHandlerWithOptionsDeleteNulls pins the factory's second gate: asking a
+// null-less format for null deletion is an error, not a silent no-op that
+// would hand the caller additive-only merges when it asked for deletions.
+func TestHandlerWithOptionsDeleteNulls(t *testing.T) {
+	for _, tt := range []struct {
+		format  string
+		wantErr bool
+	}{
+		{"json", false},
+		{"yaml", false},
+		{"ini", true},
+		{"toml", true},
+		{"text", true},
+		{"netrc", true},
+		{"ssh_config", true},
+	} {
+		t.Run(tt.format, func(t *testing.T) {
+			h, err := HandlerWithOptions(tt.format, Options{DeleteNulls: true})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for delete_nulls with format %q", tt.format)
+				}
+				if !strings.Contains(err.Error(), "delete_nulls") {
+					t.Errorf("error should name the offending option, got: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if h == nil {
+				t.Fatal("handler is nil")
+			}
+		})
+	}
+}
+
+// TestHandlerForLeavesDeleteNullsOff pins that the plain factory is still
+// the historical default for every format.
+func TestHandlerForLeavesDeleteNullsOff(t *testing.T) {
+	j, err := HandlerFor("json")
+	if err != nil {
+		t.Fatalf("HandlerFor(json): %v", err)
+	}
+	if j.(*JSONHandler).DeleteNulls {
+		t.Error("JSONHandler.DeleteNulls set by HandlerFor")
+	}
+	y, err := HandlerFor("yaml")
+	if err != nil {
+		t.Fatalf("HandlerFor(yaml): %v", err)
+	}
+	if y.(*YAMLHandler).DeleteNulls {
+		t.Error("YAMLHandler.DeleteNulls set by HandlerFor")
+	}
+}

@@ -10,7 +10,15 @@ import (
 )
 
 // YAMLHandler handles YAML files with deep merge using yaml.Node trees.
-type YAMLHandler struct{}
+type YAMLHandler struct {
+	// DeleteNulls makes a null in the incoming document a tombstone: the
+	// matching key/value pair is spliced out of the target's mapping node
+	// rather than written as null. See config.Target.DeleteNulls for why it
+	// is opt-in — YAML in particular renders a null from an empty template
+	// value (`key: {{ .missing }}` becomes `key:`), so always-on deletion
+	// here would be actively dangerous.
+	DeleteNulls bool
+}
 
 func (h *YAMLHandler) Read(path string) (any, error) {
 	data, err := os.ReadFile(path)
@@ -59,6 +67,10 @@ func (h *YAMLHandler) Merge(existing any, incoming any) (any, error) {
 
 	// Empty existing doc — just return incoming
 	if len(existDoc.Content) == 0 {
+		// The incoming document is adopted wholesale rather than merged
+		// key-by-key, so tombstones in it are never matched against anything
+		// and would otherwise be written out as literal nulls.
+		pruneNullNodes(incDoc, h.DeleteNulls)
 		return incDoc, nil
 	}
 	// Empty incoming — return existing unchanged
@@ -66,7 +78,7 @@ func (h *YAMLHandler) Merge(existing any, incoming any) (any, error) {
 		return existDoc, nil
 	}
 
-	mergeNodes(existDoc.Content[0], incDoc.Content[0])
+	mergeNodes(existDoc.Content[0], incDoc.Content[0], h.DeleteNulls)
 	return existDoc, nil
 }
 
@@ -90,9 +102,15 @@ func (h *YAMLHandler) Write(path string, data any, perm os.FileMode) error {
 // mergeNodes recursively merges src into dst.
 // For MappingNodes: add/update keys from src, preserve existing keys not in src.
 // For other node types: replace dst with src.
-func mergeNodes(dst, src *yaml.Node) {
+//
+// When deleteNulls is set, a null value in src is a tombstone rather than a
+// value: the whole key/value pair is spliced out of dst instead of written.
+// Splicing a key dst does not have is a no-op, so a tombstone left in a
+// template indefinitely keeps producing an unchanged file.
+func mergeNodes(dst, src *yaml.Node, deleteNulls bool) {
 	if dst.Kind != yaml.MappingNode || src.Kind != yaml.MappingNode {
 		// Replace entirely for non-mapping nodes
+		pruneNullNodes(src, deleteNulls)
 		*dst = *src
 		return
 	}
@@ -102,14 +120,25 @@ func mergeNodes(dst, src *yaml.Node) {
 		srcKey := src.Content[i]
 		srcVal := src.Content[i+1]
 
+		if deleteNulls && isNullNode(srcVal) {
+			for j := 0; j < len(dst.Content); j += 2 {
+				if dst.Content[j].Value == srcKey.Value {
+					dst.Content = append(dst.Content[:j], dst.Content[j+2:]...)
+					break
+				}
+			}
+			continue
+		}
+
 		found := false
 		for j := 0; j < len(dst.Content); j += 2 {
 			dstKey := dst.Content[j]
 			if dstKey.Value == srcKey.Value {
 				// Key exists — recurse if both values are mappings, else replace
 				if dst.Content[j+1].Kind == yaml.MappingNode && srcVal.Kind == yaml.MappingNode {
-					mergeNodes(dst.Content[j+1], srcVal)
+					mergeNodes(dst.Content[j+1], srcVal, deleteNulls)
 				} else {
+					pruneNullNodes(srcVal, deleteNulls)
 					dst.Content[j+1] = srcVal
 				}
 				found = true
@@ -118,8 +147,45 @@ func mergeNodes(dst, src *yaml.Node) {
 		}
 
 		if !found {
+			// srcVal is adopted rather than merged, so any tombstone nested
+			// inside it has nothing to match and must be dropped rather than
+			// written out as a literal null.
+			pruneNullNodes(srcVal, deleteNulls)
 			dst.Content = append(dst.Content, srcKey, srcVal)
 		}
+	}
+}
+
+// isNullNode reports whether n is a YAML null. This covers every spelling the
+// parser resolves to the null tag — `key: null`, `key: ~`, and the bare
+// `key:` an empty template substitution produces — so all three behave
+// identically as tombstones.
+func isNullNode(n *yaml.Node) bool {
+	return n != nil && n.Kind == yaml.ScalarNode && n.Tag == "!!null"
+}
+
+// pruneNullNodes recursively strips null-valued pairs from mapping nodes,
+// for src subtrees that are adopted into dst wholesale instead of merged
+// key-by-key. It is the yaml.Node counterpart of pruneNullsJSON.
+func pruneNullNodes(n *yaml.Node, deleteNulls bool) {
+	if !deleteNulls || n == nil {
+		return
+	}
+	switch n.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for _, child := range n.Content {
+			pruneNullNodes(child, deleteNulls)
+		}
+	case yaml.MappingNode:
+		kept := n.Content[:0]
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if isNullNode(n.Content[i+1]) {
+				continue
+			}
+			pruneNullNodes(n.Content[i+1], deleteNulls)
+			kept = append(kept, n.Content[i], n.Content[i+1])
+		}
+		n.Content = kept
 	}
 }
 

@@ -755,8 +755,19 @@ func readSingleRule(root registry.Key, name string) (Rule, error) {
 	rule.Target.Format, _ = readRegString(key, "TargetFormat")
 	rule.Target.Template, _ = readRegString(key, "TargetTemplate")
 	rule.Target.Merge, _ = readRegString(key, "TargetMerge")
-	if v := readRegDWORD(key, "TargetDeleteNulls"); v != nil {
-		rule.Target.DeleteNulls = *v != 0
+
+	// Read strictly, unlike the surrounding fields. readRegDWORD collapses
+	// "absent" and "wrong type" into nil, which for this flag would mean an
+	// admin who wrote TargetDeleteNulls as a REG_SZ "1" gets DeleteNulls
+	// false and believes retired credentials are being removed while they
+	// sit on disk. The .reg parser hard-errors on the same mistake; a GPO
+	// machine must not be the lenient one.
+	deleteNulls, err := readRegDWORDStrict(key, "TargetDeleteNulls")
+	if err != nil {
+		return Rule{}, fmt.Errorf("rule %q: %w", name, err)
+	}
+	if deleteNulls != nil {
+		rule.Target.DeleteNulls = *deleteNulls != 0
 	}
 
 	// Read optional OAuth settings.
@@ -804,6 +815,22 @@ func readRegDWORD(key registry.Key, name string) *uint32 {
 	}
 	v := uint32(val)
 	return &v
+}
+
+// readRegDWORDStrict reads a REG_DWORD value, returning nil when the value is
+// absent and an error when it exists with the wrong type. Use it for values
+// where silently reading a mistyped policy as its zero value would be worse
+// than refusing to start.
+func readRegDWORDStrict(key registry.Key, name string) (*uint32, error) {
+	val, _, err := key.GetIntegerValue(name)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read REG_DWORD %q: %w (expected a DWORD; a string value here would be read as disabled)", name, err)
+	}
+	v := uint32(val)
+	return &v, nil
 }
 
 // readRegMultiString reads a REG_MULTI_SZ value, returning nil if not found.

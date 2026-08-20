@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,4 +248,56 @@ func TestHandlerForLeavesDeleteNullsOff(t *testing.T) {
 	if y.(*YAMLHandler).DeleteNulls {
 		t.Error("YAMLHandler.DeleteNulls set by HandlerFor")
 	}
+}
+
+// TestDeleteNullsTreatsArraysAsOpaque pins that json and yaml agree: the
+// merge replaces arrays wholesale rather than merging into them, so there is
+// nothing inside one for a tombstone to remove and a null there is written as
+// a value. The two handlers diverged here at one point — the same logical rule
+// stripped the key under yaml and wrote a literal null under json.
+func TestDeleteNullsTreatsArraysAsOpaque(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		h := &JSONHandler{DeleteNulls: true}
+		existing, _ := h.Parse(`{}`)
+		incoming, _ := h.Parse(`{"servers": [{"host": "h", "port": null}]}`)
+		merged, err := h.Merge(existing, incoming)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		servers, ok := merged.(map[string]any)["servers"].([]any)
+		if !ok || len(servers) != 1 {
+			t.Fatalf("servers = %#v", merged.(map[string]any)["servers"])
+		}
+		elem := servers[0].(map[string]any)
+		if _, present := elem["port"]; !present {
+			t.Error("json stripped a null inside an array element; arrays are opaque values")
+		}
+	})
+
+	t.Run("yaml", func(t *testing.T) {
+		h := &YAMLHandler{DeleteNulls: true}
+		existing, _ := h.Parse("")
+		incoming, _ := h.Parse("servers:\n  - host: h\n    port: null\n")
+		merged, err := h.Merge(existing, incoming)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		out := filepath.Join(t.TempDir(), "out.yaml")
+		if err := h.Write(out, merged, 0600); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		raw, _ := os.ReadFile(out)
+		var got struct {
+			Servers []map[string]any `yaml:"servers"`
+		}
+		if err := yaml.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("re-parse: %v\n%s", err, raw)
+		}
+		if len(got.Servers) != 1 {
+			t.Fatalf("servers = %#v\n%s", got.Servers, raw)
+		}
+		if _, present := got.Servers[0]["port"]; !present {
+			t.Errorf("yaml stripped a null inside a sequence element; arrays are opaque values:\n%s", raw)
+		}
+	})
 }

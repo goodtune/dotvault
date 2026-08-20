@@ -102,7 +102,7 @@ keeps the `User` and the `RemoteForward` listen path stable across syncs (the `u
 
 The merge is additive: a rule writes the keys it manages and preserves everything else. That is the right default, but it means there is no way to *retire* a key. If a secret you used to publish into a file is no longer needed — say you have moved a client from a static credential to one it fetches dynamically through the Client API — writing nothing leaves the old value in the file, and deleting the rule stops managing the file altogether, which also leaves it there. Either way the credential stays on disk.
 
-`target.delete_nulls` closes that off. With it set, a `null` in the rendered template is a tombstone rather than a value: the matching key is deleted from the target file, the equivalent of `del(.KEY_I_USED_TO_FILL)` in `jq`.
+`target.delete_nulls` closes that off. With it set, a `null` in the rendered template is a tombstone rather than a value: the matching object key is deleted from the target file, the equivalent of `del(.KEY_I_USED_TO_FILL)` in `jq`.
 
 ```yaml
 rules:
@@ -133,13 +133,35 @@ password: {{ .password }}
 
 over an empty or missing value renders `password:`, which parses as a null. Under always-on deletion that would silently delete a live credential instead of writing an empty one. Requiring the opt-in keeps that failure mode off every rule that has not asked for it.
 
+The opt-in is per **rule**, not per key, so it does not make that hazard go away inside a rule that has enabled it — every null the template renders is a tombstone, including one you did not mean. Quote any value you do not want tombstoned:
+
+```yaml
+password: "{{ .password }}"
+```
+
+An empty substitution then renders `password: ""`, an empty string rather than a null. Keeping `delete_nulls` rules small and templating them explicitly is the practical discipline.
+
 All three YAML spellings of null — `key: null`, `key: ~`, and a bare `key:` — are tombstones when the flag is on.
+
+### What a tombstone does and does not reach
+
+Tombstones delete **object/mapping keys**. Arrays and sequences are replaced wholesale by the merge rather than merged into, so there is nothing inside one for a tombstone to remove: a `null` inside an array element is written as a value, identically under `json` and `yaml`.
+
+For `yaml` specifically, dotvault **refuses the merge** — failing the rule with an error rather than writing the file — when the target document uses an **anchor, an alias, or a merge key (`<<`)** and the template renders a tombstone. None of those can be resolved by matching a key name: a key supplied through `<<: *base` is not written literally, so deleting it would report success while the value stayed in effect; and removing a pair that carries an anchor referenced elsewhere would strand a dangling alias and corrupt the file. Refusing loudly is the only outcome consistent with the guarantee the flag exists to give. A rule with the flag on whose template renders no null is unaffected and keeps working on such a file.
+
+Duplicate keys are all removed, not just the first — YAML permits them and most consumers read the last occurrence, so stopping at the first match would leave the value that actually gets used.
+
+Deleting the last key of a mapping leaves an empty mapping, which YAML renders as `{}`.
+
+If a rule has no `target.template`, the secret's own fields are the incoming document, so a Vault field whose value is `null` acts as a tombstone too.
 
 ### Supported formats
 
 `delete_nulls` is accepted for `json` and `yaml` only. Those are the two formats whose syntax has a null literal a template can render. The rest have no way to express one: TOML has no null in the spec, INI values are strings (`key =` is an empty string, not an absent one), `text` is a whole-file overwrite with no keys at all, and `netrc` and `ssh_config` are line-oriented directive formats.
 
 Setting `delete_nulls: true` on any of those is a **config error** at load time, naming the rule and the format. It is rejected rather than ignored on purpose: a flag that silently did nothing would leave you believing a credential had been removed while it sat in the file untouched — precisely the outcome the feature exists to prevent. Removal for those formats needs a different mechanism and is not yet designed.
+
+The same reasoning applies on Windows: a `TargetDeleteNulls` policy value of the wrong registry type makes the daemon refuse to start rather than read it as disabled. See [Group Policy](../admin/windows-gpo.md#rules-rulename-subkeys).
 
 ## File permissions
 

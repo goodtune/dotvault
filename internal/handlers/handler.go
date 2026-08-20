@@ -13,6 +13,12 @@ type FileHandler interface {
 
 	// Merge takes existing data and incoming data and returns the merged result.
 	// Existing keys not present in incoming are preserved.
+	//
+	// Both arguments may be mutated: implementations build the result by
+	// modifying existing in place, and a handler configured to delete nulls
+	// also strips tombstones out of incoming. Callers must treat both as
+	// consumed by the call and must not reuse either afterwards. The sync
+	// engine satisfies this by parsing both fresh for every rule.
 	Merge(existing any, incoming any) (any, error)
 
 	// Write serialises the merged data back to the file atomically.
@@ -35,6 +41,28 @@ type Options struct {
 	DeleteNulls bool
 }
 
+// deleteNullsFormats lists the formats whose syntax has a null literal, and
+// which can therefore express a tombstone in a template.
+//
+// The rest cannot, and it is an error to ask them to: TOML has no null in the
+// spec at all (parseTOMLValue rejects an empty value); INI values are strings,
+// where `key =` is an empty string rather than an absent one; text is a
+// whole-file overwrite with no keys; and netrc and ssh_config are line-oriented
+// directive formats. Silently accepting the option on those would leave an
+// operator believing a credential had been deleted when it was still sitting in
+// the file — exactly the outcome the feature exists to prevent.
+var deleteNullsFormats = map[string]bool{
+	"json": true,
+	"yaml": true,
+}
+
+// SupportsDeleteNulls reports whether format can express a null tombstone.
+// It is the single definition behind both gates on the option: config
+// validation at load time and HandlerWithOptions at construction.
+func SupportsDeleteNulls(format string) bool {
+	return deleteNullsFormats[format]
+}
+
 // HandlerFor returns the appropriate FileHandler for the given format, with
 // default merge behaviour.
 func HandlerFor(format string) (FileHandler, error) {
@@ -50,7 +78,7 @@ func HandlerFor(format string) (FileHandler, error) {
 // handler by some other route from quietly getting additive-only merges when
 // it asked for deletions.
 func HandlerWithOptions(format string, opts Options) (FileHandler, error) {
-	if opts.DeleteNulls && format != "json" && format != "yaml" {
+	if opts.DeleteNulls && !SupportsDeleteNulls(format) {
 		return nil, fmt.Errorf("format %q does not support delete_nulls (only json and yaml have a null literal a template can render)", format)
 	}
 	switch format {

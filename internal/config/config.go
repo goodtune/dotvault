@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/handlers"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -750,22 +751,6 @@ type Target struct {
 	DeleteNulls bool `yaml:"delete_nulls"`
 }
 
-// nullableFormats lists the target formats whose syntax has a null literal,
-// and which can therefore express a DeleteNulls tombstone in a template.
-//
-// The rest cannot, and it is a config error to ask them to (validateRule):
-// TOML has no null in the spec at all (parseTOMLValue rejects an empty
-// value); INI values are strings, where `key =` is an empty string rather
-// than an absent one; text is a whole-file overwrite with no keys; and
-// netrc and ssh_config are line-oriented directive formats. Silently
-// accepting the flag on those would leave an operator believing a
-// credential had been deleted when it was still sitting in the file —
-// exactly the outcome the feature exists to prevent.
-var nullableFormats = map[string]bool{
-	"json": true,
-	"yaml": true,
-}
-
 var validFormats = map[string]bool{
 	"yaml":       true,
 	"json":       true,
@@ -1304,7 +1289,7 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	if !validFormats[r.Target.Format] {
 		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
 	}
-	if r.Target.DeleteNulls && !nullableFormats[r.Target.Format] {
+	if r.Target.DeleteNulls && !handlers.SupportsDeleteNulls(r.Target.Format) {
 		return fmt.Errorf("rules[%d] (%s): target.delete_nulls is not supported for format %q (only json and yaml have a null literal a template can render)", i, r.Name, r.Target.Format)
 	}
 	return nil

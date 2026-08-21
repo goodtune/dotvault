@@ -123,6 +123,7 @@ Each rule maps a Vault secret to a local file:
 | `target.path` | Local file path (supports `~`) |
 | `target.format` | One of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config` |
 | `target.template` | Optional Go template for formatting |
+| `target.delete_nulls` | Optional (default `false`). Treat a `null` in the template as a tombstone that removes the key from the target file. `json` and `yaml` only |
 
 Managed files are written atomically at `0600`.
 

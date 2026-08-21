@@ -502,14 +502,11 @@ func TestNeedsWizard_UnattendedExclusionIsUnconditional(t *testing.T) {
 	}
 }
 
-// TestSetupWizard_RendersUnattendedCardsWithHelpText guards the boundary of
-// the unattended exclusion. It applies to whether the wizard *appears*, and
-// to nothing else: once the wizard is up, a copy enrolment is an ordinary
-// card and its configured help_text renders — as markdown — exactly like any
-// other engine's. Narrowing the exclusion into the render loop would drop it
-// silently, since a missing card looks like a card for an enrolment that
-// simply is not configured.
-func TestSetupWizard_RendersUnattendedCardsWithHelpText(t *testing.T) {
+// TestSetupWizard_OmitsUnattendedCards pins where an unattended enrolment
+// belongs. The wizard's whole purpose is the things a user must do, so a copy
+// enrolment — which needs nobody — is not shown there; it lives in the
+// enrolments tree instead, where its help text and controls remain available.
+func TestSetupWizard_OmitsUnattendedCards(t *testing.T) {
 	s := setupTestServer(t, map[string]config.Enrolment{
 		"mirror": {Engine: "copy", HelpText: "Mirrors the **team** secret."},
 		"ssh":    {Engine: "ssh", HelpText: "Generates a key pair."},
@@ -521,15 +518,119 @@ func TestSetupWizard_RendersUnattendedCardsWithHelpText(t *testing.T) {
 		t.Fatalf("setup status = %d, want 200 (the ssh enrolment warrants a wizard)", w.Code)
 	}
 	body := w.Body.String()
-
-	if !strings.Contains(body, "Mirrors the") {
-		t.Error("copy enrolment's help_text is missing from the wizard")
-	}
-	if !strings.Contains(body, "<strong>team</strong>") {
-		t.Error("copy enrolment's help_text was not rendered as markdown")
+	if strings.Contains(body, "Mirrors the") || strings.Contains(body, `value="mirror"`) {
+		t.Errorf("copy enrolment appears in the wizard; body = %s", body)
 	}
 	if !strings.Contains(body, "Generates a key pair") {
-		t.Error("interactive enrolment's help_text is missing from the wizard")
+		t.Error("interactive enrolment is missing from the wizard")
+	}
+
+	// It is still fully present on its own page in the enrolments tree.
+	req := httptest.NewRequest("GET", "/ui/enrolments/copy/mirror/", nil)
+	req.SetPathValue("engine", "copy")
+	req.SetPathValue("key", "mirror")
+	w2 := httptest.NewRecorder()
+	s.handleUIEnrolDetail(w2, req)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("enrolment detail status = %d, want 200", w2.Code)
+	}
+	detail := w2.Body.String()
+	if !strings.Contains(detail, "Mirrors the") || !strings.Contains(detail, "<strong>team</strong>") {
+		t.Errorf("copy enrolment's help_text is missing from its own page; body = %s", detail)
+	}
+}
+
+// TestSetupFooter_IgnoresUnattendedWork guards the trap that filtering the
+// cards without filtering the footer would create: a pending copy enrolment
+// the wizard does not show would hold the exit control on "Skip remaining"
+// forever, offering to skip something invisible. The footer must be computed
+// over the same narrowed set the page renders.
+func TestSetupFooter_IgnoresUnattendedWork(t *testing.T) {
+	s := setupTestServer(t, map[string]config.Enrolment{
+		"mirror": {Engine: "copy"}, // deliberately left pending
+		"ssh":    {Engine: "ssh"},
+	})
+	if err := s.getEnrolRunner().Skip("ssh"); err != nil {
+		t.Fatalf("Skip: %v", err)
+	}
+
+	if !s.setupFooterData().AllAddressed {
+		t.Error("a pending unattended enrolment kept the wizard footer offering to skip it")
+	}
+	frag, err := uiFragment("setup-footer", s.setupFooterData())
+	if err != nil {
+		t.Fatalf("render footer fragment: %v", err)
+	}
+	if !strings.Contains(frag, `href="/"`) || strings.Contains(frag, "Skip remaining") {
+		t.Errorf("footer should be a plain link out; fragment = %s", frag)
+	}
+}
+
+// TestSetupWizard_NeverRendersEmpty pins the invariant that ties the two
+// halves of the unattended exclusion together. NeedsWizard decides whether
+// the wizard appears and wizardStates decides what it contains; if they could
+// disagree, a user would get a wizard with no cards — and, because the
+// wizard holds the daemon's startup gate, the sync engine would wait on them
+// clicking through a page with nothing on it.
+//
+// They cannot: NeedsWizard is true only when some enrolment has a real engine
+// and is neither unattended, skipped, nor complete, and such a state always
+// survives the filter. This asserts it over the shapes that could break it.
+func TestSetupWizard_NeverRendersEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		enr  map[string]config.Enrolment
+	}{
+		{"unattended only", map[string]config.Enrolment{"mirror": {Engine: "copy"}}},
+		{"unattended plus unknown engine", map[string]config.Enrolment{"mirror": {Engine: "copy"}, "x": {Engine: "nope"}}},
+		{"unknown engine only", map[string]config.Enrolment{"x": {Engine: "nope"}}},
+		{"unattended plus interactive", map[string]config.Enrolment{"mirror": {Engine: "copy"}, "ssh": {Engine: "ssh"}}},
+		{"none configured", map[string]config.Enrolment{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestServer(t, tc.enr)
+			runner := s.getEnrolRunner()
+			if runner == nil {
+				// No enrolments configured: no runner, and NeedsSetupWizard
+				// is false, so there is nothing to render empty.
+				if s.NeedsSetupWizard() {
+					t.Error("wizard warranted with no runner at all")
+				}
+				return
+			}
+			cards := len(wizardStates(runner.States()))
+			if s.NeedsSetupWizard() && cards == 0 {
+				t.Error("wizard would be shown with no cards, holding the startup gate on an empty page")
+			}
+		})
+	}
+}
+
+// TestEnrolState_CarriesUnattended guards the field the wizard filter keys
+// on. If it silently defaulted to false the filter would match nothing and
+// the exclusion would quietly stop working, with every test that asserts an
+// *absence* still passing for the wrong reason.
+func TestEnrolState_CarriesUnattended(t *testing.T) {
+	r := NewEnrolmentRunner(map[string]config.Enrolment{
+		"mirror": {Engine: "copy"},
+		"ssh":    {Engine: "ssh"},
+		"x":      {Engine: "nope"},
+	})
+
+	want := map[string]bool{"mirror": true, "ssh": false, "x": false}
+	for _, st := range r.States() {
+		if st.Unattended != want[st.Key] {
+			t.Errorf("States(): %s.Unattended = %v, want %v", st.Key, st.Unattended, want[st.Key])
+		}
+		// GetState builds the same snapshot through the shared helper; the
+		// two used to be separate copies of this construction.
+		got, err := r.GetState(st.Key)
+		if err != nil {
+			t.Fatalf("GetState(%s): %v", st.Key, err)
+		}
+		if got.Unattended != want[st.Key] {
+			t.Errorf("GetState(%s).Unattended = %v, want %v", st.Key, got.Unattended, want[st.Key])
+		}
 	}
 }
 

@@ -24,6 +24,10 @@ type EnrolStateInfo struct {
 	Output       []string `json:"output,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	HelpTextHTML string   `json:"help_text_html,omitempty"`
+	// Unattended mirrors enrol.EngineUnattended for this enrolment's engine:
+	// it needs no user interaction. Carried on the snapshot rather than
+	// re-derived by name at each call site so there is one answer per state.
+	Unattended bool `json:"unattended,omitempty"`
 }
 
 type enrolState struct {
@@ -37,6 +41,29 @@ type enrolState struct {
 	errMsg       string
 	doneCh       chan struct{} // closed when engine finishes
 	mu           sync.Mutex
+}
+
+// infoLocked snapshots this enrolment for the API and the UI. The caller must
+// hold s.mu. It is shared by States and GetState so the two cannot drift —
+// they previously carried identical copies of this construction.
+func (s *enrolState) infoLocked() EnrolStateInfo {
+	info := EnrolStateInfo{
+		Key:          s.key,
+		Engine:       s.engineName,
+		Status:       s.status,
+		Output:       append([]string{}, s.output...),
+		Error:        s.errMsg,
+		HelpTextHTML: s.helpTextHTML,
+	}
+	if s.engine != nil {
+		info.EngineName = s.engine.Name()
+		info.Fields = enrol.EngineFields(s.engine, s.settings)
+		info.Unattended = enrol.EngineUnattended(s.engine)
+	} else {
+		info.EngineName = s.engineName
+		info.Fields = []string{}
+	}
+	return info
 }
 
 // Sentinel errors for enrolment operations.
@@ -135,21 +162,7 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 			continue
 		}
 		s.mu.Lock()
-		info := EnrolStateInfo{
-			Key:          s.key,
-			Engine:       s.engineName,
-			Status:       s.status,
-			Output:       append([]string{}, s.output...),
-			Error:        s.errMsg,
-			HelpTextHTML: s.helpTextHTML,
-		}
-		if s.engine != nil {
-			info.EngineName = s.engine.Name()
-			info.Fields = enrol.EngineFields(s.engine, s.settings)
-		} else {
-			info.EngineName = s.engineName
-			info.Fields = []string{}
-		}
+		info := s.infoLocked()
 		s.mu.Unlock()
 		result = append(result, info)
 	}
@@ -221,22 +234,7 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := EnrolStateInfo{
-		Key:          s.key,
-		Engine:       s.engineName,
-		Status:       s.status,
-		Output:       append([]string{}, s.output...),
-		Error:        s.errMsg,
-		HelpTextHTML: s.helpTextHTML,
-	}
-	if s.engine != nil {
-		info.EngineName = s.engine.Name()
-		info.Fields = enrol.EngineFields(s.engine, s.settings)
-	} else {
-		info.EngineName = s.engineName
-		info.Fields = []string{}
-	}
-	return info, nil
+	return s.infoLocked(), nil
 }
 
 // AnyRunning reports whether any enrolment is currently executing. The

@@ -105,17 +105,27 @@ type Watcher interface {
 //
 // The distinction matters to one caller: the web UI's first-run enrolment
 // wizard, which exists to walk a human through the enrolments that need a
-// human. An unattended enrolment is evidence in neither direction there — it
-// gives the user nothing to do, and when it completes on its own that says
-// nothing about whether the user has been through the wizard. Counting one
-// either way makes the wizard fire when there is nothing to do, or — the case
-// this exists to prevent — suppresses it for the interactive enrolments that
-// genuinely need it, because an unattended enrolment completed first and
-// looked like prior progress.
+// human. Declaring this keeps an engine out of that wizard entirely — out of
+// the decision to show it, and off the page when it is shown.
 //
-// The scope really is that narrow, deliberately. Every other caller should go
-// on treating an unattended enrolment as ordinary pending work, because it is:
-// the CLI's enrolment run executes it (that is how it gets done outside the
+// Out of the decision, because an unattended enrolment is evidence in neither
+// direction: it gives the user nothing to do, and when it completes on its own
+// that says nothing about whether the user has been through the wizard.
+// Counting one either way makes the wizard fire when there is nothing to do,
+// or — the case this exists to prevent — suppresses it for the interactive
+// enrolments that genuinely need it, because an unattended enrolment completed
+// first and looked like prior progress.
+//
+// Off the page, because a card the user cannot meaningfully act on is noise on
+// a page whose entire purpose is the work they must do. Note the consequence
+// for anyone declaring this on a new engine: the enrolment will not appear at
+// /setup/ at all. It is managed from /ui/enrolments/ instead, with its help
+// text and controls intact. The web side of this is internal/web's
+// wizardStates.
+//
+// The scope stops there. Every other caller should go on treating an
+// unattended enrolment as ordinary pending work, because it is: the CLI's
+// enrolment run executes it (that is how it gets done outside the
 // WatchManager's polling), and `dotvault enrol` rightly offers it as something
 // the user can run on demand. This says nothing about whether an enrolment
 // needs doing — only about whether a human needs to be walked through it.
@@ -154,7 +164,7 @@ type IO struct {
 	In           io.Reader // optional; defaults to os.Stdin if nil
 	Browser      BrowserOpener
 	Log          *slog.Logger
-	Username     string                              // authenticated Vault username
+	Username     string                             // authenticated Vault username
 	PromptSecret func(label string) (string, error) // masked user input
 
 	// Vault is the authenticated Vault client. Most engines do not need

@@ -41,6 +41,29 @@ func (s *Server) completeEnrolments() {
 	}
 }
 
+// wizardStates narrows a full enrolment list to the ones the first-run wizard
+// shows: the interactive ones. An unattended enrolment (the copy engine) is
+// already excluded from the decision to show the wizard at all; excluding it
+// from the page too keeps the two consistent, since a card the user cannot
+// meaningfully act on is noise on a page whose entire purpose is the things
+// they must do. It stays visible, with its help text and its controls, on
+// /ui/enrolments/.
+//
+// Every consumer of the wizard's contents must go through this, not just the
+// card loop. allAddressed in particular: computing it over the unfiltered
+// list would let a pending copy enrolment hold the footer on "Skip remaining"
+// permanently, offering to skip something the page does not show.
+func wizardStates(states []EnrolStateInfo) []EnrolStateInfo {
+	out := make([]EnrolStateInfo, 0, len(states))
+	for _, st := range states {
+		if st.Unattended {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
 // allAddressed reports whether every enrolment has been dealt with, either by
 // completing or by the user declining it. It is the one definition of the
 // wizard's "nothing left to do" state, called by both the page render and the
@@ -48,10 +71,10 @@ func (s *Server) completeEnrolments() {
 // two paths disagreeing would mean a page whose exit control changes shape on
 // a patch that was not meant to change it.
 //
-// An empty list is vacuously addressed, which is the right answer for the
-// only way to reach it: a runner that no longer exists (a config reload
-// landing mid-request), where offering "continue" beats offering to skip
-// enrolments that are not there.
+// An empty list is vacuously addressed, which is the right answer for both
+// ways to reach it: a runner that no longer exists (a config reload landing
+// mid-request), and a configuration whose enrolments are all unattended and
+// so all filtered out.
 func allAddressed(states []EnrolStateInfo) bool {
 	for _, st := range states {
 		if st.Status != "complete" && st.Status != "skipped" {
@@ -69,7 +92,7 @@ func (s *Server) setupFooterData() uiSetupData {
 	if runner == nil {
 		return uiSetupData{AllAddressed: true}
 	}
-	return uiSetupData{AllAddressed: allAddressed(runner.States())}
+	return uiSetupData{AllAddressed: allAddressed(wizardStates(runner.States()))}
 }
 
 // handleSetupComplete abandons whatever is still outstanding and enters the
@@ -101,8 +124,18 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	states := runner.States()
-	anyRunning := runner.AnyRunning()
+	states := wizardStates(runner.States())
+	// Busy-ness is judged over the same narrowed set. runner.AnyRunning()
+	// counts every enrolment, so a copy enrolment started from
+	// /ui/enrolments/ in another tab would grey out every card here for
+	// something this page does not show.
+	anyRunning := false
+	for _, st := range states {
+		if st.Status == "running" {
+			anyRunning = true
+			break
+		}
+	}
 
 	data := uiSetupData{
 		uiStandaloneData: uiStandaloneData{

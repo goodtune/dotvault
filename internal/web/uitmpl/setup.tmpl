@@ -1,0 +1,17 @@
+{{/* The first-run enrolment wizard. Shown only while no enrolment has been
+     completed (see NeedsSetupWizard) — once the user has any credential in
+     Vault this page steps aside and individual enrolments are managed from
+     /ui/enrolments/ instead. */}}
+{{define "content"}}
+<div class="enrol-page">
+  <div class="enrol-container">
+    <h2 class="enrol-heading">Complete your setup</h2>
+    <p class="enrol-subheading">The following credentials need to be configured before syncing can begin.</p>
+    {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
+    <div class="enrol-list">
+      {{range .Cards}}{{template "enrol-card" .}}{{end}}
+    </div>
+    {{template "setup-footer" .}}
+  </div>
+</div>
+{{end}}

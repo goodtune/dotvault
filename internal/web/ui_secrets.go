@@ -192,8 +192,7 @@ func (s *Server) renderUISecretFolder(w http.ResponseWriter, ctx context.Context
 }
 
 // uiSecretFieldValue reads one field of the user's secret and returns its
-// display form (strings verbatim, everything else pretty-printed JSON —
-// matching the SPA).
+// display form: strings verbatim, everything else pretty-printed JSON.
 func (s *Server) uiSecretFieldValue(ctx context.Context, path, field string) (string, bool, error) {
 	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+path)
 	if err != nil || secret == nil {
@@ -227,8 +226,8 @@ func uiSecretFragmentParams(r *http.Request) (path, field string, id int, ok boo
 
 // handleUISecretReveal patches the field's value cell with the revealed
 // value plus an "open eye" button. The revealed cell re-masks itself after
-// 30 seconds (a delayed @get of the mask fragment), mirroring the SPA's
-// client-side auto-hide.
+// 30 seconds (a delayed @get of the mask fragment), so a revealed secret
+// does not sit on screen indefinitely.
 func (s *Server) handleUISecretReveal(w http.ResponseWriter, r *http.Request) {
 	if !s.requireUIRead(w) {
 		return

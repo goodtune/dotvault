@@ -1,0 +1,23 @@
+{{/* The LDAP login's post-submit states. "totp" prompts for a passcode and
+     must NOT auto-refresh (it would clobber what the user is typing); the
+     push-approval wait carries the meta refresh instead, so the page advances
+     on its own once the user approves on their device. */}}
+{{define "content"}}
+<div class="login-container">
+  <div class="login-card">
+    <h1 class="login-title">.vault</h1>
+    {{if eq .Phase "totp"}}
+      <p class="login-subtitle">Enter MFA passcode</p>
+      {{if .Error}}<p class="login-error">{{.Error}}</p>{{end}}
+      <form method="post" action="/login/ldap/totp">
+        <input type="text" name="passcode" class="login-input" placeholder="Passcode" aria-label="MFA Passcode" autocomplete="one-time-code" inputmode="numeric" autofocus required>
+        <button type="submit" class="login-btn">Verify</button>
+      </form>
+    {{else}}
+      <p class="login-mfa-wait">Waiting for MFA approval&#8230;</p>
+      <p class="login-mfa-hint">Check your device</p>
+      {{if .Error}}<p class="login-error">{{.Error}}</p>{{end}}
+    {{end}}
+  </div>
+</div>
+{{end}}

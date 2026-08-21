@@ -53,7 +53,6 @@ The FUSE mount tests likewise skip when FUSE is unusable (`mount_fuse_test.go`);
 Dependabot is configured in `.github/dependabot.yml` and currently covers:
 
 - `gomod` at repo root
-- `npm` at `internal/web/frontend`
 - `github-actions` at repo root
 
 When introducing a new package ecosystem (e.g. a second npm workspace, a Dockerfile, a Python tool directory), extend `.github/dependabot.yml` with a matching `updates:` entry so the new manifests are kept up to date. Use the same weekly schedule and grouped-updates pattern as the existing entries unless there is a reason to diverge.

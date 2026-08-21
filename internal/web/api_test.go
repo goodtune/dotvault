@@ -130,7 +130,7 @@ func TestHandleStatus_VaultFieldsHiddenWhenUnauthenticated(t *testing.T) {
 }
 
 // The /api/v1/status auth_method must carry the *base* method, with any
-// "+tpm" sealing suffix stripped, because the web SPA dispatches its login
+// "+tpm" sealing suffix stripped, because the login view dispatches its
 // form on an exact-string match (login-page.jsx). A raw "ldap+tpm" would fall
 // through to "Unknown auth method" and break the login page. Normalisation
 // happens in NewServer, so this exercises that boundary rather than poking the
@@ -157,7 +157,7 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 				t.Fatalf("NewServer: %v", err)
 			}
 			if s.authMethod != tc.wantWire {
-				t.Errorf("s.authMethod = %q, want %q (the +tpm suffix must be stripped for the SPA)", s.authMethod, tc.wantWire)
+				t.Errorf("s.authMethod = %q, want %q (the +tpm suffix must be stripped for the login view)", s.authMethod, tc.wantWire)
 			}
 			if s.sealToken != tc.wantSealToken {
 				t.Errorf("s.sealToken = %v, want %v (sealing must still be honoured)", s.sealToken, tc.wantSealToken)
@@ -181,7 +181,7 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 // The Effective Configuration view (/api/v1/config) must show the RAW
 // configured auth_method including any "+tpm" suffix, so it agrees with the
 // lossless config-download and honestly reflects that token-sealing is on.
-// This is the opposite of /api/v1/status, which strips the suffix for the SPA
+// This is the opposite of /api/v1/status, which strips the suffix for the
 // login dispatch — the two endpoints deliberately differ.
 func TestHandleConfig_AuthMethodRaw(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
@@ -739,106 +739,6 @@ func TestRedactEnrolmentSettings_Nested(t *testing.T) {
 	}
 	if first["secret"] != "***" {
 		t.Errorf("slice element secret = %v, want redacted", first["secret"])
-	}
-}
-
-func TestHandleEnrolPrompt_NoPending(t *testing.T) {
-	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
-	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)
-	w := httptest.NewRecorder()
-
-	s.handleEnrolPrompt(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp["pending"] != false {
-		t.Errorf("pending = %v, want false", resp["pending"])
-	}
-}
-
-func TestHandleEnrolPrompt_Pending(t *testing.T) {
-	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
-	s.enrolPromptMu.Lock()
-	s.enrolPromptCh = make(chan string, 1)
-	s.enrolPromptLabel = "Enter passphrase:"
-	s.enrolPromptMu.Unlock()
-
-	req := httptest.NewRequest("GET", "/api/v1/enrol/prompt", nil)
-	w := httptest.NewRecorder()
-
-	s.handleEnrolPrompt(w, req)
-
-	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp["pending"] != true {
-		t.Errorf("pending = %v, want true", resp["pending"])
-	}
-	if resp["label"] != "Enter passphrase:" {
-		t.Errorf("label = %v, want %q", resp["label"], "Enter passphrase:")
-	}
-}
-
-func TestHandleEnrolSecret_NoPending(t *testing.T) {
-	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
-	body := strings.NewReader(`{"value":"secret"}`)
-	req := httptest.NewRequest("POST", "/api/v1/enrol/secret", body)
-	w := httptest.NewRecorder()
-
-	s.handleEnrolSecret(w, req)
-
-	if w.Code != http.StatusConflict {
-		t.Errorf("status = %d, want 409", w.Code)
-	}
-}
-
-func TestHandleEnrolSecret_Accepted(t *testing.T) {
-	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))
-	ch := make(chan string, 1)
-	s.enrolPromptMu.Lock()
-	s.enrolPromptCh = ch
-	s.enrolPromptLabel = "Enter passphrase:"
-	s.enrolPromptMu.Unlock()
-
-	body := strings.NewReader(`{"value":"hunter2"}`)
-	req := httptest.NewRequest("POST", "/api/v1/enrol/secret", body)
-	w := httptest.NewRecorder()
-
-	s.handleEnrolSecret(w, req)
-
-	if w.Code != 200 {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	// Verify value was sent through the channel
-	val := <-ch
-	if val != "hunter2" {
-		t.Errorf("channel value = %q, want %q", val, "hunter2")
-	}
-	// Verify state was cleared atomically
-	s.enrolPromptMu.RLock()
-	promptCh := s.enrolPromptCh
-	promptLabel := s.enrolPromptLabel
-	s.enrolPromptMu.RUnlock()
-	if promptCh != nil {
-		t.Error("enrolPromptCh should be nil after accepted submission")
-	}
-	if promptLabel != "" {
-		t.Errorf("enrolPromptLabel = %q, want empty", promptLabel)
-	}
-}
-
-func TestHandleEnrolSecretRequiresCSRF(t *testing.T) {
-	s := testServer(t)
-	body := strings.NewReader(`{"value":"secret"}`)
-	req := httptest.NewRequest("POST", "/api/v1/enrol/secret", body)
-	w := httptest.NewRecorder()
-
-	s.requireCSRF(s.handleEnrolSecret)(w, req)
-
-	if w.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want 403 for missing CSRF", w.Code)
 	}
 }
 

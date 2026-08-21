@@ -15,6 +15,10 @@ type targetView struct {
 	Format      string `json:"format"`
 	Merge       string `json:"merge,omitempty"`
 	HasTemplate bool   `json:"has_template"`
+	// DeleteNulls is surfaced because it is the only target setting that
+	// removes data: without it a rule that deletes keys is indistinguishable
+	// from an additive one in the config view.
+	DeleteNulls bool `json:"delete_nulls,omitempty"`
 }
 
 type oauthView struct {
@@ -93,6 +97,7 @@ func (s *Server) buildConfigViewModel() configView {
 				Format:      rule.Target.Format,
 				Merge:       rule.Target.Merge,
 				HasTemplate: rule.Target.Template != "",
+				DeleteNulls: rule.Target.DeleteNulls,
 			},
 		}
 		if rule.OAuth != nil {
@@ -148,7 +153,7 @@ func (s *Server) buildConfigViewModel() configView {
 			// The effective-config view shows the raw configured method
 			// (including any "+tpm" suffix) so it matches the lossless
 			// config-download and honestly reflects token-sealing. Only the
-			// SPA login dispatch on /api/v1/status needs the base form.
+			// login dispatch on /api/v1/status needs the base form.
 			AuthMethod:          s.vaultCfg.AuthMethod,
 			AuthMount:           s.authMount,
 			AuthRole:            s.authRole,

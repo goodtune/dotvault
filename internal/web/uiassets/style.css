@@ -505,8 +505,15 @@ body {
   font-size: 14px;
   font-weight: 600;
   font-family: inherit;
+  /* The wizard's exit control is a <button> in one state and an <a> in the
+     other, so the class has to render identically as either: an anchor is
+     inline by default (vertical padding would not affect line height) and
+     comes underlined. */
+  display: inline-block;
+  text-decoration: none;
+  line-height: normal;
 }
-.enrol-continue-btn:hover { background: #047857; }
+.enrol-continue-btn:hover { background: #047857; color: white; }
 
 /* Header indicator */
 .enrol-indicator {

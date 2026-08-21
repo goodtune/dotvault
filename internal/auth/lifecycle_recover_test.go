@@ -67,7 +67,7 @@ func waitFor(cond func() bool, d time.Duration) bool {
 // loop. The headline case is recoverSucceeds: a certificate-auth daemon whose
 // Vault token expired mints a fresh one from the credential already on disk,
 // and — crucially — must NOT fire OnReauth, which in web mode would clear
-// in-memory auth state and bounce the SPA to a login screen for an outage the
+// in-memory auth state and bounce the web UI to a login screen for an outage the
 // daemon just healed by itself.
 func TestLifecycleManager_RecoverWiring(t *testing.T) {
 	const recoveredToken = "recovered-token"

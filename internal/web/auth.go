@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 )
@@ -106,228 +104,26 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bootstrap mode: hand the RAW token back to the waiting BootstrapLogin
-	// and adopt nothing. The mTLS bootstrap token carries pki/sign and is
-	// consumed immediately to mint a certificate — downscoping it would strip
-	// the very capability it exists for, and persisting or installing it would
-	// put a broad credential on disk and behind GET /api/v1/token.
-	if s.deliverBootstrapToken(loginSecret.Auth.ClientToken) {
-		slog.Info("OIDC bootstrap login successful via web UI")
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-
-	// Under certificate auth a browser login is only ever a bootstrap, so it
-	// must not be adopted — see operationalAdoptionAllowed. Reached when a
-	// second callback arrives after the divert above consumed the first.
-	if !s.operationalAdoptionAllowed() {
-		slog.Debug("ignoring already-consumed bootstrap login on a repeat OIDC callback")
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-
-	token, err := auth.Downscope(r.Context(), s.vault, loginSecret.Auth.ClientToken, s.policyConstraint())
+	// Token adoption (including the bootstrap divert) is shared with the
+	// LDAP flow — see consumeLoginToken for why a bootstrap token must never
+	// be downscoped, persisted, or installed.
+	bootstrapped, err := s.consumeLoginToken(r.Context(), loginSecret.Auth.ClientToken)
 	if err != nil {
 		slog.Error("downscoping token to least privilege failed", "error", err)
 		http.Error(w, "Authentication failed during token downscoping", http.StatusInternalServerError)
 		return
 	}
-	s.vault.SetToken(token)
-	auth.WarnUnrestrictedPolicy(s.policyConstraint())
-
-	if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
-		slog.Warn("failed to write token file", "error", err)
+	if bootstrapped {
+		slog.Info("OIDC bootstrap login successful via web UI")
+		// issuing=1 tells the login view that the credential step is done
+		// and the daemon is now minting the certificate, so it shows the
+		// issuance message rather than the generic sign-in one.
+		http.Redirect(w, r, "/?issuing=1", http.StatusSeeOther)
+		return
 	}
 
 	slog.Info("OIDC authentication successful via web UI")
-
-	// Signal auth completion (non-blocking).
-	select {
-	case s.authDone <- struct{}{}:
-	default:
-	}
-
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.Username == "" || req.Password == "" {
-		writeError(w, "username and password required", http.StatusBadRequest)
-		return
-	}
-
-	sessionID, err := generateSessionID()
-	if err != nil {
-		slog.Error("failed to generate session ID", "error", err)
-		writeError(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	mount := s.loginMount("ldap")
-
-	s.login.StartLogin(sessionID, mount, req.Username, req.Password)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{"session_id": sessionID})
-}
-
-func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.URL.Query().Get("session")
-	if sessionID == "" {
-		writeError(w, "session parameter required", http.StatusBadRequest)
-		return
-	}
-
-	status := s.login.GetStatus(sessionID)
-	if status == nil {
-		writeError(w, "session not found", http.StatusNotFound)
-		return
-	}
-
-	// Clear failed sessions to prevent unbounded growth.
-	if status.State == "failed" {
-		s.login.Clear(sessionID)
-	}
-
-	// If authenticated, consume the token server-side.
-	if status.State == "authenticated" && status.Token != "" {
-		// Bootstrap mode: hand the RAW token to the waiting BootstrapLogin
-		// and adopt nothing — see handleAuthCallback for the rationale. The
-		// response body is unchanged either way (LoginStatus.Token is
-		// json:"-", so the token never crosses the wire).
-		if s.deliverBootstrapToken(status.Token) {
-			s.login.Clear(sessionID)
-			slog.Info("LDAP bootstrap login successful via web UI")
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(status)
-			return
-		}
-
-		// Under certificate auth a browser login is only ever a bootstrap, so
-		// it must not be adopted — see operationalAdoptionAllowed. Reached when
-		// a concurrent poll of this endpoint lost the race to the divert above.
-		if !s.operationalAdoptionAllowed() {
-			s.login.Clear(sessionID)
-			slog.Debug("ignoring already-consumed bootstrap login on a concurrent status poll")
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(status)
-			return
-		}
-
-		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
-		if err != nil {
-			slog.Error("downscoping token to least privilege failed", "error", err)
-			s.login.Clear(sessionID)
-			writeError(w, "authentication failed during token downscoping", http.StatusInternalServerError)
-			return
-		}
-		s.vault.SetToken(token)
-		auth.WarnUnrestrictedPolicy(s.policyConstraint())
-		if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
-			slog.Warn("failed to write token file", "error", err)
-		}
-		s.login.Clear(sessionID)
-
-		slog.Info("LDAP authentication successful via web UI")
-
-		// Signal auth completion.
-		select {
-		case s.authDone <- struct{}{}:
-		default:
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
-
-func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"session_id"`
-		Passcode  string `json:"passcode"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.SessionID == "" || req.Passcode == "" {
-		writeError(w, "session_id and passcode required", http.StatusBadRequest)
-		return
-	}
-
-	status := s.login.GetStatus(req.SessionID)
-	if status == nil {
-		writeError(w, "session not found", http.StatusNotFound)
-		return
-	}
-	if status.State != "mfa_required" || len(status.MFAMethods) == 0 || !status.MFAMethods[0].UsesPasscode {
-		writeError(w, "passcode not expected for this session", http.StatusBadRequest)
-		return
-	}
-
-	s.login.SubmitTOTP(req.SessionID, req.Passcode)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"status": "submitted"})
-}
-
-func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
-	// Under certificate auth the operational token comes from the cert login
-	// alone — see operationalAdoptionAllowed. Pasting a token here would
-	// install a credential the cert flow never sanctioned, so refuse rather
-	// than enforcing the invariant at only some adoption sites. The SPA never
-	// renders this form under mtls; this closes the direct-POST path.
-	if !s.operationalAdoptionAllowed() {
-		writeError(w, "token login is not available under certificate authentication: this daemon obtains its Vault token from its client certificate", http.StatusForbidden)
-		return
-	}
-
-	var req struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.Token == "" {
-		writeError(w, "token required", http.StatusBadRequest)
-		return
-	}
-
-	// Validate the token, preserving any existing token on failure.
-	prevToken := s.vault.Token()
-	s.vault.SetToken(req.Token)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	if _, err := s.vault.LookupSelf(ctx); err != nil {
-		s.vault.SetToken(prevToken)
-		writeError(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	if err := auth.WriteTokenFile(s.tokenFilePath, req.Token, s.sealToken); err != nil {
-		slog.Warn("failed to write token file", "error", err)
-	}
-
-	slog.Info("token authentication successful via web UI")
-
-	// Signal auth completion.
-	select {
-	case s.authDone <- struct{}{}:
-	default:
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"state": "authenticated"})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func generateSessionID() (string, error) {

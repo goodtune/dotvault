@@ -19,7 +19,6 @@ All binaries are statically compiled (no CGO dependencies) and require no runtim
 Requirements:
 
 - Go 1.25 or later
-- Node.js (for building the web frontend)
 - Make
 
 ```sh
@@ -34,17 +33,9 @@ To cross-compile for all supported platforms:
 make build-all
 ```
 
-### Building the web frontend
+### Web UI assets
 
-If you modify the web UI, rebuild the frontend assets before compiling:
-
-```sh
-cd internal/web/frontend && npm run build
-cd -
-make build
-```
-
-The built frontend assets are embedded into the binary via Go's `embed.FS`, so the final binary is fully self-contained.
+The web UI is server-rendered: its Go templates and static assets are embedded into the binary via Go's `embed.FS`, so there is no separate asset build and the final binary is fully self-contained. Editing a template or stylesheet only needs `make build`.
 
 ## Verify the installation
 

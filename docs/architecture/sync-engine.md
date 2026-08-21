@@ -1,6 +1,6 @@
 # Sync engine, handlers, templates
 
-> Carved from CLAUDE.md. Per-rule sync logic, the state store, format handlers, and template functions. User-facing: `docs/configuration/sync-rules.md`, `docs/configuration/templates.md`.
+> Carved from CLAUDE.md. Per-rule sync logic, the state store, format handlers (including `delete_nulls` tombstones), and template functions. User-facing: `docs/configuration/sync-rules.md`, `docs/configuration/templates.md`.
 
 ## Sync Engine
 
@@ -28,7 +28,7 @@ Persists to `{cache_dir}/state.json`. Per-rule: vault version, last synced times
 
 ## File Format Handlers
 
-All handlers implement the `FileHandler` interface (Read, Merge, Write). Handlers that support templates also implement the `Parser` interface. Factory: `handlers.HandlerFor(format)`.
+All handlers implement the `FileHandler` interface (Read, Merge, Write). Handlers that support templates also implement the `Parser` interface. Factory: `handlers.HandlerWithOptions(format, handlers.Options{...})`, which the sync engine calls; `handlers.HandlerFor(format)` is the zero-option wrapper. `Merge` may mutate **both** arguments — it builds the result by modifying `existing` in place, and a delete-nulls handler also strips tombstones out of `incoming` — so a caller must parse both fresh per rule, as the engine does.
 
 | Format | Library | Merge Behaviour |
 |--------|---------|-----------------|
@@ -41,6 +41,10 @@ All handlers implement the `FileHandler` interface (Read, Merge, Write). Handler
 | ssh_config | Custom parser (no external dep) | Surgical directive-level merge within each Host/Match section; comments and unmanaged directives preserved verbatim. Template-only (no raw-data path). Repeatable keywords (forwards, `IdentityFile`, `SetEnv`, …) merge by a discriminator drawn from the first argument, so the discriminator *is* the directive's identity: changing it renders a new line (old one orphaned), not a rewrite — a deliberate coexistence trade-off, documented in `docs/configuration/sync-rules.md` |
 
 The `merge` field exists in rule config but is not dispatched on. Each handler always uses its native merge strategy, which is the only sensible strategy for that format.
+
+**Field nullification (`target.delete_nulls`).** The merge is additive by construction, so a rule can add and update keys but never retire one: a secret published into a file and later moved to a dynamic source stays on disk whether the rule keeps writing (the merge preserves it) or is deleted (the file stops being managed). With `delete_nulls`, a null in the *incoming* rendered document is a tombstone — the key is removed from the target instead of written — the equivalent of `jq`'s `del(.key)`. Deleting an absent key is a no-op, so a tombstone is safe to leave in a template permanently and stops changing the file once the key is gone. The flag reaches the handler via `handlers.Options`/`HandlerWithOptions` (`HandlerFor` stays the zero-value default) and is carried on `JSONHandler`/`YAMLHandler` as a struct field; it is also mixed into `ruleRenderHash`, so toggling it re-applies against an otherwise-unchanged secret. **It is opt-in per rule, and that is load-bearing:** in YAML `password: {{ .password }}` over an empty value renders `password:`, which parses as a null — always-on deletion would silently delete live credentials. All three YAML null spellings (`null`, `~`, bare `key:`) are tombstones. Two gates reject the flag on null-less formats: `config.validateRule` at load time and `HandlerWithOptions` at construction, the latter so a caller building a handler by another route can't quietly get additive-only merges when it asked for deletions. Both the JSON and YAML implementations must *prune* tombstones from any src subtree adopted wholesale rather than merged key-by-key (`pruneNullsJSON` / `pruneNullNodes`) — the `!exists` and replace branches would otherwise write out the very null the rule asked to delete.
+
+Tombstones reach **mapping keys only**. Neither handler descends into arrays/sequences, because the merge replaces those wholesale and there is nothing inside one to delete; the two were briefly inconsistent here and `TestDeleteNullsTreatsArraysAsOpaque` pins them together. Three further properties exist because a deletion that silently doesn't happen is worse than no feature at all: **every** duplicate key is removed, not just the first (yaml.v3 permits duplicates and consumers read the last one); the YAML merge **refuses outright** — erroring the rule rather than writing — when the *existing* document uses an anchor, alias, or merge key and the incoming document carries a tombstone (`unsafeForDeletion`/`hasTombstone`), since a key inherited via `<<: *base` isn't written literally and removing an anchored pair strands aliases; and on Windows `TargetDeleteNulls` is read with `readRegDWORDStrict`, so a mistyped GPO value fails startup instead of silently reading as disabled. The refusal is gated on a tombstone actually being present, so a delete_nulls rule that renders no null this pass still works against an aliased file. Removal for the formats with no null (`ini`, `toml`, `text`, `netrc`, `ssh_config`) is an open design question, not a supported gesture.
 
 All writes are atomic (temp file with target permissions + rename). Permissions: all managed files use 0600.
 

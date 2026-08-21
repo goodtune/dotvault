@@ -24,6 +24,10 @@ type EnrolStateInfo struct {
 	Output       []string `json:"output,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	HelpTextHTML string   `json:"help_text_html,omitempty"`
+	// Unattended mirrors enrol.EngineUnattended for this enrolment's engine:
+	// it needs no user interaction. Carried on the snapshot rather than
+	// re-derived by name at each call site so there is one answer per state.
+	Unattended bool `json:"unattended,omitempty"`
 }
 
 type enrolState struct {
@@ -37,6 +41,29 @@ type enrolState struct {
 	errMsg       string
 	doneCh       chan struct{} // closed when engine finishes
 	mu           sync.Mutex
+}
+
+// infoLocked snapshots this enrolment for the API and the UI. The caller must
+// hold s.mu. It is shared by States and GetState so the two cannot drift —
+// they previously carried identical copies of this construction.
+func (s *enrolState) infoLocked() EnrolStateInfo {
+	info := EnrolStateInfo{
+		Key:          s.key,
+		Engine:       s.engineName,
+		Status:       s.status,
+		Output:       append([]string{}, s.output...),
+		Error:        s.errMsg,
+		HelpTextHTML: s.helpTextHTML,
+	}
+	if s.engine != nil {
+		info.EngineName = s.engine.Name()
+		info.Fields = enrol.EngineFields(s.engine, s.settings)
+		info.Unattended = enrol.EngineUnattended(s.engine)
+	} else {
+		info.EngineName = s.engineName
+		info.Fields = []string{}
+	}
+	return info
 }
 
 // Sentinel errors for enrolment operations.
@@ -54,12 +81,18 @@ type EnrolmentRunner struct {
 	states map[string]*enrolState
 	order  []string // sorted keys for stable ordering
 	done   chan struct{}
-	mu     sync.RWMutex
+	// dismissed latches once Complete has been called, so the first-run
+	// wizard stays dismissed for the rest of this runner's life — including
+	// the case where the user skipped every enrolment, which leaves nothing
+	// "complete" for NeedsWizard to notice. A config reload builds a new
+	// runner and so deliberately re-evaluates from scratch.
+	dismissed bool
+	mu        sync.RWMutex
 }
 
 // NewEnrolmentRunner creates a runner from the enrolments config.
 // All enrolments start as "pending". Call MarkComplete() for enrolments
-// that are already satisfied in Vault before exposing to the frontend.
+// that are already satisfied in Vault before exposing them in the UI.
 func NewEnrolmentRunner(enrolments map[string]config.Enrolment) *EnrolmentRunner {
 	keys := make([]string, 0, len(enrolments))
 	for k := range enrolments {
@@ -129,21 +162,7 @@ func (r *EnrolmentRunner) States() []EnrolStateInfo {
 			continue
 		}
 		s.mu.Lock()
-		info := EnrolStateInfo{
-			Key:          s.key,
-			Engine:       s.engineName,
-			Status:       s.status,
-			Output:       append([]string{}, s.output...),
-			Error:        s.errMsg,
-			HelpTextHTML: s.helpTextHTML,
-		}
-		if s.engine != nil {
-			info.EngineName = s.engine.Name()
-			info.Fields = enrol.EngineFields(s.engine, s.settings)
-		} else {
-			info.EngineName = s.engineName
-			info.Fields = []string{}
-		}
+		info := s.infoLocked()
 		s.mu.Unlock()
 		result = append(result, info)
 	}
@@ -215,22 +234,7 @@ func (r *EnrolmentRunner) GetState(key string) (EnrolStateInfo, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := EnrolStateInfo{
-		Key:          s.key,
-		Engine:       s.engineName,
-		Status:       s.status,
-		Output:       append([]string{}, s.output...),
-		Error:        s.errMsg,
-		HelpTextHTML: s.helpTextHTML,
-	}
-	if s.engine != nil {
-		info.EngineName = s.engine.Name()
-		info.Fields = enrol.EngineFields(s.engine, s.settings)
-	} else {
-		info.EngineName = s.engineName
-		info.Fields = []string{}
-	}
-	return info, nil
+	return s.infoLocked(), nil
 }
 
 // AnyRunning reports whether any enrolment is currently executing. The
@@ -265,20 +269,87 @@ func (r *EnrolmentRunner) HasPending() bool {
 	return false
 }
 
-// Complete signals that the user is done with enrolments.
+// NeedsWizard reports whether the first-run enrolment wizard is warranted:
+// at least one enrolment is actually runnable, none has been completed, and
+// the user has not already dismissed the wizard.
+//
+// "None completed" is the deliberate trigger. A user with credentials in
+// Vault has done first-run setup, so an outstanding enrolment they skipped
+// (or a newly added one) must not keep hijacking their entry to the site —
+// it waits for them on /ui/enrolments/ instead.
+func (r *EnrolmentRunner) NeedsWizard() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.dismissed {
+		return false
+	}
+	runnable := false
+	for _, key := range r.order {
+		s, ok := r.states[key]
+		if !ok {
+			continue
+		}
+		s.mu.Lock()
+		status := s.status
+		engine := s.engine
+		s.mu.Unlock()
+		// An unattended enrolment (the copy engine) is not evidence either
+		// way and is skipped entirely. It gives the user nothing to do, so
+		// it must not make the wizard fire; and because it completes on its
+		// own — often before a human has seen anything — letting it satisfy
+		// the "something is already enrolled" test below would suppress the
+		// wizard for the interactive enrolments that genuinely need one.
+		if engine != nil && enrol.EngineUnattended(engine) {
+			continue
+		}
+		if status == "complete" {
+			return false
+		}
+		// A skipped enrolment has been addressed: the user was shown it and
+		// declined. It must not keep the wizard standing, or the exit link
+		// would bounce a user who skipped everything straight back here with
+		// no way out — the case the old Continue button's explicit dismissal
+		// used to cover.
+		if status == "skipped" {
+			continue
+		}
+		if engine != nil {
+			runnable = true
+		}
+	}
+	return runnable
+}
+
+// Complete signals that the user is done with enrolments and dismisses the
+// wizard. Idempotent: the web entry point calls it whenever a user reaches
+// the main site, which is what keeps a daemon from waiting on a wizard
+// nobody is going to finish.
 func (r *EnrolmentRunner) Complete() {
+	r.mu.Lock()
+	r.dismissed = true
+	r.mu.Unlock()
 	select {
 	case r.done <- struct{}{}:
 	default:
 	}
 }
 
-// Wait blocks until Complete() is called. Returns immediately if there
-// are no pending enrolments.
+// Wait blocks until Complete() is called. Returns immediately unless the
+// first-run wizard is warranted — the daemon only defers its startup for a
+// wizard the user will actually be shown, never for an enrolment they can
+// address later from the main site.
 func (r *EnrolmentRunner) Wait() {
-	if !r.HasPending() {
+	if !r.NeedsWizard() {
 		return
 	}
+	// Say so. Everything past this point in daemon startup — the sync engine
+	// included — waits for a human to open the web UI, and on an unattended
+	// host nobody ever will: managed files simply stop being refreshed. That
+	// is the correct behaviour (there are credentials the daemon cannot
+	// obtain on its own) but it is indistinguishable from a hung daemon in
+	// the log, so it must not be silent. /readyz reports not-ready for the
+	// same reason.
+	slog.Info("waiting for first-run enrolment: open the web UI to continue, or the daemon will not begin syncing")
 	<-r.done
 }
 

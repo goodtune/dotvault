@@ -37,7 +37,7 @@ type uiRemoteRow struct {
 	HostKeyFingerprint string
 }
 
-// uiRemoteStateLabel mirrors the SPA's STATE_LABELS lookup.
+// uiRemoteStateLabel maps a forward's state onto its display label.
 func uiRemoteStateLabel(state string) string {
 	switch state {
 	case "connected":
@@ -59,7 +59,7 @@ func uiRemoteStateLabel(state string) string {
 	}
 }
 
-// uiRemotePillClass mirrors the SPA's statePillClass lookup.
+// uiRemotePillClass maps a forward's state onto its pill styling.
 func uiRemotePillClass(state string) string {
 	switch state {
 	case "connected":
@@ -111,7 +111,7 @@ func (s *Server) uiRemoteRows() (rows []uiRemoteRow, unavailable bool, err error
 			row.LastError = st.LastError
 		} else if row.Enabled {
 			// No live entry yet (just added, or config not yet reconciled) —
-			// fall back on the config's own enabled flag, matching the SPA.
+			// fall back on the config's own enabled flag.
 			row.State = "offline"
 		} else {
 			row.State = "disabled"

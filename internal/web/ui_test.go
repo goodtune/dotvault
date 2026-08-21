@@ -127,7 +127,7 @@ func TestUIDashboard_RendersLayout(t *testing.T) {
 	}
 	body := uiBody(t, resp)
 	for _, want := range []string{
-		`class="status-bar"`, // SPA header look
+		`class="status-bar"`, // header status bar
 		"Connected",
 		"Sync Now",
 		"Enrolments", "Remotes", "Secrets", // accordion sections
@@ -302,7 +302,7 @@ func TestUIEnrolCard_ParsesDeviceFlow(t *testing.T) {
 			"- Press Enter to open https://github.com/login/device in your browser...",
 			"⠼ Waiting for authentication...",
 		},
-	}, true)
+	}, true, enrolActionBase)
 	if !card.HasDeviceFlow {
 		t.Fatalf("expected device flow, got %+v", card)
 	}
@@ -325,7 +325,7 @@ func TestUIEnrolCard_ParsesDeviceFlow(t *testing.T) {
 		Engine: "databricks",
 		Status: "running",
 		Output: []string{"Opening https://dbc.example.com/oidc/authorize?x=1 ..."},
-	}, false)
+	}, false, enrolActionBase)
 	if !card.HasRedirectFlow || card.HasDeviceFlow {
 		t.Errorf("expected redirect flow, got %+v", card)
 	}
@@ -413,7 +413,7 @@ func TestUIRouteLabel(t *testing.T) {
 
 func TestUIConfigJSONShapeUnchanged(t *testing.T) {
 	// The handleConfig refactor onto shared view structs must preserve the
-	// SPA's wire contract.
+	// endpoint's established wire contract.
 	s := testServerWithVault(t, uiTestVaultHandler(t))
 	req := httptest.NewRequest("GET", "/api/v1/config", nil)
 	w := httptest.NewRecorder()
@@ -505,6 +505,13 @@ func TestUIWrite_AllPostRoutesRequireOrigin(t *testing.T) {
 		"/ui/remotes/add",
 		"/ui/remotes/somehost/save",
 		"/ui/remotes/somehost/delete",
+		// The wizard's own POSTs are the same class of gate on a second
+		// surface, and are just as invisible when one is dropped.
+		"/setup/complete",
+		"/setup/start",
+		"/setup/skip",
+		"/setup/reset",
+		"/setup/secret",
 	}
 	for _, route := range routes {
 		req, err := http.NewRequest("POST", ts.URL+route, nil)
@@ -591,7 +598,7 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 			"✓ Opened https://jfrog.example.com/ui/login in browser",
 			"⠼ Minting dotvault-owned access token...",
 		},
-	}, false)
+	}, false, enrolActionBase)
 	if !card.HasDeviceFlow || !card.CodeSpent {
 		t.Errorf("expected spent device flow, got %+v", card)
 	}
@@ -603,13 +610,13 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 	s.enrolPromptMu.Unlock()
 	card = s.buildUIEnrolCard(EnrolStateInfo{
 		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "running",
-	}, false)
+	}, false, enrolActionBase)
 	if !card.PromptPending || card.PromptLabel != "Enter passphrase" {
 		t.Errorf("expected pending prompt on running card, got %+v", card)
 	}
 	card = s.buildUIEnrolCard(EnrolStateInfo{
 		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "pending",
-	}, false)
+	}, false, enrolActionBase)
 	if card.PromptPending {
 		t.Errorf("non-running card must not show the prompt")
 	}

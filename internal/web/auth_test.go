@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/auth"
@@ -42,6 +41,9 @@ func authTestServer(t *testing.T, vc *vault.Client) *Server {
 		authMethod: "oidc",
 		authMount:  "oidc",
 		listenAddr: "127.0.0.1:8250",
+		// The login handlers are browser-facing: originAllowed refuses every
+		// Origin on a daemon with no TCP listener, so model one here.
+		webEnabled: true,
 	}
 }
 
@@ -209,8 +211,8 @@ func TestHandleAuthCallback_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
-	if w.Code != http.StatusFound {
-		t.Errorf("status = %d, want 302", w.Code)
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("status = %d, want 303", w.Code)
 	}
 	if loc := w.Header().Get("Location"); loc != "/" {
 		t.Errorf("Location = %q, want %q", loc, "/")
@@ -260,8 +262,8 @@ func TestHandleAuthCallback_Downscopes(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", w.Code)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
 	}
 	if got := s.vault.Token(); got != "child-token" {
 		t.Errorf("adopted token = %q, want child-token (the downscoped child)", got)
@@ -335,122 +337,5 @@ func TestWaitForAuth_ContextCancelled(t *testing.T) {
 
 	if err := s.WaitForAuth(ctx); err == nil {
 		t.Error("WaitForAuth() = nil, want error for cancelled context")
-	}
-}
-
-// --- handleLDAPLogin ---
-
-func TestHandleLDAPLogin_Success(t *testing.T) {
-	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"request_id": "req-1",
-			"auth": map[string]any{
-				"client_token":   "hvs.ldap-token",
-				"lease_duration": 3600,
-				"renewable":      true,
-			},
-		})
-	})
-
-	s := authTestServer(t, vc)
-	s.authMethod = "ldap"
-	s.authMount = "ldap"
-
-	body := strings.NewReader(`{"username":"testuser","password":"secret"}`)
-	req := httptest.NewRequest("POST", "/auth/ldap/login", body)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	s.handleLDAPLogin(w, req)
-
-	if w.Code != http.StatusAccepted {
-		t.Errorf("status = %d, want 202", w.Code)
-	}
-	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
-	sessionID, ok := resp["session_id"].(string)
-	if !ok || sessionID == "" {
-		t.Fatal("response missing session_id")
-	}
-}
-
-// --- handleLDAPStatus ---
-
-func TestHandleLDAPStatus_MissingSession(t *testing.T) {
-	s := authTestServer(t, nil)
-
-	req := httptest.NewRequest("GET", "/auth/ldap/status", nil)
-	w := httptest.NewRecorder()
-	s.handleLDAPStatus(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", w.Code)
-	}
-}
-
-func TestHandleLDAPStatus_NotFound(t *testing.T) {
-	s := authTestServer(t, nil)
-
-	req := httptest.NewRequest("GET", "/auth/ldap/status?session=nonexistent", nil)
-	w := httptest.NewRecorder()
-	s.handleLDAPStatus(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", w.Code)
-	}
-}
-
-// --- handleTokenLogin ---
-
-func TestHandleTokenLogin_Success(t *testing.T) {
-	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"request_id": "req-1",
-			"data": map[string]any{
-				"ttl":       3600,
-				"renewable": true,
-			},
-		})
-	})
-
-	s := authTestServer(t, vc)
-	s.tokenFilePath = filepath.Join(t.TempDir(), "vault-token")
-
-	body := strings.NewReader(`{"token":"hvs.test-token"}`)
-	req := httptest.NewRequest("POST", "/auth/token/login", body)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	s.handleTokenLogin(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", w.Code)
-	}
-
-	select {
-	case <-s.authDone:
-		// success
-	default:
-		t.Error("authDone was not signaled")
-	}
-}
-
-func TestHandleTokenLogin_InvalidToken(t *testing.T) {
-	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
-	})
-
-	s := authTestServer(t, vc)
-
-	body := strings.NewReader(`{"token":"invalid-token"}`)
-	req := httptest.NewRequest("POST", "/auth/token/login", body)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	s.handleTokenLogin(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", w.Code)
 	}
 }

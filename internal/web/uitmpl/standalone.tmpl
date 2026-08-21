@@ -1,0 +1,27 @@
+{{/* standalone is the chrome-less page shell used by the surfaces that exist
+     outside the main site: the login view and the first-run enrolment wizard.
+     Both are reached before there is a dashboard to frame them, so they carry
+     no status bar and no navigation — just a centred card on the same
+     stylesheet the rest of the UI uses.
+
+     Refresh, when set, emits a meta refresh: the login flow's waiting states
+     (an MFA push awaiting approval, a certificate being issued) poll purely by
+     reloading, so the login surface needs no JavaScript at all. Datastar is
+     loaded only by pages that actually script (the wizard's running cards). */}}
+{{define "standalone"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{if .Title}}{{.Title}} · {{end}}.vault</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/ui/assets/style.css">
+  <link rel="stylesheet" href="/ui/assets/ui.css">
+  {{if .Refresh}}<meta http-equiv="refresh" content="{{.Refresh}}">{{end}}
+  {{if .Datastar}}<script type="module" src="/ui/assets/datastar.js"></script>{{end}}
+</head>
+<body>
+  {{block "content" .}}{{end}}
+</body>
+</html>
+{{end}}

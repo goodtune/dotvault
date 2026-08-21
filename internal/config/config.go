@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/handlers"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -586,7 +587,7 @@ type AgentConfig struct {
 // Deliberately separate from web.enabled. The two surfaces have different
 // audiences and different exposure: the TCP listener is a browser UI
 // reachable by every uid on the box, while this socket is owner-only (0600 in
-// a 0700 directory) and carries no SPA. An operator who wants the borrow
+// a 0700 directory) and carries no browser UI. An operator who wants the borrow
 // endpoint on a headless host should not have to stand up a web UI to get it,
 // and enabling it does not widen what web.enabled already exposes.
 //
@@ -728,6 +729,26 @@ type Target struct {
 	Format   string `yaml:"format"`
 	Template string `yaml:"template"`
 	Merge    string `yaml:"merge"`
+
+	// DeleteNulls turns a null in the rendered template into a tombstone:
+	// the corresponding key is removed from the target file instead of being
+	// written as a null value — the equivalent of jq's del(.key). It exists
+	// because a surgical field-level merge is otherwise additive-only, so a
+	// secret that has been retired upstream would linger in the target file
+	// forever: neither writing nothing (the merge preserves existing keys)
+	// nor dropping the rule (which stops managing the file entirely) can
+	// remove it.
+	//
+	// Off by default, and deliberately opt-in per rule rather than always-on,
+	// because a null is far too easy to render by accident. In YAML in
+	// particular, `password: {{ .password }}` over an empty value renders
+	// `password:`, which parses as a null — under an always-on rule that
+	// would silently delete a live credential. Requiring the operator to
+	// name the behaviour on the rule that needs it keeps that failure mode
+	// off every rule that doesn't.
+	//
+	// Only json and yaml can carry it: see nullableFormats.
+	DeleteNulls bool `yaml:"delete_nulls"`
 }
 
 var validFormats = map[string]bool{
@@ -1267,6 +1288,9 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	}
 	if !validFormats[r.Target.Format] {
 		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
+	}
+	if r.Target.DeleteNulls && !handlers.SupportsDeleteNulls(r.Target.Format) {
+		return fmt.Errorf("rules[%d] (%s): target.delete_nulls is not supported for format %q (only json and yaml have a null literal a template can render)", i, r.Name, r.Target.Format)
 	}
 	return nil
 }

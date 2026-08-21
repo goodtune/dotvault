@@ -30,8 +30,9 @@ make build-all     # linux/darwin (amd64/arm64) + windows (amd64)
 
 docker compose up -d                                  # Vault + Dex, for local dev
 go run ./cmd/dotvault run --config config.dev.yaml     # daemon against the dev stack
-cd internal/web/frontend && npm run build              # rebuild the SPA bundle
 ```
+
+The web UI is server-rendered Go templates with **no build step** — `internal/web/uitmpl/*.tmpl` plus static assets in `internal/web/uiassets/`, embedded via `embed.FS`. There is no npm, no bundler, and no committed build artefact.
 
 Local dev needs `127.0.0.1 dex` in `/etc/hosts`. Dev Vault is on `127.0.0.1:8200`, the dotvault web UI on `9000`. JFrog enrolment testing is opt-in: `docker compose --profile jfrog up -d` (~3 min cold start). `vault-init` seeds sample secrets and writes the root token to `/vault/data/root-token`. `.claude/launch.json` defines both services as Claude Code Desktop preview configurations.
 
@@ -62,7 +63,7 @@ internal/
   handlers/              File format handlers (yaml, json, ini, toml, text, netrc, ssh_config)
   tmpl/                  Go template rendering (named tmpl to avoid shadowing text/template)
   enrol/                 Credential acquisition (GitHub, JFrog, Databricks, ghp, SSH, Copy)
-  web/                   Web UI server (Preact SPA + server-rendered /ui/), auth, REST API
+  web/                   Web UI server (server-rendered pages + REST API), auth endpoints
   perms/                 File permission checks (Unix mode bits, Windows DACL)
   tray/                  Windows system-tray icon (no-op elsewhere)
   agent/                 SSH agent: read-only ExtendedAgent backend + socket/pipe listeners
@@ -88,7 +89,11 @@ packaging/linux/         systemd units
 
 **Denied-token suppression.** A token Vault has rejected is not presented again — `auth.TokenDenylist` suppresses it, and `cmd/dotvault` builds **one** instance before the first Vault call and shares it across the startup reuse check, the peer borrow, `waitForHeadlessToken`, and `LifecycleManager`. Sharing is the point: the bug was each stage independently re-asking about a token an earlier stage had watched Vault refuse. Three properties are load-bearing. **Only Vault's verdict counts** — `auth.IsTokenRejected` is narrow by design (a 403 or the expired sentinel); a 5xx, a sealed Vault, or a connection failure is a fault of the moment and must leave the token retryable. **Suppression is keyed on the token's value**, so a new token is never affected. And it is a **long re-probe window** (`DenyProbeInterval`, 15m), not a permanent verdict — a 403 can also mean a policy missing `auth/token/lookup-self`, or a Vault mid-failover, which clear server-side with nothing happening on this host.
 
-**Web.** Loopback binding is a hard invariant; the daemon refuses to start if `web.listen` resolves elsewhere. CSRF protects all mutating endpoints, with three documented exceptions — `POST /api/v1/remote/{browse,notify,clipboard}` — which use an Origin check instead because their consumer is a bare curl over a forwarded socket. All `/ui/` POSTs require a present, same-origin `Origin`. Secrets never ride in page HTML: reveal and clipboard are separate server-side fragments. Inline scripts stay forbidden on both surfaces — do not use datastar's `ExecuteScript`/`Redirect` SSE helpers, which the CSP blocks; use 303 redirects. The only safe interpolation into **any** datastar attribute is a strictly URL-encoded value.
+**Web.** Loopback binding is a hard invariant; the daemon refuses to start if `web.listen` resolves elsewhere. The browser sees three surfaces and `GET /` (`handleRoot`) alone decides which: the login view at `/` when the daemon holds no token, the first-run wizard at `/setup/` when authenticated with nothing enrolled, and the main site under `/ui/` otherwise.
+
+**All browser POSTs — `/ui/`, `/setup/` and the login forms alike — require a present, same-origin `Origin`** (`requireSameOrigin`); that is the CSRF control for this surface, and an absent Origin is rejected because these endpoints have no curl consumer. The JSON API keeps token-based CSRF, with three documented exceptions — `POST /api/v1/remote/{browse,notify,clipboard}` — which use an Origin check instead because their consumer is a bare curl over a forwarded socket where an issue-then-spend handshake is impractical.
+
+Secrets never ride in page HTML: reveal and clipboard are separate server-side fragments, and the clipboard copy happens server-side so the value never reaches the browser. **The login view loads no JavaScript at all** — its waiting states advance via `<meta http-equiv="refresh">`. Inline scripts stay forbidden; do not use datastar's `ExecuteScript`/`Redirect` SSE helpers, which the CSP blocks — use 303 redirects. The only safe interpolation into **any** datastar attribute is a strictly URL-encoded value.
 
 **The `client/` facade is the only supported import boundary.** External modules import `client`, never `internal/*`. Identity is the **OS user**, not the token — changing that default derivation is a path-layout migration, not a facade tweak. Keep the `client.Config` projection in lockstep when the connectivity/auth shape of the system config changes. The Python bridge imports **only** `client`; when extending its surface, change the error category codes on both sides together and add a matching exception class.
 
@@ -114,12 +119,15 @@ Deliberate choices, recorded so they are not re-litigated by accident — and so
 
 ## Gotchas
 
-- **The SPA bundle is a committed artefact.** `internal/web/static/app.js` is checked in and CI fails it stale. Rebuild and `git add` it in the same commit as any frontend source change.
+- **Adding a scripted page means updating `uiScriptedPath`.** The relaxed CSP that lets datastar evaluate attribute expressions is keyed on that list. A page missed there renders fine and then silently refuses to evaluate *any* datastar expression — which is how the wizard's card poll was first found broken.
 - **A green `go test ./...` is not evidence the Vault-backed tests ran.** They skip silently when the docker-compose stack is down. This has masked a real regression: five packages each hardcoded a `dev-root-token` that was never valid, so those tests skipped when down and 403'd when up — a whole tier never ran. `internal/vaulttest` centralises the lookup; **new Vault-backed tests must go through it**. Bring the stack up before trusting a run touching auth, sync, enrolment, or the vault client.
+- **Seven `internal/web` socket tests fail on macOS and pass in CI.** `t.TempDir()` there yields a ~112-byte path against the OS's 103-byte `sun_path` limit for Unix sockets, so `TestSocketOnly*`, `TestLosingServerDoesNotUnlinkWinnersSocket`, `TestPartialBindCleansUpBoundListeners`, `TestTokenEndpointDeclinesDuringReauth`, and `TestSocketActivatedAPIServesAndSurvivesShutdown` fail with a path-length error. CI is Linux (`/tmp/...`, short) and green. Confirm against a clean checkout before assuming you broke something.
 - **FUSE tests skip when FUSE is unusable.** CI installs `fuse3`; macOS needs macFUSE. The platform-neutral `internal/vaultfs` core is tested everywhere regardless.
-- **A new browser-driven enrolment engine needs a matching web card.** The web runner deliberately builds `enrol.IO` with a nil `Browser` (the daemon must not pop a browser on a headless host), so the engine writes its login URL to `io.Out`. Emit it in a form `enrol-card.jsx` already recognises, or add a branch — otherwise it lands in the raw-output fallback and the user sees a bare URL with nothing to click. **Verify the web path, not just the CLI**, which opens a real browser and masks this.
+- **A new browser-driven enrolment engine needs a matching web card.** The web runner deliberately builds `enrol.IO` with a nil `Browser` (the daemon must not pop a browser on a headless host), so the engine writes its login URL to `io.Out`. Emit it in a form the card (`internal/web/ui_enrol.go` + `uitmpl/enrol_card.tmpl`) already recognises — an `https://` URL, plus the one-time-code line only if there is a user code — or add a branch. Otherwise it lands in the raw-output fallback and the user sees a bare URL with nothing to click. **Verify the web path, not just the CLI**, which opens a real browser and masks this.
 - **A rule's render-affecting definition is fingerprinted into state.** Without `ruleRenderHash`, editing only `target.template` would skip forever — neither the secret version nor the file moved.
-- **New package ecosystem → add a `.github/dependabot.yml` entry** (currently gomod, npm at the frontend, github-actions, pip at `python/`).
+- **New package ecosystem → add a `.github/dependabot.yml` entry** (currently gomod, github-actions, and pip at `python/`).
+- **`target.delete_nulls` is json/yaml only**, and tombstones reach **mapping keys only** — neither handler descends into arrays, which the merge replaces wholesale. It exists because the merge is otherwise additive by construction: without it a rule can add and update keys but never retire one.
+- **Unattended engines are invisible to the first-run wizard** (`enrol.EngineUnattended`, today only Copy) — excluded from the decision to show it *and* from the page. A copy enrolment often finishes before the user sees anything, so counting it would satisfy `NeedsWizard` on its own.
 
 ## Where the depth lives
 

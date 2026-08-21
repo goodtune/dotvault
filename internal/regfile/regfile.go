@@ -434,6 +434,7 @@ func (e *emitter) writeRule(r config.Rule) {
 	rulePath := rootKey + `\Rules\` + r.Name
 	e.writeKey(rulePath)
 	e.writeString("Description", r.Description)
+	e.writeBool("TargetDeleteNulls", r.Target.DeleteNulls)
 	e.writeString("TargetFormat", r.Target.Format)
 	e.writeString("TargetMerge", r.Target.Merge)
 	e.writeString("TargetPath", r.Target.Path)

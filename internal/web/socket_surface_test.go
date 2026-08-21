@@ -111,7 +111,7 @@ func TestSocketOnlyServerOmitsUIRoutes(t *testing.T) {
 		"/auth/oidc/start",
 		"/auth/ldap/status",
 		"/api/v1/enrol/prompt",
-		"/", // the SPA
+		"/", // the login view
 	} {
 		resp, err := client.Get("http://localhost" + path)
 		if err != nil {

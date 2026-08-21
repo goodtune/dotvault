@@ -55,7 +55,7 @@ trap 'rm -rf "$STAGING"' EXIT
 
 cp "$BINARY" "$STAGING/dotvault.exe"
 cp "$PROJECT_ROOT/LICENSE" "$STAGING/LICENSE"
-cp "$PROJECT_ROOT/internal/web/static/favicon.ico" "$STAGING/dotvault.ico"
+cp "$PROJECT_ROOT/internal/web/uiassets/favicon.ico" "$STAGING/dotvault.ico"
 cp "$SCRIPT_DIR/dotvault.nsi" "$STAGING/dotvault.nsi"
 
 # Run NSIS

@@ -63,7 +63,7 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 	// Reject browser-originated cross-site requests. A cross-origin form or
 	// fetch POST always carries an Origin header naming the attacker's site
 	// (or "null"); only an Origin naming this daemon's own loopback identity
-	// — i.e. the SPA itself — is acceptable. Non-browser clients (curl,
+	// — i.e. this daemon's own UI — is acceptable. Non-browser clients (curl,
 	// `dotvault browse`) send no Origin header and pass.
 	if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin) {
 		writeError(w, "cross-site requests are not allowed", http.StatusForbidden)
@@ -130,7 +130,7 @@ func (s *Server) handleRemoteBrowse(w http.ResponseWriter, r *http.Request) {
 // actually arrived on, but an Origin names whichever server served the page,
 // and a hostname-only check would let a page from any other loopback-served
 // origin (http://127.0.0.1:12345 — some other local app's UI rendering
-// untrusted content) drive this endpoint. Only the SPA's own origin passes;
+// untrusted content) drive this endpoint. Only this daemon's own origin passes;
 // everything else (including the literal "null" sent by sandboxed iframes
 // and privacy-redirects) is rejected.
 func (s *Server) originAllowed(origin string) bool {

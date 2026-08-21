@@ -2,7 +2,6 @@ version: 2
 
 before:
   hooks:
-    - sh -c "cd internal/web/frontend && npm ci && npm run build"
     # Embed the Windows .exe icon AND version metadata. goversioninfo emits a
     # COFF object (.syso) carrying the icon plus a VS_VERSIONINFO resource
     # (Explorer Details tab: File/Product version, Company, Description). The

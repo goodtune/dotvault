@@ -5,7 +5,7 @@
      terminal state renders without the interval attribute. */}}
 {{define "enrol-card"}}
 {{if eq .Status "complete"}}
-<div id="ui-enrol-card" class="enrol-card enrol-complete" data-signals="{confirmReset: false}">
+<div id="{{.ElementID}}" class="enrol-card enrol-complete" data-signals="{confirmReset: false}">
   <div class="enrol-card-header">
     <div><span class="enrol-check">&#10003;</span><strong>{{.Title}}</strong></div>
     <div class="enrol-card-actions">
@@ -16,7 +16,7 @@
   <div class="enrol-warn" data-show="$confirmReset" style="display: none">
     <p class="enrol-warn-text">This will overwrite your existing credentials. Are you sure?</p>
     <div class="enrol-warn-actions">
-      <form class="ui-inline-form" method="post" action="/ui/enrol/reset">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/reset">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-danger" {{if .Busy}}disabled{{end}}>Overwrite credentials</button>
       </form>
@@ -25,12 +25,12 @@
   </div>
 </div>
 {{else if eq .Status "skipped"}}
-<div id="ui-enrol-card" class="enrol-card enrol-skipped">
+<div id="{{.ElementID}}" class="enrol-card enrol-skipped">
   <div class="enrol-card-header">
     <div><strong>{{.Title}}</strong><span class="enrol-badge">SKIPPED</span></div>
     <div class="enrol-card-actions">
       <span class="enrol-engine-desc">{{.EngineDesc}}</span>
-      <form class="ui-inline-form" method="post" action="/ui/enrol/reset">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/reset">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-secondary" {{if .Busy}}disabled{{end}}>Re-enrol</button>
       </form>
@@ -38,7 +38,11 @@
   </div>
 </div>
 {{else if eq .Status "running"}}
-<div id="ui-enrol-card" class="enrol-card enrol-running" data-on-interval__duration.2s="@get('{{.FragmentURL}}')">
+{{/* The poll pauses while an engine is waiting on input: a patch replaces the
+     whole card, so a 2s refresh would wipe whatever the user has typed into
+     the passphrase field (and detach the element mid-click). The form submit
+     re-renders the page, which resumes polling on the next state. */}}
+<div id="{{.ElementID}}" class="enrol-card enrol-running"{{if not .PromptPending}} data-on-interval__duration.2s="@get('{{.FragmentURL}}')"{{end}}>
   <div class="enrol-card-header">
     <div><strong>{{.Title}}</strong><span class="enrol-badge enrol-badge-running">RUNNING</span></div>
   </div>
@@ -70,7 +74,7 @@
     <p class="enrol-device-waiting">{{.ProgressLine}}</p>
   </div>
   {{else if .PromptPending}}
-  <form class="enrol-prompt-form" method="post" action="/ui/enrol/secret">
+  <form class="enrol-prompt-form" method="post" action="{{.ActionBase}}/secret">
     <input type="hidden" name="key" value="{{.Key}}">
     <label class="enrol-prompt-label" for="enrol-secret">{{.PromptLabel}}</label>
     <input type="password" id="enrol-secret" name="value" class="enrol-prompt-input" placeholder="Enter passphrase" autofocus>
@@ -85,15 +89,15 @@
   {{end}}
 </div>
 {{else if eq .Status "failed"}}
-<div id="ui-enrol-card" class="enrol-card enrol-failed">
+<div id="{{.ElementID}}" class="enrol-card enrol-failed">
   <div class="enrol-card-header">
     <div><strong>{{.Title}}</strong><span class="enrol-engine-desc">{{.EngineDesc}}</span></div>
     <div class="enrol-card-actions">
-      <form class="ui-inline-form" method="post" action="/ui/enrol/start">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/start">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-primary" {{if .Busy}}disabled{{end}}>Retry</button>
       </form>
-      <form class="ui-inline-form" method="post" action="/ui/enrol/skip">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/skip">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-secondary" {{if .Busy}}disabled{{end}}>Skip</button>
       </form>
@@ -103,15 +107,15 @@
   <p class="enrol-error-text">{{.Error}}</p>
 </div>
 {{else}}
-<div id="ui-enrol-card" class="enrol-card">
+<div id="{{.ElementID}}" class="enrol-card">
   <div class="enrol-card-header">
     <div><strong>{{.Title}}</strong><span class="enrol-engine-desc">{{.EngineDesc}}</span></div>
     <div class="enrol-card-actions">
-      <form class="ui-inline-form" method="post" action="/ui/enrol/start">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/start">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-primary" {{if .Busy}}disabled{{end}}>Start</button>
       </form>
-      <form class="ui-inline-form" method="post" action="/ui/enrol/skip">
+      <form class="ui-inline-form" method="post" action="{{.ActionBase}}/skip">
         <input type="hidden" name="key" value="{{.Key}}">
         <button class="enrol-btn-secondary" {{if .Busy}}disabled{{end}}>Skip</button>
       </form>

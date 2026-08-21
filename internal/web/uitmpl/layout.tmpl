@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{if .Title}}{{.Title}} · {{end}}.vault</title>
   <link rel="icon" href="/favicon.ico">
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/ui/assets/style.css">
   <link rel="stylesheet" href="/ui/assets/ui.css">
   <script type="module" src="/ui/assets/datastar.js"></script>
 </head>
@@ -26,6 +26,12 @@
     </div>
   </header>
   {{if .Error}}<div class="error-banner">{{.Error}}</div>{{end}}
+  {{if .OAuthRules}}<div class="oauth-banners">
+    {{range .OAuthRules}}<div class="oauth-banner">
+      <span>{{.Label}} requires authorization</span>
+      <a class="oauth-btn" href="{{.StartURL}}">Authorize</a>
+    </div>{{end}}
+  </div>{{end}}
   <div class="main-layout">
     {{template "nav" .}}
     <main class="secret-panel">

@@ -60,7 +60,7 @@ type LifecycleManager struct {
 
 	// OnReauth, when non-nil, is invoked exactly once each time the
 	// manager transitions to the needs-reauth state. Used by web mode to
-	// clear in-memory auth state and force the SPA back to its login
+	// clear in-memory auth state and force the web UI back to its login
 	// screen. Reset when a subsequent check succeeds, so the callback
 	// fires again on the next failure.
 	onReauth func()
@@ -203,7 +203,7 @@ func (lm *LifecycleManager) SetTokenSockets(paths []string) {
 // SetOnReauth registers a callback fired when the manager transitions into
 // the needs-reauth state. The callback runs synchronously on the lifecycle
 // goroutine — keep it short. In web mode this is used to clear the
-// in-memory Vault token so the SPA's status check reflects "logged out".
+// in-memory Vault token so the web UI reflects "logged out".
 func (lm *LifecycleManager) SetOnReauth(fn func()) {
 	lm.onReauth = fn
 }
@@ -376,7 +376,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// certificate auth being the case that matters. Tried
 						// before signalReauth deliberately: a successful
 						// recovery must not fire OnReauth, which would clear
-						// web state and bounce the SPA to a login screen for
+						// web state and bounce the browser to a login screen for
 						// an outage the daemon just healed by itself. If it
 						// fails we fall through, and the recovery poll retries
 						// it every cycle.

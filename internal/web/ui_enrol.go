@@ -1,6 +1,8 @@
 package web
 
 import (
+	"encoding/hex"
+	"errors"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -11,8 +13,8 @@ import (
 
 // uiEnrolCard is the view model for the server-rendered enrolment card. The
 // output parsing (device code, verification URL, progress line) is the Go
-// port of the SPA's enrol-card.jsx heuristics, so the two surfaces recognise
-// the same engine output shapes.
+// port of the heuristics the previous Preact card used, so the recognised
+// engine output shapes did not change with the rewrite.
 type uiEnrolCard struct {
 	Key             string
 	Engine          string
@@ -38,6 +40,19 @@ type uiEnrolCard struct {
 	FragmentURL string
 	PageURL     string
 	Busy        bool
+	// ElementID is this card's DOM id, unique per enrolment key: the setup
+	// wizard renders every card at once, so a fixed id would make each SSE
+	// patch land on whichever card happened to be first. Hex-encoding the
+	// key keeps it collision-free (keys may contain "/" and other characters
+	// an id cannot carry) and stable across renders, which is what lets a
+	// patch find its own card.
+	ElementID string
+	// ActionBase prefixes this card's form actions, selecting where the
+	// shared enrolment actions return to: the enrolment's own page under
+	// /ui/enrol, or the wizard under /setup. Always one of two fixed,
+	// server-chosen strings — never request-derived, so it cannot become a
+	// redirect the caller controls.
+	ActionBase string
 }
 
 var (
@@ -47,7 +62,7 @@ var (
 	uiExchangeRe   = regexp.MustCompile(`(?i)exchang|minting`)
 )
 
-// uiEngineDescription mirrors the SPA's engineDescription lookup.
+// uiEngineDescription is the one-line summary shown beside an engine.
 func uiEngineDescription(engine string) string {
 	switch engine {
 	case "github":
@@ -67,16 +82,80 @@ func uiEngineDescription(engine string) string {
 	}
 }
 
+// Sentinels for deliverEnrolPrompt; their text is the user-facing message.
+var (
+	errNoPendingPrompt = errors.New("no pending prompt")
+	errPromptAnswered  = errors.New("prompt already answered")
+)
+
+// deliverEnrolPrompt hands a submitted secret value to the engine blocked in
+// EnrolPromptSecret. It owns the lock/select/clear protocol over
+// enrolPromptCh so the form endpoints on both surfaces (the enrolment page
+// and the wizard) cannot drift apart.
+func (s *Server) deliverEnrolPrompt(value string) error {
+	s.enrolPromptMu.Lock()
+	defer s.enrolPromptMu.Unlock()
+	ch := s.enrolPromptCh
+	if ch == nil {
+		return errNoPendingPrompt
+	}
+	select {
+	case ch <- value:
+		s.enrolPromptCh = nil
+		s.enrolPromptLabel = ""
+		return nil
+	default:
+		return errPromptAnswered
+	}
+}
+
+// enrolActionBase is the form-action prefix for enrolment actions driven
+// from the main site (the wizard passes setupActionBase instead).
+const enrolActionBase = "/ui/enrol"
+
+// enrolActionTarget is where an enrolment action returns the browser: the
+// wizard's own page when the action came from there, else the enrolment's
+// detail page. Chosen from the fixed base, never from request input.
+func enrolActionTarget(base string, st EnrolStateInfo) string {
+	if base == setupActionBase {
+		return "/setup/"
+	}
+	return uiEnrolPageURL(st.Engine, st.Key)
+}
+
+// enrolFragmentURL is the poll URL for one card, carrying the action base so
+// the patched card keeps posting where the original did.
+func enrolFragmentURL(key, base string) string {
+	q := url.Values{"key": {key}}
+	if base == setupActionBase {
+		q.Set("base", "setup")
+	}
+	return "/ui/fragments/enrol-card?" + q.Encode()
+}
+
+// enrolBaseFromRequest maps the fragment poll's base parameter back onto one
+// of the two fixed action bases.
+func enrolBaseFromRequest(r *http.Request) string {
+	if r.URL.Query().Get("base") == "setup" {
+		return setupActionBase
+	}
+	return enrolActionBase
+}
+
 // uiEnrolPageURL is the canonical detail-page URL for an enrolment.
 func uiEnrolPageURL(engine, key string) string {
 	return "/ui/enrolments/" + url.PathEscape(engine) + "/" + uiEscapePath(key) + "/"
 }
 
 // buildUIEnrolCard assembles the card view from an enrolment's live state.
-func (s *Server) buildUIEnrolCard(st EnrolStateInfo, anyRunning bool) uiEnrolCard {
+// base selects where this card's actions post and return to (see ActionBase);
+// it also rides the fragment URL, so a running card polled from the wizard
+// re-renders as a wizard card rather than silently reverting to the main
+// site's actions on the first patch.
+func (s *Server) buildUIEnrolCard(st EnrolStateInfo, anyRunning bool, base string) uiEnrolCard {
 	title := st.EngineName
 	if i := strings.IndexByte(st.Key, '/'); i >= 0 {
-		// Grouped keys title on the leaf, matching the SPA's grouped cards.
+		// Grouped keys title on the leaf ("databricks/prod" shows "prod").
 		title = st.Key[i+1:]
 	}
 	card := uiEnrolCard{
@@ -89,8 +168,10 @@ func (s *Server) buildUIEnrolCard(st EnrolStateInfo, anyRunning bool) uiEnrolCar
 		Error:       st.Error,
 		HelpText:    template.HTML(st.HelpTextHTML),
 		Output:      st.Output,
-		FragmentURL: "/ui/fragments/enrol-card?" + url.Values{"key": {st.Key}}.Encode(),
+		FragmentURL: enrolFragmentURL(st.Key, base),
 		PageURL:     uiEnrolPageURL(st.Engine, st.Key),
+		ElementID:   "ui-enrol-" + hex.EncodeToString([]byte(st.Key)),
+		ActionBase:  base,
 		Busy:        anyRunning && st.Status != "running",
 	}
 	for _, line := range st.Output {
@@ -168,7 +249,7 @@ func (s *Server) handleUIEnrolDetail(w http.ResponseWriter, r *http.Request) {
 		s.uiRenderPage(w, "enrolments", data)
 		return
 	}
-	card := s.buildUIEnrolCard(st, anyRunning)
+	card := s.buildUIEnrolCard(st, anyRunning, enrolActionBase)
 	if msg := r.URL.Query().Get("err"); msg != "" {
 		card.Error = msg
 	}
@@ -196,13 +277,13 @@ func (s *Server) handleUIEnrolCardFragment(w http.ResponseWriter, r *http.Reques
 		writeError(w, "enrolment not found", http.StatusNotFound)
 		return
 	}
-	uiPatchFragment(w, r, "enrol-card", s.buildUIEnrolCard(st, anyRunning))
+	uiPatchFragment(w, r, "enrol-card", s.buildUIEnrolCard(st, anyRunning, enrolBaseFromRequest(r)))
 }
 
 // uiEnrolAction wraps the shared form-POST plumbing of the start/skip/reset
 // handlers: gate, look up, act, redirect back to the detail page (with the
 // error carried in the query when the action was refused).
-func (s *Server) uiEnrolAction(w http.ResponseWriter, r *http.Request, act func(runner *EnrolmentRunner, key string) error) {
+func (s *Server) uiEnrolAction(w http.ResponseWriter, r *http.Request, base string, act func(runner *EnrolmentRunner, key string) error) {
 	if !s.requireUIWrite(w, r) {
 		return
 	}
@@ -217,7 +298,7 @@ func (s *Server) uiEnrolAction(w http.ResponseWriter, r *http.Request, act func(
 		writeError(w, "enrolment not found", http.StatusNotFound)
 		return
 	}
-	target := uiEnrolPageURL(st.Engine, st.Key)
+	target := enrolActionTarget(base, st)
 	if err := act(runner, key); err != nil {
 		target += "?err=" + url.QueryEscape(err.Error())
 	}
@@ -225,7 +306,15 @@ func (s *Server) uiEnrolAction(w http.ResponseWriter, r *http.Request, act func(
 }
 
 func (s *Server) handleUIEnrolStart(w http.ResponseWriter, r *http.Request) {
-	s.uiEnrolAction(w, r, func(runner *EnrolmentRunner, key string) error {
+	s.enrolStart(w, r, enrolActionBase)
+}
+
+func (s *Server) handleSetupEnrolStart(w http.ResponseWriter, r *http.Request) {
+	s.enrolStart(w, r, setupActionBase)
+}
+
+func (s *Server) enrolStart(w http.ResponseWriter, r *http.Request, base string) {
+	s.uiEnrolAction(w, r, base, func(runner *EnrolmentRunner, key string) error {
 		err := runner.Start(
 			s.shutdownCtx, key, s.vault,
 			s.kvMount, s.userKVPrefix(), s.username,
@@ -239,29 +328,55 @@ func (s *Server) handleUIEnrolStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUIEnrolSkip(w http.ResponseWriter, r *http.Request) {
-	s.uiEnrolAction(w, r, func(runner *EnrolmentRunner, key string) error {
+	s.enrolSkip(w, r, enrolActionBase)
+}
+
+func (s *Server) handleSetupEnrolSkip(w http.ResponseWriter, r *http.Request) {
+	s.enrolSkip(w, r, setupActionBase)
+}
+
+func (s *Server) enrolSkip(w http.ResponseWriter, r *http.Request, base string) {
+	s.uiEnrolAction(w, r, base, func(runner *EnrolmentRunner, key string) error {
 		return runner.Skip(key)
 	})
 }
 
 func (s *Server) handleUIEnrolReset(w http.ResponseWriter, r *http.Request) {
-	s.uiEnrolAction(w, r, func(runner *EnrolmentRunner, key string) error {
+	s.enrolReset(w, r, enrolActionBase)
+}
+
+func (s *Server) handleSetupEnrolReset(w http.ResponseWriter, r *http.Request) {
+	s.enrolReset(w, r, setupActionBase)
+}
+
+func (s *Server) enrolReset(w http.ResponseWriter, r *http.Request, base string) {
+	s.uiEnrolAction(w, r, base, func(runner *EnrolmentRunner, key string) error {
 		return runner.Reset(key)
 	})
 }
 
-// handleUIEnrolSecret is the form-POST counterpart of the SPA's
-// /api/v1/enrol/secret: it hands the submitted passphrase to the engine
+// handleUIEnrolSecret takes the passphrase an engine is blocked on: it hands the submitted passphrase to the engine
 // blocked in EnrolPromptSecret, then returns to the detail page.
 func (s *Server) handleUIEnrolSecret(w http.ResponseWriter, r *http.Request) {
+	s.enrolSecret(w, r, enrolActionBase)
+}
+
+func (s *Server) handleSetupEnrolSecret(w http.ResponseWriter, r *http.Request) {
+	s.enrolSecret(w, r, setupActionBase)
+}
+
+func (s *Server) enrolSecret(w http.ResponseWriter, r *http.Request, base string) {
 	if !s.requireUIWrite(w, r) {
 		return
 	}
 	key := uiFormValue(r, "key")
 	value := r.PostFormValue("value")
 	target := "/ui/enrolments/"
+	if base == setupActionBase {
+		target = "/setup/"
+	}
 	if st, _, err := s.uiEnrolState(key); err == nil {
-		target = uiEnrolPageURL(st.Engine, st.Key)
+		target = enrolActionTarget(base, st)
 	}
 
 	if err := s.deliverEnrolPrompt(value); err != nil {

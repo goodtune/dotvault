@@ -1,20 +1,23 @@
-// Server-rendered web UI under /ui/ — the parallel, bookmarkable surface
-// alongside the SPA at /. Every page is rendered from Go html/template with
-// real URLs; interactivity (live "last updated", secret reveal/copy, the
-// enrolment progress poll) comes from datastar (https://data-star.dev)
-// patching server-rendered fragments over SSE. The SPA remains untouched;
-// the two surfaces share the same Server state, validation, and services.
+// The main site, served under /ui/ with real, bookmarkable URLs. Every page
+// is rendered from Go html/template; interactivity (live "last updated",
+// secret reveal/copy, the enrolment progress poll, managed-forward state)
+// comes from datastar (https://data-star.dev) patching server-rendered
+// fragments over SSE.
+//
+// The chrome-less surfaces that sit in front of it — the login view and the
+// first-run enrolment wizard — live in ui_login.go and ui_setup.go and share
+// this file's template machinery through the "standalone" shell.
 //
 // Request posture:
 //   - Page GETs require the daemon to be authenticated; an unauthenticated
-//     browser is redirected to the SPA at /, which owns the login flows.
+//     browser is redirected to the login view at /.
 //   - Fragment GETs return 401 JSON when unauthenticated (a datastar patch
 //     request has no use for a redirect).
 //   - Mutating POSTs require a same-origin Origin header (requireUIWrite).
 //     Browsers attach Origin to every POST — fetch and form submits alike —
 //     so requiring it and matching it against the daemon's own origin is a
 //     robust CSRF control for a browser-only surface, equivalent in effect
-//     to the SPA's issue-then-spend CSRF token but compatible with
+//     to an issue-then-spend CSRF token but compatible with
 //     server-rendered forms and multiple tabs. (The peer-action endpoints
 //     accept an *absent* Origin because curl is their consumer; these
 //     endpoints have no non-browser consumer, so absence is rejected.)
@@ -91,6 +94,7 @@ var uiFuncs = template.FuncMap{
 // plus one page file contributing its "content" block.
 var uiSharedTmpl = []string{
 	"uitmpl/layout.tmpl",
+	"uitmpl/standalone.tmpl",
 	"uitmpl/nav.tmpl",
 	"uitmpl/fragments.tmpl",
 	"uitmpl/enrol_card.tmpl",
@@ -102,8 +106,8 @@ var uiSharedTmpl = []string{
 // registerSSRUIRoutes — deliberately NOT at package init with template.Must,
 // which would panic every binary importing internal/web (the CLI included)
 // for a defect in a surface that only exists on a web-enabled daemon.
-// A parse failure disables the /ui/ routes and is logged, mirroring how
-// registerUIRoutes already treats an fs.Sub failure for the SPA.
+// A parse failure disables the browser surface and is logged rather than
+// taking the daemon down with it.
 var (
 	uiPages     map[string]*template.Template
 	uiFragments *template.Template
@@ -121,6 +125,9 @@ func uiInitTemplates() error {
 		names := []string{
 			"dashboard", "secret", "folder", "enrolments",
 			"enrol_detail", "remotes", "remote_detail", "config",
+			// Chrome-less pages: they render through "standalone" rather
+			// than "layout" (see uiRenderStandalone).
+			"login", "login_ldap", "setup",
 		}
 		pages := make(map[string]*template.Template, len(names))
 		for _, name := range names {
@@ -180,6 +187,9 @@ type uiPageData struct {
 	Error          string
 	Sections       []uiNavSection
 	SecretViewText template.HTML
+	// OAuthRules lists the sync rules whose OAuth authorisation the user
+	// still has to grant; the layout renders one banner each.
+	OAuthRules []uiOAuthRule
 	// SSHStream, when non-empty, is the /ui/sse/ssh subscription URL the
 	// layout opens for this page, so managed-forward state (nav dots, the
 	// remotes table, a remote's detail state line) live-updates — including
@@ -188,9 +198,34 @@ type uiPageData struct {
 	SSHStream string
 }
 
-// registerSSRUIRoutes wires the server-rendered /ui/ surface. Called from
-// registerUIRoutes, so — like the SPA — it exists only when the loopback TCP
-// listener does.
+// uiOAuthRule is one dashboard OAuth banner: a rule that declares an OAuth
+// provider, linked to the authorisation flow that grants it.
+type uiOAuthRule struct {
+	Label    string
+	StartURL string
+}
+
+// uiOAuthRules builds the banner rows from the configured rules.
+func (s *Server) uiOAuthRules() []uiOAuthRule {
+	var out []uiOAuthRule
+	for _, rule := range s.getRules() {
+		if rule.OAuth == nil {
+			continue
+		}
+		label := rule.OAuth.Provider
+		if label == "" {
+			label = rule.Name
+		}
+		out = append(out, uiOAuthRule{
+			Label:    label,
+			StartURL: "/api/v1/oauth/" + url.PathEscape(rule.Name) + "/start",
+		})
+	}
+	return out
+}
+
+// registerSSRUIRoutes wires the main site under /ui/. Called from
+// registerUIRoutes, so it exists only when the loopback TCP listener does.
 func (s *Server) registerSSRUIRoutes() {
 	if err := uiInitTemplates(); err != nil {
 		slog.Error("failed to parse ui templates; /ui/ routes disabled", "error", err)
@@ -249,9 +284,8 @@ func (s *Server) uiAuthenticated() bool {
 }
 
 // requireUIPage gates a page GET: an unauthenticated browser is sent to the
-// SPA root, which owns every login flow (OIDC redirects, LDAP MFA, token
-// entry, the mtls bootstrap). Reimplementing those here would duplicate the
-// hardest part of the SPA for no gain.
+// root, which owns every login flow (OIDC redirects, LDAP MFA, token entry,
+// the mtls bootstrap) — see ui_login.go.
 func (s *Server) requireUIPage(w http.ResponseWriter, r *http.Request) bool {
 	if !s.uiAuthenticated() {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -285,16 +319,29 @@ func (s *Server) requireUIWrite(w http.ResponseWriter, r *http.Request) bool {
 	return s.requireUIRead(w)
 }
 
-// uiRenderPage executes a page template set. Render errors after the first
-// byte cannot become a clean 500, so the page is rendered to a buffer first.
+// uiRenderPage executes a page inside the main site's chrome (header, nav).
 func (s *Server) uiRenderPage(w http.ResponseWriter, page string, data any) {
+	s.uiRender(w, page, "layout", data)
+}
+
+// uiRenderStandalone executes a page inside the chrome-less shell used by the
+// login view and the first-run wizard — the surfaces that exist before there
+// is a dashboard to frame them.
+func (s *Server) uiRenderStandalone(w http.ResponseWriter, page string, data any) {
+	s.uiRender(w, page, "standalone", data)
+}
+
+// uiRender executes a page template set through the named shell. Render
+// errors after the first byte cannot become a clean 500, so the page is
+// rendered to a buffer first.
+func (s *Server) uiRender(w http.ResponseWriter, page, shell string, data any) {
 	tmpl, ok := uiPages[page]
 	if !ok {
 		writeError(w, "unknown page", http.StatusInternalServerError)
 		return
 	}
 	var b strings.Builder
-	if err := tmpl.ExecuteTemplate(&b, "layout", data); err != nil {
+	if err := tmpl.ExecuteTemplate(&b, shell, data); err != nil {
 		slog.Error("render ui page failed", "page", page, "error", err)
 		writeError(w, "failed to render page", http.StatusInternalServerError)
 		return
@@ -346,11 +393,12 @@ func (s *Server) uiBase(ctx context.Context, title, active, selected string) uiP
 		VaultURL:       uiSafeVaultURL(s.vaultAddress),
 		Updated:        time.Now().Format("15:04:05"),
 		Sections:       s.buildUINav(ctx, active, selected),
+		OAuthRules:     s.uiOAuthRules(),
 		SecretViewText: template.HTML(s.secretViewTextHTML),
 	}
 }
 
-// uiSafeVaultURL mirrors the SPA's check before linking to the Vault UI: only
+// uiSafeVaultURL checks before linking to the Vault UI: only
 // http(s) addresses become anchors.
 func uiSafeVaultURL(addr string) string {
 	lower := strings.ToLower(addr)
@@ -370,7 +418,7 @@ func uiEscapePath(p string) string {
 	return strings.Join(segs, "/")
 }
 
-// uiVaultSecretURL is the Go port of the SPA's buildVaultSecretURL: a deep
+// uiVaultSecretURL builds a deep
 // link into the Vault UI for this user's secret (or folder listing, when
 // secretPath ends with a slash).
 func (s *Server) uiVaultSecretURL(secretPath string) string {
@@ -615,8 +663,7 @@ func uiRemotesNavItems(rows []uiRemoteRow, selected string) []uiNavItem {
 }
 
 // handleUIDashboard renders /ui/ — the index page. The content column shows
-// the configured secret_view_text markdown, exactly as the SPA's empty
-// dashboard state does.
+// the configured secret_view_text markdown.
 func (s *Server) handleUIDashboard(w http.ResponseWriter, r *http.Request) {
 	if !s.requireUIPage(w, r) {
 		return
@@ -686,8 +733,7 @@ func (s *Server) handleUISyncBtnFragment(w http.ResponseWriter, r *http.Request)
 }
 
 // handleUIActionCopyToken places the daemon's Vault token on this machine's
-// clipboard server-side — the SSR analogue of the SPA's copy-token button,
-// minus the trip through browser JS. Loopback-only means the daemon host and
+// clipboard server-side, with no trip through browser JS. Loopback-only means the daemon host and
 // the browser host are the same machine.
 func (s *Server) handleUIActionCopyToken(w http.ResponseWriter, r *http.Request) {
 	if !s.requireUIWrite(w, r) {
@@ -746,8 +792,7 @@ type uiSettingRow struct {
 	Code  bool
 }
 
-// uiSettingRows formats redacted enrolment settings the way the SPA's config
-// page does: scalar values in code style, flat lists joined, structured
+// uiSettingRows formats redacted enrolment settings for the config page: scalar values in code style, flat lists joined, structured
 // values as pretty JSON.
 func uiSettingRows(settings map[string]any) []uiSettingRow {
 	keys := make([]string, 0, len(settings))
@@ -824,7 +869,7 @@ func uiFormValue(r *http.Request, name string) string {
 	return strings.TrimSpace(r.PostFormValue(name))
 }
 
-// uiParsePort validates a port form field exactly as the SPA does: empty
+// uiParsePort validates a port form field: empty
 // means "use the default" (returned as 0), otherwise a whole number between
 // 1 and 65535 with no trailing garbage.
 func uiParsePort(raw string) (int, bool) {

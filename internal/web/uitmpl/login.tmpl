@@ -1,0 +1,28 @@
+{{define "content"}}
+<div class="login-container">
+  <div class="login-card">
+    <h1 class="login-title">.vault</h1>
+    {{if .CustomText}}<div class="custom-text">{{.CustomText}}</div>{{end}}
+    {{if .Error}}<p class="login-error">{{.Error}}</p>{{end}}
+    {{if eq .Method "oidc"}}
+      <a class="login-btn" href="/auth/oidc/start">Login with OIDC</a>
+    {{else if eq .Method "ldap"}}
+      <form method="post" action="/login/ldap">
+        <input type="text" name="username" class="login-input" placeholder="Username" aria-label="Username" autocomplete="username" autofocus required>
+        <input type="password" name="password" class="login-input" placeholder="Password" aria-label="Password" autocomplete="current-password" required>
+        <button type="submit" class="login-btn">Login</button>
+      </form>
+    {{else if eq .Method "token"}}
+      <form method="post" action="/login/token">
+        <input type="password" name="token" class="login-input" placeholder="Vault Token" aria-label="Vault Token" autofocus required>
+        <button type="submit" class="login-btn">Login</button>
+      </form>
+    {{else if eq .Method "mtls"}}
+      <p class="login-mfa-wait">{{if .Issuing}}Issuing your certificate&#8230;{{else}}Signing in with your client certificate&#8230;{{end}}</p>
+      <p class="login-mfa-hint">{{if .Issuing}}Signed in. dotvault is now enrolling this host&#8217;s certificate &mdash; this only happens once. You will not need to sign in again.{{else}}Certificate authentication needs no credential &mdash; dotvault signs in with this host&#8217;s certificate, and renews automatically when its Vault token expires. If this page does not update within a minute or so, check the daemon logs: the certificate may need re-enrolling.{{end}}</p>
+    {{else}}
+      <p class="login-error">Unknown auth method: {{.Method}}</p>
+    {{end}}
+  </div>
+</div>
+{{end}}

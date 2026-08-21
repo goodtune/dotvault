@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -50,8 +49,8 @@ type Server struct {
 	// endpoint round-trips it (like agentCfg and remoteCfg).
 	apiCfg config.APIConfig
 	// webEnabled records whether the loopback TCP listener (and with it the
-	// browser-facing surface: the SPA, the auth routes, the OAuth callbacks)
-	// is in play. It is NOT the same question as "was this Server
+	// browser-facing surface: the login view, the server-rendered site, the
+	// OAuth callbacks) is in play. It is NOT the same question as "was this Server
 	// constructed" — a Server exists whenever either surface is enabled, and
 	// with web.enabled false it serves the API over the Unix socket alone.
 	webEnabled bool
@@ -93,21 +92,21 @@ type Server struct {
 	userPrefix string
 	username   string
 	// authMethod is the base login method ("oidc"/"ldap"/"token"/"mtls"),
-	// with any "+tpm" suffix already stripped. The web SPA dispatches its
-	// login form on this exact value, so the wire format must carry a single
-	// meaning — see NewServer. The orthogonal "should the token be sealed?"
+	// with any "+tpm" suffix already stripped. The login view dispatches on
+	// this exact value, so it must carry a single meaning — see NewServer. The orthogonal "should the token be sealed?"
 	// decision lives in sealToken.
 	authMethod string
 	// sealToken records whether the configured auth method requested TPM
 	// token-sealing (the "+tpm" suffix), preserved here because authMethod has
-	// the suffix stripped for the SPA.
+	// the suffix stripped for the login dispatch.
 	sealToken bool
 	authMount string
 	authRole  string
-	// bootstrapMethod is the login method the SPA should present for the
+	// bootstrapMethod is the login method the login view presents for the
 	// one-time mTLS certificate bootstrap ("ldap"/"oidc", from
 	// vault.mtls.bootstrap_method). It is reported on /api/v1/status
-	// alongside authMethod; see bootstrap.go.
+	// alongside authMethod, and selects the card the login view renders;
+	// see bootstrap.go.
 	//
 	// It carries a SECOND, load-bearing meaning: non-empty exactly when the
 	// daemon is under certificate auth, so operationalAdoptionAllowed uses it
@@ -385,8 +384,8 @@ func NewServer(sc ServerConfig) (*Server, error) {
 // every one of them is meaningless or actively broken without it. The auth
 // and OAuth handlers build redirect URIs from the bound listen address, so on
 // a socket-only daemon they would hand the identity provider a URI pointing
-// nowhere; the SPA and the enrolment routes it drives need a browser that
-// cannot reach a Unix socket in the first place. Registering them anyway
+// nowhere; the pages themselves need a browser, which cannot reach a Unix
+// socket in the first place. Registering them anyway
 // would mean publishing a login surface whose only possible outcome is a
 // confusing failure.
 func (s *Server) registerRoutes() {
@@ -396,58 +395,57 @@ func (s *Server) registerRoutes() {
 	}
 }
 
-// registerUIRoutes wires the browser-facing surface: interactive login, the
-// OAuth callbacks, the enrolment routes the SPA drives, and the SPA itself.
-// Requires the TCP listener — see registerRoutes.
+// registerUIRoutes wires the browser-facing surface: the login view, the
+// first-run enrolment wizard, the OAuth callbacks, and the server-rendered
+// site itself. Requires the TCP listener — see registerRoutes.
 func (s *Server) registerUIRoutes() {
-	// Auth routes — OIDC
+	// Entry point. Renders the login card when the daemon holds no token,
+	// and otherwise routes onward to the wizard or the site (see ui_login.go).
+	s.mux.HandleFunc("GET /{$}", s.handleRoot)
+
+	// Login flows. OIDC keeps its historical paths deliberately: the
+	// callback URI is registered in Vault's allowed_redirect_uris and in the
+	// identity provider, so it is a compatibility surface, not an internal
+	// detail we are free to rename.
 	s.mux.HandleFunc("GET /auth/oidc/start", s.handleAuthStart)
 	s.mux.HandleFunc("GET /auth/oidc/callback", s.handleAuthCallback)
+	s.mux.HandleFunc("POST /login/ldap", s.handleLoginLDAP)
+	s.mux.HandleFunc("GET /login/ldap", s.handleLoginLDAPProgress)
+	s.mux.HandleFunc("POST /login/ldap/totp", s.handleLoginLDAPTOTP)
+	s.mux.HandleFunc("POST /login/token", s.handleLoginToken)
 
-	// Auth routes — LDAP
-	s.mux.HandleFunc("POST /auth/ldap/login", s.requireCSRF(s.handleLDAPLogin))
-	s.mux.HandleFunc("GET /auth/ldap/status", s.handleLDAPStatus)
-	s.mux.HandleFunc("POST /auth/ldap/totp", s.requireCSRF(s.handleLDAPTOTP))
+	// First-run enrolment wizard (see ui_setup.go). Its cards drive the same
+	// runner the main site's enrolment pages do; only the return target
+	// differs.
+	s.mux.HandleFunc("GET /setup", s.handleSetup)
+	s.mux.HandleFunc("GET /setup/{$}", s.handleSetup)
+	s.mux.HandleFunc("POST /setup/complete", s.handleSetupComplete)
+	s.mux.HandleFunc("POST /setup/start", s.handleSetupEnrolStart)
+	s.mux.HandleFunc("POST /setup/skip", s.handleSetupEnrolSkip)
+	s.mux.HandleFunc("POST /setup/reset", s.handleSetupEnrolReset)
+	s.mux.HandleFunc("POST /setup/secret", s.handleSetupEnrolSecret)
 
-	// Auth routes — Token
-	s.mux.HandleFunc("POST /auth/token/login", s.requireCSRF(s.handleTokenLogin))
-
+	// Per-rule OAuth authorisation, linked from the dashboard's banner.
 	s.mux.HandleFunc("GET /api/v1/oauth/{rule}/start", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /api/v1/oauth/callback", s.handleOAuthCallback)
 
-	// Enrolment prompt routes
-	s.mux.HandleFunc("GET /api/v1/enrol/prompt", s.handleEnrolPrompt)
-	s.mux.HandleFunc("POST /api/v1/enrol/secret", s.requireCSRF(s.handleEnrolSecret))
+	// Browsers request /favicon.ico unprompted, so serve it from the root
+	// even though every other asset lives under /ui/assets/.
+	s.mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
 
-	// Enrolment runner routes. Flat keys use the single-segment {key} form;
-	// one-level grouped keys ("databricks/prod") are served either by the
-	// {key} form percent-encoded ("databricks%2Fprod", which Go unescapes into
-	// PathValue without splitting) or by the parallel two-segment {group}/{name}
-	// form. The segment counts don't collide, so both shapes resolve
-	// unambiguously — see enrolKeyFromRequest.
-	s.mux.HandleFunc("POST /api/v1/enrol/{key}/start", s.requireCSRF(s.handleEnrolStart))
-	s.mux.HandleFunc("POST /api/v1/enrol/{key}/skip", s.requireCSRF(s.handleEnrolSkip))
-	s.mux.HandleFunc("POST /api/v1/enrol/{key}/reset", s.requireCSRF(s.handleEnrolReset))
-	s.mux.HandleFunc("GET /api/v1/enrol/{key}/status", s.handleEnrolStatus)
-	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/start", s.requireCSRF(s.handleEnrolStart))
-	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/skip", s.requireCSRF(s.handleEnrolSkip))
-	s.mux.HandleFunc("POST /api/v1/enrol/{group}/{name}/reset", s.requireCSRF(s.handleEnrolReset))
-	s.mux.HandleFunc("GET /api/v1/enrol/{group}/{name}/status", s.handleEnrolStatus)
-	s.mux.HandleFunc("POST /api/v1/enrol/complete", s.requireCSRF(s.handleEnrolComplete))
-
-	// Server-rendered UI under /ui/ — the parallel, bookmarkable surface
-	// alongside the SPA (see ui.go). Registered here because, like the SPA,
-	// it is a browser surface that only makes sense on the TCP listener.
+	// The server-rendered site.
 	s.registerSSRUIRoutes()
+}
 
-	// Static SPA files
-	staticSub, err := fs.Sub(staticFS, "static")
+// handleFavicon serves the embedded icon.
+func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+	data, err := uiAssetsFS.ReadFile("uiassets/favicon.ico")
 	if err != nil {
-		slog.Error("failed to create sub-filesystem for static", "error", err)
+		http.NotFound(w, r)
 		return
 	}
-	fileServer := http.FileServer(http.FS(staticSub))
-	s.mux.Handle("/", fileServer)
+	w.Header().Set("Content-Type", "image/x-icon")
+	w.Write(data)
 }
 
 // registerAPIRoutes wires the surface served on every listener — TCP, the
@@ -777,7 +775,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// clickjack gestures like the host-key "Trust and add" or the
 		// copy-token button — the Origin CSRF check is blind to a framed
 		// page's own same-origin POSTs.
-		if strings.HasPrefix(r.URL.Path, "/ui/") {
+		if uiScriptedPath(r.URL.Path) {
 			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 		} else {
 			w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
@@ -833,7 +831,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		// localhost) or the hostname the daemon was configured to
 		// listen on via web.listen.
 		if !s.hostAllowed(r) {
-			// API consumers (the SPA fetch wrapper, scripts, tests)
+			// API consumers (scripts, the CLI, tests)
 			// rely on JSON error envelopes — fall back to plain text
 			// only for non-API routes (e.g. a browser hitting `/`
 			// directly). Mark the 403 no-store so the API invariant
@@ -850,6 +848,19 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, r)
 	})
+}
+
+// uiScriptedPath reports whether a path serves a page that loads datastar and
+// therefore needs the relaxed CSP: the main site under /ui/ and the first-run
+// wizard at /setup/, whose enrolment cards poll their own fragments.
+//
+// The login view is deliberately absent: it loads no script at all (its
+// waiting states advance with a meta refresh), so it keeps the strict policy.
+// Getting this wrong is silent in the markup and loud only at runtime — a
+// missed page renders fine and then refuses to evaluate any datastar
+// expression, which is how the wizard's card poll was found broken.
+func uiScriptedPath(p string) bool {
+	return strings.HasPrefix(p, "/ui/") || p == "/setup" || strings.HasPrefix(p, "/setup/")
 }
 
 // statusRecorder is the bare http.ResponseWriter wrapper that
@@ -1077,6 +1088,10 @@ func routeLabel(p string) string {
 		p == "/api/v1/remote/notify",
 		p == "/api/v1/remote/clipboard":
 		return p
+	case p == "/setup", strings.HasPrefix(p, "/setup/"):
+		return "/setup/*"
+	case strings.HasPrefix(p, "/login/"):
+		return "/login/*"
 	case strings.HasPrefix(p, "/ui/"):
 		// The whole server-rendered surface collapses to one label: its
 		// paths embed secret keys, enrolment keys, and hostnames, which
@@ -1209,10 +1224,9 @@ func (s *Server) InitialSyncComplete() bool {
 }
 
 // ForceReauth clears the in-memory Vault token so /api/v1/status reports
-// authenticated=false on the next poll. The SPA is configured to redirect
-// to the login screen whenever that flag flips, which effectively
-// invalidates any browser session that was sitting on a stale "logged-in"
-// view while the underlying token rotted. The token file on disk is
+// authenticated=false. Every page GET gates on that same in-memory token,
+// so a browser sitting on a stale "logged-in" view is sent back to the
+// login screen on its next request. The token file on disk is
 // intentionally left in place — operators may have written a fresh token
 // out-of-band that the daemon can pick up without involving the user.
 //

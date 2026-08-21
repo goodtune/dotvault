@@ -586,7 +586,7 @@ type AgentConfig struct {
 // Deliberately separate from web.enabled. The two surfaces have different
 // audiences and different exposure: the TCP listener is a browser UI
 // reachable by every uid on the box, while this socket is owner-only (0600 in
-// a 0700 directory) and carries no SPA. An operator who wants the borrow
+// a 0700 directory) and carries no browser UI. An operator who wants the borrow
 // endpoint on a headless host should not have to stand up a web UI to get it,
 // and enabling it does not widen what web.enabled already exposes.
 //

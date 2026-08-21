@@ -148,7 +148,7 @@ func (s *Server) buildConfigViewModel() configView {
 			// The effective-config view shows the raw configured method
 			// (including any "+tpm" suffix) so it matches the lossless
 			// config-download and honestly reflects token-sealing. Only the
-			// SPA login dispatch on /api/v1/status needs the base form.
+			// login dispatch on /api/v1/status needs the base form.
 			AuthMethod:          s.vaultCfg.AuthMethod,
 			AuthMount:           s.authMount,
 			AuthRole:            s.authRole,

@@ -302,7 +302,7 @@ func TestUIEnrolCard_ParsesDeviceFlow(t *testing.T) {
 			"- Press Enter to open https://github.com/login/device in your browser...",
 			"⠼ Waiting for authentication...",
 		},
-	}, true)
+	}, true, enrolActionBase)
 	if !card.HasDeviceFlow {
 		t.Fatalf("expected device flow, got %+v", card)
 	}
@@ -325,7 +325,7 @@ func TestUIEnrolCard_ParsesDeviceFlow(t *testing.T) {
 		Engine: "databricks",
 		Status: "running",
 		Output: []string{"Opening https://dbc.example.com/oidc/authorize?x=1 ..."},
-	}, false)
+	}, false, enrolActionBase)
 	if !card.HasRedirectFlow || card.HasDeviceFlow {
 		t.Errorf("expected redirect flow, got %+v", card)
 	}
@@ -591,7 +591,7 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 			"✓ Opened https://jfrog.example.com/ui/login in browser",
 			"⠼ Minting dotvault-owned access token...",
 		},
-	}, false)
+	}, false, enrolActionBase)
 	if !card.HasDeviceFlow || !card.CodeSpent {
 		t.Errorf("expected spent device flow, got %+v", card)
 	}
@@ -603,13 +603,13 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 	s.enrolPromptMu.Unlock()
 	card = s.buildUIEnrolCard(EnrolStateInfo{
 		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "running",
-	}, false)
+	}, false, enrolActionBase)
 	if !card.PromptPending || card.PromptLabel != "Enter passphrase" {
 		t.Errorf("expected pending prompt on running card, got %+v", card)
 	}
 	card = s.buildUIEnrolCard(EnrolStateInfo{
 		Key: "ssh", Engine: "ssh", EngineName: "SSH", Status: "pending",
-	}, false)
+	}, false, enrolActionBase)
 	if card.PromptPending {
 		t.Errorf("non-running card must not show the prompt")
 	}

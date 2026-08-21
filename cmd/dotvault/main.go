@@ -1055,7 +1055,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
-			// Lets the SPA render the right login form for the one-time
+			// Lets the login view render the right form for the one-time
 			// certificate bootstrap. Empty for every non-mtls method.
 			BootstrapMethod: bootstrapMethodForWeb(cfg),
 			BootstrapMount:  bootstrapMountForWeb(cfg),
@@ -1093,7 +1093,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// login) needs no human and works headlessly, so it takes
 			// precedence over the web/TTY branching. Only first-run bootstrap
 			// needs a human — and when the web UI is enabled that bootstrap
-			// runs through the SPA (see below) rather than requiring a
+			// runs through the web login view (see below) rather than requiring a
 			// browser dotvault can open or a TTY to prompt on.
 			mgr := &auth.Manager{
 				VaultClient:      vc,
@@ -1113,7 +1113,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// Without it a host with no browser dotvault can open and no TTY
 			// could not bootstrap at all even with the web UI up and serving.
 			//
-			// The hook hands back a RAW, un-downscoped token that the SPA
+			// The hook hands back a RAW, un-downscoped token that the login view
 			// login deliberately does not adopt: it carries pki/sign and is
 			// consumed immediately to mint the certificate. See
 			// web.Server.BootstrapLogin.
@@ -1125,7 +1125,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 					// present, straight to cert login) never pops a window.
 					//
 					// Launch is backgrounded so the wait below registers
-					// bootstrap mode immediately — the SPA polls
+					// bootstrap mode immediately — the login view polls
 					// /api/v1/status for it, and OpenURL can block while it
 					// spawns the browser process.
 					url := webServer.URL()
@@ -1457,10 +1457,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// mode; the refresh loop below treats it as optional.
 	var enrolMgr *enrol.Manager
 	if webServer != nil && cfg.Web.Enabled {
-		// Web mode: let the frontend drive enrolments. Gated on the browser
+		// Web mode: let the browser drive enrolments. Gated on the browser
 		// surface actually existing — a socket-only daemon registers no
 		// enrolment routes and no browser can reach a Unix socket, so waiting
-		// for the frontend to complete an enrolment would block until ctx.
+		// for the browser to complete an enrolment would block until ctx.
+		//
+		// WaitForEnrolments returns immediately unless the first-run wizard is
+		// actually warranted (nothing enrolled yet); an outstanding enrolment
+		// on a host that already has credentials is addressed from the main
+		// site and must not hold up the sync engine. See NeedsWizard.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
 
 		waitDone := make(chan struct{})
@@ -2867,12 +2872,12 @@ func notifyBootstrapURL(url string) {
 	}
 }
 
-// bootstrapMethodForWeb reports the login method the web SPA should present
+// bootstrapMethodForWeb reports the login method the web login view presents
 // for the one-time mTLS certificate bootstrap ("ldap" or "oidc"), or "" when
 // the configured auth method is not certificate auth and no bootstrap exists.
 //
 // validateMTLS defaults BootstrapMethod to "oidc" and rejects anything other
-// than ldap/oidc, so a non-empty result here is always one the SPA can render.
+// than ldap/oidc, so a non-empty result here is always one the login view can render.
 func bootstrapMethodForWeb(cfg *config.Config) string {
 	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return ""
@@ -2887,7 +2892,7 @@ func bootstrapMethodForWeb(cfg *config.Config) string {
 // This is deliberately NOT vault.auth_mount: the CLI bootstrap logs in against
 // the bootstrap mount (runBootstrap sets AuthMount from MTLS.BootstrapMount), so
 // a deployment whose bootstrap mount differs from its operational one would
-// otherwise have the CLI and the SPA hitting different Vault paths for the same
+// otherwise have the CLI and the browser hitting different Vault paths for the same
 // config. Empty is fine — Server.loginMount falls back to the method default.
 func bootstrapMountForWeb(cfg *config.Config) string {
 	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {

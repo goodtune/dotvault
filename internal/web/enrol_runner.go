@@ -54,7 +54,13 @@ type EnrolmentRunner struct {
 	states map[string]*enrolState
 	order  []string // sorted keys for stable ordering
 	done   chan struct{}
-	mu     sync.RWMutex
+	// dismissed latches once Complete has been called, so the first-run
+	// wizard stays dismissed for the rest of this runner's life — including
+	// the case where the user skipped every enrolment, which leaves nothing
+	// "complete" for NeedsWizard to notice. A config reload builds a new
+	// runner and so deliberately re-evaluates from scratch.
+	dismissed bool
+	mu        sync.RWMutex
 }
 
 // NewEnrolmentRunner creates a runner from the enrolments config.
@@ -265,18 +271,60 @@ func (r *EnrolmentRunner) HasPending() bool {
 	return false
 }
 
-// Complete signals that the user is done with enrolments.
+// NeedsWizard reports whether the first-run enrolment wizard is warranted:
+// at least one enrolment is actually runnable, none has been completed, and
+// the user has not already dismissed the wizard.
+//
+// "None completed" is the deliberate trigger. A user with credentials in
+// Vault has done first-run setup, so an outstanding enrolment they skipped
+// (or a newly added one) must not keep hijacking their entry to the site —
+// it waits for them on /ui/enrolments/ instead.
+func (r *EnrolmentRunner) NeedsWizard() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.dismissed {
+		return false
+	}
+	runnable := false
+	for _, key := range r.order {
+		s, ok := r.states[key]
+		if !ok {
+			continue
+		}
+		s.mu.Lock()
+		status := s.status
+		hasEngine := s.engine != nil
+		s.mu.Unlock()
+		if status == "complete" {
+			return false
+		}
+		if hasEngine {
+			runnable = true
+		}
+	}
+	return runnable
+}
+
+// Complete signals that the user is done with enrolments and dismisses the
+// wizard. Idempotent: the web entry point calls it whenever a user reaches
+// the main site, which is what keeps a daemon from waiting on a wizard
+// nobody is going to finish.
 func (r *EnrolmentRunner) Complete() {
+	r.mu.Lock()
+	r.dismissed = true
+	r.mu.Unlock()
 	select {
 	case r.done <- struct{}{}:
 	default:
 	}
 }
 
-// Wait blocks until Complete() is called. Returns immediately if there
-// are no pending enrolments.
+// Wait blocks until Complete() is called. Returns immediately unless the
+// first-run wizard is warranted — the daemon only defers its startup for a
+// wizard the user will actually be shown, never for an enrolment they can
+// address later from the main site.
 func (r *EnrolmentRunner) Wait() {
-	if !r.HasPending() {
+	if !r.NeedsWizard() {
 		return
 	}
 	<-r.done

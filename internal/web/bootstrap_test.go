@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,8 +67,8 @@ func TestBootstrapLogin_OIDCReturnsRawTokenWithoutAdopting(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.handleAuthCallback(w, req)
 
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", w.Code)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
 	}
 
 	select {
@@ -123,42 +124,7 @@ func ldapBootstrapServer(t *testing.T, token string) (*Server, string) {
 	s.authMount = "ldap"
 	s.vaultCfg = config.VaultConfig{Policies: []string{"dotvault"}}
 
-	body := strings.NewReader(`{"username":"u","password":"p"}`)
-	req := httptest.NewRequest("POST", "/auth/ldap/login", body)
-	w := httptest.NewRecorder()
-	s.handleLDAPLogin(w, req)
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("ldap login status = %d, want 202", w.Code)
-	}
-	var resp struct {
-		SessionID string `json:"session_id"`
-	}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode session: %v", err)
-	}
-	return s, resp.SessionID
-}
-
-// pollLDAPStatus polls handleLDAPStatus until the login reaches a terminal
-// state, mirroring what the SPA does, and returns the final recorder.
-func pollLDAPStatus(t *testing.T, s *Server, sessionID string) *httptest.ResponseRecorder {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		req := httptest.NewRequest("GET", "/auth/ldap/status?session="+sessionID, nil)
-		w := httptest.NewRecorder()
-		s.handleLDAPStatus(w, req)
-		var st struct {
-			State string `json:"state"`
-		}
-		json.Unmarshal(w.Body.Bytes(), &st)
-		if st.State == "authenticated" || st.State == "failed" {
-			return w
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("LDAP login never reached a terminal state")
-	return nil
+	return s, startLDAPLogin(t, s)
 }
 
 func TestBootstrapLogin_LDAPReturnsRawTokenWithoutAdopting(t *testing.T) {
@@ -175,9 +141,14 @@ func TestBootstrapLogin_LDAPReturnsRawTokenWithoutAdopting(t *testing.T) {
 	}()
 	waitBootstrapActive(t, s)
 
-	w := pollLDAPStatus(t, s, sessionID)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	w := pollLDAPProgress(t, s, sessionID)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
+	}
+	// The bootstrap credential step is done; the login view is told issuance
+	// is now in flight rather than being dropped back to a credential prompt.
+	if loc := w.Header().Get("Location"); loc != "/?issuing=1" {
+		t.Errorf("Location = %q, want /?issuing=1", loc)
 	}
 	// The token must not appear in the response body.
 	if strings.Contains(w.Body.String(), "ldap-bootstrap-token") {
@@ -209,10 +180,10 @@ func TestBootstrapLogin_LDAPReturnsRawTokenWithoutAdopting(t *testing.T) {
 	}
 }
 
-// TestHandleLDAPStatus_NonBootstrapStillAdopts guards the other half of the
-// contract: with no BootstrapLogin waiting, the handler behaves exactly as it
-// did before — downscope, adopt, persist, signal.
-func TestHandleLDAPStatus_NonBootstrapStillAdopts(t *testing.T) {
+// TestLDAPProgress_NonBootstrapStillAdopts guards the other half of the
+// contract: with no BootstrapLogin waiting, the login adopts as usual —
+// downscope, adopt, persist, signal.
+func TestLDAPProgress_NonBootstrapStillAdopts(t *testing.T) {
 	var createCalled bool
 	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -240,16 +211,7 @@ func TestHandleLDAPStatus_NonBootstrapStillAdopts(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "vault-token")
 	s.tokenFilePath = tokenFile
 
-	body := strings.NewReader(`{"username":"u","password":"p"}`)
-	req := httptest.NewRequest("POST", "/auth/ldap/login", body)
-	w := httptest.NewRecorder()
-	s.handleLDAPLogin(w, req)
-	var resp struct {
-		SessionID string `json:"session_id"`
-	}
-	json.NewDecoder(w.Body).Decode(&resp)
-
-	pollLDAPStatus(t, s, resp.SessionID)
+	pollLDAPProgress(t, s, startLDAPLogin(t, s))
 
 	if !createCalled {
 		t.Error("auth/token/create not called — non-bootstrap login must still downscope")
@@ -433,9 +395,10 @@ func TestLDAPStatus_LosingConcurrentPollCannotAdoptRawToken(t *testing.T) {
 		t.Fatal("precondition: bootstrap mode should not be active")
 	}
 
-	req := httptest.NewRequest("GET", "/auth/ldap/status?session="+sessionID, nil)
+	req := httptest.NewRequest("GET", "/login/ldap", nil)
+	req.AddCookie(&http.Cookie{Name: loginCookieName, Value: sessionID})
 	w := httptest.NewRecorder()
-	s.handleLDAPStatus(w, req)
+	s.handleLoginLDAPProgress(w, req)
 
 	if got := s.vault.Token(); got == rawToken {
 		t.Error("shared client holds the raw pki/sign bootstrap token; it is now reachable via GET /api/v1/token")
@@ -455,7 +418,7 @@ func TestLDAPStatus_LosingConcurrentPollCannotAdoptRawToken(t *testing.T) {
 //
 // operationalAdoptionAllowed's contract is that under certificate auth the
 // operational token comes from exactly one place — the cert login. Guarding
-// only the two bootstrap-adjacent sites left /auth/token/login able to install
+// only the two bootstrap-adjacent sites left the token login able to install
 // a credential the cert flow never sanctioned, contradicting that contract.
 // It is CSRF-protected and loopback-only and the SPA never renders the form
 // under mtls, so this closes the direct-POST path rather than a likely one.
@@ -471,10 +434,9 @@ func TestTokenLogin_RefusedUnderCertificateAuth(t *testing.T) {
 	s.authMethod = "mtls"
 	s.bootstrapMethod = "ldap" // certificate auth is configured
 
-	body := strings.NewReader(`{"token":"s.user-supplied-token"}`)
-	req := httptest.NewRequest("POST", "/auth/token/login", body)
+	req := postForm(t, "/login/token", url.Values{"token": {"s.user-supplied-token"}})
 	w := httptest.NewRecorder()
-	s.handleTokenLogin(w, req)
+	s.handleLoginToken(w, req)
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", w.Code)
@@ -500,13 +462,12 @@ func TestTokenLogin_AllowedWithoutCertificateAuth(t *testing.T) {
 	s.authMethod = "token"
 	s.bootstrapMethod = "" // not certificate auth
 
-	body := strings.NewReader(`{"token":"s.user-supplied-token"}`)
-	req := httptest.NewRequest("POST", "/auth/token/login", body)
+	req := postForm(t, "/login/token", url.Values{"token": {"s.user-supplied-token"}})
 	w := httptest.NewRecorder()
-	s.handleTokenLogin(w, req)
+	s.handleLoginToken(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 (body %s)", w.Code, w.Body.String())
 	}
 	if got := s.vault.Token(); got != "s.user-supplied-token" {
 		t.Errorf("shared client token = %q, want the adopted token", got)

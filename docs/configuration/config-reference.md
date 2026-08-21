@@ -297,7 +297,7 @@ The [peer actions](../cli.md#dotvault-browse) (`browse`, `notify`, `clipboard`) 
 
 The two surfaces are enabled independently because they have different audiences and different exposure. The TCP listener serves a browser UI and is reachable by **every user on the machine**; the Unix socket is created `0600` inside a `0700` directory and is reachable only by its owner. A headless host should not have to stand up a web UI to get the borrow endpoint, and turning the socket on does not widen anything `web.enabled` already exposes — if anything it is the tighter of the two.
 
-With `web.enabled: false`, the socket serves the API routes (`/api/v1/token`, `/api/v1/status`, `/healthz`, `/readyz`, the peer actions, …) but **not** the browser-facing routes. The SPA and the interactive login flows build redirect URIs from a bound TCP address that does not exist in that mode, so they are not registered at all rather than being published as a login flow that cannot complete.
+With `web.enabled: false`, the socket serves the API routes (`/api/v1/token`, `/api/v1/status`, `/healthz`, `/readyz`, the peer actions, …) but **not** the browser-facing routes. The browser pages and the interactive login flows build redirect URIs from a bound TCP address that does not exist in that mode, so they are not registered at all rather than being published as a login flow that cannot complete.
 
 ### systemd socket activation
 

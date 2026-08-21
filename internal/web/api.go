@@ -121,6 +121,7 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		VaultKey      string `json:"vault_key"`
 		TargetPath    string `json:"target_path"`
 		Format        string `json:"format"`
+		DeleteNulls   bool   `json:"delete_nulls,omitempty"`
 		HasOAuth      bool   `json:"has_oauth,omitempty"`
 		OAuthProvider string `json:"oauth_provider,omitempty"`
 	}
@@ -134,6 +135,7 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 			VaultKey:    r.VaultKey,
 			TargetPath:  r.Target.Path,
 			Format:      r.Target.Format,
+			DeleteNulls: r.Target.DeleteNulls,
 		}
 		if r.OAuth != nil {
 			rules[i].HasOAuth = true

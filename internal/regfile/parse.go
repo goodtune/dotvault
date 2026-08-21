@@ -931,6 +931,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			func() error { return apply(&rule.Target.Format, base, "TargetFormat") },
 			func() error { return apply(&rule.Target.Template, base, "TargetTemplate") },
 			func() error { return apply(&rule.Target.Merge, base, "TargetMerge") },
+			func() error { return applyBool(&rule.Target.DeleteNulls, base, "TargetDeleteNulls") },
 		} {
 			if err := fn(); err != nil {
 				return err

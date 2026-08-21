@@ -449,6 +449,7 @@ dotvault validates the configuration on startup and exits with an error if:
 - Rule names are not unique
 - A rule omits `vault_key` (a [keyless rule](sync-rules.md#rules-without-a-vault-key)) but also omits `target.template` — there is no secret data to write
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
+- A rule sets `target.delete_nulls: true` on a format other than `json` or `yaml` — the others have no null literal a template could render, and silently ignoring the flag would leave you believing a retired credential had been deleted (see [Removing a field](sync-rules.md#removing-a-field))
 - `web.listen` resolves to a non-loopback address (when web is enabled)
 - An enrolment entry has an empty `engine` field
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,4 +192,112 @@ func TestTextRoundTrip(t *testing.T) {
 	if string(got) != "replaced key content" {
 		t.Errorf("output = %q, want 'replaced key content'", string(got))
 	}
+}
+
+// TestHandlerWithOptionsDeleteNulls pins the factory's second gate: asking a
+// null-less format for null deletion is an error, not a silent no-op that
+// would hand the caller additive-only merges when it asked for deletions.
+func TestHandlerWithOptionsDeleteNulls(t *testing.T) {
+	for _, tt := range []struct {
+		format  string
+		wantErr bool
+	}{
+		{"json", false},
+		{"yaml", false},
+		{"ini", true},
+		{"toml", true},
+		{"text", true},
+		{"netrc", true},
+		{"ssh_config", true},
+	} {
+		t.Run(tt.format, func(t *testing.T) {
+			h, err := HandlerWithOptions(tt.format, Options{DeleteNulls: true})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for delete_nulls with format %q", tt.format)
+				}
+				if !strings.Contains(err.Error(), "delete_nulls") {
+					t.Errorf("error should name the offending option, got: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if h == nil {
+				t.Fatal("handler is nil")
+			}
+		})
+	}
+}
+
+// TestHandlerForLeavesDeleteNullsOff pins that the plain factory is still
+// the historical default for every format.
+func TestHandlerForLeavesDeleteNullsOff(t *testing.T) {
+	j, err := HandlerFor("json")
+	if err != nil {
+		t.Fatalf("HandlerFor(json): %v", err)
+	}
+	if j.(*JSONHandler).DeleteNulls {
+		t.Error("JSONHandler.DeleteNulls set by HandlerFor")
+	}
+	y, err := HandlerFor("yaml")
+	if err != nil {
+		t.Fatalf("HandlerFor(yaml): %v", err)
+	}
+	if y.(*YAMLHandler).DeleteNulls {
+		t.Error("YAMLHandler.DeleteNulls set by HandlerFor")
+	}
+}
+
+// TestDeleteNullsTreatsArraysAsOpaque pins that json and yaml agree: the
+// merge replaces arrays wholesale rather than merging into them, so there is
+// nothing inside one for a tombstone to remove and a null there is written as
+// a value. The two handlers diverged here at one point — the same logical rule
+// stripped the key under yaml and wrote a literal null under json.
+func TestDeleteNullsTreatsArraysAsOpaque(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		h := &JSONHandler{DeleteNulls: true}
+		existing, _ := h.Parse(`{}`)
+		incoming, _ := h.Parse(`{"servers": [{"host": "h", "port": null}]}`)
+		merged, err := h.Merge(existing, incoming)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		servers, ok := merged.(map[string]any)["servers"].([]any)
+		if !ok || len(servers) != 1 {
+			t.Fatalf("servers = %#v", merged.(map[string]any)["servers"])
+		}
+		elem := servers[0].(map[string]any)
+		if _, present := elem["port"]; !present {
+			t.Error("json stripped a null inside an array element; arrays are opaque values")
+		}
+	})
+
+	t.Run("yaml", func(t *testing.T) {
+		h := &YAMLHandler{DeleteNulls: true}
+		existing, _ := h.Parse("")
+		incoming, _ := h.Parse("servers:\n  - host: h\n    port: null\n")
+		merged, err := h.Merge(existing, incoming)
+		if err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		out := filepath.Join(t.TempDir(), "out.yaml")
+		if err := h.Write(out, merged, 0600); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		raw, _ := os.ReadFile(out)
+		var got struct {
+			Servers []map[string]any `yaml:"servers"`
+		}
+		if err := yaml.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("re-parse: %v\n%s", err, raw)
+		}
+		if len(got.Servers) != 1 {
+			t.Fatalf("servers = %#v\n%s", got.Servers, raw)
+		}
+		if _, present := got.Servers[0]["port"]; !present {
+			t.Errorf("yaml stripped a null inside a sequence element; arrays are opaque values:\n%s", raw)
+		}
+	})
 }

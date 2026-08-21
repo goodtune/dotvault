@@ -46,6 +46,7 @@
           <strong>{{.Name}}</strong>
           {{if .Target.Format}}<span class="config-tag">{{.Target.Format}}</span>{{end}}
           {{if .Target.HasTemplate}}<span class="config-tag config-tag-info">templated</span>{{end}}
+          {{if .Target.DeleteNulls}}<span class="config-tag config-tag-warn">deletes nulls</span>{{end}}
           {{if .OAuth}}<span class="config-tag config-tag-warn">oauth: {{.OAuth.Provider}}</span>{{end}}
         </div>
         {{if .Description}}<p class="config-card-desc">{{.Description}}</p>{{end}}
@@ -54,6 +55,7 @@
           <tr><th>Format</th><td>{{orDash .Target.Format}}</td></tr>
           <tr><th>Vault key</th><td><code>{{.VaultKey}}</code></td></tr>
           {{if .Target.Merge}}<tr><th>Merge</th><td>{{.Target.Merge}}</td></tr>{{end}}
+          {{if .Target.DeleteNulls}}<tr><th>Delete nulls</th><td>yes — a null in the template removes the key</td></tr>{{end}}
           {{if .OAuth}}{{if .OAuth.Scopes}}<tr><th>OAuth scopes</th><td>{{join .OAuth.Scopes ", "}}</td></tr>{{end}}{{if .OAuth.EnginePath}}<tr><th>OAuth engine</th><td>{{.OAuth.EnginePath}}</td></tr>{{end}}{{end}}
         </tbody></table>
       </div>

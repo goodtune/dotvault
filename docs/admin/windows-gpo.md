@@ -114,7 +114,13 @@ SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetPath       (REG_SZ)    "~/.co
 SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetFormat     (REG_SZ)    "yaml"
 SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetTemplate   (REG_SZ)    "github.com:\n  oauth_token: \"{{.oauth_token}}\""
 SOFTWARE\Policies\goodtune\dotvault\Rules\gh\Description      (REG_SZ)    "GitHub CLI credentials"
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetMerge      (REG_SZ)    ""
+SOFTWARE\Policies\goodtune\dotvault\Rules\gh\TargetDeleteNulls (REG_DWORD) 0x00000001
 ```
+
+`TargetDeleteNulls` is the one non-`REG_SZ` value in a rule subkey. It enables [field nullification](../configuration/sync-rules.md#removing-a-field): a `null` in the template removes that key from the target file instead of writing it. It is valid only for `json` and `yaml` rules — a `1` on any other format is rejected at startup like any other invalid policy. `reg-export` always emits the value, including `0x00000000`, so re-importing an export clears a flag a previous policy set.
+
+Write it as a genuine `REG_DWORD`. dotvault refuses to start on a `TargetDeleteNulls` of the wrong type rather than reading it as disabled — silently treating a mistyped policy as "off" would leave retired credentials on disk while the policy said they were being removed.
 
 Optional OAuth subkey for rules with service onboarding:
 

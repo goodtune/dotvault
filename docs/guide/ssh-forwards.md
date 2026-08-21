@@ -144,4 +144,4 @@ Each remote's live connection is one of: `connecting`, `connected`, `reconnectin
 
 ## Web UI
 
-A CRUD API under `/api/v1/ssh/remotes` backs an equivalent page in the web UI SPA. Unlike the peer-action endpoints (`browse`/`notify`/`clipboard`), these routes are ordinary CSRF-protected mutations — the Origin-check exemption those use exists specifically because a bare `curl` over a forwarded socket can't run the issue-then-spend CSRF handshake, and both consumers of the SSH routes (the SPA and `dotvault ssh`) can.
+A CRUD API under `/api/v1/ssh/remotes` backs the equivalent pages in the web UI. Unlike the peer-action endpoints (`browse`/`notify`/`clipboard`), these routes are ordinary CSRF-protected mutations — the Origin-check exemption those use exists specifically because a bare `curl` over a forwarded socket can't run the issue-then-spend CSRF handshake, and both consumers of the SSH routes (the web UI and `dotvault ssh`) can.

@@ -1,7 +1,7 @@
 // SSH managed-forward CRUD. Unlike the peer-action endpoints in browse.go /
 // notify.go / clipboard.go, these are CSRF-protected in the ordinary way. That
 // exemption exists because a bare curl over a forwarded socket cannot run the
-// issue-then-spend handshake; both consumers here — the SPA and `dotvault ssh`
+// issue-then-spend handshake; both consumers here — the browser and `dotvault ssh`
 // — can, so there is no reason to weaken the control.
 //
 // Every mutation goes through sshfwd.Registry rather than touching ssh.yaml,

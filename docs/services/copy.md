@@ -8,7 +8,7 @@ Unlike the OAuth and key-generation engines, the copy engine is fully automated:
 - The web enrolment runner, which does the same for the browser-driven flow
 - The daemon's `WatchManager`, whose `Start` is invoked before any enrolment UI and whose first action is an immediate `tickAll` that performs the mirror
 
-The practical consequence is that copy enrolments converge even in headless mode (no TTY, no web UI), where the interactive wizard is skipped entirely — `WatchManager` keeps running and will produce the same result on its first tick. After the initial population, polling and (on Vault Enterprise) `kv-v2/data-write` events keep the target in sync whenever the source changes.
+The practical consequence is that copy enrolments converge even in headless mode (no TTY, no web UI), where there is no wizard at all — `WatchManager` keeps running and will produce the same result on its first tick. After the initial population, polling and (on Vault Enterprise) `kv-v2/data-write` events keep the target in sync whenever the source changes.
 
 ## Configuration
 
@@ -149,3 +149,5 @@ A typical setup pairs the enrolment with a sync rule so the workflow is:
 5. On every subsequent poll (and on `data-write` events on Vault Enterprise), the WatchManager re-evaluates the copy and writes back only if the result has changed
 
 On subsequent daemon starts the enrolment check finds the template's fields already present and skips the interactive part of the wizard, but the WatchManager continues to mirror upstream changes for as long as the daemon is running.
+
+A copy enrolment plays no part in the web UI's [first-run wizard](../web-ui.md#first-run-enrolment-wizard) and is not shown there. It cannot raise the wizard — there would be nothing in it for you to do — and, importantly, its completing does not suppress it either: because a copy enrolment finishes on its own, often before you have seen anything, counting it as progress would have hidden the wizard from a brand-new user who still had real enrolments waiting. It appears under Enrolments on the main site like any other, where you can inspect it and re-run it on demand.

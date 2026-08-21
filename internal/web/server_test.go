@@ -610,7 +610,7 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 		t.Errorf("X-Content-Type-Options on 403 = %q, want nosniff", xcto)
 	}
 	// Forbidden Host on /api/ must use the JSON error envelope so the
-	// SPA fetch wrapper and tests get a structured response. Plain
+	// API clients and tests get a structured response. Plain
 	// http.Error would give text/plain and a generic StatusText body.
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type on /api/ 403 = %q, want application/json", ct)
@@ -630,13 +630,13 @@ func TestMiddlewareRejectsBadHost(t *testing.T) {
 	}
 }
 
-// TestForceReauth verifies the two behaviours that keep the SPA and
+// TestForceReauth verifies the two behaviours that keep the web UI and
 // WaitForAuth state consistent when the lifecycle manager declares the
 // cached Vault token unusable:
 //
 //  1. The in-memory Vault token is cleared, so a follow-up GET
-//     /api/v1/status reports authenticated=false and the SPA bounces
-//     to its login screen.
+//     /api/v1/status reports authenticated=false and the browser is
+//     sent back to the login view.
 //  2. Any signal previously queued on authDone is drained so a fresh
 //     WaitForAuth (e.g. from a re-entry into the startup auth flow)
 //     blocks until the user completes the *new* login rather than

@@ -115,7 +115,7 @@ func daemonClient(cfg *config.Config) (*http.Client, string, error) {
 // every mutating request (see internal/web/csrf.go): the SSH remote CRUD
 // endpoints are ordinary CSRF-protected mutations, not one of the
 // Origin-checked peer-action exemptions, because both consumers here (this
-// CLI and the SPA) can run the issue-then-spend handshake.
+// CLI and the browser) can run the issue-then-spend handshake.
 func sshCSRFToken(ctx context.Context, client *http.Client, base string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/csrf", nil)
 	if err != nil {

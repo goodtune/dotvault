@@ -31,7 +31,7 @@ When running without the web UI, dotvault authenticates directly:
 
 ### Web UI mode
 
-When the web UI is enabled (`web.enabled: true`), all authentication is handled through the browser-based SPA. If the daemon starts without a valid token, it opens the web UI in the user's browser where they can log in.
+When the web UI is enabled (`web.enabled: true`), all authentication is handled in the browser. If the daemon starts without a valid token, it opens the web UI, which presents the login form for the configured auth method (see the [Web UI](../web-ui.md#login-view) page).
 
 ## Token lifecycle
 

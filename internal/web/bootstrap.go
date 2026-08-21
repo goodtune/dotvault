@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Bootstrap mode lets the web SPA drive the one-time mTLS certificate
+// Bootstrap mode lets the web login view drive the one-time mTLS certificate
 // bootstrap using the same LDAP/OIDC login machinery the operational login
 // uses. The crucial difference is ownership of the resulting token: an
 // operational login adopts its token (downscope → s.vault → token file →
@@ -81,7 +81,7 @@ func (s *Server) deliverBootstrapToken(token string) bool {
 }
 
 // bootstrapActive reports whether a BootstrapLogin is currently waiting for a
-// token. Surfaced (without the token) on /api/v1/status so the SPA can show
+// token. Surfaced (without the token) on /api/v1/status so a client can show
 // the bootstrap login flow instead of the operational one.
 func (s *Server) bootstrapActive() bool {
 	s.bootstrapMu.Lock()
@@ -98,7 +98,7 @@ func (s *Server) bootstrapActive() bool {
 // its Manager with AuthMount: m.MTLS.BootstrapMount — so without this the same
 // configuration would send the CLI and the browser to different Vault paths,
 // and any deployment with a non-default bootstrap mount would work from the CLI
-// and fail in the SPA.
+// and fail in the browser.
 func (s *Server) loginMount(fallback string) string {
 	if s.bootstrapMethod != "" {
 		if s.bootstrapMount != "" {

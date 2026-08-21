@@ -492,7 +492,7 @@ func storeCertInNativeStore(store securestore.Storage, cred *sealedCredential) e
 // written to the on-disk cache either (WriteTokenFile treats "" as a no-op).
 //
 // When m.BootstrapLogin is set it replaces the CLI oidc/ldap dispatch entirely:
-// the daemon obtains the transient token another way (the web SPA login) and
+// the daemon obtains the transient token another way (the web login view) and
 // hands it back here. Everything else is unchanged.
 func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 	bootClient, err := m.VaultClient.NewSibling("")
@@ -500,7 +500,7 @@ func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 		return nil, fmt.Errorf("build bootstrap client: %w", err)
 	}
 	// Browser-driven bootstrap: when the daemon supplies a BootstrapLogin (the
-	// web SPA's login flow), use the token it returns instead of running a CLI
+	// web login view's flow), use the token it returns instead of running a CLI
 	// oidc/ldap flow, which needs a browser or TTY on this host. The same
 	// invariants hold either way — the token is installed on the sibling only,
 	// never downscoped, never written to a token file, and never accompanied by

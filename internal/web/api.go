@@ -22,7 +22,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
 		// Bootstrap state, served unauthenticated alongside auth_method
-		// because the SPA needs it to choose a login form *before* any token
+		// because a client needs it to choose a login form *before* any token
 		// exists — that is the entire point of the bootstrap. "active" is
 		// true only while a BootstrapLogin is waiting; the token itself is
 		// never exposed here or anywhere else.
@@ -529,68 +529,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	slog.Info("sync triggered via web UI")
 	s.engine.TriggerSync()
 	writeJSON(w, map[string]any{"status": "sync triggered"})
-}
-
-func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnrolAuth(w) {
-		return
-	}
-	s.enrolPromptMu.RLock()
-	label := s.enrolPromptLabel
-	pending := s.enrolPromptCh != nil
-	s.enrolPromptMu.RUnlock()
-
-	writeJSON(w, map[string]any{
-		"pending": pending,
-		"label":   label,
-	})
-}
-
-func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnrolAuth(w) {
-		return
-	}
-	var req struct {
-		Value string `json:"value"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if err := s.deliverEnrolPrompt(req.Value); err != nil {
-		writeError(w, err.Error(), http.StatusConflict)
-		return
-	}
-	writeJSON(w, map[string]any{"status": "accepted"})
-}
-
-// Sentinels for deliverEnrolPrompt; their text is the user-facing message on
-// both the JSON and the form-POST surface.
-var (
-	errNoPendingPrompt = fmt.Errorf("no pending prompt")
-	errPromptAnswered  = fmt.Errorf("prompt already answered")
-)
-
-// deliverEnrolPrompt hands a submitted secret value to the engine blocked in
-// EnrolPromptSecret. It owns the lock/select/clear protocol over
-// enrolPromptCh so the SPA's JSON endpoint and the /ui/ form endpoint cannot
-// drift.
-func (s *Server) deliverEnrolPrompt(value string) error {
-	s.enrolPromptMu.Lock()
-	defer s.enrolPromptMu.Unlock()
-	ch := s.enrolPromptCh
-	if ch == nil {
-		return errNoPendingPrompt
-	}
-	select {
-	case ch <- value:
-		s.enrolPromptCh = nil
-		s.enrolPromptLabel = ""
-		return nil
-	default:
-		return errPromptAnswered
-	}
 }
 
 // handleHealthz reports daemon liveness — the process is running and

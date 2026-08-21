@@ -38,7 +38,9 @@ Note that the token login (`POST /login/token`) is refused with **403** under ce
 
 On a host where **nothing has been enrolled yet**, signing in lands on `/setup/`: a single page listing every configured enrolment as a card you can Start or Skip, plus a Continue button that enters the main site.
 
-The wizard appears *only* while no enrolment has been completed. As soon as you have one credential in Vault — or you dismiss the wizard with Continue — `/` takes you straight to the main site, and any outstanding enrolment waits for you on `/ui/enrolments/` instead of interrupting every visit. Skipping an enrolment in the wizard is remembered for that daemon run, so skipping everything does not put you back on the wizard next time.
+The wizard appears *only* while no enrolment has been completed. As soon as you have one credential from an enrolment that needed you — or you dismiss the wizard with Continue — `/` takes you straight to the main site, and any outstanding enrolment waits for you on `/ui/enrolments/` instead of interrupting every visit. Skipping an enrolment in the wizard is remembered for that daemon run, so skipping everything does not put you back on the wizard next time.
+
+Enrolments that need no interaction — the `copy` engine, which mirrors an existing Vault secret — are left out of that judgement in both directions. One of them being outstanding will not raise the wizard, since there would be nothing for you to do in it; and one of them completing does not count as your having been through setup, since it completes on its own without you. Only the enrolments that actually want a human decide whether you see the wizard.
 
 Enrolments that need input (the SSH engine's passphrase, for example) prompt inside their card; a card waiting on you stops refreshing so it cannot wipe what you are typing.
 

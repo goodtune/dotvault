@@ -662,6 +662,7 @@ Optional interfaces extend the contract for engines that need them:
 
 - `SettingsFielder.FieldsFromSettings(settings)` — engines whose written-field set depends on per-enrolment settings (currently the Copy engine, where the JSON template determines the keys). The manager and web runner use `EngineFields(engine, settings)` which falls back to `Fields()` when not implemented.
 - `Refresher.Refresh(ctx, settings, existing)` — engines whose credentials expire and can be rotated without user interaction (currently JFrog and Databricks). Driven by `RefreshManager`.
+- `Unattended.Unattended() bool` — engines that acquire their credential with no user involvement at all (currently only Copy). The first-run web wizard excludes these from its decision in both directions: an unattended enrolment gives the user nothing to do so it cannot trigger the wizard, and — the bug this closes — because it completes on its own it must not count as "something is already enrolled", which previously suppressed the wizard for the interactive enrolments that genuinely needed one. A capability rather than a name check, so a future unattended engine inherits the rule by declaring it. Engines that don't implement it are treated as interactive, the safe default.
 - `Watcher.WatchSources(settings, username) []WatchSource` — engines whose output is derived from upstream Vault data and must track source changes (currently Copy). Driven by `WatchManager`, which polls every sync interval and (on Enterprise Vault) reacts to source-write events within seconds.
 
 ### GitHub Engine Defaults
@@ -769,6 +770,8 @@ Behaviour:
 - The target secret is **merged**, not replaced — keys produced by the template are written, but pre-existing keys at the target that the template does not name are preserved. This makes it safe for multiple operators / processes to maintain different fields under the same user path.
 - The set of fields the engine writes is derived dynamically from the template's top-level JSON keys (via the `SettingsFielder` interface). The manager treats the enrolment as complete when those fields are present in the target, just as for static-field engines.
 - Preserved values are **stringified**, not type-preserved: the engine flattens the returned data to `map[string]string`, so any pre-existing object/number/bool field at the target is JSON-marshalled to its textual form before being written back. This is intentional (the engine contract is `map[string]string` and dropping non-strings would lose data) but means the copy engine should not be co-tenanted with workflows that depend on KVv2 fields keeping their original JSON type.
+
+The Copy engine also declares `Unattended`: it needs no user involvement, so the web UI's first-run wizard excludes it from its decision in both directions (see Web UI → First-run enrolment wizard). Everywhere else it is ordinary pending work.
 
 Periodic refresh:
 
@@ -891,6 +894,7 @@ Shown **only while no enrolment has been completed** (`EnrolmentRunner.NeedsWiza
 Two consequences worth keeping straight:
 
 - `Complete()` latches (`dismissed`), because skipping every enrolment completes nothing and would otherwise re-trigger the wizard forever. A config reload builds a new runner and so re-evaluates from scratch, which is intended.
+- **Unattended enrolments are excluded from the decision entirely** (`enrol.EngineUnattended`, today only the Copy engine). They are evidence in neither direction, and the direction that bit was completion: a copy enrolment finishes on its own, often before the user has seen anything, so counting it satisfied `NeedsWizard`'s "something is already enrolled" test and a fresh user with a copy enrolment configured never saw setup at all.
 - `EnrolmentRunner.Wait()` — what blocks daemon startup — returns immediately unless `NeedsWizard()`. Gating it on "anything pending" instead would hang the sync engine on a host that has credentials and one outstanding enrolment, since the user is sent straight to the site and nothing would ever call `Complete()`. `handleRoot` also calls `Complete()` whenever it decides the wizard is not needed, so reaching the main site always releases that wait.
 
 The wizard renders the same `enrol-card` fragment the main site does, with `ActionBase` selecting where the card's forms post (`/setup` vs `/ui/enrol`) and the fragment poll URL carrying that base so a patched card keeps its own actions. Cards get a per-key `ElementID` (hex of the key) because the wizard renders many at once and a shared id would send every patch to the first card. A card waiting on `io.PromptSecret` **stops polling** — a patch replaces the whole card, so a 2s refresh would wipe the half-typed passphrase and detach the field mid-click.

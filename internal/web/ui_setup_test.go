@@ -307,3 +307,90 @@ func TestUIPage_ReleasesTheStartupGate(t *testing.T) {
 		t.Fatal("serving a main-site page did not release the startup gate")
 	}
 }
+
+// TestNeedsWizard_IgnoresUnattendedEnrolments pins the copy engine's
+// exclusion from the wizard decision, in both directions.
+//
+// The bug this closes: a copy enrolment needs no human and completes on its
+// own, often before the user has seen anything. Counted as prior progress it
+// satisfied the "something is already enrolled" test and suppressed the
+// wizard for the interactive enrolments that genuinely needed one — so a
+// fresh user with a copy enrolment configured never saw setup at all.
+func TestNeedsWizard_IgnoresUnattendedEnrolments(t *testing.T) {
+	// A completed copy enrolment must not stand in for the user having been
+	// through setup: the interactive enrolment beside it still needs one.
+	r := NewEnrolmentRunner(map[string]config.Enrolment{
+		"mirror": {Engine: "copy"},
+		"gh":     {Engine: "github"},
+	})
+	r.MarkComplete("mirror")
+	if !r.NeedsWizard() {
+		t.Error("a completed copy enrolment suppressed the wizard; an interactive enrolment is still pending")
+	}
+
+	// Nor may a pending one: it gives the user nothing to do, so on its own
+	// it cannot justify a wizard.
+	if NewEnrolmentRunner(map[string]config.Enrolment{"mirror": {Engine: "copy"}}).NeedsWizard() {
+		t.Error("copy enrolments alone must not trigger the wizard")
+	}
+
+	// And an interactive enrolment beside it still decides normally.
+	r = NewEnrolmentRunner(map[string]config.Enrolment{
+		"mirror": {Engine: "copy"},
+		"gh":     {Engine: "github"},
+	})
+	if !r.NeedsWizard() {
+		t.Error("nothing interactive enrolled yet: wizard should appear")
+	}
+	r.MarkComplete("gh")
+	if r.NeedsWizard() {
+		t.Error("the interactive enrolment is complete: wizard must step aside")
+	}
+}
+
+// TestWait_CopyOnlyConfigDoesNotBlockStartup pins the more consequential half
+// of the unattended exclusion. Wait() gates daemon startup — the sync engine
+// included — behind the wizard being dismissed. A host configured with only
+// copy enrolments used to park there until a human opened the web UI, which on
+// an unattended host is never; it must now proceed on its own.
+func TestWait_CopyOnlyConfigDoesNotBlockStartup(t *testing.T) {
+	r := NewEnrolmentRunner(map[string]config.Enrolment{"mirror": {Engine: "copy"}})
+
+	returned := make(chan struct{})
+	go func() { r.Wait(); close(returned) }()
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait() blocked on a copy-only config; the daemon would never start syncing")
+	}
+}
+
+// TestNeedsWizard_UnattendedExclusionIsUnconditional records two edges a
+// future reader will question. A *failed* copy enrolment is still skipped —
+// it is unattended whatever became of it, and a human in the wizard could do
+// nothing about it — and an unknown engine keeps its existing treatment,
+// since "unattended" is a property of a registered engine and there is none.
+func TestNeedsWizard_UnattendedExclusionIsUnconditional(t *testing.T) {
+	r := NewEnrolmentRunner(map[string]config.Enrolment{"mirror": {Engine: "copy"}})
+	// No exported way to fail an enrolment without running it; this test is
+	// in-package, so set the state the engine would have left behind.
+	st := r.states["mirror"]
+	st.mu.Lock()
+	st.status = "failed"
+	st.errMsg = "source secret not found"
+	st.mu.Unlock()
+	if r.NeedsWizard() {
+		t.Error("a failed copy enrolment raised the wizard; there is nothing a user could do in it")
+	}
+
+	// Unknown engines are not runnable and were never affected by the
+	// exclusion; a copy enrolment beside one does not change that.
+	r = NewEnrolmentRunner(map[string]config.Enrolment{
+		"mirror": {Engine: "copy"},
+		"x":      {Engine: "nope"},
+	})
+	if r.NeedsWizard() {
+		t.Error("neither an unattended nor an unrunnable enrolment can justify a wizard")
+	}
+}

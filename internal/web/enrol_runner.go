@@ -293,12 +293,21 @@ func (r *EnrolmentRunner) NeedsWizard() bool {
 		}
 		s.mu.Lock()
 		status := s.status
-		hasEngine := s.engine != nil
+		engine := s.engine
 		s.mu.Unlock()
+		// An unattended enrolment (the copy engine) is not evidence either
+		// way and is skipped entirely. It gives the user nothing to do, so
+		// it must not make the wizard fire; and because it completes on its
+		// own — often before a human has seen anything — letting it satisfy
+		// the "something is already enrolled" test below would suppress the
+		// wizard for the interactive enrolments that genuinely need one.
+		if engine != nil && enrol.EngineUnattended(engine) {
+			continue
+		}
 		if status == "complete" {
 			return false
 		}
-		if hasEngine {
+		if engine != nil {
 			runnable = true
 		}
 	}
@@ -327,6 +336,14 @@ func (r *EnrolmentRunner) Wait() {
 	if !r.NeedsWizard() {
 		return
 	}
+	// Say so. Everything past this point in daemon startup — the sync engine
+	// included — waits for a human to open the web UI, and on an unattended
+	// host nobody ever will: managed files simply stop being refreshed. That
+	// is the correct behaviour (there are credentials the daemon cannot
+	// obtain on its own) but it is indistinguishable from a hung daemon in
+	// the log, so it must not be silent. /readyz reports not-ready for the
+	// same reason.
+	slog.Info("waiting for first-run enrolment: open the web UI to continue, or the daemon will not begin syncing")
 	<-r.done
 }
 

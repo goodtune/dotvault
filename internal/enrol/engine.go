@@ -98,6 +98,53 @@ type Watcher interface {
 	WatchSources(settings map[string]any, username string) []WatchSource
 }
 
+// Unattended is implemented by engines that acquire their credential with no
+// user involvement whatsoever — no browser to visit, no code to copy, no
+// prompt to answer. The copy engine is the only one today: it mirrors an
+// existing Vault secret, so it succeeds or fails entirely on its own.
+//
+// The distinction matters to one caller: the web UI's first-run enrolment
+// wizard, which exists to walk a human through the enrolments that need a
+// human. An unattended enrolment is evidence in neither direction there — it
+// gives the user nothing to do, and when it completes on its own that says
+// nothing about whether the user has been through the wizard. Counting one
+// either way makes the wizard fire when there is nothing to do, or — the case
+// this exists to prevent — suppresses it for the interactive enrolments that
+// genuinely need it, because an unattended enrolment completed first and
+// looked like prior progress.
+//
+// The scope really is that narrow, deliberately. Every other caller should go
+// on treating an unattended enrolment as ordinary pending work, because it is:
+// the CLI's enrolment run executes it (that is how it gets done outside the
+// WatchManager's polling), and `dotvault enrol` rightly offers it as something
+// the user can run on demand. This says nothing about whether an enrolment
+// needs doing — only about whether a human needs to be walked through it.
+//
+// It is deliberately a capability rather than a name check, so an engine added
+// later inherits the rule by declaring it instead of by being remembered.
+type Unattended interface {
+	Engine
+
+	// Unattended reports whether this engine runs without user interaction.
+	// An engine that does not implement this interface at all is treated as
+	// interactive, which is the safe direction: at worst a wizard appears
+	// when it need not have, rather than being skipped when it was needed.
+	//
+	// It takes no settings: an engine whose configuration could make it
+	// interactive should report false, since the wizard decision is made
+	// before any enrolment runs and cannot be revisited.
+	Unattended() bool
+}
+
+// EngineUnattended reports whether an engine runs with no user interaction.
+// Engines that don't implement Unattended are treated as interactive, which
+// is the safe default: at worst the wizard appears when it need not have,
+// rather than being skipped when it was needed.
+func EngineUnattended(e Engine) bool {
+	u, ok := e.(Unattended)
+	return ok && u.Unattended()
+}
+
 // BrowserOpener opens a URL in the user's default browser.
 type BrowserOpener func(url string) error
 

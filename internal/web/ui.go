@@ -98,6 +98,7 @@ var uiSharedTmpl = []string{
 	"uitmpl/nav.tmpl",
 	"uitmpl/fragments.tmpl",
 	"uitmpl/enrol_card.tmpl",
+	"uitmpl/setup_footer.tmpl",
 }
 
 // uiPages maps a page name to its parsed template set; uiFragments serves the

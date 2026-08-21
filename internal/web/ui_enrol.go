@@ -277,7 +277,27 @@ func (s *Server) handleUIEnrolCardFragment(w http.ResponseWriter, r *http.Reques
 		writeError(w, "enrolment not found", http.StatusNotFound)
 		return
 	}
-	uiPatchFragment(w, r, "enrol-card", s.buildUIEnrolCard(st, anyRunning, enrolBaseFromRequest(r)))
+	base := enrolBaseFromRequest(r)
+	card, err := uiFragment("enrol-card", s.buildUIEnrolCard(st, anyRunning, base))
+	if err != nil {
+		writeError(w, "failed to render fragment", http.StatusInternalServerError)
+		return
+	}
+	if base != setupActionBase {
+		uiPatchElements(w, r, card)
+		return
+	}
+	// On the wizard, the card is not the only thing this poll invalidates:
+	// finishing an enrolment can be what makes every enrolment addressed, and
+	// the footer renders from that. Patching only the card is what left the
+	// user on a completed wizard whose exit control still said "Skip
+	// remaining" and was still disabled from when something was running.
+	footer, err := uiFragment("setup-footer", s.setupFooterData())
+	if err != nil {
+		writeError(w, "failed to render fragment", http.StatusInternalServerError)
+		return
+	}
+	uiPatchElements(w, r, card+footer)
 }
 
 // uiEnrolAction wraps the shared form-POST plumbing of the start/skip/reset

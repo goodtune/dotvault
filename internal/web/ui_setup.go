@@ -41,6 +41,50 @@ func (s *Server) completeEnrolments() {
 	}
 }
 
+// allAddressed reports whether every enrolment has been dealt with, either by
+// completing or by the user declining it. It is the one definition of the
+// wizard's "nothing left to do" state, called by both the page render and the
+// fragment patch — the footer's two branches are different elements, so the
+// two paths disagreeing would mean a page whose exit control changes shape on
+// a patch that was not meant to change it.
+//
+// An empty list is vacuously addressed, which is the right answer for the
+// only way to reach it: a runner that no longer exists (a config reload
+// landing mid-request), where offering "continue" beats offering to skip
+// enrolments that are not there.
+func allAddressed(states []EnrolStateInfo) bool {
+	for _, st := range states {
+		if st.Status != "complete" && st.Status != "skipped" {
+			return false
+		}
+	}
+	return true
+}
+
+// setupFooterData builds the footer's view model from live runner state, for
+// the fragment patch. The page render passes its own already-fetched states
+// through allAddressed instead, rather than re-fetching the runner.
+func (s *Server) setupFooterData() uiSetupData {
+	runner := s.getEnrolRunner()
+	if runner == nil {
+		return uiSetupData{AllAddressed: true}
+	}
+	return uiSetupData{AllAddressed: allAddressed(runner.States())}
+}
+
+// handleSetupComplete abandons whatever is still outstanding and enters the
+// main site. It exists only for the not-everything-addressed half of the
+// footer: with nothing left to decide the control is a plain link to "/",
+// but leaving early is a real decision, so it is a POST rather than a GET
+// that quietly discards the rest of someone's setup.
+func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
+	if !s.requireUIWrite(w, r) {
+		return
+	}
+	s.completeEnrolments()
+	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
+}
+
 // handleSetup renders the wizard, or steps aside when it isn't needed.
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if !s.uiAuthenticated() {
@@ -68,22 +112,10 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 			Error:    r.URL.Query().Get("err"),
 		},
 		AnyRunning:   anyRunning,
-		AllAddressed: true,
+		AllAddressed: allAddressed(states),
 	}
 	for _, st := range states {
 		data.Cards = append(data.Cards, s.buildUIEnrolCard(st, anyRunning, setupActionBase))
-		if st.Status != "complete" && st.Status != "skipped" {
-			data.AllAddressed = false
-		}
 	}
 	s.uiRenderStandalone(w, "setup", data)
-}
-
-// handleSetupComplete dismisses the wizard and enters the main site.
-func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
-	if !s.requireUIWrite(w, r) {
-		return
-	}
-	s.completeEnrolments()
-	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }

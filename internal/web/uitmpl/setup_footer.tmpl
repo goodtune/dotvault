@@ -1,0 +1,27 @@
+{{/* The wizard's exit control, in its own fragment because it has to be
+     re-patched alongside a card whose state changed. It was previously
+     rendered once with the page while only the card was patched, so after the
+     last enrolment finished it still carried the label ("Skip remaining") and
+     the disabled attribute it was born with — a completed wizard whose only
+     control was dead. Nothing here is disabled any more: leaving mid-run is
+     harmless (the enrolment runs server-side and can be watched from
+     /ui/enrolments/), and a disabled control is exactly what went stale.
+
+     The two states are different in kind, so they are different elements.
+     With everything addressed there is nothing to decide and the control is a
+     plain link to the root, which re-derives on the server where the user
+     belongs. With enrolments still outstanding, leaving *means* something —
+     abandon the rest — so it stays a POST: a link to "/" would be answered by
+     handleRoot with a redirect straight back to this page, which is precisely
+     the case this control exists for. */}}
+{{define "setup-footer"}}
+<div class="enrol-footer" id="setup-footer">
+  {{if .AllAddressed}}
+    <a href="/" class="enrol-continue-btn">Continue to Dashboard &rarr;</a>
+  {{else}}
+    <form method="post" action="/setup/complete">
+      <button type="submit" class="enrol-continue-btn">Skip remaining and continue &rarr;</button>
+    </form>
+  {{end}}
+</div>
+{{end}}

@@ -307,6 +307,14 @@ func (r *EnrolmentRunner) NeedsWizard() bool {
 		if status == "complete" {
 			return false
 		}
+		// A skipped enrolment has been addressed: the user was shown it and
+		// declined. It must not keep the wizard standing, or the exit link
+		// would bounce a user who skipped everything straight back here with
+		// no way out — the case the old Continue button's explicit dismissal
+		// used to cover.
+		if status == "skipped" {
+			continue
+		}
 		if engine != nil {
 			runnable = true
 		}

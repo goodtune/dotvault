@@ -11,11 +11,7 @@
     <div class="enrol-list">
       {{range .Cards}}{{template "enrol-card" .}}{{end}}
     </div>
-    <div class="enrol-footer">
-      <form method="post" action="/setup/complete">
-        <button type="submit" class="enrol-continue-btn"{{if .AnyRunning}} disabled{{end}}>{{if .AllAddressed}}Continue to Dashboard &rarr;{{else}}Skip remaining and continue &rarr;{{end}}</button>
-      </form>
-    </div>
+    {{template "setup-footer" .}}
   </div>
 </div>
 {{end}}

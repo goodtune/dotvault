@@ -3,7 +3,6 @@ package web
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -51,17 +50,21 @@ func TestNeedsWizard_ZeroCompletedIsTheTrigger(t *testing.T) {
 		t.Error("an enrolment is complete: wizard must step aside")
 	}
 
-	// Skipping everything completes nothing, so the dismissal latch — not a
-	// completion — is what stops the wizard reappearing forever.
+	// Skipping everything completes nothing, but it addresses everything:
+	// the user was shown each enrolment and declined it, so there is nothing
+	// left for the wizard to do and it must stand aside on its own.
 	r = newRunner()
 	for _, key := range []string{"ssh", "gh"} {
 		if err := r.Skip(key); err != nil {
 			t.Fatalf("Skip(%s): %v", key, err)
 		}
 	}
-	if !r.NeedsWizard() {
-		t.Error("all skipped but nothing enrolled: wizard still warranted until dismissed")
+	if r.NeedsWizard() {
+		t.Error("everything skipped is everything addressed: the wizard has nothing left to offer")
 	}
+	// The dismissal latch still covers the other route out: leaving with
+	// enrolments genuinely outstanding.
+	r = newRunner()
 	r.Complete()
 	if r.NeedsWizard() {
 		t.Error("dismissed wizard must stay dismissed")
@@ -108,7 +111,7 @@ func TestSetupWizard_RendersCardsAndStepsAside(t *testing.T) {
 		"Complete your setup",
 		`action="/setup/start"`, // cards return to the wizard, not the site
 		`action="/setup/skip"`,
-		`action="/setup/complete"`,
+		`action="/setup/complete"`, // with work outstanding, leaving is a POST
 		"enrol-card",
 	} {
 		if !strings.Contains(body, want) {
@@ -141,29 +144,133 @@ func TestSetupWizard_RedirectsUnauthenticated(t *testing.T) {
 	}
 }
 
-// TestSetupComplete_DismissesAndReleases pins the Continue button: it lets
-// the daemon proceed and sends the user to the main site.
-func TestSetupComplete_DismissesAndReleases(t *testing.T) {
+// TestSetupExitLink_DismissesAndReleases pins the wizard's exit control now
+// that it is a plain link to "/" rather than a form POST: following it must
+// let the daemon proceed and land the user on the main site.
+func TestSetupExitLink_DismissesAndReleases(t *testing.T) {
 	s := setupTestServer(t, map[string]config.Enrolment{"ssh": {Engine: "ssh"}})
 
 	waited := make(chan struct{})
 	go func() { s.WaitForEnrolments(); close(waited) }()
 
-	req := postForm(t, "/setup/complete", url.Values{})
-	req.Header.Set("Origin", "http://127.0.0.1:9000") // matches this server's listener
+	// Skipping is what a user leaving a wizard with nothing enrolled has
+	// done; the link then has to take them out rather than loop them back.
+	if err := s.getEnrolRunner().Skip("ssh"); err != nil {
+		t.Fatalf("Skip: %v", err)
+	}
 	w := httptest.NewRecorder()
-	s.handleSetupComplete(w, req)
-
+	s.handleRoot(w, httptest.NewRequest("GET", "/", nil))
 	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/ui/" {
-		t.Fatalf("status = %d, location = %q", w.Code, w.Header().Get("Location"))
+		t.Fatalf("following the exit link: status = %d, location = %q; want a redirect to /ui/", w.Code, w.Header().Get("Location"))
 	}
 	select {
 	case <-waited:
 	case <-time.After(2 * time.Second):
-		t.Fatal("WaitForEnrolments still blocked after the wizard was completed")
+		t.Fatal("WaitForEnrolments still blocked after the wizard was left")
 	}
 	if s.NeedsSetupWizard() {
-		t.Error("wizard still warranted after completion")
+		t.Error("wizard still warranted after the user left it")
+	}
+}
+
+// TestSetupFooter_FollowsTheWorkAndNeverGoesStale pins the fix for a wizard
+// the user could not leave. The footer used to render once with the page as a
+// submit button carrying {{if .AnyRunning}}disabled{{end}}, while only the
+// card was re-patched by the poll — so when the last enrolment finished, the
+// button stayed disabled and still read "Skip remaining", stranding the user
+// on a completed wizard.
+//
+// It also pins why the two states are different elements. With work still
+// outstanding, leaving means abandoning it, so the control stays a POST: a
+// link to "/" would be answered by handleRoot with a redirect straight back
+// to the wizard, making a control labelled "Skip remaining" a no-op loop.
+// With everything addressed there is nothing to abandon and it is a link.
+func TestSetupFooter_FollowsTheWorkAndNeverGoesStale(t *testing.T) {
+	s := setupTestServer(t, map[string]config.Enrolment{"ssh": {Engine: "ssh"}})
+
+	w := httptest.NewRecorder()
+	s.handleSetup(w, httptest.NewRequest("GET", "/setup/", nil))
+	body := w.Body.String()
+	if !strings.Contains(body, `action="/setup/complete"`) {
+		t.Errorf("with an enrolment outstanding the footer must be a dismissing POST; body = %s", body)
+	}
+	if !strings.Contains(body, "Skip remaining") {
+		t.Error("with an enrolment outstanding the footer should offer to skip the rest")
+	}
+	if strings.Contains(body, `class="enrol-continue-btn" disabled`) {
+		t.Error("footer button is disabled again; that is exactly what went stale")
+	}
+
+	// Completing the work flips it to a plain link out.
+	s.getEnrolRunner().MarkComplete("ssh")
+	frag, err := uiFragment("setup-footer", s.setupFooterData())
+	if err != nil {
+		t.Fatalf("render footer fragment: %v", err)
+	}
+	if !strings.Contains(frag, `id="setup-footer"`) {
+		t.Error("footer fragment lacks the id datastar patches it by")
+	}
+	if !strings.Contains(frag, `href="/"`) {
+		t.Errorf("with nothing outstanding the footer must be a link to the root; fragment = %s", frag)
+	}
+	if !strings.Contains(frag, "Continue to Dashboard") || strings.Contains(frag, "Skip remaining") {
+		t.Errorf("footer did not follow the enrolment to completion; fragment = %s", frag)
+	}
+}
+
+// TestSetupExitPOST_DismissesWithWorkOutstanding covers the branch three
+// reviewers independently identified as the one that strands a user: an
+// enrolment that is pending, running, or repeatedly failing keeps the wizard
+// warranted, so leaving has to be an action that dismisses rather than a link
+// handleRoot would bounce back.
+func TestSetupExitPOST_DismissesWithWorkOutstanding(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(r *EnrolmentRunner)
+	}{
+		{"pending", func(*EnrolmentRunner) {}},
+		{"failed", func(r *EnrolmentRunner) {
+			st := r.states["ssh"]
+			st.mu.Lock()
+			st.status = "failed"
+			st.errMsg = "engine exploded"
+			st.mu.Unlock()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := setupTestServer(t, map[string]config.Enrolment{"ssh": {Engine: "ssh"}})
+			tc.setup(s.getEnrolRunner())
+
+			// The wizard is genuinely warranted, so a bare link out would loop.
+			if !s.NeedsSetupWizard() {
+				t.Fatalf("precondition: wizard should still be warranted in %s state", tc.name)
+			}
+			w := httptest.NewRecorder()
+			s.handleRoot(w, httptest.NewRequest("GET", "/", nil))
+			if got := w.Header().Get("Location"); got != "/setup/" {
+				t.Fatalf("precondition: GET / went to %q, want a bounce to /setup/", got)
+			}
+
+			// The footer's POST is what actually gets the user out.
+			waited := make(chan struct{})
+			go func() { s.WaitForEnrolments(); close(waited) }()
+
+			req := postForm(t, "/setup/complete", nil)
+			req.Header.Set("Origin", "http://127.0.0.1:9000")
+			w2 := httptest.NewRecorder()
+			s.handleSetupComplete(w2, req)
+			if w2.Code != http.StatusSeeOther || w2.Header().Get("Location") != "/ui/" {
+				t.Fatalf("status = %d, location = %q; want a redirect to /ui/", w2.Code, w2.Header().Get("Location"))
+			}
+			select {
+			case <-waited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("WaitForEnrolments still blocked after the wizard was left")
+			}
+			if s.NeedsSetupWizard() {
+				t.Error("wizard still warranted after the user left it")
+			}
+		})
 	}
 }
 
@@ -423,5 +530,33 @@ func TestSetupWizard_RendersUnattendedCardsWithHelpText(t *testing.T) {
 	}
 	if !strings.Contains(body, "Generates a key pair") {
 		t.Error("interactive enrolment's help_text is missing from the wizard")
+	}
+}
+
+// TestSetupCardFragment_PatchesFooterToo pins the mechanism that keeps the
+// exit control honest in a live page. The card's own poll stops once the
+// enrolment reaches a terminal state, so the patch that observes completion
+// is the last one the page will ever get — if the footer does not ride along
+// with it, nothing else will ever correct it.
+func TestSetupCardFragment_PatchesFooterToo(t *testing.T) {
+	s := setupTestServer(t, map[string]config.Enrolment{"ssh": {Engine: "ssh"}})
+	s.getEnrolRunner().MarkComplete("ssh")
+
+	w := httptest.NewRecorder()
+	s.handleUIEnrolCardFragment(w, httptest.NewRequest("GET", "/ui/fragments/enrol-card?key=ssh&base=setup", nil))
+	body := w.Body.String()
+	if !strings.Contains(body, "setup-footer") {
+		t.Fatalf("wizard card patch does not carry the footer; body = %s", body)
+	}
+	if !strings.Contains(body, "Continue to Dashboard") || strings.Contains(body, "Skip remaining") {
+		t.Errorf("patched footer did not follow the enrolment to completion; body = %s", body)
+	}
+
+	// The main site has no such footer; sending one would patch an element
+	// that does not exist there.
+	w2 := httptest.NewRecorder()
+	s.handleUIEnrolCardFragment(w2, httptest.NewRequest("GET", "/ui/fragments/enrol-card?key=ssh", nil))
+	if strings.Contains(w2.Body.String(), "setup-footer") {
+		t.Error("main-site card patch carried the wizard footer")
 	}
 }

@@ -889,13 +889,17 @@ Token adoption for *every* browser login funnels through one helper, `consumeLog
 
 ### First-run enrolment wizard (`/setup/`)
 
-Shown **only while no enrolment has been completed** (`EnrolmentRunner.NeedsWizard`), which is the deliberate difference from the enrolment page it replaces: that one reappeared whenever *any* enrolment was outstanding, so it kept interrupting users who had knowingly skipped one. Once anything is enrolled — or the user dismisses the wizard with Continue — the main site takes over and individual enrolments are managed from `/ui/enrolments/`.
+Shown **only while no enrolment has been completed** (`EnrolmentRunner.NeedsWizard`), which is the deliberate difference from the enrolment page it replaces: that one reappeared whenever *any* enrolment was outstanding, so it kept interrupting users who had knowingly skipped one. Once anything is enrolled — or every enrolment has been addressed, completed or skipped alike — or the user leaves it with work outstanding, the main site takes over and individual enrolments are managed from `/ui/enrolments/`.
 
 Two consequences worth keeping straight:
 
-- `Complete()` latches (`dismissed`), because skipping every enrolment completes nothing and would otherwise re-trigger the wizard forever. A config reload builds a new runner and so re-evaluates from scratch, which is intended.
+- A skipped enrolment counts as *addressed*: the user was shown it and declined, so it does not keep the wizard standing. `Complete()` still latches (`dismissed`) for the other way out — leaving with enrolments genuinely outstanding. A config reload builds a new runner and so re-evaluates from scratch, which is intended.
 - **Unattended enrolments are excluded from the decision entirely** (`enrol.EngineUnattended`, today only the Copy engine). They are evidence in neither direction, and the direction that bit was completion: a copy enrolment finishes on its own, often before the user has seen anything, so counting it satisfied `NeedsWizard`'s "something is already enrolled" test and a fresh user with a copy enrolment configured never saw setup at all.
 - `EnrolmentRunner.Wait()` — what blocks daemon startup — returns immediately unless `NeedsWizard()`. Gating it on "anything pending" instead would hang the sync engine on a host that has credentials and one outstanding enrolment, since the user is sent straight to the site and nothing would ever call `Complete()`. `handleRoot` also calls `Complete()` whenever it decides the wizard is not needed, so reaching the main site always releases that wait.
+
+The wizard's exit control (`setup-footer`) is re-patched alongside the card, from the shared `allAddressed` predicate. It was previously rendered once with the page as a submit button carrying `{{if .AnyRunning}}disabled{{end}}` while only the *card* was patched, so finishing the last enrolment left a user parked on a completed wizard whose only control still read "Skip remaining" and was still disabled. Nothing in it is disabled now — leaving mid-run is harmless, and a disabled control is precisely what went stale.
+
+Its two states are **different elements, deliberately**. With everything addressed there is nothing to decide, so it is a plain `<a href="/">` and the server re-derives on that GET where the user belongs. With enrolments still outstanding, leaving *means* abandoning them, so it stays a `POST /setup/complete`: a link to `/` in that state would be answered by `handleRoot` with a redirect straight back to the wizard, making a control labelled "Skip remaining" a no-op loop — the trap three reviewers independently found when the whole footer was made a link. Relatedly, "skipped" now counts as addressed, so skipping everything stands the wizard down on its own rather than needing the explicit dismissal.
 
 The wizard renders the same `enrol-card` fragment the main site does, with `ActionBase` selecting where the card's forms post (`/setup` vs `/ui/enrol`) and the fragment poll URL carrying that base so a patched card keeps its own actions. Cards get a per-key `ElementID` (hex of the key) because the wizard renders many at once and a shared id would send every patch to the first card. A card waiting on `io.PromptSecret` **stops polling** — a patch replaces the whole card, so a 2s refresh would wipe the half-typed passphrase and detach the field mid-click.
 
@@ -927,7 +931,7 @@ The same server can additionally (or instead) serve its API over a per-user Unix
 - `GET /login/ldap` — LDAP progress page (MFA wait or TOTP prompt); adopts the token once Vault authenticates
 - `POST /login/ldap/totp` — submit an MFA passcode
 - `POST /login/token` — validate and adopt a pasted token (403 under certificate auth)
-- `GET /setup/`, `POST /setup/{complete,start,skip,reset,secret}` — the first-run wizard and its enrolment actions
+- `GET /setup/`, `POST /setup/{start,skip,reset,secret}` — the first-run wizard and its enrolment actions (leaving the wizard is a plain link to `/`, not a POST)
 - `GET /favicon.ico` — the embedded icon (browsers request it unprompted)
 
 **Health probes** (served on every enabled HTTP surface — the loopback web listener and/or the local API socket; a daemon with neither has nothing to probe):

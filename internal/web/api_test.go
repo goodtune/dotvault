@@ -130,7 +130,7 @@ func TestHandleStatus_VaultFieldsHiddenWhenUnauthenticated(t *testing.T) {
 }
 
 // The /api/v1/status auth_method must carry the *base* method, with any
-// "+tpm" sealing suffix stripped, because the web SPA dispatches its login
+// "+tpm" sealing suffix stripped, because the login view dispatches its
 // form on an exact-string match (login-page.jsx). A raw "ldap+tpm" would fall
 // through to "Unknown auth method" and break the login page. Normalisation
 // happens in NewServer, so this exercises that boundary rather than poking the
@@ -157,7 +157,7 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 				t.Fatalf("NewServer: %v", err)
 			}
 			if s.authMethod != tc.wantWire {
-				t.Errorf("s.authMethod = %q, want %q (the +tpm suffix must be stripped for the SPA)", s.authMethod, tc.wantWire)
+				t.Errorf("s.authMethod = %q, want %q (the +tpm suffix must be stripped for the login view)", s.authMethod, tc.wantWire)
 			}
 			if s.sealToken != tc.wantSealToken {
 				t.Errorf("s.sealToken = %v, want %v (sealing must still be honoured)", s.sealToken, tc.wantSealToken)
@@ -181,7 +181,7 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 // The Effective Configuration view (/api/v1/config) must show the RAW
 // configured auth_method including any "+tpm" suffix, so it agrees with the
 // lossless config-download and honestly reflects that token-sealing is on.
-// This is the opposite of /api/v1/status, which strips the suffix for the SPA
+// This is the opposite of /api/v1/status, which strips the suffix for the
 // login dispatch — the two endpoints deliberately differ.
 func TestHandleConfig_AuthMethodRaw(t *testing.T) {
 	s := testServerWithVault(t, http.HandlerFunc(fakeVaultHandler))

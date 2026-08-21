@@ -286,11 +286,19 @@ func (s *Server) uiAuthenticated() bool {
 // requireUIPage gates a page GET: an unauthenticated browser is sent to the
 // root, which owns every login flow (OIDC redirects, LDAP MFA, token entry,
 // the mtls bootstrap) — see ui_login.go.
+//
+// Reaching any main-site page also dismisses the first-run wizard, releasing
+// a daemon parked in EnrolmentRunner.Wait(). Doing this only in handleRoot
+// would leave the gate held by a browser that never touches "/": a bookmarked
+// or reloaded /ui/secrets/ renders a fully working site while the sync engine
+// never starts. The user is demonstrably past the wizard whichever page they
+// arrived on, so that is where the release belongs.
 func (s *Server) requireUIPage(w http.ResponseWriter, r *http.Request) bool {
 	if !s.uiAuthenticated() {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return false
 	}
+	s.completeEnrolments()
 	return true
 }
 

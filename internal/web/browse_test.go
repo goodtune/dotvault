@@ -262,7 +262,7 @@ func TestHandleRemoteBrowse_RejectsCrossSiteOrigin(t *testing.T) {
 }
 
 func TestHandleRemoteBrowse_AllowsOwnOrigin(t *testing.T) {
-	// The SPA's own origin — a loopback hostname on the daemon's own
+	// The UI's own origin — a loopback hostname on the daemon's own
 	// listener port, whichever loopback alias the user browsed to — must
 	// still be able to use the endpoint.
 	for _, origin := range []string{"http://127.0.0.1:9000", "http://localhost:9000"} {

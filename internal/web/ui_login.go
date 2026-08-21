@@ -143,7 +143,14 @@ func setLoginCookie(w http.ResponseWriter, sessionID string) {
 		Value:    sessionID,
 		Path:     "/login",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		// Strict, not Lax. The LDAP progress page is a GET that adopts the
+		// token once Vault authenticates, so it cannot carry an Origin check
+		// of its own; under Lax the cookie would still ride a cross-site
+		// top-level navigation, letting a hostile page decide the moment the
+		// user's own in-flight login gets adopted. Every legitimate way to
+		// reach the page is a same-site redirect or meta-refresh, so Strict
+		// costs nothing.
+		SameSite: http.SameSiteStrictMode,
 	})
 }
 

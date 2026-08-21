@@ -65,7 +65,7 @@ type EnrolmentRunner struct {
 
 // NewEnrolmentRunner creates a runner from the enrolments config.
 // All enrolments start as "pending". Call MarkComplete() for enrolments
-// that are already satisfied in Vault before exposing to the frontend.
+// that are already satisfied in Vault before exposing them in the UI.
 func NewEnrolmentRunner(enrolments map[string]config.Enrolment) *EnrolmentRunner {
 	keys := make([]string, 0, len(enrolments))
 	for k := range enrolments {

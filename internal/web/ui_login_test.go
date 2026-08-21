@@ -258,3 +258,163 @@ func TestHandleRoot_RoutesByState(t *testing.T) {
 		t.Fatalf("enrolled root: status = %d, location = %q", w.Code, w.Header().Get("Location"))
 	}
 }
+
+// totpLoginServer returns a server whose fake Vault answers the first login
+// with a TOTP MFA requirement and the second (post-passcode) with a token —
+// the same shape internal/auth's own TOTP test drives.
+func totpLoginServer(t *testing.T) *Server {
+	t.Helper()
+	var calls int
+	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			json.NewEncoder(w).Encode(map[string]any{
+				"request_id": "req-1",
+				"auth": map[string]any{
+					"client_token": "",
+					"mfa_requirement": map[string]any{
+						"mfa_request_id": "mfa-req-1",
+						"mfa_constraints": map[string]any{
+							"totp": map[string]any{
+								"any": []map[string]any{
+									{"type": "totp", "id": "method-totp-1", "uses_passcode": true},
+								},
+							},
+						},
+					},
+				},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"request_id": "req-2",
+			"auth": map[string]any{
+				"client_token":   "hvs.totp-token",
+				"lease_duration": 3600,
+			},
+		})
+	})
+	if err := uiInitTemplates(); err != nil {
+		t.Fatalf("init templates: %v", err)
+	}
+	s := authTestServer(t, vc)
+	s.authMethod = "ldap"
+	s.authMount = "ldap"
+	return s
+}
+
+// awaitTOTPPrompt polls the progress page until it renders the passcode
+// prompt, and returns that response.
+func awaitTOTPPrompt(t *testing.T, s *Server, sessionID string) *httptest.ResponseRecorder {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest("GET", "/login/ldap", nil)
+		req.AddCookie(&http.Cookie{Name: loginCookieName, Value: sessionID})
+		w := httptest.NewRecorder()
+		s.handleLoginLDAPProgress(w, req)
+		if strings.Contains(w.Body.String(), `name="passcode"`) {
+			return w
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("progress page never rendered the TOTP passcode prompt")
+	return nil
+}
+
+// TestLoginLDAP_TOTPPromptCarriesNoRefresh is the login-view counterpart of
+// TestEnrolCard_PromptPausesThePoll: a meta refresh on the passcode card
+// would reload the page out from under whatever the user is typing. Every
+// other progress state polls, so the absence has to be asserted, not assumed.
+func TestLoginLDAP_TOTPPromptCarriesNoRefresh(t *testing.T) {
+	s := totpLoginServer(t)
+	sessionID := startLDAPLogin(t, s)
+	body := awaitTOTPPrompt(t, s, sessionID).Body.String()
+
+	if strings.Contains(body, "http-equiv=\"refresh\"") {
+		t.Error("TOTP prompt carries a meta refresh; it would wipe the passcode being typed")
+	}
+	if !strings.Contains(body, `action="/login/ldap/totp"`) {
+		t.Errorf("TOTP prompt does not post to the passcode endpoint; body = %s", body)
+	}
+}
+
+// TestLoginLDAPTOTP_SubmitAdvancesTheLogin drives the passcode through to
+// adoption: the handler must reach SubmitTOTP, and the progress page must
+// then authenticate.
+func TestLoginLDAPTOTP_SubmitAdvancesTheLogin(t *testing.T) {
+	s := totpLoginServer(t)
+	sessionID := startLDAPLogin(t, s)
+	awaitTOTPPrompt(t, s, sessionID)
+
+	req := postForm(t, "/login/ldap/totp", url.Values{"passcode": {"123456"}})
+	req.AddCookie(&http.Cookie{Name: loginCookieName, Value: sessionID})
+	w := httptest.NewRecorder()
+	s.handleLoginLDAPTOTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("totp submit status = %d, want 303", w.Code)
+	}
+
+	final := pollLDAPProgress(t, s, sessionID)
+	if final.Code != http.StatusSeeOther {
+		t.Fatalf("after passcode: status = %d, want 303; body = %s", final.Code, final.Body.String())
+	}
+	if got := s.vault.Token(); got != "hvs.totp-token" {
+		t.Errorf("adopted token = %q, want the post-MFA token", got)
+	}
+}
+
+// TestLoginLDAPTOTP_StalePhaseRedirects pins the guard against a resubmitted
+// passcode form: with the session no longer in the passcode phase the handler
+// must bounce to the progress page rather than pushing a passcode into a
+// login that is not waiting for one.
+func TestLoginLDAPTOTP_StalePhaseRedirects(t *testing.T) {
+	s := totpLoginServer(t)
+	sessionID := startLDAPLogin(t, s)
+	awaitTOTPPrompt(t, s, sessionID)
+
+	// Answer it once, then replay the same form.
+	first := postForm(t, "/login/ldap/totp", url.Values{"passcode": {"123456"}})
+	first.AddCookie(&http.Cookie{Name: loginCookieName, Value: sessionID})
+	s.handleLoginLDAPTOTP(httptest.NewRecorder(), first)
+	pollLDAPProgress(t, s, sessionID)
+
+	replay := postForm(t, "/login/ldap/totp", url.Values{"passcode": {"999999"}})
+	replay.AddCookie(&http.Cookie{Name: loginCookieName, Value: sessionID})
+	w := httptest.NewRecorder()
+	s.handleLoginLDAPTOTP(w, replay)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("stale totp submit status = %d, want 303", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != "/" && got != "/login/ldap" {
+		t.Errorf("stale totp redirect = %q, want the entry point or the progress page", got)
+	}
+}
+
+// TestDeliverEnrolPrompt covers the channel hand-off that survived the SPA's
+// deleted JSON secret endpoint: one waiting engine gets exactly one value,
+// the pending state is cleared atomically, and a second submit is refused.
+func TestDeliverEnrolPrompt(t *testing.T) {
+	s := &Server{}
+
+	if err := s.deliverEnrolPrompt("x"); err != errNoPendingPrompt {
+		t.Errorf("with no prompt pending: err = %v, want errNoPendingPrompt", err)
+	}
+
+	ch := make(chan string, 1)
+	s.enrolPromptCh = ch
+	s.enrolPromptLabel = "Enter passphrase:"
+
+	if err := s.deliverEnrolPrompt("hunter2"); err != nil {
+		t.Fatalf("deliverEnrolPrompt: %v", err)
+	}
+	if got := <-ch; got != "hunter2" {
+		t.Errorf("engine received %q, want %q", got, "hunter2")
+	}
+	if s.enrolPromptCh != nil || s.enrolPromptLabel != "" {
+		t.Error("pending prompt state was not cleared on delivery")
+	}
+	if err := s.deliverEnrolPrompt("again"); err != errNoPendingPrompt {
+		t.Errorf("second submit: err = %v, want errNoPendingPrompt", err)
+	}
+}

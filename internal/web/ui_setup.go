@@ -47,13 +47,16 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if !s.NeedsSetupWizard() {
+	// Take the runner once. NeedsSetupWizard() loads it too, and a
+	// concurrent InitEnrolments swapping in a runner-less config between the
+	// two loads would panic on the States() call below.
+	runner := s.getEnrolRunner()
+	if runner == nil || !runner.NeedsWizard() {
 		s.completeEnrolments()
 		http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 		return
 	}
 
-	runner := s.getEnrolRunner()
 	states := runner.States()
 	anyRunning := runner.AnyRunning()
 

@@ -231,6 +231,16 @@ func TestSetupWizard_GetsScriptedCSP(t *testing.T) {
 			t.Errorf("%s must not get the relaxed CSP", path)
 		}
 	}
+
+	// uiScriptedPath is only half the guarantee: assert the header the
+	// middleware actually emits, so rewiring the predicate's call site
+	// cannot pass this test while serving the wrong policy.
+	_, ts := uiTestServer(t)
+	resp := uiGet(t, ts, "/setup/")
+	defer resp.Body.Close()
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "'unsafe-eval'") {
+		t.Errorf("/setup/ response CSP = %q, want the datastar-compatible policy", csp)
+	}
 }
 
 // TestEnrolCard_PromptPausesThePoll pins the fix for a defect the browser
@@ -264,5 +274,36 @@ func TestEnrolCard_PromptPausesThePoll(t *testing.T) {
 	}
 	if !strings.Contains(prompting, `name="value"`) {
 		t.Error("prompting card missing the passphrase field")
+	}
+}
+
+// TestUIPage_ReleasesTheStartupGate pins the fix for a deadlock that
+// requireUIPage — not handleRoot — has to close. The daemon blocks on
+// WaitForEnrolments, and only a page that dismisses the wizard releases it.
+// A browser reloading a bookmarked /ui/ page after a daemon restart never
+// touches "/", so releasing solely there left the user browsing a working
+// site while the sync engine never started.
+func TestUIPage_ReleasesTheStartupGate(t *testing.T) {
+	s := setupTestServer(t, map[string]config.Enrolment{"ssh": {Engine: "ssh"}})
+
+	waited := make(chan struct{})
+	go func() { s.WaitForEnrolments(); close(waited) }()
+
+	select {
+	case <-waited:
+		t.Fatal("startup gate released before any page was served")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// A main-site page GET, reached directly — no visit to "/" first.
+	w := httptest.NewRecorder()
+	if !s.requireUIPage(w, httptest.NewRequest("GET", "/ui/secrets/", nil)) {
+		t.Fatalf("requireUIPage refused an authenticated request: status = %d", w.Code)
+	}
+
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("serving a main-site page did not release the startup gate")
 	}
 }

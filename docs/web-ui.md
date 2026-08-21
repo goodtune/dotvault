@@ -135,3 +135,17 @@ Browser endpoints (present only when `web.enabled`; all POSTs are Origin-checked
 | `POST` | `/login/token` | Validate and adopt a pasted token (403 under certificate auth) |
 | `GET` | `/setup/` | First-run enrolment wizard |
 | `POST` | `/setup/complete` | Dismiss the wizard and enter the main site |
+
+## Removed endpoints
+
+The browser surface above replaces a single-page application that drove login and enrolment through JSON endpoints. Those endpoints existed only to serve that application and have been removed along with it — the equivalent work is now done by the form POSTs and page GETs listed above.
+
+| Removed | Replacement |
+|---------|-------------|
+| `POST /auth/ldap/login` | `POST /login/ldap` (form POST, redirects to the progress page) |
+| `GET /auth/ldap/status` | `GET /login/ldap` (renders the state rather than returning it) |
+| `POST /auth/ldap/mfa` | `POST /login/ldap/totp` |
+| `POST /auth/token/login` | `POST /login/token` |
+| `GET /api/v1/enrol` and the `/api/v1/enrol/*` action endpoints | `/setup/` and `/ui/enrolments/` with their form POSTs |
+
+Nothing under `/api/v1/` other than the enrolment endpoints changed: the status, rules, config, secrets, sync, token, SSH-remote, and peer-action routes are unaffected, so anything scripting against those keeps working. If you were driving login or enrolment programmatically, use [`dotvault login`](cli.md) and [`dotvault enrol`](cli.md#dotvault-enrol) instead — those are the supported non-browser paths and always were.

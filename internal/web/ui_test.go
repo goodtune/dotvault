@@ -127,7 +127,7 @@ func TestUIDashboard_RendersLayout(t *testing.T) {
 	}
 	body := uiBody(t, resp)
 	for _, want := range []string{
-		`class="status-bar"`, // SPA header look
+		`class="status-bar"`, // header status bar
 		"Connected",
 		"Sync Now",
 		"Enrolments", "Remotes", "Secrets", // accordion sections
@@ -413,7 +413,7 @@ func TestUIRouteLabel(t *testing.T) {
 
 func TestUIConfigJSONShapeUnchanged(t *testing.T) {
 	// The handleConfig refactor onto shared view structs must preserve the
-	// SPA's wire contract.
+	// endpoint's established wire contract.
 	s := testServerWithVault(t, uiTestVaultHandler(t))
 	req := httptest.NewRequest("GET", "/api/v1/config", nil)
 	w := httptest.NewRecorder()
@@ -505,6 +505,13 @@ func TestUIWrite_AllPostRoutesRequireOrigin(t *testing.T) {
 		"/ui/remotes/add",
 		"/ui/remotes/somehost/save",
 		"/ui/remotes/somehost/delete",
+		// The wizard's own POSTs are the same class of gate on a second
+		// surface, and are just as invisible when one is dropped.
+		"/setup/complete",
+		"/setup/start",
+		"/setup/skip",
+		"/setup/reset",
+		"/setup/secret",
 	}
 	for _, route := range routes {
 		req, err := http.NewRequest("POST", ts.URL+route, nil)

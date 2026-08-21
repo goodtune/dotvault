@@ -420,7 +420,7 @@ func TestLDAPStatus_LosingConcurrentPollCannotAdoptRawToken(t *testing.T) {
 // operational token comes from exactly one place — the cert login. Guarding
 // only the two bootstrap-adjacent sites left the token login able to install
 // a credential the cert flow never sanctioned, contradicting that contract.
-// It is CSRF-protected and loopback-only and the SPA never renders the form
+// It is CSRF-protected and loopback-only and the login view never renders the form
 // under mtls, so this closes the direct-POST path rather than a likely one.
 //
 // Reverting the guard in handleTokenLogin must fail this test.
@@ -480,7 +480,7 @@ func TestTokenLogin_AllowedWithoutCertificateAuth(t *testing.T) {
 // vault.mtls.bootstrap_mount. The CLI bootstrap already does — runBootstrap
 // builds its Manager with AuthMount: m.MTLS.BootstrapMount — so before this fix
 // a deployment whose bootstrap mount differed from its operational auth mount
-// worked from the CLI and silently hit the wrong Vault path from the SPA.
+// worked from the CLI and silently hit the wrong Vault path from the browser.
 //
 // Reverting loginMount (i.e. going back to s.authMount at the three handler
 // sites) must fail the certAuth cases below.

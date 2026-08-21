@@ -896,7 +896,7 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 // TestLifecycleManager_OnReauthFires verifies that when the token is
 // invalid AND no fresh value is available on disk, the OnReauth callback
 // fires exactly once (so web mode can clear the in-memory token and
-// force the SPA back to its login screen).
+// force the web UI back to its login screen).
 func TestLifecycleManager_OnReauthFires(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -265,7 +265,7 @@ type ServerConfig struct {
 	Version       string
 	// BootstrapMethod is the login method used for the one-time mTLS
 	// certificate bootstrap ("ldap" or "oidc", from
-	// vault.mtls.bootstrap_method). Reported on /api/v1/status so the SPA
+	// vault.mtls.bootstrap_method). Reported on /api/v1/status so a client
 	// knows which login form to present while a BootstrapLogin is waiting.
 	BootstrapMethod string
 	// BootstrapMount is the auth mount used for the one-time mTLS certificate
@@ -1364,7 +1364,7 @@ func (s *Server) WaitForEnrolments() {
 }
 
 // EnrolPromptSecret implements a web-based PromptSecret. It sets the pending
-// prompt state and blocks until the frontend submits a value via the
+// prompt state and blocks until the UI submits a value via the
 // /api/v1/enrol/secret endpoint, or the context is cancelled.
 func (s *Server) EnrolPromptSecret(ctx context.Context, label string) (string, error) {
 	ch := make(chan string, 1)

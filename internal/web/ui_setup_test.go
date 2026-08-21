@@ -394,3 +394,34 @@ func TestNeedsWizard_UnattendedExclusionIsUnconditional(t *testing.T) {
 		t.Error("neither an unattended nor an unrunnable enrolment can justify a wizard")
 	}
 }
+
+// TestSetupWizard_RendersUnattendedCardsWithHelpText guards the boundary of
+// the unattended exclusion. It applies to whether the wizard *appears*, and
+// to nothing else: once the wizard is up, a copy enrolment is an ordinary
+// card and its configured help_text renders — as markdown — exactly like any
+// other engine's. Narrowing the exclusion into the render loop would drop it
+// silently, since a missing card looks like a card for an enrolment that
+// simply is not configured.
+func TestSetupWizard_RendersUnattendedCardsWithHelpText(t *testing.T) {
+	s := setupTestServer(t, map[string]config.Enrolment{
+		"mirror": {Engine: "copy", HelpText: "Mirrors the **team** secret."},
+		"ssh":    {Engine: "ssh", HelpText: "Generates a key pair."},
+	})
+
+	w := httptest.NewRecorder()
+	s.handleSetup(w, httptest.NewRequest("GET", "/setup/", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("setup status = %d, want 200 (the ssh enrolment warrants a wizard)", w.Code)
+	}
+	body := w.Body.String()
+
+	if !strings.Contains(body, "Mirrors the") {
+		t.Error("copy enrolment's help_text is missing from the wizard")
+	}
+	if !strings.Contains(body, "<strong>team</strong>") {
+		t.Error("copy enrolment's help_text was not rendered as markdown")
+	}
+	if !strings.Contains(body, "Generates a key pair") {
+		t.Error("interactive enrolment's help_text is missing from the wizard")
+	}
+}

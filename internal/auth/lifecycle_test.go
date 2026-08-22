@@ -15,6 +15,8 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 
 	"github.com/goodtune/dotvault/internal/vaulttest"
+
+	"github.com/goodtune/dotvault/internal/sockettest"
 )
 
 func TestLifecycleManager_Start(t *testing.T) {
@@ -562,7 +564,7 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 	defer ts.Close()
 
 	// The peer daemon serves its live token over the socket.
-	sock := filepath.Join(t.TempDir(), "peer.sock")
+	sock := filepath.Join(sockettest.Dir(t), "peer.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
 	})
@@ -1022,7 +1024,7 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
+	sock := filepath.Join(sockettest.Dir(t), "peer.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"token":"fresh-token"}`))
 	})

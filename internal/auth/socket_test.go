@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/sockettest"
 )
 
 // newUnixTokenServer starts an httptest server bound to a Unix socket at
@@ -35,7 +37,7 @@ func newUnixTokenServer(t *testing.T, sockPath string, handler http.HandlerFunc)
 }
 
 func TestFetchTokenFromSocket_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockettest.Dir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"token":"hvs.peer-token"}`))
@@ -60,7 +62,7 @@ func TestFetchTokenFromSocket_EmptyPath(t *testing.T) {
 func TestFetchTokenFromSocket_MissingSocket(t *testing.T) {
 	// A path that does not exist must resolve to ("", nil) — the peer simply
 	// isn't connected, and the caller carries on with its normal auth flow.
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockettest.Dir(t), "absent.sock")
 	got, err := FetchTokenFromSocket(context.Background(), sock)
 	if err != nil || got != "" {
 		t.Errorf("got (%q, %v), want (\"\", nil)", got, err)
@@ -70,7 +72,7 @@ func TestFetchTokenFromSocket_MissingSocket(t *testing.T) {
 func TestFetchTokenFromSocket_StaleSocket(t *testing.T) {
 	// A regular file at the socket path (no listener) stands in for a stale
 	// socket left behind by a dead SSH session: the dial fails and we carry on.
-	sock := filepath.Join(t.TempDir(), "stale.sock")
+	sock := filepath.Join(sockettest.Dir(t), "stale.sock")
 	if err := os.WriteFile(sock, []byte("not a socket"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +85,7 @@ func TestFetchTokenFromSocket_StaleSocket(t *testing.T) {
 func TestFetchTokenFromSocket_PeerUnauthenticated(t *testing.T) {
 	// The peer is reachable but holds no token (mirrors handleToken's 401):
 	// best-effort, so we return ("", nil) rather than an error.
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockettest.Dir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"not authenticated"}`, http.StatusUnauthorized)
 	})
@@ -95,7 +97,7 @@ func TestFetchTokenFromSocket_PeerUnauthenticated(t *testing.T) {
 }
 
 func TestFetchTokenFromSocket_MalformedBody(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockettest.Dir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`this is not json`))
 	})
@@ -157,7 +159,7 @@ func TestManagerLogin_BorrowsFromSocket(t *testing.T) {
 
 	vaultURL := mockVaultAccepting(t, "peer-token")
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
+	sock := filepath.Join(sockettest.Dir(t), "peer.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
 	})
@@ -191,7 +193,7 @@ func TestManagerLogin_SocketTokenRejectedFallsThrough(t *testing.T) {
 	// The mock Vault accepts no token, so the borrowed one is rejected.
 	vaultURL := mockVaultAccepting(t, "")
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
+	sock := filepath.Join(sockettest.Dir(t), "peer.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"token":"rejected-token"}`))
 	})
@@ -219,7 +221,7 @@ func TestManagerLogin_SocketTokenRejectedFallsThrough(t *testing.T) {
 // pass sockets most-stable-first (local API socket before an SSH-forwarded
 // peer) and the first that answers is used, without dialling the rest.
 func TestFetchTokenFromSockets_FirstWins(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	local := filepath.Join(dir, "api.sock")
 	remote := filepath.Join(dir, "peer.sock")
 
@@ -248,7 +250,7 @@ func TestFetchTokenFromSockets_FirstWins(t *testing.T) {
 // exists for in reverse: the preferred socket is gone (or holds no token) and
 // the next candidate must still be tried.
 func TestFetchTokenFromSockets_FallsThrough(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	missing := filepath.Join(dir, "absent.sock")
 	empty := filepath.Join(dir, "empty.sock")
 	good := filepath.Join(dir, "good.sock")
@@ -270,7 +272,7 @@ func TestFetchTokenFromSockets_FallsThrough(t *testing.T) {
 }
 
 func TestFetchTokenFromSockets_AllExhausted(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	got, source := FetchTokenFromSockets(context.Background(), []string{
 		"", filepath.Join(dir, "absent.sock"),
 	})

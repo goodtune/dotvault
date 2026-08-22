@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/sockettest"
 )
 
 // newUnixServer starts an httptest server bound to a Unix socket at sockPath,
@@ -30,7 +32,7 @@ func newUnixServer(t *testing.T, sockPath, pattern string, handler http.HandlerF
 }
 
 func TestPostFormToPeer_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockettest.Dir(t), "dotvault.sock")
 	var gotPath, gotField, gotHost string
 	newUnixServer(t, sock, "POST /api/v1/remote/browse", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -54,7 +56,7 @@ func TestPostFormToPeer_Success(t *testing.T) {
 }
 
 func TestPostFormToPeer_MissingSocketIsUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockettest.Dir(t), "absent.sock")
 	err := PostFormToPeer(context.Background(), sock, "/api/v1/remote/browse", url.Values{})
 	if !errors.Is(err, ErrPeerUnreachable) {
 		t.Fatalf("err = %v, want it to wrap ErrPeerUnreachable", err)
@@ -62,7 +64,7 @@ func TestPostFormToPeer_MissingSocketIsUnreachable(t *testing.T) {
 }
 
 func TestPostFormToPeer_StaleSocketIsUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "stale.sock")
+	sock := filepath.Join(sockettest.Dir(t), "stale.sock")
 	if err := os.WriteFile(sock, []byte("not a socket"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +75,7 @@ func TestPostFormToPeer_StaleSocketIsUnreachable(t *testing.T) {
 }
 
 func TestPostFormToPeer_NonOKIsStatusError(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockettest.Dir(t), "dotvault.sock")
 	newUnixServer(t, sock, "POST /api/v1/remote/browse", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":"unsupported url scheme"}`))

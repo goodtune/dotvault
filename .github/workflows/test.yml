@@ -1,16 +1,49 @@
 name: Test
 
 on:
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and with one it would get no CI at all — the case is silent, since GitHub
+  # reports "no checks" rather than a failure. Running on every PR costs
+  # nothing here (public repo, free runners) and is the point of having tests.
   pull_request:
-    branches: [main, master]
 
 permissions:
   contents: read
 
 jobs:
   unit-tests:
-    name: Go unit tests
-    runs-on: ubuntu-latest
+    name: Go unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the result on the others — a
+      # Windows-only regression is exactly what this matrix exists to surface,
+      # and cancelling the other jobs on it would lose the signal that the
+      # failure is platform-specific rather than general.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: dotvault
+          - os: windows-latest
+            # go build -o takes the name literally; it does not append .exe.
+            bin: dotvault.exe
+            # Advisory, not blocking — see below.
+            advisory: true
+          - os: macos-latest
+            bin: dotvault
+    # Windows reports but does not block, because 28 test functions there had
+    # never executed and six packages fail on assumptions nobody could have
+    # noticed: Unix-only socket paths, Unix mode bits on a platform that has
+    # DACLs instead, and LF line endings. Those are the tests' problem, not the
+    # daemon's — except for one that is real, an OIDC callback-port fallback
+    # that never fires on Windows because net returns WSAEADDRINUSE where
+    # internal/auth/oidc.go tests for syscall.EADDRINUSE.
+    #
+    # Blocking on that backlog would mean this matrix could not land at all,
+    # and the alternative — keeping Windows uncompiled — is how the backlog got
+    # here. Drop `advisory` once the follow-ups clear; the flag is a debt
+    # marker, not a decision that Windows failures are acceptable.
+    continue-on-error: ${{ matrix.advisory || false }}
     steps:
       - uses: actions/checkout@v7
 
@@ -22,21 +55,30 @@ jobs:
       # the go-fuse binding would silently go untested in CI while every
       # other package stayed green. Installing the helper makes the skip a
       # real signal rather than the permanent state.
+      #
+      # Linux only: macOS would need macFUSE, a kernel extension requiring
+      # manual approval and so not installable unattended, and Windows has no
+      # FUSE at all (vaultfs/mount_other.go returns ErrUnsupported there).
+      # Both still exercise the platform-neutral tree/render/cache core, which
+      # is where the logic lives.
       - name: Install FUSE (for the filesystem mount tests)
+        if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y fuse3
 
       - name: Run tests
         run: go test ./...
 
       - name: Build binary
-        run: CGO_ENABLED=0 go build -o dotvault ./cmd/dotvault
+        run: CGO_ENABLED=0 go build -o ${{ matrix.bin }} ./cmd/dotvault
 
       - name: Verify binary runs
-        run: ./dotvault version
+        run: ./${{ matrix.bin }} version
 
+      # systemd is Linux-only, and the units ship in the RPM/DEB/APK packages
+      # built there.
       - name: Verify packaged systemd units
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo install -m 0755 ./dotvault /usr/bin/dotvault
           systemd-analyze verify \
             packaging/linux/dotvault.service
-

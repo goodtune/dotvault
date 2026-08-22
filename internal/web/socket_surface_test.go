@@ -17,6 +17,8 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
+
+	"github.com/goodtune/dotvault/internal/sockettest"
 )
 
 // socketClient builds an http.Client that reaches the server over its Unix
@@ -45,7 +47,7 @@ func startSocketServer(t *testing.T, vaultHandler http.Handler) (*Server, *http.
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "api.sock")
+	sock := filepath.Join(sockettest.Dir(t), "api.sock")
 	s, err := NewServer(ServerConfig{
 		WebCfg:        config.WebConfig{Enabled: false},
 		VaultCfg:      config.VaultConfig{Address: ts.URL, KVMount: "kv", UserPrefix: "users/"},
@@ -202,7 +204,7 @@ func TestSocketAndTCPShareOneMux(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "api.sock")
+	sock := filepath.Join(sockettest.Dir(t), "api.sock")
 	s, err := NewServer(ServerConfig{
 		WebCfg:        config.WebConfig{Enabled: true, Listen: "127.0.0.1:0"},
 		VaultCfg:      config.VaultConfig{Address: ts.URL, KVMount: "kv", UserPrefix: "users/"},
@@ -345,7 +347,7 @@ func TestPartialBindCleansUpBoundListeners(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "api.sock")
+	sock := filepath.Join(sockettest.Dir(t), "api.sock")
 	s, err := NewServer(ServerConfig{
 		WebCfg:        config.WebConfig{Enabled: true, Listen: occupied.Addr().String()},
 		VaultCfg:      config.VaultConfig{Address: ts.URL},
@@ -445,7 +447,7 @@ func fakeActivatedListener(t *testing.T, path string) func() {
 // systemd owns the node — its Shutdown must not unlink it. Reverting the
 // socketBound skip or the activated branch fails this test.
 func TestSocketActivatedAPIServesAndSurvivesShutdown(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	activatedPath := filepath.Join(dir, "systemd.sock")
 	restore := fakeActivatedListener(t, activatedPath)
 	defer restore()

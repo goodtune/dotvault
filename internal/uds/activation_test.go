@@ -10,22 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-)
 
-// shortSockDir returns a temp directory with a short absolute path. It
-// deliberately avoids t.TempDir(), whose path embeds the full test and
-// subtest names: under macOS's already-long /var/folders TMPDIR that blows
-// through the 104-byte sun_path limit and every bind fails with a baffling
-// "invalid argument" before the test proper begins.
-func shortSockDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "uds")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return dir
-}
+	"github.com/goodtune/dotvault/internal/sockettest"
+)
 
 // listenerFile binds a real unix listener and returns a dup'd *os.File for
 // it, standing in for an fd inherited from systemd. The parent directory is
@@ -56,7 +43,7 @@ func listenerFile(t *testing.T, path string) *os.File {
 
 func TestAdoptActivated(t *testing.T) {
 	t.Run("accepts an owner-only listener and reports its real path", func(t *testing.T) {
-		dir := shortSockDir(t)
+		dir := sockettest.Dir(t)
 		path := filepath.Join(dir, "api.sock")
 		f := listenerFile(t, path)
 
@@ -79,7 +66,7 @@ func TestAdoptActivated(t *testing.T) {
 		// retry would self-bind against the systemd-owned path and loop on
 		// "already running" forever; re-adoption from the retained master
 		// is the fix, so it is the contract under test.
-		dir := shortSockDir(t)
+		dir := sockettest.Dir(t)
 		path := filepath.Join(dir, "s.sock")
 		f := listenerFile(t, path)
 
@@ -117,7 +104,7 @@ func TestAdoptActivated(t *testing.T) {
 		// SocketMode defaults to 0666, so a hand-written socket unit that
 		// omits it would silently hand the token endpoint to every uid on
 		// the box. Refusal — not a warning — is the invariant.
-		dir := shortSockDir(t)
+		dir := sockettest.Dir(t)
 		path := filepath.Join(dir, "loose.sock")
 		f := listenerFile(t, path)
 		if err := os.Chmod(path, 0o666); err != nil {
@@ -140,7 +127,7 @@ func TestAdoptActivated(t *testing.T) {
 		// check, feeding borrowers a hostile "token". Self-bind creates
 		// the parent 0700; activation must refuse what self-bind would
 		// never produce.
-		dir := shortSockDir(t)
+		dir := sockettest.Dir(t)
 		path := filepath.Join(dir, "s.sock")
 		f := listenerFile(t, path)
 		if err := os.Chmod(dir, 0o755); err != nil {
@@ -159,7 +146,7 @@ func TestAdoptActivated(t *testing.T) {
 	t.Run("refusal leaves the node in place", func(t *testing.T) {
 		// A refusal must not unlink systemd's node: FileListener-derived
 		// listeners have unlink-on-close disabled, and this pins that.
-		dir := shortSockDir(t)
+		dir := sockettest.Dir(t)
 		path := filepath.Join(dir, "keep.sock")
 		f := listenerFile(t, path)
 		if err := os.Chmod(path, 0o666); err != nil {
@@ -174,7 +161,7 @@ func TestAdoptActivated(t *testing.T) {
 	})
 
 	t.Run("refuses a non-socket fd", func(t *testing.T) {
-		f, err := os.CreateTemp(shortSockDir(t), "plain")
+		f, err := os.CreateTemp(sockettest.Dir(t), "plain")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +193,7 @@ func TestAdoptActivated(t *testing.T) {
 }
 
 func TestActivationStateClaims(t *testing.T) {
-	dir := shortSockDir(t)
+	dir := sockettest.Dir(t)
 	fAPI := listenerFile(t, filepath.Join(dir, "api.sock"))
 	fUnknown := listenerFile(t, filepath.Join(dir, "u.sock"))
 	st := &activationState{byName: map[string][]*os.File{
@@ -253,7 +240,7 @@ func TestActivationStateClaims(t *testing.T) {
 // clients hang — and a re-claim after a listener restart must not hand the
 // same extras out again.
 func TestActivationStateClaimExtras(t *testing.T) {
-	dir := shortSockDir(t)
+	dir := sockettest.Dir(t)
 	f1 := listenerFile(t, filepath.Join(dir, "a.sock"))
 	f2 := listenerFile(t, filepath.Join(dir, "b.sock"))
 	f3 := listenerFile(t, filepath.Join(dir, "c.sock"))
@@ -285,7 +272,7 @@ func TestDrainListener(t *testing.T) {
 	// systemd retains its own listening fd, so closing our dup refuses
 	// nobody — clients would connect into a backlog no one accepts and
 	// hang. Drained clients connect and get EOF immediately.
-	dir := shortSockDir(t)
+	dir := sockettest.Dir(t)
 	path := filepath.Join(dir, "drain.sock")
 	ln, err := net.Listen("unix", path)
 	if err != nil {

@@ -9,13 +9,15 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/sockettest"
 )
 
 // TestListenPermissions pins the owner-only invariant. Anyone who can connect
 // to a dotvault socket can borrow the live Vault token or have the agent sign
 // for them, so 0600-in-0700 is a security property, not a style choice.
 func TestListenPermissions(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sock := filepath.Join(dir, "sub", "api.sock")
 
 	ln, err := Listen(sock)
@@ -40,7 +42,7 @@ func TestListenPermissions(t *testing.T) {
 // XDG_RUNTIME_DIR/dotvault may already exist from an earlier run (or another
 // tool) with wider bits, and binding into it must not inherit them.
 func TestListenTightensLooseDirectory(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sub := filepath.Join(dir, "loose")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
@@ -62,7 +64,7 @@ func TestListenTightensLooseDirectory(t *testing.T) {
 // TestListenRemovesStaleSocket covers the unclean-shutdown case: a leftover
 // node with nothing behind it must not block the next start.
 func TestListenRemovesStaleSocket(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sock := filepath.Join(dir, "api.sock")
 	if err := os.WriteFile(sock, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -86,7 +88,7 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 // socket a running instance is serving, which would silently disconnect every
 // client of the first.
 func TestListenRefusesLiveSocket(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sock := filepath.Join(dir, "api.sock")
 
 	first, err := Listen(sock)
@@ -124,7 +126,7 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 }
 
 func TestCleanupRemovesSocket(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sock := filepath.Join(dir, "api.sock")
 	ln, err := Listen(sock)
 	if err != nil {
@@ -147,7 +149,7 @@ func TestCleanupRemovesSocket(t *testing.T) {
 // loser must not fail startup over a node that is already gone — which is the
 // state it wanted in the first place.
 func TestRemoveStaleToleratesMissingNode(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	absent := filepath.Join(dir, "never-existed.sock")
 
 	if err := removeStale(absent); err != nil {
@@ -183,7 +185,7 @@ func TestRemoveStaleToleratesMissingNode(t *testing.T) {
 // listening" rather than as a raw bind or unlink error an operator would read
 // as a dotvault bug.
 func TestConcurrentListenYieldsOneWinner(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockettest.Dir(t)
 	sock := filepath.Join(dir, "api.sock")
 	// Seed a stale node so every racer takes the probe-then-remove path.
 	if err := os.WriteFile(sock, nil, 0o600); err != nil {

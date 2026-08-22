@@ -70,6 +70,7 @@ internal/
   sshfwd/                Daemon-managed SSH remote forwards
   vaultfs/               FUSE filesystem: platform-neutral core + build-tagged go-fuse binding
   vaulttest/             Shared plumbing for tests against the docker-compose dev Vault
+  sockettest/            Short temp dir for tests that bind Unix sockets (macOS sun_path limit)
 test/integration/        Integration tests against real Vault
 packaging/windows/       NSIS installer script + build helper
 packaging/linux/         systemd units
@@ -121,7 +122,7 @@ Deliberate choices, recorded so they are not re-litigated by accident — and so
 
 - **Adding a scripted page means updating `uiScriptedPath`.** The relaxed CSP that lets datastar evaluate attribute expressions is keyed on that list. A page missed there renders fine and then silently refuses to evaluate *any* datastar expression — which is how the wizard's card poll was first found broken.
 - **A green `go test ./...` is not evidence the Vault-backed tests ran.** They skip silently when the docker-compose stack is down. This has masked a real regression: five packages each hardcoded a `dev-root-token` that was never valid, so those tests skipped when down and 403'd when up — a whole tier never ran. `internal/vaulttest` centralises the lookup; **new Vault-backed tests must go through it**. Bring the stack up before trusting a run touching auth, sync, enrolment, or the vault client.
-- **Seven `internal/web` socket tests fail on macOS and pass in CI.** `t.TempDir()` there yields a ~112-byte path against the OS's 103-byte `sun_path` limit for Unix sockets, so `TestSocketOnly*`, `TestLosingServerDoesNotUnlinkWinnersSocket`, `TestPartialBindCleansUpBoundListeners`, `TestTokenEndpointDeclinesDuringReauth`, and `TestSocketActivatedAPIServesAndSurvivesShutdown` fail with a path-length error. CI is Linux (`/tmp/...`, short) and green. Confirm against a clean checkout before assuming you broke something.
+- **Bind Unix sockets in tests under `sockettest.Dir(t)`, never `t.TempDir()`.** macOS caps `sun_path` at 104 bytes and puts TMPDIR under `/var/folders/...`, so `t.TempDir()` plus the test's own name overflows it and `bind(2)` fails. It is a function of the *test name's* length, so renaming a passing test can break it while Linux CI stays green throughout.
 - **FUSE tests skip when FUSE is unusable.** CI installs `fuse3`; macOS needs macFUSE. The platform-neutral `internal/vaultfs` core is tested everywhere regardless.
 - **A new browser-driven enrolment engine needs a matching web card.** The web runner deliberately builds `enrol.IO` with a nil `Browser` (the daemon must not pop a browser on a headless host), so the engine writes its login URL to `io.Out`. Emit it in a form the card (`internal/web/ui_enrol.go` + `uitmpl/enrol_card.tmpl`) already recognises — an `https://` URL, plus the one-time-code line only if there is a user code — or add a branch. Otherwise it lands in the raw-output fallback and the user sees a bare URL with nothing to click. **Verify the web path, not just the CLI**, which opens a real browser and masks this.
 - **A rule's render-affecting definition is fingerprinted into state.** Without `ruleRenderHash`, editing only `target.template` would skip forever — neither the secret version nor the file moved.

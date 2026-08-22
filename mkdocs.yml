@@ -4,13 +4,10 @@ site_url: https://goodtune.github.io/dotvault/
 repo_url: https://github.com/goodtune/dotvault
 repo_name: goodtune/dotvault
 
-# Internal planning/spec artifacts live under docs/superpowers/, and the
-# agent-facing architecture reference carved out of CLAUDE.md lives under
-# docs/architecture/. Both are repo-local reference, not part of the published
-# site.
+# Internal planning/spec artifacts live under docs/superpowers/ for repo-local
+# reference but are not part of the published site.
 exclude_docs: |
   superpowers/
-  architecture/
 
 theme:
   name: material

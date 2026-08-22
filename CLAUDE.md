@@ -2,7 +2,7 @@
 
 Cross-platform daemon (Go) that runs in user context, authenticates to HashiCorp Vault, and synchronises KVv2 secrets into local configuration files via surgical, field-level merges.
 
-**How to read this file.** It is a router, not a specification. Items under **Invariant** break something when violated — treat them as binding. Items under **Current design** record a choice that made sense at the time; if a task calls for revisiting one, propose it and say what changes. Depth lives in `docs/architecture/` and in package doc comments — follow the pointer rather than assuming this file is complete.
+**How to read this file.** It is a router, not a specification. Items under **Invariant** break something when violated — treat them as binding. Items under **Current design** record a choice that made sense at the time; if a task calls for revisiting one, propose it and say what changes. Depth lives in package doc comments and `docs/`, never in a third copy here — follow the pointer rather than assuming this file is complete.
 
 ## Agent workflow: review before pushing
 
@@ -131,22 +131,8 @@ Deliberate choices, recorded so they are not re-litigated by accident — and so
 
 ## Where the depth lives
 
-Carved verbatim out of this file; each is the full prior text, not a summary.
+**Not in another markdown file.** Rationale belongs at the symbol it explains, in a godoc comment, because that is the only copy that cannot drift past what it describes — when #156 deleted the SPA, its 14 source files took their comments with them automatically, while this file went on advertising an npm build step that had been wrong since April. A separate architecture document is a fourth copy of something the code and `docs/` already carry twice, and the one with no coupling to either.
 
-| Topic | Internal detail | User-facing |
-|---|---|---|
-| Authentication, tokens, sockets | `docs/architecture/authentication.md` | `docs/authentication/` |
-| Config sections, validation, registry | `docs/architecture/configuration.md` | `docs/configuration/config-reference.md` |
-| CLI command behaviour | `docs/architecture/cli-internals.md` | `docs/cli.md` |
-| Daemon startup and reload | `docs/architecture/daemon-lifecycle.md` | `docs/admin/deployment.md` |
-| Enrolment engines | `docs/architecture/enrolment.md` | `docs/services/` |
-| Sync engine, handlers, templates | `docs/architecture/sync-engine.md` | `docs/configuration/sync-rules.md` |
-| Web UI, `/ui/`, routes | `docs/architecture/web.md` | `docs/web-ui.md` |
-| SSH agent and forwards | `docs/architecture/ssh.md` | `docs/guide/ssh-agent.md`, `ssh-forwards.md` |
-| FUSE and the per-user overlay | `docs/architecture/filesystem.md` | `docs/guide/filesystem.md` |
-| `client/` facade, Python bindings | `docs/architecture/public-api.md` | `client/README.md`, `python/README.md` |
-| Version injection, Windows binaries | `docs/architecture/build-and-packaging.md` | `docs/getting-started/installation.md` |
-| Dependency table, permission matrix | `docs/architecture/dependencies-and-testing.md` | — |
-| Dependency table, permission matrix | `docs/architecture/dependencies-and-testing.md` | — |
+So: for *how* something works, read the package — `internal/vaulttest`, `internal/uds`, `internal/vaultfs`, `internal/securestore`, and `internal/auth/method.go` are the models for the density expected. For user-facing behaviour, `docs/` is the published reference (`docs/authentication/`, `docs/configuration/`, `docs/guide/`, `docs/services/`). For a dated record of why a design was chosen, `docs/superpowers/specs/`.
 
-Package doc comments carry the rationale nearest the code — `internal/vaulttest`, `internal/uds`, `internal/vaultfs`, and `internal/securestore` are the models. Prefer adding new rationale there over growing this file.
+What lives *here* is only what has no code home: rules spanning several files that no single file owns (the registry three-surface lockstep), decisions **not** taken (there is no ADMX template to comment on), workflow, and environmental traps. When you find yourself adding anything else to this file, that is the signal it belongs in a godoc instead.

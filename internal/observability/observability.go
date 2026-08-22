@@ -62,8 +62,7 @@
 //     discipline the slog handlers follow. The one deliberate exception is
 //     the `host` label on the SSH forward instruments (dotvault.ssh.*):
 //     unlike a JFrog server URL, it names an entry in the operator's own
-//     small, statically-configured remote list — see
-//     docs/superpowers/specs/2026-08-09-managed-ssh-forwards-design.md — so
+//     small, statically-configured remote list (see internal/sshfwd), so
 //     the cardinality bound holds for the same reason a Vault path's does
 //     not.
 //   - The identity attributes on the resource (service.name,

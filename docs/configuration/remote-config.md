@@ -2,8 +2,6 @@
 
 The locally provisioned configuration (the YAML file, or the Windows registry under Group Policy) can act as a **base** that is overlaid with a partial configuration document fetched over HTTPS from a `dotvault-config` service. This lets a fleet operator deliver dynamic, personalised configuration — per-user, per-OS, and per-group rules and enrolments — without touching the locally managed base.
 
-The full design, including the service side, lives in the repository spec at `docs/superpowers/specs/2026-06-10-remote-config-design.md`.
-
 ## Enabling the overlay
 
 ```yaml

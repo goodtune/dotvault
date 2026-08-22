@@ -1,8 +1,11 @@
 name: Test
 
 on:
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and with one it would get no CI at all — the case is silent, since GitHub
+  # reports "no checks" rather than a failure. Running on every PR costs
+  # nothing here (public repo, free runners) and is the point of having tests.
   pull_request:
-    branches: [main, master]
 
 permissions:
   contents: read

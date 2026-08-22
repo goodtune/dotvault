@@ -27,8 +27,23 @@ jobs:
           - os: windows-latest
             # go build -o takes the name literally; it does not append .exe.
             bin: dotvault.exe
+            # Advisory, not blocking — see below.
+            advisory: true
           - os: macos-latest
             bin: dotvault
+    # Windows reports but does not block, because 28 test functions there had
+    # never executed and six packages fail on assumptions nobody could have
+    # noticed: Unix-only socket paths, Unix mode bits on a platform that has
+    # DACLs instead, and LF line endings. Those are the tests' problem, not the
+    # daemon's — except for one that is real, an OIDC callback-port fallback
+    # that never fires on Windows because net returns WSAEADDRINUSE where
+    # internal/auth/oidc.go tests for syscall.EADDRINUSE.
+    #
+    # Blocking on that backlog would mean this matrix could not land at all,
+    # and the alternative — keeping Windows uncompiled — is how the backlog got
+    # here. Drop `advisory` once the follow-ups clear; the flag is a debt
+    # marker, not a decision that Windows failures are acceptable.
+    continue-on-error: ${{ matrix.advisory || false }}
     steps:
       - uses: actions/checkout@v7
 

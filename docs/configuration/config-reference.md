@@ -174,12 +174,12 @@ vault:
     }
     ```
 
-    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these three and is a working reference *for them*. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
+    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these three. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
 
 !!! warning "Certificate auth needs two more"
     Under `mtls`, `mtls+tpm`, or `mtls+os` the daemon also rotates its own certificate and retires the one it replaces, both headless and both using this same downscoped token. That needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the superseded certificate) on top of the three above. Without `pki/sign` the certificate runs to expiry and the host needs a fresh human bootstrap; without `pki/revoke` rotation still works but each superseded certificate stays valid at the CA until its own TTL ends.
 
-    `pki/revoke` is not scopeable to a host's own certificates — read the trade-off in [What your Vault admin must set up](../authentication/mtls.md#what-your-vault-admin-must-set-up) before granting it, and note that [`revoke_superseded: false`](../authentication/mtls.md#retiring-the-superseded-certificate) is the supported way to decline it without collecting a warning on every rotation. The dev stack's `dotvault` policy grants both and is a working reference for the whole cert-auth lifecycle.
+    `pki/revoke` is not scopeable to a host's own certificates — read the trade-off in [What your Vault admin must set up](../authentication/mtls.md#what-your-vault-admin-must-set-up) before granting it, and note that [`revoke_superseded: false`](../authentication/mtls.md#opting-out-revoke_superseded-false) is the supported way to decline it without collecting a warning on every rotation. The dev stack's `dotvault` policy grants both and is a working reference for the whole cert-auth lifecycle.
 
 This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
 

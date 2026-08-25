@@ -83,6 +83,7 @@ vault:
     ttl: ""                      # optional TTL hint; PKI role TTL is authoritative (mtls+os defaults to 720h)
     reissue_before: 168h         # rotate this long before expiry (default 7d)
     seal_to_pcrs: false          # mtls+tpm only: bind unseal to the current boot state
+    revoke_superseded: true      # revoke the cert a rotation replaced (default true; see below)
     storage_dir: ""              # default: {cache_dir}/mtls
     byo:                         # optional bring-your-own seeding (not supported with mtls+os)
       cert: ""                   # PEM certificate path
@@ -182,10 +183,11 @@ This is a Vault configuration exercise, not a dotvault setting:
       capabilities = ["create", "update"]
     }
 
-    # Retiring the certificate the rotation replaced. Missing: rotation still
-    # succeeds and warns; the old certificate stays valid at the CA until its
-    # own expiry. Read the scoping warning above before granting this — it
-    # cannot be limited to this host's own certificates.
+    # Retiring the certificate the rotation replaced. Read the scoping warning
+    # above before granting this — it cannot be limited to this host's own
+    # certificates. If you decide against it, set vault.mtls.revoke_superseded:
+    # false rather than simply omitting it: dotvault reads a missing capability
+    # as a misconfiguration and will warn and retry on every rotation.
     path "pki/revoke" {
       capabilities = ["create", "update"]
     }

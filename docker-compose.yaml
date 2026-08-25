@@ -160,7 +160,7 @@ services:
         #               enters its reissue_before window. Without it the cert
         #               runs to expiry and the host needs a fresh human
         #               bootstrap, defeating the point of certificate auth.
-        #   pki/revoke — retires the certificate the rotation replaced. Without
+        #   pki/revoke - retires the certificate the rotation replaced. Without
         #               it rotation still works, but each superseded cert stays
         #               valid at the CA until its own TTL ends, so a host
         #               accumulates simultaneously valid identities.
@@ -168,10 +168,12 @@ services:
         # Read the scoping caveat before copying pki/revoke into a production
         # policy: Vault takes the serial as a request-body parameter and ACLs
         # cannot constrain one, so this grants revocation for EVERY certificate
-        # in the pki mount, not just this host's. That is tolerable here because
-        # the dev mount issues nothing else; in production, issue client certs
-        # from a dedicated mount or intermediate, or set
-        # vault.mtls.revoke_superseded: false to opt out.
+        # in the pki mount, not just this host's — including every other dev
+        # user's client cert, since they all come from this one mount. That is
+        # tolerable in a throwaway dev stack; in production, issue client certs
+        # from a dedicated mount or intermediate so the blast radius is only the
+        # client-cert population, or set vault.mtls.revoke_superseded: false to
+        # opt out of revocation entirely.
         path "pki/sign/dotvault-client" {
           capabilities = ["create", "update"]
         }

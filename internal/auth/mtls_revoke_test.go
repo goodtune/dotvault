@@ -337,7 +337,7 @@ func TestRevocationCanBeDisabled(t *testing.T) {
 	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
 
 	m := mtlsManager(t, srv, dir)
-	m.MTLS.RevokeSuperseded = false
+	m.MTLS.SkipRevokeSuperseded = true
 	m.VaultClient.SetToken("s.operational-token")
 
 	buf := captureSlog(t)
@@ -358,52 +358,137 @@ func TestRevocationCanBeDisabled(t *testing.T) {
 	if len(f.revokedSerials) != 0 {
 		t.Errorf("revoked %v with revocation disabled", f.revokedSerials)
 	}
-	// A deliberate choice must not nag on every rotation.
-	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("disabling revocation must not warn; log=%q", buf.String())
+	// A deliberate choice must not nag on every rotation, but must not be
+	// invisible either — a fleet quietly accumulating live certificates has to
+	// look different from one that is not. Assert the positive: the INFO line
+	// naming the setting. Asserting only the absence of a WARN would not
+	// discriminate, since the enabled path emits none either.
+	logged := buf.String()
+	if strings.Contains(logged, "level=WARN") {
+		t.Errorf("disabling revocation must not warn; log=%q", logged)
+	}
+	if !strings.Contains(logged, "revoke_superseded is false") {
+		t.Errorf("the skip must be logged naming the setting; log=%q", logged)
 	}
 }
 
-// TestDisablingRevocationPreservesTheBacklog pins what happens to serials
-// already queued when an operator turns revocation off. They are kept, not
-// dropped: the operator has declined to revoke *for now*, and discarding the
-// list would mean re-enabling later silently starts from empty, leaving those
-// certificates valid with nothing left that remembers them.
-func TestDisablingRevocationPreservesTheBacklog(t *testing.T) {
+// TestParamsZeroValueRevokes pins the safe zero value.
+//
+// MTLSParams carries resolved values and is built at several sites — the
+// daemon, the client facade, integration tests. The field is therefore spelled
+// as a NEGATIVE (SkipRevokeSuperseded) so that a site which never mentions it
+// gets revocation, not silence. Spelled positively, forgetting it would
+// silently disable a security default, which is exactly what happened to the
+// integration harness before this test existed.
+func TestParamsZeroValueRevokes(t *testing.T) {
 	ca := newTestCA(t)
 	f := &fakeVault{ca: ca}
 	srv := newFakeVaultServer(t, f)
 	dir := t.TempDir()
 	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
 
+	// Deliberately built WITHOUT naming the field, as a forgetful caller would.
+	vc, err := vault.NewClient(vault.Config{Address: srv.URL, TLSSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		VaultClient:   vc,
+		TokenFilePath: filepath.Join(dir, "token"),
+		AuthMethod:    "mtls",
+		Username:      "alice",
+		MTLS: &MTLSParams{
+			VaultAddress: srv.URL, TLSSkipVerify: true, Method: "mtls",
+			CertMount: "cert", CertRole: "dotvault",
+			PKIMount: "pki", PKIRole: "dotvault",
+			KeyType: "ec", CommonName: "{{.user}}",
+			ReissueBefore: 7 * 24 * time.Hour, StorageDir: dir,
+		},
+	}
+	m.VaultClient.SetToken("s.operational-token")
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("ReissueIfDue: %v", err)
+	}
+	if len(f.revokedSerials) != 1 {
+		t.Errorf("revoked %v, want the superseded certificate: an unmentioned field must not disable revocation",
+			f.revokedSerials)
+	}
+}
+
+// TestDisablingRevocationStillQueuesForLater pins what the opt-out does and
+// does not switch off.
+//
+// It gates the Vault call, not the bookkeeping. Serials superseded while it is
+// off are still recorded, so re-enabling retires the certificates the opt-out
+// window produced instead of starting from an empty list with those
+// certificates valid and nothing left that remembers them. Recording them costs
+// a bounded list in a 0600 file; forgetting them cannot be undone.
+func TestDisablingRevocationStillQueuesForLater(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	firstSerial := seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
 	cred, err := loadCredential(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cred.PendingRevocations = []string{"aa:aa:aa", "bb:bb:bb"}
+	cred.PendingRevocations = []string{"aa:aa:aa"} // an older backlog
 	if err := saveCredential(dir, cred); err != nil {
 		t.Fatal(err)
 	}
 
 	m := mtlsManager(t, srv, dir)
-	m.MTLS.RevokeSuperseded = false
+	m.MTLS.SkipRevokeSuperseded = true
 	m.VaultClient.SetToken("s.operational-token")
 	if err := m.ReissueIfDue(t.Context()); err != nil {
 		t.Fatalf("ReissueIfDue: %v", err)
 	}
 	if len(f.revokedSerials) != 0 {
-		t.Errorf("revoked %v with revocation disabled", f.revokedSerials)
+		t.Fatalf("revoked %v with revocation disabled", f.revokedSerials)
 	}
 	after, err := loadCredential(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(after.PendingRevocations) != 2 {
-		t.Errorf("pending revocations = %v, want the existing backlog preserved", after.PendingRevocations)
+		t.Fatalf("pending = %v, want the old backlog plus the newly superseded serial", after.PendingRevocations)
+	}
+	if indexOf(after.PendingRevocations, "aa:aa:aa") < 0 {
+		t.Errorf("pending = %v, want the pre-existing backlog preserved", after.PendingRevocations)
+	}
+	if indexOf(after.PendingRevocations, firstSerial) < 0 {
+		t.Errorf("pending = %v, want the serial superseded while disabled (%s) recorded",
+			after.PendingRevocations, firstSerial)
+	}
+
+	// Re-enable: everything accumulated is retired, which is the claim the docs
+	// make and the reason recording during the opt-out matters.
+	after.NotAfter = time.Now().Add(3 * 24 * time.Hour)
+	secondSerial := vaultSerialOf(t, after)
+	if err := saveCredential(dir, after); err != nil {
+		t.Fatal(err)
+	}
+	m.MTLS.SkipRevokeSuperseded = false
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("second ReissueIfDue: %v", err)
+	}
+	for _, want := range []string{"aa:aa:aa", firstSerial, secondSerial} {
+		if indexOf(f.revokedSerials, want) < 0 {
+			t.Errorf("revoked %v, want it to include %s", f.revokedSerials, want)
+		}
+	}
+	final, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.PendingRevocations) != 0 {
+		t.Errorf("pending = %v, want the backlog drained", final.PendingRevocations)
 	}
 }
 
-// TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed keeps the two halves of
+// TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed keeps the two halves of// TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed keeps the two halves of
 // retirement from contradicting each other. A certificate the sweep could not
 // remove is still installed, so it must not be queued for a later revocation
 // either — that would just defer the revoked-yet-installed state rather than

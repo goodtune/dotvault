@@ -40,15 +40,20 @@ type MTLSParams struct {
 	CommonName      string // template over {{.user}}
 	TTL             string
 	ReissueBefore   time.Duration
-	// RevokeSuperseded is the resolved vault.mtls.revoke_superseded tri-state
-	// (default true). False opts the deployment out of revoking the certificate
-	// a rotation replaced; see MTLSConfig.RevokeSuperseded for why that choice
-	// exists.
-	RevokeSuperseded bool
-	SealToPCRs       bool
-	StorageDir       string
-	BYOCert          string
-	BYOKey           string
+	// SkipRevokeSuperseded is the resolved vault.mtls.revoke_superseded
+	// tri-state, INVERTED: true means do not revoke the certificate a rotation
+	// replaced. See MTLSConfig.RevokeSuperseded for why that opt-out exists.
+	//
+	// Negative on purpose. MTLSParams is built at several sites — the daemon,
+	// the client facade, the integration harness — and a positively-spelled
+	// field would make "forgot to set it" mean "revocation off", silently
+	// disabling a security default. Spelled this way the zero value is the safe
+	// one, so only a caller that deliberately opts out has to say anything.
+	SkipRevokeSuperseded bool
+	SealToPCRs           bool
+	StorageDir           string
+	BYOCert              string
+	BYOKey               string
 }
 
 // authenticateMTLS runs the certificate-auth flow: reuse an in-window
@@ -391,7 +396,11 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 // and the credential is in use. The cost is only that these serials are not
 // retried, which is where they already were.
 func (m *Manager) persistPendingRevocations(cred *sealedCredential, pending []string) {
-	if len(pending) == 0 && len(cred.PendingRevocations) == 0 {
+	if sameSerials(cred.PendingRevocations, pending) {
+		// Nothing to record. Guarding on equality rather than on emptiness
+		// matters once revocation is disabled: the list is then stable across
+		// rotations, and rewriting an identical envelope every time would be a
+		// pure cost.
 		return
 	}
 	cred.PendingRevocations = pending
@@ -442,19 +451,9 @@ func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedC
 	if old == nil {
 		return nil
 	}
-	if !m.MTLS.RevokeSuperseded {
-		// Opted out. The existing backlog is returned untouched rather than
-		// cleared: the operator has declined to revoke for now, and discarding
-		// the list would mean re-enabling later starts from empty with nothing
-		// left that remembers those certificates. No WARN — a deliberate
-		// configuration choice must not nag on every rotation, which is exactly
-		// the noise this opt-out exists to let an operator escape.
-		slog.Debug("skipping revocation of the superseded certificate: vault.mtls.revoke_superseded is false",
-			"pending", len(old.PendingRevocations))
-		return old.PendingRevocations
-	}
 	// Inherited backlog first: these were swept in an earlier rotation, so
-	// nothing is presenting them and only the CA half is outstanding.
+	// nothing is presenting them and only the CA half is outstanding. Copied,
+	// never aliased — the caller writes the result back into the envelope.
 	outstanding := append([]string(nil), old.PendingRevocations...)
 
 	if swept != nil {
@@ -463,6 +462,25 @@ func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedC
 			"serial", supersededSerial(old), "error", swept)
 	} else if serial := supersededSerial(old); serial != "" {
 		outstanding = append(outstanding, serial)
+	}
+	outstanding = capPendingRevocations(outstanding)
+
+	if m.MTLS.SkipRevokeSuperseded {
+		// Opted out. The gate is on the Vault call, not on the bookkeeping:
+		// serials keep accumulating so that re-enabling retires the
+		// certificates this window produced, rather than starting from an empty
+		// list with those certificates still valid and nothing left that
+		// remembers them. Recording costs a bounded list in a 0600 file;
+		// forgetting cannot be undone.
+		//
+		// INFO, not WARN: a deliberate configuration choice must not nag on
+		// every rotation — escaping that nagging is the whole point of the
+		// opt-out — but it must not be invisible either, or a fleet quietly
+		// accumulating live certificates looks exactly like one that is not.
+		// Rotations are weeks apart, so one line each is not noise.
+		slog.Info("not revoking the superseded certificate: vault.mtls.revoke_superseded is false",
+			"serial", supersededSerial(old), "awaiting_revocation", len(outstanding))
+		return outstanding
 	}
 
 	// The rotation itself is already complete, so this must not inherit a
@@ -475,7 +493,8 @@ func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedC
 	for _, serial := range outstanding {
 		if err := m.VaultClient.RevokeCertificate(rctx, m.MTLS.PKIMount, serial); err != nil {
 			slog.Warn("could not revoke a superseded certificate; it stays valid at Vault until it expires. "+
-				"Grant update on <pki_mount>/revoke to this host's Vault policy, or revoke it manually with "+
+				"Grant update on <pki_mount>/revoke to this host's Vault policy, set "+
+				"vault.mtls.revoke_superseded: false if that is deliberate, or revoke it manually with "+
 				"`vault write "+m.MTLS.PKIMount+"/revoke serial_number=<serial>`",
 				"serial", serial, "pki_mount", m.MTLS.PKIMount, "error", err)
 			failed = append(failed, serial)
@@ -483,13 +502,34 @@ func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedC
 		}
 		slog.Info("revoked a superseded mtls certificate", "serial", serial)
 	}
-	if len(failed) > maxPendingRevocations {
-		dropped := failed[:len(failed)-maxPendingRevocations]
-		slog.Warn("too many certificates are awaiting revocation; dropping the oldest, which are closest to expiring anyway",
-			"dropped", dropped, "limit", maxPendingRevocations)
-		failed = failed[len(failed)-maxPendingRevocations:]
-	}
 	return failed
+}
+
+// capPendingRevocations bounds the retry list carried in the envelope. The
+// oldest entries are dropped because they are the closest to expiring on their
+// own, and so the least worth another attempt.
+func capPendingRevocations(pending []string) []string {
+	if len(pending) <= maxPendingRevocations {
+		return pending
+	}
+	dropped := pending[:len(pending)-maxPendingRevocations]
+	slog.Warn("too many certificates are awaiting revocation; dropping the oldest, which are closest to expiring anyway",
+		"dropped", dropped, "limit", maxPendingRevocations)
+	return pending[len(pending)-maxPendingRevocations:]
+}
+
+// sameSerials reports whether two serial lists are identical in order and
+// content. nil and empty are the same thing here.
+func sameSerials(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // supersededSerial derives the serial to revoke from the credential's own

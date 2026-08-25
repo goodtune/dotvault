@@ -544,7 +544,7 @@ type MTLSConfig struct {
 	// "never mentioned" (inherit the default) from "explicitly off", and a
 	// plain bool's zero value would silently mean off for every existing
 	// config. Same tri-state shape as agent.windows.putty.
-	RevokeSuperseded *bool `yaml:"revoke_superseded"`
+	RevokeSuperseded *bool `yaml:"revoke_superseded,omitempty"`
 	// StorageDir holds the credential envelope. Default {cache_dir}/mtls.
 	StorageDir string `yaml:"storage_dir"`
 	// BYO supplies an existing certificate, skipping bootstrap.

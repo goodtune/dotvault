@@ -174,7 +174,12 @@ vault:
     }
     ```
 
-    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these and is a working reference. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
+    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these three and is a working reference *for them*. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
+
+!!! warning "Certificate auth needs two more, and the dev stack does not have them"
+    Under `mtls`, `mtls+tpm`, or `mtls+os` the daemon also rotates its own certificate and retires the one it replaces, both headless and both using this same downscoped token. That needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the superseded certificate) on top of the three above. Without `pki/sign` the certificate runs to expiry and the host needs a fresh human bootstrap; without `pki/revoke` rotation still works but each superseded certificate stays valid at the CA until its own TTL ends, and dotvault warns at every rotation.
+
+    `pki/revoke` is not scopeable to a host's own certificates — read the trade-off in [What your Vault admin must set up](../authentication/mtls.md#what-your-vault-admin-must-set-up) before granting it. The dev stack grants `pki/sign` only to the separate `dotvault-bootstrap` policy and grants `pki/revoke` nowhere, so headless rotation and revocation are **not** exercised there; they are covered by unit tests instead.
 
 This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
 

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,6 +79,7 @@ func pemCert(der []byte) string {
 // fakeVault serves the two endpoints the cert-auth flow touches: PKI sign and
 // cert-auth login. loginCount/signCount let tests assert what happened.
 type fakeVault struct {
+	mu                 sync.Mutex // guards record; see note
 	ca                 *testCA
 	loginCount         int
 	signCount          int
@@ -99,8 +101,13 @@ type fakeVault struct {
 	record func(op string)
 }
 
-// note logs an opcode when the test asked for ordering to be recorded.
+// note logs an opcode when the test asked for ordering to be recorded. The
+// callback runs on httptest's handler goroutines and typically appends to a
+// slice the test goroutine reads, so it is serialised here rather than relying
+// on the request/response happens-before edge to cover every caller.
 func (f *fakeVault) note(op string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.record != nil {
 		f.record(op)
 	}
@@ -512,8 +519,11 @@ func TestReissueIfDue(t *testing.T) {
 }
 
 // seedCredentialFile writes a file-backend credential envelope (key + CA-signed
-// cert) into dir, as if a previous run had seeded it.
-func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) {
+// cert) into dir, as if a previous run had seeded it. It returns the seeded
+// certificate's serial in Vault's colon-hex form — what a revocation of this
+// credential must name, which is derived from the certificate rather than from
+// the envelope's recorded (deliberately unrelated) "old-serial" marker.
+func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) string {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	leaf := ca.signLeaf(t, &key.PublicKey, "alice", notAfter)
@@ -530,4 +540,5 @@ func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time
 	if err := saveCredential(dir, cred); err != nil {
 		t.Fatal(err)
 	}
+	return vault.FormatSerial(mustLeaf(t, leaf).SerialNumber)
 }

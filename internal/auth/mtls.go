@@ -11,9 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/securestore"
@@ -134,7 +132,21 @@ func (m *Manager) authenticateMTLS(ctx context.Context) error {
 	if cred != nil {
 		oldHandle = cred.Handle
 	}
+	// Deliberately swept but NOT revoked, unlike reissue. This path is reached
+	// because the old credential could not be used, and "could not be used" is
+	// not proof it should be retired at the CA: a transient Vault error, a
+	// clock skew, or a cert-role change all land here with a certificate that
+	// is still perfectly valid, and revoking on that evidence would destroy a
+	// working credential every other host sharing it still depends on. Rotation
+	// is the case where supersession is certain, because dotvault just minted
+	// the replacement from the original. Any backlog the old envelope carried
+	// is preserved for the same reason it exists — those serials were retired
+	// deliberately and are merely awaiting the CA.
 	commitCertRotation(store, newCred.Handle, oldHandle)
+	if cred != nil {
+		newCred.PendingRevocations = cred.PendingRevocations
+		m.persistPendingRevocations(newCred, cred.PendingRevocations)
+	}
 	WarnUnrestrictedPolicy(m.Policy)
 	return nil
 }
@@ -352,16 +364,52 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 	// Persisted and operational: the replacement is now authoritative, so the
 	// superseded container and leaf can go.
 	committed = true
-	commitCertRotation(store, newCred.Handle, old.Handle)
-	// Only now, with the superseded certificate gone from the OS-native store,
-	// is it safe to revoke it at the CA. See revokeSupersededCertificate for
-	// why that order is the load-bearing part.
-	m.revokeSupersededCertificate(ctx, old)
+	// Only once the superseded certificate is actually gone from the OS-native
+	// store is it safe to revoke it at the CA — and "actually gone" means the
+	// sweep's outcome, not merely this call's position in the function. See
+	// retireSupersededCertificates for why.
+	swept := commitCertRotation(store, newCred.Handle, old.Handle)
+	m.persistPendingRevocations(newCred, m.retireSupersededCertificates(ctx, old, swept))
 	return nil
 }
 
-// revokeSupersededCertificate retires the certificate a rotation replaced,
-// closing the window in which it still authenticates.
+// persistPendingRevocations records the serials that still need revoking onto
+// the now-authoritative envelope, so the next rotation retries them.
+//
+// It is a second write of a file saved moments ago, which is worth the cost
+// only because the alternative loses the serial entirely: the envelope has
+// already been overwritten with the replacement, so a failed revocation would
+// survive nowhere but one WARN line. The common case writes nothing — there is
+// no list to record when every revocation succeeded, which is almost always.
+//
+// Its own failure is advisory for the usual reason: the rotation is complete
+// and the credential is in use. The cost is only that these serials are not
+// retried, which is where they already were.
+func (m *Manager) persistPendingRevocations(cred *sealedCredential, pending []string) {
+	if len(pending) == 0 && len(cred.PendingRevocations) == 0 {
+		return
+	}
+	cred.PendingRevocations = pending
+	if err := saveCredential(m.MTLS.StorageDir, cred); err != nil {
+		slog.Warn("could not record certificates still awaiting revocation; they will not be retried",
+			"serials", pending, "error", err)
+	}
+}
+
+// maxPendingRevocations bounds the retry list carried in the envelope. A
+// deployment whose policy lacks pki/revoke accumulates one entry per rotation
+// forever, and an unbounded list would grow the envelope without ever helping:
+// past the cap the oldest entries are the least worth retrying, being the
+// closest to expiring on their own.
+const maxPendingRevocations = 16
+
+// revocationTimeout bounds the revoke calls so a slow or hung Vault cannot
+// hold up a rotation that has, by this point, already succeeded.
+const revocationTimeout = 30 * time.Second
+
+// retireSupersededCertificates revokes the certificate a rotation replaced —
+// plus any earlier ones whose revocation has not yet succeeded — and returns
+// the serials still outstanding, for the caller to carry forward.
 //
 // The OS-store sweep and this are two halves of one retirement and neither
 // substitutes for the other: removing the leaf from CurrentUser\My stops *this
@@ -369,36 +417,86 @@ func (m *Manager) reissue(ctx context.Context, store securestore.Storage, old *s
 // NotAfter, so any copy taken before the rotation keeps working for the rest of
 // that lifetime. Only the CA can end it.
 //
-// It must run AFTER the sweep, never before. A certificate revoked while still
-// installed is one every browser and client on the host may still choose to
-// present — and a sweep that then fails leaves it installed permanently — so
-// revoking first converts a successful rotation into broken mTLS. Removing
-// first means the worst case is a certificate that is gone locally but still
-// valid at Vault, which the next rotation or an operator can fix.
+// It must run AFTER the sweep, and only when the sweep actually succeeded —
+// position in the flow is not the guarantee, the outcome is. A certificate
+// revoked while still installed is one every browser and client on the host may
+// go on choosing, and because a sweep failure is not retried it stays installed
+// permanently, so revoking anyway would convert a successful rotation into
+// indefinitely broken mTLS. Declining to revoke leaves the milder state: a
+// certificate that still works and can be retired later.
 //
-// Failures are advisory and logged, never returned, for the same reason
-// commitCertRotation's are: by this point the replacement is persisted,
-// operational, and the old artefacts are gone. Failing here would report a
-// broken rotation for a credential the daemon is already using, and — because
-// the caller would retry — mint a fresh certificate on every attempt. The
-// operator cost of a missed revocation is one certificate living out its TTL;
-// the cost of the alternative is a re-issue loop. Deployments that want
-// revocation must grant update on <pki_mount>/revoke to the policies in
-// vault.policies, and the WARN names what to do when they have not.
-func (m *Manager) revokeSupersededCertificate(ctx context.Context, old *sealedCredential) {
-	if old == nil || old.Serial == "" {
-		// Nothing to name: an envelope written before serials were recorded, or
-		// an issuer that returned none. Sending an empty serial would only earn
-		// a rejection.
-		return
+// Failures are logged and returned as outstanding work, never surfaced as an
+// error: by this point the replacement is persisted, operational, and the old
+// artefacts are gone. Failing here would report a broken rotation for a
+// credential the daemon is already using and, because the caller retries, mint
+// a fresh certificate on every attempt. The retry list is what stops that
+// leniency from silently accumulating valid certificates — the failure mode
+// this whole feature exists to close — when the cause is persistent, which the
+// commonest one (a policy without pki/revoke) is.
+func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedCredential, swept error) []string {
+	if old == nil {
+		return nil
 	}
-	if err := m.VaultClient.RevokeCertificate(ctx, m.MTLS.PKIMount, old.Serial); err != nil {
-		slog.Warn("could not revoke the superseded certificate; it stays valid at Vault until it expires",
-			"serial", old.Serial, "not_after", old.NotAfter.Format(time.RFC3339),
-			"pki_mount", m.MTLS.PKIMount, "error", err)
-		return
+	// Inherited backlog first: these were swept in an earlier rotation, so
+	// nothing is presenting them and only the CA half is outstanding.
+	outstanding := append([]string(nil), old.PendingRevocations...)
+
+	if swept != nil {
+		slog.Warn("not revoking the superseded certificate: it is still installed in the OS certificate store, "+
+			"and revoking one the host may still present would break mTLS for it",
+			"serial", supersededSerial(old), "error", swept)
+	} else if serial := supersededSerial(old); serial != "" {
+		outstanding = append(outstanding, serial)
 	}
-	slog.Info("revoked the superseded mtls certificate", "serial", old.Serial)
+
+	// The rotation itself is already complete, so this must not inherit a
+	// cancellation that would otherwise strand the serials — but it must not
+	// hang either.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), revocationTimeout)
+	defer cancel()
+
+	var failed []string
+	for _, serial := range outstanding {
+		if err := m.VaultClient.RevokeCertificate(rctx, m.MTLS.PKIMount, serial); err != nil {
+			slog.Warn("could not revoke a superseded certificate; it stays valid at Vault until it expires. "+
+				"Grant update on <pki_mount>/revoke to this host's Vault policy, or revoke it manually with "+
+				"`vault write "+m.MTLS.PKIMount+"/revoke serial_number=<serial>`",
+				"serial", serial, "pki_mount", m.MTLS.PKIMount, "error", err)
+			failed = append(failed, serial)
+			continue
+		}
+		slog.Info("revoked a superseded mtls certificate", "serial", serial)
+	}
+	if len(failed) > maxPendingRevocations {
+		dropped := failed[:len(failed)-maxPendingRevocations]
+		slog.Warn("too many certificates are awaiting revocation; dropping the oldest, which are closest to expiring anyway",
+			"dropped", dropped, "limit", maxPendingRevocations)
+		failed = failed[len(failed)-maxPendingRevocations:]
+	}
+	return failed
+}
+
+// supersededSerial derives the serial to revoke from the credential's own
+// certificate, falling back to the recorded field.
+//
+// The certificate is the authority and the field is not, because the field has
+// had two provenances: a Vault-signed credential records the colon-hex serial
+// Vault returned, while a BYO import recorded big.Int.String() — a decimal
+// string naming nothing Vault has heard of. Normalising new writes fixes new
+// envelopes only; envelopes already on disk from an earlier build still carry
+// the decimal form, and those are exactly the ones a first post-upgrade
+// rotation would try to revoke. Deriving from CertPEM sidesteps the provenance
+// question entirely and needs no migration.
+func supersededSerial(cred *sealedCredential) string {
+	if leaf, err := leafCert(cred.CertPEM); err == nil {
+		if serial := vault.FormatSerial(leaf.SerialNumber); serial != "" {
+			return serial
+		}
+	}
+	// An envelope written before serials were recorded, or one whose CertPEM
+	// will not parse, leaves nothing to name; the caller sends nothing rather
+	// than a serial Vault would reject.
+	return cred.Serial
 }
 
 // seedCredential produces a fresh credential via BYO or LDAP/OIDC bootstrap.
@@ -473,21 +571,27 @@ func (m *Manager) seedCredential(ctx context.Context, store securestore.Storage)
 
 // commitCertRotation finalises a rotation whose replacement credential is
 // persisted and operational, letting a CertLifecycle backend drop the
-// superseded key container and leaf certificate. A no-op for backends without
-// the capability (file, tpm), where the handle IS the key material and
-// overwriting the envelope is the whole transaction.
+// superseded key container and leaf certificate. A no-op — and so a success —
+// for backends without the capability (file, tpm), where the handle IS the key
+// material and overwriting the envelope is the whole transaction.
 //
-// Errors are advisory and logged, never returned: the replacement is already
-// live, and failing an otherwise successful login because a stale artefact
-// could not be swept would trade a working daemon for a tidy certificate store.
-func commitCertRotation(store securestore.Storage, newHandle, oldHandle []byte) {
+// It logs its own failure and the caller must not fail the rotation over one:
+// the replacement is already live, and rejecting a working daemon because a
+// stale artefact could not be swept would be the worse trade. The error is
+// nonetheless returned, because one caller does need the outcome — revocation
+// is only safe once the certificate is actually gone from the store, and a
+// swallowed error there produces a revoked certificate the host keeps
+// presenting. Reporting is this function's job; deciding is the caller's.
+func commitCertRotation(store securestore.Storage, newHandle, oldHandle []byte) error {
 	cl, ok := store.(securestore.CertLifecycle)
 	if !ok {
-		return
+		return nil
 	}
 	if err := cl.CommitCert(newHandle, oldHandle); err != nil {
 		slog.Warn("could not remove the superseded certificate credential; it remains in the store", "error", err)
+		return err
 	}
+	return nil
 }
 
 // rollbackCertRotation discards a replacement credential that never became
@@ -657,7 +761,7 @@ func (m *Manager) importBYO(store securestore.Storage) (crypto.Signer, []byte, s
 	if err != nil {
 		return nil, nil, "", time.Time{}, "", fmt.Errorf("import byo key into secure store: %w", err)
 	}
-	return signer, handle, string(certPEM), leaf.NotAfter, formatSerial(leaf.SerialNumber), nil
+	return signer, handle, string(certPEM), leaf.NotAfter, vault.FormatSerial(leaf.SerialNumber), nil
 }
 
 // certLogin assembles a tls.Certificate from the stored cert and signer, dials
@@ -760,31 +864,6 @@ func buildTLSCertificate(certPEM string, signer crypto.Signer) (tls.Certificate,
 		return tls.Certificate{}, fmt.Errorf("parse leaf certificate: %w", err)
 	}
 	return tls.Certificate{Certificate: der, PrivateKey: signer, Leaf: leaf}, nil
-}
-
-// formatSerial renders a certificate serial the way Vault does — lowercase
-// hex, byte pairs separated by colons — which is the only form its PKI
-// endpoints accept for serial_number.
-//
-// It exists because sealedCredential.Serial has two provenances and only one
-// of them was revocable: a Vault-signed certificate records the serial Vault
-// returned (already this form), while a BYO import recorded
-// big.Int.String(), a decimal string naming nothing Vault has ever heard of.
-// Normalising at the point of import means the field means one thing wherever
-// it is read, so revokeSupersededCertificate needs no per-provenance branch.
-func formatSerial(n *big.Int) string {
-	if n == nil {
-		return ""
-	}
-	hexDigits := fmt.Sprintf("%x", n)
-	if len(hexDigits)%2 == 1 {
-		hexDigits = "0" + hexDigits
-	}
-	pairs := make([]string, 0, len(hexDigits)/2)
-	for i := 0; i < len(hexDigits); i += 2 {
-		pairs = append(pairs, hexDigits[i:i+2])
-	}
-	return strings.Join(pairs, ":")
 }
 
 // leafCert parses the first CERTIFICATE block from a PEM chain.

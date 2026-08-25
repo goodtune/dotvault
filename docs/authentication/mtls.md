@@ -128,17 +128,23 @@ A rotation is not finished when the replacement works. The certificate it replac
 
 dotvault therefore does two things once a rotation has committed, **in this order**:
 
-1. **Remove it locally.** For `mtls+os` the superseded CNG key container and its `CurrentUser\My` leaf are deleted, so nothing on the machine can present it any more. For `mtls` and `mtls+tpm` there is nothing to sweep — the credential envelope holds the key and has already been overwritten.
-2. **Revoke it at Vault.** dotvault calls `pki/revoke` with the superseded certificate's serial number, which is what actually ends its validity for anyone holding a copy.
+1. **Remove it locally.** For `mtls+os` the superseded CNG key container and its `CurrentUser\My` leaf are deleted, so nothing on the machine can present it any more. For `mtls` and `mtls+tpm` there is nothing to sweep — the credential envelope holds the key and has already been overwritten — so this step trivially succeeds.
+2. **Revoke it at Vault.** dotvault calls `<pki_mount>/revoke` with the superseded certificate's serial number, which is what actually ends its validity for anyone holding a copy.
 
-The order is the load-bearing part, and it only runs one way round. Revoking first would leave a **revoked certificate still installed** in the OS store for as long as the removal takes — and permanently if the removal fails — so every browser and client on the machine could go on choosing a certificate the CA now rejects, turning a successful rotation into broken mTLS on that host. Removing first means the worst case is the opposite and much milder: a certificate that is gone locally but still valid at Vault, which the next rotation or an operator can clean up.
+The order is load-bearing, and so is the fact that step 2 is **conditional on step 1 having succeeded**. Revoking first — or revoking anyway after a failed sweep — would leave a **revoked certificate still installed** in the OS store, and since a failed sweep is not retried it would stay there indefinitely, so every browser and client on the machine could go on choosing a certificate the CA now rejects. That turns a successful rotation into permanently broken mTLS on that host. Declining to revoke leaves the strictly milder state: a certificate that is gone from the CA's point of view or not, but that still *works*, and that the next rotation or an operator can retire later.
 
-!!! note "A failed revocation does not fail the rotation"
-    By the time revocation runs, the replacement certificate is issued, persisted, operational, and the old artefacts are already gone. Failing the rotation at that point would report an error for a credential the daemon is happily using, and — because the caller would retry — mint a brand-new certificate on every attempt. So a revocation failure is logged as a warning naming the serial and the PKI mount, and the rotation stands. The cost of a missed revocation is one certificate living out its TTL; the cost of the alternative is a re-issue loop.
+!!! note "A failed revocation does not fail the rotation — but it is not forgotten either"
+    By the time revocation runs, the replacement certificate is issued, persisted, operational, and the old artefacts are already gone. Failing the rotation at that point would report an error for a credential the daemon is happily using, and — because the caller would retry — mint a brand-new certificate on every attempt. So a revocation failure is logged as a warning naming the serial and the manual remedy, and the rotation stands.
 
-    The usual cause is a policy that omits `pki/revoke` — see item 4 under [What your Vault admin must set up](#what-your-vault-admin-must-set-up). If you have set `vault.policies`, the downscoped child token carries only what those policies grant, so the capability has to be in one of them.
+    Left there, that leniency would defeat the feature: the commonest cause is a Vault policy without `pki/revoke`, which is *persistent*, so every rotation would quietly leave one more valid certificate behind. dotvault therefore records the outstanding serials in the credential envelope (`pending_revocations`) and retries them at the next rotation, so the backlog drains by itself as soon as the policy is fixed. The list is capped; past the cap the oldest entries are dropped, being the closest to expiring on their own. A certificate whose **sweep** failed is deliberately *not* queued — it is still installed, so revoking it later would only defer the broken state rather than avoid it.
 
-Two limits worth stating plainly. **Only rotation revokes.** A credential you delete by hand, a host you decommission, and a re-seed that follows a failed login all leave their certificate valid at Vault; revoking those is an operator action (`vault write pki/revoke serial_number=...`). And **revocation is only as useful as the CRL/OCSP checking in front of it** — Vault's own cert auth method honours the CRL, but a third-party service trusting the same CA (the browser-mTLS case `mtls+os` exists for) only does if it has been configured to fetch it.
+Three limits worth stating plainly.
+
+**Only rotation revokes.** A credential you delete by hand, a host you decommission, and a re-seed that follows a failed login all leave their certificate valid at Vault. The re-seed case is deliberate rather than an oversight: dotvault reaches it because the old credential could not be *used*, and that is not evidence it should be retired — a transient Vault error, clock skew, or a changed cert role all land there with a certificate that is still perfectly good. Rotation is the one case where supersession is certain, because dotvault just minted the replacement from the original. Retiring the others is an operator action: `vault write <pki_mount>/revoke serial_number=...`.
+
+**Revocation is only as useful as the CRL/OCSP checking in front of it.** Vault's own cert auth method honours the CRL, but a third-party service trusting the same CA — the browser-mTLS case `mtls+os` exists for — only does if it has been configured to fetch it.
+
+**`pki/revoke` cannot be scoped to a host's own certificates.** Vault takes the serial in the request body, and its ACL system cannot constrain a body parameter, so a policy granting `pki/revoke` on a mount grants it for **every certificate in that mount** — other users' client certificates, and any server certificates issued from the same mount. Granting it to the operational cert-auth policy therefore hands a fleet-wide revocation capability to the least-trusted principal in the design: an unattended token sitting on a laptop. Weigh that against the accumulation it prevents. If you want both, issue client certificates from a **dedicated PKI mount or intermediate** used for nothing else, so the blast radius is the client-certificate population rather than your whole PKI. If you would rather not grant it at all, leave it out — rotation still works, dotvault warns once per rotation, and the superseded certificates live out their TTL.
 
 ## What your Vault admin must set up
 
@@ -150,6 +156,9 @@ This is a Vault configuration exercise, not a dotvault setting:
 4. **Operational cert-auth policy** — separate from the above; the ongoing capability of an mTLS-authenticated session. Because rotation and revocation are both headless steps performed with *this* token, it needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the certificate it replaced) in addition to whatever KV access dotvault is there to provide:
 
     ```hcl
+    # Paths below assume the defaults vault.mtls.pki_mount: pki and
+    # vault.mtls.pki_role: dotvault-client — substitute your own.
+
     # Rotation mints the replacement with the operational token — this is the
     # step that keeps a host going without a human. Missing: the certificate
     # runs to expiry and the host needs a fresh bootstrap.
@@ -158,8 +167,9 @@ This is a Vault configuration exercise, not a dotvault setting:
     }
 
     # Retiring the certificate the rotation replaced. Missing: rotation still
-    # succeeds and logs a warning; the old certificate stays valid at the CA
-    # until its own expiry.
+    # succeeds and warns; the old certificate stays valid at the CA until its
+    # own expiry. Read the scoping warning above before granting this — it
+    # cannot be limited to this host's own certificates.
     path "pki/revoke" {
       capabilities = ["create", "update"]
     }
@@ -168,6 +178,7 @@ This is a Vault configuration exercise, not a dotvault setting:
 ## Limitations (v1)
 
 - First-run **bootstrap** is the only step that needs a human; the steady-state cert login is fully headless. How that human is prompted depends on whether the web UI is enabled. **With `web.enabled: true`** the bootstrap runs in the browser: the daemon opens the web UI, whose login view presents whichever credential flow `bootstrap_method` names (the same LDAP-with-MFA or OIDC login it already serves), and no TTY is involved — which is what makes bootstrap work under `dotvaultw.exe`, the GUI-subsystem Windows binary that has no console to prompt on. **Without the web UI** the bootstrap falls back to the CLI flow, needing a browser dotvault can open (OIDC) or a terminal to prompt on (LDAP); a host with neither must seed a certificate via `byo`. Note the sharp edge this leaves on Windows: `dotvaultw.exe` has no console, so `bootstrap_method: ldap` with the web UI disabled cannot prompt and the daemon exits with an error rather than idling. On that combination either enable the web UI (the recommended fix, and the reason this path exists), run the first bootstrap once through `dotvault.exe` from a console, or seed via `byo`. `bootstrap_method: oidc` is unaffected — it opens a browser via `ShellExecute` and needs no console.
+- **Upgrade note (new in this release).** Rotation now revokes the certificate it supersedes. Existing cert-auth deployments need `pki/revoke` added to the operational policy — see [Retiring the superseded certificate](#retiring-the-superseded-certificate) for the trade-off that grant carries, and note that declining it is a supported choice. Nothing breaks either way: a deployment without the capability rotates exactly as before and warns once per rotation, with the outstanding serials queued so they are retired automatically if the policy is added later.
 - The bootstrap token is **not revoked** after the certificate is minted. It is transient and never persisted — it lives only on an isolated in-memory client, is never downscoped, never written to the token cache, and never exposed through `GET /api/v1/token` — but dotvault does not call `auth/token/revoke-self` on it, so it remains valid at Vault until its own TTL expires. Keep the bootstrap policy narrow and short-lived.
 
 For `mtls+tpm`, the TPM hardware caveats — no physical-TPM coverage in CI, and the macOS Secure Enclave still being scaffolding — are covered under [TPM-Backed Protection](tpm.md#platform-support-and-limitations).

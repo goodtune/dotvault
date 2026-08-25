@@ -5,7 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"math/big"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/securestore"
+	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // TestReissueRevokesSupersededCertificate pins the half of rotation that the
@@ -28,7 +29,7 @@ func TestReissueRevokesSupersededCertificate(t *testing.T) {
 	srv := newFakeVaultServer(t, f)
 	dir := t.TempDir()
 	// Expires in 3 days against a 7-day window, so it is due for rotation.
-	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+	wantSerial := seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
 
 	m := mtlsManager(t, srv, dir)
 	// A distinctive pre-rotation value, so the revoke's token proves which
@@ -43,8 +44,8 @@ func TestReissueRevokesSupersededCertificate(t *testing.T) {
 	if len(f.revokedSerials) != 1 {
 		t.Fatalf("revoked serials = %v, want exactly the superseded one", f.revokedSerials)
 	}
-	if f.revokedSerials[0] != "old-serial" {
-		t.Errorf("revoked %q, want the superseded certificate's serial %q", f.revokedSerials[0], "old-serial")
+	if f.revokedSerials[0] != wantSerial {
+		t.Errorf("revoked %q, want the superseded certificate's serial %q", f.revokedSerials[0], wantSerial)
 	}
 	// The revocation must ride the credential that is now current, not the one
 	// being retired: by this point certLogin has adopted the replacement's
@@ -132,6 +133,80 @@ func TestReissueRevokesOnlyAfterOSStoreRemoval(t *testing.T) {
 	}
 }
 
+// failingLifecycle is a CertStorer+CertLifecycle backend whose sweep fails —
+// the OS backend unable to delete the superseded CNG container or its
+// CurrentUser\My leaf.
+type failingLifecycle struct {
+	securestore.Storage
+	record func(string)
+}
+
+func (f *failingLifecycle) StoreCert(handle []byte, _ string) ([]byte, error) { return handle, nil }
+
+func (f *failingLifecycle) CommitCert(_, _ []byte) error {
+	f.record("commit-failed")
+	return errors.New("delete key container: access denied")
+}
+
+func (f *failingLifecycle) RollbackCert(_ []byte) error { return nil }
+
+// TestReissueDoesNotRevokeWhenTheStoreSweepFails is the other half of the
+// ordering rule, and the half ordering alone does not buy.
+//
+// Running the sweep first only helps if its outcome is consulted. The sweep's
+// errors are advisory — a stale artefact must not fail a live rotation — so
+// revoking regardless would produce exactly the state the ordering exists to
+// prevent, and produce it permanently: a certificate revoked at the CA while
+// still sitting in CurrentUser\My, which browsers go on offering until an
+// operator removes it by hand. Leaving it unrevoked is the strictly better
+// failure: the certificate still works, and the next rotation can retry both
+// halves.
+func TestReissueDoesNotRevokeWhenTheStoreSweepFails(t *testing.T) {
+	ca := newTestCA(t)
+	var events []string
+	record := func(op string) { events = append(events, op) }
+
+	f := &fakeVault{ca: ca, record: record}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
+	base, err := securestore.Open("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &failingLifecycle{Storage: base, record: record}
+
+	m := mtlsManager(t, srv, dir)
+	m.VaultClient.SetToken("s.operational-token")
+	old, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := captureSlog(t)
+	// The rotation itself must still succeed: the replacement is issued,
+	// persisted and operational, and a stale artefact is not worth failing it.
+	if err := m.reissue(t.Context(), store, old); err != nil {
+		t.Fatalf("a failed sweep must not fail the rotation: %v", err)
+	}
+	cred, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Serial != "aa:bb:cc" {
+		t.Errorf("credential not rotated; serial=%q", cred.Serial)
+	}
+
+	if len(f.revokedSerials) != 0 {
+		t.Errorf("revoked %v while the certificate was still installed in the store; events=%v",
+			f.revokedSerials, events)
+	}
+	if !strings.Contains(buf.String(), "still installed") {
+		t.Errorf("a skipped revocation must say why; log=%q", buf.String())
+	}
+}
+
 func indexOf(events []string, want string) int {
 	for i, e := range events {
 		if e == want {
@@ -168,9 +243,124 @@ func TestReissueRevocationFailureIsAdvisory(t *testing.T) {
 	if cred.Serial != "aa:bb:cc" {
 		t.Errorf("credential not rotated; serial=%q", cred.Serial)
 	}
-	if !strings.Contains(buf.String(), "revoke") {
-		t.Errorf("a failed revocation must be logged; log=%q", buf.String())
+	// Assert on the failure line specifically. Matching a bare "revoke" would
+	// also match the success line ("revoked a superseded mtls certificate"),
+	// so the assertion would pass just as happily against a revocation that
+	// worked — pinning nothing about the failure path it exists to cover.
+	logged := buf.String()
+	if len(f.revokedSerials) != 0 {
+		t.Fatalf("the fake accepted a revocation it was configured to refuse: %v", f.revokedSerials)
 	}
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "stays valid at Vault") {
+		t.Errorf("a failed revocation must WARN that the certificate is still valid; log=%q", logged)
+	}
+	if !strings.Contains(logged, "/revoke serial_number=") {
+		t.Errorf("the WARN must name the manual remedy; log=%q", logged)
+	}
+}
+
+// TestFailedRevocationIsRetriedOnTheNextRotation pins the durability half.
+//
+// A revocation failure is advisory, which alone would make it disappear: the
+// envelope has just been overwritten with the replacement, so the serial
+// survives nowhere but one WARN line. The commonest cause — a Vault policy
+// without pki/revoke — is persistent, so every rotation would leave one more
+// valid certificate behind, which is precisely the accumulation revocation
+// exists to prevent. Carrying the serial forward means the backlog drains as
+// soon as the cause clears.
+func TestFailedRevocationIsRetriedOnTheNextRotation(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca, failRevoke: true}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	firstSerial := seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
+	m := mtlsManager(t, srv, dir)
+	m.VaultClient.SetToken("s.operational-token")
+
+	// Rotation one: revocation is refused, so the serial must be recorded.
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("first ReissueIfDue: %v", err)
+	}
+	cred, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cred.PendingRevocations) != 1 || cred.PendingRevocations[0] != firstSerial {
+		t.Fatalf("pending revocations = %v, want [%s]", cred.PendingRevocations, firstSerial)
+	}
+
+	// Age the replacement into the re-issue window and let the policy be fixed.
+	cred.NotAfter = time.Now().Add(3 * 24 * time.Hour)
+	secondSerial := vaultSerialOf(t, cred)
+	if err := saveCredential(dir, cred); err != nil {
+		t.Fatal(err)
+	}
+	f.failRevoke = false
+
+	// Rotation two: the backlog drains alongside the newly superseded cert.
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("second ReissueIfDue: %v", err)
+	}
+	if len(f.revokedSerials) != 2 {
+		t.Fatalf("revoked %v, want both the backlog and the newly superseded certificate", f.revokedSerials)
+	}
+	if indexOf(f.revokedSerials, firstSerial) < 0 {
+		t.Errorf("revoked %v, want it to include the retried %s", f.revokedSerials, firstSerial)
+	}
+	if indexOf(f.revokedSerials, secondSerial) < 0 {
+		t.Errorf("revoked %v, want it to include the newly superseded %s", f.revokedSerials, secondSerial)
+	}
+	after, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.PendingRevocations) != 0 {
+		t.Errorf("pending revocations = %v, want the backlog cleared", after.PendingRevocations)
+	}
+}
+
+// TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed keeps the two halves of
+// retirement from contradicting each other. A certificate the sweep could not
+// remove is still installed, so it must not be queued for a later revocation
+// either — that would just defer the revoked-yet-installed state rather than
+// avoid it.
+func TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
+	base, err := securestore.Open("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &failingLifecycle{Storage: base, record: func(string) {}}
+
+	m := mtlsManager(t, srv, dir)
+	m.VaultClient.SetToken("s.operational-token")
+	old, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.reissue(t.Context(), store, old); err != nil {
+		t.Fatalf("reissue: %v", err)
+	}
+	cred, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cred.PendingRevocations) != 0 {
+		t.Errorf("pending revocations = %v, want none: an unswept certificate must not be queued for revocation",
+			cred.PendingRevocations)
+	}
+}
+
+// vaultSerialOf reports the colon-hex serial of a credential's certificate.
+func vaultSerialOf(t *testing.T, cred *sealedCredential) string {
+	t.Helper()
+	return vault.FormatSerial(mustLeaf(t, cred.CertPEM).SerialNumber)
 }
 
 // TestReissueWithoutSupersededSerialSkipsRevocation covers an envelope written
@@ -184,21 +374,25 @@ func TestReissueWithoutSupersededSerialSkipsRevocation(t *testing.T) {
 	dir := t.TempDir()
 	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
 
+	// Strip both sources of a serial. Clearing the recorded field alone no
+	// longer suffices — revocation derives the serial from the certificate —
+	// so the envelope is edited in memory and handed straight to reissue.
 	cred, err := loadCredential(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cred.Serial = ""
-	if err := saveCredential(dir, cred); err != nil {
+	cred.CertPEM = ""
+
+	base, err := securestore.Open("file")
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	m := mtlsManager(t, srv, dir)
-	// A distinctive pre-rotation value, so the revoke's token proves which
-	// credential made the call rather than merely being non-empty.
-	m.VaultClient.SetToken("s.pre-rotation-token")
-	if err := m.ReissueIfDue(t.Context()); err != nil {
-		t.Fatalf("ReissueIfDue: %v", err)
+	m.VaultClient.SetToken("s.operational-token")
+	if err := m.reissue(t.Context(), base, cred); err != nil {
+		t.Fatalf("reissue: %v", err)
 	}
 	if f.signCount != 1 {
 		t.Fatalf("expected one re-issue, got signs=%d", f.signCount)
@@ -212,52 +406,72 @@ func TestReissueWithoutSupersededSerialSkipsRevocation(t *testing.T) {
 // the one pki/revoke understands. Vault's sign response already returns its
 // colon-hex form, but a BYO import used big.Int.String() — a decimal string
 // Vault has never heard of — so the first rotation after a BYO seed would send
-// a serial that could not match anything and quietly revoke nothing.
+// a serial that could not match anything and quietly revoke nothing. The
+// encoding itself is pinned in internal/vault, which owns the wire format.
 func TestSeedRecordsRevocableSerial(t *testing.T) {
-	tests := []struct {
-		name   string
-		serial *big.Int
-		want   string
-	}{
-		{"single byte pads to a pair", big.NewInt(0x0a), "0a"},
-		{"multi-byte is colon-separated", big.NewInt(0xaabbcc), "aa:bb:cc"},
-		{"leading zero byte is preserved", big.NewInt(0x00ff), "ff"},
-		{"zero", big.NewInt(0), "00"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := formatSerial(tc.serial); got != tc.want {
-				t.Errorf("formatSerial(%v) = %q, want %q", tc.serial, got, tc.want)
-			}
-		})
-	}
+	ca := newTestCA(t)
+	dir := t.TempDir()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
+	certPath := writeFile(t, dir, "byo.crt", leaf)
+	keyPath := writeFile(t, dir, "byo.key", newPEMKey(t, key))
 
-	t.Run("byo import records colon-hex", func(t *testing.T) {
-		ca := newTestCA(t)
-		dir := t.TempDir()
-		key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
-		certPath := writeFile(t, dir, "byo.crt", leaf)
-		keyPath := writeFile(t, dir, "byo.key", newPEMKey(t, key))
+	m := &Manager{MTLS: &MTLSParams{
+		Method: "mtls", KeyType: "ec", StorageDir: dir,
+		BYOCert: certPath, BYOKey: keyPath,
+	}}
+	store, err := securestore.Open("file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, serial, err := m.importBYO(store)
+	if err != nil {
+		t.Fatalf("importBYO: %v", err)
+	}
+	if !strings.Contains(serial, ":") {
+		t.Errorf("BYO serial = %q, want Vault's colon-hex form", serial)
+	}
+	if want := vault.FormatSerial(mustLeaf(t, leaf).SerialNumber); serial != want {
+		t.Errorf("BYO serial = %q, want %q", serial, want)
+	}
+}
 
-		m := &Manager{MTLS: &MTLSParams{
-			Method: "mtls", KeyType: "ec", StorageDir: dir,
-			BYOCert: certPath, BYOKey: keyPath,
-		}}
-		store, err := securestore.Open("file")
-		if err != nil {
-			t.Fatal(err)
+// TestSupersededSerialPrefersTheCertificate pins that revocation derives the
+// serial from the credential's own certificate rather than trusting the
+// recorded field.
+//
+// Normalising at write time fixes envelopes written from now on. It does
+// nothing for the ones already on disk — a BYO host upgraded from an earlier
+// build still carries a decimal serial, and that host's first rotation is
+// exactly the one that would try to use it. The certificate is present in every
+// envelope and is unambiguous, so it is the authority.
+func TestSupersededSerialPrefersTheCertificate(t *testing.T) {
+	ca := newTestCA(t)
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
+	want := vault.FormatSerial(mustLeaf(t, leaf).SerialNumber)
+
+	t.Run("stale decimal serial is overridden", func(t *testing.T) {
+		// What an envelope written by an earlier build actually looks like.
+		cred := &sealedCredential{
+			CertPEM: leaf,
+			Serial:  mustLeaf(t, leaf).SerialNumber.String(), // decimal
 		}
-		_, _, _, _, serial, err := m.importBYO(store)
-		if err != nil {
-			t.Fatalf("importBYO: %v", err)
+		if got := supersededSerial(cred); got != want {
+			t.Errorf("supersededSerial = %q, want the certificate's %q", got, want)
 		}
-		if !strings.Contains(serial, ":") {
-			t.Errorf("BYO serial = %q, want Vault's colon-hex form", serial)
+	})
+
+	t.Run("falls back to the field when the PEM will not parse", func(t *testing.T) {
+		cred := &sealedCredential{CertPEM: "not a certificate", Serial: "aa:bb:cc"}
+		if got := supersededSerial(cred); got != "aa:bb:cc" {
+			t.Errorf("supersededSerial = %q, want the recorded aa:bb:cc", got)
 		}
-		want := formatSerial(mustLeaf(t, leaf).SerialNumber)
-		if serial != want {
-			t.Errorf("BYO serial = %q, want %q", serial, want)
+	})
+
+	t.Run("no certificate and no field yields nothing to revoke", func(t *testing.T) {
+		if got := supersededSerial(&sealedCredential{}); got != "" {
+			t.Errorf("supersededSerial = %q, want empty", got)
 		}
 	})
 }
@@ -270,7 +484,7 @@ func TestRevokeSupersededCertificateToleratesNoLifecycleBackend(t *testing.T) {
 	f := &fakeVault{ca: ca}
 	srv := newFakeVaultServer(t, f)
 	dir := t.TempDir()
-	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+	wantSerial := seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
 
 	base, err := securestore.Open("file")
 	if err != nil {
@@ -289,8 +503,8 @@ func TestRevokeSupersededCertificateToleratesNoLifecycleBackend(t *testing.T) {
 	if err := m.reissue(t.Context(), base, old); err != nil {
 		t.Fatalf("reissue: %v", err)
 	}
-	if len(f.revokedSerials) != 1 || f.revokedSerials[0] != "old-serial" {
-		t.Errorf("revoked %v, want [old-serial]", f.revokedSerials)
+	if len(f.revokedSerials) != 1 || f.revokedSerials[0] != wantSerial {
+		t.Errorf("revoked %v, want [%s]", f.revokedSerials, wantSerial)
 	}
 }
 

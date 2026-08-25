@@ -2,12 +2,84 @@ package vault
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"crypto/ecdsa"
+	"crypto/elliptic"
 )
+
+// TestFormatSerial pins the encoding Vault's PKI endpoints accept. Getting it
+// wrong is silent: a well-formed request naming a serial the CA has never
+// issued is answered without revoking anything.
+func TestFormatSerial(t *testing.T) {
+	tests := []struct {
+		name   string
+		serial *big.Int
+		want   string
+	}{
+		{"nil is no serial", nil, ""},
+		{"single byte", big.NewInt(0x0a), "0a"},
+		{"odd-length hex pads", big.NewInt(0xabc), "0a:bc"},
+		{"multi-byte", big.NewInt(0xaabbcc), "aa:bb:cc"},
+		// A serial's leading zero bytes are not part of its value, so they do
+		// not survive — 0x00ff and 0xff are the same integer and Vault records
+		// the shorter form.
+		{"leading zero byte is not significant", big.NewInt(0x00ff), "ff"},
+		// Non-conformant but parseable; must render as a serial rather than as
+		// the empty string, which would read as "no serial" and skip the call.
+		{"zero", big.NewInt(0), "00"},
+		// x509 parsing accepts negative serials. big.Int's %x would render
+		// "-2a" and yield the malformed "0-:2a"; the magnitude is what Vault
+		// stores.
+		{"negative uses the magnitude", big.NewInt(-0x2a), "2a"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FormatSerial(tc.serial); got != tc.want {
+				t.Errorf("FormatSerial(%v) = %q, want %q", tc.serial, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatSerialMatchesAParsedCertificate is the end-to-end check that the
+// encoding agrees with a real certificate's serial rather than only with the
+// table above.
+func TestFormatSerialMatchesAParsedCertificate(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := big.NewInt(0x0102030405)
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "serial-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := FormatSerial(parsed.SerialNumber), "01:02:03:04:05"; got != want {
+		t.Errorf("FormatSerial(parsed) = %q, want %q", got, want)
+	}
+}
 
 // TestRevokeCertificate covers the endpoint, path shape, and body the PKI
 // revoke call must produce. The certificate lives at the CA under its serial

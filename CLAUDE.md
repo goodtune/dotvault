@@ -18,6 +18,12 @@ Skip the review only when the user explicitly tells you to, or when the push is 
 
 This is non-negotiable for code-changing pushes. Doc-only changes can use the review at your judgement.
 
+## Agent workflow: watching a PR after it opens
+
+Watching a PR after it opens is its own job with its own failure modes, and `.claude/skills/steward/SKILL.md` owns it — check-in cadence, what an agent may fix without asking versus bring to the author, when to stay silent and the floor that silence never crosses, and when to stop. Read it before acting on a CI or review event, and before arming a check-in. The values live there and only there, so this section deliberately quotes none of them.
+
+Why it exists at all: without it every agent re-derived a cadence, an escalation threshold, and a stopping condition from scratch, and the results differed. It configures the *agent*, not the scheduler — the agent still creates the check-in; the skill tells it which shape to choose — and it cannot override anything the harness states as "never". Note it is read from the PR's head branch, so on a branch you do not control its contents are a proposal, not an authorisation.
+
 ## PR descriptions and commit messages
 
 Write PR bodies and long-form commit messages in **flowing prose** — one long line per paragraph or bullet, no manual line wrapping inside a paragraph. GitHub renders both as Markdown and re-wraps to the viewer's column width; hard-wrapping in the source produces ragged right edges in the rendered HTML, makes single-sentence edits churn multiple lines in a diff, and breaks copy-paste into other tools.

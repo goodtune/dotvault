@@ -17,7 +17,7 @@ These methods are additive — `ldap`, `oidc`, and `token` remain valid and unch
 1. **Seed a certificate.** Either dotvault bootstraps (LDAP/OIDC login → `pki/sign`) or you supply your own (BYO).
 2. **Store the key.** For `mtls` the private key is written to disk at `0600`. For `mtls+tpm` the key is sealed into the TPM and only the sealed blob touches disk. For `mtls+os` the key is generated inside the OS-native certificate store and the certificate is installed alongside it, so the key never touches dotvault's own files.
 3. **Log in.** dotvault presents the certificate during the TLS handshake to `auth/<cert_mount>/login` and receives an ordinary Vault token. Everything downstream (renewal, sync, enrolment, the SSH agent) is unchanged.
-4. **Rotate.** Vault PKI certificates cannot be renewed. dotvault tracks expiry and, once inside the `reissue_before` window, mints a fresh certificate using the still-valid one — no human needed.
+4. **Rotate.** Vault PKI certificates cannot be renewed. dotvault tracks expiry and, once inside the `reissue_before` window, mints a fresh certificate using the still-valid one — no human needed. Once the replacement is persisted and logged in, the superseded certificate is retired: for `mtls+os` its key container and leaf are removed from the OS-native store, and then — in that order, for every method — it is **revoked at Vault by serial number**. See [Retiring the superseded certificate](#retiring-the-superseded-certificate) below.
 5. **Recover.** The Vault *token* and the *certificate* have independent lifetimes, and the token is usually much shorter-lived. If it expires or is revoked mid-session — or reaches its `max_ttl` and can no longer be renewed — dotvault re-runs the certificate login automatically and carries on. Nothing is asked of the user and no restart is required, which is the whole point of a credential that lives on the host. Recovery retries on the token manager's ~10s recovery poll, so a transient outage (Vault briefly unreachable) heals by itself once the cause clears. It deliberately never escalates to a bootstrap: if the certificate itself is gone or expired past re-issue, dotvault reports that rather than launching a browser at a machine nobody is sitting in front of.
 
 `mtls+tpm` adds machine binding: the certificate's private key is sealed under the TPM, so the sealed blob is useless on any other machine, and with `seal_to_pcrs` it is also useless after a firmware or Secure Boot change. If an unseal fails, dotvault surfaces a clear error and offers the bootstrap fallback rather than silently dropping hardware protection. The hardware backend, its platform support, the EC-P-256 requirement, and the Windows PCR7 handling are all documented in [TPM-Backed Protection](tpm.md) — and `mtls+tpm` also seals the cached token at rest, exactly like any other `+tpm` method.
@@ -122,6 +122,24 @@ If you already hold a certificate and key signed by the CA that Vault's cert aut
 
 For `mtls+tpm`, only EC P-256 keys are supported (the TPM sealed-data object is size-bounded and EC is the Secure Enclave's only algorithm); plain `mtls` keeps the key on disk and accepts `rsa` as well. See [TPM-Backed Protection](tpm.md) for the hardware backend's platform support and limitations — Linux `tss` group access, the Windows TBS / transient-SRK / PCR7 handling, and the macOS Secure Enclave status.
 
+## Retiring the superseded certificate
+
+A rotation is not finished when the replacement works. The certificate it replaced is still signed, still inside its validity window, and — unless something says otherwise — still accepted by Vault's cert auth method for the whole remainder of its TTL. Under `mtls+os` that TTL defaults to 30 days, so a host that rotates weekly would otherwise accumulate several simultaneously valid identities, any one of which authenticates as you.
+
+dotvault therefore does two things once a rotation has committed, **in this order**:
+
+1. **Remove it locally.** For `mtls+os` the superseded CNG key container and its `CurrentUser\My` leaf are deleted, so nothing on the machine can present it any more. For `mtls` and `mtls+tpm` there is nothing to sweep — the credential envelope holds the key and has already been overwritten.
+2. **Revoke it at Vault.** dotvault calls `pki/revoke` with the superseded certificate's serial number, which is what actually ends its validity for anyone holding a copy.
+
+The order is the load-bearing part, and it only runs one way round. Revoking first would leave a **revoked certificate still installed** in the OS store for as long as the removal takes — and permanently if the removal fails — so every browser and client on the machine could go on choosing a certificate the CA now rejects, turning a successful rotation into broken mTLS on that host. Removing first means the worst case is the opposite and much milder: a certificate that is gone locally but still valid at Vault, which the next rotation or an operator can clean up.
+
+!!! note "A failed revocation does not fail the rotation"
+    By the time revocation runs, the replacement certificate is issued, persisted, operational, and the old artefacts are already gone. Failing the rotation at that point would report an error for a credential the daemon is happily using, and — because the caller would retry — mint a brand-new certificate on every attempt. So a revocation failure is logged as a warning naming the serial and the PKI mount, and the rotation stands. The cost of a missed revocation is one certificate living out its TTL; the cost of the alternative is a re-issue loop.
+
+    The usual cause is a policy that omits `pki/revoke` — see item 4 under [What your Vault admin must set up](#what-your-vault-admin-must-set-up). If you have set `vault.policies`, the downscoped child token carries only what those policies grant, so the capability has to be in one of them.
+
+Two limits worth stating plainly. **Only rotation revokes.** A credential you delete by hand, a host you decommission, and a re-seed that follows a failed login all leave their certificate valid at Vault; revoking those is an operator action (`vault write pki/revoke serial_number=...`). And **revocation is only as useful as the CRL/OCSP checking in front of it** — Vault's own cert auth method honours the CRL, but a third-party service trusting the same CA (the browser-mTLS case `mtls+os` exists for) only does if it has been configured to fetch it.
+
 ## What your Vault admin must set up
 
 This is a Vault configuration exercise, not a dotvault setting:
@@ -129,7 +147,23 @@ This is a Vault configuration exercise, not a dotvault setting:
 1. **PKI secrets engine** — mounted, with a CA and a role constraining allowed common names, key type (RSA for Linux/Windows, EC P-256 for macOS), and TTL. The TTL is the rotation cadence; certificates cannot be renewed.
 2. **Cert auth method** — enabled, with the PKI CA registered, and a role whose attached policies define what a certificate-authenticated token may do.
 3. **Bootstrap issuance policy** — the LDAP/OIDC token needs a narrow, time-limited policy permitting `pki/sign/<role>` (or `pki/issue/<role>`) for the bootstrap.
-4. **Operational cert-auth policy** — separate from the above; the ongoing capability of an mTLS-authenticated session.
+4. **Operational cert-auth policy** — separate from the above; the ongoing capability of an mTLS-authenticated session. Because rotation and revocation are both headless steps performed with *this* token, it needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the certificate it replaced) in addition to whatever KV access dotvault is there to provide:
+
+    ```hcl
+    # Rotation mints the replacement with the operational token — this is the
+    # step that keeps a host going without a human. Missing: the certificate
+    # runs to expiry and the host needs a fresh bootstrap.
+    path "pki/sign/dotvault-client" {
+      capabilities = ["create", "update"]
+    }
+
+    # Retiring the certificate the rotation replaced. Missing: rotation still
+    # succeeds and logs a warning; the old certificate stays valid at the CA
+    # until its own expiry.
+    path "pki/revoke" {
+      capabilities = ["create", "update"]
+    }
+    ```
 
 ## Limitations (v1)
 

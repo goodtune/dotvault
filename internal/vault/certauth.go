@@ -81,6 +81,33 @@ func (c *Client) IssueCertificate(ctx context.Context, mount, role, commonName, 
 	return c.pkiWrite(ctx, "pki_issue", path, data)
 }
 
+// RevokeCertificate revokes a previously issued certificate by serial number.
+// The serial must be in Vault's own form — lowercase hex, byte pairs separated
+// by colons — which is what the sign and issue responses return.
+//
+// Revocation is what makes rotation complete: superseding a certificate stops
+// this host presenting it, but the certificate itself stays valid at the CA
+// until its own NotAfter, so anything holding a copy keeps authenticating. Only
+// the CA can close that window.
+//
+// The token must carry update on <mount>/revoke. Vault answers a serial it has
+// already revoked with the original revocation time rather than an error, so a
+// repeated call is harmless.
+func (c *Client) RevokeCertificate(ctx context.Context, mount, serial string) error {
+	if serial == "" {
+		return fmt.Errorf("pki_revoke: no serial number")
+	}
+	path := fmt.Sprintf("%s/revoke", strings.Trim(mount, "/"))
+	if _, err := c.raw.Logical().WriteWithContext(ctx, path, map[string]interface{}{
+		"serial_number": serial,
+	}); err != nil {
+		observability.RecordVaultCall(ctx, "pki_revoke", classifyVaultErr(err))
+		return fmt.Errorf("pki_revoke %s: %w", path, err)
+	}
+	observability.RecordVaultCall(ctx, "pki_revoke", "ok")
+	return nil
+}
+
 func (c *Client) pkiWrite(ctx context.Context, op, path string, data map[string]interface{}) (*IssuedCert, error) {
 	secret, err := c.raw.Logical().WriteWithContext(ctx, path, data)
 	if err != nil {

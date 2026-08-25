@@ -88,6 +88,22 @@ type fakeVault struct {
 	// signTokens records the X-Vault-Token presented on each PKI sign call, so
 	// tests can assert which client (and therefore which token) did the signing.
 	signTokens []string
+	// revokedSerials records the serial_number of each pki/revoke call, and
+	// revokeTokens the X-Vault-Token that made it.
+	revokedSerials []string
+	revokeTokens   []string
+	failRevoke     bool // when set, /v1/pki/revoke returns 403
+	// record, when set, is called with an opcode ("sign", "login", "revoke")
+	// as each endpoint is served, so a test can assert the order of a flow
+	// against events it observes elsewhere (e.g. an OS-store removal).
+	record func(op string)
+}
+
+// note logs an opcode when the test asked for ordering to be recorded.
+func (f *fakeVault) note(op string) {
+	if f.record != nil {
+		f.record(op)
+	}
 }
 
 func (f *fakeVault) handler() http.Handler {
@@ -102,8 +118,25 @@ func (f *fakeVault) handler() http.Handler {
 			return
 		}
 		f.loginCount++
+		f.note("login")
 		json.NewEncoder(w).Encode(map[string]any{
 			"auth": map[string]any{"client_token": "s.operational-token"},
+		})
+	})
+	mux.HandleFunc("/v1/pki/revoke", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SerialNumber string `json:"serial_number"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if f.failRevoke {
+			http.Error(w, "permission denied", http.StatusForbidden)
+			return
+		}
+		f.revokedSerials = append(f.revokedSerials, body.SerialNumber)
+		f.revokeTokens = append(f.revokeTokens, r.Header.Get("X-Vault-Token"))
+		f.note("revoke")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"revocation_time": 1700000000},
 		})
 	})
 	mux.HandleFunc("/v1/auth/token/create", func(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +163,7 @@ func (f *fakeVault) handler() http.Handler {
 			return
 		}
 		f.signCount++
+		f.note("sign")
 		ttl := f.leafTTL
 		if ttl == 0 {
 			ttl = 24 * time.Hour

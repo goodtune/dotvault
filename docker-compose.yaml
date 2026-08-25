@@ -151,6 +151,33 @@ services:
         path "sys/events/subscribe/*" {
           capabilities = ["read"]
         }
+        # Certificate-auth lifecycle. Under mtls/mtls+tpm/mtls+os the daemon
+        # keeps its OWN certificate alive with no human involved, and both
+        # halves of that run with this operational token — not the bootstrap
+        # one, which exists only for the very first certificate.
+        #
+        #   pki/sign  — rotation mints the replacement once the current cert
+        #               enters its reissue_before window. Without it the cert
+        #               runs to expiry and the host needs a fresh human
+        #               bootstrap, defeating the point of certificate auth.
+        #   pki/revoke — retires the certificate the rotation replaced. Without
+        #               it rotation still works, but each superseded cert stays
+        #               valid at the CA until its own TTL ends, so a host
+        #               accumulates simultaneously valid identities.
+        #
+        # Read the scoping caveat before copying pki/revoke into a production
+        # policy: Vault takes the serial as a request-body parameter and ACLs
+        # cannot constrain one, so this grants revocation for EVERY certificate
+        # in the pki mount, not just this host's. That is tolerable here because
+        # the dev mount issues nothing else; in production, issue client certs
+        # from a dedicated mount or intermediate, or set
+        # vault.mtls.revoke_superseded: false to opt out.
+        path "pki/sign/dotvault-client" {
+          capabilities = ["create", "update"]
+        }
+        path "pki/revoke" {
+          capabilities = ["create", "update"]
+        }
         POLICY
 
         echo "==> Writing sample secrets..."
@@ -224,8 +251,14 @@ services:
           certificate=@/vault/data/pki-ca.crt \
           ttl=3600
 
-        # Broader policy for the bootstrap step: signing a CSR needs pki/sign,
-        # which the operational dotvault policy deliberately does not grant.
+        # Narrow policy for the bootstrap step, which runs before any
+        # certificate exists and so cannot use the cert-auth token. It grants
+        # pki/sign and nothing else: the human LDAP/OIDC token is broad by
+        # nature, so the child token dotvault mints for the bootstrap is held to
+        # the single capability that step needs. The operational dotvault policy
+        # grants pki/sign too, for headless rotation — the separation here is
+        # about keeping the BOOTSTRAP token narrow, not about withholding
+        # issuance from the daemon.
         echo "==> Writing dotvault-bootstrap policy..."
         vault policy write dotvault-bootstrap - <<'POLICY'
         path "pki/sign/dotvault-client" {

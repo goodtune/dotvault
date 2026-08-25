@@ -40,10 +40,15 @@ type MTLSParams struct {
 	CommonName      string // template over {{.user}}
 	TTL             string
 	ReissueBefore   time.Duration
-	SealToPCRs      bool
-	StorageDir      string
-	BYOCert         string
-	BYOKey          string
+	// RevokeSuperseded is the resolved vault.mtls.revoke_superseded tri-state
+	// (default true). False opts the deployment out of revoking the certificate
+	// a rotation replaced; see MTLSConfig.RevokeSuperseded for why that choice
+	// exists.
+	RevokeSuperseded bool
+	SealToPCRs       bool
+	StorageDir       string
+	BYOCert          string
+	BYOKey           string
 }
 
 // authenticateMTLS runs the certificate-auth flow: reuse an in-window
@@ -436,6 +441,17 @@ const revocationTimeout = 30 * time.Second
 func (m *Manager) retireSupersededCertificates(ctx context.Context, old *sealedCredential, swept error) []string {
 	if old == nil {
 		return nil
+	}
+	if !m.MTLS.RevokeSuperseded {
+		// Opted out. The existing backlog is returned untouched rather than
+		// cleared: the operator has declined to revoke for now, and discarding
+		// the list would mean re-enabling later starts from empty with nothing
+		// left that remembers those certificates. No WARN — a deliberate
+		// configuration choice must not nag on every rotation, which is exactly
+		// the noise this opt-out exists to let an operator escape.
+		slog.Debug("skipping revocation of the superseded certificate: vault.mtls.revoke_superseded is false",
+			"pending", len(old.PendingRevocations))
+		return old.PendingRevocations
 	}
 	// Inherited backlog first: these were swept in an earlier rotation, so
 	// nothing is presenting them and only the CA half is outstanding.

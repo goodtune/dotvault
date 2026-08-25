@@ -2834,10 +2834,13 @@ func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 		CommonName:      m.CommonName,
 		TTL:             m.TTL,
 		ReissueBefore:   m.ReissueBeforeDur,
-		SealToPCRs:      m.SealToPCRs,
-		StorageDir:      storageDir,
-		BYOCert:         m.BYO.Cert,
-		BYOKey:          m.BYO.Key,
+		// Resolve the tri-state here: MTLSParams carries settled values, so
+		// internal/auth never has to re-derive what an unset field meant.
+		RevokeSuperseded: m.RevokeSupersededEnabled(),
+		SealToPCRs:       m.SealToPCRs,
+		StorageDir:       storageDir,
+		BYOCert:          m.BYO.Cert,
+		BYOKey:           m.BYO.Key,
 	}
 }
 

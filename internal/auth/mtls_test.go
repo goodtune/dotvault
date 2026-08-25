@@ -230,7 +230,11 @@ func mtlsManager(t *testing.T, srv *httptest.Server, storageDir string) *Manager
 			KeyType:       "ec",
 			CommonName:    "{{.user}}",
 			ReissueBefore: 7 * 24 * time.Hour,
-			StorageDir:    storageDir,
+			// Models a default deployment. MTLSParams carries resolved values,
+			// so this is the settled form of an unset vault.mtls.
+			// revoke_superseded, which defaults to true.
+			RevokeSuperseded: true,
+			StorageDir:       storageDir,
 		},
 	}
 }

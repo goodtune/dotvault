@@ -267,6 +267,7 @@ type registryLayer struct {
 	MTLSReissueBefore   string
 	MTLSStorageDir      string
 	MTLSSealToPCRs      *uint32
+	MTLSRevokeSuperR    *uint32
 	MTLSBYOCert         string
 	MTLSBYOKey          string
 
@@ -391,6 +392,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.MTLSReissueBefore, _ = readRegString(mk, "ReissueBefore")
 		layer.MTLSStorageDir, _ = readRegString(mk, "StorageDir")
 		layer.MTLSSealToPCRs = readRegDWORD(mk, "SealToPCRs")
+		layer.MTLSRevokeSuperR = readRegDWORD(mk, "RevokeSuperseded")
 	}
 	bk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS\BYO`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
@@ -603,6 +605,12 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.MTLSStorageDir != "" {
 		cfg.Vault.MTLS.StorageDir = layer.MTLSStorageDir
+	}
+	if layer.MTLSRevokeSuperR != nil {
+		// Tri-state, like Agent\WindowsPutty: an absent value leaves the *bool
+		// nil so the default-true applies, rather than pinning it to false.
+		b := *layer.MTLSRevokeSuperR != 0
+		cfg.Vault.MTLS.RevokeSuperseded = &b
 	}
 	if layer.MTLSSealToPCRs != nil {
 		cfg.Vault.MTLS.SealToPCRs = *layer.MTLSSealToPCRs != 0

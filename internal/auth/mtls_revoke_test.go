@@ -320,6 +320,89 @@ func TestFailedRevocationIsRetriedOnTheNextRotation(t *testing.T) {
 	}
 }
 
+// TestRevocationCanBeDisabled covers the deployment opt-out.
+//
+// Automating revocation is the right default — the superseded certificate is a
+// live credential until the CA says otherwise. But `pki/revoke` cannot be
+// scoped to a host's own certificates, so granting it to every enrolled host
+// is a real trade-off some deployments will decline. Opting out must be a
+// configuration gesture that leaves rotation itself untouched, not something
+// an operator achieves by withholding the capability and absorbing a warning
+// on every rotation.
+func TestRevocationCanBeDisabled(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
+	m := mtlsManager(t, srv, dir)
+	m.MTLS.RevokeSuperseded = false
+	m.VaultClient.SetToken("s.operational-token")
+
+	buf := captureSlog(t)
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("ReissueIfDue: %v", err)
+	}
+	// Rotation is unaffected — only the retirement half is opted out of.
+	if f.signCount != 1 {
+		t.Errorf("expected one re-issue, got signs=%d", f.signCount)
+	}
+	cred, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Serial != "aa:bb:cc" {
+		t.Errorf("credential not rotated; serial=%q", cred.Serial)
+	}
+	if len(f.revokedSerials) != 0 {
+		t.Errorf("revoked %v with revocation disabled", f.revokedSerials)
+	}
+	// A deliberate choice must not nag on every rotation.
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("disabling revocation must not warn; log=%q", buf.String())
+	}
+}
+
+// TestDisablingRevocationPreservesTheBacklog pins what happens to serials
+// already queued when an operator turns revocation off. They are kept, not
+// dropped: the operator has declined to revoke *for now*, and discarding the
+// list would mean re-enabling later silently starts from empty, leaving those
+// certificates valid with nothing left that remembers them.
+func TestDisablingRevocationPreservesTheBacklog(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(3*24*time.Hour))
+
+	cred, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred.PendingRevocations = []string{"aa:aa:aa", "bb:bb:bb"}
+	if err := saveCredential(dir, cred); err != nil {
+		t.Fatal(err)
+	}
+
+	m := mtlsManager(t, srv, dir)
+	m.MTLS.RevokeSuperseded = false
+	m.VaultClient.SetToken("s.operational-token")
+	if err := m.ReissueIfDue(t.Context()); err != nil {
+		t.Fatalf("ReissueIfDue: %v", err)
+	}
+	if len(f.revokedSerials) != 0 {
+		t.Errorf("revoked %v with revocation disabled", f.revokedSerials)
+	}
+	after, err := loadCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.PendingRevocations) != 2 {
+		t.Errorf("pending revocations = %v, want the existing backlog preserved", after.PendingRevocations)
+	}
+}
+
 // TestSweptButUnrevokedIsNotQueuedWhenTheSweepFailed keeps the two halves of
 // retirement from contradicting each other. A certificate the sweep could not
 // remove is still installed, so it must not be queued for a later revocation

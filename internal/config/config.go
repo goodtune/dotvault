@@ -527,6 +527,24 @@ type MTLSConfig struct {
 	// SealToPCRs binds the TPM unseal to the current boot (PCR) state.
 	// mtls+tpm only.
 	SealToPCRs bool `yaml:"seal_to_pcrs"`
+	// RevokeSuperseded controls whether a rotation revokes the certificate it
+	// replaced, at <pki_mount>/revoke. Default true — a superseded certificate
+	// is a live credential until the CA says otherwise, so the safe behaviour
+	// is the one a config that never mentions this gets.
+	//
+	// It exists because the capability it needs cannot be scoped: Vault takes
+	// the serial as a request-body parameter, so a policy granting pki/revoke
+	// grants it for every certificate in the mount. That is a real trade-off
+	// for a token living unattended on a laptop, and a deployment that declines
+	// it should be able to say so — rather than withhold the capability and
+	// absorb a warning on every rotation, which is indistinguishable from a
+	// misconfiguration.
+	//
+	// A *bool, not a bool: the merge and the registry layer both have to tell
+	// "never mentioned" (inherit the default) from "explicitly off", and a
+	// plain bool's zero value would silently mean off for every existing
+	// config. Same tri-state shape as agent.windows.putty.
+	RevokeSuperseded *bool `yaml:"revoke_superseded"`
 	// StorageDir holds the credential envelope. Default {cache_dir}/mtls.
 	StorageDir string `yaml:"storage_dir"`
 	// BYO supplies an existing certificate, skipping bootstrap.
@@ -538,6 +556,11 @@ type MTLSConfig struct {
 type MTLSBYO struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
+}
+
+// RevokeSupersededEnabled resolves the tri-state: unset means enabled.
+func (m MTLSConfig) RevokeSupersededEnabled() bool {
+	return m.RevokeSuperseded == nil || *m.RevokeSuperseded
 }
 
 // SyncConfig holds sync settings.

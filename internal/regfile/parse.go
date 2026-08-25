@@ -694,6 +694,9 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.MTLS.ReissueBefore, mtlsKey, "ReissueBefore") },
 		func() error { return apply(&cfg.Vault.MTLS.StorageDir, mtlsKey, "StorageDir") },
 		func() error { return applyBool(&cfg.Vault.MTLS.SealToPCRs, mtlsKey, "SealToPCRs") },
+		func() error {
+			return applyBoolPtr(&cfg.Vault.MTLS.RevokeSuperseded, mtlsKey, "RevokeSuperseded")
+		},
 		func() error { return apply(&cfg.Vault.MTLS.BYO.Cert, mtlsKey+`\BYO`, "Cert") },
 		func() error { return apply(&cfg.Vault.MTLS.BYO.Key, mtlsKey+`\BYO`, "Key") },
 	} {

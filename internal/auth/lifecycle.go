@@ -27,6 +27,25 @@ type LifecycleManager struct {
 	disableRenewal bool
 	needsReauth    atomic.Bool
 
+	// tokenInFlux marks the window in which the manager is actively replacing
+	// the token on the shared client — reloading a candidate from
+	// file/env/socket, or minting a fresh one through the unattended-recovery
+	// hook. Throughout it the client still carries the token that just failed,
+	// so a concurrent user of the client would present a credential Vault has
+	// already rejected.
+	//
+	// It is deliberately separate from needsReauth rather than folded into it:
+	// needsReauth is a *signal* (it fires OnReauth, which clears web state and
+	// bounces a browser to the login view) and must stay reserved for the case
+	// where a human is genuinely needed. This flag is only a gate. Recovery
+	// takes network round trips — a PKI sign plus a cert login, comfortably
+	// hundreds of milliseconds — and it usually succeeds, which is exactly the
+	// case where nothing used to hold the gate at all: signalReauth was reached
+	// only after recovery had already failed. NeedsReauth reports the two
+	// together, so a gate consumer waits out a successful recovery instead of
+	// racing it.
+	tokenInFlux atomic.Bool
+
 	// reloadCh is signalled by Reload() to force an immediate tryReload
 	// on the lifecycle goroutine. Buffered size 1 so a burst of signals
 	// coalesces to a single pass; the surplus is dropped because every
@@ -293,9 +312,34 @@ func (lm *LifecycleManager) recoverBackoff() time.Duration {
 	return d
 }
 
-// NeedsReauth returns true if the token is expired or needs re-authentication.
+// NeedsReauth reports whether the client's token should be treated as
+// unusable right now — either because re-authentication has been signalled, or
+// because the manager is mid-replacement and the client still carries the
+// token that failed.
+//
+// Consumers of this as a gate (the SSH agent's Sign/List, the web UI's
+// /api/v1/token) want both: they are asking "is it safe to use the shared
+// client", and a replacement in flight answers no just as firmly as a declared
+// re-auth. The manager's own branch decisions read lm.needsReauth directly
+// instead, because those turn on whether the *signal* has been raised.
 func (lm *LifecycleManager) NeedsReauth() bool {
-	return lm.needsReauth.Load()
+	return lm.needsReauth.Load() || lm.tokenInFlux.Load()
+}
+
+// withTokenInFlux runs a token-replacement step with the NeedsReauth gate
+// held, so a concurrent consumer of the shared Vault client waits out the
+// replacement rather than presenting the token it is replacing.
+//
+// Every path that can swap the client's token goes through here — the reload
+// candidates as well as the recovery hook — because tryReload also installs an
+// unvalidated candidate on the client before LookupSelf passes judgement on
+// it. Wrapping the step rather than the individual helpers means a call site
+// that runs both holds the gate across the pair, with no gap between them
+// where the failed token is live again.
+func (lm *LifecycleManager) withTokenInFlux(fn func() bool) bool {
+	lm.tokenInFlux.Store(true)
+	defer lm.tokenInFlux.Store(false)
+	return fn()
 }
 
 // Start begins the token lifecycle goroutine. Returns a channel that receives
@@ -330,7 +374,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				// or all candidates invalid) leave the schedule alone —
 				// the original timer.C tick will run checkAndRenew on
 				// its existing cadence.
-				if lm.tryReload(ctx) {
+				if lm.withTokenInFlux(func() bool { return lm.tryReload(ctx) }) {
 					lm.clearReauth()
 					lm.currentDelay = lm.checkInterval
 					if !timer.Stop() {
@@ -360,27 +404,35 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 					// question it had already answered (a suppressed token) or
 					// could answer itself (no token at all).
 					if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || IsNoToken(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
-						// Try reloading the token from disk/env before
-						// declaring re-auth — a parallel `dotvault login`
-						// may have already written a fresh token. If the
-						// reload yields a working token we treat the
-						// failure as transient.
-						if lm.tryReload(ctx) {
-							lm.clearReauth()
-							lm.currentDelay = lm.checkInterval
-							timer.Reset(lm.currentDelay)
-							continue
-						}
-						// No usable token anywhere, but this host may hold a
-						// credential that can mint one without a human —
-						// certificate auth being the case that matters. Tried
-						// before signalReauth deliberately: a successful
-						// recovery must not fire OnReauth, which would clear
-						// web state and bounce the browser to a login screen for
-						// an outage the daemon just healed by itself. If it
-						// fails we fall through, and the recovery poll retries
-						// it every cycle.
-						if lm.tryRecover(ctx) {
+						// Both replacement attempts run under a single
+						// withTokenInFlux, so NeedsReauth reports the whole
+						// window. That matters most for the branch that
+						// succeeds: recovery mints a certificate and exchanges
+						// it for a token over the network, and until the last
+						// step installs the result the client still carries the
+						// token that just failed. Holding the gate across the
+						// pair also closes the instant between them, where a
+						// failed tryReload has restored that same broken token.
+						if lm.withTokenInFlux(func() bool {
+							// Try reloading the token from disk/env before
+							// declaring re-auth — a parallel `dotvault login`
+							// may have already written a fresh token. If the
+							// reload yields a working token we treat the
+							// failure as transient.
+							if lm.tryReload(ctx) {
+								return true
+							}
+							// No usable token anywhere, but this host may hold
+							// a credential that can mint one without a human —
+							// certificate auth being the case that matters.
+							// Tried before signalReauth deliberately: a
+							// successful recovery must not fire OnReauth, which
+							// would clear web state and bounce the browser to a
+							// login screen for an outage the daemon just healed
+							// by itself. If it fails we fall through, and the
+							// recovery poll retries it every cycle.
+							return lm.tryRecover(ctx)
+						}) {
 							lm.clearReauth()
 							lm.currentDelay = lm.checkInterval
 							timer.Reset(lm.currentDelay)
@@ -412,7 +464,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// lookup-self, so a failed attempt leaves the current
 						// (still working) token in place and we fall through
 						// to the normal backoff.
-						if lm.tryReload(ctx) {
+						if lm.withTokenInFlux(func() bool { return lm.tryReload(ctx) }) {
 							lm.clearReauth()
 							lm.currentDelay = lm.checkInterval
 							timer.Reset(lm.currentDelay)

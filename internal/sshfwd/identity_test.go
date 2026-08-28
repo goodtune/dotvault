@@ -495,17 +495,46 @@ func TestSignersMarksListFailureAsIdentityError(t *testing.T) {
 	}
 }
 
+// TestSignersMarksUnparseableIdentityAsIdentityError covers the other way
+// Signers can fail. An advertised blob the agent protocol delivered but
+// x/crypto cannot parse is a fault of the credential *source*, not of any
+// remote, so it classifies with the listing failure above rather than as an
+// authentication problem.
+func TestSignersMarksUnparseableIdentityAsIdentityError(t *testing.T) {
+	fb := &fakeBackend{keys: []*sshagent.Key{{
+		Format:  "ssh-ed25519",
+		Blob:    []byte("not an ssh wire-format public key"),
+		Comment: "dotvault",
+	}}}
+
+	_, err := Signers(fb)
+	if err == nil {
+		t.Fatal("Signers() = nil error for an unparseable identity blob")
+	}
+	if !errors.Is(err, ErrIdentity) {
+		t.Errorf("Signers() error %v is not ErrIdentity", err)
+	}
+	if got := Classify(err); got != ClassIdentity {
+		t.Errorf("Classify() = %q, want %q", got, ClassIdentity)
+	}
+}
+
 // TestIdentityFailureAvoidsAuthBackoffFloor states the consequence of that
 // classification in the terms an operator feels: the forward retries on the
 // ordinary backoff rather than sitting out AuthFailureFloor, because the cause
 // has very likely cleared already.
+//
+// Both assertions are guards rather than coverage — ClassIdentity reaches the
+// default arm of each switch, so they would hold for any unmapped class. That
+// is the point: they fail the day someone adds ClassIdentity to either switch
+// and quietly re-acquires the five-minute floor this change removed.
 func TestIdentityFailureAvoidsAuthBackoffFloor(t *testing.T) {
 	if stateForClass(ClassIdentity, StateOffline) == StateAuthError {
 		t.Error("an identity-resolution failure reports authentication-error, " +
 			"which is the state reserved for credentials a remote refused")
 	}
 
-	r := &ManagedRemote{backoff: NewBackoff()}
+	r := newManagedRemote(Remote{Host: "example.test"}, Deps{})
 	if d := r.backoffDelay(ClassIdentity); d >= AuthFailureFloor {
 		t.Errorf("backoffDelay(ClassIdentity) = %s, want well under the "+
 			"AuthFailureFloor of %s", d, AuthFailureFloor)

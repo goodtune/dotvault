@@ -105,3 +105,62 @@ func TestLifecycleManager_ReauthGateHeldDuringSuccessfulRecovery(t *testing.T) {
 		t.Errorf("OnReauth fired %d times across a successful recovery, want 0", n)
 	}
 }
+
+// TestLifecycleManager_ReauthGateIsBounded pins that the gate cannot be held
+// open-endedly by a slow replacement.
+//
+// An unbounded gate is worse than none: a consumer waits on it, exhausts its
+// own budget (the SSH agent allows 30s) and fails anyway, having spent the time
+// as well. The window that made this reachable is tryReload's, whose LookupSelf
+// calls otherwise inherit the Vault SDK's own ~60s default with retries — and
+// it is held even in the renewal-failure branch, where the token being replaced
+// still works, so a slow Vault could gate a healthy daemon against itself.
+func TestLifecycleManager_ReauthGateIsBounded(t *testing.T) {
+	lm := &LifecycleManager{}
+
+	start := time.Now()
+	got := lm.withTokenInFlux(context.Background(), 50*time.Millisecond, func(ctx context.Context) bool {
+		// Stand in for a Vault call that never answers: honour the context, as
+		// every real step must, and report failure when it expires.
+		<-ctx.Done()
+		return false
+	})
+	elapsed := time.Since(start)
+
+	if got {
+		t.Error("withTokenInFlux reported success for a step that timed out")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("step ran for %s past its 50ms budget; the gate is unbounded", elapsed)
+	}
+	if lm.NeedsReauth() {
+		t.Error("the gate is still held after the step returned")
+	}
+}
+
+// TestLifecycleManager_SignalIsNarrowerThanGate pins the distinction the two
+// flags exist to draw, because collapsing them is the easy mistake in both
+// directions.
+//
+// A caller asking "does this daemon need someone to find it a token" must not
+// see a reload that is already under way — cmd/dotvault's peer-socket watcher
+// reads it exactly that way, and answering yes there queues a second reload
+// that would demote a healthy token to a borrowed one. A caller asking "is it
+// safe to use the client" must see it.
+func TestLifecycleManager_SignalIsNarrowerThanGate(t *testing.T) {
+	lm := &LifecycleManager{}
+
+	var gateDuringStep, signalDuringStep bool
+	lm.withTokenInFlux(context.Background(), time.Second, func(context.Context) bool {
+		gateDuringStep, signalDuringStep = lm.NeedsReauth(), lm.ReauthSignalled()
+		return true
+	})
+
+	if !gateDuringStep {
+		t.Error("NeedsReauth() was false mid-replacement; the gate must be held")
+	}
+	if signalDuringStep {
+		t.Error("ReauthSignalled() was true mid-replacement; a replacement " +
+			"already under way is not a daemon awaiting rescue")
+	}
+}

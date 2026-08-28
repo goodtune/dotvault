@@ -20,6 +20,22 @@ import (
 // enough that the ~10s recovery poll stays responsive.
 const recoverTimeout = 20 * time.Second
 
+// reloadTimeout bounds one token-reload attempt, for the same reason
+// recoverTimeout bounds a recovery: it runs on the lifecycle goroutine, and it
+// is now also the window in which NeedsReauth gates every other consumer of the
+// shared client. Its work is a file read, an env read, a peer-socket fetch and
+// up to three LookupSelf round trips — milliseconds against a reachable Vault —
+// but each of those inherits the Vault SDK's own ~60s default with retries, so
+// unbounded it could hold the gate for minutes. That matters most in the
+// renewal-failure branch, where the token being replaced still works and a slow
+// Vault would otherwise let a healthy daemon gate itself.
+//
+// Kept well under the SSH agent's 30s reauthTimeout so that even a reload
+// followed by a full recovery leaves a consumer's wait able to outlast the
+// gate rather than expiring against it. Failing fast costs nothing: the
+// recovery poll retries within ~10s.
+const reloadTimeout = 5 * time.Second
+
 // LifecycleManager manages token TTL checks and renewal.
 type LifecycleManager struct {
 	client         *vault.Client
@@ -326,20 +342,40 @@ func (lm *LifecycleManager) NeedsReauth() bool {
 	return lm.needsReauth.Load() || lm.tokenInFlux.Load()
 }
 
+// ReauthSignalled reports whether the manager has declared that it needs a new
+// token from outside — the state signalReauth raises and clearReauth ends.
+//
+// This is the *signal*, and it is the narrower of the two: it excludes a
+// replacement already in flight. A caller asking "should I go find this daemon
+// a token" wants this, because during a reload the manager is already doing
+// exactly that. NeedsReauth is the gate, and answering the signal question with
+// it would make every routine reload look like a daemon in need of rescue.
+func (lm *LifecycleManager) ReauthSignalled() bool {
+	return lm.needsReauth.Load()
+}
+
 // withTokenInFlux runs a token-replacement step with the NeedsReauth gate
 // held, so a concurrent consumer of the shared Vault client waits out the
 // replacement rather than presenting the token it is replacing.
 //
-// Every path that can swap the client's token goes through here — the reload
+// Every replacement *this manager* performs goes through here — the reload
 // candidates as well as the recovery hook — because tryReload also installs an
-// unvalidated candidate on the client before LookupSelf passes judgement on
-// it. Wrapping the step rather than the individual helpers means a call site
-// that runs both holds the gate across the pair, with no gap between them
-// where the failed token is live again.
-func (lm *LifecycleManager) withTokenInFlux(fn func() bool) bool {
+// unvalidated candidate on the client before LookupSelf passes judgement on it.
+// (It does not reach token adoption elsewhere in the daemon, such as the web
+// UI's token-paste login, which owns its own client mutation.) Wrapping the
+// step rather than the individual helpers means a call site that runs both
+// holds the gate across the pair, with no gap between them where the failed
+// token is live again.
+//
+// The step is bounded, because an open-ended gate is worse than no gate: a
+// consumer waits on it and then fails anyway, having also lost the time. fn
+// receives the bounded context and must use it for its Vault calls.
+func (lm *LifecycleManager) withTokenInFlux(ctx context.Context, d time.Duration, fn func(context.Context) bool) bool {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
 	lm.tokenInFlux.Store(true)
 	defer lm.tokenInFlux.Store(false)
-	return fn()
+	return fn(ctx)
 }
 
 // Start begins the token lifecycle goroutine. Returns a channel that receives
@@ -374,7 +410,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				// or all candidates invalid) leave the schedule alone —
 				// the original timer.C tick will run checkAndRenew on
 				// its existing cadence.
-				if lm.withTokenInFlux(func() bool { return lm.tryReload(ctx) }) {
+				if lm.withTokenInFlux(ctx, reloadTimeout, lm.tryReload) {
 					lm.clearReauth()
 					lm.currentDelay = lm.checkInterval
 					if !timer.Stop() {
@@ -413,7 +449,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// token that just failed. Holding the gate across the
 						// pair also closes the instant between them, where a
 						// failed tryReload has restored that same broken token.
-						if lm.withTokenInFlux(func() bool {
+						if lm.withTokenInFlux(ctx, reloadTimeout+recoverTimeout, func(ctx context.Context) bool {
 							// Try reloading the token from disk/env before
 							// declaring re-auth — a parallel `dotvault login`
 							// may have already written a fresh token. If the
@@ -464,7 +500,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						// lookup-self, so a failed attempt leaves the current
 						// (still working) token in place and we fall through
 						// to the normal backoff.
-						if lm.withTokenInFlux(func() bool { return lm.tryReload(ctx) }) {
+						if lm.withTokenInFlux(ctx, reloadTimeout, lm.tryReload) {
 							lm.clearReauth()
 							lm.currentDelay = lm.checkInterval
 							timer.Reset(lm.currentDelay)

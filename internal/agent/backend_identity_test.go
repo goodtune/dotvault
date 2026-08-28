@@ -6,8 +6,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/ssh/agent"
 )
 
 // TestBackendListAllSourcesFailingReportsError pins the difference between
@@ -147,7 +145,6 @@ func TestBackendListConcurrent(t *testing.T) {
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for j := 0; j < 25; j++ {
-				var keys []*agent.Key
 				keys, err := b.List()
 				if err != nil || len(keys) != 1 {
 					failures.Add(1)

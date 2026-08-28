@@ -29,6 +29,14 @@ type gateHolder struct{ gate ReauthGate }
 const (
 	defaultListCacheTTL  = 8 * time.Second
 	defaultReauthTimeout = 30 * time.Second
+
+	// defaultSourceTimeout bounds the Vault work itself — a source fan-out for
+	// List, a signature for Sign — and is deliberately a *separate* budget from
+	// reauthTimeout rather than a share of it. Spending one budget on both
+	// would mean a replacement that cleared at the 29th second left nothing for
+	// the work it had been waiting to do, turning a successful recovery into a
+	// deadline-exceeded failure at the last moment.
+	defaultSourceTimeout = 30 * time.Second
 )
 
 // Backend is the platform-neutral agent.ExtendedAgent served by both
@@ -55,6 +63,7 @@ type Backend struct {
 	// rather than defensive.
 	gate          atomic.Value
 	reauthTimeout time.Duration
+	sourceTimeout time.Duration
 	cacheTTL      time.Duration
 	now           func() time.Time
 
@@ -102,6 +111,16 @@ func WithReauthTimeout(d time.Duration) Option {
 	}
 }
 
+// WithSourceTimeout bounds the Vault work a List or Sign performs, separately
+// from the re-auth wait that may precede it.
+func WithSourceTimeout(d time.Duration) Option {
+	return func(b *Backend) {
+		if d > 0 {
+			b.sourceTimeout = d
+		}
+	}
+}
+
 // WithCacheTTL sets the List cache window.
 func WithCacheTTL(d time.Duration) Option {
 	return func(b *Backend) {
@@ -130,6 +149,7 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 	b := &Backend{
 		sources:       sources,
 		reauthTimeout: defaultReauthTimeout,
+		sourceTimeout: defaultSourceTimeout,
 		cacheTTL:      defaultListCacheTTL,
 		now:           time.Now,
 	}
@@ -225,6 +245,23 @@ func (b *Backend) identitiesWithoutVault() (ids []Identity, done bool) {
 	return nil, false
 }
 
+// gatedContext waits out a token replacement using the caller's wait — List
+// and Sign owe different answers to an unauthenticated daemon, so each passes
+// its own — and then returns a context budgeted for the Vault work that
+// follows, along with its cancel func.
+//
+// The two budgets are separate on purpose — see defaultSourceTimeout. Callers
+// must call cancel when the returned error is nil.
+func (b *Backend) gatedContext(wait func(context.Context) error) (context.Context, context.CancelFunc, error) {
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), b.reauthTimeout)
+	defer cancelWait()
+	if err := wait(waitCtx); err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.sourceTimeout)
+	return ctx, cancel, nil
+}
+
 // List enumerates the available identities (cached briefly).
 //
 // A refresh waits out a re-authentication window, as SignWithFlags does: List
@@ -240,12 +277,11 @@ func (b *Backend) identitiesWithoutVault() (ids []Identity, done bool) {
 func (b *Backend) List() ([]*agent.Key, error) {
 	ids, done := b.identitiesWithoutVault()
 	if !done {
-		ctx, cancel := context.WithTimeout(context.Background(), b.reauthTimeout)
-		defer cancel()
-		if err := b.waitForReauth(ctx); err != nil {
+		ctx, cancel, err := b.gatedContext(b.waitForReauth)
+		if err != nil {
 			return nil, err
 		}
-		var err error
+		defer cancel()
 		if ids, err = b.identities(ctx); err != nil {
 			return nil, err
 		}
@@ -277,12 +313,11 @@ func (b *Backend) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 // up matching the key, so a genuine "no source can produce this signature"
 // case still reports why.
 func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.reauthTimeout)
-	defer cancel()
-
-	if err := b.waitForToken(ctx); err != nil {
+	ctx, cancel, err := b.gatedContext(b.waitForToken)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 
 	var errs []error
 	for _, src := range b.sources {

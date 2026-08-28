@@ -140,53 +140,116 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 }
 
 // identities returns the aggregated identities, refreshing from every source
-// when the cache has expired. Sources that error are skipped (logged at debug)
-// so one failing source does not blank the whole agent.
+// when the cache has expired. It performs the Vault work; the two answers that
+// need no Vault call at all are served ahead of it by identitiesWithoutVault.
 //
-// With no Vault token there is nothing any source could resolve, so a cache
-// miss answers empty rather than making a round of doomed Vault calls. That
-// keeps the pre-authentication reply instant, which is what makes serving the
-// endpoint before the daemon has a token an improvement on not serving it: an
-// ssh client reads "no identities" and tries its next auth method, where a
-// slow reply would stall it just as an unaccepted connection does. The cache
-// is deliberately left untouched, so the first List once a token arrives does
-// a real refresh instead of being answered from an empty snapshot.
+// A source that errors is skipped so one failing source does not blank the
+// whole agent — but the failure is not discarded:
 //
-// The token check sits AFTER the cache check, and the order is load-bearing.
-// A token is absent in two quite different situations: the daemon has never
-// authenticated (no cache exists, so both orderings answer empty), and the
-// daemon is mid-re-auth — web mode clears the in-memory token on the re-auth
-// transition — where a still-fresh cache should keep being served exactly as
-// it was before this short-circuit existed. Checking the token first blanked
-// that window, so `ssh-add -l` returned nothing and ssh dropped dotvault's
-// keys instead of reaching Sign, which is the call that knows how to wait the
-// re-auth out.
-func (b *Backend) identities(ctx context.Context) []Identity {
+//   - If other sources produced identities, the partial list is returned and
+//     NOT cached. Caching it would pin a listing that is missing a source for
+//     the whole TTL, long after the cause had cleared.
+//   - If every source failed, the joined error is returned instead of an empty
+//     list. "This source hit a transient error" and "nothing is configured"
+//     are different answers, and an agent client cannot act on the first if it
+//     is told the second: a caller that sees zero identities reasonably gives
+//     up, where one that sees an error can retry. The motivating case is a
+//     vault-ca source whose mint lands inside a token-replacement window —
+//     hundreds of milliseconds during which the whole agent used to report
+//     itself as having no keys at all.
+//
+// The cache and token checks are repeated here rather than trusted from the
+// caller: a concurrent List may have refreshed the cache, or the token may
+// have gone away, while this call waited on the re-auth gate.
+func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
-		return b.cached
+		return b.cached, nil
 	}
 	if !b.haveToken() {
-		return nil
+		return nil, nil
 	}
 	var all []Identity
+	var errs []error
 	for _, src := range b.sources {
 		ids, err := src.Identities(ctx)
 		if err != nil {
 			slog.Debug("ssh agent: source failed to list identities", "source", src.Name(), "error", err)
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
 			continue
 		}
 		all = append(all, ids...)
 	}
+	if len(errs) > 0 {
+		if len(all) == 0 {
+			return nil, fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+		}
+		return all, nil
+	}
 	b.cached = all
 	b.cachedAt = b.now()
-	return all
+	return all, nil
+}
+
+// identitiesWithoutVault returns the answer that is available without
+// consulting any source, reporting done=true when it found one. A refresh is
+// required otherwise.
+//
+// Both answers it can give are owed to the caller *immediately*, which is why
+// they are separated out and taken before the re-auth gate:
+//
+//   - A cache still inside its TTL. The token check deliberately sits after
+//     it, because web mode clears the in-memory token on the re-auth
+//     transition, so a token going missing is routinely a refresh rather than
+//     a logout, and a still-fresh list must keep being served through it.
+//   - The empty list a daemon with no token owes. There is nothing any source
+//     could resolve, so the round of doomed Vault calls is skipped and the
+//     cache left untouched, letting the first List after a token arrives do a
+//     real refresh.
+//
+// Neither path touches Vault, so neither can present a half-replaced token —
+// which is what makes it safe to answer them without waiting out a re-auth,
+// and necessary to: an ssh client reads the identity list before it picks a
+// key, so a List that stalls costs the connection just as surely as one that
+// comes back blank.
+func (b *Backend) identitiesWithoutVault() (ids []Identity, done bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
+		return b.cached, true
+	}
+	if !b.haveToken() {
+		return nil, true
+	}
+	return nil, false
 }
 
 // List enumerates the available identities (cached briefly).
+//
+// A refresh waits out a re-authentication window, as SignWithFlags does: List
+// is what an SSH client calls before choosing a key, so refreshing from a
+// half-replaced token turns a pause into a failed connection. The answers that
+// need no refresh are served first and never wait — see
+// identitiesWithoutVault.
+//
+// It waits on waitForReauth rather than waitForToken: an unauthenticated
+// daemon owes an empty list, not the ErrNoToken that Sign owes, so that the
+// client moves on to its next authentication method. A source failure that
+// leaves nothing to advertise is still an error — see identities.
 func (b *Backend) List() ([]*agent.Key, error) {
-	ids := b.identities(context.Background())
+	ids, done := b.identitiesWithoutVault()
+	if !done {
+		ctx, cancel := context.WithTimeout(context.Background(), b.reauthTimeout)
+		defer cancel()
+		if err := b.waitForReauth(ctx); err != nil {
+			return nil, err
+		}
+		var err error
+		if ids, err = b.identities(ctx); err != nil {
+			return nil, err
+		}
+	}
 	keys := make([]*agent.Key, 0, len(ids))
 	for _, id := range ids {
 		keys = append(keys, &agent.Key{

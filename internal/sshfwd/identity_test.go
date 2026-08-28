@@ -16,12 +16,18 @@ import (
 type fakeBackend struct {
 	keys            []*sshagent.Key
 	signer          ssh.Signer
+	listErr         error
 	signErr         error
 	signCall        int
 	onSignWithFlags func(sshagent.SignatureFlags)
 }
 
-func (f *fakeBackend) List() ([]*sshagent.Key, error) { return f.keys, nil }
+func (f *fakeBackend) List() ([]*sshagent.Key, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.keys, nil
+}
 
 func (f *fakeBackend) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent.SignatureFlags) (*ssh.Signature, error) {
 	f.signCall++
@@ -459,3 +465,49 @@ func TestSignWithAlgorithmRSACertificateFlags(t *testing.T) {
 
 // ErrUnsupportedAlgorithm is re-exported from identity.go for testing.
 // (We can reference it directly here since it's defined in the same package.)
+
+// TestSignersMarksListFailureAsIdentityError pins that a backend which could
+// not be consulted is reported as ErrIdentity, not as an authentication
+// failure.
+//
+// The agent reaches this whenever its only credential source erred — a
+// Vault-CA mint hitting a token-replacement window being the case that started
+// this. Classified as authentication, a blip lasting a few hundred
+// milliseconds took the five-minute AuthFailureFloor and showed up in the
+// state line and the failure metric as though a principal or a policy were
+// wrong.
+func TestSignersMarksListFailureAsIdentityError(t *testing.T) {
+	fb := &fakeBackend{listErr: errors.New("ssh agent: ca: mint certificate: permission denied")}
+
+	_, err := Signers(fb)
+	if err == nil {
+		t.Fatal("Signers() = nil error, want the backend's listing failure")
+	}
+	if !errors.Is(err, ErrIdentity) {
+		t.Errorf("Signers() error %v is not ErrIdentity", err)
+	}
+	if errors.Is(err, ErrAuth) {
+		t.Error("Signers() error is ErrAuth; a source that could not be " +
+			"consulted must not read as a credential the remote refused")
+	}
+	if got := Classify(err); got != ClassIdentity {
+		t.Errorf("Classify() = %q, want %q", got, ClassIdentity)
+	}
+}
+
+// TestIdentityFailureAvoidsAuthBackoffFloor states the consequence of that
+// classification in the terms an operator feels: the forward retries on the
+// ordinary backoff rather than sitting out AuthFailureFloor, because the cause
+// has very likely cleared already.
+func TestIdentityFailureAvoidsAuthBackoffFloor(t *testing.T) {
+	if stateForClass(ClassIdentity, StateOffline) == StateAuthError {
+		t.Error("an identity-resolution failure reports authentication-error, " +
+			"which is the state reserved for credentials a remote refused")
+	}
+
+	r := &ManagedRemote{backoff: NewBackoff()}
+	if d := r.backoffDelay(ClassIdentity); d >= AuthFailureFloor {
+		t.Errorf("backoffDelay(ClassIdentity) = %s, want well under the "+
+			"AuthFailureFloor of %s", d, AuthFailureFloor)
+	}
+}

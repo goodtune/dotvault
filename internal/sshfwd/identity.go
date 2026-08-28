@@ -1,12 +1,26 @@
 package sshfwd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
 )
+
+// ErrIdentity marks a failure to resolve signing identities from the agent
+// backend — as distinct from having resolved them and been rejected by the
+// remote (ErrAuth), or from the agent genuinely advertising none.
+//
+// The distinction is what keeps a momentary credential-source outage from
+// looking like a misconfiguration. The agent's only source is often a Vault-CA
+// role, and a mint attempt that lands inside a token-replacement window fails
+// for a few hundred milliseconds; classified as authentication that would take
+// the AuthFailureFloor, holding the forward down for five minutes over a blip,
+// and would report itself in the state line and the failure metric as though a
+// principal or a policy were wrong.
+var ErrIdentity = errors.New("ssh identity resolution failed")
 
 // SignerSource is the slice of agent.ExtendedAgent the forwarder needs.
 // *agent.Backend satisfies it structurally; the narrowed interface keeps this
@@ -31,13 +45,13 @@ type SignerSource interface {
 func Signers(src SignerSource) ([]ssh.Signer, error) {
 	keys, err := src.List()
 	if err != nil {
-		return nil, fmt.Errorf("list agent identities: %w", err)
+		return nil, fmt.Errorf("%w: list agent identities: %w", ErrIdentity, err)
 	}
 	signers := make([]ssh.Signer, 0, len(keys))
 	for _, k := range keys {
 		pub, err := ssh.ParsePublicKey(k.Blob)
 		if err != nil {
-			return nil, fmt.Errorf("parse agent identity %q: %w", k.Comment, err)
+			return nil, fmt.Errorf("%w: parse agent identity %q: %w", ErrIdentity, k.Comment, err)
 		}
 		signers = append(signers, &backendSigner{src: src, pub: pub})
 	}

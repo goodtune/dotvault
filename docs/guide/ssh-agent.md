@@ -234,10 +234,23 @@ config tooling (Nix/Ansible/etc.).
     blast radius. `ProxyJump` avoids forwarding entirely where topology allows
     and is the preferred pattern.
 
-- **Token-refresh interaction.** If the Vault token is mid-reauthentication when
-  a signing request arrives, the agent blocks briefly on the lifecycle manager
-  rather than failing, then signs once a usable token is available (up to a
-  bounded timeout).
+- **Token-refresh interaction.** If the Vault token is being replaced when a
+  request arrives, the agent blocks briefly on the lifecycle manager rather
+  than failing, then proceeds once a usable token is available (up to a bounded
+  timeout). This covers *listing* as well as signing: a client asks the agent
+  what identities it has before choosing a key, so answering that from a
+  half-replaced token is where a connection is actually lost. It also covers
+  the replacements that succeed — a certificate-auth daemon renewing its own
+  token unattended holds the gate for the few hundred milliseconds the mint and
+  login take, so callers wait it out instead of racing it.
+- **A source that errors is not silently empty.** With several `agent.keys[]`
+  sources configured, one that fails to list is skipped and the rest are still
+  advertised. If *every* source fails, the agent reports an error rather than
+  an empty list, because "the credential source hit a transient problem" and
+  "no keys are configured" call for opposite responses from a client — the
+  first is worth retrying in a moment, the second is not. A listing taken while
+  any source was failing is also not cached, so a retry sees the source the
+  moment it recovers rather than waiting out the cache window.
 - **Concurrency.** The backend is safe for concurrent use — two clients may
   request signatures simultaneously, and identity listings are cached for a few
   seconds to avoid hammering Vault on repeated `ssh-add -l`.

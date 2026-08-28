@@ -273,3 +273,91 @@ func mustTestPub(t *testing.T) ssh.PublicKey {
 	_, _, pub, _ := genEd25519(t, "x")
 	return pub
 }
+
+// TestBackendWithoutTokenAnswersEmptyImmediately covers the pre-authentication
+// window the listener now serves in. An agent that answers "no identities"
+// straight away is one an ssh client moves past; the point of the probe is
+// that it does so without a round of Vault calls that could not succeed, since
+// a slow reply would stall the client just as an unaccepted connection does.
+func TestBackendWithoutTokenAnswersEmptyImmediately(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+
+	var hasToken atomic.Bool
+	b := NewBackend([]Source{srcA}, WithTokenProbe(hasToken.Load))
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("want no identities before authentication, got %d", len(keys))
+	}
+	if srcA.listCalls != 0 {
+		t.Errorf("sources must not be consulted without a token; got %d calls", srcA.listCalls)
+	}
+
+	// A token arriving must not be masked by the empty answer having been
+	// cached — the next List has to do a real refresh.
+	hasToken.Store(true)
+	keys, err = b.List()
+	if err != nil {
+		t.Fatalf("List after token: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("want 1 identity once authenticated, got %d", len(keys))
+	}
+}
+
+// TestBackendSignWithoutTokenFailsFast pins the other half: a Sign arriving
+// before the daemon has authenticated must be refused immediately, not held
+// for the re-auth timeout. There is no re-auth underway to wait out — the
+// daemon has simply never logged in — and a 30s stall per signature would
+// reintroduce the block this path exists to avoid.
+func TestBackendSignWithoutTokenFailsFast(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+	b := NewBackend([]Source{srcA},
+		WithTokenProbe(func() bool { return false }),
+		WithReauthTimeout(10*time.Second),
+	)
+
+	start := time.Now()
+	_, err := b.Sign(pubA, []byte("x"))
+	if err == nil {
+		t.Fatal("Sign: want a refusal without a token, got nil")
+	}
+	if !errors.Is(err, ErrNoToken) {
+		t.Errorf("want ErrNoToken, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Sign waited %s without a token; it must fail fast", elapsed)
+	}
+}
+
+// TestBackendSignWaitsThroughReauthWithoutToken keeps the two conditions
+// distinct: a re-auth in progress is transient and still waits, so a token
+// landing during the window produces a signature rather than a refusal.
+func TestBackendSignWaitsThroughReauthWithoutToken(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+
+	gate := &stubGate{}
+	gate.reauth.Store(true)
+	var hasToken atomic.Bool // token cleared during reauth, as web mode does
+	b := NewBackend([]Source{srcA},
+		WithReauthGate(gate),
+		WithTokenProbe(hasToken.Load),
+		WithReauthTimeout(2*time.Second),
+	)
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		hasToken.Store(true)
+		gate.reauth.Store(false)
+	}()
+
+	if _, err := b.Sign(pubA, []byte("x")); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+}

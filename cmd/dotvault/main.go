@@ -1037,6 +1037,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// The backend's token probe keeps the pre-auth reply immediate ("no
 		// identities", and a refusal on Sign) until a token arrives; the
 		// reauth gate is wired below, once the lifecycle manager exists.
+		//
+		// A later startup failure can now return with the socket bound and no
+		// one waiting on Run to unlink it. That is benign: uds.Listen removes
+		// a stale socket no live instance owns on the next start, and under
+		// systemd activation the node belongs to the socket unit and must not
+		// be unlinked anyway.
 		go agentSvc.Run(ctx)
 		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
@@ -1319,10 +1325,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		agentSvc.Backend.SetReauthGate(lm)
 	}
 
-	// Mount the filesystem now that we hold a Vault token, for the same
-	// reason the agent listener waits: every read it serves is a Vault call,
-	// so a mount that came up first would answer errors to anything that
-	// happened to look at the directory. Never fatal — see startFUSE.
+	// Mount the filesystem now that we hold a Vault token: every read it
+	// serves is a Vault call, so a mount that came up first would answer
+	// errors to anything that happened to look at the directory. The agent
+	// listener deliberately does not wait this way (it is already serving);
+	// the difference is that an agent has an honest empty answer and a
+	// filesystem has none. Never fatal — see startFUSE.
 	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
 		webServer.SetFUSEStatus(fuseSvc.Status)
 	}

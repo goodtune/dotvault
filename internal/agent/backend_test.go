@@ -307,6 +307,82 @@ func TestBackendWithoutTokenAnswersEmptyImmediately(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("want 1 identity once authenticated, got %d", len(keys))
 	}
+	if srcA.listCalls != 1 {
+		t.Errorf("want exactly one source refresh once authenticated, got %d", srcA.listCalls)
+	}
+}
+
+// TestBackendKeepsCacheWhenTokenLostMidLife pins the ordering inside
+// identities(): the token check must sit AFTER the cache check. Web mode
+// clears the in-memory token on the re-auth transition, so a token going
+// missing is routinely a refresh rather than a logout. Blanking the list there
+// makes `ssh-add -l` return nothing and ssh drop dotvault's keys instead of
+// reaching Sign, which is the call that knows how to wait the re-auth out.
+func TestBackendKeepsCacheWhenTokenLostMidLife(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+
+	var hasToken atomic.Bool
+	hasToken.Store(true)
+	b := NewBackend([]Source{srcA}, WithTokenProbe(hasToken.Load))
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("want 1 identity while authenticated, got %d", len(keys))
+	}
+
+	// Token cleared, as web.Server.ForceReauth does. The cache is still
+	// inside its TTL, so it must keep being served.
+	hasToken.Store(false)
+	keys, err = b.List()
+	if err != nil {
+		t.Fatalf("List after token loss: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("want the cached identity served through a re-auth, got %d", len(keys))
+	}
+	if srcA.listCalls != 1 {
+		t.Errorf("cached answer must not re-consult sources, got %d calls", srcA.listCalls)
+	}
+}
+
+// TestBackendExpiredCacheWithoutTokenAnswersEmpty is the other half: once the
+// cache has aged out there is nothing valid to serve and no token to refresh
+// with, so the answer is empty — and still without a doomed round of Vault
+// calls.
+func TestBackendExpiredCacheWithoutTokenAnswersEmpty(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	srcA := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+
+	var hasToken atomic.Bool
+	hasToken.Store(true)
+	now := time.Now()
+	b := NewBackend([]Source{srcA},
+		WithTokenProbe(hasToken.Load),
+		WithCacheTTL(time.Second),
+		withClock(func() time.Time { return now }),
+	)
+
+	if keys, err := b.List(); err != nil || len(keys) != 1 {
+		t.Fatalf("List: keys=%d err=%v", len(keys), err)
+	}
+
+	hasToken.Store(false)
+	now = now.Add(10 * time.Second) // age the cache out
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List after cache expiry: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("want empty once the cache expired without a token, got %d", len(keys))
+	}
+	if srcA.listCalls != 1 {
+		t.Errorf("sources must not be consulted without a token, got %d calls", srcA.listCalls)
+	}
 }
 
 // TestBackendSignWithoutTokenFailsFast pins the other half: a Sign arriving
@@ -357,7 +433,12 @@ func TestBackendSignWaitsThroughReauthWithoutToken(t *testing.T) {
 		gate.reauth.Store(false)
 	}()
 
+	start := time.Now()
 	if _, err := b.Sign(pubA, []byte("x")); err != nil {
 		t.Fatalf("Sign: %v", err)
+	}
+	// Without the elapsed check this passes even if Sign never waited.
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("Sign returned in %s; it must have waited out the re-auth", elapsed)
 	}
 }

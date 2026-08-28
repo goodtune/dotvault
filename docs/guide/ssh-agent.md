@@ -187,12 +187,19 @@ Auth: not authenticated (no local token; no peer socket holds a token)
 ...
 SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
-  (no identities loaded)
+  (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)
 ```
 
 `ssh` sees the same empty list and moves straight on to its next
-authentication method; a signing request in that window is refused with
-`dotvault holds no vault token (not authenticated)` rather than being held.
+authentication method. A signing request in that window is refused rather than
+held — the agent protocol carries only an opaque failure, so the client reports
+something like `agent refused operation` and the reason appears in the daemon's
+own log:
+
+```
+ssh agent: dotvault holds no vault token (not authenticated); run `dotvault login`
+```
+
 Fix the `Auth:` line — run `dotvault login`, or make a peer socket reachable —
 and the identities appear without restarting anything.
 

@@ -162,7 +162,9 @@ func TestQueryListeningUnresponsiveEndpoint(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected an error from an endpoint that accepts but never replies")
 		}
-	case <-time.After(5 * time.Second):
+	// Comfortably clear of queryTimeout: a guard equal to the budget would
+	// race it and flake if caller-deadline propagation ever regressed.
+	case <-time.After(3 * queryTimeout):
 		t.Fatal("QueryListening blocked on a connected but silent endpoint; the agent-protocol exchange is unbounded")
 	}
 
@@ -184,12 +186,21 @@ func TestQueryListeningHonoursCallerCancellation(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
+	// Hold the accepted conn open for the life of the test without parking a
+	// goroutine on a timer that outlives it.
+	held := make(chan net.Conn, 1)
 	go func() {
 		if conn, err := ln.Accept(); err == nil {
-			defer conn.Close()
-			<-time.After(5 * time.Second)
+			held <- conn
 		}
 	}()
+	t.Cleanup(func() {
+		select {
+		case conn := <-held:
+			conn.Close()
+		default:
+		}
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

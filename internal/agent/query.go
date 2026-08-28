@@ -31,9 +31,10 @@ const queryTimeout = 5 * time.Second
 // A dial failure — or a connected endpoint that does not answer within
 // queryTimeout — is returned to the caller: when the agent is configured as
 // enabled, an unreachable or unresponsive endpoint is an unexpected condition
-// (the daemon isn't running, or hasn't authenticated far enough to start the
-// listener) and the caller should surface it as such rather than silently
-// substituting config.
+// (the daemon isn't running) and the caller should surface it as such rather
+// than silently substituting config. "Not yet authenticated" is no longer one
+// of the causes: the daemon serves the agent before it holds a token, and
+// answers an empty identity list until it does.
 func QueryListening(ctx context.Context, addr string) ([]IdentityStatus, error) {
 	// A caller-supplied deadline earlier than queryTimeout wins, per
 	// context's own semantics — which is how tests exercise the

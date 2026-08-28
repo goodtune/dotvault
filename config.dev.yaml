@@ -5,7 +5,8 @@ vault:
   # Least-privilege token policies (per-deployment; no default provided).
   # When set, dotvault exchanges the login token for a child token restricted
   # to exactly these policies. Left unset here so the dev OIDC role's policies
-  # flow through unchanged — the dev Vault doesn't seed a dedicated policy.
+  # flow through unchanged; the stack's `dotvault` policy (docker-compose.yaml)
+  # is already the least-privilege set, so downscoping to it would be a no-op.
   #
   # policies:
   #   - dotvault-sync

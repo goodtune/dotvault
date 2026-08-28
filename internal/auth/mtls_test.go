@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,6 +79,7 @@ func pemCert(der []byte) string {
 // fakeVault serves the two endpoints the cert-auth flow touches: PKI sign and
 // cert-auth login. loginCount/signCount let tests assert what happened.
 type fakeVault struct {
+	mu                 sync.Mutex // guards record; see note
 	ca                 *testCA
 	loginCount         int
 	signCount          int
@@ -88,6 +90,27 @@ type fakeVault struct {
 	// signTokens records the X-Vault-Token presented on each PKI sign call, so
 	// tests can assert which client (and therefore which token) did the signing.
 	signTokens []string
+	// revokedSerials records the serial_number of each pki/revoke call, and
+	// revokeTokens the X-Vault-Token that made it.
+	revokedSerials []string
+	revokeTokens   []string
+	failRevoke     bool // when set, /v1/pki/revoke returns 403
+	// record, when set, is called with an opcode ("sign", "login", "revoke")
+	// as each endpoint is served, so a test can assert the order of a flow
+	// against events it observes elsewhere (e.g. an OS-store removal).
+	record func(op string)
+}
+
+// note logs an opcode when the test asked for ordering to be recorded. The
+// callback runs on httptest's handler goroutines and typically appends to a
+// slice the test goroutine reads, so it is serialised here rather than relying
+// on the request/response happens-before edge to cover every caller.
+func (f *fakeVault) note(op string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.record != nil {
+		f.record(op)
+	}
 }
 
 func (f *fakeVault) handler() http.Handler {
@@ -102,8 +125,25 @@ func (f *fakeVault) handler() http.Handler {
 			return
 		}
 		f.loginCount++
+		f.note("login")
 		json.NewEncoder(w).Encode(map[string]any{
 			"auth": map[string]any{"client_token": "s.operational-token"},
+		})
+	})
+	mux.HandleFunc("/v1/pki/revoke", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SerialNumber string `json:"serial_number"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if f.failRevoke {
+			http.Error(w, "permission denied", http.StatusForbidden)
+			return
+		}
+		f.revokedSerials = append(f.revokedSerials, body.SerialNumber)
+		f.revokeTokens = append(f.revokeTokens, r.Header.Get("X-Vault-Token"))
+		f.note("revoke")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"revocation_time": 1700000000},
 		})
 	})
 	mux.HandleFunc("/v1/auth/token/create", func(w http.ResponseWriter, r *http.Request) {
@@ -130,6 +170,7 @@ func (f *fakeVault) handler() http.Handler {
 			return
 		}
 		f.signCount++
+		f.note("sign")
 		ttl := f.leafTTL
 		if ttl == 0 {
 			ttl = 24 * time.Hour
@@ -189,7 +230,9 @@ func mtlsManager(t *testing.T, srv *httptest.Server, storageDir string) *Manager
 			KeyType:       "ec",
 			CommonName:    "{{.user}}",
 			ReissueBefore: 7 * 24 * time.Hour,
-			StorageDir:    storageDir,
+			// SkipRevokeSuperseded deliberately left unset: its zero value is
+			// "revoke", which is what a default deployment gets.
+			StorageDir: storageDir,
 		},
 	}
 }
@@ -478,8 +521,11 @@ func TestReissueIfDue(t *testing.T) {
 }
 
 // seedCredentialFile writes a file-backend credential envelope (key + CA-signed
-// cert) into dir, as if a previous run had seeded it.
-func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) {
+// cert) into dir, as if a previous run had seeded it. It returns the seeded
+// certificate's serial in Vault's colon-hex form — what a revocation of this
+// credential must name, which is derived from the certificate rather than from
+// the envelope's recorded (deliberately unrelated) "old-serial" marker.
+func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) string {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	leaf := ca.signLeaf(t, &key.PublicKey, "alice", notAfter)
@@ -496,4 +542,5 @@ func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time
 	if err := saveCredential(dir, cred); err != nil {
 		t.Fatal(err)
 	}
+	return vault.FormatSerial(mustLeaf(t, leaf).SerialNumber)
 }

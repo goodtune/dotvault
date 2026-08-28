@@ -254,21 +254,22 @@ type registryLayer struct {
 	VaultTokenSocket         string
 
 	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
-	MTLSBootstrapMethod string
-	MTLSBootstrapMount  string
-	MTLSCertMount       string
-	MTLSCertRole        string
-	MTLSPKIMount        string
-	MTLSPKIRole         string
-	MTLSKeyType         string
-	MTLSKeyBits         *uint32
-	MTLSCommonName      string
-	MTLSTTL             string
-	MTLSReissueBefore   string
-	MTLSStorageDir      string
-	MTLSSealToPCRs      *uint32
-	MTLSBYOCert         string
-	MTLSBYOKey          string
+	MTLSBootstrapMethod  string
+	MTLSBootstrapMount   string
+	MTLSCertMount        string
+	MTLSCertRole         string
+	MTLSPKIMount         string
+	MTLSPKIRole          string
+	MTLSKeyType          string
+	MTLSKeyBits          *uint32
+	MTLSCommonName       string
+	MTLSTTL              string
+	MTLSReissueBefore    string
+	MTLSStorageDir       string
+	MTLSSealToPCRs       *uint32
+	MTLSRevokeSuperseded *uint32
+	MTLSBYOCert          string
+	MTLSBYOKey           string
 
 	// Sync
 	SyncInterval string
@@ -391,6 +392,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.MTLSReissueBefore, _ = readRegString(mk, "ReissueBefore")
 		layer.MTLSStorageDir, _ = readRegString(mk, "StorageDir")
 		layer.MTLSSealToPCRs = readRegDWORD(mk, "SealToPCRs")
+		layer.MTLSRevokeSuperseded = readRegDWORD(mk, "RevokeSuperseded")
 	}
 	bk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS\BYO`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
@@ -606,6 +608,12 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.MTLSSealToPCRs != nil {
 		cfg.Vault.MTLS.SealToPCRs = *layer.MTLSSealToPCRs != 0
+	}
+	if layer.MTLSRevokeSuperseded != nil {
+		// Tri-state, like Agent\WindowsPutty: an absent value leaves the *bool
+		// nil so the default-true applies, rather than pinning it to false.
+		b := *layer.MTLSRevokeSuperseded != 0
+		cfg.Vault.MTLS.RevokeSuperseded = &b
 	}
 	if layer.MTLSBYOCert != "" {
 		cfg.Vault.MTLS.BYO.Cert = layer.MTLSBYOCert

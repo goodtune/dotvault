@@ -29,6 +29,16 @@ type sealedCredential struct {
 	NotAfter time.Time `json:"not_after"`
 	Identity string    `json:"identity"` // OS username at issue time
 	IssuedAt time.Time `json:"issued_at"`
+	// PendingRevocations are serials of previously superseded certificates
+	// whose revocation has not yet succeeded, carried here so the next rotation
+	// retries them. Without it a failed revocation survives nowhere — this
+	// envelope has already been overwritten with the replacement — so a
+	// persistent cause (a Vault policy without pki/revoke being the common one)
+	// would leave one more valid certificate behind on every rotation, which is
+	// the accumulation revocation exists to prevent. Omitted when empty, which
+	// is the normal state; absent in envelopes from earlier builds, where it
+	// decodes to nil and simply means no backlog.
+	PendingRevocations []string `json:"pending_revocations,omitempty"`
 }
 
 func credentialPath(storageDir string) string {

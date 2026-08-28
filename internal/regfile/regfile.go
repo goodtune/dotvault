@@ -142,6 +142,14 @@ func (e *emitter) writeMTLS(m config.MTLSConfig) {
 	e.writeString("ReissueBefore", m.ReissueBefore)
 	e.writeString("StorageDir", m.StorageDir)
 	e.writeBool("SealToPCRs", m.SealToPCRs)
+	// Tri-state: emitted only when explicitly set, following the Agent
+	// WindowsPutty pattern. Always emitting it would pin an unset field to
+	// whatever the export observed, turning "inherit the default" into a
+	// hardcoded value on the next import — and for this field that would
+	// silently freeze a security default an operator never chose.
+	if m.RevokeSuperseded != nil {
+		e.writeBool("RevokeSuperseded", *m.RevokeSuperseded)
+	}
 	e.WriteString("\r\n")
 
 	byoKey := mtlsKey + `\BYO`

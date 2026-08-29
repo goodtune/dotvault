@@ -238,11 +238,14 @@ config tooling (Nix/Ansible/etc.).
   request arrives, the agent blocks briefly on the lifecycle manager rather
   than failing, then proceeds once a usable token is available (up to a bounded
   timeout). This covers *listing* as well as signing: a client asks the agent
-  what identities it has before choosing a key, so answering that from a
+  what identities it has before choosing a key, so rebuilding that list from a
   half-replaced token is where a connection is actually lost. It also covers
   the replacements that succeed — a certificate-auth daemon renewing its own
   token unattended holds the gate for the few hundred milliseconds the mint and
-  login take, so callers wait it out instead of racing it.
+  login take, so callers wait it out instead of racing it. A listing that needs
+  no Vault call is still answered immediately: a cached list inside its window,
+  or the empty list the daemon owes before it has authenticated (see "Before
+  the daemon has authenticated" above), never waits.
 - **A source that errors is not silently empty.** With several `agent.keys[]`
   sources configured, one that fails to list is skipped and the rest are still
   advertised. If *every* source fails, the agent reports an error rather than

@@ -159,3 +159,48 @@ func TestBackendListConcurrent(t *testing.T) {
 		t.Errorf("%d concurrent List calls did not return the single identity", n)
 	}
 }
+
+// TestBackendListServesFreshCacheWithoutWaitingForReauth pins the ordering
+// between the two fixes this change sits between.
+//
+// The re-auth gate exists so a listing is not rebuilt from a half-replaced
+// token. A cache still inside its TTL is not rebuilt from anything — it needs
+// no Vault call — so making it wait buys nothing and costs the very thing the
+// pre-auth work exists to protect: an ssh client reads the identity list
+// before it picks a key, so a List that stalls loses the connection just as
+// surely as one that comes back blank. Web mode clears the in-memory token on
+// the re-auth transition, which is exactly when both conditions hold at once.
+func TestBackendListServesFreshCacheWithoutWaitingForReauth(t *testing.T) {
+	_, _, pubA, _ := genEd25519(t, "a")
+	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}}
+	gate := &stubGate{}
+	b := NewBackend([]Source{src}, WithReauthGate(gate),
+		WithCacheTTL(time.Minute), WithReauthTimeout(30*time.Second))
+
+	// Populate the cache while healthy.
+	if _, err := b.List(); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	// A replacement starts and never finishes within this test. The cached
+	// answer is still valid and must come back immediately.
+	gate.reauth.Store(true)
+
+	start := time.Now()
+	keys, err := b.List()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("List during re-auth: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("want the cached identity served through a re-auth, got %d", len(keys))
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("List took %s to serve a cached answer; it waited on the "+
+			"re-auth gate before checking the cache", elapsed)
+	}
+	if src.listCalls != 1 {
+		t.Errorf("cached answer must not re-consult sources, got %d calls", src.listCalls)
+	}
+}

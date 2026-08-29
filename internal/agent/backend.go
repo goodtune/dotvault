@@ -67,9 +67,18 @@ type Backend struct {
 	cacheTTL      time.Duration
 	now           func() time.Time
 
+	// mu guards the cache fields only, and is never held across a source
+	// call. refreshMu serialises the fan-out itself. Splitting them is what
+	// makes cachedIdentities' "never waits" true: with one mutex, a
+	// cache hit queued behind an in-flight refresh for as long as the refresh
+	// took — up to sourceTimeout — which is exactly the stall that answering
+	// from cache exists to avoid. Lock order is always refreshMu then mu;
+	// nothing takes them the other way round.
 	mu       sync.Mutex
 	cached   []Identity
 	cachedAt time.Time
+
+	refreshMu sync.Mutex
 }
 
 // Option configures a Backend.
@@ -161,7 +170,8 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 
 // identities returns the aggregated identities, refreshing from every source
 // when the cache has expired. It performs the Vault work; the two answers that
-// need no Vault call at all are served ahead of it by identitiesWithoutVault.
+// need no Vault call at all are handled around it: a fresh cache by
+// cachedIdentities, and a tokenless daemon by the probe below.
 //
 // A source that errors is skipped so one failing source does not blank the
 // whole agent — but the failure is not discarded:
@@ -180,16 +190,22 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 //
 // The cache and token checks are repeated here rather than trusted from the
 // caller: a concurrent List may have refreshed the cache, or the token may
-// have gone away, while this call waited on the re-auth gate.
+// have gone away, while this call waited on the re-auth gate or on refreshMu.
 func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
-		return b.cached, nil
+	// One refresh at a time. The re-check that follows is what collapses a
+	// thundering herd: callers that queued here while another was fanning out
+	// take its result rather than repeating the work — and, when that work
+	// failed and cached nothing, they would otherwise each redo the whole
+	// doomed fan-out in turn.
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	if ids, ok := b.cachedIdentities(); ok {
+		return ids, nil
 	}
 	if !b.haveToken() {
 		return nil, nil
 	}
+
 	var all []Identity
 	var errs []error
 	for _, src := range b.sources {
@@ -207,40 +223,29 @@ func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
 		}
 		return all, nil
 	}
+	b.mu.Lock()
 	b.cached = all
 	b.cachedAt = b.now()
+	b.mu.Unlock()
 	return all, nil
 }
 
-// identitiesWithoutVault returns the answer that is available without
-// consulting any source, reporting done=true when it found one. A refresh is
-// required otherwise.
+// cachedIdentities returns the cached listing while it is still inside its
+// TTL. It is the one answer List can give without any Vault call at all, and
+// so the one it never makes anyone wait for.
 //
-// Both answers it can give are owed to the caller *immediately*, which is why
-// they are separated out and taken before the re-auth gate:
-//
-//   - A cache still inside its TTL. The token check deliberately sits after
-//     it, because web mode clears the in-memory token on the re-auth
-//     transition, so a token going missing is routinely a refresh rather than
-//     a logout, and a still-fresh list must keep being served through it.
-//   - The empty list a daemon with no token owes. There is nothing any source
-//     could resolve, so the round of doomed Vault calls is skipped and the
-//     cache left untouched, letting the first List after a token arrives do a
-//     real refresh.
-//
-// Neither path touches Vault, so neither can present a half-replaced token —
-// which is what makes it safe to answer them without waiting out a re-auth,
-// and necessary to: an ssh client reads the identity list before it picks a
-// key, so a List that stalls costs the connection just as surely as one that
-// comes back blank.
-func (b *Backend) identitiesWithoutVault() (ids []Identity, done bool) {
+// It deliberately does not consider the token. Web mode clears the in-memory
+// token on the re-auth transition, so a token going missing is routinely a
+// refresh rather than a logout, and a still-fresh list must keep being served
+// through it: a blank `ssh-add -l` makes ssh drop dotvault's keys before it
+// ever reaches Sign, which is the call that knows how to wait. The token check
+// belongs after this one, in identities, where a refresh is actually about to
+// happen.
+func (b *Backend) cachedIdentities() ([]Identity, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
 		return b.cached, true
-	}
-	if !b.haveToken() {
-		return nil, true
 	}
 	return nil, false
 }
@@ -264,19 +269,29 @@ func (b *Backend) gatedContext(wait func(context.Context) error) (context.Contex
 
 // List enumerates the available identities (cached briefly).
 //
-// A refresh waits out a re-authentication window, as SignWithFlags does: List
-// is what an SSH client calls before choosing a key, so refreshing from a
-// half-replaced token turns a pause into a failed connection. The answers that
-// need no refresh are served first and never wait — see
-// identitiesWithoutVault.
+// A cache still inside its TTL is served immediately and never waits, because
+// it needs no Vault call and so cannot be built from a half-replaced token —
+// see cachedIdentities. Anything else is a refresh, and a refresh waits out a
+// re-authentication window as SignWithFlags does: List is what an SSH client
+// calls before choosing a key, so rebuilding that list from a token Vault has
+// already rejected turns a pause into a failed connection.
 //
-// It waits on waitForReauth rather than waitForToken: an unauthenticated
-// daemon owes an empty list, not the ErrNoToken that Sign owes, so that the
-// client moves on to its next authentication method. A source failure that
-// leaves nothing to advertise is still an error — see identities.
+// Waiting *before* the token probe is deliberate, and it is why the probe sits
+// in identities rather than out here. An absent token means two different
+// things: mid-replacement, where it is transient and about to come back, and
+// never-authenticated (or logged out), where nothing is coming. The gate is
+// what tells them apart, so the first waits and then refreshes normally, while
+// the second falls through the probe to an empty list at once — no gate is
+// wired before the daemon's first login, so that path never stalls.
+//
+// It waits on waitForReauth rather than waitForToken: if the token is still
+// absent afterwards an unauthenticated daemon owes an empty list, not the
+// ErrNoToken that Sign owes, so the client moves on to its next authentication
+// method rather than treating dotvault as broken. A source failure that leaves
+// nothing to advertise is still an error — see identities.
 func (b *Backend) List() ([]*agent.Key, error) {
-	ids, done := b.identitiesWithoutVault()
-	if !done {
+	ids, ok := b.cachedIdentities()
+	if !ok {
 		ctx, cancel, err := b.gatedContext(b.waitForReauth)
 		if err != nil {
 			return nil, err

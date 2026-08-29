@@ -1880,9 +1880,11 @@ func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
 // an agent *client* — it dials the running daemon's socket / pipe and lists the
 // identities being served (the `ssh-add -l` equivalent), so the output reflects
 // what the daemon actually offers, including a minted certificate's true
-// remaining validity. status never creates the endpoint; a failure to connect
-// is therefore unexpected (the daemon isn't running) and is reported as such.
-// The query is bounded end to end, not just at the dial — see
+// remaining validity. status never creates the endpoint, so a failure to reach
+// it is unexpected (the daemon isn't running) and is reported as such — while a
+// daemon that answered and simply could not resolve any identity is reported as
+// its own case, since the two send an operator looking in completely different
+// places. The query is bounded end to end, not just at the dial — see
 // agent.QueryListening for why the dial is the half that cannot hang.
 func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Agent.Enabled {

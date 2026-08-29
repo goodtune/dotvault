@@ -163,8 +163,9 @@ SSH Agent:
 ```
 
 Because the agent is only relevant when configured, `dotvault status` consults
-the endpoint only when `agent.enabled` is set. A failure to connect in that case
-is reported as unexpected — it means the daemon isn't running:
+the endpoint only when `agent.enabled` is set. A failure to reach it is
+reported as unexpected — it means the daemon isn't running, or is not yet
+serving this endpoint:
 
 ```
 $ dotvault status
@@ -174,6 +175,25 @@ SSH Agent:
   unreachable: dial unix /run/user/1000/dotvault/agent.sock: connect: no such file or directory
   (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)
 ```
+
+A daemon that *is* serving but cannot resolve any identity right now reports
+that separately, because the two send you looking in completely different
+places. The usual cause is a `vault-ca` source unable to mint for a moment,
+often while the daemon replaces its own Vault token — check the per-source
+errors on the web dashboard, or simply retry:
+
+```
+$ dotvault status
+...
+SSH Agent:
+  endpoint: /run/user/1000/dotvault/agent.sock
+  serving, but no identities could be resolved: agent could not list identities: ssh agent: ca: mint certificate: permission denied
+  (check the per-source errors on the web dashboard, or retry — a source may be mid-recovery)
+```
+
+Note this is distinct from the empty list below: an empty list means the agent
+has nothing to offer and says so cleanly, where this means it could not find
+out.
 
 ### Before the daemon has authenticated
 
@@ -189,6 +209,9 @@ SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
   (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)
 ```
+
+(A source that *failed* is not folded into this line — that is the "serving,
+but no identities could be resolved" case above.)
 
 `ssh` sees the same empty list and moves straight on to its next
 authentication method. A signing request in that window is refused rather than

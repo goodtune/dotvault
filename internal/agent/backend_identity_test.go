@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -174,8 +176,12 @@ func TestBackendListServesFreshCacheWithoutWaitingForReauth(t *testing.T) {
 	_, _, pubA, _ := genEd25519(t, "a")
 	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}}
 	gate := &stubGate{}
+	// A deliberately short re-auth budget: the point of the test is the
+	// elapsed-time assertion below, and with the production 30s budget a
+	// regression fails on the returned error after a 30s stall instead,
+	// leaving the timing check dead.
 	b := NewBackend([]Source{src}, WithReauthGate(gate),
-		WithCacheTTL(time.Minute), WithReauthTimeout(30*time.Second))
+		WithCacheTTL(time.Minute), WithReauthTimeout(time.Second))
 
 	// Populate the cache while healthy.
 	if _, err := b.List(); err != nil {
@@ -196,11 +202,180 @@ func TestBackendListServesFreshCacheWithoutWaitingForReauth(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("want the cached identity served through a re-auth, got %d", len(keys))
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > 500*time.Millisecond {
 		t.Errorf("List took %s to serve a cached answer; it waited on the "+
 			"re-auth gate before checking the cache", elapsed)
 	}
 	if src.listCalls != 1 {
 		t.Errorf("cached answer must not re-consult sources, got %d calls", src.listCalls)
+	}
+}
+
+// TestBackendCacheHitDoesNotQueueBehindSlowRefresh pins that the cache fast
+// path is not merely ordered before the gate but genuinely unblocked.
+//
+// Holding one mutex across the source fan-out made "answered first" mean
+// "answered first once the refresh finishes" — up to the full source timeout,
+// which is the same stall arrived at by a different route. A cache read and a
+// Vault round trip contend for nothing, so they must not share a lock.
+//
+// The cache is aged and un-aged through the injected clock rather than by
+// writing b.cached directly: touching the fields would need b.mu, which is the
+// very lock under test, so a regression would deadlock the test instead of
+// failing it. The measured List runs in its own goroutine for the same reason
+// — a blocked fast path has to be observable as elapsed time, not as a hang.
+func TestBackendCacheHitDoesNotQueueBehindSlowRefresh(t *testing.T) {
+	_, _, pubA, _ := genEd25519(t, "a")
+	release := make(chan struct{})
+	slow := &blockingSource{
+		fakeSource: fakeSource{name: "slow", ids: []Identity{{PubKey: pubA}}},
+		block:      release,
+	}
+
+	base := time.Now()
+	var offset atomic.Int64 // nanoseconds added to base
+	b := NewBackend([]Source{slow}, WithCacheTTL(time.Minute),
+		withClock(func() time.Time { return base.Add(time.Duration(offset.Load())) }))
+
+	// Populate the cache at the base instant.
+	if _, err := b.List(); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	// Age it past the TTL so the next caller must refresh, and park that
+	// refresh inside the source.
+	offset.Store(int64(2 * time.Minute))
+	slow.arm()
+	refreshDone := make(chan struct{})
+	go func() {
+		defer close(refreshDone)
+		_, _ = b.List()
+	}()
+	slow.waitEntered(t)
+
+	// With a refresh in flight and parked, wind the clock back so the existing
+	// cache entry is inside its window again. A concurrent caller now has a
+	// valid answer available and must get it without waiting for the refresh.
+	offset.Store(0)
+
+	measured := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		if _, err := b.List(); err != nil {
+			t.Errorf("List during refresh: %v", err)
+		}
+		measured <- time.Since(start)
+	}()
+
+	select {
+	case d := <-measured:
+		if d > 500*time.Millisecond {
+			t.Errorf("cache hit took %s while a refresh was in flight; the "+
+				"fast path is sharing a lock with the source fan-out", d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("cache hit blocked behind an in-flight refresh; the fast path " +
+			"is sharing a lock with the source fan-out")
+	}
+
+	close(release)
+	<-refreshDone
+}
+
+// blockingSource parks inside Identities until released, so a test can hold a
+// refresh open and observe what other callers can do meanwhile.
+type blockingSource struct {
+	fakeSource
+	block   chan struct{}
+	armed   atomic.Bool
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingSource) arm() {
+	s.entered = make(chan struct{})
+	s.armed.Store(true)
+}
+
+func (s *blockingSource) waitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh never reached the source")
+	}
+}
+
+func (s *blockingSource) Identities(ctx context.Context) ([]Identity, error) {
+	if s.armed.Load() {
+		s.once.Do(func() { close(s.entered) })
+		<-s.block
+	}
+	return s.fakeSource.Identities(ctx)
+}
+
+// TestBackendListWaitsOutReauthWhenTokenCleared pins the case where the two
+// rules this change reconciles actually meet.
+//
+// Web mode clears the in-memory token on the re-auth transition, so during a
+// replacement the token is absent *and* a gate is up. With a cold cache there
+// is nothing to serve, and answering empty there would be the blank
+// `ssh-add -l` that makes ssh drop dotvault's keys — the very failure the
+// pre-auth work exists to prevent, reached by a different route. An absent
+// token under a raised gate is transient, so List waits for it.
+func TestBackendListWaitsOutReauthWhenTokenCleared(t *testing.T) {
+	_, _, pubA, _ := genEd25519(t, "a")
+	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}}
+
+	var hasToken atomic.Bool
+	gate := &stubGate{}
+	gate.reauth.Store(true) // replacement under way, token cleared
+	b := NewBackend([]Source{src}, WithTokenProbe(hasToken.Load),
+		WithReauthGate(gate), WithReauthTimeout(5*time.Second))
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		hasToken.Store(true) // replacement lands
+		gate.reauth.Store(false)
+	}()
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("want the identity that became available once the replacement "+
+			"landed, got %d — List answered empty instead of waiting", len(keys))
+	}
+}
+
+// TestBackendListAndSignDifferWithoutToken pins the asymmetry gatedContext's
+// wait parameter exists for, which is otherwise invisible: every other path
+// into it already holds a token, so swapping the two waits changes nothing a
+// test would notice.
+//
+// An unauthenticated daemon owes List an empty list — an ssh client reads that
+// and moves straight on to its next authentication method — and owes Sign a
+// refusal, because a signature it cannot produce must not look like a key it
+// does not have. No gate is raised here: nothing is coming, so neither call
+// waits.
+func TestBackendListAndSignDifferWithoutToken(t *testing.T) {
+	_, _, pubA, signerA := genEd25519(t, "a")
+	src := &fakeSource{name: "a", ids: []Identity{{PubKey: pubA}}, signer: signerA}
+
+	var hasToken atomic.Bool // stays false
+	b := NewBackend([]Source{src}, WithTokenProbe(hasToken.Load),
+		WithReauthGate(&stubGate{}), WithReauthTimeout(5*time.Second))
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List without a token: want an empty list, got error %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("List without a token: want 0 keys, got %d", len(keys))
+	}
+
+	if _, err := b.Sign(pubA, []byte("x")); !errors.Is(err, ErrNoToken) {
+		t.Errorf("Sign without a token: want ErrNoToken, got %v", err)
 	}
 }

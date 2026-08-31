@@ -106,6 +106,74 @@ func TestLoginPage_RendersConfiguredMethod(t *testing.T) {
 	}
 }
 
+// TestLoginPage_BorrowOnlyShowsWaitingCard pins the borrow-only login view:
+// regardless of the configured auth method, no credential card is ever
+// rendered — only a waiting-for-peer card that polls itself, exactly like the
+// mtls waiting card.
+func TestLoginPage_BorrowOnlyShowsWaitingCard(t *testing.T) {
+	for _, method := range []string{"oidc", "ldap", "token", "mtls", ""} {
+		s := authTestServer(t, nil)
+		s.authMethod = method
+		s.vaultCfg.BorrowOnly = true
+
+		w := httptest.NewRecorder()
+		s.renderLogin(w, httptest.NewRequest("GET", "/", nil), "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", method, w.Code)
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "Waiting to borrow a Vault token") {
+			t.Errorf("%s: borrow-only login card missing the waiting message; body = %s", method, body)
+		}
+		for _, credForm := range []string{`href="/auth/oidc/start"`, `action="/login/ldap"`, `action="/login/token"`} {
+			if strings.Contains(body, credForm) {
+				t.Errorf("%s: borrow-only login card must never render a credential form, found %q", method, credForm)
+			}
+		}
+		if strings.Contains(body, "datastar.js") {
+			t.Errorf("%s: borrow-only login card loads datastar; the login view is script-free by design", method)
+		}
+	}
+}
+
+// TestBorrowOnlyLoginHandlers_Refuse pins the defense-in-depth
+// guards on the credential-adoption handlers themselves: even though the
+// borrow-only login view never links to them, a direct request must still be
+// refused rather than silently authenticating a host that is supposed to
+// carry no Vault identity of its own.
+func TestBorrowOnlyLoginHandlers_Refuse(t *testing.T) {
+	t.Run("ldap", func(t *testing.T) {
+		s := authTestServer(t, nil)
+		s.vaultCfg.BorrowOnly = true
+		req := postForm(t, "/login/ldap", url.Values{"username": {"u"}, "password": {"p"}})
+		w := httptest.NewRecorder()
+		s.handleLoginLDAP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("token", func(t *testing.T) {
+		s := authTestServer(t, nil)
+		s.vaultCfg.BorrowOnly = true
+		req := postForm(t, "/login/token", url.Values{"token": {"hvs.whatever"}})
+		w := httptest.NewRecorder()
+		s.handleLoginToken(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("oidc", func(t *testing.T) {
+		s := authTestServer(t, nil)
+		s.vaultCfg.BorrowOnly = true
+		req := httptest.NewRequest("GET", "/auth/oidc/start", nil)
+		w := httptest.NewRecorder()
+		s.handleAuthStart(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+		}
+	})
+}
+
 // TestLoginPage_MTLSBootstrapBorrowsCredentialCard pins the one interactive
 // moment certificate auth has: while a BootstrapLogin waits, the card becomes
 // the bootstrap method's credential prompt, framed as a one-time enrolment.

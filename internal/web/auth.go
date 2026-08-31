@@ -33,6 +33,14 @@ func (s *Server) WaitForAuth(ctx context.Context) error {
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
+	// Mirrors the borrow-only guards on the LDAP/token login POSTs: this
+	// path is never linked from the login view under borrow-only mode, but
+	// a direct GET must be closed too — this host has no fresh-auth flow to
+	// start.
+	if s.vaultCfg.BorrowOnly {
+		http.Error(w, "OIDC login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
+		return
+	}
 	mount := s.loginMount("oidc")
 
 	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)

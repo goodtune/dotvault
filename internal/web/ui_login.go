@@ -185,8 +185,21 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 // renderLogin draws the login card for the configured auth method, or — while
-// a certificate bootstrap is waiting — for the bootstrap credential method.
+// a certificate bootstrap is waiting — for the bootstrap credential method, or
+// — under borrow-only mode — a waiting card of its own: this host runs no
+// fresh-auth flow at all, so none of the credential cards below are ever
+// reachable, and showing one would invite a login attempt the daemon has no
+// way to honour.
 func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg string) {
+	if s.vaultCfg.BorrowOnly {
+		s.uiRenderStandalone(w, "login", uiLoginData{
+			uiStandaloneData: uiStandaloneData{Title: "Sign in", Error: errMsg, Refresh: loginPollSeconds},
+			Method:           "borrow",
+			CustomText:       template.HTML(s.loginTextHTML),
+		})
+		return
+	}
+
 	data := uiLoginData{
 		uiStandaloneData: uiStandaloneData{Title: "Sign in", Error: errMsg},
 		Method:           s.authMethod,
@@ -213,6 +226,10 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 // handleLoginLDAP starts an LDAP login and hands off to the progress page.
 func (s *Server) handleLoginLDAP(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	if s.vaultCfg.BorrowOnly {
+		writeError(w, "credential login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
 		return
 	}
 	if s.login == nil {
@@ -348,6 +365,12 @@ func (s *Server) handleLoginLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 // handleLoginToken adopts a pasted Vault token after validating it.
 func (s *Server) handleLoginToken(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	// Mirrors the borrow-only guard in handleLoginLDAP: no card ever posts
+	// here under borrow-only mode, but this closes the direct-POST path.
+	if s.vaultCfg.BorrowOnly {
+		writeError(w, "token login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
 		return
 	}
 	// Under certificate auth the operational token comes from the cert login

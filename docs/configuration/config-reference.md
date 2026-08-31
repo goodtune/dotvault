@@ -129,6 +129,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `tls_skip_verify` | bool | `false` | Skip TLS certificate verification (development only) |
 | `disable_token_renewal` | bool | `false` | Never call `RenewSelf`; TTL expiry still triggers re-auth |
 | `token_socket` | string | — | Optional path to a peer dotvault's web-API Unix socket to borrow a token from (see below) |
+| `borrow_only` | bool | `false` | Forbid this host from ever running its own fresh-auth flow; it only ever borrows a token via `token_socket` (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
 
@@ -223,6 +224,26 @@ The socket carries traffic the other way too. [`dotvault browse <url>`](../cli.m
 
 !!! warning "The socket grants the token to anyone who can connect"
     Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it — and, via `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard`, open arbitrary web pages (including phishing pages) in the workstation's browser, raise arbitrary desktop notifications on it, and replace the workstation's clipboard contents (a paste-hijacking primitive — e.g. swapping a copied wallet address or command). dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
+
+### `borrow_only` — forbid a fresh-auth flow entirely
+
+`borrow_only: true` takes the borrow above and makes it the *only* way this host can ever obtain a Vault token. `auth_method` (and the `mtls` block, if present) is simply not consulted: no OIDC browser, no LDAP prompt, no certificate bootstrap, and the web login view shows a waiting card instead of any credential form. Validated to require a non-empty `token_socket`, since without one this host could never authenticate at all.
+
+The use case is a fleet where one machine — an operator's desktop — is the sole holder of a Vault identity, and every other host it reaches must receive that identity only by borrowing it, never by minting one of its own:
+
+```yaml
+# Remote/headless host's config — shares vault.address, kv_mount, etc. with
+# the desktop's config; auth_method can even be left as whatever the desktop
+# uses, since it is ignored here.
+vault:
+  address: "https://vault.example.com:8200"
+  token_socket: "~/.ssh/dotvault.sock"   # forwarded from the desktop
+  borrow_only: true
+```
+
+Reuse of an already-cached token (the token file or `DOTVAULT_TOKEN`) still applies first, exactly as in every other mode — `borrow_only` only gates what happens once that comes up empty and the borrow itself fails. The daemon (`dotvault run`) then **idles and keeps retrying the borrow**, watching both the token file (for a manually-dropped override) and the socket, rather than failing startup — the same shape a headless host with no interactive facility already uses while waiting for `dotvault login` to run elsewhere. A one-shot command has no fresh-auth flow to wait on, so it fails immediately instead: `dotvault login`'s entire purpose — force a fresh login, ignoring the cache — has no meaning under this mode and is refused outright with an explanation; `dotvault sync`/`--once` and the Go/Python client libraries' `Login` refuse the same way (`AuthenticateCached`, which never runs a fresh-auth flow to begin with, is unaffected and keeps borrowing normally).
+
+On Windows GPO the equivalent registry value is a `BorrowOnly` REG_DWORD under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Vault`.
 
 For example, with defaults and username `jane`, the rule `vault_key: "gh"` reads from `kv/data/users/jane/gh`.
 

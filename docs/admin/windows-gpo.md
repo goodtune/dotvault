@@ -54,6 +54,7 @@ Every YAML field has a registry equivalent. The tables below give the value name
 | `Vault\NoDefaultPolicy` | REG_DWORD | Strip the implicit `default` policy from the working token (0/1) |
 | `Vault\DisableTokenRenewal` | REG_DWORD | Disable RenewSelf (0/1) |
 | `Vault\TokenSocket` | REG_SZ | Path to a peer dotvault web-API Unix socket to borrow a token from |
+| `Vault\BorrowOnly` | REG_DWORD | Forbid a fresh-auth flow entirely; only ever borrow via `TokenSocket` (0/1) |
 
 ### Sync settings (`Sync\` subkey)
 

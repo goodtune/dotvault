@@ -473,8 +473,36 @@ type VaultConfig struct {
 	// user's home. A missing or stale socket is ignored — the normal auth
 	// flow proceeds — so the field is purely additive and needs no validation.
 	TokenSocket string `yaml:"token_socket"`
+	// BorrowOnly, when true, forces this host to authenticate to Vault
+	// exclusively by borrowing a live token over TokenSocket — it never runs
+	// AuthMethod's own fresh-auth flow (no OIDC browser, no LDAP prompt, no
+	// certificate bootstrap, no web login form). The use case is a remote or
+	// headless host that must never carry its own Vault identity: the
+	// operator's desktop authenticates interactively and is the sole holder
+	// of a credential, and every other host reached from it (over the same
+	// SSH RemoteForward'd socket vault.token_socket already documents)
+	// receives that identity only by borrowing it, never by minting its own.
+	//
+	// AuthMethod (and vault.mtls, if set) is simply ignored in this mode —
+	// deliberately, so the same base config can be shared between the
+	// desktop and its remote hosts with only this flag differing, rather
+	// than requiring the remote hosts to carry a method they must never
+	// actually use. Reuse of an existing cached token (the token file or
+	// DOTVAULT_TOKEN) still applies first, exactly as in every other mode;
+	// this only gates what happens once that comes up empty. Validated to
+	// require a non-empty TokenSocket, since without one there would be
+	// nothing to borrow from and the host could never authenticate at all.
+	//
+	// The daemon idles — watching the token file and the socket, retrying
+	// the borrow — rather than failing when no token is available yet; a
+	// one-shot command (`dotvault login`, `dotvault sync`) instead returns
+	// an error naming the mode, since there is no fresh-auth flow for it to
+	// wait on. `dotvault login`'s "ignore the cache and force a fresh login"
+	// contract has no meaning under this mode and is refused outright.
+	BorrowOnly bool `yaml:"borrow_only"`
 	// MTLS configures the cert auth methods. It is consulted only when
 	// AuthMethod drives the cert-auth flow ("mtls", "mtls+tpm", "mtls+os").
+	// Ignored entirely when BorrowOnly is set.
 	MTLS MTLSConfig `yaml:"mtls"`
 }
 
@@ -959,8 +987,15 @@ func IsMTLSMethod(method string) bool {
 }
 
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
-// unless auth_method drives the cert-auth flow (see IsMTLSMethod).
+// unless auth_method drives the cert-auth flow (see IsMTLSMethod), and is
+// skipped entirely under vault.borrow_only — that mode never runs any
+// fresh-auth flow, cert-issuing or otherwise, so the block's requirements
+// (cert_role, pki_role, ...) would only obstruct a config that shares its
+// AuthMethod with a non-borrow-only deployment of the same base config.
 func (c *Config) validateMTLS() error {
+	if c.Vault.BorrowOnly {
+		return nil
+	}
 	method := c.Vault.AuthMethod
 	if !IsMTLSMethod(method) {
 		return nil
@@ -1093,6 +1128,14 @@ func (c *Config) validate() error {
 	// mTLS / cert-auth validation and defaulting, gated on the auth method.
 	if err := c.validateMTLS(); err != nil {
 		return err
+	}
+
+	// vault.borrow_only forces every fresh-auth attempt onto the borrow
+	// path; without a socket to borrow from, this host could never obtain a
+	// token at all, so require one up front rather than trapping the
+	// operator in a daemon that idles forever with no way to succeed.
+	if c.Vault.BorrowOnly && c.Vault.TokenSocket == "" {
+		return fmt.Errorf("vault.borrow_only requires vault.token_socket (there is nothing to borrow a token from otherwise)")
 	}
 
 	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {

@@ -24,6 +24,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 			UserPrefix:          "users/",
 			OIDCCallbackPort:    8251,
 			TokenSocket:         "~/.ssh/dotvault.sock",
+			BorrowOnly:          true,
 			Policies:            []string{"dotvault", "kv-read"},
 			NoDefaultPolicy:     true,
 			DisableTokenRenewal: true,

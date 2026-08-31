@@ -948,7 +948,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// another — destroying a working credential to enforce a guarantee that
 	// login was never going to reach. Removal therefore happens in certLogin, on
 	// success, which is exactly the moment the guarantee is claimed for.
-	reuseFromFile := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+	// Under vault.borrow_only this exclusion does not apply even when
+	// auth_method happens to be the literal "mtls+os": auth_method is
+	// ignored entirely in that mode (see config.VaultConfig.BorrowOnly), so
+	// there is no certLogin that will ever remove the file, and treating a
+	// leftover token as unusable would only break the promised manual
+	// override — see effectivePersistTokenAtRest.
+	reuseFromFile := effectivePersistTokenAtRest(cfg)
 
 	// Try to reuse an existing token before starting any auth flow.
 	authenticated := false
@@ -1088,7 +1094,25 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		if cfg.Vault.BorrowOnly {
+			// This host runs no fresh-auth flow of its own, by design (see
+			// config.VaultConfig.BorrowOnly): AuthMethod, mtls settings, the
+			// web login view, and any interactive TTY prompt are all beside
+			// the point here. The only path to a token is borrowing one over
+			// borrowSockets, which the inline attempt above already tried
+			// once and failed (authenticated is still false) — so idle and
+			// keep retrying the borrow exactly as a headless host with no
+			// interactive facility does, rather than failing startup. A
+			// token dropped into the file manually (an emergency override)
+			// is still picked up, since waitForHeadlessToken watches it too.
+			slog.Warn("borrow-only mode: no local auth method configured; idling until a vault token can be borrowed from a peer socket", "sockets", borrowSockets)
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath, cfg.Vault.BorrowOnly), borrowSockets, denyList) {
+				slog.Info("shutting down before a vault token was borrowed")
+				return nil
+			}
+			slog.Info("borrowed vault token from peer socket; continuing startup")
+			authenticated = true
+		} else if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 			// Certificate auth: the steady state (load credential → cert
 			// login) needs no human and works headlessly, so it takes
 			// precedence over the web/TTY branching. Only first-run bootstrap
@@ -1175,7 +1199,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from the peer socket")
-			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrowSockets, denyList) {
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath, cfg.Vault.BorrowOnly), borrowSockets, denyList) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -1222,7 +1246,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// recovery, and ahead of the certificate hook that is the correct source
 	// of a replacement token for this method.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
-	if auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+	if effectivePersistTokenAtRest(cfg) {
 		lm.SetTokenFilePath(tokenPath)
 	}
 	lm.SetTokenSockets(borrowSockets)
@@ -1244,7 +1268,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// in steady state — the startup cert login is otherwise the only one, and
 	// ReissueIfDue rotates the certificate rather than the token, so a token
 	// that expired mid-session would strand the daemon until a restart.
-	if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+	// Gated the same way mtlsParams is (IsMTLSMethod AND NOT borrow_only): a
+	// borrow-only host must recover only by re-borrowing (which tryReload
+	// already does via lm's token sockets), never by a cert login of its
+	// own, even when auth_method happens to be a cert method left over from
+	// a shared base config — see mtlsParams and config.VaultConfig.BorrowOnly.
+	if config.IsMTLSMethod(cfg.Vault.AuthMethod) && !cfg.Vault.BorrowOnly {
 		recoverMgr := &auth.Manager{
 			VaultClient:   vc,
 			TokenFilePath: tokenPath,
@@ -1355,7 +1384,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		slog.Debug("vault token file changed, re-reading")
 		lm.Reload()
 	}
-	if !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+	if !effectivePersistTokenAtRest(cfg) {
 		slog.Debug("token-file watcher not started; this auth method keeps no token at rest", "auth_method", cfg.Vault.AuthMethod)
 	} else if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
 		slog.Warn("token-file watcher unavailable; relying on periodic re-read", "error", err)
@@ -1740,13 +1769,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// a source here — and its absence says nothing about whether the host is
 	// working. Report on the credential that actually exists instead: the
 	// certificate. That is verifiable from disk, side-effect free, and closer to
-	// what the operator wants to know.
+	// what the operator wants to know. This carve-out does not apply under
+	// vault.borrow_only, even when auth_method happens to be the literal
+	// "mtls+os": auth_method is ignored entirely in that mode, so there is no
+	// certificate to report on, and persistsToken (effectivePersistTokenAtRest)
+	// folds that in so the token-file/borrow-only paths below apply instead.
 	//
 	// The alternative — performing a certificate login so status could show a
 	// live token — was rejected: `status` is an informational command, and
 	// minting a Vault token (with its lease) merely to answer "am I set up?"
 	// makes an observation command a mutating one.
-	persistsToken := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+	persistsToken := effectivePersistTokenAtRest(cfg)
 	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
 	borrowSockets := cfg.TokenBorrowSockets()
 	borrowedFrom := ""
@@ -1767,6 +1800,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
 		for _, s := range borrowSockets {
 			fmt.Printf("  token socket: %s\n", s)
+		}
+		if cfg.Vault.BorrowOnly {
+			fmt.Println("  (borrow-only mode: this host runs no fresh-auth flow of its own and will keep retrying the borrow)")
 		}
 	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
@@ -1930,6 +1966,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 		TokenSockets:     freshLoginBorrowSockets(cfg),
+		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -1942,6 +1979,15 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		// Ctrl-C should exit quietly — the user knows they cancelled.
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 			return nil
+		}
+		// Under borrow-only mode this is the expected, informative outcome
+		// rather than a misconfiguration: `dotvault login`'s whole purpose —
+		// forcing a fresh interactive auth flow — has no meaning on a host
+		// that runs none. errors.Is surfaces distinctly here so a caller
+		// scripting around this command can tell the two apart if it needs
+		// to; the printed text is the same either way.
+		if errors.Is(err, auth.ErrBorrowOnly) {
+			return fmt.Errorf("login: %w (this host is configured with vault.borrow_only: true — it only ever borrows a token from vault.token_socket %q; make sure the peer is reachable and already holds a token)", err, cfg.Vault.TokenSocket)
 		}
 		return fmt.Errorf("login: %w", err)
 	}
@@ -2149,7 +2195,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	// mtls+tpm still cache a token, and this hook still renews it for them —
 	// short-circuiting on certificate validity there would silently stop that
 	// renewal, which is a behaviour change to methods this work must not touch.
-	if !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) && config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+	if !cfg.Vault.BorrowOnly && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) && config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		info, err := auth.InspectCertCredential(mtlsStorageDir(cfg))
 		switch {
 		case err != nil:
@@ -2269,6 +2315,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 		TokenSockets:     cfg.TokenBorrowSockets(),
+		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2505,6 +2552,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 		TokenSockets:     cfg.TokenBorrowSockets(),
+		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2813,7 +2861,15 @@ func mtlsStorageDir(cfg *config.Config) string {
 }
 
 func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
-	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+	// Under borrow_only, auth_method (and therefore vault.mtls) is ignored
+	// entirely — see config.VaultConfig.BorrowOnly — so this must return nil
+	// even when auth_method happens to be a cert method, e.g. because it is
+	// shared with a non-borrow-only deployment of the same base config.
+	// Every caller of mtlsParams that wires cert-specific behaviour (startup
+	// dispatch, unattended recovery, the periodic reissue check) keys off
+	// this nil, so gating here is what keeps that behaviour off for every
+	// one of them without repeating the check at each call site.
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return nil
 	}
 	m := cfg.Vault.MTLS
@@ -2884,7 +2940,7 @@ func notifyBootstrapURL(url string) {
 // validateMTLS defaults BootstrapMethod to "oidc" and rejects anything other
 // than ldap/oidc, so a non-empty result here is always one the login view can render.
 func bootstrapMethodForWeb(cfg *config.Config) string {
-	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return ""
 	}
 	return cfg.Vault.MTLS.BootstrapMethod
@@ -2900,7 +2956,7 @@ func bootstrapMethodForWeb(cfg *config.Config) string {
 // otherwise have the CLI and the browser hitting different Vault paths for the same
 // config. Empty is fine — Server.loginMount falls back to the method default.
 func bootstrapMountForWeb(cfg *config.Config) string {
-	if !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return ""
 	}
 	return cfg.Vault.MTLS.BootstrapMount
@@ -2910,10 +2966,34 @@ func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
+// effectivePersistTokenAtRest reports whether this host's token file is a
+// valid source (reuse candidate, manual-override watch target) once
+// vault.borrow_only is folded in. auth.PersistTokenAtRest alone answers a
+// narrower question — does auth_method's own no-persist guarantee (mtls+os)
+// apply — but under borrow_only that guarantee is moot regardless of what
+// auth_method is set to: it is ignored entirely (see
+// config.VaultConfig.BorrowOnly), so no cert flow exists that would need the
+// file kept clear for it, and the file reverts to being an ordinary
+// candidate. Every cmd/dotvault site that decides whether to read or watch
+// the token file for reuse purposes should call this rather than
+// auth.PersistTokenAtRest directly.
+func effectivePersistTokenAtRest(cfg *config.Config) bool {
+	return cfg.Vault.BorrowOnly || auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+}
+
 // headlessTokenPath returns the token path waitForHeadlessToken should watch,
 // or "" under an auth method that keeps no token at rest — the headless idle
 // must not adopt a file that method has undertaken never to use.
-func headlessTokenPath(method, tokenPath string) string {
+//
+// borrowOnly overrides that: under vault.borrow_only, auth_method (mtls+os
+// included) is ignored entirely — see config.VaultConfig.BorrowOnly — so
+// there is no cert flow whose no-persist guarantee a watched file could
+// undermine, and the token file remains a normal manual-override candidate
+// regardless of what auth_method happens to be set to.
+func headlessTokenPath(method, tokenPath string, borrowOnly bool) string {
+	if borrowOnly {
+		return tokenPath
+	}
 	if !auth.PersistTokenAtRest(method) {
 		return ""
 	}

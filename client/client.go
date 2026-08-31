@@ -301,7 +301,15 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	// token file: that file belongs to the daemon, and a library inside
 	// somebody else's process must not race it. Same ownership rule as the
 	// peer-socket borrow above.
-	if config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
+	//
+	// Excluded entirely under BorrowOnly, even when AuthMethod happens to be
+	// a cert method: BorrowOnly documents AuthMethod as ignored altogether
+	// (see VaultConfig.BorrowOnly), and this host must never mint its own
+	// operational token from a certificate it may only be holding as a
+	// leftover from a shared base config — that is exactly the "never mints
+	// its own identity" guarantee borrow-only exists to give. Mirrors the
+	// equivalent guard the daemon applies via mtlsParams.
+	if !c.cfg.Vault.BorrowOnly && config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
 		mgr := c.manager()
 		mgr.TokenFilePath = "" // in-memory only; see above
 		if err := mgr.CertLoginFromStore(ctx); err != nil {
@@ -383,6 +391,16 @@ func (c *Client) Login(ctx context.Context) error {
 	if config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
 		return fmt.Errorf("%w: auth method %q is consumption-only from the client API: use AuthenticateCached to present an already-enrolled certificate, and enrol this host with the dotvault daemon or CLI",
 			ErrLoginRequired, c.cfg.Vault.AuthMethod)
+	}
+	// Mirrors the mtls refusal above: a host configured borrow-only (see
+	// VaultConfig.BorrowOnly) runs no fresh-auth flow at all, so there is
+	// nothing for Login to do beyond what the borrow already tried inside
+	// AuthenticateCached. auth.Manager.Login would refuse identically (it
+	// returns auth.ErrBorrowOnly), but failing here is clearer for a facade
+	// consumer than surfacing that sentinel wrapped in ErrAuthFailed.
+	if c.cfg.Vault.BorrowOnly {
+		return fmt.Errorf("%w: this host is configured borrow-only: it authenticates exclusively by borrowing a token over TokenSocket/APISocket, never via a fresh-auth flow — use AuthenticateCached instead",
+			ErrLoginRequired)
 	}
 	if err := c.manager().Login(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrAuthFailed, err)

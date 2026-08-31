@@ -659,6 +659,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
 		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
+		func() error { return applyBool(&cfg.Vault.BorrowOnly, vaultKey, "BorrowOnly") },
 		func() error {
 			v, ok, err := getMultiString(vaultKey, "Policies")
 			if err != nil {

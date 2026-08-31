@@ -190,8 +190,25 @@ func TestHeadlessTokenPathGatedByPersistence(t *testing.T) {
 		{method: "oidc+os", want: path}, // no-persist is implemented only off mtls
 	} {
 		t.Run(tt.method, func(t *testing.T) {
-			if got := headlessTokenPath(tt.method, path); got != tt.want {
-				t.Errorf("headlessTokenPath(%q, path) = %q, want %q", tt.method, got, tt.want)
+			if got := headlessTokenPath(tt.method, path, false); got != tt.want {
+				t.Errorf("headlessTokenPath(%q, path, false) = %q, want %q", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHeadlessTokenPathBorrowOnlyOverridesPersistence pins the borrow-only
+// carve-out found by pre-push review: auth_method is documented as ignored
+// entirely under vault.borrow_only, including the literal "mtls+os" a shared
+// base config might leave in place — so borrowOnly=true must always watch the
+// token file (the manual-override candidate), regardless of what
+// PersistTokenAtRest(method) alone would say.
+func TestHeadlessTokenPathBorrowOnlyOverridesPersistence(t *testing.T) {
+	const path = "/home/alice/.dotvault-token"
+	for _, method := range []string{"mtls+os", "mtls", "mtls+tpm", "oidc", "ldap", "token"} {
+		t.Run(method, func(t *testing.T) {
+			if got := headlessTokenPath(method, path, true); got != path {
+				t.Errorf("headlessTokenPath(%q, path, true) = %q, want %q", method, got, path)
 			}
 		})
 	}

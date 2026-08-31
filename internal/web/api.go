@@ -19,6 +19,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{
 		"authenticated": authenticated,
 		"auth_method":   s.authMethod,
+		"borrow_only":   s.vaultCfg.BorrowOnly,
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
 		// Bootstrap state, served unauthenticated alongside auth_method

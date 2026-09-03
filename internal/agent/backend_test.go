@@ -255,6 +255,98 @@ func TestBackendSetReauthGateRace(t *testing.T) {
 	wg.Wait()
 }
 
+// stubReporter is a controllable RejectionReporter recording every report.
+type stubReporter struct {
+	mu    sync.Mutex
+	calls []error
+}
+
+func (r *stubReporter) NotifyRejected(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, err)
+}
+
+func (r *stubReporter) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+// TestBackendListReportsSourceErrorToReporter pins the write side of the
+// ReauthGate/RejectionReporter pair: a source failure discovered via List
+// (the vault-ca source's certificate mint hitting a 403, in production) must
+// reach the wired reporter so the lifecycle manager can recover sooner than
+// its own poll would notice.
+func TestBackendListReportsSourceErrorToReporter(t *testing.T) {
+	boom := errors.New("mint certificate: 403")
+	bad := &fakeSource{name: "bad", idErr: boom}
+	reporter := &stubReporter{}
+	b := NewBackend([]Source{bad}, WithReauthReporter(reporter))
+
+	if _, err := b.List(); err == nil {
+		t.Fatal("List: want error when the only source fails, got nil")
+	}
+	if got := reporter.count(); got != 1 {
+		t.Fatalf("reporter notified %d times, want 1", got)
+	}
+	if !errors.Is(reporter.calls[0], boom) {
+		t.Errorf("reporter received %v, want it to wrap %v", reporter.calls[0], boom)
+	}
+}
+
+// TestBackendSignReportsSourceErrorToReporter mirrors the List case for the
+// signing path.
+func TestBackendSignReportsSourceErrorToReporter(t *testing.T) {
+	boom := errors.New("mint certificate: 403")
+	bad := &fakeSource{name: "bad", signErr: boom}
+	reporter := &stubReporter{}
+	b := NewBackend([]Source{bad}, WithReauthReporter(reporter))
+
+	if _, err := b.Sign(mustTestPub(t), []byte("x")); err == nil {
+		t.Fatal("Sign: want error when the only source fails, got nil")
+	}
+	if got := reporter.count(); got != 1 {
+		t.Fatalf("reporter notified %d times, want 1", got)
+	}
+	if !errors.Is(reporter.calls[0], boom) {
+		t.Errorf("reporter received %v, want it to wrap %v", reporter.calls[0], boom)
+	}
+}
+
+// TestBackendWithoutReporterDoesNotPanic ensures a Backend built with no
+// reporter wired (headless / test construction, the common case) tolerates a
+// source failure exactly as before — reportRejection must be a safe no-op.
+func TestBackendWithoutReporterDoesNotPanic(t *testing.T) {
+	bad := &fakeSource{name: "bad", idErr: errors.New("boom")}
+	b := NewBackend([]Source{bad})
+	if _, err := b.List(); err == nil {
+		t.Fatal("List: want error, got nil")
+	}
+}
+
+// TestBackendSetReauthReporterRace exercises the same race SetReauthGate's
+// test guards, for the reporter's atomic.Value.
+func TestBackendSetReauthReporterRace(t *testing.T) {
+	bad := &fakeSource{name: "bad", idErr: errors.New("boom")}
+	b := NewBackend([]Source{bad}, WithCacheTTL(0))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.SetReauthReporter(&stubReporter{})
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = b.List()
+		}()
+	}
+	wg.Wait()
+}
+
 // ensure *Backend satisfies the x/crypto ExtendedAgent interface.
 var _ agent.ExtendedAgent = (*Backend)(nil)
 

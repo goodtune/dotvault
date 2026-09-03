@@ -1321,8 +1321,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// instead of failing. The listener is already serving (started before
 	// authentication, above); SetReauthGate is atomic precisely so it can be
 	// wired under a live listener.
+	//
+	// SetReauthReporter is the write side of the same relationship: a source
+	// error (the vault-ca source's certificate mint hitting a 403, most
+	// often) is reported back to lm so recovery starts immediately instead of
+	// waiting out lm's own checkInterval — see LifecycleManager.NotifyRejected.
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
+		agentSvc.Backend.SetReauthReporter(lm)
 	}
 
 	// Mount the filesystem now that we hold a Vault token: every read it

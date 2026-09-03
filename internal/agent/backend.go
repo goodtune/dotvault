@@ -26,6 +26,30 @@ type ReauthGate interface {
 // ReauthGate implementation (the real LifecycleManager, a test stub) is wired.
 type gateHolder struct{ gate ReauthGate }
 
+// RejectionReporter lets the backend report a Vault-confirmed token rejection
+// it observed independently of the daemon's own token-lifecycle poll — a
+// vault-ca source's certificate mint hitting a 403 is the motivating case —
+// so recovery starts now instead of waiting out that poll's own check
+// interval (5 minutes by default). *auth.LifecycleManager satisfies it via
+// NotifyRejected, which classifies the error itself, so this side needs no
+// classification of its own: every source error is reported unconditionally
+// and a transient fault (Vault unreachable, sealed) is simply ignored on the
+// other end.
+//
+// This is the write side of the relationship ReauthGate is the read side of:
+// the backend waits on the gate before using a token mid-replacement, and
+// reports here when it independently discovers the token is bad. The two are
+// deliberately separate interfaces (mirroring LifecycleManager's own
+// NeedsReauth/ReauthSignalled split) — a component that only ever waits (a
+// test stub wired as a ReauthGate) is not obligated to also implement this.
+type RejectionReporter interface {
+	NotifyRejected(err error)
+}
+
+// reporterHolder wraps a RejectionReporter for the same atomic.Value reason
+// gateHolder wraps a ReauthGate.
+type reporterHolder struct{ reporter RejectionReporter }
+
 const (
 	defaultListCacheTTL  = 8 * time.Second
 	defaultReauthTimeout = 30 * time.Second
@@ -66,6 +90,14 @@ type Backend struct {
 	sourceTimeout time.Duration
 	cacheTTL      time.Duration
 	now           func() time.Time
+
+	// reporter holds a reporterHolder, wired the same way and at the same
+	// time as gate (SetReauthGate and SetReauthReporter are called together
+	// in cmd/dotvault, once the lifecycle manager exists). Read whenever a
+	// source reports an error from identities/SignWithFlags, so a rejection
+	// this backend discovers independently reaches the lifecycle manager's
+	// recovery path instead of sitting unacted on until its next poll.
+	reporter atomic.Value
 
 	// mu guards the cache fields only, and is never held across a source
 	// call. refreshMu serialises the fan-out itself. Splitting them is what
@@ -109,6 +141,47 @@ func (b *Backend) reauthGate() ReauthGate {
 		return h.gate
 	}
 	return nil
+}
+
+// WithReauthReporter wires the rejection reporter used to notify the
+// lifecycle manager of a Vault rejection a source discovers independently.
+func WithReauthReporter(r RejectionReporter) Option {
+	return func(b *Backend) { b.setReporter(r) }
+}
+
+// SetReauthReporter wires the reporter after construction, mirroring
+// SetReauthGate — the daemon calls both together once the lifecycle manager
+// exists. A nil argument is a no-op; nothing relies on clearing it.
+func (b *Backend) SetReauthReporter(r RejectionReporter) { b.setReporter(r) }
+
+// setReporter stores the reporter, ignoring a nil so WithReauthReporter(nil)
+// (the headless / no-lifecycle case, and every test that doesn't care) leaves
+// the backend reporter-less rather than boxing a nil.
+func (b *Backend) setReporter(r RejectionReporter) {
+	if r != nil {
+		b.reporter.Store(reporterHolder{reporter: r})
+	}
+}
+
+// reportRejection forwards err to the wired reporter, a no-op if none is set.
+// Every source error from identities/SignWithFlags is reported unconditionally
+// — classification of "is this actually a rejection, or a transient fault"
+// belongs to the reporter (LifecycleManager.NotifyRejected), which already
+// owns that predicate for its own checkAndRenew path. Duplicating it here
+// would risk the two classifications drifting apart.
+//
+// Logs at debug regardless of whether the reporter's own classification
+// accepts or discards it — the caller (identities/SignWithFlags) already
+// logged the source failure itself; this line is what lets that failure be
+// correlated with "and it was forwarded to the lifecycle manager", which
+// otherwise has no visible trace on this side of the interface.
+func (b *Backend) reportRejection(err error) {
+	h, ok := b.reporter.Load().(reporterHolder)
+	if !ok || h.reporter == nil {
+		return
+	}
+	slog.Debug("ssh agent: reporting source failure to the token lifecycle manager", "error", err)
+	h.reporter.NotifyRejected(err)
 }
 
 // WithReauthTimeout bounds how long Sign waits for re-auth to clear.
@@ -213,6 +286,12 @@ func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
 		if err != nil {
 			slog.Debug("ssh agent: source failed to list identities", "source", src.Name(), "error", err)
 			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			// Report unconditionally — a vault-ca mint's 403 is exactly the
+			// case this exists for, and a transient fault (Vault
+			// unreachable, sealed) is filtered out on the reporter's side
+			// (LifecycleManager.NotifyRejected), not here. See
+			// RejectionReporter.
+			b.reportRejection(err)
 			continue
 		}
 		all = append(all, ids...)
@@ -340,6 +419,9 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 		if err != nil {
 			slog.Debug("ssh agent: source failed to sign", "source", src.Name(), "error", err)
 			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			// See the matching call in identities: reported unconditionally,
+			// classified on the reporter's side.
+			b.reportRejection(err)
 			continue
 		}
 		if matched {

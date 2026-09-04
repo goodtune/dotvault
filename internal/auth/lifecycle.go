@@ -749,10 +749,12 @@ func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- erro
 // the client's current token, so the pass that just succeeded already answered
 // it.
 //
-// The narrow cost is a report about the *new* token landing in the instant
-// between the swap and this drain, which is then swallowed; the next scheduled
-// tick catches it, and the reporting subsystem reports again on its next
-// attempt once the rate-limit window allows.
+// The cost is a report about the *new* token landing between the swap and this
+// drain, which is then swallowed. That window is an instant, but the delay it
+// buys is not: the reporter spent its rate-limit window queueing the report, so
+// it cannot raise another for up to recoveryInterval, and a genuinely
+// newly-broken token therefore goes unreported for that long rather than until
+// the next attempt. The scheduled tick remains the backstop.
 func (lm *LifecycleManager) drainReject() {
 	select {
 	case <-lm.rejectCh:

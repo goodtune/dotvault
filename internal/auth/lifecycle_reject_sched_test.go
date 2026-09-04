@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,5 +176,88 @@ func TestLifecycleManager_SuccessfulCycleDrainsQueuedReport(t *testing.T) {
 	case <-lm.rejectCh:
 		t.Error("a report queued during a cycle that ended healthy was left to trigger a redundant re-check")
 	default:
+	}
+}
+
+// TestLifecycleManager_OutOfCycleRecoveryDoesNotReCheck drives the whole path
+// through Start — NotifyRejected, the rejectCh branch, an out-of-cycle
+// runCheckCycle that recovers, and the nextTickAt threading behind it — rather
+// than the helpers in isolation.
+//
+// It covers the drain on an early-return success path, which the scheduled
+// case cannot reach, and pins the behaviour that motivated it: the reporting
+// subsystem keeps failing for as long as the gate is held, so a report lands
+// during the very cycle that fixes the token. Without the drain, every
+// successful recovery was followed by an immediate redundant re-check.
+func TestLifecycleManager_OutOfCycleRecoveryDoesNotReCheck(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	const recovered = "recovered-token"
+	var valid atomic.Value
+	valid.Store(recovered)
+
+	var lookups atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("X-Vault-Token") == valid.Load().(string) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"ttl": json.Number("3600"), "creation_ttl": json.Number("3600"), "renewable": true,
+			}})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"permission denied"}})
+	}))
+	defer ts.Close()
+
+	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// A long checkInterval keeps the scheduled tick out of the measurement:
+	// anything that runs here was driven by the report, not the clock.
+	lm := NewLifecycleManager(vc, time.Hour, false)
+	// A short rate-limit window models the case that actually produces the
+	// queued report: a real recovery (a PKI sign plus a Vault login, bounded
+	// at 20s) outlasts the reporter's window, so its next failure does queue.
+	// Left at the 10s default the in-cycle report below is simply rate-limited
+	// away and the test proves nothing.
+	lm.recoveryInterval = time.Millisecond
+	lm.SetRecover(func(context.Context) error {
+		// Stand in for the reporting subsystem still failing while the gate is
+		// held — this is the report the drain exists to discard.
+		time.Sleep(5 * time.Millisecond) // outlast the window, as a real recovery does
+		lm.NotifyRejected(forbiddenErr())
+		vc.SetToken(recovered)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	errCh := lm.Start(ctx)
+	go func() {
+		for range errCh {
+		}
+	}()
+
+	lm.NotifyRejected(forbiddenErr())
+	if !waitFor(func() bool { return vc.Token() == recovered }, 5*time.Second) {
+		t.Fatalf("token = %q, want %q — the reported rejection did not drive a recovery", vc.Token(), recovered)
+	}
+
+	// Let any queued nudge that survived the drain be acted on.
+	// Assert on the total rather than sampling after the token flips: the
+	// redundant cycle races that flip, so a delta measured from there passes
+	// whenever it happens to run first. One lookup-self is the whole story —
+	// the cycle the report drove. A second means the report queued during it
+	// survived and drove another against the token that cycle had just fixed.
+	time.Sleep(500 * time.Millisecond)
+	if got := lookups.Load(); got != 1 {
+		t.Errorf("%d lookup-self calls, want 1; a report queued during the recovery was left to trigger a redundant re-check", got)
+	}
+	if lm.NeedsReauth() {
+		t.Error("NeedsReauth() = true after a successful notify-driven recovery")
 	}
 }

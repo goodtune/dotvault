@@ -18,6 +18,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -95,7 +96,22 @@ func (s *Server) signalAuthDone() {
 // credential. Under certificate auth a browser login is *only* ever a
 // bootstrap, so a second login arriving after the bootstrap was consumed is
 // dropped rather than adopted (operationalAdoptionAllowed).
+//
+// Also refuses under borrow-only, as the chokepoint every adopting caller
+// funnels through — not a substitute for the guards each entry point
+// (handleAuthStart, handleAuthCallback, handleLoginLDAP) already carries,
+// which additionally stop those handlers from ever starting a flow or
+// completing a real Vault authentication in the first place (letting one
+// through only to discard the result here would still mint a live,
+// unrevoked Vault token nobody adopts), but a second, independent line: a
+// review found handleLoginLDAPProgress reaches this function with no guard
+// of its own, relying entirely on handleLoginLDAP never having created the
+// session it polls. Guarding here means every current and future caller
+// inherits the guarantee instead of having to remember it individually.
 func (s *Server) consumeLoginToken(ctx context.Context, raw string) (bootstrapped bool, err error) {
+	if s.vaultCfg.BorrowOnly {
+		return false, fmt.Errorf("borrow-only mode: this host authenticates only by borrowing a token from its peer socket")
+	}
 	if s.deliverBootstrapToken(raw) {
 		return true, nil
 	}

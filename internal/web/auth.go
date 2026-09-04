@@ -74,6 +74,18 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	// Mirrors handleAuthStart's guard: under borrow-only this daemon must
+	// never complete an OIDC login and install a token, regardless of how
+	// the request arrives. handleAuthStart already refuses to initiate the
+	// flow, but the callback is a separate registered route (and a
+	// compatibility surface whose IdP-facing URL can't be renamed — see
+	// CLAUDE.md) — a stale bookmarked callback from before this host was
+	// switched to borrow-only, or any other way a valid code+state pair
+	// reaches here, must not be allowed to finish the login anyway.
+	if s.vaultCfg.BorrowOnly {
+		http.Error(w, "OIDC login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
+		return
+	}
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 

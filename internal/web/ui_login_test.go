@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -172,6 +173,54 @@ func TestBorrowOnlyLoginHandlers_Refuse(t *testing.T) {
 			t.Errorf("status = %d, want 403; body = %s", w.Code, w.Body.String())
 		}
 	})
+	// oidc_callback pins the gap Copilot's PR review found: handleAuthStart
+	// refuses to *initiate* an OIDC login under borrow-only, but the callback
+	// is a separate registered route — a direct request carrying a valid-looking
+	// code+state must be refused too, rather than completing the login and
+	// installing a token. This server carries a nil vault client, so without
+	// the guard the handler would panic dereferencing it (s.vault.Raw()) well
+	// before reaching consumeLoginToken's own borrow-only check — the 403
+	// here is what proves the guard fires first, ahead of any Vault access.
+	t.Run("oidc_callback", func(t *testing.T) {
+		s := authTestServer(t, nil)
+		s.vaultCfg.BorrowOnly = true
+		req := httptest.NewRequest("GET", "/auth/oidc/callback?code=abc&state=xyz", nil)
+		w := httptest.NewRecorder()
+		s.handleAuthCallback(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestConsumeLoginTokenRefusesUnderBorrowOnly pins the chokepoint fix an
+// architecture review found: handleLoginLDAPProgress reaches consumeLoginToken
+// with no borrow-only guard of its own, relying entirely on handleLoginLDAP
+// having refused to ever create the session it polls. Guarding inside
+// consumeLoginToken itself means that reliance is no longer load-bearing —
+// every current and future caller inherits the refusal directly.
+func TestConsumeLoginTokenRefusesUnderBorrowOnly(t *testing.T) {
+	// A real (but silent) Vault client, not nil: the guard must return
+	// before ever making a Vault call, and asserting Token() afterward needs
+	// a non-nil client to call it on safely. Any request reaching it fails
+	// the test outright, catching a regression that removed the early return.
+	vc := newFakeVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected Vault call: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	s := authTestServer(t, vc)
+	s.vaultCfg.BorrowOnly = true
+
+	bootstrapped, err := s.consumeLoginToken(context.Background(), "hvs.whatever")
+	if err == nil {
+		t.Fatal("consumeLoginToken() error = nil, want a refusal under vault.borrow_only")
+	}
+	if bootstrapped {
+		t.Error("bootstrapped = true, want false — nothing should be diverted or adopted")
+	}
+	if got := s.vault.Token(); got != "" {
+		t.Errorf("client token = %q, want empty — the token must never be adopted", got)
+	}
 }
 
 // TestLoginPage_MTLSBootstrapBorrowsCredentialCard pins the one interactive

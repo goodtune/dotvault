@@ -1105,7 +1105,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// interactive facility does, rather than failing startup. A
 			// token dropped into the file manually (an emergency override)
 			// is still picked up, since waitForHeadlessToken watches it too.
-			slog.Warn("borrow-only mode: no local auth method configured; idling until a vault token can be borrowed from a peer socket", "sockets", borrowSockets)
+			slog.Warn("borrow-only mode: this host runs no fresh-auth flow of its own (auth_method, if set, is ignored); idling until a vault token can be borrowed from a peer socket", "sockets", borrowSockets)
 			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath, cfg.Vault.BorrowOnly), borrowSockets, denyList) {
 				slog.Info("shutting down before a vault token was borrowed")
 				return nil

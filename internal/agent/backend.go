@@ -38,11 +38,21 @@ type Backend struct {
 	sources  []Source
 	endpoint string
 
+	// hasToken reports whether the daemon currently holds a Vault token. It
+	// is what lets the listener run before the daemon has authenticated: an
+	// agent that answers "no identities" instantly is one an ssh client moves
+	// straight past, where an endpoint nothing accepts leaves that client
+	// blocked with no timeout of its own. Nil means "no opinion" (a Backend
+	// built without a probe, as in tests) and is treated as having a token,
+	// so nothing has to wire it to behave as before.
+	hasToken func() bool
+
 	// gate holds a gateHolder. It is read on every Sign and written by
-	// SetReauthGate (which the daemon calls after construction, before the
-	// listener accepts connections). The atomic.Value makes that wiring safe
-	// against a concurrent Sign rather than relying on the happens-before being
-	// obvious to a future caller.
+	// SetReauthGate, which the daemon calls once the lifecycle manager exists
+	// — after authentication, and so under an already-accepting listener,
+	// since the listener now starts before auth. The atomic.Value is what
+	// makes that wiring safe against a concurrent Sign; it is load-bearing
+	// rather than defensive.
 	gate          atomic.Value
 	reauthTimeout time.Duration
 	cacheTTL      time.Duration
@@ -60,10 +70,11 @@ type Option func(*Backend)
 // during a re-authentication window.
 func WithReauthGate(g ReauthGate) Option { return func(b *Backend) { b.setGate(g) } }
 
-// SetReauthGate wires the gate after construction. Safe to call concurrently
-// with Sign — the store is atomic — though in practice the daemon sets it once,
-// before the listener begins accepting connections. A nil argument is a no-op
-// (the gate cannot be un-wired); nothing relies on clearing it.
+// SetReauthGate wires the gate after construction. The daemon sets it once,
+// when the lifecycle manager comes up — by which point the listener is already
+// accepting connections, so a concurrent Sign is a real possibility and the
+// atomic store is what makes this safe. A nil argument is a no-op (the gate
+// cannot be un-wired); nothing relies on clearing it.
 func (b *Backend) SetReauthGate(g ReauthGate) { b.setGate(g) }
 
 // setGate stores the gate, ignoring a nil so WithReauthGate(nil) (the headless
@@ -103,6 +114,14 @@ func WithCacheTTL(d time.Duration) Option {
 // WithEndpoint records the listen address for status reporting.
 func WithEndpoint(addr string) Option { return func(b *Backend) { b.endpoint = addr } }
 
+// WithTokenProbe wires the predicate reporting whether the daemon holds a
+// Vault token. Without one the backend assumes it does.
+func WithTokenProbe(fn func() bool) Option { return func(b *Backend) { b.hasToken = fn } }
+
+// haveToken reports whether a Vault token is available for the sources to use.
+// A backend with no probe wired has no opinion and answers true.
+func (b *Backend) haveToken() bool { return b.hasToken == nil || b.hasToken() }
+
 // withClock overrides the time source (tests).
 func withClock(fn func() time.Time) Option { return func(b *Backend) { b.now = fn } }
 
@@ -123,11 +142,33 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 // identities returns the aggregated identities, refreshing from every source
 // when the cache has expired. Sources that error are skipped (logged at debug)
 // so one failing source does not blank the whole agent.
+//
+// With no Vault token there is nothing any source could resolve, so a cache
+// miss answers empty rather than making a round of doomed Vault calls. That
+// keeps the pre-authentication reply instant, which is what makes serving the
+// endpoint before the daemon has a token an improvement on not serving it: an
+// ssh client reads "no identities" and tries its next auth method, where a
+// slow reply would stall it just as an unaccepted connection does. The cache
+// is deliberately left untouched, so the first List once a token arrives does
+// a real refresh instead of being answered from an empty snapshot.
+//
+// The token check sits AFTER the cache check, and the order is load-bearing.
+// A token is absent in two quite different situations: the daemon has never
+// authenticated (no cache exists, so both orderings answer empty), and the
+// daemon is mid-re-auth — web mode clears the in-memory token on the re-auth
+// transition — where a still-fresh cache should keep being served exactly as
+// it was before this short-circuit existed. Checking the token first blanked
+// that window, so `ssh-add -l` returned nothing and ssh dropped dotvault's
+// keys instead of reaching Sign, which is the call that knows how to wait the
+// re-auth out.
 func (b *Backend) identities(ctx context.Context) []Identity {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
 		return b.cached
+	}
+	if !b.haveToken() {
+		return nil
 	}
 	var all []Identity
 	for _, src := range b.sources {
@@ -199,9 +240,29 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 }
 
 // waitForToken blocks while the lifecycle manager reports a re-auth in
-// progress, up to the deadline carried by ctx. Without a gate it returns
-// immediately.
+// progress, up to the deadline carried by ctx, then requires that a token
+// actually be present. Without a gate there is nothing to wait for and only
+// the presence check applies.
+//
+// The two are distinct conditions and the order matters. A re-auth in progress
+// is transient — a signature issued in that window should wait it out rather
+// than fail — whereas a daemon that has never authenticated (the listener now
+// runs before the first login) has no token and no re-auth underway, so it
+// must fail immediately: waiting the full reauthTimeout would reintroduce, at
+// 30s a time, exactly the stall this path exists to avoid.
 func (b *Backend) waitForToken(ctx context.Context) error {
+	if err := b.waitForReauth(ctx); err != nil {
+		return err
+	}
+	if !b.haveToken() {
+		return fmt.Errorf("ssh agent: %w", ErrNoToken)
+	}
+	return nil
+}
+
+// waitForReauth blocks while the lifecycle gate reports a re-auth in progress,
+// up to the deadline carried by ctx. Without a gate it returns immediately.
+func (b *Backend) waitForReauth(ctx context.Context) error {
 	gate := b.reauthGate()
 	if gate == nil || !gate.NeedsReauth() {
 		return nil
@@ -222,6 +283,12 @@ func (b *Backend) waitForToken(ctx context.Context) error {
 
 // ErrKeyNotFound is returned by Sign when no source owns the requested key.
 var ErrKeyNotFound = fmt.Errorf("no matching key")
+
+// ErrNoToken is returned by Sign when the daemon is serving the agent but
+// holds no Vault token — it has not authenticated yet, or its token expired
+// and could not be replaced. Answering plainly is the point: the client gets a
+// refusal it can act on instead of a connection nobody accepts.
+var ErrNoToken = errors.New("dotvault holds no vault token (not authenticated); run `dotvault login`")
 
 // --- read-only surface: dotvault is one-way, so the agent is too. ---
 

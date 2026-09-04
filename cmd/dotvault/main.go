@@ -977,7 +977,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// nobody, it would just leave clients hanging in a backlog no one
 	// accepts. The keep list names the surfaces that claim their fds
 	// themselves: the web server takes "api" when it starts (below), and
-	// the SSH agent takes "agent" after the first successful auth.
+	// the SSH agent takes "agent" when its listener starts (also below).
 	var keepActivated []string
 	if apiSocket != "" {
 		keepActivated = append(keepActivated, "api")
@@ -1019,14 +1019,32 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Build the SSH agent backend if enabled. Construction is side-effect-free
 	// (no Vault calls — vault-ca ephemeral keys are generated in memory), so
 	// it is safe before authentication and lets the web server surface agent
-	// status. The transport listener itself is started only after the first
-	// successful Vault auth, below.
+	// status.
 	var agentSvc *agent.Service
 	if cfg.Agent.Enabled {
 		agentSvc, err = agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
 		if err != nil {
 			return fmt.Errorf("ssh agent: %w", err)
 		}
+		// Serve the agent now, before authentication, for the same reason the
+		// HTTP surfaces start here: a client must get an honest answer while
+		// startup is still acquiring a token, not silence. The listener used
+		// to wait for the first successful auth, which under systemd socket
+		// activation left the already-published endpoint accepted-but-unread
+		// — and a daemon with no local token and no peer to borrow from waits
+		// in waitForHeadlessToken indefinitely, so ssh clients and `dotvault
+		// status` blocked forever rather than for the seconds of a restart.
+		// The backend's token probe keeps the pre-auth reply immediate ("no
+		// identities", and a refusal on Sign) until a token arrives; the
+		// reauth gate is wired below, once the lifecycle manager exists.
+		//
+		// A later startup failure can now return with the socket bound and no
+		// one waiting on Run to unlink it. That is benign: uds.Listen removes
+		// a stale socket no live instance owns on the next start, and under
+		// systemd activation the node belongs to the socket unit and must not
+		// be unlinked anyway.
+		go agentSvc.Run(ctx)
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
 	// Start the HTTP surfaces if either is enabled — the loopback web UI
@@ -1298,21 +1316,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	// Start the SSH agent listener now that we hold a Vault token. The gate is
-	// wired before the listener accepts connections so a Sign issued during a
-	// token refresh blocks briefly on the lifecycle manager instead of failing.
-	// Run supervises the listener (restart-on-terminate) until ctx is
-	// cancelled; the backend persists across token refreshes without a restart.
+	// Wire the SSH agent's re-auth gate now that the lifecycle manager exists,
+	// so a Sign issued during a later token refresh blocks briefly on it
+	// instead of failing. The listener is already serving (started before
+	// authentication, above); SetReauthGate is atomic precisely so it can be
+	// wired under a live listener.
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
-		go agentSvc.Run(ctx)
-		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
-	// Mount the filesystem now that we hold a Vault token, for the same
-	// reason the agent listener waits: every read it serves is a Vault call,
-	// so a mount that came up first would answer errors to anything that
-	// happened to look at the directory. Never fatal — see startFUSE.
+	// Mount the filesystem now that we hold a Vault token: every read it
+	// serves is a Vault call, so a mount that came up first would answer
+	// errors to anything that happened to look at the directory. The agent
+	// listener deliberately does not wait this way (it is already serving);
+	// the difference is that an agent has an honest empty answer and a
+	// filesystem has none. Never fatal — see startFUSE.
 	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
 		webServer.SetFUSEStatus(fuseSvc.Status)
 	}
@@ -1857,8 +1875,9 @@ func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
 // identities being served (the `ssh-add -l` equivalent), so the output reflects
 // what the daemon actually offers, including a minted certificate's true
 // remaining validity. status never creates the endpoint; a failure to connect
-// is therefore unexpected (the daemon isn't running, or hasn't authenticated
-// far enough to start the listener) and is reported as such.
+// is therefore unexpected (the daemon isn't running) and is reported as such.
+// The query is bounded end to end, not just at the dial — see
+// agent.QueryListening for why the dial is the half that cannot hang.
 func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Agent.Enabled {
 		return
@@ -1874,7 +1893,11 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 		return
 	}
 	if len(ids) == 0 {
-		fmt.Println("  (no identities loaded)")
+		// The daemon serves the agent before it authenticates, so an empty
+		// list is the normal pre-auth answer as well as the "no keys in Vault"
+		// one. Naming both spares the reader guessing which they are looking
+		// at; the Auth line above says which it is.
+		fmt.Println("  (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)")
 		return
 	}
 	for _, id := range ids {

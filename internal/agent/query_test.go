@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,5 +113,110 @@ func TestQueryListeningUnreachable(t *testing.T) {
 	// And it must NOT have created the socket — status never stands up a listener.
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Errorf("QueryListening created %s; it must never create the endpoint", sock)
+	}
+}
+
+// TestQueryListeningUnresponsiveEndpoint is the regression test for the hang
+// reported against a socket-activated daemon: the endpoint exists and accepts
+// (systemd holds the listening fd, so connect() completes into its backlog
+// whether or not anything reads), but no reply ever comes because the daemon
+// is still waiting for a Vault token it cannot obtain. Bounding only the dial
+// left `dotvault status` blocked in List() until Ctrl+C. The whole exchange
+// must be bounded, so the query returns an error instead.
+//
+// The listener here accepts and then does nothing, which is exactly what an
+// unaccepted systemd backlog looks like from the client's side.
+func TestQueryListeningUnresponsiveEndpoint(t *testing.T) {
+	dir := sockTempDir(t)
+	sock := filepath.Join(dir, "silent.sock")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Hold the connection open and never speak the agent protocol.
+		accepted <- conn
+	}()
+
+	// A caller deadline shorter than queryTimeout wins, keeping the test quick
+	// while exercising the same code path.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := QueryListening(ctx, sock)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from an endpoint that accepts but never replies")
+		}
+	// Comfortably clear of queryTimeout: a guard equal to the budget would
+	// race it and flake if caller-deadline propagation ever regressed.
+	case <-time.After(3 * queryTimeout):
+		t.Fatal("QueryListening blocked on a connected but silent endpoint; the agent-protocol exchange is unbounded")
+	}
+
+	select {
+	case conn := <-accepted:
+		conn.Close()
+	default:
+	}
+}
+
+// TestQueryListeningHonoursCallerCancellation confirms Ctrl+C (a cancelled
+// parent context) unblocks the query rather than waiting out queryTimeout.
+func TestQueryListeningHonoursCallerCancellation(t *testing.T) {
+	dir := sockTempDir(t)
+	sock := filepath.Join(dir, "silent2.sock")
+
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	// Hold the accepted conn open for the life of the test without parking a
+	// goroutine on a timer that outlives it.
+	held := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			held <- conn
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case conn := <-held:
+			conn.Close()
+		default:
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := QueryListening(ctx, sock)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after the caller cancelled")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("QueryListening ignored caller cancellation")
 	}
 }

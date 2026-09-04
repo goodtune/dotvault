@@ -113,7 +113,7 @@ integration step, left to you (or your fleet tooling).
   ```
 
     !!! tip "Surviving daemon restarts (Linux)"
-        The packaged `dotvault-agent.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an `ssh` launched mid-restart queues briefly instead of failing. `agent.enabled` remains required, and under activation the unit's `ListenStream=` path wins over `agent.unix.path`. See [Socket activation](../admin/deployment.md#socket-activation-optional).
+        The packaged `dotvault-agent.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an `ssh` launched mid-restart queues briefly instead of failing. The queue is bounded by startup, not by authentication: the daemon serves the agent before it holds a Vault token (see [Before the daemon has authenticated](#before-the-daemon-has-authenticated)). `agent.enabled` remains required, and under activation the unit's `ListenStream=` path wins over `agent.unix.path`. See [Socket activation](../admin/deployment.md#socket-activation-optional).
 
 - **PuTTY / Pageant (Windows):** modern PuTTY-family clients (PuTTY 0.71+,
   WinSCP, FileZilla, …) locate Pageant over a named pipe whose name follows a
@@ -164,8 +164,7 @@ SSH Agent:
 
 Because the agent is only relevant when configured, `dotvault status` consults
 the endpoint only when `agent.enabled` is set. A failure to connect in that case
-is reported as unexpected — it means the daemon isn't running, or hasn't
-authenticated far enough to start the listener:
+is reported as unexpected — it means the daemon isn't running:
 
 ```
 $ dotvault status
@@ -175,6 +174,42 @@ SSH Agent:
   unreachable: dial unix /run/user/1000/dotvault/agent.sock: connect: no such file or directory
   (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)
 ```
+
+### Before the daemon has authenticated
+
+The daemon starts serving the agent early, *before* it obtains a Vault token,
+so a client always gets an answer. Until a token arrives the agent has no
+identities to offer, which `dotvault status` reports as:
+
+```
+$ dotvault status
+Auth: not authenticated (no local token; no peer socket holds a token)
+...
+SSH Agent:
+  endpoint: /run/user/1000/dotvault/agent.sock
+  (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)
+```
+
+`ssh` sees the same empty list and moves straight on to its next
+authentication method. A signing request in that window is refused rather than
+held — the agent protocol carries only an opaque failure, so the client reports
+something like `agent refused operation` and the reason appears in the daemon's
+own log:
+
+```
+ssh agent: dotvault holds no vault token (not authenticated); run `dotvault login`
+```
+
+Fix the `Auth:` line — run `dotvault login`, or make a peer socket reachable —
+and the identities appear without restarting anything.
+
+This matters most under [socket activation](../admin/deployment.md#socket-activation-optional),
+where systemd binds the socket at boot and the kernel completes `connect()`
+into its backlog whether or not the daemon is accepting yet. Serving early
+keeps that queue to the length of startup itself. A host that can never obtain
+a token — nothing local and no peer to borrow from — would otherwise leave
+every `ssh` and every `dotvault status` blocked indefinitely on a connection
+that had been made and would never be read.
 
 ## Server-side prerequisite for cert mode
 

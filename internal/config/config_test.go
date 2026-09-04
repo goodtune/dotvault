@@ -222,6 +222,70 @@ rules:
 	}
 }
 
+// TestValidateBorrowOnlyRequiresTokenSocket pins the load-bearing requirement
+// documented on VaultConfig.BorrowOnly: without a socket to borrow from, a
+// borrow-only host could never obtain a token at all, so this is refused at
+// config load rather than left to idle forever in the daemon.
+func TestValidateBorrowOnlyRequiresTokenSocket(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  borrow_only: true
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: text
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want an error naming the missing vault.token_socket")
+	} else if !strings.Contains(err.Error(), "token_socket") {
+		t.Errorf("Load() error = %v, want it to mention vault.token_socket", err)
+	}
+}
+
+// TestLoadBorrowOnlyIgnoresAuthMethod pins the other half of the contract: a
+// borrow-only config carries token_socket and may leave auth_method (and its
+// mtls block) as whatever a shared base config already has — including a
+// cert method that would otherwise require cert_role/pki_role — because
+// neither is ever consulted under this mode.
+func TestLoadBorrowOnlyIgnoresAuthMethod(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "mtls"
+  token_socket: "~/.ssh/dotvault.sock"
+  borrow_only: true
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: text
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v (vault.mtls.cert_role should not be required under borrow_only)", err)
+	}
+	if !cfg.Vault.BorrowOnly {
+		t.Error("Vault.BorrowOnly = false, want true")
+	}
+	if cfg.Vault.TokenSocket != "~/.ssh/dotvault.sock" {
+		t.Errorf("Vault.TokenSocket = %q, want %q", cfg.Vault.TokenSocket, "~/.ssh/dotvault.sock")
+	}
+}
+
 func TestLoadCustomUserPrefix(t *testing.T) {
 	yaml := `
 vault:

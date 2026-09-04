@@ -360,6 +360,48 @@ func TestAuthenticateIgnoresStaleTokenUnderNoPersist(t *testing.T) {
 	}
 }
 
+// TestAuthenticateBorrowOnlyOverridesNoPersist is the borrow-only counterpart
+// to TestAuthenticateIgnoresStaleTokenUnderNoPersist, pinning a pre-push
+// review finding: under BorrowOnly, AuthMethod's own no-persist guarantee
+// (mtls+os) must not apply, because BorrowOnly documents AuthMethod as
+// ignored entirely — there is no certLogin left to protect the file from,
+// and refusing to read it would silently break the promised manual-override
+// fallback for a one-shot caller (dotvault sync/--once via the authenticate()
+// helper, which is the caller that reaches Manager.Authenticate this way).
+func TestAuthenticateBorrowOnlyOverridesNoPersist(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"id":"s.manually-dropped","ttl":3600}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	vc, err := vault.NewClient(vault.Config{Address: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, ".dotvault-token")
+	if err := os.WriteFile(tokenPath, []byte("s.manually-dropped"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		VaultClient:   vc,
+		TokenFilePath: tokenPath,
+		AuthMethod:    "mtls+os",
+		BorrowOnly:    true,
+	}
+	if err := m.Authenticate(t.Context()); err != nil {
+		t.Fatalf("Authenticate() = %v, want the manually-dropped token file reused under borrow_only", err)
+	}
+	if got := vc.Token(); got != "s.manually-dropped" {
+		t.Errorf("client token = %q, want the file's token to have been adopted", got)
+	}
+}
+
 // TestMTLSOSNoTokenInstalledWhenRemovalFails pins the fail-closed contract that
 // Copilot's re-review found leaking.
 //

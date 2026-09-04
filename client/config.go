@@ -141,6 +141,14 @@ type VaultConfig struct {
 	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
 	TokenSocket string
 
+	// BorrowOnly mirrors vault.borrow_only: the host this Config describes
+	// runs no fresh-auth flow of its own and authenticates exclusively by
+	// borrowing over TokenSocket/APISocket. AuthenticateCached is unaffected
+	// — it never runs a fresh-auth flow either way — but Login refuses
+	// outright with ErrLoginRequired, since "run the configured auth flow"
+	// has no meaning here.
+	BorrowOnly bool
+
 	// APISocket is an optional path to the *local* dotvault daemon's API
 	// socket (mirrors the api section: the resolved api.unix.path, or the
 	// per-user runtime default when api.enabled is set without a path).
@@ -242,6 +250,7 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 			TokenSocket:      cfg.Vault.TokenSocket,
+			BorrowOnly:       cfg.Vault.BorrowOnly,
 			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,
 			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,

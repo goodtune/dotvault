@@ -178,6 +178,30 @@ func TestHandleStatus_AuthMethod(t *testing.T) {
 	}
 }
 
+// TestHandleStatus_BorrowOnly pins the unauthenticated borrow_only field: a
+// client needs it to render the borrow-only waiting card instead of a
+// credential form before any token exists, mirroring why bootstrap.active is
+// surfaced unauthenticated too.
+func TestHandleStatus_BorrowOnly(t *testing.T) {
+	for _, borrowOnly := range []bool{true, false} {
+		s, err := NewServer(ServerConfig{
+			WebCfg:   config.WebConfig{Enabled: true, Listen: "127.0.0.1:8200"},
+			VaultCfg: config.VaultConfig{AuthMethod: "oidc", BorrowOnly: borrowOnly},
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		req := httptest.NewRequest("GET", "/api/v1/status", nil)
+		w := httptest.NewRecorder()
+		s.handleStatus(w, req)
+		var resp map[string]any
+		json.NewDecoder(w.Body).Decode(&resp)
+		if resp["borrow_only"] != borrowOnly {
+			t.Errorf("borrow_only = %v, want %v", resp["borrow_only"], borrowOnly)
+		}
+	}
+}
+
 // The Effective Configuration view (/api/v1/config) must show the RAW
 // configured auth_method including any "+tpm" suffix, so it agrees with the
 // lossless config-download and honestly reflects that token-sealing is on.

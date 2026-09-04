@@ -110,6 +110,7 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("KVMount", v.KVMount)
 	e.writeString("UserPrefix", v.UserPrefix)
 	e.writeString("TokenSocket", v.TokenSocket)
+	e.writeBool("BorrowOnly", v.BorrowOnly)
 	// Emit Policies whenever non-nil so an explicit empty list round-trips as an
 	// empty REG_MULTI_SZ rather than being silently dropped, matching the OAuth
 	// Scopes / agent Principals treatment.

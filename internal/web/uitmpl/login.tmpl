@@ -20,6 +20,9 @@
     {{else if eq .Method "mtls"}}
       <p class="login-mfa-wait">{{if .Issuing}}Issuing your certificate&#8230;{{else}}Signing in with your client certificate&#8230;{{end}}</p>
       <p class="login-mfa-hint">{{if .Issuing}}Signed in. dotvault is now enrolling this host&#8217;s certificate &mdash; this only happens once. You will not need to sign in again.{{else}}Certificate authentication needs no credential &mdash; dotvault signs in with this host&#8217;s certificate, and renews automatically when its Vault token expires. If this page does not update within a minute or so, check the daemon logs: the certificate may need re-enrolling.{{end}}</p>
+    {{else if eq .Method "borrow"}}
+      <p class="login-mfa-wait">Waiting to borrow a Vault token from its peer&#8230;</p>
+      <p class="login-mfa-hint">This host is configured borrow-only: it never signs in on its own, and instead waits for a live token borrowed over its configured peer socket &mdash; typically an SSH-forwarded connection back to a workstation that has already authenticated. Nothing to do here; this page updates itself once a token arrives. If it never does, check that the peer connection is up and that the peer itself holds a valid token.</p>
     {{else}}
       <p class="login-error">Unknown auth method: {{.Method}}</p>
     {{end}}

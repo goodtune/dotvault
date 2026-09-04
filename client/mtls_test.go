@@ -78,6 +78,98 @@ func TestLogin_AllowedForNonCertificateMethods(t *testing.T) {
 	}
 }
 
+// TestLogin_RefusedUnderBorrowOnly: a host configured borrow-only carries no
+// fresh-auth flow of its own — Login must refuse rather than dispatch to
+// auth.Manager.Login, which would itself refuse with the less caller-friendly
+// auth.ErrBorrowOnly wrapped in ErrAuthFailed.
+func TestLogin_RefusedUnderBorrowOnly(t *testing.T) {
+	c, err := New(&Config{
+		Vault: VaultConfig{
+			Address:     "http://127.0.0.1:1",
+			AuthMethod:  "oidc",
+			TokenSocket: "~/.ssh/dotvault.sock",
+			BorrowOnly:  true,
+		},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	err = c.Login(context.Background())
+	if err == nil {
+		t.Fatal("Login() = nil, want a refusal — a borrow-only host runs no fresh-auth flow")
+	}
+	if !errors.Is(err, ErrLoginRequired) {
+		t.Errorf("Login() error = %v, want ErrLoginRequired", err)
+	}
+	if !strings.Contains(err.Error(), "borrow-only") {
+		t.Errorf("Login() error = %q, want it to explain the borrow-only contract", err)
+	}
+	if !strings.Contains(err.Error(), "AuthenticateCached") {
+		t.Errorf("Login() error = %q, want it to name the non-interactive alternative", err)
+	}
+}
+
+// TestAuthenticateCached_SkipsCertCandidateUnderBorrowOnly pins the pre-push
+// review finding: a borrow-only host must never attempt its own certificate
+// login, even when auth_method happens to be a cert method left over from a
+// shared base config — that would defeat the entire "never mints its own
+// identity" guarantee borrow_only exists to give.
+//
+// Distinguished by error message content, since neither run can produce a
+// live token here: without borrow_only, AuthenticateCached reaches the cert
+// candidate and its failure names "certificate"; with borrow_only it must
+// never reach that candidate at all, falling straight through to the
+// generic no-source message instead.
+func TestAuthenticateCached_SkipsCertCandidateUnderBorrowOnly(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	tokenFile := filepath.Join(t.TempDir(), ".vault-token") // never written
+
+	newClient := func(borrowOnly bool) *Client {
+		t.Helper()
+		c, err := New(&Config{
+			Vault: VaultConfig{
+				Address:     "http://127.0.0.1:1",
+				AuthMethod:  "mtls",
+				TokenSocket: "~/.dotvault-borrow-only-test-absent.sock",
+				BorrowOnly:  borrowOnly,
+				MTLS:        MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
+			},
+			TokenFile: tokenFile,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return c
+	}
+
+	t.Run("mtls without borrow_only reaches the cert candidate", func(t *testing.T) {
+		c := newClient(false)
+		err := c.AuthenticateCached(context.Background())
+		if !errors.Is(err, ErrLoginRequired) {
+			t.Fatalf("error = %v, want ErrLoginRequired", err)
+		}
+		if !strings.Contains(err.Error(), "certificate") {
+			t.Errorf("error = %q, want it to name the certificate candidate (proves the test setup actually reaches it)", err)
+		}
+	})
+
+	t.Run("borrow_only skips the cert candidate entirely", func(t *testing.T) {
+		c := newClient(true)
+		err := c.AuthenticateCached(context.Background())
+		if !errors.Is(err, ErrLoginRequired) {
+			t.Fatalf("error = %v, want ErrLoginRequired", err)
+		}
+		if strings.Contains(err.Error(), "certificate") {
+			t.Errorf("error = %q, must not mention certificate — borrow_only must never attempt its own cert login", err)
+		}
+		if got := c.Token(); got != "" {
+			t.Errorf("Token() = %q, want empty", got)
+		}
+	})
+}
+
 // TestNew_MTLSDefaultsMatchDaemon: the facade must look for the credential
 // envelope exactly where the daemon wrote it. A drifting default would make
 // certificate login silently unavailable rather than fail loudly.

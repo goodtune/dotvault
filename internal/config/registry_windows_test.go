@@ -66,6 +66,26 @@ func TestApplyRegistryLayerLeastPrivilegePolicies(t *testing.T) {
 	}
 }
 
+func TestApplyRegistryLayerBorrowOnly(t *testing.T) {
+	cfg := &Config{}
+	on := uint32(1)
+	applyRegistryLayer(cfg, registryLayer{
+		VaultTokenSocket: "~/.ssh/dotvault.sock",
+		VaultBorrowOnly:  &on,
+	})
+	if !cfg.Vault.BorrowOnly {
+		t.Error("BorrowOnly should be true when DWORD is 1")
+	}
+
+	// Absent (nil) must leave the base untouched, matching every other
+	// registry DWORD.
+	cfg2 := &Config{Vault: VaultConfig{BorrowOnly: true}}
+	applyRegistryLayer(cfg2, registryLayer{})
+	if !cfg2.Vault.BorrowOnly {
+		t.Error("BorrowOnly should stay true when the DWORD is absent from the layer")
+	}
+}
+
 func TestApplyRegistryLayerMerge(t *testing.T) {
 	// Machine layer sets base values.
 	cfg := &Config{}

@@ -1180,10 +1180,10 @@ func RecordSSHReconnect(ctx context.Context, host string) {
 // RecordSSHConnectFailure increments dotvault.ssh.connect_failure_total,
 // labelled by host and class. class must be one of sshfwd's fixed
 // ErrorClass values (dns, network-unreachable, connection-refused,
-// handshake, authentication, host-key, remote-socket-bind, home-probe,
-// config, other) — pass sshfwd.Classify(err)'s result converted to a
-// string, never an error message or any other free-form text, or the label
-// cardinality is unbounded.
+// handshake, authentication, identity, host-key, remote-socket-bind,
+// remote-socket-dir, home-probe, config, other) — pass sshfwd.Classify(err)'s
+// result converted to a string, never an error message or any other free-form
+// text, or the label cardinality is unbounded.
 func RecordSSHConnectFailure(ctx context.Context, host, class string) {
 	instrMu.RLock()
 	c := sshConnectFailures

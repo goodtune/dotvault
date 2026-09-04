@@ -418,10 +418,11 @@ type identityResult struct {
 //
 // The bound is load-bearing at shutdown. Deps.Signers is wired to
 // sshfwd.Signers over the SSH agent backend, whose List() resolves identities
-// under a hardcoded context.Background() (internal/agent/backend.go) — so a
-// Vault KV listing it triggers is not cancellable and runs to the Vault
-// client's own timeout. Calling it inline meant stop()'s wg.Wait() sat behind
-// that timeout, making Ctrl-C take tens of seconds and then log a
+// under a context of its own (internal/agent/backend.go) rather than the
+// caller's — so a Vault KV listing it triggers is not cancellable from here,
+// runs to the backend's own source timeout, and may first wait out a token
+// replacement. Calling it inline meant stop()'s wg.Wait() sat behind all of
+// that, making Ctrl-C take tens of seconds and then log a
 // `context deadline exceeded` listing error against a daemon already on its
 // way out. Deps.User is resolved on the same goroutine because it is the same
 // per-attempt identity resolution and shares the same exposure.

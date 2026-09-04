@@ -20,6 +20,38 @@ import (
 // enough that the ~10s recovery poll stays responsive.
 const recoverTimeout = 20 * time.Second
 
+// rejectClockBase anchors NotifyRejected's rate-limit window to the monotonic
+// clock. time.Since reads this value's monotonic component, so the window
+// measures elapsed time and is unaffected by a wall-clock step.
+//
+// That matters because the alternative fails in the unsafe direction. Storing
+// wall-clock UnixNano and differencing it means an NTP correction, a suspend
+// and resume, or a VM snapshot rollback yields a *negative* elapsed time,
+// which compares as inside the window — so every report is dropped and the
+// fast path silently disables itself until wall time catches up, which is
+// exactly when a daemon is most likely to find its token dead.
+//
+// Package-level rather than a field because it is only an origin, not state:
+// every manager can share one, including those built as a struct literal in
+// tests rather than through NewLifecycleManager.
+var rejectClockBase = time.Now()
+
+// reloadTimeout bounds one token-reload attempt, for the same reason
+// recoverTimeout bounds a recovery: it runs on the lifecycle goroutine, and it
+// is now also the window in which NeedsReauth gates every other consumer of the
+// shared client. Its work is a file read, an env read, a peer-socket fetch and
+// up to three LookupSelf round trips — milliseconds against a reachable Vault —
+// but each of those inherits the Vault SDK's own ~60s default with retries, so
+// unbounded it could hold the gate for minutes. That matters most in the
+// renewal-failure branch, where the token being replaced still works and a slow
+// Vault would otherwise let a healthy daemon gate itself.
+//
+// Kept well under the SSH agent's 30s reauthTimeout so that even a reload
+// followed by a full recovery leaves a consumer's wait able to outlast the
+// gate rather than expiring against it. Failing fast costs nothing: the
+// recovery poll retries within ~10s.
+const reloadTimeout = 5 * time.Second
+
 // LifecycleManager manages token TTL checks and renewal.
 type LifecycleManager struct {
 	client         *vault.Client
@@ -27,11 +59,68 @@ type LifecycleManager struct {
 	disableRenewal bool
 	needsReauth    atomic.Bool
 
+	// tokenInFlux marks the window in which the manager is actively replacing
+	// the token on the shared client — reloading a candidate from
+	// file/env/socket, or minting a fresh one through the unattended-recovery
+	// hook. Throughout it the client still carries the token that just failed,
+	// so a concurrent user of the client would present a credential Vault has
+	// already rejected.
+	//
+	// It is deliberately separate from needsReauth rather than folded into it:
+	// needsReauth is a *signal* (it fires OnReauth, which clears web state and
+	// bounces a browser to the login view) and must stay reserved for the case
+	// where a human is genuinely needed. This flag is only a gate. Recovery
+	// takes network round trips — a PKI sign plus a cert login, comfortably
+	// hundreds of milliseconds — and it usually succeeds, which is exactly the
+	// case where nothing used to hold the gate at all: signalReauth was reached
+	// only after recovery had already failed. NeedsReauth reports the two
+	// together, so a gate consumer waits out a successful recovery instead of
+	// racing it.
+	tokenInFlux atomic.Bool
+
 	// reloadCh is signalled by Reload() to force an immediate tryReload
 	// on the lifecycle goroutine. Buffered size 1 so a burst of signals
 	// coalesces to a single pass; the surplus is dropped because every
 	// reload reads the same file and an extra round-trip adds nothing.
 	reloadCh chan struct{}
+
+	// rejectCh is signalled by NotifyRejected to force an immediate
+	// checkAndRenew pass — the full recovery branch, not just tryReload —
+	// on the lifecycle goroutine. Buffered size 1 for the same coalescing
+	// reason as reloadCh: several sources hitting the same dead token in the
+	// same second (the SSH agent's vault-ca source, more than one managed SSH
+	// forward resolving its identity) must collapse to one wakeup, since they
+	// are all reporting the identical fact.
+	//
+	// It exists because none of those consumers has any other way to shorten
+	// this manager's own checkInterval-bounded detection latency (default 5
+	// minutes): they only ever *read* the gate (NeedsReauth, to wait out a
+	// replacement already in flight), never write to it, so a rejection they
+	// observe independently of this manager's own LookupSelf poll sat unacted
+	// on until the next tick. See NotifyRejected.
+	rejectCh chan struct{}
+
+	// lastRejectNotifyAt bounds NotifyRejected to at most one accepted call
+	// per recoveryInterval, stored as a nanosecond offset from rejectClockBase
+	// so it can be read/written with a plain CAS from arbitrary caller
+	// goroutines rather than a mutex. The offset is measured against the
+	// monotonic clock, not wall time — see rejectClockBase. Zero means "never
+	// reported"; an offset that would land on zero is stored as 1.
+	//
+	// rejectCh's buffered-1 channel alone only coalesces a *concurrent*
+	// burst — it does nothing to bound a *sustained* stream of reports one
+	// per call. That distinction matters because IsTokenRejected classifies
+	// on the response code alone: a 403 from a source's own narrowly-scoped
+	// Vault call (e.g. a vault-ca role denied `ssh/sign/<role>` while the
+	// shared token itself is still perfectly valid) is indistinguishable
+	// from a globally dead token, and the SSH agent can retry that call once
+	// per connection attempt — sub-second under load. Without a rate limit
+	// here, that misconfiguration would reintroduce the request storm the
+	// token denylist exists to prevent (see TokenDenylist), just against a
+	// different Vault endpoint than lookup-self and via a path the denylist
+	// cannot see, since checkAndRenew's own denylist check is keyed on the
+	// token value, not on "did anyone report a rejection".
+	lastRejectNotifyAt atomic.Int64
 
 	// Token file path. When the current in-memory token becomes invalid,
 	// the manager will first read this file directly (and only then fall
@@ -147,6 +236,7 @@ func NewLifecycleManager(client *vault.Client, checkInterval time.Duration, disa
 		currentDelay:     checkInterval,
 		maxDelay:         5 * time.Minute,
 		reloadCh:         make(chan struct{}, 1),
+		rejectCh:         make(chan struct{}, 1),
 		denied:           NewTokenDenylist(),
 	}
 }
@@ -180,6 +270,93 @@ func (lm *LifecycleManager) Reload() {
 	select {
 	case lm.reloadCh <- struct{}{}:
 	default:
+	}
+}
+
+// NotifyRejected lets a subsystem that shares the daemon's Vault client — the
+// SSH agent's vault-ca source minting a certificate, a managed SSH forward
+// resolving its signing identity — report a 403/invalid-token failure it
+// observed independently of this manager's own LookupSelf poll, so recovery
+// starts now instead of waiting out checkInterval (5 minutes by default).
+//
+// Without this, a token that goes bad is detected by whichever of these
+// call paths happens to ask Vault a question first, but only THIS manager's
+// answer matters: the agent and sshfwd have no channel back into it, so they
+// just keep retrying the same dead token on their own backoff while this
+// manager sits blind until its next tick.
+//
+// err is classified with the same predicate checkAndRenew uses
+// (vault.IsForbidden / IsExpired via IsTokenRejected) so a transient fault —
+// Vault unreachable, sealed, mid-failover — does not trigger a recovery pass
+// over nothing: those must stay retryable, not treated as a verdict on the
+// token. Coalescing and non-blocking like Reload: several sources hitting the
+// same dead token in the same instant collapse to one wakeup, and a call
+// before Start is buffered rather than dropped.
+//
+// Rate-limited to at most once per recoveryInterval (see lastRejectNotifyAt):
+// IsTokenRejected can't tell "the shared token is dead" apart from "this one
+// Vault path denied the token", and the second case can repeat far faster
+// than a real outage would — once per SSH connection attempt, sub-second
+// under load — without ever becoming true grounds for another lookup-self.
+// The limiter is deliberately coarser than rejectCh's channel-buffer
+// coalescing: that only catches a concurrent burst landing in the same
+// instant, not a sustained stream arriving one at a time. A call that misses
+// the window is simply dropped — the next scheduled tick or a later report
+// still gets a chance.
+//
+// The window is consumed only by a call that actually queues a nudge. A report
+// dropped because rejectCh is already full has cost nothing and releases the
+// window again: letting it burn the full interval would mean a redundant
+// report suppressing the next genuine one for as long as a real nudge would
+// have.
+//
+// The signalled pass runs the full recovery branch (tryReload then tryRecover
+// under the withTokenInFlux gate), not just tryReload — unlike Reload, which
+// only re-reads file/env/socket candidates. A rejection report means "Vault
+// has spoken", the same verdict checkAndRenew's own 403 produces, so it must
+// reach the same fallback-to-unattended-recovery path (the case that matters
+// for mtls+os, which keeps no token file to reload from at all).
+func (lm *LifecycleManager) NotifyRejected(err error) {
+	if !IsTokenRejected(err) {
+		return
+	}
+
+	window := lm.recoveryInterval
+	if window <= 0 {
+		window = 10 * time.Second
+	}
+	elapsed := int64(time.Since(rejectClockBase))
+	if elapsed == 0 {
+		// Keep 0 reserved for "never reported".
+		elapsed = 1
+	}
+	last := lm.lastRejectNotifyAt.Load()
+	if last != 0 && time.Duration(elapsed-last) < window {
+		return
+	}
+	if !lm.lastRejectNotifyAt.CompareAndSwap(last, elapsed) {
+		// Lost the race to another caller inside the same window; the
+		// winner's send (or its own recent send) already covers this report.
+		return
+	}
+
+	select {
+	case lm.rejectCh <- struct{}{}:
+		// Logged only on the send that actually queues a nudge, not on every
+		// call — a burst of reports for the same rejection would otherwise
+		// repeat the line as many times as there are callers, which is the
+		// exact log-volume problem the denylist solves on the request side.
+		// This is the one line that distinguishes "the fast path fired" from
+		// "the 5-minute poll would have caught this anyway": everything
+		// runCheckCycle logs afterward (reauth required, recovered without
+		// reauth, etc.) is identical regardless of which path triggered it.
+		slog.Debug("vault rejection reported outside the lifecycle poll; requesting an immediate recheck", "error", err)
+	default:
+		// A nudge is already queued, so this report costs nothing and must
+		// not spend the window — release it so the next genuine report is
+		// not suppressed by one that did no work. CAS rather than Store so a
+		// caller that won the window after us is not stomped.
+		lm.lastRejectNotifyAt.CompareAndSwap(elapsed, last)
 	}
 }
 
@@ -293,9 +470,54 @@ func (lm *LifecycleManager) recoverBackoff() time.Duration {
 	return d
 }
 
-// NeedsReauth returns true if the token is expired or needs re-authentication.
+// NeedsReauth reports whether the client's token should be treated as
+// unusable right now — either because re-authentication has been signalled, or
+// because the manager is mid-replacement and the client still carries the
+// token that failed.
+//
+// Consumers of this as a gate (the SSH agent's Sign/List, the web UI's
+// /api/v1/token) want both: they are asking "is it safe to use the shared
+// client", and a replacement in flight answers no just as firmly as a declared
+// re-auth. The manager's own branch decisions read lm.needsReauth directly
+// instead, because those turn on whether the *signal* has been raised.
 func (lm *LifecycleManager) NeedsReauth() bool {
+	return lm.needsReauth.Load() || lm.tokenInFlux.Load()
+}
+
+// ReauthSignalled reports whether the manager has declared that it needs a new
+// token from outside — the state signalReauth raises and clearReauth ends.
+//
+// This is the *signal*, and it is the narrower of the two: it excludes a
+// replacement already in flight. A caller asking "should I go find this daemon
+// a token" wants this, because during a reload the manager is already doing
+// exactly that. NeedsReauth is the gate, and answering the signal question with
+// it would make every routine reload look like a daemon in need of rescue.
+func (lm *LifecycleManager) ReauthSignalled() bool {
 	return lm.needsReauth.Load()
+}
+
+// withTokenInFlux runs a token-replacement step with the NeedsReauth gate
+// held, so a concurrent consumer of the shared Vault client waits out the
+// replacement rather than presenting the token it is replacing.
+//
+// Every replacement *this manager* performs goes through here — the reload
+// candidates as well as the recovery hook — because tryReload also installs an
+// unvalidated candidate on the client before LookupSelf passes judgement on it.
+// (It does not reach token adoption elsewhere in the daemon, such as the web
+// UI's token-paste login, which owns its own client mutation.) Wrapping the
+// step rather than the individual helpers means a call site that runs both
+// holds the gate across the pair, with no gap between them where the failed
+// token is live again.
+//
+// The step is bounded, because an open-ended gate is worse than no gate: a
+// consumer waits on it and then fails anyway, having also lost the time. fn
+// receives the bounded context and must use it for its Vault calls.
+func (lm *LifecycleManager) withTokenInFlux(ctx context.Context, d time.Duration, fn func(context.Context) bool) bool {
+	ctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	lm.tokenInFlux.Store(true)
+	defer lm.tokenInFlux.Store(false)
+	return fn(ctx)
 }
 
 // Start begins the token lifecycle goroutine. Returns a channel that receives
@@ -308,6 +530,13 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 
 		timer := time.NewTimer(lm.currentDelay)
 		defer timer.Stop()
+
+		// nextTickAt tracks when the scheduled check is due, so an
+		// out-of-cycle run can re-arm without pushing it further out. Every
+		// timer.Reset in this loop is paired with an update here; the
+		// scheduled and reject branches update it after runCheckCycle, which
+		// arms the timer itself.
+		nextTickAt := time.Now().Add(lm.currentDelay)
 
 		for {
 			select {
@@ -330,7 +559,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 				// or all candidates invalid) leave the schedule alone —
 				// the original timer.C tick will run checkAndRenew on
 				// its existing cadence.
-				if lm.tryReload(ctx) {
+				if lm.withTokenInFlux(ctx, reloadTimeout, lm.tryReload) {
 					lm.clearReauth()
 					lm.currentDelay = lm.checkInterval
 					if !timer.Stop() {
@@ -340,112 +569,243 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						}
 					}
 					timer.Reset(lm.currentDelay)
+					nextTickAt = time.Now().Add(lm.currentDelay)
 				}
 			case <-timer.C:
-				if err := lm.checkAndRenew(ctx); err != nil {
-					// Recoverable failure modes:
-					//   - 403 (token revoked/invalid)
-					//   - sentinel for an expired token reported via
-					//     lookup-self with a concrete expire_time
-					//   - we are already in the needs-reauth state, OR the
-					//     current client token is empty (because OnReauth
-					//     just cleared it). In the empty-token case Vault
-					//     returns "missing client token" (400), which is
-					//     neither 403 nor the expired sentinel — without
-					//     this branch the manager would slip into the
-					//     transient-error path, back off to 5m, and never
-					//     observe a fresh token written to disk.
-					// IsDenied and IsNoToken are the cached forms of the same
-					// verdicts: checkAndRenew returned without asking Vault a
-					// question it had already answered (a suppressed token) or
-					// could answer itself (no token at all).
-					if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || IsNoToken(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
-						// Try reloading the token from disk/env before
-						// declaring re-auth — a parallel `dotvault login`
-						// may have already written a fresh token. If the
-						// reload yields a working token we treat the
-						// failure as transient.
-						if lm.tryReload(ctx) {
-							lm.clearReauth()
-							lm.currentDelay = lm.checkInterval
-							timer.Reset(lm.currentDelay)
-							continue
-						}
-						// No usable token anywhere, but this host may hold a
-						// credential that can mint one without a human —
-						// certificate auth being the case that matters. Tried
-						// before signalReauth deliberately: a successful
-						// recovery must not fire OnReauth, which would clear
-						// web state and bounce the browser to a login screen for
-						// an outage the daemon just healed by itself. If it
-						// fails we fall through, and the recovery poll retries
-						// it every cycle.
-						if lm.tryRecover(ctx) {
-							lm.clearReauth()
-							lm.currentDelay = lm.checkInterval
-							timer.Reset(lm.currentDelay)
-							continue
-						}
-						nextDelay := lm.recoveryInterval
-						// Warn on the transition only. The recovery poll keeps
-						// running for as long as the daemon sits without a
-						// usable token, and re-stating the same fact every 10s
-						// buries the one line that mattered — the same
-						// repetition problem on the log side that the denylist
-						// fixes on the request side.
-						if lm.needsReauth.Load() {
-							slog.Debug("still awaiting a usable vault token", "error", err, "next_retry", nextDelay)
-						} else {
-							slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
-						}
-						lm.signalReauth(ctx, errCh, err)
-						lm.currentDelay = nextDelay
-					} else if IsRenewFailed(err) {
-						// The token still answers lookup-self — it just could
-						// not be extended. The common cause is a lease that
-						// has reached its max TTL, which no amount of retrying
-						// will fix: this token is now on a countdown to
-						// expiry. A peer may already hold a fresher one, so
-						// try a borrow now rather than waiting for the token
-						// to die and the recovery path to notice. tryReload
-						// only adopts a *different* token that passes
-						// lookup-self, so a failed attempt leaves the current
-						// (still working) token in place and we fall through
-						// to the normal backoff.
-						if lm.tryReload(ctx) {
-							lm.clearReauth()
-							lm.currentDelay = lm.checkInterval
-							timer.Reset(lm.currentDelay)
-							continue
-						}
-						nextDelay := lm.currentDelay * 2
-						if nextDelay > lm.maxDelay {
-							nextDelay = lm.maxDelay
-						}
-						slog.Warn("token renewal failed and no fresher token available, will retry", "error", err, "next_retry", nextDelay)
-						lm.currentDelay = nextDelay
-					} else {
-						// Transient error: backoff up to maxDelay.
-						nextDelay := lm.currentDelay * 2
-						if nextDelay > lm.maxDelay {
-							nextDelay = lm.maxDelay
-						}
-						slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", nextDelay)
-						lm.currentDelay = nextDelay
+				nextTickAt = time.Now().Add(lm.runCheckCycle(ctx, errCh, timer, true, time.Time{}))
+			case <-lm.rejectCh:
+				// A subsystem outside this manager (the SSH agent's vault-ca
+				// source, a managed SSH forward) independently observed Vault
+				// reject the shared token and reported it via NotifyRejected.
+				// Run exactly the cycle the next timer.C tick would have run,
+				// just now instead of up to checkInterval from now.
+				//
+				// No special-casing needed for "the token was already fixed
+				// since the report" or "already denylisted": checkAndRenew
+				// re-derives its own verdict from the client's *current*
+				// token (LookupSelf succeeds if a concurrent fix already
+				// landed; the denylist short-circuits without a Vault call if
+				// the same rejection is still standing), so this is safe to
+				// run unconditionally rather than trying to out-think it here.
+				//
+				// Logged here (distinct from NotifyRejected's own log line)
+				// because the two can be arbitrarily far apart in time if the
+				// lifecycle goroutine was already busy — this is the line
+				// that says the fast path actually ran, not just that it was
+				// requested.
+				slog.Debug("running an out-of-cycle token check; a rejection was reported outside the lifecycle poll")
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
 					}
-				} else {
-					// Reset to base interval on success and clear any
-					// previously-set re-auth state (a freshly-loaded token
-					// can succeed even after the previous one was revoked).
-					lm.clearReauth()
-					lm.currentDelay = lm.checkInterval
 				}
-				timer.Reset(lm.currentDelay)
+				nextTickAt = time.Now().Add(lm.runCheckCycle(ctx, errCh, timer, false, nextTickAt))
 			}
 		}
 	}()
 
 	return errCh
+}
+
+// runCheckCycle runs one checkAndRenew pass and reacts to the result exactly
+// as the Start loop's timer tick always has — recoverable failure modes
+// (403/expired/already-denylisted/no-token) attempt reload-then-recover
+// before signalling re-auth; a renewal failure on an otherwise-valid token
+// tries a reload/borrow before backing off; anything else is a transient
+// backoff. It always leaves timer armed for the next pass before returning.
+//
+// Factored out so both the scheduled timer.C tick and an externally-reported
+// rejection (rejectCh, via NotifyRejected) converge on one implementation:
+// the latter exists only to run this sooner, not to run something different.
+//
+// scheduled distinguishes the two, and only for how the *schedule* is left
+// behind: an out-of-cycle run exists to pre-empt the next tick, so it must
+// never leave the daemon waiting longer than it already was. deadline is when
+// that pre-empted tick was due, and is ignored on a scheduled run.
+//
+// Returns the delay it armed the timer for, so the caller can track when the
+// next tick is due without having to re-derive it — the clamp above means the
+// armed delay is not always lm.currentDelay, and a caller that guessed would
+// drift.
+func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- error, timer *time.Timer, scheduled bool, deadline time.Time) time.Duration {
+	healthy := false
+	if err := lm.checkAndRenew(ctx); err != nil {
+		// Recoverable failure modes:
+		//   - 403 (token revoked/invalid)
+		//   - sentinel for an expired token reported via
+		//     lookup-self with a concrete expire_time
+		//   - we are already in the needs-reauth state, OR the
+		//     current client token is empty (because OnReauth
+		//     just cleared it). In the empty-token case Vault
+		//     returns "missing client token" (400), which is
+		//     neither 403 nor the expired sentinel — without
+		//     this branch the manager would slip into the
+		//     transient-error path, back off to 5m, and never
+		//     observe a fresh token written to disk.
+		// IsDenied and IsNoToken are the cached forms of the same
+		// verdicts: checkAndRenew returned without asking Vault a
+		// question it had already answered (a suppressed token) or
+		// could answer itself (no token at all).
+		if vault.IsForbidden(err) || IsExpired(err) || IsDenied(err) || IsNoToken(err) || lm.needsReauth.Load() || lm.client.Token() == "" {
+			// Both replacement attempts run under a single
+			// withTokenInFlux, so NeedsReauth reports the whole
+			// window. That matters most for the branch that
+			// succeeds: recovery mints a certificate and exchanges
+			// it for a token over the network, and until the last
+			// step installs the result the client still carries the
+			// token that just failed. Holding the gate across the
+			// pair also closes the instant between them, where a
+			// failed tryReload has restored that same broken token.
+			if lm.withTokenInFlux(ctx, reloadTimeout+recoverTimeout, func(ctx context.Context) bool {
+				// Try reloading the token from disk/env before
+				// declaring re-auth — a parallel `dotvault login`
+				// may have already written a fresh token. If the
+				// reload yields a working token we treat the
+				// failure as transient.
+				if lm.tryReload(ctx) {
+					return true
+				}
+				// No usable token anywhere, but this host may hold
+				// a credential that can mint one without a human —
+				// certificate auth being the case that matters.
+				// Tried before signalReauth deliberately: a
+				// successful recovery must not fire OnReauth, which
+				// would clear web state and bounce the browser to a
+				// login screen for an outage the daemon just healed
+				// by itself. If it fails we fall through, and the
+				// recovery poll retries it every cycle.
+				return lm.tryRecover(ctx)
+			}) {
+				lm.clearReauth()
+				lm.currentDelay = lm.checkInterval
+				lm.drainReject()
+				timer.Reset(lm.currentDelay)
+				return lm.currentDelay
+			}
+			nextDelay := lm.recoveryInterval
+			// Warn on the transition only. The recovery poll keeps
+			// running for as long as the daemon sits without a
+			// usable token, and re-stating the same fact every 10s
+			// buries the one line that mattered — the same
+			// repetition problem on the log side that the denylist
+			// fixes on the request side.
+			if lm.needsReauth.Load() {
+				slog.Debug("still awaiting a usable vault token", "error", err, "next_retry", nextDelay)
+			} else {
+				slog.Warn("vault token invalid, re-authentication required", "error", err, "next_retry", nextDelay)
+			}
+			lm.signalReauth(ctx, errCh, err)
+			lm.currentDelay = nextDelay
+		} else if IsRenewFailed(err) {
+			// The token still answers lookup-self — it just could
+			// not be extended. The common cause is a lease that
+			// has reached its max TTL, which no amount of retrying
+			// will fix: this token is now on a countdown to
+			// expiry. A peer may already hold a fresher one, so
+			// try a borrow now rather than waiting for the token
+			// to die and the recovery path to notice. tryReload
+			// only adopts a *different* token that passes
+			// lookup-self, so a failed attempt leaves the current
+			// (still working) token in place and we fall through
+			// to the normal backoff.
+			if lm.withTokenInFlux(ctx, reloadTimeout, lm.tryReload) {
+				lm.clearReauth()
+				lm.currentDelay = lm.checkInterval
+				lm.drainReject()
+				timer.Reset(lm.currentDelay)
+				return lm.currentDelay
+			}
+			nextDelay := lm.backoffFrom(lm.currentDelay, scheduled)
+			slog.Warn("token renewal failed and no fresher token available, will retry", "error", err, "next_retry", nextDelay)
+			lm.currentDelay = nextDelay
+		} else {
+			// Transient error: backoff up to maxDelay.
+			nextDelay := lm.backoffFrom(lm.currentDelay, scheduled)
+			slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", nextDelay)
+			lm.currentDelay = nextDelay
+		}
+	} else {
+		// Reset to base interval on success and clear any
+		// previously-set re-auth state (a freshly-loaded token
+		// can succeed even after the previous one was revoked).
+		lm.clearReauth()
+		lm.currentDelay = lm.checkInterval
+		lm.drainReject()
+		healthy = true
+	}
+	return lm.armAfterCycle(timer, scheduled, healthy, deadline)
+}
+
+// drainReject discards a rejection report queued while the cycle that just
+// ended was running, and is called only on the paths that ended with a working
+// token.
+//
+// Such a report is reliably present rather than a rare race: the subsystem
+// doing the reporting keeps failing for as long as the gate is held, so a
+// successful recovery was otherwise always followed by an immediate
+// out-of-cycle re-check of the token it had just fixed. Anything queued before
+// the cycle began is covered too — checkAndRenew re-derives its verdict from
+// the client's current token, so the pass that just succeeded already answered
+// it.
+//
+// The cost is a report about the *new* token landing between the swap and this
+// drain, which is then swallowed. That window is an instant, but the delay it
+// buys is not: the reporter spent its rate-limit window queueing the report, so
+// it cannot raise another for up to recoveryInterval, and a genuinely
+// newly-broken token therefore goes unreported for that long rather than until
+// the next attempt. The scheduled tick remains the backstop.
+func (lm *LifecycleManager) drainReject() {
+	select {
+	case <-lm.rejectCh:
+	default:
+	}
+}
+
+// backoffFrom returns the delay to wait after a failed check. Only a scheduled
+// tick advances the exponential backoff.
+//
+// An out-of-cycle run must not, because the two are counted against different
+// clocks: the doubling is designed to happen once per elapsed currentDelay,
+// but a rejection report can arrive once per rate-limit window (10s). During a
+// Vault outage — where a subsystem sees a 403 it reported earlier while
+// checkAndRenew is failing transiently — that compounds every 10s instead of
+// every currentDelay, driving the delay from checkInterval to the 5m cap in
+// under a minute. The fast path would then have made recovery slower than the
+// poll it exists to pre-empt.
+func (lm *LifecycleManager) backoffFrom(current time.Duration, scheduled bool) time.Duration {
+	if !scheduled {
+		return current
+	}
+	next := current * 2
+	if next > lm.maxDelay {
+		next = lm.maxDelay
+	}
+	return next
+}
+
+// armAfterCycle re-arms timer for the next pass.
+//
+// A scheduled tick simply arms the delay the cycle decided. An out-of-cycle
+// run that did NOT restore health arms whichever is sooner, that delay or
+// what remained of the tick it pre-empted — otherwise each report would push
+// the scheduled check a full delay further out, and a steady trickle of them
+// would starve it indefinitely. A run that *did* restore health is exempt:
+// there is nothing left to be urgent about, so returning to checkInterval is
+// correct even though it is longer than what remained.
+// Returns the delay it armed, which is not always lm.currentDelay.
+func (lm *LifecycleManager) armAfterCycle(timer *time.Timer, scheduled, healthy bool, deadline time.Time) time.Duration {
+	if !scheduled && !healthy {
+		if remaining := time.Until(deadline); remaining < lm.currentDelay {
+			if remaining < 0 {
+				remaining = 0
+			}
+			timer.Reset(remaining)
+			return remaining
+		}
+	}
+	timer.Reset(lm.currentDelay)
+	return lm.currentDelay
 }
 
 // signalReauth flips the manager into the needs-reauth state and invokes

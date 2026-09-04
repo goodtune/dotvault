@@ -1321,8 +1321,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// instead of failing. The listener is already serving (started before
 	// authentication, above); SetReauthGate is atomic precisely so it can be
 	// wired under a live listener.
+	//
+	// SetReauthReporter is the write side of the same relationship: a source
+	// error (the vault-ca source's certificate mint hitting a 403, most
+	// often) is reported back to lm so recovery starts immediately instead of
+	// waiting out lm's own checkInterval — see LifecycleManager.NotifyRejected.
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
+		agentSvc.Backend.SetReauthReporter(lm)
 	}
 
 	// Mount the filesystem now that we hold a Vault token: every read it
@@ -1394,7 +1400,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// socket was stale (so the lifecycle manager is already in its needs-reauth
 	// recovery state), this picks up a fresh peer token the moment the socket
 	// comes back rather than waiting out the 10s recovery poll. The
-	// NeedsReauth gate is deliberate: tryReload adopts any *different* valid
+	// re-auth gate is deliberate: tryReload adopts any *different* valid
 	// candidate, so an unconditional nudge would demote a still-healthy token
 	// to a borrowed one every time the forwarder flapped. lm.Reload triggers
 	// tryReload, which already consults the socket after the file/env
@@ -1405,7 +1411,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		if socketPath, err := paths.ExpandHome(configured); err != nil {
 			slog.Debug("could not expand peer token socket path for watching; relying on periodic re-borrow", "socket", configured, "error", err)
 		} else if sw, err := tokenwatch.New(socketPath, func() {
-			if !lm.NeedsReauth() {
+			// ReauthSignalled, not NeedsReauth: the question here is "does the
+			// daemon need someone to find it a token", which is the signal.
+			// NeedsReauth is the broader gate and is also true while a reload is
+			// already in flight — nudging there would queue a second reload
+			// that adopts any different valid candidate, which is exactly the
+			// demotion of a healthy token this check exists to prevent.
+			if !lm.ReauthSignalled() {
 				// Current token is healthy; don't demote it to a borrowed one.
 				return
 			}
@@ -1874,9 +1886,11 @@ func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
 // an agent *client* — it dials the running daemon's socket / pipe and lists the
 // identities being served (the `ssh-add -l` equivalent), so the output reflects
 // what the daemon actually offers, including a minted certificate's true
-// remaining validity. status never creates the endpoint; a failure to connect
-// is therefore unexpected (the daemon isn't running) and is reported as such.
-// The query is bounded end to end, not just at the dial — see
+// remaining validity. status never creates the endpoint, so a failure to reach
+// it is unexpected (the daemon isn't running) and is reported as such — while a
+// daemon that answered and simply could not resolve any identity is reported as
+// its own case, since the two send an operator looking in completely different
+// places. The query is bounded end to end, not just at the dial — see
 // agent.QueryListening for why the dial is the half that cannot hang.
 func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Agent.Enabled {
@@ -1887,6 +1901,16 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	fmt.Printf("  endpoint: %s\n", endpoint)
 
 	ids, err := agent.QueryListening(ctx, endpoint)
+	if errors.Is(err, agent.ErrListIdentities) {
+		// The endpoint answered, so the daemon is running and serving. Only
+		// identity resolution failed — usually a Vault-CA source that could
+		// not mint for a moment, often while the daemon replaces its own Vault
+		// token. Pointing the operator at a missing daemon here would send
+		// them after the wrong thing entirely.
+		fmt.Printf("  serving, but no identities could be resolved: %v\n", err)
+		fmt.Println("  (check the per-source errors on the web dashboard, or retry — a source may be mid-recovery)")
+		return
+	}
 	if err != nil {
 		fmt.Printf("  unreachable: %v\n", err)
 		fmt.Println("  (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)")

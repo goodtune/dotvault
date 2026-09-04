@@ -26,9 +26,41 @@ type ReauthGate interface {
 // ReauthGate implementation (the real LifecycleManager, a test stub) is wired.
 type gateHolder struct{ gate ReauthGate }
 
+// RejectionReporter lets the backend report a Vault-confirmed token rejection
+// it observed independently of the daemon's own token-lifecycle poll — a
+// vault-ca source's certificate mint hitting a 403 is the motivating case —
+// so recovery starts now instead of waiting out that poll's own check
+// interval (5 minutes by default). *auth.LifecycleManager satisfies it via
+// NotifyRejected, which classifies the error itself, so this side needs no
+// classification of its own: every source error is reported unconditionally
+// and a transient fault (Vault unreachable, sealed) is simply ignored on the
+// other end.
+//
+// This is the write side of the relationship ReauthGate is the read side of:
+// the backend waits on the gate before using a token mid-replacement, and
+// reports here when it independently discovers the token is bad. The two are
+// deliberately separate interfaces (mirroring LifecycleManager's own
+// NeedsReauth/ReauthSignalled split) — a component that only ever waits (a
+// test stub wired as a ReauthGate) is not obligated to also implement this.
+type RejectionReporter interface {
+	NotifyRejected(err error)
+}
+
+// reporterHolder wraps a RejectionReporter for the same atomic.Value reason
+// gateHolder wraps a ReauthGate.
+type reporterHolder struct{ reporter RejectionReporter }
+
 const (
 	defaultListCacheTTL  = 8 * time.Second
 	defaultReauthTimeout = 30 * time.Second
+
+	// defaultSourceTimeout bounds the Vault work itself — a source fan-out for
+	// List, a signature for Sign — and is deliberately a *separate* budget from
+	// reauthTimeout rather than a share of it. Spending one budget on both
+	// would mean a replacement that cleared at the 29th second left nothing for
+	// the work it had been waiting to do, turning a successful recovery into a
+	// deadline-exceeded failure at the last moment.
+	defaultSourceTimeout = 30 * time.Second
 )
 
 // Backend is the platform-neutral agent.ExtendedAgent served by both
@@ -55,12 +87,30 @@ type Backend struct {
 	// rather than defensive.
 	gate          atomic.Value
 	reauthTimeout time.Duration
+	sourceTimeout time.Duration
 	cacheTTL      time.Duration
 	now           func() time.Time
 
+	// reporter holds a reporterHolder, wired the same way and at the same
+	// time as gate (SetReauthGate and SetReauthReporter are called together
+	// in cmd/dotvault, once the lifecycle manager exists). Read whenever a
+	// source reports an error from identities/SignWithFlags, so a rejection
+	// this backend discovers independently reaches the lifecycle manager's
+	// recovery path instead of sitting unacted on until its next poll.
+	reporter atomic.Value
+
+	// mu guards the cache fields only, and is never held across a source
+	// call. refreshMu serialises the fan-out itself. Splitting them is what
+	// makes cachedIdentities' "never waits" true: with one mutex, a
+	// cache hit queued behind an in-flight refresh for as long as the refresh
+	// took — up to sourceTimeout — which is exactly the stall that answering
+	// from cache exists to avoid. Lock order is always refreshMu then mu;
+	// nothing takes them the other way round.
 	mu       sync.Mutex
 	cached   []Identity
 	cachedAt time.Time
+
+	refreshMu sync.Mutex
 }
 
 // Option configures a Backend.
@@ -93,11 +143,62 @@ func (b *Backend) reauthGate() ReauthGate {
 	return nil
 }
 
+// WithReauthReporter wires the rejection reporter used to notify the
+// lifecycle manager of a Vault rejection a source discovers independently.
+func WithReauthReporter(r RejectionReporter) Option {
+	return func(b *Backend) { b.setReporter(r) }
+}
+
+// SetReauthReporter wires the reporter after construction, mirroring
+// SetReauthGate — the daemon calls both together once the lifecycle manager
+// exists. A nil argument is a no-op; nothing relies on clearing it.
+func (b *Backend) SetReauthReporter(r RejectionReporter) { b.setReporter(r) }
+
+// setReporter stores the reporter, ignoring a nil so WithReauthReporter(nil)
+// (the headless / no-lifecycle case, and every test that doesn't care) leaves
+// the backend reporter-less rather than boxing a nil.
+func (b *Backend) setReporter(r RejectionReporter) {
+	if r != nil {
+		b.reporter.Store(reporterHolder{reporter: r})
+	}
+}
+
+// reportRejection forwards err to the wired reporter, a no-op if none is set.
+// Every source error from identities/SignWithFlags is reported unconditionally
+// — classification of "is this actually a rejection, or a transient fault"
+// belongs to the reporter (LifecycleManager.NotifyRejected), which already
+// owns that predicate for its own checkAndRenew path. Duplicating it here
+// would risk the two classifications drifting apart.
+//
+// Logs at debug regardless of whether the reporter's own classification
+// accepts or discards it — the caller (identities/SignWithFlags) already
+// logged the source failure itself; this line is what lets that failure be
+// correlated with "and it was forwarded to the lifecycle manager", which
+// otherwise has no visible trace on this side of the interface.
+func (b *Backend) reportRejection(err error) {
+	h, ok := b.reporter.Load().(reporterHolder)
+	if !ok || h.reporter == nil {
+		return
+	}
+	slog.Debug("ssh agent: reporting source failure to the token lifecycle manager", "error", err)
+	h.reporter.NotifyRejected(err)
+}
+
 // WithReauthTimeout bounds how long Sign waits for re-auth to clear.
 func WithReauthTimeout(d time.Duration) Option {
 	return func(b *Backend) {
 		if d > 0 {
 			b.reauthTimeout = d
+		}
+	}
+}
+
+// WithSourceTimeout bounds the Vault work a List or Sign performs, separately
+// from the re-auth wait that may precede it.
+func WithSourceTimeout(d time.Duration) Option {
+	return func(b *Backend) {
+		if d > 0 {
+			b.sourceTimeout = d
 		}
 	}
 }
@@ -130,6 +231,7 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 	b := &Backend{
 		sources:       sources,
 		reauthTimeout: defaultReauthTimeout,
+		sourceTimeout: defaultSourceTimeout,
 		cacheTTL:      defaultListCacheTTL,
 		now:           time.Now,
 	}
@@ -140,53 +242,144 @@ func NewBackend(sources []Source, opts ...Option) *Backend {
 }
 
 // identities returns the aggregated identities, refreshing from every source
-// when the cache has expired. Sources that error are skipped (logged at debug)
-// so one failing source does not blank the whole agent.
+// when the cache has expired. It performs the Vault work; the two answers that
+// need no Vault call at all are handled around it: a fresh cache by
+// cachedIdentities, and a tokenless daemon by the probe below.
 //
-// With no Vault token there is nothing any source could resolve, so a cache
-// miss answers empty rather than making a round of doomed Vault calls. That
-// keeps the pre-authentication reply instant, which is what makes serving the
-// endpoint before the daemon has a token an improvement on not serving it: an
-// ssh client reads "no identities" and tries its next auth method, where a
-// slow reply would stall it just as an unaccepted connection does. The cache
-// is deliberately left untouched, so the first List once a token arrives does
-// a real refresh instead of being answered from an empty snapshot.
+// A source that errors is skipped so one failing source does not blank the
+// whole agent — but the failure is not discarded:
 //
-// The token check sits AFTER the cache check, and the order is load-bearing.
-// A token is absent in two quite different situations: the daemon has never
-// authenticated (no cache exists, so both orderings answer empty), and the
-// daemon is mid-re-auth — web mode clears the in-memory token on the re-auth
-// transition — where a still-fresh cache should keep being served exactly as
-// it was before this short-circuit existed. Checking the token first blanked
-// that window, so `ssh-add -l` returned nothing and ssh dropped dotvault's
-// keys instead of reaching Sign, which is the call that knows how to wait the
-// re-auth out.
-func (b *Backend) identities(ctx context.Context) []Identity {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
-		return b.cached
+//   - If other sources produced identities, the partial list is returned and
+//     NOT cached. Caching it would pin a listing that is missing a source for
+//     the whole TTL, long after the cause had cleared.
+//   - If every source failed, the joined error is returned instead of an empty
+//     list. "This source hit a transient error" and "nothing is configured"
+//     are different answers, and an agent client cannot act on the first if it
+//     is told the second: a caller that sees zero identities reasonably gives
+//     up, where one that sees an error can retry. The motivating case is a
+//     vault-ca source whose mint lands inside a token-replacement window —
+//     hundreds of milliseconds during which the whole agent used to report
+//     itself as having no keys at all.
+//
+// The cache and token checks are repeated here rather than trusted from the
+// caller: a concurrent List may have refreshed the cache, or the token may
+// have gone away, while this call waited on the re-auth gate or on refreshMu.
+func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
+	// One refresh at a time. The re-check that follows is what collapses a
+	// thundering herd: callers that queued here while another was fanning out
+	// take its result rather than repeating the work — and, when that work
+	// failed and cached nothing, they would otherwise each redo the whole
+	// doomed fan-out in turn.
+	b.refreshMu.Lock()
+	defer b.refreshMu.Unlock()
+	if ids, ok := b.cachedIdentities(); ok {
+		return ids, nil
 	}
 	if !b.haveToken() {
-		return nil
+		return nil, nil
 	}
+
 	var all []Identity
+	var errs []error
 	for _, src := range b.sources {
 		ids, err := src.Identities(ctx)
 		if err != nil {
 			slog.Debug("ssh agent: source failed to list identities", "source", src.Name(), "error", err)
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			// Report unconditionally — a vault-ca mint's 403 is exactly the
+			// case this exists for, and a transient fault (Vault
+			// unreachable, sealed) is filtered out on the reporter's side
+			// (LifecycleManager.NotifyRejected), not here. See
+			// RejectionReporter.
+			b.reportRejection(err)
 			continue
 		}
 		all = append(all, ids...)
 	}
+	if len(errs) > 0 {
+		if len(all) == 0 {
+			return nil, fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+		}
+		return all, nil
+	}
+	b.mu.Lock()
 	b.cached = all
 	b.cachedAt = b.now()
-	return all
+	b.mu.Unlock()
+	return all, nil
+}
+
+// cachedIdentities returns the cached listing while it is still inside its
+// TTL. It is the one answer List can give without any Vault call at all, and
+// so the one it never makes anyone wait for.
+//
+// It deliberately does not consider the token. Web mode clears the in-memory
+// token on the re-auth transition, so a token going missing is routinely a
+// refresh rather than a logout, and a still-fresh list must keep being served
+// through it: a blank `ssh-add -l` makes ssh drop dotvault's keys before it
+// ever reaches Sign, which is the call that knows how to wait. The token check
+// belongs after this one, in identities, where a refresh is actually about to
+// happen.
+func (b *Backend) cachedIdentities() ([]Identity, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cached != nil && b.now().Sub(b.cachedAt) < b.cacheTTL {
+		return b.cached, true
+	}
+	return nil, false
+}
+
+// gatedContext waits out a token replacement using the caller's wait — List
+// and Sign owe different answers to an unauthenticated daemon, so each passes
+// its own — and then returns a context budgeted for the Vault work that
+// follows, along with its cancel func.
+//
+// The two budgets are separate on purpose — see defaultSourceTimeout. Callers
+// must call cancel when the returned error is nil.
+func (b *Backend) gatedContext(wait func(context.Context) error) (context.Context, context.CancelFunc, error) {
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), b.reauthTimeout)
+	defer cancelWait()
+	if err := wait(waitCtx); err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), b.sourceTimeout)
+	return ctx, cancel, nil
 }
 
 // List enumerates the available identities (cached briefly).
+//
+// A cache still inside its TTL is served immediately and never waits, because
+// it needs no Vault call and so cannot be built from a half-replaced token —
+// see cachedIdentities. Anything else is a refresh, and a refresh waits out a
+// re-authentication window as SignWithFlags does: List is what an SSH client
+// calls before choosing a key, so rebuilding that list from a token Vault has
+// already rejected turns a pause into a failed connection.
+//
+// Waiting *before* the token probe is deliberate, and it is why the probe sits
+// in identities rather than out here. An absent token means two different
+// things: mid-replacement, where it is transient and about to come back, and
+// never-authenticated (or logged out), where nothing is coming. The gate is
+// what tells them apart, so the first waits and then refreshes normally, while
+// the second falls through the probe to an empty list at once — no gate is
+// wired before the daemon's first login, so that path never stalls.
+//
+// It waits on waitForReauth rather than waitForToken: if the token is still
+// absent afterwards an unauthenticated daemon owes an empty list, not the
+// ErrNoToken that Sign owes, so the client moves on to its next authentication
+// method rather than treating dotvault as broken. A source failure that leaves
+// nothing to advertise is still an error — see identities.
 func (b *Backend) List() ([]*agent.Key, error) {
-	ids := b.identities(context.Background())
+	ids, ok := b.cachedIdentities()
+	if !ok {
+		ctx, cancel, err := b.gatedContext(b.waitForReauth)
+		if err != nil {
+			return nil, err
+		}
+		defer cancel()
+		if ids, err = b.identities(ctx); err != nil {
+			return nil, err
+		}
+	}
 	keys := make([]*agent.Key, 0, len(ids))
 	for _, id := range ids {
 		keys = append(keys, &agent.Key{
@@ -214,12 +407,11 @@ func (b *Backend) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 // up matching the key, so a genuine "no source can produce this signature"
 // case still reports why.
 func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.reauthTimeout)
-	defer cancel()
-
-	if err := b.waitForToken(ctx); err != nil {
+	ctx, cancel, err := b.gatedContext(b.waitForToken)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 
 	var errs []error
 	for _, src := range b.sources {
@@ -227,6 +419,9 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 		if err != nil {
 			slog.Debug("ssh agent: source failed to sign", "source", src.Name(), "error", err)
 			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			// See the matching call in identities: reported unconditionally,
+			// classified on the reporter's side.
+			b.reportRejection(err)
 			continue
 		}
 		if matched {

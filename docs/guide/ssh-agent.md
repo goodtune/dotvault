@@ -163,8 +163,9 @@ SSH Agent:
 ```
 
 Because the agent is only relevant when configured, `dotvault status` consults
-the endpoint only when `agent.enabled` is set. A failure to connect in that case
-is reported as unexpected — it means the daemon isn't running:
+the endpoint only when `agent.enabled` is set. A failure to reach it is
+reported as unexpected — it means the daemon isn't running, or is not yet
+serving this endpoint:
 
 ```
 $ dotvault status
@@ -174,6 +175,25 @@ SSH Agent:
   unreachable: dial unix /run/user/1000/dotvault/agent.sock: connect: no such file or directory
   (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)
 ```
+
+A daemon that *is* serving but cannot resolve any identity right now reports
+that separately, because the two send you looking in completely different
+places. The usual cause is a `vault-ca` source unable to mint for a moment,
+often while the daemon replaces its own Vault token — check the per-source
+errors on the web dashboard, or simply retry:
+
+```
+$ dotvault status
+...
+SSH Agent:
+  endpoint: /run/user/1000/dotvault/agent.sock
+  serving, but no identities could be resolved: agent could not list identities: ssh agent: ca: mint certificate: permission denied
+  (check the per-source errors on the web dashboard, or retry — a source may be mid-recovery)
+```
+
+Note this is distinct from the empty list below: an empty list means the agent
+has nothing to offer and says so cleanly, where this means it could not find
+out.
 
 ### Before the daemon has authenticated
 
@@ -189,6 +209,9 @@ SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
   (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)
 ```
+
+(A source that *failed* is not folded into this line — that is the "serving,
+but no identities could be resolved" case above.)
 
 `ssh` sees the same empty list and moves straight on to its next
 authentication method. A signing request in that window is refused rather than
@@ -234,10 +257,26 @@ config tooling (Nix/Ansible/etc.).
     blast radius. `ProxyJump` avoids forwarding entirely where topology allows
     and is the preferred pattern.
 
-- **Token-refresh interaction.** If the Vault token is mid-reauthentication when
-  a signing request arrives, the agent blocks briefly on the lifecycle manager
-  rather than failing, then signs once a usable token is available (up to a
-  bounded timeout).
+- **Token-refresh interaction.** If the Vault token is being replaced when a
+  request arrives, the agent blocks briefly on the lifecycle manager rather
+  than failing, then proceeds once a usable token is available (up to a bounded
+  timeout). This covers *listing* as well as signing: a client asks the agent
+  what identities it has before choosing a key, so rebuilding that list from a
+  half-replaced token is where a connection is actually lost. It also covers
+  the replacements that succeed — a certificate-auth daemon renewing its own
+  token unattended holds the gate for the few hundred milliseconds the mint and
+  login take, so callers wait it out instead of racing it. A listing that needs
+  no Vault call is still answered immediately: a cached list inside its window,
+  or the empty list the daemon owes before it has authenticated (see "Before
+  the daemon has authenticated" above), never waits.
+- **A source that errors is not silently empty.** With several `agent.keys[]`
+  sources configured, one that fails to list is skipped and the rest are still
+  advertised. If *every* source fails, the agent reports an error rather than
+  an empty list, because "the credential source hit a transient problem" and
+  "no keys are configured" call for opposite responses from a client — the
+  first is worth retrying in a moment, the second is not. A listing taken while
+  any source was failing is also not cached, so a retry sees the source the
+  moment it recovers rather than waiting out the cache window.
 - **Concurrency.** The backend is safe for concurrent use — two clients may
   request signatures simultaneously, and identity listings are cached for a few
   seconds to avoid hammering Vault on repeated `ssh-add -l`.

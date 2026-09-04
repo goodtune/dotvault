@@ -20,6 +20,22 @@ import (
 // enough that the ~10s recovery poll stays responsive.
 const recoverTimeout = 20 * time.Second
 
+// rejectClockBase anchors NotifyRejected's rate-limit window to the monotonic
+// clock. time.Since reads this value's monotonic component, so the window
+// measures elapsed time and is unaffected by a wall-clock step.
+//
+// That matters because the alternative fails in the unsafe direction. Storing
+// wall-clock UnixNano and differencing it means an NTP correction, a suspend
+// and resume, or a VM snapshot rollback yields a *negative* elapsed time,
+// which compares as inside the window — so every report is dropped and the
+// fast path silently disables itself until wall time catches up, which is
+// exactly when a daemon is most likely to find its token dead.
+//
+// Package-level rather than a field because it is only an origin, not state:
+// every manager can share one, including those built as a struct literal in
+// tests rather than through NewLifecycleManager.
+var rejectClockBase = time.Now()
+
 // reloadTimeout bounds one token-reload attempt, for the same reason
 // recoverTimeout bounds a recovery: it runs on the lifecycle goroutine, and it
 // is now also the window in which NeedsReauth gates every other consumer of the
@@ -85,8 +101,11 @@ type LifecycleManager struct {
 	rejectCh chan struct{}
 
 	// lastRejectNotifyAt bounds NotifyRejected to at most one accepted call
-	// per recoveryInterval, stored as UnixNano so it can be read/written with
-	// a plain CAS from arbitrary caller goroutines rather than a mutex.
+	// per recoveryInterval, stored as a nanosecond offset from rejectClockBase
+	// so it can be read/written with a plain CAS from arbitrary caller
+	// goroutines rather than a mutex. The offset is measured against the
+	// monotonic clock, not wall time — see rejectClockBase. Zero means "never
+	// reported"; an offset that would land on zero is stored as 1.
 	//
 	// rejectCh's buffered-1 channel alone only coalesces a *concurrent*
 	// burst — it does nothing to bound a *sustained* stream of reports one
@@ -282,8 +301,14 @@ func (lm *LifecycleManager) Reload() {
 // The limiter is deliberately coarser than rejectCh's channel-buffer
 // coalescing: that only catches a concurrent burst landing in the same
 // instant, not a sustained stream arriving one at a time. A call that misses
-// the window is simply dropped, exactly like a full rejectCh — the next
-// scheduled tick or a later report still gets a chance.
+// the window is simply dropped — the next scheduled tick or a later report
+// still gets a chance.
+//
+// The window is consumed only by a call that actually queues a nudge. A report
+// dropped because rejectCh is already full has cost nothing and releases the
+// window again: letting it burn the full interval would mean a redundant
+// report suppressing the next genuine one for as long as a real nudge would
+// have.
 //
 // The signalled pass runs the full recovery branch (tryReload then tryRecover
 // under the withTokenInFlux gate), not just tryReload — unlike Reload, which
@@ -300,12 +325,16 @@ func (lm *LifecycleManager) NotifyRejected(err error) {
 	if window <= 0 {
 		window = 10 * time.Second
 	}
-	now := time.Now()
+	elapsed := int64(time.Since(rejectClockBase))
+	if elapsed == 0 {
+		// Keep 0 reserved for "never reported".
+		elapsed = 1
+	}
 	last := lm.lastRejectNotifyAt.Load()
-	if last != 0 && now.Sub(time.Unix(0, last)) < window {
+	if last != 0 && time.Duration(elapsed-last) < window {
 		return
 	}
-	if !lm.lastRejectNotifyAt.CompareAndSwap(last, now.UnixNano()) {
+	if !lm.lastRejectNotifyAt.CompareAndSwap(last, elapsed) {
 		// Lost the race to another caller inside the same window; the
 		// winner's send (or its own recent send) already covers this report.
 		return
@@ -323,6 +352,11 @@ func (lm *LifecycleManager) NotifyRejected(err error) {
 		// reauth, etc.) is identical regardless of which path triggered it.
 		slog.Debug("vault rejection reported outside the lifecycle poll; requesting an immediate recheck", "error", err)
 	default:
+		// A nudge is already queued, so this report costs nothing and must
+		// not spend the window — release it so the next genuine report is
+		// not suppressed by one that did no work. CAS rather than Store so a
+		// caller that won the window after us is not stomped.
+		lm.lastRejectNotifyAt.CompareAndSwap(elapsed, last)
 	}
 }
 
@@ -497,6 +531,13 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 		timer := time.NewTimer(lm.currentDelay)
 		defer timer.Stop()
 
+		// nextTickAt tracks when the scheduled check is due, so an
+		// out-of-cycle run can re-arm without pushing it further out. Every
+		// timer.Reset in this loop is paired with an update here; the
+		// scheduled and reject branches update it after runCheckCycle, which
+		// arms the timer itself.
+		nextTickAt := time.Now().Add(lm.currentDelay)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -528,9 +569,10 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 						}
 					}
 					timer.Reset(lm.currentDelay)
+					nextTickAt = time.Now().Add(lm.currentDelay)
 				}
 			case <-timer.C:
-				lm.runCheckCycle(ctx, errCh, timer)
+				nextTickAt = time.Now().Add(lm.runCheckCycle(ctx, errCh, timer, true, time.Time{}))
 			case <-lm.rejectCh:
 				// A subsystem outside this manager (the SSH agent's vault-ca
 				// source, a managed SSH forward) independently observed Vault
@@ -558,7 +600,7 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 					default:
 					}
 				}
-				lm.runCheckCycle(ctx, errCh, timer)
+				nextTickAt = time.Now().Add(lm.runCheckCycle(ctx, errCh, timer, false, nextTickAt))
 			}
 		}
 	}()
@@ -576,7 +618,18 @@ func (lm *LifecycleManager) Start(ctx context.Context) <-chan error {
 // Factored out so both the scheduled timer.C tick and an externally-reported
 // rejection (rejectCh, via NotifyRejected) converge on one implementation:
 // the latter exists only to run this sooner, not to run something different.
-func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- error, timer *time.Timer) {
+//
+// scheduled distinguishes the two, and only for how the *schedule* is left
+// behind: an out-of-cycle run exists to pre-empt the next tick, so it must
+// never leave the daemon waiting longer than it already was. deadline is when
+// that pre-empted tick was due, and is ignored on a scheduled run.
+//
+// Returns the delay it armed the timer for, so the caller can track when the
+// next tick is due without having to re-derive it — the clamp above means the
+// armed delay is not always lm.currentDelay, and a caller that guessed would
+// drift.
+func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- error, timer *time.Timer, scheduled bool, deadline time.Time) time.Duration {
+	healthy := false
 	if err := lm.checkAndRenew(ctx); err != nil {
 		// Recoverable failure modes:
 		//   - 403 (token revoked/invalid)
@@ -626,8 +679,9 @@ func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- erro
 			}) {
 				lm.clearReauth()
 				lm.currentDelay = lm.checkInterval
+				lm.drainReject()
 				timer.Reset(lm.currentDelay)
-				return
+				return lm.currentDelay
 			}
 			nextDelay := lm.recoveryInterval
 			// Warn on the transition only. The recovery poll keeps
@@ -658,21 +712,16 @@ func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- erro
 			if lm.withTokenInFlux(ctx, reloadTimeout, lm.tryReload) {
 				lm.clearReauth()
 				lm.currentDelay = lm.checkInterval
+				lm.drainReject()
 				timer.Reset(lm.currentDelay)
-				return
+				return lm.currentDelay
 			}
-			nextDelay := lm.currentDelay * 2
-			if nextDelay > lm.maxDelay {
-				nextDelay = lm.maxDelay
-			}
+			nextDelay := lm.backoffFrom(lm.currentDelay, scheduled)
 			slog.Warn("token renewal failed and no fresher token available, will retry", "error", err, "next_retry", nextDelay)
 			lm.currentDelay = nextDelay
 		} else {
 			// Transient error: backoff up to maxDelay.
-			nextDelay := lm.currentDelay * 2
-			if nextDelay > lm.maxDelay {
-				nextDelay = lm.maxDelay
-			}
+			nextDelay := lm.backoffFrom(lm.currentDelay, scheduled)
 			slog.Warn("token lifecycle check failed, will retry", "error", err, "next_retry", nextDelay)
 			lm.currentDelay = nextDelay
 		}
@@ -682,8 +731,79 @@ func (lm *LifecycleManager) runCheckCycle(ctx context.Context, errCh chan<- erro
 		// can succeed even after the previous one was revoked).
 		lm.clearReauth()
 		lm.currentDelay = lm.checkInterval
+		lm.drainReject()
+		healthy = true
+	}
+	return lm.armAfterCycle(timer, scheduled, healthy, deadline)
+}
+
+// drainReject discards a rejection report queued while the cycle that just
+// ended was running, and is called only on the paths that ended with a working
+// token.
+//
+// Such a report is reliably present rather than a rare race: the subsystem
+// doing the reporting keeps failing for as long as the gate is held, so a
+// successful recovery was otherwise always followed by an immediate
+// out-of-cycle re-check of the token it had just fixed. Anything queued before
+// the cycle began is covered too — checkAndRenew re-derives its verdict from
+// the client's current token, so the pass that just succeeded already answered
+// it.
+//
+// The narrow cost is a report about the *new* token landing in the instant
+// between the swap and this drain, which is then swallowed; the next scheduled
+// tick catches it, and the reporting subsystem reports again on its next
+// attempt once the rate-limit window allows.
+func (lm *LifecycleManager) drainReject() {
+	select {
+	case <-lm.rejectCh:
+	default:
+	}
+}
+
+// backoffFrom returns the delay to wait after a failed check. Only a scheduled
+// tick advances the exponential backoff.
+//
+// An out-of-cycle run must not, because the two are counted against different
+// clocks: the doubling is designed to happen once per elapsed currentDelay,
+// but a rejection report can arrive once per rate-limit window (10s). During a
+// Vault outage — where a subsystem sees a 403 it reported earlier while
+// checkAndRenew is failing transiently — that compounds every 10s instead of
+// every currentDelay, driving the delay from checkInterval to the 5m cap in
+// under a minute. The fast path would then have made recovery slower than the
+// poll it exists to pre-empt.
+func (lm *LifecycleManager) backoffFrom(current time.Duration, scheduled bool) time.Duration {
+	if !scheduled {
+		return current
+	}
+	next := current * 2
+	if next > lm.maxDelay {
+		next = lm.maxDelay
+	}
+	return next
+}
+
+// armAfterCycle re-arms timer for the next pass.
+//
+// A scheduled tick simply arms the delay the cycle decided. An out-of-cycle
+// run that did NOT restore health arms whichever is sooner, that delay or
+// what remained of the tick it pre-empted — otherwise each report would push
+// the scheduled check a full delay further out, and a steady trickle of them
+// would starve it indefinitely. A run that *did* restore health is exempt:
+// there is nothing left to be urgent about, so returning to checkInterval is
+// correct even though it is longer than what remained.
+// Returns the delay it armed, which is not always lm.currentDelay.
+func (lm *LifecycleManager) armAfterCycle(timer *time.Timer, scheduled, healthy bool, deadline time.Time) time.Duration {
+	if !scheduled && !healthy {
+		if remaining := time.Until(deadline); remaining < lm.currentDelay {
+			if remaining < 0 {
+				remaining = 0
+			}
+			timer.Reset(remaining)
+			return remaining
+		}
 	}
 	timer.Reset(lm.currentDelay)
+	return lm.currentDelay
 }
 
 // signalReauth flips the manager into the needs-reauth state and invokes

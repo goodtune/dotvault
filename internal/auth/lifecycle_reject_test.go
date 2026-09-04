@@ -253,7 +253,6 @@ func TestLifecycleManager_NotifyRejectedRateLimited(t *testing.T) {
 	}
 }
 
-
 // TestLifecycleManager_NotifyRejectedBeforeStartIsBuffered pins that a report
 // arriving before Start is not dropped — mirroring Reload's documented
 // contract — so a race between wiring the reporter and starting the goroutine

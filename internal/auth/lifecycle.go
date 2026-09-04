@@ -326,7 +326,6 @@ func (lm *LifecycleManager) NotifyRejected(err error) {
 	}
 }
 
-
 // SetTokenFilePath wires a token file path so that on detection of an
 // invalid/expired token the manager will attempt to reload (and re-validate)
 // the token from disk or DOTVAULT_TOKEN before declaring re-auth necessary.

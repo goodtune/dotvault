@@ -1944,6 +1944,26 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// dotvault login exists to force a fresh interactive auth flow,
+	// ignoring any cached token — and under borrow-only there is no such
+	// flow, ever, regardless of whether a peer happens to hold a
+	// borrowable token right now. Letting mgr.Login below try the borrow
+	// anyway would make this command succeed without persisting anything
+	// (a borrowed token is deliberately held in memory only), which
+	// contradicts both its own "force a fresh login" contract and the
+	// "refused outright" semantics vault.borrow_only documents. Refuse
+	// unconditionally instead, before ever touching Vault — mirrors
+	// client.Client.Login's identical borrow-only refusal.
+	//
+	// Deliberately NOT wrapping auth.ErrBorrowOnly: that sentinel means "a
+	// borrow was attempted and failed" (see its doc), which is not what
+	// happened here — no borrow is ever attempted on this path. Reusing it
+	// would make errors.Is(err, auth.ErrBorrowOnly) claim a failed attempt
+	// that never occurred; a plain error avoids that false signal.
+	if cfg.Vault.BorrowOnly {
+		return fmt.Errorf("login: this host is configured with vault.borrow_only: true — it runs no fresh-auth flow of its own, so there is nothing for `dotvault login` to force; `dotvault run` retries the borrow from vault.token_socket %q automatically, and `dotvault status` reports whether a token is currently borrowable", cfg.Vault.TokenSocket)
+	}
+
 	username, err := paths.Username()
 	if err != nil {
 		return fmt.Errorf("resolve username: %w", err)
@@ -1966,7 +1986,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 		TokenSockets:     freshLoginBorrowSockets(cfg),
-		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -1979,15 +1998,6 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		// Ctrl-C should exit quietly — the user knows they cancelled.
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 			return nil
-		}
-		// Under borrow-only mode this is the expected, informative outcome
-		// rather than a misconfiguration: `dotvault login`'s whole purpose —
-		// forcing a fresh interactive auth flow — has no meaning on a host
-		// that runs none. errors.Is surfaces distinctly here so a caller
-		// scripting around this command can tell the two apart if it needs
-		// to; the printed text is the same either way.
-		if errors.Is(err, auth.ErrBorrowOnly) {
-			return fmt.Errorf("login: %w (this host is configured with vault.borrow_only: true — it only ever borrows a token from vault.token_socket %q; make sure the peer is reachable and already holds a token)", err, cfg.Vault.TokenSocket)
 		}
 		return fmt.Errorf("login: %w", err)
 	}

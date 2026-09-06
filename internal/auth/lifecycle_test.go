@@ -430,7 +430,9 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -443,18 +445,13 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 	}()
 
 	// Wait until the manager has had a chance to run a check and reload.
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "new-token" {
-			break
+	// Both conditions: tryReload installs the candidate before LookupSelf
+	// judges it, so waiting on the token alone can release while
+	// NeedsReauth is still legitimately true (see the denylist test).
+	if !waitFor(func() bool { return vc.Token() == "new-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "new-token" {
+			t.Fatalf("client token = %q after reload, want %q", got, "new-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "new-token" {
-		t.Fatalf("client token = %q after reload, want %q", got, "new-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after successful reload")
 	}
 	if onReauthFired.Load() {
@@ -508,7 +505,9 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenFilePath(tokenPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -517,16 +516,8 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "file-token" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "file-token" {
-		t.Fatalf("client token = %q after reload, want %q (file content); env-first ResolveToken regressed", got, "file-token")
+	if !waitFor(func() bool { return vc.Token() == "file-token" }, 2*time.Second) {
+		t.Fatalf("timed out waiting for client token %q after reload (last seen %q); env-first ResolveToken regressed", "file-token", vc.Token())
 	}
 }
 
@@ -579,7 +570,9 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -588,19 +581,21 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "peer-token" {
-			break
+	// Both conditions: tryReload installs the candidate before LookupSelf
+	// judges it, so waiting on the token alone can release while
+	// NeedsReauth is still legitimately true (see the denylist test).
+	if !waitFor(func() bool { return vc.Token() == "peer-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "peer-token" {
+			t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "peer-token" {
-		t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after successful socket reload")
+	}
+	// The twin at ReloadFromTokenFile asserts this and reaches it through the
+	// same branch: a borrow that succeeds must not have solicited credentials
+	// on the way. Without the assertion the callback above is instrumentation
+	// that looks like coverage and is none.
+	if onReauthFired.Load() {
+		t.Error("OnReauth callback fired despite successful socket reload")
 	}
 }
 
@@ -856,7 +851,9 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenFilePath(tokenPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: the 150ms settle below and the 2s waitFor after it stack, and
+	// the manager must outlive both to satisfy them — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -865,11 +862,13 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 		}
 	}()
 
-	// Let the manager run a tick or two with the empty token — it should
-	// surface "missing client token" responses but stay on the recovery
-	// path (10s recovery interval, not the transient backoff).
-	time.Sleep(150 * time.Millisecond)
-	if !lm.NeedsReauth() {
+	// Wait for the manager to run a tick or two with the empty token — it
+	// should surface "missing client token" responses but stay on the
+	// recovery path (10s recovery interval, not the transient backoff). A
+	// fixed sleep would assert this had happened within three ticks, which
+	// is the same self-limiting shape as a wait outliving its context: true
+	// on an idle machine, not on a loaded one.
+	if !waitFor(lm.NeedsReauth, 2*time.Second) {
 		t.Error("NeedsReauth() = false after empty-token checks; recovery path was not taken")
 	}
 
@@ -878,17 +877,10 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 		t.Fatalf("write token file: %v", err)
 	}
 
-	deadline := time.Now().Add(800 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "new-token" && !lm.NeedsReauth() {
-			break
+	if !waitFor(func() bool { return vc.Token() == "new-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "new-token" {
+			t.Fatalf("client token = %q after token-file write, want %q (recovery never fired)", got, "new-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := vc.Token(); got != "new-token" {
-		t.Fatalf("client token = %q after token-file write, want %q (recovery never fired)", got, "new-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after recovery picked up a working token")
 	}
 }
@@ -1035,7 +1027,9 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenSockets([]string{sock})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errCh := lm.Start(ctx)
 	go func() {
@@ -1043,15 +1037,8 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "fresh-token" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := vc.Token(); got != "fresh-token" {
-		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", got)
+	if !waitFor(func() bool { return vc.Token() == "fresh-token" }, 2*time.Second) {
+		t.Errorf("timed out waiting for client token \"fresh-token\" (last seen %q); no re-borrow after renewal failed", vc.Token())
 	}
 }
 

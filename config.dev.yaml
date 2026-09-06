@@ -84,11 +84,27 @@ fuse:
   # default is 30s.
   cache_ttl: "5s"
 
-# SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
-# domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
-# live Vault token. Point SSH_AUTH_SOCK at the socket to use it.
+# SSH agent surface. Serves an agent.ExtendedAgent over a Unix domain socket
+# (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the live Vault
+# token. Point SSH_AUTH_SOCK at the socket to use it. dotvault's own
+# identities are read-only; because the SSH agent relay is on by default (below)
+# the mutating operations are proxied to the agents it shadows instead, so
+# `ssh-add` through this socket still works.
 agent:
   enabled: true
+  # The SSH agent relay: sit in front of the agents you already run
+  # (ssh-agent, gpg-agent, a keyring daemon, the Windows OpenSSH agent,
+  # Pageant). Their keys are served alongside the Vault-backed ones and
+  # `ssh-add` against dotvault lands in the agent underneath. dotvault
+  # forwards the protocol and stores nothing.
+  #
+  # On by default and always tried last, after every keys[] entry below, so
+  # dotvault's own identities are offered first. Set relay.enabled: false to
+  # turn it off — that is the only way to not have it. relay.socket (Unix) /
+  # relay.pipe (Windows) pin it to one endpoint instead of auto-detecting;
+  # both accept {{.username}}/{{.uid}}.
+  relay:
+    enabled: true
   unix:
     path: ""              # default: per-user runtime socket
   windows:

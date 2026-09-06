@@ -15,6 +15,9 @@ Two, and both are hard requirements — a remote whose preconditions aren't met 
 - **A local API surface.** The forward's target is dotvault's own web API, so something has to be listening: `api.enabled` (the per-user API socket) or `web.enabled` (the loopback web listener). When both are configured the **API socket is preferred** — it is `0600` inside a `0700` directory, whereas the TCP listener `web.enabled` controls is reachable by every uid on the box.
 - **`agent.enabled`**, with at least one usable key source. The SSH identity used to authenticate to each remote is drawn from the same [agent backend](ssh-agent.md) that serves `ssh-add -l` — there is no separate credential to configure.
 
+!!! note "Managed forwards offer your relayed keys too"
+    Because the identity is the whole agent backend, and the [SSH agent relay](ssh-agent.md#the-ssh-agent-relay) is on by default, a managed forward offers the keys held by the agents you already run alongside dotvault's Vault-backed ones. The relay is always tried last, so a Vault-backed key is offered first and normally wins — but on a busy agent the extra identities can exhaust the remote `sshd`'s `MaxAuthTries` before the right one is reached, which surfaces as `authentication-error` and its long retry floor. If a remote authenticates by hand but not through a managed forward, that is the first thing to check; `agent.relay.enabled: false` is the lever, and it applies to the agent surface and managed forwards together — there is no way to relay for one and not the other.
+
 !!! warning "Windows: `web.enabled` is required"
     The per-user API socket (`api.enabled`) is Unix-only today. On Windows, `dotvault ssh` and the managed-forward subsystem need `web.enabled` — there is no local named-pipe equivalent of the API socket yet.
 

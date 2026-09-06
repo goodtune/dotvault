@@ -4,6 +4,7 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows/registry"
@@ -497,6 +498,61 @@ func TestApplyRegistryLayerAgentPutty(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerAgentRelay covers the Agent\Relay subkey's three
+// values. The tri-state matters most: an absent Enabled DWORD must leave the
+// *bool nil so RelayEnabled's default-true applies, because a GPO that simply
+// never mentions the relay is not an operator asking for it to be off.
+func TestApplyRegistryLayerAgentRelay(t *testing.T) {
+	t.Run("absent stays nil", func(t *testing.T) {
+		cfg := &Config{}
+		applyRegistryLayer(cfg, registryLayer{})
+		if cfg.Agent.Relay.Enabled != nil {
+			t.Errorf("Relay.Enabled = %v, want nil (absent policy must not read as off)", *cfg.Agent.Relay.Enabled)
+		}
+		if !cfg.Agent.RelayEnabled() {
+			t.Error("RelayEnabled() = false with no policy value, want true")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		dw   uint32
+		want bool
+	}{
+		{"zero disables", 0, false},
+		{"one enables", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			dw := tc.dw
+			applyRegistryLayer(cfg, registryLayer{AgentRelayEnabled: &dw})
+			if cfg.Agent.Relay.Enabled == nil {
+				t.Fatalf("Relay.Enabled = nil, want %v", tc.want)
+			}
+			if *cfg.Agent.Relay.Enabled != tc.want {
+				t.Errorf("Relay.Enabled = %v, want %v", *cfg.Agent.Relay.Enabled, tc.want)
+			}
+			if cfg.Agent.RelayEnabled() != tc.want {
+				t.Errorf("RelayEnabled() = %v, want %v", cfg.Agent.RelayEnabled(), tc.want)
+			}
+		})
+	}
+
+	t.Run("pinned endpoints", func(t *testing.T) {
+		cfg := &Config{}
+		applyRegistryLayer(cfg, registryLayer{
+			AgentRelaySocket: "/run/user/{{.uid}}/ssh-agent.socket",
+			AgentRelayPipe:   `\\.\pipe\openssh-ssh-agent`,
+		})
+		if cfg.Agent.Relay.Socket != "/run/user/{{.uid}}/ssh-agent.socket" {
+			t.Errorf("Relay.Socket = %q", cfg.Agent.Relay.Socket)
+		}
+		if cfg.Agent.Relay.Pipe != `\\.\pipe\openssh-ssh-agent` {
+			t.Errorf("Relay.Pipe = %q", cfg.Agent.Relay.Pipe)
+		}
+	})
+}
+
 func TestReadRegistryAgentKeysOrdered(t *testing.T) {
 	t.Cleanup(func() {
 		for i := 0; i < 12; i++ {
@@ -814,5 +870,107 @@ func TestApplyRegistryLayerSignalEmptyHeaders(t *testing.T) {
 	}
 	if len(cfg.Observability.Logs.Headers) != 0 {
 		t.Errorf("Logs.Headers = %v, want empty", cfg.Observability.Logs.Headers)
+	}
+}
+
+// TestReadRegistryLayerAgentRelay exercises the loader against a real registry
+// key, which is the only way to catch the failure this subkey is most exposed
+// to: a path or value name that does not match what the emitter writes.
+// applyRegistryLayer tests take an already-built layer and so cannot see it,
+// and the relay arrived here by a bulk rename from three flat Agent values,
+// which is exactly the change that produces such a mismatch.
+//
+// It also pins the tri-state end to end. An absent Enabled must leave the
+// *bool nil so the default-true applies — a policy that never mentions the
+// relay is not an administrator asking for it off — while an explicit 0 must
+// survive as false, because that is the only control there is.
+func TestReadRegistryLayerAgentRelay(t *testing.T) {
+	const base = `SOFTWARE\dotvault-test-relay`
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Agent\Relay`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Agent`)
+		registry.DeleteKey(registry.CURRENT_USER, base)
+	})
+
+	mk := func(t *testing.T, path string) registry.Key {
+		t.Helper()
+		k, _, err := registry.CreateKey(registry.CURRENT_USER, path, registry.ALL_ACCESS)
+		if err != nil {
+			t.Fatalf("create %s: %v", path, err)
+		}
+		return k
+	}
+
+	ak := mk(t, base+`\Agent`)
+	if err := ak.SetDWordValue("Enabled", 1); err != nil {
+		t.Fatalf("set Agent\\Enabled: %v", err)
+	}
+	ak.Close()
+
+	// No Relay subkey at all: the relay must read as unmentioned, not off.
+	layer, found, err := readRegistryLayerAt(registry.CURRENT_USER, base)
+	if err != nil || !found {
+		t.Fatalf("readRegistryLayerAt: found=%v err=%v", found, err)
+	}
+	if layer.AgentRelayEnabled != nil {
+		t.Errorf("with no Relay subkey, AgentRelayEnabled = %v, want nil", *layer.AgentRelayEnabled)
+	}
+
+	rk := mk(t, base+`\Agent\Relay`)
+	if err := rk.SetDWordValue("Enabled", 0); err != nil {
+		t.Fatalf("set Relay\\Enabled: %v", err)
+	}
+	if err := rk.SetStringValue("Socket", "/run/user/{{.uid}}/ssh-agent.socket"); err != nil {
+		t.Fatalf("set Relay\\Socket: %v", err)
+	}
+	if err := rk.SetStringValue("Pipe", `\\.\pipe\openssh-ssh-agent`); err != nil {
+		t.Fatalf("set Relay\\Pipe: %v", err)
+	}
+	rk.Close()
+
+	layer, found, err = readRegistryLayerAt(registry.CURRENT_USER, base)
+	if err != nil || !found {
+		t.Fatalf("readRegistryLayerAt: found=%v err=%v", found, err)
+	}
+	if layer.AgentRelayEnabled == nil {
+		t.Fatal("AgentRelayEnabled = nil after writing Relay\\Enabled=0; the loader is not reading the subkey")
+	}
+	if *layer.AgentRelayEnabled != 0 {
+		t.Errorf("AgentRelayEnabled = %d, want 0", *layer.AgentRelayEnabled)
+	}
+	if layer.AgentRelaySocket != "/run/user/{{.uid}}/ssh-agent.socket" {
+		t.Errorf("AgentRelaySocket = %q", layer.AgentRelaySocket)
+	}
+	if layer.AgentRelayPipe != `\\.\pipe\openssh-ssh-agent` {
+		t.Errorf("AgentRelayPipe = %q", layer.AgentRelayPipe)
+	}
+}
+
+// TestReadRegistryLayerRejectsLegacyFlatRelay pins the refusal that keeps the
+// off-switch from failing open. The relay's settings moved from three flat
+// values on Agent into the Agent\Relay subkey; a policy still carrying the old
+// spelling would otherwise be read as "unmentioned", which for this field
+// means on — an administrator who wrote Relay=0 to turn it off getting it
+// anyway, silently.
+func TestReadRegistryLayerRejectsLegacyFlatRelay(t *testing.T) {
+	const base = `SOFTWARE\dotvault-test-relay-legacy`
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, base+`\Agent`)
+		registry.DeleteKey(registry.CURRENT_USER, base)
+	})
+
+	ak, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\Agent`, registry.ALL_ACCESS)
+	if err != nil {
+		t.Fatalf("create Agent: %v", err)
+	}
+	if err := ak.SetDWordValue("Relay", 0); err != nil {
+		t.Fatalf("set legacy Relay: %v", err)
+	}
+	ak.Close()
+
+	if _, _, err := readRegistryLayerAt(registry.CURRENT_USER, base); err == nil {
+		t.Fatal("a legacy flat Relay value loaded cleanly; it must be refused rather than silently leaving the relay on")
+	} else if !strings.Contains(err.Error(), `Agent\Relay`) {
+		t.Errorf("error %q should name the subkey the value must move to", err)
 	}
 }

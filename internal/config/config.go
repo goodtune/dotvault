@@ -609,17 +609,83 @@ type WebConfig struct {
 // enabled the daemon serves an agent.ExtendedAgent over a Unix domain socket
 // (Linux/macOS) or a named pipe (Windows), backed by the live Vault token.
 //
-// The inner fields deliberately omit `omitempty` for the same round-trip
-// reason as ObservabilityConfig: an exported config must re-emit cleared
-// optional values so a re-import can blank a previously-set path or pipe. The
-// top-level Agent field keeps `omitempty` so operators who don't use the agent
-// see no empty block in downloads.
+// The inner string fields deliberately omit `omitempty` for the same
+// round-trip reason as ObservabilityConfig: an exported config must re-emit
+// cleared optional values so a re-import can blank a previously-set path or
+// pipe. The *bool tri-states are the exception and do carry it — for them nil
+// and false are different answers, so an unset one must not be emitted at all.
+// Note this is now about the field inside its block, not the block: `relay`
+// and `windows` are structs and are always written, so what a missing
+// `omitempty` would produce is `relay.enabled: null` or `windows.putty: null`
+// — a preference nobody expressed, handed back by an export as though they
+// had. The top-level Agent field keeps `omitempty` so operators who don't use
+// the agent see no empty block in downloads.
 type AgentConfig struct {
 	Enabled bool               `yaml:"enabled"`
 	Unix    AgentUnixConfig    `yaml:"unix"`
 	Windows AgentWindowsConfig `yaml:"windows"`
-	Keys    []AgentKeySource   `yaml:"keys"`
+
+	// Relay configures the upstream-agent relay: the SSH agents this user
+	// already runs, which dotvault proxies to so their keys are served
+	// alongside its own Vault-backed ones and `ssh-add` lands in the agent
+	// underneath. It is **on by default** and is not a key source — the relay
+	// is always appended last, after every configured keys[] entry, so
+	// dotvault's own identities are offered first and the shadowed agents fill
+	// in behind them. A block rather than three sibling scalars because that
+	// is what it is: one subsystem with a switch and its settings, the same
+	// shape as Unix and Windows above.
+	Relay AgentRelayConfig `yaml:"relay"`
+
+	Keys []AgentKeySource `yaml:"keys"`
 }
+
+// AgentRelayConfig holds the upstream-agent relay's switch and its endpoint
+// override.
+type AgentRelayConfig struct {
+	// Enabled controls whether the relay runs. It is implicit rather than
+	// opt-in because "point every SSH client at dotvault once and leave it
+	// there" only holds if the keys the user already had keep working without
+	// them having to ask. An arrangement that silently drops half of someone's
+	// keys unless they found a config stanza is not one they can adopt
+	// wholesale, so the single supported way to not have it is to say so:
+	// relay.enabled: false.
+	//
+	// A *bool because the merge and registry layers must tell "unmentioned"
+	// from "explicitly false" — a plain bool would make every operator who
+	// never wrote the field look like they were turning the relay off. Read it
+	// through AgentConfig.RelayEnabled, never directly.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// Socket (Unix) and Pipe (Windows) pin the relay to one named endpoint
+	// instead of auto-detecting. Empty — the recommended setting — re-scans
+	// the platform's well-known agent locations on every listing, so an agent
+	// started, restarted, or forwarded mid-session is picked up with no config
+	// change and no daemon restart.
+	//
+	// The override exists for the case detection cannot serve: an agent at a
+	// path dotvault does not know about. Both accept {{.username}} and
+	// {{.uid}}. Only the field matching the running platform is consulted, so
+	// one config can carry both for a mixed fleet.
+	//
+	// Naming an endpoint also skips the peer-ownership check auto-detection
+	// applies, deliberately: the operator chose this endpoint and may well mean
+	// an agent running as another account. On Unix that is a real trade — the
+	// pin buys a fixed path and gives up the kernel's answer about who is on
+	// the other end — so it is logged when it happens.
+	//
+	// It is NOT a security control, and on Windows specifically it is not the
+	// answer to a multi-user host. A pinned pipe name authenticates nothing:
+	// the namespace is first-creator-wins, so whoever created
+	// \\.\pipe\openssh-ssh-agent first owns it for the boot whether or not
+	// the config names it. Pinning narrows which endpoint is dialled, not who
+	// answers. Where that matters, the control is relay.enabled: false.
+	Socket string `yaml:"socket"`
+	Pipe   string `yaml:"pipe"`
+}
+
+// RelayEnabled reports whether the upstream-agent relay should run. Absent
+// means on: see AgentRelayConfig.Enabled for why the default is to relay.
+func (a AgentConfig) RelayEnabled() bool { return a.Relay.Enabled == nil || *a.Relay.Enabled }
 
 // APIConfig configures the local API socket: the daemon's web API served over
 // a per-user Unix domain socket in addition to (or instead of) the loopback
@@ -736,11 +802,16 @@ func (w AgentWindowsConfig) PuttyEnabled() bool {
 	return w.Putty == nil || *w.Putty
 }
 
-// AgentKeySource is one ordered origin of signing identities: either raw keys
-// discovered under a KV path prefix, or short-lived certificates minted by a
-// Vault SSH CA.
+// AgentKeySource is one ordered origin of Vault-backed signing identities:
+// raw keys discovered under a KV path prefix, or short-lived certificates
+// minted by a Vault SSH CA. Those two are the whole list — the upstream-agent
+// relay is not a key source and is configured by AgentRelayConfig instead.
 type AgentKeySource struct {
 	// Source selects the engine: "kv" or "vault-ca".
+	//
+	// The upstream-agent relay was once spelled here as source: "agent". It is
+	// no longer a key source at all — it is implicit, always last, and
+	// controlled by agent.relay.enabled. See AgentRelayConfig.
 	Source string `yaml:"source"`
 
 	// PathPrefix (kv) is resolved under kv/data/{user_prefix}{you}/; every
@@ -1248,8 +1319,14 @@ func (c *Config) validate() error {
 	// user opted in. Transport paths are left empty-able: the agent applies
 	// per-user defaults at construction (Unix runtime socket / DefaultAgentPipe).
 	if c.Agent.Enabled {
-		if len(c.Agent.Keys) == 0 {
-			return fmt.Errorf("agent.keys: at least one key source is required when the agent is enabled")
+		// keys[] may be empty: the relay is implicit and on by default, so
+		// "serve whatever agents I already run, and nothing of my own" is a
+		// complete configuration. It is only empty *and* relay-off that leaves
+		// the agent with nothing to serve, which is a mistake worth naming
+		// rather than starting a listener that can only ever answer "no
+		// identities".
+		if len(c.Agent.Keys) == 0 && !c.Agent.RelayEnabled() {
+			return fmt.Errorf("agent: with agent.relay.enabled false, at least one agent.keys[] source is required (otherwise the agent has nothing to serve)")
 		}
 		for i, k := range c.Agent.Keys {
 			switch k.Source {
@@ -1271,6 +1348,11 @@ func (c *Config) validate() error {
 						return fmt.Errorf("agent.keys[%d].ttl %q: must be positive", i, k.TTL)
 					}
 				}
+			case "agent":
+				// Named explicitly so an existing config gets told what
+				// happened rather than "invalid source": the relay stopped
+				// being a key source and became implicit.
+				return fmt.Errorf("agent.keys[%d]: source %q is no longer a key source — the upstream-agent relay is implicit and always last; remove this entry, and use agent.relay.enabled: false to turn it off or agent.relay.socket/agent.relay.pipe to pin an endpoint", i, k.Source)
 			case "":
 				return fmt.Errorf("agent.keys[%d]: source is required (kv or vault-ca)", i)
 			default:

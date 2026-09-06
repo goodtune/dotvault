@@ -890,6 +890,17 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	if err := applyBoolPtr(&cfg.Agent.Windows.Putty, agentKey, "WindowsPutty"); err != nil {
 		return err
 	}
+	// The relay block has its own subkey, matching the YAML nesting.
+	relayKey := agentKey + `\Relay`
+	if err := applyBoolPtr(&cfg.Agent.Relay.Enabled, relayKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Relay.Socket, relayKey, "Socket"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Relay.Pipe, relayKey, "Pipe"); err != nil {
+		return err
+	}
 	// Agent key sources. Each is a subkey under Agent\Keys named after its
 	// zero-based list index; sort numerically to recover the original order.
 	if len(agentKeys) > 0 {

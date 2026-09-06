@@ -275,13 +275,22 @@ func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
 	if ids, ok := b.cachedIdentities(); ok {
 		return ids, nil
 	}
-	if !b.haveToken() {
+	// Without a token, consult only the sources that need none. That is not
+	// the same as consulting nothing: the upstream-agent proxy holds no Vault
+	// credential, so a daemon that has not authenticated (or cannot) must
+	// still serve the user's own agents through it — otherwise pointing every
+	// client permanently at dotvault would make an unreachable Vault take the
+	// legacy keys down with it. Vault-backed sources are skipped exactly as
+	// before, so the "answer instantly, make no doomed Vault calls" property
+	// the probe exists for is unchanged.
+	sources, reduced := b.usableSources()
+	if len(sources) == 0 {
 		return nil, nil
 	}
 
 	var all []Identity
 	var errs []error
-	for _, src := range b.sources {
+	for _, src := range sources {
 		ids, err := src.Identities(ctx)
 		if err != nil {
 			slog.Debug("ssh agent: source failed to list identities", "source", src.Name(), "error", err)
@@ -302,11 +311,33 @@ func (b *Backend) identities(ctx context.Context) ([]Identity, error) {
 		}
 		return all, nil
 	}
+	if reduced {
+		// A listing assembled from only the token-independent sources is
+		// missing the Vault-backed ones, for the same reason a partial listing
+		// above is not cached: holding it would keep those keys hidden for a
+		// TTL after a token arrives, when the whole point is that the first
+		// List afterwards does a real refresh.
+		return all, nil
+	}
 	b.mu.Lock()
 	b.cached = all
 	b.cachedAt = b.now()
 	b.mu.Unlock()
 	return all, nil
+}
+
+// usableSources returns the sources that can be consulted right now, and
+// whether the set was narrowed because no Vault token is held.
+func (b *Backend) usableSources() (sources []Source, reduced bool) {
+	if b.haveToken() {
+		return b.sources, false
+	}
+	for _, src := range b.sources {
+		if !sourceNeedsToken(src) {
+			sources = append(sources, src)
+		}
+	}
+	return sources, true
 }
 
 // cachedIdentities returns the cached listing while it is still inside its
@@ -407,14 +438,25 @@ func (b *Backend) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 // up matching the key, so a genuine "no source can produce this signature"
 // case still reports why.
 func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	ctx, cancel, err := b.gatedContext(b.waitForToken)
+	ctx, cancel, err := b.gatedContext(b.waitForReauth)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 
+	// Waiting on waitForReauth rather than waitForToken, then narrowing, is
+	// what lets a token-independent source sign on an unauthenticated daemon.
+	// The re-auth wait itself is unchanged — a signature issued mid-replacement
+	// still waits it out — and a config with only Vault-backed sources still
+	// gets ErrNoToken immediately rather than stalling, because the narrowed
+	// set is then empty.
+	sources, reduced := b.usableSources()
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("ssh agent: %w", ErrNoToken)
+	}
+
 	var errs []error
-	for _, src := range b.sources {
+	for _, src := range sources {
 		sig, matched, err := src.Sign(ctx, key, data, flags)
 		if err != nil {
 			slog.Debug("ssh agent: source failed to sign", "source", src.Name(), "error", err)
@@ -430,6 +472,17 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+	}
+	if reduced {
+		// Nothing matched, but the token-dependent sources were never asked —
+		// so "no matching key" would be a claim this call has not earned. The
+		// case is reachable and not rare: List serves a still-fresh cache
+		// without consulting the token (deliberately, since web mode clears it
+		// on the re-auth transition), so a client can pick a Vault-backed key
+		// out of that listing and arrive here while the token is briefly gone.
+		// Reporting the real cause is what lets it wait and retry instead of
+		// concluding the key is gone and moving to its next auth method.
+		return nil, fmt.Errorf("ssh agent: %w", ErrNoToken)
 	}
 	return nil, fmt.Errorf("ssh agent: %w", ErrKeyNotFound)
 }
@@ -485,16 +538,172 @@ var ErrKeyNotFound = fmt.Errorf("no matching key")
 // refusal it can act on instead of a connection nobody accepts.
 var ErrNoToken = errors.New("dotvault holds no vault token (not authenticated); run `dotvault login`")
 
-// --- read-only surface: dotvault is one-way, so the agent is too. ---
+// --- mutating surface: forwarded to an upstream agent, else read-only. ---
+//
+// dotvault's own identities come from Vault and are never added, removed, or
+// locked by a client, so with no upstream configured every operation below is
+// ErrReadOnly exactly as before. With one configured they are proxied to the
+// agent dotvault shadows, which is what lets a user point their clients at the
+// dotvault endpoint permanently instead of switching SSH_AUTH_SOCK back and
+// forth to run an `ssh-add`.
+//
+// None of these wait on the Vault token or the re-auth gate the way List and
+// Sign do. They touch no Vault-backed source by definition — the only source
+// that can serve them is the upstream proxy — so making them block on a token
+// dotvault does not need would strand `ssh-add` on an unauthenticated daemon
+// for no benefit. They take the source timeout alone.
 
-func (b *Backend) Add(key agent.AddedKey) error   { return ErrReadOnly }
-func (b *Backend) Remove(key ssh.PublicKey) error { return ErrReadOnly }
-func (b *Backend) RemoveAll() error               { return ErrReadOnly }
-func (b *Backend) Lock(passphrase []byte) error   { return ErrReadOnly }
-func (b *Backend) Unlock(passphrase []byte) error { return ErrReadOnly }
+// mutatingSources returns the sources that accept mutations, in config order.
+func (b *Backend) mutatingSources() []MutatingSource {
+	var out []MutatingSource
+	for _, src := range b.sources {
+		if ms, ok := src.(MutatingSource); ok {
+			out = append(out, ms)
+		}
+	}
+	return out
+}
+
+// mutationContext bounds a forwarded mutation. See the note above on why this
+// is the source timeout alone and not gatedContext.
+func (b *Backend) mutationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), b.sourceTimeout)
+}
+
+// invalidate drops the cached listing so a mutation is visible to the very
+// next List rather than up to a cache TTL later — `ssh-add` followed
+// immediately by `ssh-add -l` is the normal way a user checks it worked.
+func (b *Backend) invalidate() {
+	b.mu.Lock()
+	b.cached = nil
+	b.cachedAt = time.Time{}
+	b.mu.Unlock()
+}
+
+// Add forwards a key to the first source that accepts one — the upstream
+// agent. Nothing is written to disk or to Vault on this path.
+func (b *Backend) Add(key agent.AddedKey) error {
+	srcs := b.mutatingSources()
+	if len(srcs) == 0 {
+		return ErrReadOnly
+	}
+	ctx, cancel := b.mutationContext()
+	defer cancel()
+
+	// The first mutating source, and only it. Falling through on failure would
+	// hand the private key to a source the user did not name — the same
+	// objection as fanning out, arrived at by a different route.
+	src := srcs[0]
+	if err := src.Add(ctx, key); err != nil {
+		return fmt.Errorf("ssh agent: %s: %w", src.Name(), err)
+	}
+	b.invalidate()
+	return nil
+}
+
+// Remove deletes a key from whichever upstream holds it. A key no upstream
+// owns — a Vault-backed identity, or one that was never here — is ErrReadOnly:
+// the client asked for something dotvault will not do, and saying so is more
+// useful than a success that removed nothing.
+func (b *Backend) Remove(key ssh.PublicKey) error {
+	srcs := b.mutatingSources()
+	if len(srcs) == 0 {
+		return ErrReadOnly
+	}
+	ctx, cancel := b.mutationContext()
+	defer cancel()
+
+	var errs []error
+	for _, src := range srcs {
+		matched, err := src.Remove(ctx, key)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+			continue
+		}
+		if matched {
+			b.invalidate()
+			return nil
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+	}
+	return ErrReadOnly
+}
+
+// RemoveAll clears every upstream agent. dotvault's own identities are
+// untouched — they are not the agent's to delete and would return from Vault
+// regardless — so this means for the shadowed agent exactly what it would have
+// meant addressed directly.
+func (b *Backend) RemoveAll() error {
+	return b.broadcast(func(ctx context.Context, src MutatingSource) error { return src.RemoveAll(ctx) }, true)
+}
+
+// Lock locks every upstream agent. dotvault's own identities are governed by
+// the Vault token rather than a passphrase, so they are unaffected.
+func (b *Backend) Lock(passphrase []byte) error {
+	// Invalidates, like the removals: a locked agent advertises nothing, so a
+	// cache held over from before would keep offering keys that can no longer
+	// sign — `ssh-add -x` followed by `ssh-add -l` must show the lock took.
+	return b.broadcast(func(ctx context.Context, src MutatingSource) error { return src.Lock(ctx, passphrase) }, true)
+}
+
+// Unlock unlocks every upstream agent.
+func (b *Backend) Unlock(passphrase []byte) error {
+	// Invalidates for the mirror-image reason to Lock: the keys are available
+	// again and the cache from the locked window says otherwise.
+	return b.broadcast(func(ctx context.Context, src MutatingSource) error { return src.Unlock(ctx, passphrase) }, true)
+}
+
+// broadcast applies an agent-wide operation to every mutating source, joining
+// the failures. Unlike Add these are not key-scoped, so every shadowed agent
+// is addressed: a client locking "the agent" means all of what it serves.
+func (b *Backend) broadcast(op func(context.Context, MutatingSource) error, invalidates bool) error {
+	srcs := b.mutatingSources()
+	if len(srcs) == 0 {
+		return ErrReadOnly
+	}
+	ctx, cancel := b.mutationContext()
+	defer cancel()
+
+	var errs []error
+	for _, src := range srcs {
+		if err := op(ctx, src); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src.Name(), err))
+		}
+	}
+	if invalidates {
+		b.invalidate()
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// Signers stays read-only regardless of the upstream. It is a client-side
+// convenience on agent.Agent with no wire representation — the agent protocol
+// has no "give me your signers" request — so there is nothing to forward and
+// nothing a remote caller can reach it through.
 func (b *Backend) Signers() ([]ssh.Signer, error) { return nil, ErrReadOnly }
 
-// Extension reports no extensions are supported.
+// Extension answers dotvault's own identity probe and nothing else.
+//
+// Extensions are deliberately not forwarded upstream. Some are connection-
+// scoped by design — OpenSSH's session-bind@openssh.com binds the *client's*
+// connection to a session, and answering it from a proxied connection to a
+// different agent would be a lie about what was bound — and a blanket forward
+// would extend dotvault's surface to whatever the upstream implements without
+// anyone having reasoned about it. Refusing is a valid, expected answer:
+// clients treat SSH_AGENT_FAILURE here as "unsupported" and move on.
+//
+// IDExtension is the exception because it is about this process rather than
+// about any agent's keys: it is how upstream discovery recognises a candidate
+// endpoint as this very daemon reached under another path, and so how the
+// delegation loop is prevented. See IDExtension.
 func (b *Backend) Extension(extensionType string, contents []byte) ([]byte, error) {
+	if extensionType == IDExtension {
+		return processAgentID, nil
+	}
 	return nil, agent.ErrExtensionUnsupported
 }

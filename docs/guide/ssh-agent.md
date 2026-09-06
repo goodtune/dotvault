@@ -4,7 +4,8 @@ dotvault can expose an SSH agent backed by your live Vault token. Because the
 daemon already holds a renewing token and reads your per-user KVv2 secrets, it
 can answer signing requests without ever writing a private key to disk.
 
-Two key sources are supported:
+Two key sources are configured under `agent.keys[]`, and a third — the **SSH
+agent relay** — is always present unless you turn it off:
 
 - **KV keys** — raw key pairs discovered under a KV path prefix (the same
   `public_key` / `private_key` schema the [SSH enrolment engine](../services/ssh.md)
@@ -12,10 +13,24 @@ Two key sources are supported:
 - **Vault-CA certificates** — short-lived certificates minted on demand by a
   Vault SSH CA secrets engine. The private key is generated in memory and never
   persisted.
+- **The SSH agent relay** (implicit, on by default) — the SSH agents you already run:
+  your own `ssh-agent`, a
+  keyring daemon, gpg-agent, a password manager's agent, the Windows OpenSSH
+  agent, Pageant) that dotvault sits in front of and proxies to. dotvault never
+  stores or reads their key material — it forwards the agent protocol — so you
+  keep using legacy on-disk keys that already live in your personal agent (the
+  static keys you've registered with GitHub, Bitbucket Server, etc.) alongside
+  dotvault's Vault-backed keys, from one socket. It **auto-detects** them and
+  is **always tried last**, after your configured key sources — you do not
+  declare it, and `agent.relay.enabled: false` is the one way to switch it off.
 
-The agent is **read-only**: like dotvault's one-way sync, it never accepts keys,
-locks, or removals from clients. `ssh-add -d`, `ssh-add -D`, and `ssh-add`
-(adding) all return an error.
+dotvault's **own** identities are read-only, mirroring its one-way sync: they
+come from Vault and are never added, removed, or locked by a client. Because
+the relay is on by default, `ssh-add`, `ssh-add -d` and `ssh-add -D` are
+[forwarded to the agent underneath](#adding-keys-through-dotvault) rather than
+refused — they do to your own agent exactly what they would have done had you
+addressed it directly. With `relay.enabled: false` there is nowhere to forward
+them, so the whole agent is read-only and all three return an error.
 
 !!! tip "Cert mode is the recommended direction"
     With Vault-CA certificates the private key never lands on disk, rotation is
@@ -31,6 +46,10 @@ Add an `agent:` section. It is disabled by default.
 ```yaml
 agent:
   enabled: true
+  relay:
+    enabled: true   # default; the only way to disable the relay
+    socket: ""      # Unix; empty = auto-detect (recommended)
+    pipe: ""        # Windows; empty = auto-detect (recommended)
   unix:
     path: ""          # default: $XDG_RUNTIME_DIR/dotvault/agent.sock
   windows:
@@ -53,7 +72,10 @@ agent:
 | `agent.unix.path`    | Unix socket path                                  | per-user runtime path       |
 | `agent.windows.pipe` | Windows pipe name                                 | `\\.\pipe\dotvault-agent`   |
 | `agent.windows.putty` | Also serve a Pageant-convention pipe (Windows)   | `true`                      |
-| `agent.keys[]`       | Ordered list of key sources (see below)           | —                           |
+| `agent.relay.enabled` | Proxy to the SSH agents you already run          | `true`                      |
+| `agent.relay.socket` | Pin the relay to one Unix socket instead of detecting | *(empty = auto-detect)* |
+| `agent.relay.pipe`   | Pin the relay to one Windows pipe instead of detecting | *(empty = auto-detect)* |
+| `agent.keys[]`       | Ordered list of Vault-backed key sources (see below) | —                        |
 
 On Windows, the entire `agent` section can be deployed via Group Policy / the
 registry under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Agent` instead of YAML
@@ -96,6 +118,245 @@ dotvault generates an in-memory key pair at startup and requests a certificate
 from Vault at signing time. Certificates are cached until shortly before expiry
 and transparently re-minted on the next request — including over a forwarded
 agent connection, so long-lived forwarded session chains keep working.
+
+### The SSH agent relay
+
+The relay puts dotvault **in front of** the SSH agents you already run and
+proxies the agent protocol to them. It is not something you configure into
+`agent.keys[]` — it is implicit, on whenever the agent is, and always tried
+**last**, after every key source you did configure.
+
+Last is deliberate: an ssh client works down the advertised list against the
+server's `MaxAuthTries` budget, so dotvault's own identities get the first
+attempts and the shadowed agents fill in behind them.
+
+On by default is also deliberate. "Point every SSH client at dotvault once and
+leave it there" only holds if the keys you already had keep working without you
+having to ask; an arrangement that silently drops half your keys unless you
+found the right config stanza is not one you can adopt wholesale. So the single
+supported way to not have it is to say so — `agent.relay.enabled: false`.
+
+This is what keeps legacy keys working: a static key registered with a service
+that can't take a short-lived cert, a key in a password manager's agent, a
+Secure Enclave key — all served from the same socket as your Vault-backed
+ones.
+
+dotvault is a pure proxy here: it never stores, reads, or persists the
+upstream's private keys, and it dials a fresh connection per request so an
+upstream agent can come and go without a dotvault restart.
+
+#### Auto-detection (the default)
+
+Leave `relay.socket`/`relay.pipe` empty — the recommended setting — and
+dotvault finds your agents itself:
+
+```yaml
+agent:
+  enabled: true
+  # relay.enabled defaults to true; nothing to write here at all
+```
+
+On every identity refresh dotvault re-scans the well-known agent locations for
+the platform and proxies to every one that is a socket owned by your own
+account. Because the scan is repeated rather than resolved once at startup, an
+agent you start, restart, or forward in mid-session is picked up on the next
+request — no config change, no daemon restart.
+
+What it looks at, in priority order:
+
+| Order | Unix                                                                  | Windows                                       |
+|-------|-----------------------------------------------------------------------|-----------------------------------------------|
+| 1     | `$SSH_AUTH_SOCK`                                                      | `$SSH_AUTH_SOCK` (Git-for-Windows / WSL set this) |
+| 2     | `$XDG_RUNTIME_DIR/ssh-agent.socket` (systemd `ssh-agent.service`)      | `\\.\pipe\openssh-ssh-agent` (OpenSSH agent service) |
+| 3     | `$XDG_RUNTIME_DIR/gcr/ssh`, `.../keyring/ssh` (GNOME keyring)          | the Pageant-convention pipe                   |
+| 4     | `$XDG_RUNTIME_DIR/gnupg/S.gpg-agent.ssh`, `~/.gnupg/S.gpg-agent.ssh`   | —                                             |
+| 5     | `~/.1password/agent.sock`; on macOS 1Password's group container and Secretive | —                                     |
+| 6     | `/tmp/ssh-*/agent.*` (a plain `ssh-agent` fork); on macOS the launchd socket and `$TMPDIR` equivalents | — |
+
+On Linux the runtime-dir entries are also looked for under `/run/user/<uid>`
+when `XDG_RUNTIME_DIR` is unset, which is the usual state for a daemon started
+outside a login session.
+
+Two things bound the scan:
+
+- **Ownership.** On **Linux and macOS** every connection to a discovered agent
+  is checked against the *peer's* uid (`SO_PEERCRED` / `LOCAL_PEERCRED`) — the
+  kernel's answer about the process on the other end, not about the path it was
+  reached through. That distinction matters because paths can be swapped: a
+  candidate under the globbed `/tmp` patterns could otherwise be pointed at
+  your real agent to pass a path check and re-pointed before the dial. Since
+  mutations are forwarded (see below), the endpoint that won that race would
+  receive the private key from your `ssh-add`. A path-level socket-and-owner
+  check still runs first as a cheap filter, and it follows symlinks — the tmux
+  `~/.ssh/ssh_auth_sock` convention and 1Password's documented symlink on macOS
+  are both symlinks, and refusing to follow them would hide the very agent you
+  most want found.
+
+    !!! warning "Only Linux and macOS have the peer check"
+        Every other platform falls back to the path-level socket-and-owner
+        check alone, which is weaker: it follows symlinks, so it establishes
+        who owns the target *now* and cannot rule out the path being re-pointed
+        before the dial. That covers Windows and also the other Unix platforms
+        dotvault can be built for (the BSDs, illumos) — supported builds are
+        Linux, macOS and Windows, but if you build elsewhere, this is what you
+        get until a `peerUID` implementation is added for it. On any
+        multi-user host in that group, the honest advice is
+        `relay.enabled: false` — pinning `relay.socket`/`relay.pipe` fixes
+        *which* endpoint is dialled
+        but verifies nothing about who answers, and on Unix it also switches
+        off the peer check auto-detection would have performed (the daemon logs
+        a WARN when you pin one, for that reason).
+
+        Windows additionally has no peer check *available* — a named pipe
+        carries no owner a caller can read without opening it and querying its
+        security descriptor — so detection there is a short fixed list. Be
+        clear about what that does and does not buy: pipes are
+        first-creator-wins, so a local user who creates
+        `\\.\pipe\openssh-ssh-agent` before the OpenSSH agent service starts
+        owns that name for the boot, and the Pageant name's per-boot hash is
+        derived with `CryptProtectMemory(CROSS_PROCESS)`, which any process on
+        the machine can reverse. This is the same trust model Windows
+        OpenSSH's own `ssh.exe` and every PuTTY client already operate under
+        when they dial those names — dotvault inherits that exposure rather
+        than widening it. The daemon logs a WARN at startup saying so, because
+        the relay is on by default and `ssh-add` through it deposits a private
+        key at whatever answers.
+
+        **Pinning `relay.pipe` is not a mitigation for this.** Naming the pipe
+        yourself decides which endpoint is dialled, never who is listening on
+        it — a squatted `\\.\pipe\openssh-ssh-agent` is reached identically
+        whether the name came from detection or from your config. On a
+        multi-user Windows host the control is `relay.enabled: false`.
+- **Never itself.** dotvault refuses to delegate to an endpoint it serves,
+  which would loop `List`/`Sign` back into the daemon forever. It checks the
+  paths *and* asks each candidate over the wire whether it is this daemon (a
+  private agent extension). The second check is the one that matters in
+  practice: once you set `SSH_AUTH_SOCK` to dotvault — the whole point — the
+  top candidate *is* dotvault, often reached by a symlink, bind mount, or
+  forwarded socket that no path comparison would catch.
+
+If several agents advertise the same key it is listed once, attributed to the
+first, so a client doesn't burn two of a server's `MaxAuthTries` attempts on
+one key. If one agent is unreachable the others still answer. If none is
+running, the source simply contributes nothing — that is not an error.
+
+The endpoints currently being shadowed are reported per source as `upstreams`
+on `GET /api/v1/status` — the machine-readable answer to "what did detection
+actually find?". The field distinguishes three cases, because "found nothing"
+and "reports no upstreams at all" are different answers: it is absent on a
+source with no upstreams to report, `[]` on a relay that found no agent to
+shadow, and a list of endpoints otherwise. Key off the field rather than the
+source's `type`, which does not imply it — a relay that failed to construct is
+reported with `type: agent` and no `upstreams`. The endpoints are not rendered
+in the web UI today; `dotvault status` lists the identities being served but
+not which agent each came from.
+
+#### Turning it off, or pinning one endpoint
+
+Turning it off leaves the agent with only what you configured, so
+`relay.enabled: false` needs at least one `agent.keys[]` entry — an agent that
+can serve nothing is refused at config load rather than started as a listener
+that only ever answers "no identities":
+
+```yaml
+agent:
+  enabled: true
+  relay:
+    enabled: false             # no relay at all
+  keys:
+    - source: kv
+      path_prefix: "ssh/"      # required: nothing else is left to serve
+```
+
+Pinning keeps the relay but stops it detecting:
+
+```yaml
+agent:
+  enabled: true
+  relay:
+    socket: /run/user/{{.uid}}/ssh-agent.socket   # Unix: pin one agent
+    pipe: \\.\pipe\openssh-ssh-agent               # Windows: pin one agent
+```
+
+| Field                | Platform | Description                              | Default                 |
+|----------------------|----------|------------------------------------------|-------------------------|
+| `agent.relay.enabled` | all     | Proxy to the agents you already run      | `true`                  |
+| `agent.relay.socket` | Unix     | Pin the relay to this socket             | *(empty = auto-detect)* |
+| `agent.relay.pipe`   | Windows  | Pin the relay to this named pipe         | *(empty = auto-detect)* |
+
+Naming an endpoint **disables** detection for that platform and pins the relay
+to exactly that one. It is the escape hatch for an agent at a path detection
+doesn't know — it is **not** a security control, and it is not the answer on a
+multi-user host (see the warning above): it decides which endpoint is dialled,
+not who answers, and on Unix it gives up the peer-ownership check detection
+performs. The daemon logs a WARN when you pin one.
+
+Like `windows.putty`, all three are inert rather than rejected when
+`agent.enabled` is false, so you can stage a config before switching the agent
+on.
+
+Only the field matching the running platform is consulted, so a single config
+can carry both for a mixed fleet. Both accept `{{.username}}` and `{{.uid}}`
+template variables, so a fleet-wide config can resolve to each user's own
+agent (e.g. `relay.socket: "/run/user/{{.uid}}/ssh-agent.socket"`).
+`{{.username}}` is the bare OS account name; `{{.uid}}` is the numeric UID on
+Unix (and the user's SID on Windows, where it is rarely useful in a pipe
+name). A mis-typed variable (e.g. `{{.user}}`) is rejected when the source is
+constructed, not silently left in the path. A leading `~` in a socket path is
+expanded to your home directory.
+
+An endpoint that can't be resolved — a bad template, or a path equal to
+dotvault's own socket — becomes an error reported in status; the other sources
+keep working.
+
+#### Adding keys through dotvault
+
+Because dotvault sits in front of your agent rather than beside it, the
+mutating agent operations are **forwarded upstream** instead of refused:
+
+```sh
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/dotvault/agent.sock"
+ssh-add ~/.ssh/id_ed25519    # lands in your own agent, via dotvault
+ssh-add -l                   # lists it alongside dotvault's Vault-backed keys
+ssh-add -d ~/.ssh/id_ed25519 # removes it from your agent
+ssh-add -D                   # clears your agent (not dotvault's Vault keys)
+ssh-add -x / -X              # locks / unlocks your agent
+```
+
+dotvault stores nothing on this path either: the key goes straight out over the
+upstream connection and no copy is retained. Details worth knowing:
+
+- **`ssh-add` targets one agent, not all of them.** The key goes to the
+  most-preferred endpoint — `$SSH_AUTH_SOCK` when it names a real upstream,
+  otherwise the first discovered. Copying a private key into every agent on the
+  machine is not what you asked for and not something you could easily undo.
+- **`-D`, `-x`, `-X` are agent-wide** and do address every shadowed agent, which
+  is what a client locking "the agent" means.
+- **dotvault's own identities are untouched.** They come from Vault and would
+  return regardless, so `ssh-add -d` against a Vault-backed key is refused
+  rather than silently doing nothing.
+- **With `relay.enabled: false` the whole agent is read-only:** there is
+  nowhere to forward a mutation to, so `ssh-add`, `ssh-add -d`, `-D`, `-x` and
+  `-X` all return an error. That is the only configuration in which they do.
+- **No Vault token is needed.** These operations touch no Vault-backed source,
+  so `ssh-add` works against a daemon that hasn't authenticated yet. The same
+  is true of listing and signing *upstream* keys: a daemon that cannot reach
+  Vault still serves the agents it shadows, so an outage doesn't take your
+  legacy keys down with the Vault-backed ones.
+- **Check where `$SSH_AUTH_SOCK` points before adding a key.** `ssh-add`
+  targets the most-preferred endpoint, which is `$SSH_AUTH_SOCK` when it names
+  a real upstream — and on a host you reached with `ssh -A`, that is the
+  *forwarded* agent on your workstation, so the key would leave this machine.
+  `dotvault status` and the `upstreams` field show what is being shadowed.
+- **`ssh-add -x` sends the passphrase to every shadowed agent.** Locking is
+  agent-wide by definition, so with several agents detected the one passphrase
+  reaches all of them.
+
+Agent *extensions* are deliberately not proxied. Some are connection-scoped by
+design — OpenSSH's `session-bind@openssh.com` binds the client's own
+connection — and answering one from a proxied connection to a different agent
+would be a lie about what was bound. Clients treat the refusal as "unsupported"
+and carry on.
 
 ## Pointing clients at the agent
 

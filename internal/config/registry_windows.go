@@ -303,6 +303,11 @@ type registryLayer struct {
 	AgentWindowsPipe  string
 	AgentWindowsPutty *uint32
 
+	// Agent\Relay (the relay block's own subkey, mirroring the YAML nesting).
+	AgentRelayEnabled *uint32
+	AgentRelaySocket  string
+	AgentRelayPipe    string
+
 	// API (local API socket).
 	APIEnabled  *uint32
 	APIUnixPath string
@@ -337,9 +342,20 @@ type registryLayer struct {
 // Returns the layer, whether the key exists, and any unexpected error.
 // A missing key (ErrNotExist) is not an error — it means no policy is set.
 func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
+	return readRegistryLayerAt(root, registryPolicyPath)
+}
+
+// readRegistryLayerAt is readRegistryLayer with the policy base path supplied
+// rather than hardcoded. The seam exists so tests can point the whole loader
+// at a scratch key instead of the machine's real policy path — without it the
+// only reachable surface is applyRegistryLayer, which takes an already-built
+// layer and so cannot catch the failure that matters most here: a subkey path
+// or value name that does not match what the emitter writes. That is precisely
+// how a bulk rename goes wrong, and it is invisible to a Linux-only CI.
+func readRegistryLayerAt(root registry.Key, policyPath string) (registryLayer, bool, error) {
 	var layer registryLayer
 
-	key, err := registry.OpenKey(root, registryPolicyPath, registry.READ)
+	key, err := registry.OpenKey(root, policyPath, registry.READ)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotExist) {
 			return layer, false, nil
@@ -352,7 +368,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	layer.BypassSystemConfig = readRegDWORD(key, "BypassSystemConfig")
 
 	// Read Vault subkey.
-	vk, err := registry.OpenKey(root, registryPolicyPath+`\Vault`, registry.READ)
+	vk, err := registry.OpenKey(root, policyPath+`\Vault`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Vault policy key: %w", err)
 	}
@@ -375,7 +391,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read Vault\MTLS subkey (cert auth) and its nested BYO subkey.
-	mk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS`, registry.READ)
+	mk, err := registry.OpenKey(root, policyPath+`\Vault\MTLS`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Vault\\MTLS policy key: %w", err)
 	}
@@ -396,7 +412,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.MTLSSealToPCRs = readRegDWORD(mk, "SealToPCRs")
 		layer.MTLSRevokeSuperseded = readRegDWORD(mk, "RevokeSuperseded")
 	}
-	bk, err := registry.OpenKey(root, registryPolicyPath+`\Vault\MTLS\BYO`, registry.READ)
+	bk, err := registry.OpenKey(root, policyPath+`\Vault\MTLS\BYO`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Vault\\MTLS\\BYO policy key: %w", err)
 	}
@@ -407,7 +423,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read Sync subkey.
-	sk, err := registry.OpenKey(root, registryPolicyPath+`\Sync`, registry.READ)
+	sk, err := registry.OpenKey(root, policyPath+`\Sync`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Sync policy key: %w", err)
 	}
@@ -417,7 +433,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read Web subkey.
-	wk, err := registry.OpenKey(root, registryPolicyPath+`\Web`, registry.READ)
+	wk, err := registry.OpenKey(root, policyPath+`\Web`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Web policy key: %w", err)
 	}
@@ -435,7 +451,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	// false, Init would short-circuit to an inactive Provider, and the WARN
 	// record from LogRegistryConfigManaged would vanish into the no-op
 	// global logger — silently dropping the registry-config notification.
-	obk, err := registry.OpenKey(root, registryPolicyPath+`\Observability`, registry.READ)
+	obk, err := registry.OpenKey(root, policyPath+`\Observability`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Observability policy key: %w", err)
 	}
@@ -449,15 +465,15 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Per-signal observability overrides.
-	if layer.ObsMetrics, err = readRegistrySignal(root, registryPolicyPath, "Metrics"); err != nil {
+	if layer.ObsMetrics, err = readRegistrySignal(root, policyPath, "Metrics"); err != nil {
 		return layer, false, err
 	}
-	if layer.ObsLogs, err = readRegistrySignal(root, registryPolicyPath, "Logs"); err != nil {
+	if layer.ObsLogs, err = readRegistrySignal(root, policyPath, "Logs"); err != nil {
 		return layer, false, err
 	}
 
 	// Read Agent subkey (scalar transport settings only).
-	ak, err := registry.OpenKey(root, registryPolicyPath+`\Agent`, registry.READ)
+	ak, err := registry.OpenKey(root, policyPath+`\Agent`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open Agent policy key: %w", err)
 	}
@@ -467,10 +483,44 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.AgentUnixPath, _ = readRegString(ak, "UnixPath")
 		layer.AgentWindowsPipe, _ = readRegString(ak, "WindowsPipe")
 		layer.AgentWindowsPutty = readRegDWORD(ak, "WindowsPutty")
+		// The relay's settings moved into the Agent\Relay subkey below. A
+		// policy still carrying the old flat spelling would otherwise be
+		// read as "the relay is unmentioned", i.e. ON — an administrator who
+		// wrote Relay=0 to turn it off would silently get it anyway. That
+		// direction of failure is unacceptable for an off-switch, so a
+		// leftover value is named and refused rather than ignored. Only the
+		// switch is worth this: a stale RelaySocket/RelayPipe would drop a
+		// pin back to auto-detection, which is a change of endpoint, not a
+		// loss of a control.
+		if legacy, err := readRegDWORDStrict(ak, "Relay"); err != nil || legacy != nil {
+			return layer, false, fmt.Errorf("agent policy: the Relay value under the Agent key was replaced by the Agent\\Relay subkey; move it to Agent\\Relay\\Enabled (leaving it here would read as the relay being unmentioned, which means on)")
+		}
+	}
+
+	// Read Agent\Relay subkey. Its own key rather than three Relay* values on
+	// Agent, so the registry surface has the same shape as the YAML block and
+	// an administrator writing policy is not translating between two layouts.
+	relayk, err := registry.OpenKey(root, policyPath+`\Agent\Relay`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Agent\\Relay policy key: %w", err)
+	}
+	if err == nil {
+		defer relayk.Close()
+		// Strict, unlike the WindowsPutty tri-state: this is an off-switch,
+		// and readRegDWORD reports a wrong-typed value as absent, which for
+		// this field means "on". An administrator who wrote REG_SZ "0" would
+		// get the relay they were trying to turn off, silently. Fail the load
+		// and name the value instead — the same reasoning TargetDeleteNulls
+		// already applies.
+		if layer.AgentRelayEnabled, err = readRegDWORDStrict(relayk, "Enabled"); err != nil {
+			return layer, false, fmt.Errorf("agent relay policy: %w", err)
+		}
+		layer.AgentRelaySocket, _ = readRegString(relayk, "Socket")
+		layer.AgentRelayPipe, _ = readRegString(relayk, "Pipe")
 	}
 
 	// Read API subkey (local API socket).
-	apik, err := registry.OpenKey(root, registryPolicyPath+`\API`, registry.READ)
+	apik, err := registry.OpenKey(root, policyPath+`\API`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open API policy key: %w", err)
 	}
@@ -481,7 +531,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read FUSE subkey (the filesystem view).
-	fusek, err := registry.OpenKey(root, registryPolicyPath+`\FUSE`, registry.READ)
+	fusek, err := registry.OpenKey(root, policyPath+`\FUSE`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open FUSE policy key: %w", err)
 	}
@@ -494,7 +544,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 	}
 
 	// Read SSH subkey (host-CA trust material).
-	sshk, err := registry.OpenKey(root, registryPolicyPath+`\SSH`, registry.READ)
+	sshk, err := registry.OpenKey(root, policyPath+`\SSH`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open SSH policy key: %w", err)
 	}
@@ -506,7 +556,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 
 	// Read RemoteConfig subkey (scalar fields only; Headers is a nested
 	// key/value map read separately by readRegistryRemoteConfigHeaders).
-	rk, err := registry.OpenKey(root, registryPolicyPath+`\RemoteConfig`, registry.READ)
+	rk, err := registry.OpenKey(root, policyPath+`\RemoteConfig`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return layer, false, fmt.Errorf("open RemoteConfig policy key: %w", err)
 	}
@@ -670,6 +720,19 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.AgentWindowsPutty != nil {
 		b := *layer.AgentWindowsPutty != 0
 		cfg.Agent.Windows.Putty = &b
+	}
+	// Tri-state, like Agent\WindowsPutty: an absent value leaves the *bool nil
+	// so RelayEnabled's default-true applies, rather than a missing policy
+	// value reading as an explicit "off".
+	if layer.AgentRelayEnabled != nil {
+		b := *layer.AgentRelayEnabled != 0
+		cfg.Agent.Relay.Enabled = &b
+	}
+	if layer.AgentRelaySocket != "" {
+		cfg.Agent.Relay.Socket = layer.AgentRelaySocket
+	}
+	if layer.AgentRelayPipe != "" {
+		cfg.Agent.Relay.Pipe = layer.AgentRelayPipe
 	}
 	if layer.APIEnabled != nil {
 		cfg.API.Enabled = *layer.APIEnabled != 0

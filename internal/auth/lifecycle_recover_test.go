@@ -50,6 +50,15 @@ func newRecoveryVaultServer(t *testing.T, valid *atomic.Value) *httptest.Server 
 // held. Polling (rather than sleeping a fixed amount) keeps the timer-driven
 // lifecycle tests fast in the common case and tolerant of scheduler lag under
 // -race.
+//
+// A caller waiting on a LifecycleManager owes d a context that outlives it. The
+// manager goroutine returns when its Start context is done, so a budget shorter
+// than the wait it feeds takes the very thing being waited for down mid-wait,
+// and the test then fails on whatever assertion follows — a stale token, a
+// re-auth flag still set — with no hint that the manager simply stopped. Give
+// the context comfortable headroom rather than a matched value: a test returns
+// as soon as cond holds, so the ceiling costs nothing on the passing path and
+// only bounds a run that was going to fail anyway.
 func waitFor(cond func() bool, d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {

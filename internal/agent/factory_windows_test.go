@@ -20,15 +20,39 @@ func testVaultClientWin(t *testing.T) *vault.Client {
 	return vc
 }
 
-// TestResolveUpstreamEndpointWindowsDefault confirms an unset pipe falls back
-// to the built-in OpenSSH agent pipe.
-func TestResolveUpstreamEndpointWindowsDefault(t *testing.T) {
-	got, err := resolveUpstreamEndpoint(config.AgentKeySource{Source: "agent"}, "alice", "S-1-5-21-1")
-	if err != nil {
-		t.Fatalf("resolveUpstreamEndpoint: %v", err)
+// TestResolveUpstreamEndpointWindowsEmptyRejected pins the resolver's contract
+// after auto-detection took over the empty case: this function is only ever
+// reached for an endpoint the operator named explicitly, so an empty pipe is a
+// caller bug and is rejected rather than quietly resolving to a default.
+//
+// The built-in OpenSSH pipe is still the first thing tried when no pipe is
+// configured — it is simply candidateEndpoints' job now, not this resolver's
+// (see TestWindowsCandidatesIncludeOpenSSHPipe).
+func TestResolveUpstreamEndpointWindowsEmptyRejected(t *testing.T) {
+	if _, err := resolveUpstreamEndpoint(config.AgentKeySource{Source: "agent"}, "alice", "S-1-5-21-1"); err == nil {
+		t.Fatal("an empty pipe should be rejected by the explicit-endpoint resolver, got nil")
 	}
-	if got != defaultWindowsUpstreamPipe {
-		t.Errorf("endpoint = %q, want %q", got, defaultWindowsUpstreamPipe)
+}
+
+// TestWindowsCandidatesIncludeOpenSSHPipe confirms the default that moved: the
+// built-in OpenSSH agent pipe is offered by auto-detection. The pipe only
+// appears when it actually exists, so this asserts the candidate list is
+// *derived from* that name rather than asserting the name is always present.
+func TestWindowsCandidatesIncludeOpenSSHPipe(t *testing.T) {
+	names, ok := existingPipes()
+	if !ok {
+		t.Skip("pipe namespace not enumerable in this environment")
+	}
+	want := names[pipeLeafName(defaultWindowsUpstreamPipe)]
+	got := false
+	for _, ep := range candidateEndpoints() {
+		if strings.EqualFold(ep, defaultWindowsUpstreamPipe) {
+			got = true
+			break
+		}
+	}
+	if got != want {
+		t.Errorf("openssh pipe in candidates = %v, want %v (present in namespace = %v)", got, want, want)
 	}
 }
 

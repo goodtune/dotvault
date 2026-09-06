@@ -154,8 +154,8 @@ outside a login session.
 
 Two things bound the scan:
 
-- **Ownership.** On Linux and macOS every connection to a discovered agent is
-  checked against the *peer's* uid (`SO_PEERCRED` / `LOCAL_PEERCRED`) — the
+- **Ownership.** On **Linux and macOS** every connection to a discovered agent
+  is checked against the *peer's* uid (`SO_PEERCRED` / `LOCAL_PEERCRED`) — the
   kernel's answer about the process on the other end, not about the path it was
   reached through. That distinction matters because paths can be swapped: a
   candidate under the globbed `/tmp` patterns could otherwise be pointed at
@@ -167,19 +167,29 @@ Two things bound the scan:
   are both symlinks, and refusing to follow them would hide the very agent you
   most want found.
 
-    !!! warning "Windows has no equivalent check"
-        A named pipe carries no owner a caller can read without opening it and
-        querying its security descriptor, so there is no peer check on Windows.
-        Detection there is a short fixed list, but be clear about what that
-        does and does not buy: pipes are first-creator-wins, so a local user
-        who creates `\\.\pipe\openssh-ssh-agent` before the OpenSSH agent
-        service starts owns that name for the boot, and the Pageant name's
-        per-boot hash is derived with `CryptProtectMemory(CROSS_PROCESS)`,
-        which any process on the machine can reverse. This is the same trust
-        model Windows OpenSSH's own `ssh.exe` and every PuTTY client already
-        operate under when they dial those names — dotvault inherits that
-        exposure rather than widening it — but on a multi-user Windows host,
-        set `pipe` explicitly rather than relying on detection.
+    !!! warning "Only Linux and macOS have the peer check"
+        Every other platform falls back to the path-level socket-and-owner
+        check alone, which is weaker: it follows symlinks, so it establishes
+        who owns the target *now* and cannot rule out the path being re-pointed
+        before the dial. That covers Windows and also the other Unix platforms
+        dotvault can be built for (the BSDs, illumos) — supported builds are
+        Linux, macOS and Windows, but if you build elsewhere, this is what you
+        get until a `peerUID` implementation is added for it. On any
+        multi-user host in that group, set `socket`/`pipe` explicitly rather
+        than relying on detection.
+
+        Windows additionally has no peer check *available* — a named pipe
+        carries no owner a caller can read without opening it and querying its
+        security descriptor — so detection there is a short fixed list. Be
+        clear about what that does and does not buy: pipes are
+        first-creator-wins, so a local user who creates
+        `\\.\pipe\openssh-ssh-agent` before the OpenSSH agent service starts
+        owns that name for the boot, and the Pageant name's per-boot hash is
+        derived with `CryptProtectMemory(CROSS_PROCESS)`, which any process on
+        the machine can reverse. This is the same trust model Windows
+        OpenSSH's own `ssh.exe` and every PuTTY client already operate under
+        when they dial those names — dotvault inherits that exposure rather
+        than widening it.
 - **Never itself.** dotvault refuses to delegate to an endpoint it serves,
   which would loop `List`/`Sign` back into the daemon forever. It checks the
   paths *and* asks each candidate over the wire whether it is this daemon (a

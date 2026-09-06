@@ -71,7 +71,7 @@ func waitForMoreInput(fd uintptr, timeout time.Duration) bool {
 // Flooring is right everywhere above a millisecond, because a truncated wait
 // still blocks and the loop simply comes round again; only zero is hazardous.
 //
-// Both call sites reject a non-positive budget before calling, so the clamp is
+// Its one call site rejects a non-positive budget first, so the clamp is
 // unreachable today. It is written as < 1 rather than == 0 anyway, because a
 // negative timeout tells poll to block forever: if a future caller ever let
 // one through, == 0 would trade a wait that ends too early for one that never

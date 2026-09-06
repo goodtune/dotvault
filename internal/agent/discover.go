@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
 	"time"
 
 	"golang.org/x/crypto/ssh/agent"
@@ -60,11 +61,15 @@ func discoverUpstreamEndpoints(ctx context.Context, exclude []string, dial dialF
 			continue
 		}
 		seen[key] = true
-		if isSelfAgent(ctx, cand, dial) {
+		switch probeCandidate(ctx, cand, dial) {
+		case candidateSelf:
 			slog.Debug("ssh agent: skipping discovered endpoint served by this daemon", "endpoint", cand)
 			// Remember it as ours so a second path to the same daemon is
 			// dropped without another probe.
 			excluded[key] = true
+			continue
+		case candidateForeign:
+			slog.Debug("ssh agent: skipping discovered endpoint owned by another user", "endpoint", cand)
 			continue
 		}
 		out = append(out, cand)
@@ -72,23 +77,36 @@ func discoverUpstreamEndpoints(ctx context.Context, exclude []string, dial dialF
 	return out
 }
 
-// isSelfAgent reports whether endpoint is served by this dotvault process,
-// asked over the wire rather than inferred from the path. A non-dotvault agent
-// answers SSH_AGENT_FAILURE (agent.ErrExtensionUnsupported) and a dead one
-// fails to dial; either way the answer is "not us" and the endpoint stays in
-// the candidate list, where the ordinary per-request error handling deals with
-// it. Only a reply that matches this process's ID excludes an endpoint, so a
-// probe that cannot run never silently blanks discovery.
-func isSelfAgent(ctx context.Context, endpoint string, dial dialFunc) bool {
-	if len(processAgentID) == 0 {
-		return false
-	}
+// candidateVerdict is what a single discovery probe concluded about an
+// endpoint.
+type candidateVerdict int
+
+const (
+	// candidateUsable: not this daemon, and not owned by another user as far
+	// as this platform can tell. Note "as far as it can tell" is the honest
+	// reading — a probe that could not run at all lands here too, which is the
+	// deliberate fail-open documented on peerUID.
+	candidateUsable candidateVerdict = iota
+	// candidateSelf: this very daemon, reached under another name.
+	candidateSelf
+	// candidateForeign: served by a different uid.
+	candidateForeign
+)
+
+// probeCandidate dials an endpoint once and answers both questions the dial
+// can settle: is this us, and is it ours. One connection serves both because
+// the answers come from the same place — the peer we are already attached to.
+//
+// A dead endpoint (dial fails) is reported usable rather than dropped: it may
+// simply be starting, and the ordinary per-request error handling deals with
+// it far better than removing it from the candidate list would.
+func probeCandidate(ctx context.Context, endpoint string, dial dialFunc) candidateVerdict {
 	ctx, cancel := context.WithTimeout(ctx, discoveryProbeTimeout)
 	defer cancel()
 
 	conn, err := dial(ctx, endpoint)
 	if err != nil {
-		return false
+		return candidateUsable
 	}
 	defer conn.Close()
 	// The probe must not outlive its context even if the peer never replies.
@@ -96,12 +114,31 @@ func isSelfAgent(ctx context.Context, endpoint string, dial dialFunc) bool {
 		_ = conn.SetDeadline(dl)
 	}
 
-	reply, err := agent.NewClient(conn).Extension(IDExtension, nil)
-	if err != nil {
-		return false
+	// Ownership first: it is a local syscall with no round trip, and an
+	// endpoint that is not ours should not be sent even an identity probe.
+	if uid, ok := peerUID(conn); ok && uid != selfUID() {
+		return candidateForeign
 	}
-	return string(reply) == string(processAgentID)
+
+	// Then identity. A non-dotvault agent answers SSH_AGENT_FAILURE
+	// (agent.ErrExtensionUnsupported), which is the "not us" answer; only a
+	// reply matching this process's ID excludes an endpoint, so a probe that
+	// cannot run never silently blanks discovery.
+	if len(processAgentID) == 0 {
+		return candidateUsable
+	}
+	reply, err := agent.NewClient(conn).Extension(IDExtension, nil)
+	if err == nil && string(reply) == string(processAgentID) {
+		return candidateSelf
+	}
+	return candidateUsable
 }
+
+// selfUID is the uid peer credentials are compared against. On Windows
+// os.Getuid returns -1, which no peerUID implementation there can match — but
+// peerUID also always reports "unknown" on that platform, so the comparison is
+// never reached.
+func selfUID() uint32 { return uint32(os.Getuid()) }
 
 // dialFunc opens a connection to an agent endpoint. Injected so tests can
 // drive discovery without real sockets; production wires it to dialEndpoint.

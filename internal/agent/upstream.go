@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -48,6 +49,15 @@ type upstreamSource struct {
 	// wires it to the platform dialEndpoint.
 	dial dialFunc
 
+	// verifyPeer requires every connection to be answered by a process running
+	// as this same user, checked with peerUID on the connection itself. It is
+	// set for auto-detected endpoints — dotvault chose those from a shared
+	// namespace, so it owes the check — and deliberately NOT for an explicitly
+	// configured one, where the operator named the endpoint and may well have
+	// meant a system agent running as another account. Where peerUID cannot
+	// answer (no platform support) the check passes; see peerUID.
+	verifyPeer bool
+
 	mu sync.Mutex
 	// owner maps a Marshal()'d public-key blob to the endpoint that last
 	// advertised it, so Sign and Remove route straight to the agent that holds
@@ -70,10 +80,42 @@ func newUpstreamSource(name, endpoint string) *upstreamSource {
 // every listing, excluding the endpoints this daemon serves itself.
 func newAutoUpstreamSource(name string, self []string) *upstreamSource {
 	s := newUpstreamSourceFunc(name, nil)
-	s.resolve = func(ctx context.Context) []string {
+	s.verifyPeer = true
+	scan := func(ctx context.Context) []string {
 		return discoverUpstreamEndpoints(ctx, self, s.dial)
 	}
+	s.resolve = memoiseScan(scan, discoveryMemoTTL)
 	return s
+}
+
+// discoveryMemoTTL collapses the repeated scans a single logical operation
+// triggers. A scan dials every candidate, so it is the expensive part of the
+// source, and several call sites resolve endpoints independently: an identity
+// refresh, a Sign whose owner is unknown, an Add, a broadcast, and every
+// /api/v1/status poll (Status calls Identities directly, bypassing the
+// backend's own List cache). The window is deliberately shorter than that
+// cache so "re-scan on every refresh" stays true at the cadence that matters —
+// it suppresses duplicate scans within one burst, not between refreshes.
+const discoveryMemoTTL = 3 * time.Second
+
+// memoiseScan wraps an endpoint scan in a short single-flight TTL cache.
+// Concurrent callers share one scan rather than each dialling every candidate.
+func memoiseScan(scan func(context.Context) []string, ttl time.Duration) func(context.Context) []string {
+	var (
+		mu   sync.Mutex
+		at   time.Time
+		last []string
+	)
+	return func(ctx context.Context) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		if !at.IsZero() && time.Since(at) < ttl {
+			return last
+		}
+		last = scan(ctx)
+		at = time.Now()
+		return last
+	}
 }
 
 func newUpstreamSourceFunc(name string, resolve func(ctx context.Context) []string) *upstreamSource {
@@ -86,6 +128,11 @@ func newUpstreamSourceFunc(name string, resolve func(ctx context.Context) []stri
 
 func (s *upstreamSource) Name() string { return s.name }
 func (s *upstreamSource) Type() string { return "agent" }
+
+// NeedsVaultToken is false: this source proxies to agents that hold their own
+// keys, so it works on a daemon that has never authenticated. See
+// VaultIndependent.
+func (s *upstreamSource) NeedsVaultToken() bool { return false }
 
 // Endpoints reports the upstream endpoints from the most recent resolve, for
 // status output. It does not itself trigger a scan: Status calls Identities
@@ -122,6 +169,12 @@ func (s *upstreamSource) connect(ctx context.Context, endpoint string) (agent.Ex
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
+	if s.verifyPeer {
+		if uid, known := peerUID(conn); known && uid != selfUID() {
+			conn.Close()
+			return nil, nil, fmt.Errorf("upstream agent %s is served by uid %d, not this user", endpoint, uid)
+		}
+	}
 	return agent.NewClient(conn), conn, nil
 }
 
@@ -133,9 +186,12 @@ func (s *upstreamSource) connect(ctx context.Context, endpoint string) (agent.Ex
 func (s *upstreamSource) remember(owner map[string]string, complete bool) {
 	s.mu.Lock()
 	s.owner = owner
-	if complete {
-		s.listed = true
-	}
+	// Assigned, never latched. owner is replaced wholesale, so a later scan in
+	// which an endpoint was down installs a map missing that endpoint's keys —
+	// and leaving listed true from an earlier complete scan would then let
+	// mightOwn answer a confident "not ours" for a key the source really does
+	// own, refusing to sign it. listed must describe the map it sits beside.
+	s.listed = complete
 	s.mu.Unlock()
 }
 
@@ -333,6 +389,10 @@ func (s *upstreamSource) Add(ctx context.Context, key agent.AddedKey) error {
 	if len(eps) == 0 {
 		return fmt.Errorf("no upstream SSH agent available to add the key to")
 	}
+	// Deliberately no fallthrough to eps[1:] on failure: retrying elsewhere
+	// would put the private key in an agent the user did not name, which is
+	// precisely what targeting one endpoint exists to prevent. A failed add is
+	// reported, not rerouted.
 	client, conn, err := s.connect(ctx, eps[0])
 	if err != nil {
 		return err
@@ -429,15 +489,22 @@ func (s *upstreamSource) broadcast(ctx context.Context, what string, op func(age
 	}
 	var errs []error
 	for _, ep := range eps {
-		client, conn, err := s.connect(ctx, ep)
+		// The closure is what makes the close deferred per iteration rather
+		// than per function, so a panicking op cannot leak the connection.
+		err := func() error {
+			client, conn, err := s.connect(ctx, ep)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			if err := op(client); err != nil {
+				return fmt.Errorf("upstream agent %s %s: %w", ep, what, err)
+			}
+			return nil
+		}()
 		if err != nil {
 			errs = append(errs, err)
-			continue
 		}
-		if err := op(client); err != nil {
-			errs = append(errs, fmt.Errorf("upstream agent %s %s: %w", ep, what, err))
-		}
-		conn.Close()
 	}
 	return errors.Join(errs...)
 }

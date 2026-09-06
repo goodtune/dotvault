@@ -137,6 +137,34 @@ type MutatingSource interface {
 	Unlock(ctx context.Context, passphrase []byte) error
 }
 
+// VaultIndependent is the optional capability a Source declares when it needs
+// no Vault token to do its work — today only the upstream-agent proxy, whose
+// keys live in someone else's agent entirely.
+//
+// It exists because the daemon's token probe is a blunt instrument: it exists
+// so a pre-auth agent answers instantly instead of making Vault calls that
+// cannot succeed, and applying it to every source made an unauthenticated
+// daemon serve nothing at all. That is wrong for a proxy — and it defeats the
+// point of putting dotvault permanently in front of a user's agents, since a
+// host that cannot reach Vault would lose the legacy keys too, not just the
+// Vault-backed ones.
+//
+// A source that does not implement this is assumed to need a token, which is
+// the safe default and leaves kv/vault-ca behaviour untouched.
+type VaultIndependent interface {
+	// NeedsVaultToken reports whether this source requires the daemon to hold
+	// a Vault token before it can list or sign.
+	NeedsVaultToken() bool
+}
+
+// sourceNeedsToken reports whether src must wait for a Vault token.
+func sourceNeedsToken(src Source) bool {
+	if v, ok := src.(VaultIndependent); ok {
+		return v.NeedsVaultToken()
+	}
+	return true
+}
+
 // signData signs data, honouring the rsa-sha2-256 / rsa-sha2-512 flags modern
 // servers require so SHA-1 signatures are not produced for RSA keys. Non-RSA
 // signers (Ed25519) ignore the flags and sign normally.

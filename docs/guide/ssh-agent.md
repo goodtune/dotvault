@@ -154,13 +154,32 @@ outside a login session.
 
 Two things bound the scan:
 
-- **Ownership.** A Unix candidate must be a socket owned by your uid — checked
-  with `lstat`, so a symlink to another user's socket doesn't pass. That is
-  what makes globbing a shared `/tmp` safe, and it matters more than it would
-  for a read-only proxy because mutations are forwarded too (see below): a
-  foreign endpoint that slipped into the fan-out would receive the private key
-  from your `ssh-add`. Windows enumerates a short fixed list for the same
-  reason — a pipe's owner isn't readable without opening it.
+- **Ownership.** On Linux and macOS every connection to a discovered agent is
+  checked against the *peer's* uid (`SO_PEERCRED` / `LOCAL_PEERCRED`) — the
+  kernel's answer about the process on the other end, not about the path it was
+  reached through. That distinction matters because paths can be swapped: a
+  candidate under the globbed `/tmp` patterns could otherwise be pointed at
+  your real agent to pass a path check and re-pointed before the dial. Since
+  mutations are forwarded (see below), the endpoint that won that race would
+  receive the private key from your `ssh-add`. A path-level socket-and-owner
+  check still runs first as a cheap filter, and it follows symlinks — the tmux
+  `~/.ssh/ssh_auth_sock` convention and 1Password's documented symlink on macOS
+  are both symlinks, and refusing to follow them would hide the very agent you
+  most want found.
+
+    !!! warning "Windows has no equivalent check"
+        A named pipe carries no owner a caller can read without opening it and
+        querying its security descriptor, so there is no peer check on Windows.
+        Detection there is a short fixed list, but be clear about what that
+        does and does not buy: pipes are first-creator-wins, so a local user
+        who creates `\\.\pipe\openssh-ssh-agent` before the OpenSSH agent
+        service starts owns that name for the boot, and the Pageant name's
+        per-boot hash is derived with `CryptProtectMemory(CROSS_PROCESS)`,
+        which any process on the machine can reverse. This is the same trust
+        model Windows OpenSSH's own `ssh.exe` and every PuTTY client already
+        operate under when they dial those names — dotvault inherits that
+        exposure rather than widening it — but on a multi-user Windows host,
+        set `pipe` explicitly rather than relying on detection.
 - **Never itself.** dotvault refuses to delegate to an endpoint it serves,
   which would loop `List`/`Sign` back into the daemon forever. It checks the
   paths *and* asks each candidate over the wire whether it is this daemon (a
@@ -174,8 +193,10 @@ first, so a client doesn't burn two of a server's `MaxAuthTries` attempts on
 one key. If one agent is unreachable the others still answer. If none is
 running, the source simply contributes nothing — that is not an error.
 
-The endpoints currently being shadowed are reported per source in the web
-dashboard's agent status (`upstreams` on `GET /api/v1/status`).
+The endpoints currently being shadowed are reported per source as `upstreams`
+on `GET /api/v1/status` — the machine-readable answer to "what did detection
+actually find?". They are not rendered in the web UI today; `dotvault status`
+lists the identities being served but not which agent each came from.
 
 #### Naming an endpoint explicitly
 
@@ -241,7 +262,18 @@ upstream connection and no copy is retained. Details worth knowing:
 - **With no upstream source configured, nothing changes:** every mutating
   operation returns the same read-only error it always did.
 - **No Vault token is needed.** These operations touch no Vault-backed source,
-  so `ssh-add` works against a daemon that hasn't authenticated yet.
+  so `ssh-add` works against a daemon that hasn't authenticated yet. The same
+  is true of listing and signing *upstream* keys: a daemon that cannot reach
+  Vault still serves the agents it shadows, so an outage doesn't take your
+  legacy keys down with the Vault-backed ones.
+- **Check where `$SSH_AUTH_SOCK` points before adding a key.** `ssh-add`
+  targets the most-preferred endpoint, which is `$SSH_AUTH_SOCK` when it names
+  a real upstream — and on a host you reached with `ssh -A`, that is the
+  *forwarded* agent on your workstation, so the key would leave this machine.
+  `dotvault status` and the `upstreams` field show what is being shadowed.
+- **`ssh-add -x` sends the passphrase to every shadowed agent.** Locking is
+  agent-wide by definition, so with several agents detected the one passphrase
+  reaches all of them.
 
 Agent *extensions* are deliberately not proxied. Some are connection-scoped by
 design — OpenSSH's `session-bind@openssh.com` binds the client's own

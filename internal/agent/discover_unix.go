@@ -81,12 +81,16 @@ func candidateEndpoints() []string {
 }
 
 // runtimeDirs returns the per-user runtime directories to look under:
-// $XDG_RUNTIME_DIR when set, and /run/user/<uid> when it is not. The explicit
-// fallback matters because the daemon may run without the environment a login
-// session would have supplied (a systemd system unit, a cron job, an SSH
-// command invocation) while /run/user/<uid> is mounted and populated all the
-// same — which is exactly the case where auto-detection earns its keep over a
-// configured path.
+// $XDG_RUNTIME_DIR when set, plus /run/user/<uid> on Linux (deduplicated, so
+// the usual case where they are the same yields one entry).
+//
+// /run/user/<uid> is added whether or not XDG_RUNTIME_DIR is set, not merely
+// as a fallback for when it is missing: a daemon started outside a login
+// session (a systemd system unit, a cron job, an SSH command invocation) may
+// have no XDG_RUNTIME_DIR at all, and one started with the variable pointing
+// somewhere else entirely would otherwise never look where the agent actually
+// is. Both are cases where auto-detection earns its keep over a configured
+// path, so both are covered.
 func runtimeDirs() []string {
 	var dirs []string
 	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
@@ -146,23 +150,28 @@ func glob(pattern string) []string {
 	return m
 }
 
-// ownedAgentSocket reports whether path is a socket owned by the running uid.
+// ownedAgentSocket reports whether path looks like a socket this user owns.
 //
-// Both halves are load-bearing. The socket check keeps a regular file that
-// happens to sit at a known path from being dialled; the ownership check is
-// what makes globbing a world-writable /tmp safe, since another uid's agent
-// must never join the fan-out — dotvault forwards mutations upstream, so a
-// foreign endpoint would receive the private key from a client's `ssh-add`,
-// not merely answer a listing.
+// It is a cheap pre-filter, NOT the security boundary — that is peerUID, taken
+// on the connection actually used (see upstreamSource.connect). The
+// distinction is load-bearing in both directions:
 //
-// Lstat rather than Stat: a symlink pointing at someone else's socket would
-// otherwise pass the check on the target's identity while the attacker retains
-// the ability to re-point it. A genuine agent puts a real socket at its path.
+//   - Stat, not Lstat. A symlink must be followed, because the single most
+//     important candidate is routinely one: the tmux convention points
+//     $SSH_AUTH_SOCK at a stable ~/.ssh/ssh_auth_sock symlink, and 1Password
+//     documents `ln -s ... ~/.1password/agent.sock` on macOS. Lstat reports
+//     ModeSymlink rather than ModeSocket for those, so it silently dropped the
+//     user's real agent — the exact thing auto-detection exists to find.
+//   - Following symlinks means this check alone cannot be trusted. It sees who
+//     owns the target now; an attacker who controls a path component can
+//     re-point it before the dial. Hence the peer-credential check, which asks
+//     the kernel who is on the other end of the connection we already hold and
+//     so has no window to race.
 func ownedAgentSocket(path string) bool {
 	if path == "" {
 		return false
 	}
-	fi, err := os.Lstat(path)
+	fi, err := os.Stat(path)
 	if err != nil || fi.Mode()&os.ModeSocket == 0 {
 		return false
 	}

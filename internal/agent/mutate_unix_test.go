@@ -306,3 +306,196 @@ func TestUpstreamNoEndpointsIsNotAnError(t *testing.T) {
 		t.Errorf("Add with no upstream should error")
 	}
 }
+
+// TestUpstreamAddThenSignWithoutRelisting is the regression test for forget().
+// Add mutates the upstream behind the routing table's back, so without the
+// invalidation `listed` stays true while `owner` lacks the new blob — and
+// mightOwn then answers a confident "not ours" for the key just added, which
+// therefore cannot sign. The earlier Add test missed this because its
+// intervening List rebuilt the table anyway; this one goes straight from Add
+// to Sign, which is what a client does.
+func TestUpstreamAddThenSignWithoutRelisting(t *testing.T) {
+	priv, pub := genUpstreamKey(t)
+	sock := filepath.Join(t.TempDir(), "upstream.sock")
+	serveUpstreamAgentAt(t, sock, priv)
+	src := newUpstreamSource("agent", sock)
+	ctx := context.Background()
+
+	// A completed listing first, so `listed` is true and the fast path is live.
+	if _, err := src.Identities(ctx); err != nil {
+		t.Fatalf("Identities: %v", err)
+	}
+
+	pk, sk, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Add(ctx, agent.AddedKey{PrivateKey: sk}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	added, err := ssh.NewPublicKey(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("challenge")
+	sig, matched, err := src.Sign(ctx, added, data, 0)
+	if err != nil || !matched {
+		t.Fatalf("Sign straight after Add: matched=%v err=%v", matched, err)
+	}
+	if err := added.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+	// The pre-existing key still signs too.
+	if _, matched, err := src.Sign(ctx, pub, data, 0); err != nil || !matched {
+		t.Errorf("pre-existing key after Add: matched=%v err=%v", matched, err)
+	}
+}
+
+// TestUpstreamPartialScanClearsListed pins the other half of the routing
+// table's contract: a scan in which an endpoint was down installs an owner map
+// missing that endpoint's keys, so `listed` must go back to false. Leaving it
+// latched from an earlier complete scan makes mightOwn refuse a key the source
+// really does own.
+func TestUpstreamPartialScanClearsListed(t *testing.T) {
+	priv, pub := genUpstreamKey(t)
+	live := filepath.Join(t.TempDir(), "live.sock")
+	serveUpstreamAgentAt(t, live, priv)
+	dead := filepath.Join(t.TempDir(), "dead.sock")
+
+	endpoints := []string{live}
+	src := newUpstreamSourceFunc("agent", func(context.Context) []string { return endpoints })
+	ctx := context.Background()
+
+	if _, err := src.Identities(ctx); err != nil {
+		t.Fatalf("Identities: %v", err)
+	}
+	if _, might := src.mightOwn(pub); !might {
+		t.Fatal("after a complete scan the advertised key must be owned")
+	}
+
+	// A second endpoint appears and is unreachable: the scan is now partial.
+	endpoints = []string{live, dead}
+	if _, err := src.Identities(ctx); err != nil {
+		t.Fatalf("Identities with a dead endpoint: %v", err)
+	}
+	src.mu.Lock()
+	listed := src.listed
+	src.mu.Unlock()
+	if listed {
+		t.Error("listed must be false after an incomplete scan")
+	}
+
+	// And the key still signs — the point of clearing the flag.
+	if _, matched, err := src.Sign(ctx, pub, []byte("x"), 0); err != nil || !matched {
+		t.Errorf("owned key after a partial scan: matched=%v err=%v", matched, err)
+	}
+}
+
+// TestBackendLockInvalidatesListCache confirms `ssh-add -x` is visible to the
+// very next `ssh-add -l`. A locked agent advertises nothing, so a cache held
+// over from before the lock would keep offering keys that can no longer sign.
+func TestBackendLockInvalidatesListCache(t *testing.T) {
+	priv, _ := genUpstreamKey(t)
+	sock := filepath.Join(t.TempDir(), "upstream.sock")
+	serveUpstreamAgentAt(t, sock, priv)
+	b := NewBackend([]Source{newUpstreamSource("agent", sock)})
+
+	if keys, err := b.List(); err != nil || len(keys) != 1 {
+		t.Fatalf("List before lock = %d keys, %v", len(keys), err)
+	}
+	if err := b.Lock([]byte("pw")); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List after lock: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("agent lists %d keys after Lock, want 0 — the cache was not invalidated", len(keys))
+	}
+}
+
+// TestUpstreamSignRetriesWhenOwnerEndpointDied covers the routing table naming
+// an endpoint that has since gone away: the key may have moved to another
+// agent, so a failed dial to the recorded owner must not be the final answer.
+func TestUpstreamSignRetriesWhenOwnerEndpointDied(t *testing.T) {
+	priv, pub := genUpstreamKey(t)
+	gone := filepath.Join(t.TempDir(), "gone.sock")
+	live := filepath.Join(t.TempDir(), "live.sock")
+	serveUpstreamAgentAt(t, live, priv)
+
+	src := newUpstreamSourceFunc("agent", func(context.Context) []string {
+		return []string{gone, live}
+	})
+	ctx := context.Background()
+	if _, err := src.Identities(ctx); err != nil {
+		t.Fatalf("Identities: %v", err)
+	}
+
+	data := []byte("challenge")
+	sig, matched, err := src.Sign(ctx, pub, data, 0)
+	if err != nil || !matched {
+		t.Fatalf("Sign: matched=%v err=%v", matched, err)
+	}
+	if err := pub.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+}
+
+// TestUpstreamServesWithoutVaultToken is the "in front of, permanently" claim
+// under the condition that most tests its worth: a daemon holding no Vault
+// token at all. The upstream proxy needs none — the keys live in the user's own
+// agent — so listing and signing through it must keep working, or an
+// unreachable Vault would take the legacy keys down along with the
+// Vault-backed ones and every client pointed at dotvault would lose both.
+func TestUpstreamServesWithoutVaultToken(t *testing.T) {
+	priv, pub := genUpstreamKey(t)
+	sock := filepath.Join(t.TempDir(), "upstream.sock")
+	serveUpstreamAgentAt(t, sock, priv)
+
+	_, _, vaultPub, vaultSigner := genEd25519(t, "vault-backed")
+	b := NewBackend([]Source{
+		&fakeSource{name: "kv", ids: []Identity{{PubKey: vaultPub}}, signer: vaultSigner},
+		newUpstreamSource("agent", sock),
+	}, WithTokenProbe(func() bool { return false }))
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List on a tokenless daemon: %v", err)
+	}
+	if len(keys) != 1 || !keyEqual(keys[0], pub) {
+		t.Fatalf("lists %d keys, want only the upstream one", len(keys))
+	}
+
+	data := []byte("challenge")
+	sig, err := b.Sign(pub, data)
+	if err != nil {
+		t.Fatalf("Sign on a tokenless daemon: %v", err)
+	}
+	if err := pub.Verify(data, sig); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+
+	// The Vault-backed key is still refused, and says why.
+	if _, err := b.Sign(vaultPub, data); err == nil {
+		t.Error("a Vault-backed key must not sign without a token")
+	}
+}
+
+// TestBackendNoTokenNoUpstreamStillFailsFast pins the other side: with only
+// Vault-backed sources a tokenless daemon must still answer ErrNoToken
+// immediately rather than stalling out the re-auth wait.
+func TestBackendNoTokenNoUpstreamStillFailsFast(t *testing.T) {
+	_, _, pub, signer := genEd25519(t, "kv")
+	b := NewBackend([]Source{&fakeSource{name: "kv", ids: []Identity{{PubKey: pub}}, signer: signer}},
+		WithTokenProbe(func() bool { return false }))
+
+	if _, err := b.Sign(pub, []byte("x")); !errors.Is(err, ErrNoToken) {
+		t.Errorf("Sign = %v, want ErrNoToken", err)
+	}
+	keys, err := b.List()
+	if err != nil || len(keys) != 0 {
+		t.Errorf("List = (%d keys, %v), want (0, nil)", len(keys), err)
+	}
+}

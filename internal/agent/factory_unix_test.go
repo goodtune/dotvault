@@ -19,11 +19,9 @@ func TestNewSourcesUpstreamAgentAutoDetects(t *testing.T) {
 	// agent this user is actually running rather than a path someone wrote
 	// down. Standing a real agent up at the systemd-convention location under
 	// a temp XDG_RUNTIME_DIR is the whole contract in one assertion.
-	rt := t.TempDir()
-	t.Setenv("XDG_RUNTIME_DIR", rt)
+	rt := isolateDiscovery(t)
 	priv, pub := genUpstreamKey(t)
 	serveUpstreamAgentAt(t, filepath.Join(rt, "ssh-agent.socket"), priv)
-	t.Setenv("SSH_AUTH_SOCK", "")
 
 	vc := testVaultClient(t)
 	cfg := config.AgentConfig{
@@ -62,8 +60,7 @@ func TestNewSourcesUpstreamAgentExplicitSocketPinsIt(t *testing.T) {
 	// An explicit socket disables detection and pins the source to exactly
 	// that endpoint — the escape hatch for an agent at a path the candidate
 	// list does not know.
-	rt := t.TempDir()
-	t.Setenv("XDG_RUNTIME_DIR", rt)
+	rt := isolateDiscovery(t)
 	priv, pub := genUpstreamKey(t)
 	explicit := filepath.Join(t.TempDir(), "elsewhere.sock")
 	serveUpstreamAgentAt(t, explicit, priv)

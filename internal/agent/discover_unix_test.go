@@ -120,26 +120,76 @@ func TestDiscoverExcludesOwnEndpointByPath(t *testing.T) {
 // TestDiscoverExcludesOwnEndpointByProbe is the half that matters in practice.
 // Once a user points SSH_AUTH_SOCK at dotvault — the entire purpose of the
 // arrangement — the top discovery candidate IS dotvault, reached by a path
-// (here a symlink) that never string-equals the one we bound. Delegating to it
-// would recurse until the listener ran out of connections, so the daemon has
-// to recognise itself over the wire.
+// that never string-equals the one we bound. Delegating to it would recurse
+// until the listener ran out of connections, so the daemon has to recognise
+// itself over the wire.
+//
+// The daemon is reached here through a SECOND REAL LISTENER on the same
+// backend, not a symlink. That distinction is the test: an earlier version
+// used a symlink and passed vacuously, because the ownership pre-filter
+// rejected it before any dial and the probe never ran at all. Two genuine
+// sockets leave the wire probe as the only thing that can tell them apart.
 func TestDiscoverExcludesOwnEndpointByProbe(t *testing.T) {
 	rt := isolateDiscovery(t)
-	real := filepath.Join(t.TempDir(), "dotvault-agent.sock")
-	serveBackendAt(t, real, NewBackend(nil))
+	backend := NewBackend(nil)
 
-	// A different path to the same daemon, which no amount of string
-	// comparison against `real` would catch.
+	bound := filepath.Join(t.TempDir(), "dotvault-agent.sock")
+	serveBackendAt(t, bound, backend)
+
+	// A second, independent socket served by the same daemon — the shape an
+	// SSH RemoteForward or a bind mount produces.
+	alsoUs := filepath.Join(rt, "ssh-agent.socket")
+	serveBackendAt(t, alsoUs, backend)
+	t.Setenv("SSH_AUTH_SOCK", alsoUs)
+
+	// Only the bound path is declared as ours. The other is a different file
+	// entirely, so no amount of path comparison can exclude it.
+	got := discoverUpstreamEndpoints(context.Background(), []string{bound}, dialEndpoint)
+	if len(got) != 0 {
+		t.Errorf("discovered %v, want nothing — every endpoint is served by this daemon", got)
+	}
+}
+
+// TestDiscoverProbeIsWhatExcludesSelf pins the previous test against going
+// vacuous again: with the identity probe disabled, the same setup must yield
+// the endpoint, proving the probe is doing the work rather than some earlier
+// filter quietly dropping it.
+func TestDiscoverProbeIsWhatExcludesSelf(t *testing.T) {
+	rt := isolateDiscovery(t)
+	backend := NewBackend(nil)
+	bound := filepath.Join(t.TempDir(), "dotvault-agent.sock")
+	serveBackendAt(t, bound, backend)
+	alsoUs := filepath.Join(rt, "ssh-agent.socket")
+	serveBackendAt(t, alsoUs, backend)
+
+	saved := processAgentID
+	processAgentID = nil // the documented "probe cannot run" degradation
+	t.Cleanup(func() { processAgentID = saved })
+
+	got := discoverUpstreamEndpoints(context.Background(), []string{bound}, dialEndpoint)
+	if len(got) != 1 || got[0] != alsoUs {
+		t.Fatalf("discovered %v, want [%q]: without the probe nothing else excludes it", got, alsoUs)
+	}
+}
+
+// TestDiscoverFollowsSymlinkedSocket covers the candidate shape that matters
+// most in practice and that an Lstat-based check silently dropped: the tmux
+// convention points SSH_AUTH_SOCK at a stable symlink, and 1Password documents
+// one on macOS. The user's real agent must be found through it.
+func TestDiscoverFollowsSymlinkedSocket(t *testing.T) {
+	rt := isolateDiscovery(t)
+	priv, _ := genUpstreamKey(t)
+	real := filepath.Join(t.TempDir(), "real-agent.sock")
+	serveUpstreamAgentAt(t, real, priv)
+
 	link := filepath.Join(rt, "ssh-agent.socket")
 	if err := os.Symlink(real, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	t.Setenv("SSH_AUTH_SOCK", link)
 
-	// Deliberately NOT passing `real` as an exclusion: the probe alone must
-	// be enough.
-	if got := discoverUpstreamEndpoints(context.Background(), nil, dialEndpoint); len(got) != 0 {
-		t.Errorf("discovered %v, want nothing (every path leads back to this daemon)", got)
+	got := discoverUpstreamEndpoints(context.Background(), nil, dialEndpoint)
+	if len(got) != 1 || got[0] != link {
+		t.Errorf("discovered %v, want the symlinked agent [%q]", got, link)
 	}
 }
 

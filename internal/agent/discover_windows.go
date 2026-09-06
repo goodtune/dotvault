@@ -19,15 +19,24 @@ const pipePrefix = `\\.\pipe\`
 // exist.
 //
 // Windows deliberately enumerates a short fixed list rather than pattern-
-// matching the pipe namespace the way the Unix side globs /tmp. A named pipe
-// carries no owning uid a caller can read without opening it and querying its
-// security descriptor, so "which pipes are mine" is not a question the
-// namespace answers cheaply — and dotvault forwards mutations upstream, so a
-// pipe squatted by another user would receive a client's private key on
-// `ssh-add`. The two names below are the ones whose access is already
-// constrained by construction: the OpenSSH agent service's well-known pipe,
-// and the Pageant convention whose name embeds a per-user, per-boot hash that
-// another session cannot derive.
+// matching the pipe namespace the way the Unix side globs /tmp, because a
+// named pipe carries no owning uid a caller can read without opening it and
+// querying its security descriptor — so "which pipes are mine" is not a
+// question the namespace answers, and peerUID has no implementation here.
+//
+// Be precise about what that leaves, since mutations are forwarded and a
+// squatted pipe would receive a client's private key on `ssh-add`: the two
+// well-known names below are NOT tamper-proof. Windows named pipes are
+// first-creator-wins, so a local user who creates \\.\pipe\openssh-ssh-agent
+// before the OpenSSH agent service starts owns that name for the boot, and the
+// Pageant name's per-boot hash comes from CryptProtectMemory with
+// CROSS_PROCESS, which any process on the machine can reverse. What can be
+// said is narrower and still worth saying: this is exactly the trust model
+// Windows OpenSSH's own ssh.exe and every PuTTY client already operate under
+// when they dial these same names, so dotvault is not widening the exposure a
+// user already has — it is inheriting it. $SSH_AUTH_SOCK is different in kind
+// and safer: it comes from this daemon's own environment, which is as trusted
+// as its config. The residual risk is documented in docs/guide/ssh-agent.md.
 func candidateEndpoints() []string {
 	var raw []string
 
@@ -41,12 +50,20 @@ func candidateEndpoints() []string {
 		raw = append(raw, name)
 	}
 
-	existing := existingPipes()
+	// An enumeration failure must not read as "no agents are running": that
+	// would silently disable detection wholesale, including for an endpoint
+	// named explicitly by $SSH_AUTH_SOCK. When the namespace cannot be listed,
+	// skip the existence filter and let the dial decide — a pipe that is not
+	// there fails to open, which is the same answer one round trip later.
+	existing, enumerated := existingPipes()
 	out := make([]string, 0, len(raw))
 	seen := make(map[string]bool, len(raw))
 	for _, p := range raw {
 		key := strings.ToLower(p)
-		if seen[key] || !existing[strings.ToLower(pipeLeafName(p))] {
+		if seen[key] {
+			continue
+		}
+		if enumerated && !existing[pipeLeafName(p)] {
 			continue
 		}
 		seen[key] = true
@@ -58,26 +75,30 @@ func candidateEndpoints() []string {
 // existingPipes returns the set of currently-open pipe names, lower-cased.
 // Reading the pipe namespace lists names without opening any of them, so an
 // agent is never handed a connection just to answer "are you there".
-func existingPipes() map[string]bool {
+//
+// ok reports whether the listing succeeded; the caller must not treat an empty
+// set from a failed listing as "nothing is running".
+func existingPipes() (names map[string]bool, ok bool) {
 	entries, err := os.ReadDir(pipePrefix)
 	if err != nil {
-		// Auto-detection finds nothing without this listing, which is a
-		// degradation worth a trace rather than a silent "no agents running".
-		slog.Debug("ssh agent: cannot enumerate the named-pipe namespace for upstream detection", "error", err)
-		return nil
+		slog.Debug("ssh agent: cannot enumerate the named-pipe namespace; falling back to dialling each candidate", "error", err)
+		return nil, false
 	}
 	set := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		set[strings.ToLower(e.Name())] = true
 	}
-	return set
+	return set, true
 }
 
-// pipeLeafName strips the \\.\pipe\ prefix from a pipe path, leaving the name
-// as it appears in the namespace listing.
+// pipeLeafName strips the \\.\pipe\ prefix from a pipe path and lower-cases the
+// result, so it can be compared against the (also lower-cased) namespace
+// listing. Case folding happens before the trim as well as after: the pipe
+// namespace is case-insensitive, so \\.\Pipe\x names the same pipe as
+// \\.\pipe\x and a case-sensitive prefix trim would drop the candidate.
 func pipeLeafName(p string) string {
-	trimmed := strings.TrimPrefix(strings.ReplaceAll(p, "/", `\`), pipePrefix)
-	return strings.TrimPrefix(trimmed, `\`)
+	lowered := strings.ToLower(strings.ReplaceAll(p, "/", `\`))
+	return strings.TrimPrefix(strings.TrimPrefix(lowered, pipePrefix), `\`)
 }
 
 // resolveEndpointPath has nothing to resolve on Windows: a pipe name is not a

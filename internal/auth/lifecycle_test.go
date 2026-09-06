@@ -430,7 +430,9 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -503,7 +505,9 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenFilePath(tokenPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -512,16 +516,8 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "file-token" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "file-token" {
-		t.Fatalf("client token = %q after reload, want %q (file content); env-first ResolveToken regressed", got, "file-token")
+	if !waitFor(func() bool { return vc.Token() == "file-token" }, 2*time.Second) {
+		t.Fatalf("client token = %q after reload, want %q (file content); env-first ResolveToken regressed", vc.Token(), "file-token")
 	}
 }
 
@@ -574,7 +570,9 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -846,7 +844,9 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenFilePath(tokenPath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: the 150ms settle below and the 2s waitFor after it stack, and
+	// the manager must outlive both to satisfy them — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	errCh := lm.Start(ctx)
@@ -868,17 +868,10 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 		t.Fatalf("write token file: %v", err)
 	}
 
-	deadline := time.Now().Add(800 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "new-token" && !lm.NeedsReauth() {
-			break
+	if !waitFor(func() bool { return vc.Token() == "new-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "new-token" {
+			t.Fatalf("client token = %q after token-file write, want %q (recovery never fired)", got, "new-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := vc.Token(); got != "new-token" {
-		t.Fatalf("client token = %q after token-file write, want %q (recovery never fired)", got, "new-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after recovery picked up a working token")
 	}
 }
@@ -1025,7 +1018,9 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
 	lm.SetTokenSockets([]string{sock})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 5s, not 1s: headroom over the 2s waitFor below, which the manager must
+	// outlive to satisfy — see waitFor.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	errCh := lm.Start(ctx)
 	go func() {
@@ -1033,15 +1028,8 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "fresh-token" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := vc.Token(); got != "fresh-token" {
-		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", got)
+	if !waitFor(func() bool { return vc.Token() == "fresh-token" }, 2*time.Second) {
+		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", vc.Token())
 	}
 }
 

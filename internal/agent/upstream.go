@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -49,6 +50,11 @@ type upstreamSource struct {
 	// wires it to the platform dialEndpoint.
 	dial dialFunc
 
+	// autoDetected records that resolve() came from discovery rather than from
+	// a configured endpoint. It changes what an all-endpoints-failed listing
+	// means: see Identities.
+	autoDetected bool
+
 	// verifyPeer requires every connection to be answered by a process running
 	// as this same user, checked with peerUID on the connection itself. It is
 	// set for auto-detected endpoints — dotvault chose those from a shared
@@ -80,6 +86,7 @@ func newUpstreamSource(name, endpoint string) *upstreamSource {
 // every listing, excluding the endpoints this daemon serves itself.
 func newAutoUpstreamSource(name string, self []string) *upstreamSource {
 	s := newUpstreamSourceFunc(name, nil)
+	s.autoDetected = true
 	s.verifyPeer = true
 	scan := func(ctx context.Context) []string {
 		return discoverUpstreamEndpoints(ctx, self, s.dial)
@@ -268,6 +275,31 @@ func (s *upstreamSource) Identities(ctx context.Context) ([]Identity, error) {
 	}
 	s.remember(owner, len(errs) == 0)
 	if len(ids) == 0 && len(errs) > 0 {
+		// Nothing answered. What that means depends on where the endpoints
+		// came from, and the split matches the one verifyPeer already draws.
+		//
+		// Auto-detected, it is the same answer as finding no endpoints at all:
+		// no agent of yours is reachable right now. A socket node outlives the
+		// agent that made it — a killed ssh-agent leaves one that still looks
+		// like a socket this uid owns — so this is an ordinary state, not a
+		// fault. Reporting it as an error matters because with no Vault token
+		// the relay is the only source consulted, so the error becomes the
+		// whole backend's answer and `ssh-add -l` fails where it owes "no
+		// identities"; a client reads the first as a broken agent and gives
+		// up, where the second lets it move to its next authentication method.
+		//
+		// Configured, the operator named this endpoint, so silence would hide
+		// their typo. That case keeps the error, and it is why this is decided
+		// here rather than by dropping undialable endpoints during discovery:
+		// discovery never sees a pinned endpoint, and dropping would also
+		// promote the next candidate into the slot Add targets, putting a
+		// private key in an agent the user did not name — exactly what Add's
+		// no-fallthrough rule exists to prevent.
+		if s.autoDetected {
+			slog.Debug("ssh agent: no discovered agent answered; serving no relayed identities",
+				"source", s.name, "endpoints", len(eps), "error", errors.Join(errs...))
+			return nil, nil
+		}
 		return nil, errors.Join(errs...)
 	}
 	return ids, nil

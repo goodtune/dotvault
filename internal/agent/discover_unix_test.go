@@ -287,3 +287,78 @@ func TestBackendExtensionAnswersIdentityProbe(t *testing.T) {
 		t.Errorf("unknown extension err = %v, want ErrExtensionUnsupported", err)
 	}
 }
+
+// staleSocketNode leaves a socket path behind with nothing listening on it,
+// which is what a killed ssh-agent does: the node outlives the process and
+// still satisfies the path-level socket-and-owner filter.
+//
+// sockTempDir rather than t.TempDir: a Unix socket address is capped by
+// sun_path, and these test names are long enough to overrun it on macOS.
+func staleSocketNode(t *testing.T) string {
+	t.Helper()
+	sock := filepath.Join(sockTempDir(t), "stale.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("expected the socket node to outlive its listener: %v", err)
+	}
+	return sock
+}
+
+// TestRelayAutoListIsEmptyNotErrorWhenNothingAnswers pins the answer a relay
+// owes when none of the agents it discovered are reachable.
+//
+// It matters because of what consumes it. With no Vault token the relay is the
+// only source the backend consults, so this source's error becomes the whole
+// agent's answer, and `ssh-add -l` then fails where it owes "no identities". A
+// client reads those differently: a failure says the agent is broken and ends
+// the attempt, where an empty list lets it move to its next authentication
+// method. A stale node is an ordinary state — every killed ssh-agent leaves
+// one — so it must not present as a fault.
+func TestRelayAutoListIsEmptyNotErrorWhenNothingAnswers(t *testing.T) {
+	isolateDiscovery(t)
+	stale := staleSocketNode(t)
+
+	tempAgentGlobsOverride = func() []string { return []string{filepath.Dir(stale) + "/*.sock"} }
+	t.Cleanup(func() { tempAgentGlobsOverride = nil })
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	b := NewBackend([]Source{newAutoUpstreamSource("relay:auto", nil)},
+		WithTokenProbe(func() bool { return false }))
+
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List with only an unreachable discovered agent returned an error, want an empty list: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("want no identities, got %d", len(keys))
+	}
+}
+
+// TestRelayPinnedListStillErrorsWhenNothingAnswers is the other half, and the
+// reason the distinction lives in Identities rather than in discovery: a
+// pinned endpoint is a name the operator wrote, so an unreachable one is their
+// mistake to hear about, not a state to absorb silently. Discovery never sees
+// a pinned endpoint, so it could not have drawn this line at all.
+//
+// TestUpstreamSourceUnreachable covers the same rule one layer down, on the
+// source directly. This one adds the dimension that made it worth a fix: a
+// backend with no Vault token, where the relay is the only source consulted
+// and so this verdict becomes the whole agent's answer.
+func TestRelayPinnedListStillErrorsWhenNothingAnswers(t *testing.T) {
+	isolateDiscovery(t)
+	stale := staleSocketNode(t)
+
+	b := NewBackend([]Source{newUpstreamSource("relay:"+stale, stale)},
+		WithTokenProbe(func() bool { return false }))
+
+	if _, err := b.List(); err == nil {
+		t.Fatal("a pinned but unreachable relay endpoint listed cleanly; the operator named it, so it must surface")
+	}
+}

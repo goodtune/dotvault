@@ -130,6 +130,12 @@ func TestUpstreamSourceSignFallthrough(t *testing.T) {
 func TestUpstreamSourceUnreachable(t *testing.T) {
 	// A socket that nobody serves: Identities surfaces the dial error so status
 	// can report the upstream as unreachable.
+	//
+	// This is the *pinned* half of a deliberate asymmetry — an auto-detected
+	// source that reaches nothing returns an empty list instead, since a stale
+	// node is an ordinary state rather than a fault. Do not "unify" the two:
+	// see TestRelayAutoListIsEmptyNotErrorWhenNothingAnswers and its pinned
+	// counterpart in discover_unix_test.go, which pin the pair end to end.
 	src := newUpstreamSource("agent", filepath.Join(t.TempDir(), "nope.sock"))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

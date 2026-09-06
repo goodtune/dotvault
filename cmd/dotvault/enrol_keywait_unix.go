@@ -38,7 +38,7 @@ func waitForMoreInput(fd uintptr, timeout time.Duration) bool {
 		if remaining <= 0 {
 			return false
 		}
-		n, err := unix.Poll(pfd, int(remaining/time.Millisecond))
+		n, err := unix.Poll(pfd, pollTimeoutMillis(remaining))
 		if errors.Is(err, unix.EINTR) {
 			// A signal interrupted the wait, which says nothing about
 			// whether input arrived — retry for what is left of the budget.
@@ -58,6 +58,30 @@ func waitForMoreInput(fd uintptr, timeout time.Duration) bool {
 		}
 		return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0
 	}
+}
+
+// pollTimeoutMillis converts a remaining budget to poll(2)'s whole-millisecond
+// timeout. It floors, with a floor of 1: any positive value below a
+// millisecond becomes 1 rather than 0.
+//
+// Zero is not a short wait but a non-blocking check: poll returns at once,
+// and waitForMoreInput reads that as "no input" even though the budget had
+// time left and the byte may land microseconds later — the same wrong answer
+// the EINTR retry above removes, reached by arithmetic instead of by a signal.
+// Flooring is right everywhere above a millisecond, because a truncated wait
+// still blocks and the loop simply comes round again; only zero is hazardous.
+//
+// Its one call site rejects a non-positive budget first, so the clamp is
+// unreachable today. It is written as < 1 rather than == 0 anyway, because a
+// negative timeout tells poll to block forever: if a future caller ever let
+// one through, == 0 would trade a wait that ends too early for one that never
+// ends at all.
+func pollTimeoutMillis(remaining time.Duration) int {
+	ms := int(remaining / time.Millisecond)
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
 }
 
 // blockUntilInput waits until fd has input ready to read or ctx is

@@ -24,6 +24,12 @@ type Listener struct {
 	mu     sync.Mutex
 	ln     net.Listener
 	closed bool
+	// activated records that the endpoint was inherited from systemd socket
+	// activation rather than bound by us (Unix only). platformCleanup skips
+	// unlinking then — the socket unit owns the node. Guarded by mu: a Close
+	// racing a Serve still inside platformListen (the racing-shutdown case
+	// above) would otherwise read it while platformListen writes it.
+	activated bool
 }
 
 // NewListener returns a listener bound to addr (socket path or pipe name) that
@@ -32,8 +38,15 @@ func NewListener(addr string, backend agent.ExtendedAgent) *Listener {
 	return &Listener{addr: addr, backend: backend}
 }
 
-// Addr returns the configured endpoint address.
-func (l *Listener) Addr() string { return l.addr }
+// Addr returns the endpoint address: as configured, or — under systemd
+// socket activation — the activated socket's actual path, which
+// platformListen adopts. Locked because that adoption can race a concurrent
+// reader.
+func (l *Listener) Addr() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.addr
+}
 
 // Serve creates the endpoint and accepts connections until ctx is cancelled,
 // dispatching each to agent.ServeAgent in its own goroutine. Cancellation
@@ -55,7 +68,7 @@ func (l *Listener) Serve(ctx context.Context) error {
 	l.ln = ln
 	l.mu.Unlock()
 
-	slog.Info("ssh agent listening", "endpoint", l.addr)
+	slog.Info("ssh agent listening", "endpoint", l.Addr())
 
 	done := make(chan struct{})
 	defer close(done)

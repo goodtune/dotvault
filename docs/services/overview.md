@@ -10,11 +10,16 @@ Enrolments are declared in the configuration under the `enrolments` key. Each en
 enrolments:
   gh:                        # Vault KV path segment (secret stored at users/{username}/gh)
     engine: github           # enrolment engine to use
+    help_text: |             # admin-authored markdown shown in the web UI (optional)
+      Mints a GitHub OAuth token via a device flow. You'll sign in with
+      GitHub in your browser and approve a short code.
     settings:                # engine-specific settings (optional)
       scopes:
         - repo
         - read:org
 ```
+
+`help_text` is free-form Markdown (headers, bold/italic, links, inline code, and unordered lists) rendered to sanitized HTML and shown alongside the enrolment card in the web UI, explaining what the engine will do before the user runs it. It has no effect on the CLI picker (`dotvault enrol`). Like every other config field it round-trips through YAML, the Windows registry, and `.reg` files.
 
 ## Grouping enrolments
 
@@ -83,5 +88,6 @@ Engines that need extra behaviour layer it on through optional interfaces the ma
 - **`SettingsFielder`** — for engines whose written-field set is determined by per-enrolment settings rather than being static (used by `copy`, where the JSON template decides the keys)
 - **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog` and `databricks`); driven by the daemon's `RefreshManager`
 - **`Watcher`** — for engines whose output is derived from upstream Vault data and must track source changes (used by `copy`); driven by the daemon's `WatchManager`, which polls on every sync interval and reacts to `kv-v2/data-write` events on Vault Enterprise
+- **`Unattended`** — for engines that acquire their credential with no user involvement at all: no browser to visit, no code to copy, no prompt to answer (used by `copy`). Declaring it keeps the engine out of the web UI's first-run wizard — both out of the decision to show it, in both directions, and off the page itself (it is managed from the enrolments tree instead) — it cannot raise the wizard, since there would be nothing for the user to do in it, and its completing does not count as the user having been through setup, since it completes without them. It changes nothing else: the enrolment is still ordinary pending work everywhere else, run by the CLI enrolment pass and offered by `dotvault enrol`. An engine that does not implement it is treated as interactive
 
 This means new engines can be added to support additional services without changes to the core enrolment system.

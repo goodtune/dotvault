@@ -4,7 +4,7 @@
 // Open for a backend, then Generate/Import/Load a crypto.Signer plus an
 // opaque handle it can persist alongside the certificate.
 //
-// Two backends ship today:
+// Three backends ship today:
 //
 //   - "file"  — a software key stored as a PKCS#8 PEM handle. Used for the
 //     plain "mtls" auth method and on any platform without hardware support.
@@ -12,6 +12,14 @@
 //   - "tpm"   — (Linux/Windows only) the key is sealed under the TPM's
 //     Storage Root Key. The handle is the marshalled go-tpm-tools SealedBytes
 //     proto and carries no usable key material off the originating chip.
+//   - "os"    — (Windows only) the key and certificate live in the OS-native
+//     certificate store (CurrentUser, CNG software provider) via
+//     github.com/google/certtostore, so other software — most importantly the
+//     system browsers — can discover and present the certificate for mTLS. The
+//     handle records the CNG provider + key container; the cert is pushed into
+//     the store through the optional CertStorer capability. On non-Windows
+//     platforms Open("os") returns ErrUnsupported (Linux PKCS#11 and macOS
+//     Keychain backends are future work).
 //
 // macOS Secure Enclave support is a future backend: Open("tpm") returns
 // ErrUnsupported there until the binary is code-signed with the required
@@ -72,7 +80,11 @@ type Storage interface {
 	// reconstruct the signer. sealToPCRs binds the key to the current PCR
 	// (boot) state where the backend supports it; it is ignored by backends
 	// that do not.
-	Generate(kt KeyType, sealToPCRs bool) (crypto.Signer, []byte, error)
+	// bits sizes an RSA modulus (2048/3072/4096/8192); zero means the
+	// backend default of 2048, and it is ignored for EC, which is fixed at
+	// P-256. It is threaded through because a Vault PKI role's key_bits is a
+	// minimum, so an operator with a 4096-bit role needs a matching key.
+	Generate(kt KeyType, bits int, sealToPCRs bool) (crypto.Signer, []byte, error)
 	// Import takes an existing software private key (the BYO path) and
 	// returns a crypto.Signer plus a handle, sealing it into hardware where
 	// supported.
@@ -96,6 +108,58 @@ type DataSealer interface {
 	SealData(data []byte) ([]byte, error)
 	// UnsealData reverses SealData.
 	UnsealData(handle []byte) ([]byte, error)
+}
+
+// CertStorer is an optional capability for backends that keep the certificate
+// alongside the private key in a shared, externally-visible store (the "os"
+// backend's OS-native certificate store). The "file" and "tpm" backends do NOT
+// implement it — they hold only the key, and the certificate lives in
+// dotvault's own credential envelope. The cert-auth flow type-asserts this
+// capability after a certificate is issued and, when present, pushes the cert
+// into the store so other software (browsers, etc.) can present it.
+type CertStorer interface {
+	// StoreCert installs certPEM (leaf followed by its issuing CA chain) into
+	// the store, associating it with the key behind handle. It returns the
+	// handle to persist going forward. For the "os" backend the returned handle
+	// records the installed leaf, so it differs from the one passed in and MUST
+	// be the one persisted.
+	StoreCert(handle []byte, certPEM string) ([]byte, error)
+}
+
+// CertLifecycle is an optional capability for CertStorer backends whose store
+// accumulates state that a rotation must clean up — the "os" backend, where
+// each rotation creates a new CNG key container and installs another leaf into
+// CurrentUser\My. It makes rotation two-phase so a failure part-way through
+// cannot destroy the credential the host is still using.
+//
+// The contract the cert-auth flow must honour, in order:
+//
+//  1. Generate a key and issue a certificate. The previous credential remains
+//     authoritative and usable throughout.
+//  2. StoreCert the new certificate, persist the returned handle in the
+//     envelope, and complete the replacement cert login.
+//  3. On success, CommitCert(newHandle, oldHandle) — the old key container and
+//     leaf are removed. On any failure at or after step 1,
+//     RollbackCert(newHandle) — the replacement's container and leaf are
+//     removed and the old credential stays authoritative.
+//
+// Backends that do not implement it (file, tpm) need no such cleanup: their
+// handle *is* the key material, so overwriting the envelope is the whole
+// transaction.
+type CertLifecycle interface {
+	// CommitCert finalises a rotation whose replacement credential is now
+	// persisted and operational, removing the superseded key container and
+	// leaf certificate. oldHandle may be nil or empty for a first seed, in
+	// which case there is nothing to remove. Errors are advisory — the new
+	// credential is already live and the only cost is a leftover artefact — so
+	// callers should log rather than fail the login.
+	CommitCert(newHandle, oldHandle []byte) error
+	// RollbackCert discards a replacement credential that never became
+	// operational, removing its key container and any leaf certificate
+	// installed for it. It is safe to call when StoreCert was never reached
+	// (the leaf simply does not exist) and safe to call twice. Like
+	// CommitCert, errors are advisory.
+	RollbackCert(newHandle []byte) error
 }
 
 // SealData seals data under the platform hardware backend (TPM on
@@ -155,28 +219,55 @@ func Open(mode string) (Storage, error) {
 		return fileStorage{}, nil
 	case "tpm":
 		return openHardware()
+	case "os":
+		return openOSStore()
 	default:
 		return nil, fmt.Errorf("securestore: unknown backend %q", mode)
 	}
 }
 
 // ModeForMethod maps a dotvault auth method to a securestore backend mode.
-// "mtls+tpm" wants hardware; everything else (including plain "mtls") uses
-// the file backend.
+// "mtls+tpm" wants hardware, "mtls+os" the OS-native cert store; everything
+// else (including plain "mtls") uses the file backend.
 func ModeForMethod(authMethod string) string {
-	if authMethod == "mtls+tpm" {
+	switch authMethod {
+	case "mtls+tpm":
 		return "tpm"
+	case "mtls+os":
+		return "os"
+	default:
+		return "file"
 	}
-	return "file"
 }
 
-// newSoftwareKey generates a private key of the requested type.
-func newSoftwareKey(kt KeyType) (crypto.Signer, error) {
+// defaultRSABits is the modulus size used when key_bits is unset. It matches
+// what dotvault generated before key_bits existed, so an upgrade changes
+// nothing for an operator who does not set it.
+const defaultRSABits = 2048
+
+// rsaBitsOrDefault resolves a requested RSA modulus size, substituting the
+// default when unset.
+//
+// Platform-neutral on purpose: both key-generating backends need it (the
+// software one here and the Windows CNG one in osstore_windows.go), and the
+// Windows file cannot be compiled or tested off Windows. Keeping the default in
+// one place stops the two backends from silently disagreeing about what an
+// unset key_bits means.
+func rsaBitsOrDefault(bits int) int {
+	if bits == 0 {
+		return defaultRSABits
+	}
+	return bits
+}
+
+// newSoftwareKey generates a private key of the requested type. bits sizes an
+// RSA modulus; zero selects defaultRSABits. EC ignores it — P-256 is fixed.
+func newSoftwareKey(kt KeyType, bits int) (crypto.Signer, error) {
 	switch kt {
 	case KeyEC, "":
 		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	case KeyRSA:
-		return rsa.GenerateKey(rand.Reader, 2048)
+		return rsa.GenerateKey(rand.Reader, rsaBitsOrDefault(bits))
 	default:
 		return nil, fmt.Errorf("securestore: unknown key type %q", kt)
 	}
@@ -222,8 +313,8 @@ func (fileStorage) Capabilities() Capabilities {
 	return Capabilities{Name: "file", HardwareBound: false}
 }
 
-func (fileStorage) Generate(kt KeyType, _ bool) (crypto.Signer, []byte, error) {
-	signer, err := newSoftwareKey(kt)
+func (fileStorage) Generate(kt KeyType, bits int, _ bool) (crypto.Signer, []byte, error) {
+	signer, err := newSoftwareKey(kt, bits)
 	if err != nil {
 		return nil, nil, err
 	}

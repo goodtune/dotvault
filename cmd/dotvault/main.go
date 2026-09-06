@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,25 +15,29 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
+	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/passwd"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
-	"github.com/goodtune/dotvault/internal/sdnotify"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/sync"
 	"github.com/goodtune/dotvault/internal/tokenwatch"
 	"github.com/goodtune/dotvault/internal/tray"
+	"github.com/goodtune/dotvault/internal/uds"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/web"
 	vaultapi "github.com/hashicorp/vault/api"
@@ -120,6 +127,10 @@ but driven by dotvault's loaded configuration (YAML or Group Policy).`,
 			RunE:  runStatus,
 		},
 		newEnrolCmd(),
+		newBrowseCmd(),
+		newNotifyCmd(),
+		newClipboardCmd(),
+		newSSHCmd(),
 		newVersionCmd(),
 		newRegExportCmd(),
 		newRegImportCmd(),
@@ -171,6 +182,14 @@ func setupLogging() {
 	} else {
 		handler = slog.NewTextHandler(os.Stderr, opts)
 	}
+	// Mirror every record to the OTel LoggerProvider alongside stderr.
+	// Safe to wrap unconditionally: before observability.Init runs (and
+	// whenever observability is disabled) the global provider is the
+	// OTel no-op implementation, so this costs a couple of interface
+	// calls per log line and emits nothing — no cfg.Observability.Enabled
+	// check needed here, matching the package's existing no-op-backed
+	// convention. See internal/observability.NewSlogHandler.
+	handler = observability.NewSlogHandler(handler)
 	slog.SetDefault(slog.New(handler))
 }
 
@@ -236,7 +255,10 @@ func loadConfigRemote() (*config.Config, string, func() *remoteconfig.Status, er
 		return nil, path, nil, err
 	}
 	merged, status := withRemote(context.Background(), load)
-	cfg, err := merged()
+	// One-shot commands load once, so they stay strict: a user whose own file
+	// is broken should be told, not silently given the policy defaults.
+	overlaid, _ := withUserOverlay(merged)
+	cfg, err := overlaid()
 	return cfg, path, status, err
 }
 
@@ -351,17 +373,178 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 type refreshDeps struct {
 	load     func() (*config.Config, error)
 	interval time.Duration
-	// trackSyncTicks is set when the refresh cadence defaulted to
-	// sync.interval (no explicit remote_config.refresh_interval); the loop
-	// then follows a remotely-changed sync interval instead of staying
-	// pinned to the startup value.
-	trackSyncTicks bool
-	initial        *config.Config
+	initial  *config.Config
+	// initialStatic is the static-section snapshot taken at startup,
+	// before the daemon scrubs observability.headers from its long-lived
+	// config. The loop compares each reload against it to warn when a
+	// change cannot be applied without a restart.
+	initialStatic staticSections
+	// reload delivers manual reload requests (SIGHUP on Unix, the tray's
+	// "Reload config" entry on Windows) that run a refresh pass
+	// immediately instead of waiting for the next tick. A nil channel is
+	// fine — it just never fires.
+	reload         <-chan struct{}
 	engine         *sync.Engine
 	refreshManager *enrol.RefreshManager
 	watchManager   *enrol.WatchManager
 	web            *web.Server
 	enrolManager   *enrol.Manager
+	// sshRegistry is set only when the managed-SSH-forward subsystem is
+	// running (see startSSHForwards). Nil whenever the daemon started
+	// without it — agent.enabled false, or neither a local API socket nor
+	// the web UI configured — in which case the loop skips both the
+	// ssh.yaml resync and the SSH-config-section dynamic update below. The
+	// loop calls Registry.Resync rather than sshfwd.Load + Manager.Reconcile
+	// directly, so ssh.yaml's read-reconcile pair is always serialised
+	// against a concurrent Registry.Add/Patch/Remove under the same lock —
+	// see Resync's doc comment.
+	sshRegistry *sshfwd.Registry
+}
+
+// staticSections snapshots the config sections the daemon cannot apply
+// in-place: they configure subsystems constructed once at startup (the Vault
+// client, the web listener, the local API socket, the SSH agent, the mounted
+// filesystem, the OTel SDK). The refresh loop
+// diffs them only to tell the operator a restart is needed. remote_config is
+// deliberately NOT here: the withRemote loader rebuilds the overlay fetcher
+// whenever the section changes and the refresh loop re-derives its cadence
+// each pass, so the section applies live like the other dynamic sections.
+// Observability headers are reduced to a digest rather than retained: the
+// values carry OTLP bearer tokens that the daemon deliberately scrubs from
+// its long-lived config after the OTel SDK consumes them, and a comparison
+// snapshot must not reintroduce them into the heap.
+type staticSections struct {
+	Vault         config.VaultConfig
+	Web           config.WebConfig
+	Agent         config.AgentConfig
+	API           config.APIConfig
+	FUSE          config.FUSEConfig
+	Observability config.ObservabilityConfig
+	HeadersDigest [sha256.Size]byte
+	Bypass        bool
+}
+
+func staticSectionsOf(c *config.Config) staticSections {
+	s := staticSections{
+		Vault:         c.Vault,
+		Web:           c.Web,
+		Agent:         c.Agent,
+		API:           c.API,
+		FUSE:          c.FUSE,
+		Observability: c.Observability,
+		HeadersDigest: digestObservabilityHeaders(c.Observability),
+		Bypass:        c.BypassSystemConfig,
+	}
+	s.Observability.Headers = nil
+	s.Observability.Metrics.Headers = nil
+	s.Observability.Logs.Headers = nil
+	return s
+}
+
+// headerDigestSalt is a per-process random value mixed into every header
+// digest. Digests are only ever compared against digests computed in the
+// same process, so the salt costs nothing — and it makes a digest recovered
+// from a heap or core dump useless for offline confirmation of guessed
+// header values.
+var headerDigestSalt = func() []byte {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// An unsalted digest is still correct for the same-process
+		// equality comparison this exists for.
+		return nil
+	}
+	return b
+}()
+
+// digestObservabilityHeaders reduces every header map the observability
+// section can carry — the shared one plus the per-signal metrics/logs
+// overrides — to a single digest for the static-section comparison. Each
+// map is domain-separated by a label so moving a header between maps (a
+// real config change: it redirects which backend receives the token)
+// changes the digest even though the multiset of key/value pairs did not.
+func digestObservabilityHeaders(o config.ObservabilityConfig) [sha256.Size]byte {
+	d := sha256.New()
+	var lenBuf [8]byte
+	writeString := func(s string) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		d.Write(lenBuf[:])
+		d.Write([]byte(s))
+	}
+	for _, part := range []struct {
+		label   string
+		headers map[string]string
+	}{
+		{"shared", o.Headers},
+		{"metrics", o.Metrics.Headers},
+		{"logs", o.Logs.Headers},
+	} {
+		writeString(part.label)
+		sub := digestHeaders(part.headers)
+		d.Write(sub[:])
+	}
+	var out [sha256.Size]byte
+	copy(out[:], d.Sum(nil))
+	return out
+}
+
+// digestHeaders hashes a header map deterministically (sorted keys, each
+// key and value length-prefixed so no delimiter can be forged by the
+// content) so two snapshots can be compared for equality without either
+// retaining the header values. An empty or nil map digests to the zero
+// value.
+func digestHeaders(h map[string]string) [sha256.Size]byte {
+	if len(h) == 0 {
+		return [sha256.Size]byte{}
+	}
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	d := sha256.New()
+	d.Write(headerDigestSalt)
+	var lenBuf [8]byte
+	writeString := func(s string) {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		d.Write(lenBuf[:])
+		d.Write([]byte(s))
+	}
+	for _, k := range keys {
+		writeString(k)
+		writeString(h[k])
+	}
+	var out [sha256.Size]byte
+	copy(out[:], d.Sum(nil))
+	return out
+}
+
+// changedStaticSections names the static config sections that differ between
+// two snapshots, using their YAML section names so the warning reads back to
+// the file the operator just edited.
+func changedStaticSections(a, b staticSections) []string {
+	var out []string
+	if !reflect.DeepEqual(a.Vault, b.Vault) {
+		out = append(out, "vault")
+	}
+	if !reflect.DeepEqual(a.Web, b.Web) {
+		out = append(out, "web")
+	}
+	if !reflect.DeepEqual(a.Agent, b.Agent) {
+		out = append(out, "agent")
+	}
+	if !reflect.DeepEqual(a.API, b.API) {
+		out = append(out, "api")
+	}
+	if !reflect.DeepEqual(a.FUSE, b.FUSE) {
+		out = append(out, "fuse")
+	}
+	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
+		out = append(out, "observability")
+	}
+	if a.Bypass != b.Bypass {
+		out = append(out, "bypass_system_config")
+	}
+	return out
 }
 
 // runConfigRefresh re-runs the daemon's config loader on a fixed tick — the
@@ -370,8 +553,14 @@ type refreshDeps struct {
 // changes to the running daemon: enrolments fan out to the enrolment manager
 // (CLI), the refresh/watch managers, and the web enrolment runner; rules and
 // the sync interval go to the sync engine and the web server's snapshots.
-// Static sections (vault, web, agent, observability) are exclusively local
-// and still require a restart, as documented.
+// A manual reload request (SIGHUP, tray) runs the same pass immediately.
+// remote_config changes also apply live: the withRemote loader rebuilds the
+// overlay fetcher when the section changes, and the loop re-derives its own
+// tick cadence (explicit remote_config.refresh_interval, else the sync
+// interval) after every pass. Static sections (vault, web, agent,
+// observability, and the top-level bypass_system_config flag) are applied
+// only at startup; when a reload finds them changed the loop warns that a
+// restart is required rather than half-applying them.
 func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -379,71 +568,140 @@ func runConfigRefresh(ctx context.Context, d refreshDeps) {
 	lastEnrolments := d.initial.Enrolments
 	lastRules := d.initial.Rules
 	lastInterval := d.initial.Sync.Interval
+	lastCadence := d.interval
+	lastStatic := d.initialStatic
+	lastSSH := d.initial.SSH
+
+	refresh := func() {
+		reloaded, err := d.load()
+		if err != nil {
+			observability.RecordConfigReload(ctx, "error")
+			slog.Warn("config reload failed", "error", err)
+			return
+		}
+
+		changed := false
+
+		if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
+			// All-or-nothing: when the web runner is busy with a
+			// running enrolment the whole enrolment update is
+			// deferred (lastEnrolments stays put), so the next tick
+			// retries every consumer together rather than leaving
+			// the managers and the web runner disagreeing.
+			if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
+				slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
+			} else {
+				changed = true
+				slog.Info("enrolments config changed, re-checking")
+				if d.enrolManager != nil {
+					d.enrolManager.UpdateConfig(reloaded.Enrolments)
+				}
+				d.refreshManager.UpdateConfig(reloaded.Enrolments)
+				d.watchManager.UpdateConfig(reloaded.Enrolments)
+				lastEnrolments = reloaded.Enrolments
+			}
+		}
+
+		rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
+		intervalChanged := reloaded.Sync.Interval != lastInterval
+		if rulesChanged || intervalChanged {
+			changed = true
+			d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
+			if d.web != nil {
+				d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
+			}
+			lastRules = reloaded.Rules
+			lastInterval = reloaded.Sync.Interval
+		}
+
+		// Re-derive this loop's own cadence from the reloaded config,
+		// mirroring the startup rule: an explicit
+		// remote_config.refresh_interval wins, else the sync interval.
+		// This keeps remote_config fully dynamic — the withRemote loader
+		// already rebuilds the overlay fetcher when the section changes,
+		// so the cadence was the only piece pinned at startup.
+		cadence := reloaded.Sync.Interval
+		if reloaded.RemoteConfig.RefreshInterval > 0 {
+			cadence = reloaded.RemoteConfig.RefreshInterval
+		}
+		if cadence > 0 && cadence != lastCadence {
+			changed = true
+			ticker.Reset(cadence)
+			lastCadence = cadence
+		}
+
+		// The managed-SSH-forward subsystem, when running, applies two
+		// independent things on every pass: the ssh.yaml remotes list (a
+		// hand-edit, or an API mutation that raced this tick) and the
+		// admin-owned SSH config section (CAs, insecure flag), which is
+		// dynamic — see TestStaticSectionsCoverConfig — and reaches every
+		// future connection attempt via updateSSHPolicyConfig's atomic
+		// value rather than anything captured at startup.
+		//
+		// The ssh.yaml side goes through Registry.Resync, not a direct
+		// sshfwd.Load + Manager.Reconcile: Resync takes the same write lock
+		// Add/Patch/Remove hold across their own Load->Save->Reconcile, so a
+		// concurrent API mutation can never be raced and then reverted by
+		// this tick reconciling a file read before the mutation's Save. The
+		// SSH-config-section update below does go through the Manager's
+		// (well, the package-level atomic's) own synchronisation, since it
+		// touches no file.
+		if d.sshRegistry != nil {
+			if !reflect.DeepEqual(reloaded.SSH, lastSSH) {
+				changed = true
+				slog.Info("ssh config section changed, applying to future connection attempts")
+				updateSSHPolicyConfig(reloaded.SSH)
+				lastSSH = reloaded.SSH
+			}
+			if err := d.sshRegistry.Resync(ctx); err != nil {
+				slog.Warn("failed to resync managed SSH forwards from ssh.yaml", "error", err)
+			}
+		}
+
+		// Static sections can't be applied in place, so a change is a
+		// warning, not an application. The diff is always taken against
+		// initialStatic — the configuration the running subsystems were
+		// actually built from — so it names exactly what a restart would
+		// change; lastStatic only deduplicates, keeping it one message
+		// per edit rather than one per tick. An edit that reverts the
+		// file back to the running configuration logs an all-clear
+		// instead of a false restart-required warning.
+		if reloadedStatic := staticSectionsOf(reloaded); !reflect.DeepEqual(reloadedStatic, lastStatic) {
+			if sections := changedStaticSections(d.initialStatic, reloadedStatic); len(sections) > 0 {
+				slog.Warn("static configuration sections changed; restart the daemon to apply them",
+					"sections", strings.Join(sections, ", "))
+			} else {
+				slog.Info("static configuration sections match the running configuration again; restart no longer needed")
+			}
+			lastStatic = reloadedStatic
+		}
+
+		if changed {
+			observability.RecordConfigReload(ctx, "applied")
+		} else {
+			observability.RecordConfigReload(ctx, "no_change")
+		}
+
+		// CLI mode keeps its historical behaviour: re-check enrolments
+		// every tick and trigger a sync when something newly enrolled.
+		if d.enrolManager != nil {
+			if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
+				slog.Warn("enrolment check failed", "error", err)
+			} else if ok {
+				d.engine.TriggerSync()
+			}
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reloaded, err := d.load()
-			if err != nil {
-				observability.RecordConfigReload(ctx, "error")
-				slog.Warn("config reload failed", "error", err)
-				continue
-			}
-
-			changed := false
-
-			if !reflect.DeepEqual(reloaded.Enrolments, lastEnrolments) {
-				// All-or-nothing: when the web runner is busy with a
-				// running enrolment the whole enrolment update is
-				// deferred (lastEnrolments stays put), so the next tick
-				// retries every consumer together rather than leaving
-				// the managers and the web runner disagreeing.
-				if d.web != nil && !d.web.UpdateEnrolments(ctx, reloaded.Enrolments) {
-					slog.Info("enrolment config changed but an enrolment is running; deferring update to next tick")
-				} else {
-					changed = true
-					slog.Info("enrolments config changed, re-checking")
-					if d.enrolManager != nil {
-						d.enrolManager.UpdateConfig(reloaded.Enrolments)
-					}
-					d.refreshManager.UpdateConfig(reloaded.Enrolments)
-					d.watchManager.UpdateConfig(reloaded.Enrolments)
-					lastEnrolments = reloaded.Enrolments
-				}
-			}
-
-			rulesChanged := !reflect.DeepEqual(reloaded.Rules, lastRules)
-			intervalChanged := reloaded.Sync.Interval != lastInterval
-			if rulesChanged || intervalChanged {
-				changed = true
-				d.engine.UpdateConfig(reloaded.Rules, reloaded.Sync.Interval)
-				if d.web != nil {
-					d.web.UpdateDynamicConfig(reloaded.Rules, reloaded.Sync)
-				}
-				if intervalChanged && d.trackSyncTicks {
-					ticker.Reset(reloaded.Sync.Interval)
-				}
-				lastRules = reloaded.Rules
-				lastInterval = reloaded.Sync.Interval
-			}
-
-			if changed {
-				observability.RecordConfigReload(ctx, "applied")
-			} else {
-				observability.RecordConfigReload(ctx, "no_change")
-			}
-
-			// CLI mode keeps its historical behaviour: re-check enrolments
-			// every tick and trigger a sync when something newly enrolled.
-			if d.enrolManager != nil {
-				if ok, err := d.enrolManager.CheckAll(ctx); err != nil {
-					slog.Warn("enrolment check failed", "error", err)
-				} else if ok {
-					d.engine.TriggerSync()
-				}
-			}
+			refresh()
+		case <-d.reload:
+			slog.Info("manual config reload requested, re-reading configuration")
+			refresh()
 		}
 	}
 }
@@ -513,6 +771,18 @@ func emitConfigSourceLog(ctx context.Context, cfg *config.Config, path string) {
 	observability.LogRegistryConfigManaged(ctx, path)
 }
 
+// resolveTokenForMethod resolves a cached token, optionally excluding the token
+// file. Methods that keep no token at rest (mtls+os) still honour DOTVAULT_TOKEN,
+// which is an operator-supplied value in the process environment rather than
+// something dotvault persisted — the guarantee this method makes is about what
+// is written to disk, not about what an operator chooses to inject.
+func resolveTokenForMethod(tokenPath string, allowFile bool) string {
+	if allowFile {
+		return auth.ResolveToken(tokenPath)
+	}
+	return auth.ReadTokenEnv()
+}
+
 func runDaemon(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
@@ -533,12 +803,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	// loadCfg is the loader the daemon holds for its lifetime: the reload
 	// loop re-runs it every tick, and the remote overlay (conditional GET +
-	// merge) lives inside it so reloads converge on the remote state.
-	loadCfg, remoteStatus := withRemote(ctx, loadBase)
+	// merge) lives inside it so reloads converge on the remote state. The
+	// per-user preference overlay wraps outside it so a remote refresh can
+	// never quietly undo the user's own choice.
+	remoteLoad, remoteStatus := withRemote(ctx, loadBase)
+	loadCfg, relaxUserOverlay := withUserOverlay(remoteLoad)
 	cfg, err := loadCfg()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Startup accepted the user's file, so from here a later breakage in it
+	// must not stop policy reaching the daemon — see withUserOverlay.
+	relaxUserOverlay()
 	if rs := remoteStatus(); rs != nil {
 		slog.Info("remote config overlay active",
 			"url", rs.URL, "source", rs.Source, "etag", rs.ETag)
@@ -552,7 +828,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// (WatchdogSec=120s by default) and systemd would restart the
 	// process mid-startup. sd_notify(READY=1) is still delayed until
 	// after auth + initial sync further down.
-	go sdnotify.WatchdogLoop(ctx)
+	go watchdogLoop(ctx)
 
 	obsProvider := initObservability(ctx, cfg.Observability)
 	defer shutdownObservability(obsProvider)
@@ -563,6 +839,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Headers map, and the scrub below only reassigns cfg's field, so this
 	// copy retains the real headers. Only consumed when web is enabled.
 	obsCfgForWeb := cfg.Observability
+	// Snapshot the static config sections before the scrub below so the
+	// config-refresh loop can warn when a reload changes a section that
+	// needs a restart. The snapshot reduces observability.headers to a
+	// digest, so it does not retain the bearer tokens the scrub removes.
+	initialStatic := staticSectionsOf(cfg)
 	// Zero out the bearer-token map on the daemon's long-lived cfg now that
 	// the SDK has consumed it. cfg lives for the daemon's full lifetime;
 	// keeping Headers in the heap-resident Config struct gives a future log
@@ -570,6 +851,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// credential. The OTel SDK keeps its own copy internally; the web
 	// server (if enabled) holds obsCfgForWeb.
 	cfg.Observability.Headers = nil
+	cfg.Observability.Metrics.Headers = nil
+	cfg.Observability.Logs.Headers = nil
 
 	// Surface the registry-config notification through the OTel
 	// LoggerProvider now that it's installed. Deliberately not
@@ -579,19 +862,38 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Windows box) or be lost to the no-op global logger.
 	emitConfigSourceLog(ctx, cfg, cfgPath)
 
-	// Handle signals. SIGHUP triggers an immediate ~/.dotvault-token re-read
-	// via the LifecycleManager so a fresh token written by `dotvault
-	// login` is picked up within seconds, without waiting for the
-	// 5-minute tick. This is the manual counterpart to the in-process
-	// inotify watcher (internal/tokenwatch) wired in further down, which
-	// performs the same re-read automatically on token-file changes.
-	// Full config reload on SIGHUP is still not implemented.
+	// Handle signals. SIGHUP is the daemon's reload trigger: it re-reads
+	// ~/.dotvault-token immediately via the LifecycleManager (so a fresh
+	// token written by `dotvault login` is picked up within seconds,
+	// without waiting for the 5-minute tick — the manual counterpart to
+	// the in-process inotify watcher wired in further down) AND nudges
+	// the config-refresh loop to re-run the loader now instead of on its
+	// next tick. Dynamic sections (rules, enrolments, sync interval)
+	// apply in place; the refresh loop warns when static sections changed
+	// and a restart is required. On Windows SIGHUP is not delivered; the
+	// tray's "Reload config" entry drives the same two calls instead.
 	//
 	// lmPtr bridges the asynchronous signal goroutine (set up here, before
 	// any Vault work) and the LifecycleManager (constructed only after
-	// auth completes further down). A SIGHUP arriving before lm exists is
-	// metered and logged as a debug no-op rather than dropped silently.
+	// auth completes further down). A reload arriving before lm exists
+	// skips the token re-read (there is no token to manage yet) but is not
+	// dropped: configReloadCh is buffered, so the nudge sits pending until
+	// the refresh loop starts and consumes it.
 	var lmPtr atomic.Pointer[auth.LifecycleManager]
+	configReloadCh := make(chan struct{}, 1)
+	// reloadNow is the shared body of the daemon's manual reload triggers
+	// (SIGHUP here, the tray's "Reload config" entry further down).
+	reloadNow := func() {
+		if lm := lmPtr.Load(); lm != nil {
+			lm.Reload()
+		} else {
+			slog.Debug("reload requested before lifecycle manager is ready; skipping token re-read, config reload deferred")
+		}
+		select {
+		case configReloadCh <- struct{}{}:
+		default: // a reload is already pending
+		}
+	}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -602,12 +904,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				cancel()
 			case syscall.SIGHUP:
 				observability.RecordSIGHUP(ctx)
-				if lm := lmPtr.Load(); lm != nil {
-					slog.Info("received SIGHUP, re-reading vault token file")
-					lm.Reload()
-				} else {
-					slog.Debug("received SIGHUP before lifecycle manager is ready; ignoring")
-				}
+				slog.Info("received SIGHUP, re-reading vault token file and reloading configuration")
+				reloadNow()
 			}
 		}
 	}()
@@ -628,18 +926,73 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	tokenPath := paths.VaultTokenPath()
 
+	// One denied-token cache for the whole daemon, created before the first
+	// Vault call so every stage shares one verdict: the startup reuse check,
+	// the peer borrow, the headless idle loop, and (once it exists) the
+	// lifecycle manager. Without the sharing, each stage would independently
+	// re-present a token Vault had already rejected to an earlier one — which
+	// is how an expired ~/.dotvault-token turned into a permanent stream of
+	// denied lookup-self requests. See auth.TokenDenylist.
+	denyList := auth.NewTokenDenylist()
+
+	// Under mtls+os a token file found here is stale — left by plain mtls or an
+	// earlier build — and must not be adopted: reuse runs BEFORE any login, so
+	// otherwise the daemon would pick the stale credential up and certLogin's
+	// removal would never be reached. Env and the peer socket remain valid
+	// sources below; this is only about the file.
+	//
+	// It is deliberately NOT deleted here. Startup cannot yet know the method
+	// will work: mtls+os is Windows-only, so on Linux or macOS the login fails
+	// later at securestore.Open with ErrUnsupported. Deleting first would mean a
+	// misconfigured host loses a perfectly good token and then cannot obtain
+	// another — destroying a working credential to enforce a guarantee that
+	// login was never going to reach. Removal therefore happens in certLogin, on
+	// success, which is exactly the moment the guarantee is claimed for.
+	// Under vault.borrow_only this exclusion does not apply even when
+	// auth_method happens to be the literal "mtls+os": auth_method is
+	// ignored entirely in that mode (see config.VaultConfig.BorrowOnly), so
+	// there is no certLogin that will ever remove the file, and treating a
+	// leftover token as unusable would only break the promised manual
+	// override — see effectivePersistTokenAtRest.
+	reuseFromFile := effectivePersistTokenAtRest(cfg)
+
 	// Try to reuse an existing token before starting any auth flow.
 	authenticated := false
-	if token := auth.ResolveToken(tokenPath); token != "" {
+	if token := resolveTokenForMethod(tokenPath, reuseFromFile); token != "" {
 		vc.SetToken(token)
 		if _, err := vc.LookupSelf(ctx); err == nil {
 			slog.Info("reusing existing vault token")
 			authenticated = true
 		} else {
 			slog.Warn("existing token invalid, proceeding to fresh auth", "error", err)
+			denyList.NoteRejection(ctx, token, err)
 			vc.SetToken("")
 		}
 	}
+
+	// Resolve the local API socket (api.enabled) before any borrow decision:
+	// it is both a surface this daemon serves and an entry the daemon must
+	// exclude from its own borrow list.
+	apiSocket := resolveAPISocket(cfg)
+
+	// systemd socket activation housekeeping (Linux; no-op elsewhere). Any
+	// activated fd no enabled surface will claim is drained now — accepted
+	// and closed immediately, so clients fail fast — with a warning naming
+	// the mismatch. Draining rather than closing our fd, because systemd
+	// retains its own copy of the listener: closing ours would refuse
+	// nobody, it would just leave clients hanging in a backlog no one
+	// accepts. The keep list names the surfaces that claim their fds
+	// themselves: the web server takes "api" when it starts (below), and
+	// the SSH agent takes "agent" when its listener starts (also below).
+	var keepActivated []string
+	if apiSocket != "" {
+		keepActivated = append(keepActivated, "api")
+	}
+	if cfg.Agent.Enabled {
+		keepActivated = append(keepActivated, "agent")
+	}
+	uds.DrainUnclaimedActivation(keepActivated...)
+	borrowSockets := daemonBorrowSockets(cfg, apiSocket)
 
 	// Peer-socket token borrow. If no local token was usable and a peer socket
 	// is configured, try borrowing a live token from the peer before any
@@ -650,14 +1003,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// missing/stale socket or an unusable token leaves authenticated false and
 	// the normal flow continues. The borrowed token is held in memory only
 	// (never written to the token file) so the peer stays the single owner.
-	if !authenticated && cfg.Vault.TokenSocket != "" {
-		if token, _ := auth.FetchTokenFromSocket(ctx, cfg.Vault.TokenSocket); token != "" {
+	if !authenticated {
+		if token, source := auth.FetchTokenFromSockets(ctx, borrowSockets); token != "" {
 			vc.SetToken(token)
 			if _, err := vc.LookupSelf(ctx); err == nil {
-				slog.Info("using vault token borrowed from peer socket", "socket", cfg.Vault.TokenSocket)
+				slog.Info("using vault token borrowed from peer socket", "socket", source)
 				authenticated = true
 			} else {
-				slog.Warn("token from peer socket is not usable, proceeding to configured auth flow", "error", err)
+				slog.Warn("token from peer socket is not usable, proceeding to configured auth flow", "socket", source, "error", err)
+				denyList.NoteRejection(ctx, token, err)
 				vc.SetToken("")
 			}
 		}
@@ -671,26 +1025,52 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Build the SSH agent backend if enabled. Construction is side-effect-free
 	// (no Vault calls — vault-ca ephemeral keys are generated in memory), so
 	// it is safe before authentication and lets the web server surface agent
-	// status. The transport listener itself is started only after the first
-	// successful Vault auth, below.
+	// status.
 	var agentSvc *agent.Service
 	if cfg.Agent.Enabled {
 		agentSvc, err = agent.NewService(cfg.Agent, vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username, nil)
 		if err != nil {
 			return fmt.Errorf("ssh agent: %w", err)
 		}
+		// Serve the agent now, before authentication, for the same reason the
+		// HTTP surfaces start here: a client must get an honest answer while
+		// startup is still acquiring a token, not silence. The listener used
+		// to wait for the first successful auth, which under systemd socket
+		// activation left the already-published endpoint accepted-but-unread
+		// — and a daemon with no local token and no peer to borrow from waits
+		// in waitForHeadlessToken indefinitely, so ssh clients and `dotvault
+		// status` blocked forever rather than for the seconds of a restart.
+		// The backend's token probe keeps the pre-auth reply immediate ("no
+		// identities", and a refusal on Sign) until a token arrives; the
+		// reauth gate is wired below, once the lifecycle manager exists.
+		//
+		// A later startup failure can now return with the socket bound and no
+		// one waiting on Run to unlink it. That is benign: uds.Listen removes
+		// a stale socket no live instance owns on the next start, and under
+		// systemd activation the node belongs to the socket unit and must not
+		// be unlinked anyway.
+		go agentSvc.Run(ctx)
+		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
 	}
 
-	// Start web UI if enabled. We start it before authentication so it can
-	// serve the OIDC browser-based login flow.
+	// Start the HTTP surfaces if either is enabled — the loopback web UI
+	// (web.enabled) and/or the local API socket (api.enabled). Both are
+	// started before authentication: the web UI so it can serve the
+	// browser-based login flow, and the socket so a client that borrows from
+	// this daemon gets an honest 401 while startup is still acquiring a
+	// token, rather than finding no socket at all. That window is not
+	// hypothetical — a headless daemon can sit in waitForHeadlessToken
+	// indefinitely, and its clients should be able to poll it throughout.
 	var webServer *web.Server
-	if cfg.Web.Enabled {
+	if cfg.Web.Enabled || apiSocket != "" {
 		webCfg := web.ServerConfig{
 			WebCfg:        cfg.Web,
 			VaultCfg:      cfg.Vault,
 			SyncCfg:       cfg.Sync,
 			ObsCfg:        obsCfgForWeb,
 			AgentCfg:      cfg.Agent,
+			APICfg:        cfg.API,
+			APISocketPath: apiSocket,
 			RemoteCfg:     cfg.RemoteConfig,
 			RemoteStatus:  remoteStatus,
 			Rules:         cfg.Rules,
@@ -699,6 +1079,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
+			// Lets the login view render the right form for the one-time
+			// certificate bootstrap. Empty for every non-mtls method.
+			BootstrapMethod: bootstrapMethodForWeb(cfg),
+			BootstrapMount:  bootstrapMountForWeb(cfg),
 		}
 		if agentSvc != nil {
 			webCfg.Agent = agentSvc.Backend
@@ -728,12 +1112,31 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 	// Authenticate if needed.
 	if !authenticated {
-		if cfg.Vault.AuthMethod == "mtls" || cfg.Vault.AuthMethod == "mtls+tpm" {
+		if cfg.Vault.BorrowOnly {
+			// This host runs no fresh-auth flow of its own, by design (see
+			// config.VaultConfig.BorrowOnly): AuthMethod, mtls settings, the
+			// web login view, and any interactive TTY prompt are all beside
+			// the point here. The only path to a token is borrowing one over
+			// borrowSockets, which the inline attempt above already tried
+			// once and failed (authenticated is still false) — so idle and
+			// keep retrying the borrow exactly as a headless host with no
+			// interactive facility does, rather than failing startup. A
+			// token dropped into the file manually (an emergency override)
+			// is still picked up, since waitForHeadlessToken watches it too.
+			slog.Warn("borrow-only mode: this host runs no fresh-auth flow of its own (auth_method, if set, is ignored); idling until a vault token can be borrowed from a peer socket", "sockets", borrowSockets)
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath, cfg.Vault.BorrowOnly), borrowSockets, denyList) {
+				slog.Info("shutting down before a vault token was borrowed")
+				return nil
+			}
+			slog.Info("borrowed vault token from peer socket; continuing startup")
+			authenticated = true
+		} else if config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 			// Certificate auth: the steady state (load credential → cert
 			// login) needs no human and works headlessly, so it takes
 			// precedence over the web/TTY branching. Only first-run bootstrap
-			// needs a TTY (or the configured BYO cert); the flow surfaces a
-			// clear error if neither is available.
+			// needs a human — and when the web UI is enabled that bootstrap
+			// runs through the web login view (see below) rather than requiring a
+			// browser dotvault can open or a TTY to prompt on.
 			mgr := &auth.Manager{
 				VaultClient:      vc,
 				TokenFilePath:    tokenPath,
@@ -741,16 +1144,61 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				TokenSocket:      cfg.Vault.TokenSocket,
+				TokenSockets:     borrowSockets,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
 			}
+			// Web-driven bootstrap. Only the first-run bootstrap needs a
+			// human; wiring the hook costs nothing when a credential already
+			// exists, because runBootstrap is never reached in that case.
+			// Without it a host with no browser dotvault can open and no TTY
+			// could not bootstrap at all even with the web UI up and serving.
+			//
+			// The hook hands back a RAW, un-downscoped token that the login view
+			// login deliberately does not adopt: it carries pki/sign and is
+			// consumed immediately to mint the certificate. See
+			// web.Server.BootstrapLogin.
+			if webServer != nil {
+				mgr.BootstrapLogin = func(ctx context.Context) (string, error) {
+					// Opening the browser lives inside the hook, not beside
+					// it: the hook runs only when a bootstrap is genuinely
+					// needed, so the steady-state daemon start (credential
+					// present, straight to cert login) never pops a window.
+					//
+					// Launch is backgrounded so the wait below registers
+					// bootstrap mode immediately — the login view polls
+					// /api/v1/status for it, and OpenURL can block while it
+					// spawns the browser process.
+					url := webServer.URL()
+					slog.Info("certificate bootstrap required; opening browser for login", "url", url)
+					go func() {
+						if err := browser.OpenURL(url); err != nil {
+							slog.Warn("failed to open browser, please visit URL manually", "url", url, "error", err)
+							// Under dotvaultw.exe (GUI subsystem) stderr goes
+							// nowhere and the tray is not installed until much
+							// later in startup, so the log line above would
+							// leave the user with a daemon blocking on a login
+							// they cannot reach. A desktop notification is the
+							// only channel available at this point; it carries
+							// the URL as a clickable action on Windows and in
+							// the body elsewhere. Best-effort by design — a
+							// notification failure must not fail the bootstrap.
+							notifyBootstrapURL(url)
+						}
+					}()
+					return webServer.BootstrapLogin(ctx)
+				}
+			}
 			if err := mgr.Authenticate(ctx); err != nil {
 				return fmt.Errorf("authenticate: %w", err)
 			}
-		} else if webServer != nil {
-			// All auth methods go through the web UI when enabled.
+		} else if webServer != nil && cfg.Web.Enabled {
+			// All auth methods go through the web UI when enabled. Gated on
+			// cfg.Web.Enabled, not merely on the server existing: a
+			// socket-only server has no browsable address and none of the
+			// auth routes registered, so routing login through it would block
+			// forever waiting for a page nobody can open.
 			url := webServer.URL()
 			slog.Info("opening browser for authentication", "url", url)
 			if err := browser.OpenURL(url); err != nil {
@@ -769,7 +1217,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from the peer socket")
-			if !waitForHeadlessToken(ctx, vc, tokenPath, cfg.Vault.TokenSocket) {
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath, cfg.Vault.BorrowOnly), borrowSockets, denyList) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -790,7 +1238,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				TokenSocket:      cfg.Vault.TokenSocket,
+				TokenSockets:     borrowSockets,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
@@ -807,11 +1255,56 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// full re-auth. In web mode register a callback that clears the
 	// in-memory token, invalidating any browser session sitting on a
 	// stale "logged-in" view.
+	//
+	// Under a no-persist method the path is deliberately NOT wired, so the
+	// manager never reads the file (see auth.PersistTokenAtRest). Removing the
+	// file at login would otherwise be undone at runtime: a file appearing
+	// afterwards — restored from a backup, written by an older build, or
+	// dropped by anything running as this user — would be adopted on the next
+	// recovery, and ahead of the certificate hook that is the correct source
+	// of a replacement token for this method.
 	lm := auth.NewLifecycleManager(vc, 5*time.Minute, cfg.Vault.DisableTokenRenewal)
-	lm.SetTokenFilePath(tokenPath)
-	lm.SetTokenSocket(cfg.Vault.TokenSocket)
+	if effectivePersistTokenAtRest(cfg) {
+		lm.SetTokenFilePath(tokenPath)
+	}
+	lm.SetTokenSockets(borrowSockets)
+	// Hand over the cache startup has been populating, so a token the reuse
+	// check or the headless idle already watched Vault reject is not presented
+	// again by the recovery poll.
+	lm.SetTokenDenylist(denyList)
 	if webServer != nil {
 		lm.SetOnReauth(webServer.ForceReauth)
+		// Let /api/v1/token decline once this daemon knows its own token is
+		// dead, so a borrowing client is not handed a credential that cannot
+		// work. Wired here because the lifecycle manager does not exist when
+		// the server is constructed.
+		webServer.SetReauthGate(lm)
+	}
+	// Certificate auth recovers without a human: the credential that mints
+	// tokens is already on this host, so an expired or revoked token is fixable
+	// on the spot. Registering this is what keeps a cert-auth daemon headless
+	// in steady state — the startup cert login is otherwise the only one, and
+	// ReissueIfDue rotates the certificate rather than the token, so a token
+	// that expired mid-session would strand the daemon until a restart.
+	// Gated the same way mtlsParams is (IsMTLSMethod AND NOT borrow_only): a
+	// borrow-only host must recover only by re-borrowing (which tryReload
+	// already does via lm's token sockets), never by a cert login of its
+	// own, even when auth_method happens to be a cert method left over from
+	// a shared base config — see mtlsParams and config.VaultConfig.BorrowOnly.
+	if config.IsMTLSMethod(cfg.Vault.AuthMethod) && !cfg.Vault.BorrowOnly {
+		recoverMgr := &auth.Manager{
+			VaultClient:   vc,
+			TokenFilePath: tokenPath,
+			AuthMethod:    cfg.Vault.AuthMethod,
+			AuthMount:     cfg.Vault.AuthMount,
+			AuthRole:      cfg.Vault.AuthRole,
+			Policy:        vaultPolicyConstraint(cfg),
+			Username:      username,
+			MTLS:          mtlsParams(cfg, username),
+			// No BootstrapLogin: recovery must never start a bootstrap. See
+			// Manager.CertLoginFromStore.
+		}
+		lm.SetRecover(recoverMgr.CertLoginFromStore)
 	}
 	lmPtr.Store(lm)
 	lifecycleErrCh := lm.Start(ctx)
@@ -831,7 +1324,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			AuthMount:        cfg.Vault.AuthMount,
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-			TokenSocket:      cfg.Vault.TokenSocket,
+			TokenSockets:     borrowSockets,
 			Policy:           vaultPolicyConstraint(cfg),
 			Username:         username,
 			MTLS:             mtlsP,
@@ -852,15 +1345,50 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	// Start the SSH agent listener now that we hold a Vault token. The gate is
-	// wired before the listener accepts connections so a Sign issued during a
-	// token refresh blocks briefly on the lifecycle manager instead of failing.
-	// Run supervises the listener (restart-on-terminate) until ctx is
-	// cancelled; the backend persists across token refreshes without a restart.
+	// Wire the SSH agent's re-auth gate now that the lifecycle manager exists,
+	// so a Sign issued during a later token refresh blocks briefly on it
+	// instead of failing. The listener is already serving (started before
+	// authentication, above); SetReauthGate is atomic precisely so it can be
+	// wired under a live listener.
+	//
+	// SetReauthReporter is the write side of the same relationship: a source
+	// error (the vault-ca source's certificate mint hitting a 403, most
+	// often) is reported back to lm so recovery starts immediately instead of
+	// waiting out lm's own checkInterval — see LifecycleManager.NotifyRejected.
 	if agentSvc != nil {
 		agentSvc.Backend.SetReauthGate(lm)
-		go agentSvc.Run(ctx)
-		slog.Info("ssh agent enabled", "endpoint", agentSvc.Endpoint(), "endpoints", agentSvc.Endpoints())
+		agentSvc.Backend.SetReauthReporter(lm)
+	}
+
+	// Mount the filesystem now that we hold a Vault token: every read it
+	// serves is a Vault call, so a mount that came up first would answer
+	// errors to anything that happened to look at the directory. The agent
+	// listener deliberately does not wait this way (it is already serving);
+	// the difference is that an agent has an honest empty answer and a
+	// filesystem has none. Never fatal — see startFUSE.
+	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
+		webServer.SetFUSEStatus(fuseSvc.Status)
+	}
+
+	// Build and start the managed-SSH-forward subsystem now that we hold a
+	// Vault token: its SSH identity (the agent backend's Signers) may need
+	// to mint a Vault-CA certificate or read a KV-stored key, either of
+	// which requires an authenticated Vault client. Deferred to this point
+	// rather than constructed alongside agentSvc above so a remote's first
+	// connection attempt never races startup and lands in the 5-minute
+	// auth-failure backoff floor over what would otherwise resolve within
+	// seconds. Neither precondition (agent.enabled, a local API surface) is
+	// fatal — see startSSHForwards.
+	var sshBackend sshfwd.SignerSource
+	if agentSvc != nil {
+		sshBackend = agentSvc.Backend
+	}
+	sshManager, sshRegistry, _ := startSSHForwards(ctx, cfg, sshBackend, username)
+	if sshManager != nil {
+		defer sshManager.Close()
+		if webServer != nil {
+			webServer.SetSSHRegistry(sshRegistry, sshManager.Status)
+		}
 	}
 
 	// Watch the token file for replacement and nudge the lifecycle
@@ -872,11 +1400,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// that blocks until shutdown. Creation and update events trigger a
 	// reload; deletes are ignored so the daemon keeps using its current
 	// token until a new one is written.
+	//
+	// Skipped entirely under a no-persist method: there is no file to watch,
+	// and waking the manager on one appearing is precisely the behaviour the
+	// unwired path above exists to prevent.
 	onTokenChange := func() {
 		slog.Debug("vault token file changed, re-reading")
 		lm.Reload()
 	}
-	if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
+	if !effectivePersistTokenAtRest(cfg) {
+		slog.Debug("token-file watcher not started; this auth method keeps no token at rest", "auth_method", cfg.Vault.AuthMethod)
+	} else if tw, err := tokenwatch.New(tokenPath, onTokenChange); err != nil {
 		slog.Warn("token-file watcher unavailable; relying on periodic re-read", "error", err)
 	} else {
 		onTokenChange() // reconcile a token that appeared during startup
@@ -888,32 +1422,38 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	// Watch the peer token socket (if configured) for materialisation or
+	// Watch each configured peer token socket for materialisation or
 	// replacement and, *only when the daemon actually needs a token*, nudge the
 	// lifecycle manager to re-borrow. An SSH RemoteForward that reconnects
 	// re-creates the socket; if the daemon's borrowed token expired while the
 	// socket was stale (so the lifecycle manager is already in its needs-reauth
 	// recovery state), this picks up a fresh peer token the moment the socket
 	// comes back rather than waiting out the 10s recovery poll. The
-	// NeedsReauth gate is deliberate: tryReload adopts any *different* valid
+	// re-auth gate is deliberate: tryReload adopts any *different* valid
 	// candidate, so an unconditional nudge would demote a still-healthy token
 	// to a borrowed one every time the forwarder flapped. lm.Reload triggers
 	// tryReload, which already consults the socket after the file/env
 	// candidates. Linux-only (inotify); a no-op elsewhere, where the recovery
 	// poll already re-borrows within 10s. The watch is on the socket's parent
 	// directory because a reconnecting forwarder replaces the inode.
-	if cfg.Vault.TokenSocket != "" {
-		if socketPath, err := paths.ExpandHome(cfg.Vault.TokenSocket); err != nil {
-			slog.Debug("could not expand peer token socket path for watching; relying on periodic re-borrow", "error", err)
+	for _, configured := range borrowSockets {
+		if socketPath, err := paths.ExpandHome(configured); err != nil {
+			slog.Debug("could not expand peer token socket path for watching; relying on periodic re-borrow", "socket", configured, "error", err)
 		} else if sw, err := tokenwatch.New(socketPath, func() {
-			if !lm.NeedsReauth() {
+			// ReauthSignalled, not NeedsReauth: the question here is "does the
+			// daemon need someone to find it a token", which is the signal.
+			// NeedsReauth is the broader gate and is also true while a reload is
+			// already in flight — nudging there would queue a second reload
+			// that adopts any different valid candidate, which is exactly the
+			// demotion of a healthy token this check exists to prevent.
+			if !lm.ReauthSignalled() {
 				// Current token is healthy; don't demote it to a borrowed one.
 				return
 			}
-			slog.Debug("peer token socket changed and re-auth is pending, re-borrowing")
+			slog.Debug("peer token socket changed and re-auth is pending, re-borrowing", "socket", socketPath)
 			lm.Reload()
 		}); err != nil {
-			slog.Debug("token-socket watcher unavailable; relying on periodic re-borrow", "error", err)
+			slog.Debug("token-socket watcher unavailable; relying on periodic re-borrow", "socket", configured, "error", err)
 		} else {
 			go func() {
 				defer sw.Close()
@@ -956,7 +1496,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 		for err := range lifecycleErrCh {
 			slog.Warn("token lifecycle error, re-authentication may be needed", "error", err)
-			if webServer != nil {
+			// cfg.Web.Enabled, not merely webServer != nil: a socket-only
+			// server has no browsable address, so re-opening a browser would
+			// mean handing the opener an empty URL.
+			if webServer != nil && cfg.Web.Enabled {
 				if lastReauthOpen.IsZero() || time.Since(lastReauthOpen) >= reauthCooldown {
 					lastReauthOpen = time.Now()
 					url := webServer.URL()
@@ -972,8 +1515,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// enrolMgr drives the terminal wizard and exists only in CLI-interactive
 	// mode; the refresh loop below treats it as optional.
 	var enrolMgr *enrol.Manager
-	if webServer != nil {
-		// Web mode: let the frontend drive enrolments.
+	if webServer != nil && cfg.Web.Enabled {
+		// Web mode: let the browser drive enrolments. Gated on the browser
+		// surface actually existing — a socket-only daemon registers no
+		// enrolment routes and no browser can reach a Unix socket, so waiting
+		// for the browser to complete an enrolment would block until ctx.
+		//
+		// WaitForEnrolments returns immediately unless the first-run wizard is
+		// actually warranted (nothing enrolled yet); an outstanding enrolment
+		// on a host that already has credentials is addressed from the main
+		// site and must not hold up the sync engine. See NeedsWizard.
 		webServer.InitEnrolments(ctx, cfg.Enrolments)
 
 		waitDone := make(chan struct{})
@@ -1042,13 +1593,15 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	go runConfigRefresh(ctx, refreshDeps{
 		load:           loadCfg,
 		interval:       refreshInterval,
-		trackSyncTicks: cfg.RemoteConfig.RefreshInterval == 0,
 		initial:        cfg,
+		initialStatic:  initialStatic,
+		reload:         configReloadCh,
 		engine:         engine,
 		refreshManager: rm,
 		watchManager:   wm,
 		web:            webServer,
 		enrolManager:   enrolMgr,
+		sshRegistry:    sshRegistry,
 	})
 
 	slog.Info("starting dotvault daemon", "version", version, "user", username)
@@ -1083,7 +1636,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		// NOTIFY_SOCKET is unset; a non-nil return from Ready()
 		// means a genuine socket write failure (warn loudly so
 		// the systemd "start-limit-hit" log has a breadcrumb).
-		if err := sdnotify.Ready(); err != nil {
+		if err := sdNotify(daemon.SdNotifyReady); err != nil {
 			slog.Warn("sd_notify READY=1 failed; systemd unit may time out", "error", err)
 		}
 	}
@@ -1106,8 +1659,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			slog.Info("exit requested from tray")
 			cancel()
 		},
+		// Windows never delivers SIGHUP, so the tray menu is dotvaultw's
+		// (and the console daemon's) reload trigger. Same body as the
+		// SIGHUP handler: token-file re-read plus an immediate
+		// config-refresh pass.
+		OnReload: func() {
+			slog.Info("config reload requested from tray, re-reading vault token file and reloading configuration")
+			reloadNow()
+		},
 	}
 	if webServer != nil {
+		// Empty for a socket-only daemon; the tray omits its "View web UI"
+		// entry rather than opening nothing.
 		trayCfg.WebURL = webServer.URL()
 	}
 	if err := tray.Run(ctx, trayCfg); err != nil {
@@ -1127,7 +1690,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// Stop the sync loop and propagate its result. Notify systemd we're
 	// stopping so the unit state reflects the shutdown sequence rather
 	// than appearing to crash.
-	_ = sdnotify.Stopping()
+	_ = sdNotify(daemon.SdNotifyStopping)
 	cancel()
 	return <-loopErrCh
 }
@@ -1152,6 +1715,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// reason as the daemon path — keep credentials out of the
 	// heap-resident Config struct.
 	cfg.Observability.Headers = nil
+	cfg.Observability.Metrics.Headers = nil
+	cfg.Observability.Logs.Headers = nil
 
 	// Same rationale as runDaemon — emit the GPO-managed notification
 	// after the LoggerProvider is wired up. See emitConfigSourceLog.
@@ -1168,6 +1733,37 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	slog.Info("running single sync cycle", "user", username)
 	return engine.RunOnce(ctx)
+}
+
+// reportCertCredential prints what can be known about a certificate-auth host
+// that keeps no token at rest, without contacting Vault or minting anything.
+//
+// The certificate envelope IS the credential under mtls+os, so its presence and
+// validity window are the meaningful status — more so than a token, which is
+// transient and re-derived on demand.
+func reportCertCredential(cfg *config.Config) {
+	fmt.Printf("Auth: certificate auth (%s) — no token is cached at rest by design\n", cfg.Vault.AuthMethod)
+	dir := mtlsStorageDir(cfg)
+	info, err := auth.InspectCertCredential(dir)
+	switch {
+	case err != nil:
+		fmt.Printf("  certificate: envelope in %s is unreadable (%v)\n", dir, err)
+		return
+	case !info.Present:
+		fmt.Printf("  certificate: none enrolled in %s (a bootstrap is required)\n", dir)
+		return
+	}
+	state := "valid"
+	if info.Expired {
+		// Worth calling out rather than just printing a past date: re-issuance
+		// needs a still-valid certificate, so this state is not self-healing.
+		state = "EXPIRED — no token can be derived; re-enrolment required"
+	}
+	fmt.Printf("  certificate: %s (identity %s, backend %s, not_after %s)\n",
+		state, info.Identity, info.Backend, info.NotAfter.Format(time.RFC3339))
+	if !info.Expired {
+		fmt.Println("  the daemon re-derives an operational token from this certificate as needed")
+	}
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
@@ -1198,18 +1794,46 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// borrowing from a peer (no token file at rest) reports "not
 	// authenticated" here even though the running daemon is happily serving
 	// secrets — see vault.token_socket in CLAUDE.md.
-	token := auth.ResolveToken(paths.VaultTokenPath())
-	borrowed := false
-	if token == "" && cfg.Vault.TokenSocket != "" {
-		if peerToken, _ := auth.FetchTokenFromSocket(ctx, cfg.Vault.TokenSocket); peerToken != "" {
+	//
+	// Under mtls+os there is deliberately no token at rest, so the file is not
+	// a source here — and its absence says nothing about whether the host is
+	// working. Report on the credential that actually exists instead: the
+	// certificate. That is verifiable from disk, side-effect free, and closer to
+	// what the operator wants to know. This carve-out does not apply under
+	// vault.borrow_only, even when auth_method happens to be the literal
+	// "mtls+os": auth_method is ignored entirely in that mode, so there is no
+	// certificate to report on, and persistsToken (effectivePersistTokenAtRest)
+	// folds that in so the token-file/borrow-only paths below apply instead.
+	//
+	// The alternative — performing a certificate login so status could show a
+	// live token — was rejected: `status` is an informational command, and
+	// minting a Vault token (with its lease) merely to answer "am I set up?"
+	// makes an observation command a mutating one.
+	persistsToken := effectivePersistTokenAtRest(cfg)
+	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
+	borrowSockets := cfg.TokenBorrowSockets()
+	borrowedFrom := ""
+	if token == "" {
+		if peerToken, source := auth.FetchTokenFromSockets(ctx, borrowSockets); peerToken != "" {
 			token = peerToken
-			borrowed = true
+			borrowedFrom = source
 		}
 	}
 	switch {
-	case token == "" && cfg.Vault.TokenSocket != "":
-		fmt.Println("Auth: not authenticated (no local token; peer socket holds no token)")
-		fmt.Printf("  token socket: %s\n", cfg.Vault.TokenSocket)
+	case token == "" && !persistsToken:
+		// mtls+os keeps no token at rest, so "no token" is the designed state,
+		// not a fault. Report the certificate — the credential that actually
+		// persists — INSTEAD of the token verdict below, which would otherwise
+		// print a contradictory "not authenticated" line beneath it.
+		reportCertCredential(cfg)
+	case token == "" && len(borrowSockets) > 0:
+		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
+		for _, s := range borrowSockets {
+			fmt.Printf("  token socket: %s\n", s)
+		}
+		if cfg.Vault.BorrowOnly {
+			fmt.Println("  (borrow-only mode: this host runs no fresh-auth flow of its own and will keep retrying the borrow)")
+		}
 	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
 	default:
@@ -1220,10 +1844,23 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		} else {
 			ttl := secret.Data["ttl"]
 			fmt.Printf("Auth: authenticated (TTL: %v)\n", ttl)
-			if borrowed {
-				fmt.Printf("  source: borrowed from peer socket (%s)\n", cfg.Vault.TokenSocket)
+			if borrowedFrom != "" {
+				fmt.Printf("  source: borrowed from peer socket (%s)\n", borrowedFrom)
 				fmt.Println("  (no token file at rest — the peer is the sole owner; re-borrowed on each login/refresh)")
 			}
+		}
+	}
+
+	// Report the local API socket, if configured: whether this host serves
+	// the borrow endpoint is the first thing to check when a client on it
+	// cannot get a token.
+	if cfg.API.Enabled {
+		if path, err := cfg.APISocketPath(); err != nil {
+			fmt.Printf("\nLocal API socket: enabled (path unresolved: %v)\n", err)
+		} else if _, statErr := os.Stat(path); statErr != nil {
+			fmt.Printf("\nLocal API socket: enabled but not present at %s (daemon not running?)\n", path)
+		} else {
+			fmt.Printf("\nLocal API socket: %s\n", path)
 		}
 	}
 
@@ -1245,6 +1882,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	printRemoteConfigStatus(remoteStatus)
 
 	printAgentStatus(ctx, cfg)
+
+	printFUSEStatus(cfg)
 
 	return nil
 }
@@ -1283,9 +1922,12 @@ func printRemoteConfigStatus(remoteStatus func() *remoteconfig.Status) {
 // an agent *client* — it dials the running daemon's socket / pipe and lists the
 // identities being served (the `ssh-add -l` equivalent), so the output reflects
 // what the daemon actually offers, including a minted certificate's true
-// remaining validity. status never creates the endpoint; a failure to connect
-// is therefore unexpected (the daemon isn't running, or hasn't authenticated
-// far enough to start the listener) and is reported as such.
+// remaining validity. status never creates the endpoint, so a failure to reach
+// it is unexpected (the daemon isn't running) and is reported as such — while a
+// daemon that answered and simply could not resolve any identity is reported as
+// its own case, since the two send an operator looking in completely different
+// places. The query is bounded end to end, not just at the dial — see
+// agent.QueryListening for why the dial is the half that cannot hang.
 func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Agent.Enabled {
 		return
@@ -1295,13 +1937,27 @@ func printAgentStatus(ctx context.Context, cfg *config.Config) {
 	fmt.Printf("  endpoint: %s\n", endpoint)
 
 	ids, err := agent.QueryListening(ctx, endpoint)
+	if errors.Is(err, agent.ErrListIdentities) {
+		// The endpoint answered, so the daemon is running and serving. Only
+		// identity resolution failed — usually a Vault-CA source that could
+		// not mint for a moment, often while the daemon replaces its own Vault
+		// token. Pointing the operator at a missing daemon here would send
+		// them after the wrong thing entirely.
+		fmt.Printf("  serving, but no identities could be resolved: %v\n", err)
+		fmt.Println("  (check the per-source errors on the web dashboard, or retry — a source may be mid-recovery)")
+		return
+	}
 	if err != nil {
 		fmt.Printf("  unreachable: %v\n", err)
 		fmt.Println("  (agent is enabled but the daemon is not serving this endpoint — is `dotvault run` active?)")
 		return
 	}
 	if len(ids) == 0 {
-		fmt.Println("  (no identities loaded)")
+		// The daemon serves the agent before it authenticates, so an empty
+		// list is the normal pre-auth answer as well as the "no keys in Vault"
+		// one. Naming both spares the reader guessing which they are looking
+		// at; the Auth line above says which it is.
+		fmt.Println("  (no identities loaded — the daemon holds no Vault token yet, or no configured key source resolved one)")
 		return
 	}
 	for _, id := range ids {
@@ -1335,6 +1991,26 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// dotvault login exists to force a fresh interactive auth flow,
+	// ignoring any cached token — and under borrow-only there is no such
+	// flow, ever, regardless of whether a peer happens to hold a
+	// borrowable token right now. Letting mgr.Login below try the borrow
+	// anyway would make this command succeed without persisting anything
+	// (a borrowed token is deliberately held in memory only), which
+	// contradicts both its own "force a fresh login" contract and the
+	// "refused outright" semantics vault.borrow_only documents. Refuse
+	// unconditionally instead, before ever touching Vault — mirrors
+	// client.Client.Login's identical borrow-only refusal.
+	//
+	// Deliberately NOT wrapping auth.ErrBorrowOnly: that sentinel means "a
+	// borrow was attempted and failed" (see its doc), which is not what
+	// happened here — no borrow is ever attempted on this path. Reusing it
+	// would make errors.Is(err, auth.ErrBorrowOnly) claim a failed attempt
+	// that never occurred; a plain error avoids that false signal.
+	if cfg.Vault.BorrowOnly {
+		return fmt.Errorf("login: this host is configured with vault.borrow_only: true — it runs no fresh-auth flow of its own, so there is nothing for `dotvault login` to force; `dotvault run` retries the borrow from vault.token_socket %q automatically, and `dotvault status` reports whether a token is currently borrowable", cfg.Vault.TokenSocket)
+	}
+
 	username, err := paths.Username()
 	if err != nil {
 		return fmt.Errorf("resolve username: %w", err)
@@ -1356,7 +2032,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSocket:      cfg.Vault.TokenSocket,
+		TokenSockets:     freshLoginBorrowSockets(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -1551,6 +2227,55 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// Certificate auth: what this hook should do depends entirely on whether the
+	// certificate is still usable, and that is answerable from a local file.
+	//
+	// While it is valid, no interactive login can ever be required — the daemon
+	// re-derives an operational token from the certificate on demand — so the
+	// right answer is to return immediately. That matters most under mtls+os,
+	// which keeps no token at rest: the hook would otherwise find no token file
+	// on every single shell start and head toward a login that is neither
+	// possible nor needed. It also respects the latency budget, since a real
+	// certificate login (a TLS handshake plus a hardware key operation) has no
+	// business in shell startup merely to confirm something already true.
+	//
+	// But a certificate that is missing or expired is exactly the case this
+	// command exists for. Re-issuance requires a still-valid certificate, so once
+	// it lapses — a laptop left unused past its re-issue window, say — no token
+	// is derivable and the host needs a fresh bootstrap, which IS interactive.
+	// Returning silently there would report health on a host that cannot
+	// authenticate at all, and the user would discover it later as an
+	// unexplained failure. So we warn and fall through to the normal flow, which
+	// performs the bootstrap.
+	certBootstrapReason := ""
+	// Scoped to methods that keep no token at rest, i.e. mtls+os. Plain mtls and
+	// mtls+tpm still cache a token, and this hook still renews it for them —
+	// short-circuiting on certificate validity there would silently stop that
+	// renewal, which is a behaviour change to methods this work must not touch.
+	if !cfg.Vault.BorrowOnly && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) && config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		info, err := auth.InspectCertCredential(mtlsStorageDir(cfg))
+		switch {
+		case err != nil:
+			// Present but unreadable: treat as needing attention rather than
+			// assuming either state.
+			certBootstrapReason = "this host's certificate credential could not be read; a fresh enrolment is needed"
+		case !info.Present:
+			certBootstrapReason = "this host has no certificate enrolled yet"
+		case info.Expired:
+			certBootstrapReason = fmt.Sprintf("this host's certificate expired at %s and can no longer be renewed; a fresh enrolment is needed",
+				info.NotAfter.Format(time.RFC3339))
+		default:
+			slog.Debug("login-check: certificate valid, no interactive login required",
+				"method", cfg.Vault.AuthMethod, "not_after", info.NotAfter.Format(time.RFC3339))
+			// Refresh like every other exit past the freshness check, so
+			// concurrent shells stop at the marker instead of repeating this.
+			_ = loginsuppress.Refresh(markerPath)
+			return nil
+		}
+		// Fall through with certBootstrapReason set: it replaces the default
+		// notice below, and the configured flow then performs the bootstrap.
+	}
+
 	vc, err := vault.NewClient(vault.Config{
 		Address:       cfg.Vault.Address,
 		CACert:        cfg.Vault.CACert,
@@ -1569,6 +2294,9 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 	// Default covers the "no cached token" path; the branches below
 	// overwrite it for the expired / revoked cases.
 	loginReason := "no cached Vault token was found"
+	if certBootstrapReason != "" {
+		loginReason = certBootstrapReason
+	}
 	if token != "" {
 		vc.SetToken(token)
 		secret, lookupErr := vc.LookupSelf(ctx)
@@ -1643,7 +2371,8 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSocket:      cfg.Vault.TokenSocket,
+		TokenSockets:     cfg.TokenBorrowSockets(),
+		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -1879,7 +2608,8 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSocket:      cfg.Vault.TokenSocket,
+		TokenSockets:     cfg.TokenBorrowSockets(),
+		BorrowOnly:       cfg.Vault.BorrowOnly,
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2174,17 +2904,33 @@ func stderrSupportsColour() bool {
 // isInteractive reports whether stdin is connected to a TTY, i.e. whether
 // the daemon can prompt the user for credentials, MFA passcodes, etc.
 // mtlsParams builds the cert-auth parameters for the auth.Manager. It returns
-// nil unless auth_method is "mtls" or "mtls+tpm", so the LDAP/OIDC/token paths
-// are unaffected. StorageDir defaults to {cache_dir}/mtls.
+// nil unless auth_method drives the cert-auth flow (mtls / mtls+tpm / mtls+os),
+// so the LDAP/OIDC/token paths are unaffected. StorageDir defaults to
+// {cache_dir}/mtls.
+// mtlsStorageDir resolves where the certificate credential envelope lives,
+// applying the same default as mtlsParams so callers that only need to inspect
+// it (status, login-check) agree with the flow that writes it.
+func mtlsStorageDir(cfg *config.Config) string {
+	if d := cfg.Vault.MTLS.StorageDir; d != "" {
+		return d
+	}
+	return filepath.Join(paths.CacheDir(), "mtls")
+}
+
 func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
-	if cfg.Vault.AuthMethod != "mtls" && cfg.Vault.AuthMethod != "mtls+tpm" {
+	// Under borrow_only, auth_method (and therefore vault.mtls) is ignored
+	// entirely — see config.VaultConfig.BorrowOnly — so this must return nil
+	// even when auth_method happens to be a cert method, e.g. because it is
+	// shared with a non-borrow-only deployment of the same base config.
+	// Every caller of mtlsParams that wires cert-specific behaviour (startup
+	// dispatch, unattended recovery, the periodic reissue check) keys off
+	// this nil, so gating here is what keeps that behaviour off for every
+	// one of them without repeating the check at each call site.
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
 		return nil
 	}
 	m := cfg.Vault.MTLS
-	storageDir := m.StorageDir
-	if storageDir == "" {
-		storageDir = filepath.Join(paths.CacheDir(), "mtls")
-	}
+	storageDir := mtlsStorageDir(cfg)
 	return &auth.MTLSParams{
 		VaultAddress:    cfg.Vault.Address,
 		CACert:          cfg.Vault.CACert,
@@ -2197,13 +2943,19 @@ func mtlsParams(cfg *config.Config, username string) *auth.MTLSParams {
 		PKIMount:        m.PKIMount,
 		PKIRole:         m.PKIRole,
 		KeyType:         m.KeyType,
+		KeyBits:         m.KeyBits,
 		CommonName:      m.CommonName,
 		TTL:             m.TTL,
 		ReissueBefore:   m.ReissueBeforeDur,
-		SealToPCRs:      m.SealToPCRs,
-		StorageDir:      storageDir,
-		BYOCert:         m.BYO.Cert,
-		BYOKey:          m.BYO.Key,
+		// Resolve the tri-state here: MTLSParams carries settled values, so
+		// internal/auth never re-derives what an unset field meant. Inverted to
+		// match the param's negative spelling, which keeps its zero value the
+		// safe one for the other sites that build this struct.
+		SkipRevokeSuperseded: !m.RevokeSupersededEnabled(),
+		SealToPCRs:           m.SealToPCRs,
+		StorageDir:           storageDir,
+		BYOCert:              m.BYO.Cert,
+		BYOKey:               m.BYO.Key,
 	}
 }
 
@@ -2218,18 +2970,113 @@ func vaultPolicyConstraint(cfg *config.Config) auth.PolicyConstraint {
 	}
 }
 
+// notifyBootstrapURL surfaces the web UI address as a desktop notification
+// when the browser could not be opened for a certificate bootstrap. It is the
+// last resort for a GUI-subsystem daemon (dotvaultw.exe), which has no stderr
+// a user will ever read and no tray icon yet at this point in startup.
+//
+// Every failure here is swallowed to a debug log: the bootstrap is already
+// usable by anyone who visits the URL, and a missing notification daemon must
+// not be the thing that stops a host enrolling.
+func notifyBootstrapURL(url string) {
+	msg, err := notify.NewMessage("attention", "dotvault: sign in to enrol this host",
+		"Open "+url+" to complete the one-time certificate enrolment.", url)
+	if err != nil {
+		slog.Debug("could not build bootstrap notification", "error", err)
+		return
+	}
+	if err := notify.Send(msg); err != nil {
+		slog.Debug("could not raise bootstrap notification", "error", err)
+	}
+}
+
+// bootstrapMethodForWeb reports the login method the web login view presents
+// for the one-time mTLS certificate bootstrap ("ldap" or "oidc"), or "" when
+// the configured auth method is not certificate auth and no bootstrap exists.
+//
+// validateMTLS defaults BootstrapMethod to "oidc" and rejects anything other
+// than ldap/oidc, so a non-empty result here is always one the login view can render.
+func bootstrapMethodForWeb(cfg *config.Config) string {
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		return ""
+	}
+	return cfg.Vault.MTLS.BootstrapMethod
+}
+
+// bootstrapMountForWeb reports the auth mount the certificate bootstrap logs in
+// against (vault.mtls.bootstrap_mount), or "" when the configured auth method is
+// not certificate auth.
+//
+// This is deliberately NOT vault.auth_mount: the CLI bootstrap logs in against
+// the bootstrap mount (runBootstrap sets AuthMount from MTLS.BootstrapMount), so
+// a deployment whose bootstrap mount differs from its operational one would
+// otherwise have the CLI and the browser hitting different Vault paths for the same
+// config. Empty is fine — Server.loginMount falls back to the method default.
+func bootstrapMountForWeb(cfg *config.Config) string {
+	if cfg.Vault.BorrowOnly || !config.IsMTLSMethod(cfg.Vault.AuthMethod) {
+		return ""
+	}
+	return cfg.Vault.MTLS.BootstrapMount
+}
+
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
+// effectivePersistTokenAtRest reports whether this host's token file is a
+// valid source (reuse candidate, manual-override watch target) once
+// vault.borrow_only is folded in. auth.PersistTokenAtRest alone answers a
+// narrower question — does auth_method's own no-persist guarantee (mtls+os)
+// apply — but under borrow_only that guarantee is moot regardless of what
+// auth_method is set to: it is ignored entirely (see
+// config.VaultConfig.BorrowOnly), so no cert flow exists that would need the
+// file kept clear for it, and the file reverts to being an ordinary
+// candidate. Every cmd/dotvault site that decides whether to read or watch
+// the token file for reuse purposes should call this rather than
+// auth.PersistTokenAtRest directly.
+func effectivePersistTokenAtRest(cfg *config.Config) bool {
+	return cfg.Vault.BorrowOnly || auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
+}
+
+// headlessTokenPath returns the token path waitForHeadlessToken should watch,
+// or "" under an auth method that keeps no token at rest — the headless idle
+// must not adopt a file that method has undertaken never to use.
+//
+// borrowOnly overrides that: under vault.borrow_only, auth_method (mtls+os
+// included) is ignored entirely — see config.VaultConfig.BorrowOnly — so
+// there is no cert flow whose no-persist guarantee a watched file could
+// undermine, and the token file remains a normal manual-override candidate
+// regardless of what auth_method happens to be set to.
+func headlessTokenPath(method, tokenPath string, borrowOnly bool) string {
+	if borrowOnly {
+		return tokenPath
+	}
+	if !auth.PersistTokenAtRest(method) {
+		return ""
+	}
+	return tokenPath
+}
+
 // waitForHeadlessToken blocks until a usable Vault token becomes available —
 // either written to tokenPath (by an external facility such as a login profile
-// running `dotvault login`) or borrowable from a peer dotvault over socketPath
-// (an empty socketPath disables the borrow) — or ctx is cancelled. Returns true
-// once a candidate validates against Vault and is set on vc; false if ctx is
-// cancelled first. The watches are registered synchronously before the first
-// read so a token written, or a socket created, during startup cannot be missed.
-func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, socketPath string) bool {
+// running `dotvault login`) or borrowable from a peer dotvault over one of
+// socketPaths (an empty list disables the borrow) — or ctx is cancelled. An
+// empty tokenPath likewise disables the file half, which is how a no-persist
+// auth method (auth.PersistTokenAtRest) idles on the socket alone rather than
+// adopting a file it has just guaranteed will not be used.
+// Returns true once a candidate validates against Vault and is set on vc;
+// false if ctx is cancelled first. The watches are registered synchronously
+// before the first read so a token written, or a socket created, during
+// startup cannot be missed.
+//
+// denyList suppresses candidates Vault has already rejected. Without it this
+// loop re-presented the same expired token file to lookup-self every 10s for as
+// long as the daemon idled — which, on a host whose token expired while nobody
+// was around to write a new one, is indefinitely. A watcher event clears the
+// suppression, so a rewritten file is retried immediately; a poll-only platform
+// (no inotify) still picks up a rewrite, because the cache is keyed on the
+// token's value and a new token is simply not in it. May be nil.
+func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, socketPaths []string, denyList *auth.TokenDenylist) bool {
 	// The watcher goroutines below can outlive a *successful* return: a token
 	// arrives while the parent ctx is still live, so cancellation can't be
 	// what stops them. Give them a child context we cancel on the way out, and
@@ -2243,13 +3090,24 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 
 	wake := make(chan struct{}, 1)
 	notify := func() {
+		// A watcher fired: the token file was written, or a peer socket
+		// appeared. Either way the credential situation may have changed, so
+		// drop the suppressions and let the retry below try everything again —
+		// including a token whose bytes are unchanged, since Vault's reason for
+		// rejecting it may have been server-side. A still-bad token is
+		// re-suppressed on the spot.
+		denyList.Clear(ctx)
 		select {
 		case wake <- struct{}{}:
 		default:
 		}
 	}
 
-	if tw, err := tokenwatch.New(tokenPath, notify); err != nil {
+	if tokenPath == "" {
+		// No-persist method: nothing to watch, and filepath.Dir("") would
+		// otherwise put an inotify watch on the working directory.
+		slog.Debug("token-file watch skipped; this auth method keeps no token at rest")
+	} else if tw, err := tokenwatch.New(tokenPath, notify); err != nil {
 		slog.Warn("token-file watcher unavailable; polling for a token instead", "error", err)
 	} else {
 		go func() {
@@ -2260,15 +3118,15 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 		}()
 	}
 
-	// Watch the peer socket's directory too: an SSH RemoteForward that connects
+	// Watch each peer socket's directory too: an SSH RemoteForward that connects
 	// after the daemon started materialises the socket, and we want to borrow
 	// immediately rather than waiting out the 10s poll. Linux-only (inotify); a
 	// no-op elsewhere. A failure to expand or watch degrades to the poll below.
-	if socketPath != "" {
+	for _, socketPath := range socketPaths {
 		if expanded, err := paths.ExpandHome(socketPath); err != nil {
-			slog.Debug("could not expand peer token socket path for watching; relying on poll", "error", err)
+			slog.Debug("could not expand peer token socket path for watching; relying on poll", "socket", socketPath, "error", err)
 		} else if sw, err := tokenwatch.New(expanded, notify); err != nil {
-			slog.Debug("peer-socket watcher unavailable; relying on poll", "error", err)
+			slog.Debug("peer-socket watcher unavailable; relying on poll", "socket", socketPath, "error", err)
 		} else {
 			go func() {
 				defer sw.Close()
@@ -2291,10 +3149,16 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 		if candidate == "" || candidate == vc.Token() {
 			return false
 		}
+		if denyList.Denied(ctx, candidate) {
+			// Vault has already rejected exactly this token and nothing has
+			// happened since to suggest a different answer.
+			return false
+		}
 		previous := vc.Token()
 		vc.SetToken(candidate)
 		if _, lookupErr := vc.LookupSelf(ctx); lookupErr != nil {
 			vc.SetToken(previous)
+			denyList.NoteRejection(ctx, candidate, lookupErr)
 			// A cancelled parent ctx (clean shutdown) can race the wake /
 			// ticker select arms below and land here with a context.Canceled
 			// lookup error — select picks a ready case at random, so
@@ -2311,6 +3175,9 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 
 	var lastReadErrMsg string
 	tryPromote := func() bool {
+		if tokenPath == "" {
+			return false // no-persist method; the socket borrow answers instead
+		}
 		fileToken, readErr := auth.ReadTokenFile(tokenPath)
 		if readErr != nil {
 			// ReadTokenFile returns ("", nil) for a missing file, so a
@@ -2337,12 +3204,10 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 		if tryPromote() {
 			return true
 		}
-		if socketPath != "" {
-			if sockToken, _ := auth.FetchTokenFromSocket(ctx, socketPath); sockToken != "" {
-				if adopt(sockToken) {
-					slog.Info("using vault token borrowed from peer socket", "socket", socketPath)
-					return true
-				}
+		if sockToken, source := auth.FetchTokenFromSockets(ctx, socketPaths); sockToken != "" {
+			if adopt(sockToken) {
+				slog.Info("using vault token borrowed from peer socket", "socket", source)
+				return true
 			}
 		}
 		return false
@@ -2380,12 +3245,32 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath, sock
 func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *observability.Provider {
 	initCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// Layer the per-signal overrides onto the shared fields here — the
+	// config package owns those semantics (ResolveSignal) and the
+	// observability package deliberately consumes only resolved values.
+	warnSharedHeadersToOverriddenEndpoint(cfg)
+	deprecated := warnDeprecatedObservabilityConfig(cfg)
+	metrics := cfg.MetricsSignal()
+	logs := cfg.LogsSignal()
 	provider, err := observability.Init(initCtx, observability.Config{
-		Enabled:        cfg.Enabled,
-		Endpoint:       cfg.Endpoint,
-		Protocol:       cfg.Protocol,
-		Insecure:       cfg.Insecure,
-		Headers:        cfg.Headers,
+		Enabled: cfg.Enabled,
+		Metrics: observability.Signal{
+			Enabled:     metrics.Enabled,
+			Endpoint:    metrics.Endpoint,
+			Protocol:    metrics.Protocol,
+			Insecure:    metrics.Insecure,
+			Headers:     metrics.Headers,
+			Temporality: metrics.Temporality,
+		},
+		Logs: observability.Signal{
+			Enabled:  logs.Enabled,
+			Endpoint: logs.Endpoint,
+			Protocol: logs.Protocol,
+			Insecure: logs.Insecure,
+			Headers:  logs.Headers,
+			// Temporality deliberately not copied: metrics-only, and
+			// validation already rejects it on the logs block.
+		},
 		ExportInterval: cfg.ExportInterval,
 		ServiceVersion: version,
 	})
@@ -2393,10 +3278,69 @@ func initObservability(ctx context.Context, cfg config.ObservabilityConfig) *obs
 		// Telemetry must never take the daemon down. Log loudly and
 		// continue with a no-op provider so instrument call sites
 		// stay safe.
-		slog.Error("failed to initialise observability, continuing without metrics", "error", err)
+		slog.Error("failed to initialise observability, continuing without OTLP export (metrics and logs)", "error", err)
 		return &observability.Provider{}
 	}
+	// The counter half of the deprecation report waits for a successful
+	// Init — before that the instruments are bound to the no-op meter and
+	// the increments would vanish. The WARN half deliberately ran earlier,
+	// Init outcome regardless: an operator with a broken collector is
+	// exactly the operator who must not miss the migration pointer.
+	for _, field := range deprecated {
+		observability.RecordDeprecatedConfig(ctx, field)
+	}
 	return provider
+}
+
+// warnDeprecatedObservabilityConfig surfaces stage one of the shared-field
+// deprecation (#140): the top-level endpoint/protocol/insecure/headers layer
+// is being retired in favour of the per-signal metrics:/logs: blocks. Each
+// deprecated field in active use draws one WARN naming its replacement, and
+// the returned list feeds one dotvault.config.deprecated increment per field
+// once Init has bound the real meter — so an operator sees the migration
+// pointer locally even when the collector is down, and a fleet's collector
+// can measure how much of it still depends on the shared layer before the
+// removal release ships. Gated on the master switch: with observability
+// disabled the fields are inert and there is no exporter for the metric.
+func warnDeprecatedObservabilityConfig(cfg config.ObservabilityConfig) []string {
+	if !cfg.Enabled {
+		return nil
+	}
+	deprecated := cfg.DeprecatedSharedFields()
+	if len(deprecated) == 0 {
+		return nil
+	}
+	slog.Warn("deprecated shared observability fields in use; move these settings into the per-signal metrics:/logs: blocks (or the standard OTEL_EXPORTER_OTLP_* env vars) — the shared exporter fields will be removed in a future release",
+		"fields", strings.Join(deprecated, ", "))
+	return deprecated
+}
+
+// warnSharedHeadersToOverriddenEndpoint flags the cross-backend credential
+// pitfall the wholesale-replace header semantics can't catch on their own: a
+// per-signal block that redirects the endpoint without setting its own
+// headers inherits the shared map — typically a bearer token minted for the
+// shared backend — and sends it to the new one. That can be intended (same
+// vendor, different route), so this warns rather than fails; an explicit
+// per-signal `headers:` (`{}` for none) states the intent and silences it.
+// The endpoint is loggable; the header values never are.
+func warnSharedHeadersToOverriddenEndpoint(cfg config.ObservabilityConfig) {
+	if !cfg.Enabled || len(cfg.Headers) == 0 {
+		return
+	}
+	for _, sig := range []struct {
+		name string
+		s    config.ObservabilitySignalConfig
+	}{
+		{"metrics", cfg.Metrics},
+		{"logs", cfg.Logs},
+	} {
+		enabled := sig.s.Enabled == nil || *sig.s.Enabled
+		if enabled && sig.s.Endpoint != "" && sig.s.Endpoint != cfg.Endpoint && sig.s.Headers == nil {
+			slog.Warn("observability signal overrides the endpoint but inherits the shared headers; the shared credentials will be sent to the overridden endpoint — set headers on the signal (an empty map sends none) if that is not intended",
+				"signal", sig.name,
+				"endpoint", sig.s.Endpoint)
+		}
+	}
 }
 
 // shutdownObservability flushes and tears down the MeterProvider

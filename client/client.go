@@ -45,8 +45,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -227,7 +229,21 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	// but unreadable) is treated as no candidate, matching ResolveToken's own
 	// best-effort handling.
 	cachedRejected := false
-	fileToken, _ := auth.ReadTokenFile(c.cfg.TokenFile)
+	// Under mtls+os the token file is not a candidate at all — the same gate
+	// Manager.Authenticate and the daemon's startup reuse check apply. A
+	// library consumer cannot rely on the daemon having removed a leftover
+	// file: it is removed on the daemon's next successful login, which may
+	// never happen in this process's lifetime (the daemon may be stopped, or
+	// this may be the only dotvault on the host). Reading it anyway would let
+	// a token from a previous method stay silently in use for the rest of its
+	// TTL — precisely the credential this method exists to eliminate. The
+	// certificate candidate below answers instead, which is what the method
+	// intends. DOTVAULT_TOKEN is unaffected: it is caller-supplied and
+	// explicitly never at rest.
+	var fileToken string
+	if auth.PersistTokenAtRest(c.cfg.Vault.AuthMethod) {
+		fileToken, _ = auth.ReadTokenFile(c.cfg.TokenFile)
+	}
 	seen := map[string]bool{}
 	for _, cand := range []string{auth.ReadTokenEnv(), fileToken} {
 		if cand == "" || seen[cand] {
@@ -245,18 +261,85 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		cachedRejected = true
 	}
 
-	// Candidate 3: borrow from the peer socket. Best-effort — a missing/stale
-	// socket or an unauthenticated peer yields "" and falls through.
-	if c.cfg.Vault.TokenSocket != "" {
-		borrowed, _ := auth.FetchTokenFromSocket(ctx, c.cfg.Vault.TokenSocket)
-		if borrowed != "" && !seen[borrowed] {
-			if ok, unreachable := tryCandidate(borrowed); ok {
-				return nil
-			} else if unreachable != nil {
-				return unreachable
-			}
-			cachedRejected = true
+	// Candidate 3: borrow from a peer socket, local API socket first (see
+	// VaultConfig.APISocket for why that order). Best-effort — a
+	// missing/stale socket or an unauthenticated peer yields "" and falls
+	// through. Each distinct token is tried once: two sockets can front the
+	// same token (a local daemon that itself borrowed from the workstation),
+	// and re-validating an identical value would just be a wasted round trip.
+	sockets := c.cfg.Vault.borrowSockets()
+	for _, sock := range sockets {
+		borrowed, _ := auth.FetchTokenFromSocket(ctx, sock)
+		if borrowed == "" || seen[borrowed] {
+			continue
 		}
+		seen[borrowed] = true
+		if ok, unreachable := tryCandidate(borrowed); ok {
+			return nil
+		} else if unreachable != nil {
+			return unreachable
+		}
+		cachedRejected = true
+	}
+
+	// Candidate 4: this host's own client certificate. Last, so a cached token
+	// is always preferred — a cert login is a Vault round trip plus (for
+	// mtls+tpm / mtls+os) a hardware key operation, and it mints a new token
+	// where reusing one costs nothing.
+	//
+	// This stays inside AuthenticateCached's never-prompt contract: presenting
+	// a certificate the host already holds involves no browser, no terminal,
+	// and no user. It is the seam that makes certificate auth usable from a
+	// library at all — otherwise a consumer on a cert-auth host whose daemon
+	// is stopped, or whose cached token has expired, would get ErrLoginRequired
+	// while the credential that fixes it sits on the same disk.
+	//
+	// Consumption only: CertLoginFromStore never bootstraps and never rotates,
+	// so this can use an enrolled certificate but can never create one.
+	//
+	// The minted token is held in memory and deliberately NOT written to the
+	// token file: that file belongs to the daemon, and a library inside
+	// somebody else's process must not race it. Same ownership rule as the
+	// peer-socket borrow above.
+	//
+	// Excluded entirely under BorrowOnly, even when AuthMethod happens to be
+	// a cert method: BorrowOnly documents AuthMethod as ignored altogether
+	// (see VaultConfig.BorrowOnly), and this host must never mint its own
+	// operational token from a certificate it may only be holding as a
+	// leftover from a shared base config — that is exactly the "never mints
+	// its own identity" guarantee borrow-only exists to give. Mirrors the
+	// equivalent guard the daemon applies via mtlsParams.
+	if !c.cfg.Vault.BorrowOnly && config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
+		mgr := c.manager()
+		mgr.TokenFilePath = "" // in-memory only; see above
+		if err := mgr.CertLoginFromStore(ctx); err != nil {
+			c.vc.SetToken("")
+			// Preserve the error taxonomy. A certificate login can fail two
+			// very different ways, and they call for opposite responses: an
+			// unreachable, rate-limited or 5xx-ing Vault is a retry condition,
+			// whereas a missing or unusable credential means the host must be
+			// enrolled. Reporting both as ErrLoginRequired would tell a Go or
+			// Python consumer to enrol when it should back off, contradicting
+			// this method's documented ErrUnreachable contract.
+			//
+			// The split cannot be inferred from the error's shape — a
+			// transport failure carries no HTTP response, and neither does
+			// "no credential on this host" — so internal/auth marks the local
+			// causes explicitly with ErrNoCertCredential and everything else
+			// goes through the same classifier as the cached-token path.
+			if errors.Is(err, auth.ErrNoCertCredential) {
+				return fmt.Errorf("%w: no usable cached token and this host has no usable certificate: %w",
+					ErrLoginRequired, err)
+			}
+			if cat := classify(err); errors.Is(cat, ErrUnreachable) {
+				return fmt.Errorf("%w: certificate login could not reach vault: %w", ErrUnreachable, err)
+			}
+			// Vault answered and rejected the certificate (401/403) — a
+			// credential problem, so enrolment is the correct next action.
+			return fmt.Errorf("%w: no usable cached token and the certificate was rejected: %w",
+				ErrLoginRequired, err)
+		}
+		return nil
 	}
 
 	if cachedRejected {
@@ -266,18 +349,18 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	}
 	// No source produced a token at all.
 	switch {
-	case c.cfg.TokenFile == "" && c.cfg.Vault.TokenSocket == "":
+	case c.cfg.TokenFile == "" && len(sockets) == 0:
 		return fmt.Errorf("%w: no DOTVAULT_TOKEN set and no token file configured",
 			ErrLoginRequired)
 	case c.cfg.TokenFile == "":
-		return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket %s",
-			ErrLoginRequired, c.cfg.Vault.TokenSocket)
-	case c.cfg.Vault.TokenSocket == "":
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN set, no token file configured, and no token borrowable from peer socket(s) %s",
+			ErrLoginRequired, strings.Join(sockets, ", "))
+	case len(sockets) == 0:
 		return fmt.Errorf("%w: no DOTVAULT_TOKEN and no token at %s",
 			ErrLoginRequired, c.cfg.TokenFile)
 	default:
-		return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket %s",
-			ErrLoginRequired, c.cfg.TokenFile, c.cfg.Vault.TokenSocket)
+		return fmt.Errorf("%w: no DOTVAULT_TOKEN, no token at %s, and no token borrowable from peer socket(s) %s",
+			ErrLoginRequired, c.cfg.TokenFile, strings.Join(sockets, ", "))
 	}
 }
 
@@ -295,6 +378,30 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 // binary, which has no console) should drive auth through OIDC, or stick to
 // AuthenticateCached and surface ErrLoginRequired to the operator.
 func (c *Client) Login(ctx context.Context) error {
+	// Certificate auth is consumption-only from the facade. A fresh Login
+	// under a cert method would, on a host with no usable credential, run the
+	// bootstrap: an OIDC browser flow or an LDAP terminal prompt, followed by
+	// minting a certificate and writing it to this host. None of that is
+	// appropriate from a library embedded in somebody else's process, and the
+	// non-interactive part is already available without it —
+	// AuthenticateCached presents an enrolled certificate with no prompting.
+	//
+	// So refuse explicitly rather than surprising a caller with a browser.
+	// Enrolment stays with the daemon or the CLI, which own this host.
+	if config.IsMTLSMethod(c.cfg.Vault.AuthMethod) {
+		return fmt.Errorf("%w: auth method %q is consumption-only from the client API: use AuthenticateCached to present an already-enrolled certificate, and enrol this host with the dotvault daemon or CLI",
+			ErrLoginRequired, c.cfg.Vault.AuthMethod)
+	}
+	// Mirrors the mtls refusal above: a host configured borrow-only (see
+	// VaultConfig.BorrowOnly) runs no fresh-auth flow at all, so there is
+	// nothing for Login to do beyond what the borrow already tried inside
+	// AuthenticateCached. auth.Manager.Login would refuse identically (it
+	// returns auth.ErrBorrowOnly), but failing here is clearer for a facade
+	// consumer than surfacing that sentinel wrapped in ErrAuthFailed.
+	if c.cfg.Vault.BorrowOnly {
+		return fmt.Errorf("%w: this host is configured borrow-only: it authenticates exclusively by borrowing a token over TokenSocket/APISocket, never via a fresh-auth flow — use AuthenticateCached instead",
+			ErrLoginRequired)
+	}
 	if err := c.manager().Login(ctx); err != nil {
 		return fmt.Errorf("%w: %w", ErrAuthFailed, err)
 	}
@@ -318,12 +425,26 @@ func (c *Client) manager() *auth.Manager {
 		AuthMount:        c.cfg.Vault.AuthMount,
 		AuthRole:         c.cfg.Vault.AuthRole,
 		OIDCCallbackPort: c.cfg.Vault.OIDCCallbackPort,
-		TokenSocket:      c.cfg.Vault.TokenSocket,
+		TokenSockets:     c.cfg.Vault.borrowSockets(),
 		Policy: auth.PolicyConstraint{
 			Policies:        c.cfg.Vault.Policies,
 			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,
 		},
 		Username: username,
+		// Login-only certificate parameters. There is deliberately no PKI
+		// mount/role, no bootstrap method and no BYO here, so the flows that
+		// would issue a certificate cannot run from the facade even if they
+		// were reached: CertLoginFromStore is the only cert entry point the
+		// facade calls, and it never seeds. See MTLSConfig.
+		MTLS: &auth.MTLSParams{
+			VaultAddress:  c.cfg.Vault.Address,
+			CACert:        c.cfg.Vault.CACert,
+			TLSSkipVerify: c.cfg.Vault.TLSSkipVerify,
+			Method:        c.cfg.Vault.AuthMethod,
+			CertMount:     c.cfg.Vault.MTLS.CertMount,
+			CertRole:      c.cfg.Vault.MTLS.CertRole,
+			StorageDir:    c.cfg.Vault.MTLS.StorageDir,
+		},
 	}
 }
 

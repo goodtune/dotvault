@@ -2,6 +2,7 @@ package regfile
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -77,5 +78,56 @@ func TestMTLSAbsentRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Vault.MTLS, config.MTLSConfig{}) {
 		t.Errorf("expected empty MTLS, got %+v", got.Vault.MTLS)
+	}
+}
+
+// TestMTLSKeyBitsRoundTrip confirms vault.mtls.key_bits survives the .reg
+// surface as a REG_DWORD.
+//
+// The existing TestMTLSRoundTrip uses key_type ec, where key_bits is invalid by
+// config validation and so is always zero — a zero DWORD round-trips trivially
+// even if the field were never emitted at all. This exercises the case that
+// actually distinguishes a working implementation: an RSA config carrying a
+// non-default modulus size, which is the whole reason the option exists (a
+// Vault PKI role's key_bits is a minimum, so a 4096-bit role needs this set).
+func TestMTLSKeyBitsRoundTrip(t *testing.T) {
+	for _, bits := range []int{2048, 3072, 4096, 8192} {
+		t.Run(strconv.Itoa(bits), func(t *testing.T) {
+			src := &config.Config{
+				Vault: config.VaultConfig{
+					Address:    "https://vault.example.com:8200",
+					AuthMethod: "mtls",
+					MTLS: config.MTLSConfig{
+						BootstrapMethod: "oidc",
+						CertMount:       "cert",
+						CertRole:        "dotvault",
+						PKIMount:        "pki",
+						PKIRole:         "dotvault-client",
+						KeyType:         "rsa",
+						KeyBits:         bits,
+						CommonName:      "{{.user}}",
+						ReissueBefore:   "168h",
+					},
+				},
+				Rules: []config.Rule{
+					{Name: "r", VaultKey: "k", Target: config.Target{Path: "~/x", Format: "text"}},
+				},
+			}
+
+			text, err := GenerateText(src)
+			if err != nil {
+				t.Fatalf("GenerateText: %v", err)
+			}
+			got, err := Parse([]byte(text))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got.Vault.MTLS.KeyBits != bits {
+				t.Errorf("KeyBits = %d, want %d", got.Vault.MTLS.KeyBits, bits)
+			}
+			if !reflect.DeepEqual(got.Vault.MTLS, src.Vault.MTLS) {
+				t.Errorf("MTLS mismatch:\ngot:  %+v\nwant: %+v", got.Vault.MTLS, src.Vault.MTLS)
+			}
+		})
 	}
 }

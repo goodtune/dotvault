@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -140,5 +141,108 @@ func TestJSONHandler_WriteTrailingNewline(t *testing.T) {
 	got, _ := os.ReadFile(outPath)
 	if got[len(got)-1] != '\n' {
 		t.Error("output missing trailing newline")
+	}
+}
+
+// TestJSONHandler_DeleteNulls covers the field-nullification contract: with
+// DeleteNulls set, a null in the incoming (template-rendered) document is a
+// tombstone that removes the key from the target rather than a value written
+// into it.
+func TestJSONHandler_DeleteNulls(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing string
+		incoming string
+		want     map[string]any
+	}{
+		{
+			name:     "removes the tombstoned key and keeps the rest",
+			existing: `{"keep": "yes", "KEY_I_USED_TO_FILL": "secret"}`,
+			incoming: `{"keep": "yes", "KEY_I_USED_TO_FILL": null}`,
+			want:     map[string]any{"keep": "yes"},
+		},
+		{
+			name:     "unmanaged keys are still preserved",
+			existing: `{"hand_written": "mine", "gone": "secret"}`,
+			incoming: `{"gone": null}`,
+			want:     map[string]any{"hand_written": "mine"},
+		},
+		{
+			name:     "nested tombstone removes only that key",
+			existing: `{"auth": {"token": "t", "legacy": "old"}}`,
+			incoming: `{"auth": {"legacy": null}}`,
+			want:     map[string]any{"auth": map[string]any{"token": "t"}},
+		},
+		{
+			name:     "tombstoning a subtree removes the whole subtree",
+			existing: `{"auth": {"token": "t"}, "other": 1.0}`,
+			incoming: `{"auth": null}`,
+			want:     map[string]any{"other": 1.0},
+		},
+		{
+			// The idempotency case: a tombstone left in a template forever
+			// must keep producing an unchanged file once the key is gone.
+			name:     "deleting an absent key is a no-op",
+			existing: `{"keep": "yes"}`,
+			incoming: `{"KEY_I_USED_TO_FILL": null}`,
+			want:     map[string]any{"keep": "yes"},
+		},
+		{
+			// Regression: the !exists branch assigns src wholesale, so a
+			// tombstone nested under a key the target lacks must be pruned
+			// rather than written out as a literal null.
+			name:     "tombstone under an absent parent is not created",
+			existing: `{}`,
+			incoming: `{"auth": {"token": "t", "legacy": null}}`,
+			want:     map[string]any{"auth": map[string]any{"token": "t"}},
+		},
+		{
+			// Same hazard on the replace branch: dst holds a scalar, src a map.
+			name:     "tombstone in a map replacing a scalar is not created",
+			existing: `{"auth": "flat"}`,
+			incoming: `{"auth": {"token": "t", "legacy": null}}`,
+			want:     map[string]any{"auth": map[string]any{"token": "t"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &JSONHandler{DeleteNulls: true}
+			existing, err := h.Parse(tc.existing)
+			if err != nil {
+				t.Fatalf("Parse(existing): %v", err)
+			}
+			incoming, err := h.Parse(tc.incoming)
+			if err != nil {
+				t.Fatalf("Parse(incoming): %v", err)
+			}
+			merged, err := h.Merge(existing, incoming)
+			if err != nil {
+				t.Fatalf("Merge() error: %v", err)
+			}
+			if !reflect.DeepEqual(merged, tc.want) {
+				t.Errorf("merged =\n  %#v\nwant\n  %#v", merged, tc.want)
+			}
+		})
+	}
+}
+
+// TestJSONHandler_NullsWrittenWhenFlagOff pins the default: without the
+// opt-in, a null keeps its historical meaning and is written as a value.
+func TestJSONHandler_NullsWrittenWhenFlagOff(t *testing.T) {
+	h := &JSONHandler{}
+
+	existing, _ := h.Parse(`{"KEY_I_USED_TO_FILL": "secret"}`)
+	incoming, _ := h.Parse(`{"KEY_I_USED_TO_FILL": null}`)
+
+	merged, err := h.Merge(existing, incoming)
+	if err != nil {
+		t.Fatalf("Merge() error: %v", err)
+	}
+	m := merged.(map[string]any)
+	v, ok := m["KEY_I_USED_TO_FILL"]
+	if !ok {
+		t.Fatal("key was deleted without DeleteNulls set")
+	}
+	if v != nil {
+		t.Errorf("value = %v, want nil", v)
 	}
 }

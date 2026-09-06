@@ -607,3 +607,67 @@ func TestReadKVField_NonStringStringified(t *testing.T) {
 		t.Fatalf("got (%q, %v, %v), want (42, true, nil)", val, found, err)
 	}
 }
+
+// TestAuthenticateCached_PrefersAPISocket pins the facade's borrow order: the
+// local daemon's socket outlives the SSH session that the forwarded peer
+// socket depends on, so a long-running consumer must reach for it first.
+func TestAuthenticateCached_PrefersAPISocket(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	dir := t.TempDir()
+	local := filepath.Join(dir, "api.sock")
+	remote := filepath.Join(dir, "peer.sock")
+	newUnixTokenServer(t, local, "local-token")
+	newUnixTokenServer(t, remote, "remote-token")
+
+	c, err := New(&Config{
+		Vault: VaultConfig{
+			Address:     fv.srv.URL,
+			AuthMethod:  "token",
+			APISocket:   local,
+			TokenSocket: remote,
+		},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "local-token" {
+		t.Errorf("Token = %q, want local-token (the local API socket wins)", c.Token())
+	}
+}
+
+// TestAuthenticateCached_FallsBackToPeerSocket is the same ordering seen from
+// the other end: the local daemon is not running, so the forwarded peer must
+// still be tried.
+func TestAuthenticateCached_FallsBackToPeerSocket(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+	fv := newFakeVault(t)
+
+	dir := t.TempDir()
+	remote := filepath.Join(dir, "peer.sock")
+	newUnixTokenServer(t, remote, "remote-token")
+
+	c, err := New(&Config{
+		Vault: VaultConfig{
+			Address:     fv.srv.URL,
+			AuthMethod:  "token",
+			APISocket:   filepath.Join(dir, "absent.sock"),
+			TokenSocket: remote,
+		},
+		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatalf("AuthenticateCached: %v", err)
+	}
+	if c.Token() != "remote-token" {
+		t.Errorf("Token = %q, want remote-token", c.Token())
+	}
+}

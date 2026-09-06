@@ -7,7 +7,12 @@ import (
 )
 
 // JSONHandler handles JSON files with deep merge.
-type JSONHandler struct{}
+type JSONHandler struct {
+	// DeleteNulls makes a null in the incoming document a tombstone: the
+	// matching key is removed from the target file rather than written as
+	// null. See config.Target.DeleteNulls for why it is opt-in.
+	DeleteNulls bool
+}
 
 func (h *JSONHandler) Read(path string) (any, error) {
 	data, err := os.ReadFile(path)
@@ -49,7 +54,7 @@ func (h *JSONHandler) Merge(existing any, incoming any) (any, error) {
 		return nil, fmt.Errorf("incoming: expected map[string]any, got %T", incoming)
 	}
 
-	return deepMergeJSON(dst, src), nil
+	return deepMergeJSON(dst, src, h.DeleteNulls), nil
 }
 
 func (h *JSONHandler) Write(path string, data any, perm os.FileMode) error {
@@ -70,11 +75,22 @@ func (h *JSONHandler) Write(path string, data any, perm os.FileMode) error {
 
 // deepMergeJSON recursively merges src into dst.
 // Maps are merged recursively. All other types (arrays, scalars) are replaced.
-func deepMergeJSON(dst, src map[string]any) map[string]any {
+//
+// When deleteNulls is set, a null in src is a tombstone rather than a value:
+// the key is removed from dst instead of being written. Deleting a key that is
+// not there is a no-op, which is what makes a tombstone safe to leave in a
+// template forever — every subsequent sync re-applies it against a file that
+// no longer has the key and produces no change.
+func deepMergeJSON(dst, src map[string]any, deleteNulls bool) map[string]any {
 	for key, srcVal := range src {
+		if deleteNulls && srcVal == nil {
+			delete(dst, key)
+			continue
+		}
+
 		dstVal, exists := dst[key]
 		if !exists {
-			dst[key] = srcVal
+			dst[key] = pruneNullsJSON(srcVal, deleteNulls)
 			continue
 		}
 
@@ -82,11 +98,37 @@ func deepMergeJSON(dst, src map[string]any) map[string]any {
 		dstMap, dstOk := dstVal.(map[string]any)
 		srcMap, srcOk := srcVal.(map[string]any)
 		if dstOk && srcOk {
-			dst[key] = deepMergeJSON(dstMap, srcMap)
+			dst[key] = deepMergeJSON(dstMap, srcMap, deleteNulls)
 		} else {
 			// Replace (arrays, scalars, type mismatch)
-			dst[key] = srcVal
+			dst[key] = pruneNullsJSON(srcVal, deleteNulls)
 		}
 	}
 	return dst
+}
+
+// pruneNullsJSON strips tombstones from a src value that is about to be
+// assigned into dst wholesale, rather than merged key-by-key.
+//
+// Without this, a tombstone for a key the target does not have would be
+// *written* instead of ignored: `{"a": {"b": null}}` against a file with no
+// "a" takes the !exists branch and would assign the map verbatim, creating
+// the very `"b": null` the rule asked to delete. The same applies on the
+// replace branch, where dst holds a scalar and src a map.
+func pruneNullsJSON(v any, deleteNulls bool) any {
+	if !deleteNulls {
+		return v
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	for key, val := range m {
+		if val == nil {
+			delete(m, key)
+			continue
+		}
+		m[key] = pruneNullsJSON(val, deleteNulls)
+	}
+	return m
 }

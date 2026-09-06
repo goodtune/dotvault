@@ -1,0 +1,7 @@
+{{define "content"}}
+<div class="secret-heading"><h2>{{.Folder}}</h2></div>
+<div class="secret-meta">Folder</div>
+{{if .Entries}}<ul class="ui-folder-list">
+  {{range .Entries}}<li><a href="{{.Href}}"><span class="key-icon">{{.Icon}}</span>{{.Name}}</a></li>{{end}}
+</ul>{{else}}<div class="panel-empty">This folder is empty</div>{{end}}
+{{end}}

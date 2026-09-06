@@ -54,6 +54,48 @@ func TestNewEnrolmentRunner(t *testing.T) {
 	}
 }
 
+func TestNewEnrolmentRunner_HelpTextRendered(t *testing.T) {
+	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
+	defer enrol.UnregisterEngine("mock")
+
+	enrolments := map[string]config.Enrolment{
+		"svc":  {Engine: "mock", HelpText: "**Bold** help."},
+		"bare": {Engine: "mock"},
+	}
+
+	runner := NewEnrolmentRunner(enrolments)
+
+	svc, err := runner.GetState("svc")
+	if err != nil {
+		t.Fatalf("GetState(svc): %v", err)
+	}
+	if want := "<p><strong>Bold</strong> help.</p>"; svc.HelpTextHTML != want {
+		t.Errorf("svc HelpTextHTML = %q, want %q", svc.HelpTextHTML, want)
+	}
+
+	bare, err := runner.GetState("bare")
+	if err != nil {
+		t.Fatalf("GetState(bare): %v", err)
+	}
+	if bare.HelpTextHTML != "" {
+		t.Errorf("bare HelpTextHTML = %q, want empty", bare.HelpTextHTML)
+	}
+
+	// States() must render the same way as GetState().
+	for _, s := range runner.States() {
+		switch s.Key {
+		case "svc":
+			if s.HelpTextHTML != svc.HelpTextHTML {
+				t.Errorf("States() svc HelpTextHTML = %q, want %q", s.HelpTextHTML, svc.HelpTextHTML)
+			}
+		case "bare":
+			if s.HelpTextHTML != bare.HelpTextHTML {
+				t.Errorf("States() bare HelpTextHTML = %q, want %q", s.HelpTextHTML, bare.HelpTextHTML)
+			}
+		}
+	}
+}
+
 func TestEnrolmentRunner_Skip(t *testing.T) {
 	enrol.RegisterEngine("mock", &mockEngine{name: "Mock", fields: []string{"token"}})
 	defer enrol.UnregisterEngine("mock")

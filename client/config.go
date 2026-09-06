@@ -1,6 +1,7 @@
 package client
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/config"
@@ -42,6 +43,33 @@ type Config struct {
 // Vault namespaces are not a dotvault YAML field; the underlying Vault client
 // honours the VAULT_NAMESPACE environment variable, so namespaced
 // deployments work without an explicit field here.
+// MTLSConfig is the login-only view of the daemon's vault.mtls block: what a
+// consumer needs to present a certificate this host already holds, and
+// nothing more.
+//
+// The omissions are the design. Issuance parameters (pki_mount, pki_role,
+// bootstrap_method, byo, key_type, ttl, reissue_before) are absent because the
+// facade is consumption-only — it can use a certificate the daemon or CLI
+// enrolled, but it can never mint, rotate, or bootstrap one. A library inside
+// somebody else's process has no business opening a browser or writing new
+// credentials to a host it does not own.
+type MTLSConfig struct {
+	// CertMount is the Vault cert auth mount. Defaults to "cert".
+	CertMount string
+
+	// CertRole is the cert auth role. Required for a certificate login.
+	CertRole string
+
+	// StorageDir holds the credential envelope written at enrolment.
+	// Defaults to {cache_dir}/mtls, matching the daemon.
+	StorageDir string
+
+	// Deliberately absent: key_type and key_bits. Both size a key that is
+	// about to be generated, and the facade never generates one — it presents
+	// a certificate the daemon or CLI already enrolled. Projecting them would
+	// imply an issuance capability this surface does not have.
+}
+
 type VaultConfig struct {
 	// Address is the Vault server URL (e.g. https://vault.example.com:8200).
 	// Required.
@@ -53,6 +81,15 @@ type VaultConfig struct {
 	// TLSSkipVerify disables TLS verification. Insecure; for dev only.
 	TLSSkipVerify bool
 
+	// MTLS carries the subset of the daemon's vault.mtls block needed to
+	// *use* an existing client certificate. Populated by LoadConfig when the
+	// auth method is a certificate method; ignored otherwise.
+	//
+	// Deliberately login-only: it carries no PKI mount/role, no bootstrap
+	// method, and no BYO paths, because the facade never issues a
+	// certificate. See Client.AuthenticateCached and Client.Login.
+	MTLS MTLSConfig
+
 	// KVMount is the KV v2 mount that holds user secrets. Defaults to "kv".
 	KVMount string
 
@@ -62,7 +99,9 @@ type VaultConfig struct {
 	UserPrefix string
 
 	// AuthMethod is the fresh-auth method dotvault uses when no cached token
-	// is usable: "oidc", "ldap", "token", "mtls", or "mtls+tpm". A "+tpm"
+	// is usable: "oidc", "ldap", "token", "mtls", "mtls+tpm", or "mtls+os"
+	// (the last storing the certificate and its key in the OS-native
+	// certificate store; Windows-only). A "+tpm"
 	// suffix on any base method (e.g. "oidc+tpm") additionally TPM-seals the
 	// cached token file at rest. Reads are transparent to this — a sealed
 	// token file is self-describing and unsealed automatically — so a consumer
@@ -101,6 +140,44 @@ type VaultConfig struct {
 	// running the configured auth flow — the dotvault-to-dotvault sharing
 	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
 	TokenSocket string
+
+	// BorrowOnly mirrors vault.borrow_only: the host this Config describes
+	// runs no fresh-auth flow of its own and authenticates exclusively by
+	// borrowing over TokenSocket/APISocket. AuthenticateCached is unaffected
+	// — it never runs a fresh-auth flow either way — but Login refuses
+	// outright with ErrLoginRequired, since "run the configured auth flow"
+	// has no meaning here.
+	BorrowOnly bool
+
+	// APISocket is an optional path to the *local* dotvault daemon's API
+	// socket (mirrors the api section: the resolved api.unix.path, or the
+	// per-user runtime default when api.enabled is set without a path).
+	//
+	// It is the same endpoint as TokenSocket and is tried ahead of it,
+	// because the two differ in lifetime rather than capability: the local
+	// socket is served by the long-lived per-user daemon, while TokenSocket
+	// is typically an SSH RemoteForward that vanishes when the session drops.
+	// A consumer started inside an SSH session therefore keeps borrowing
+	// successfully after that session ends.
+	//
+	// Borrow direction only. The peer actions (Browse / Notify / Clipboard)
+	// deliberately keep using TokenSocket: their whole purpose is to reach
+	// the workstation where a human is looking, and sending them to the local
+	// daemon would open a browser on the headless host nobody is sitting at.
+	APISocket string
+}
+
+// borrowSockets returns the ordered token-borrow candidates, most-stable
+// first. Mirrors config.TokenBorrowSockets on the internal side.
+func (v VaultConfig) borrowSockets() []string {
+	var out []string
+	if v.APISocket != "" {
+		out = append(out, v.APISocket)
+	}
+	if v.TokenSocket != "" {
+		out = append(out, v.TokenSocket)
+	}
+	return out
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -153,6 +230,14 @@ func LoadConfig(path string) (*Config, error) {
 // The internal loader has already applied defaults and normalisation
 // (KVMount, UserPrefix trailing slash), so this is a straight copy.
 func fromInternal(cfg *config.Config) *Config {
+	// A path-resolution failure (no resolvable home directory) degrades to
+	// "no local socket" rather than failing the load: borrowing is
+	// best-effort everywhere else too, and the remaining candidates still
+	// work.
+	apiSocket, err := cfg.APISocketPath()
+	if err != nil {
+		apiSocket = ""
+	}
 	return &Config{
 		Vault: VaultConfig{
 			Address:          cfg.Vault.Address,
@@ -165,8 +250,15 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
 			TokenSocket:      cfg.Vault.TokenSocket,
+			BorrowOnly:       cfg.Vault.BorrowOnly,
+			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,
 			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,
+			MTLS: MTLSConfig{
+				CertMount:  cfg.Vault.MTLS.CertMount,
+				CertRole:   cfg.Vault.MTLS.CertRole,
+				StorageDir: cfg.Vault.MTLS.StorageDir,
+			},
 		},
 	}
 }
@@ -194,5 +286,38 @@ func (c *Config) withDefaults() Config {
 	if out.TokenFile == "" {
 		out.TokenFile = DefaultTokenFile()
 	}
+	// Certificate-login defaults are applied only under a certificate auth
+	// method, and must then match the daemon's exactly or the facade would look
+	// for the credential envelope somewhere the daemon never wrote it. Gating on
+	// the method matters beyond tidiness: defaulting StorageDir unconditionally
+	// would pull paths.CacheDir() — which panics via mustHomeDir when the OS home
+	// cannot be resolved — into New() for *every* caller, so a plain token/oidc
+	// consumer on a home-less host (a minimal container) would panic. The MTLS
+	// fields are consumed only when config.IsMTLSMethod is true (see
+	// AuthenticateCached), so non-cert methods need no defaults. Mirrors
+	// mtlsParams in cmd/dotvault and DefaultCertMount in internal/config.
+	if config.IsMTLSMethod(out.Vault.AuthMethod) {
+		if out.Vault.MTLS.CertMount == "" {
+			out.Vault.MTLS.CertMount = config.DefaultCertMount
+		}
+		if out.Vault.MTLS.StorageDir == "" {
+			out.Vault.MTLS.StorageDir = defaultMTLSStorageDir()
+		}
+	}
 	return out
+}
+
+// defaultMTLSStorageDir is {cache_dir}/mtls, matching the daemon, or "" when the
+// OS home directory cannot be resolved. paths.CacheDir panics (via mustHomeDir)
+// in that case — acceptable inside the daemon, but a public library must not
+// panic on a recoverable environment condition, so we guard it exactly as
+// DefaultTokenFile does. A cert-auth consumer on such a host then fails its
+// certificate login with a clear error rather than crashing New().
+func defaultMTLSStorageDir() (dir string) {
+	defer func() {
+		if recover() != nil {
+			dir = ""
+		}
+	}()
+	return filepath.Join(paths.CacheDir(), "mtls")
 }

@@ -31,7 +31,7 @@ When running without the web UI, dotvault authenticates directly:
 
 ### Web UI mode
 
-When the web UI is enabled (`web.enabled: true`), all authentication is handled through the browser-based SPA. If the daemon starts without a valid token, it opens the web UI in the user's browser where they can log in.
+When the web UI is enabled (`web.enabled: true`), all authentication is handled in the browser. If the daemon starts without a valid token, it opens the web UI, which presents the login form for the configured auth method (see the [Web UI](../web-ui.md#login-view) page).
 
 ## Token lifecycle
 
@@ -41,11 +41,12 @@ After successful authentication, dotvault manages the Vault token automatically:
 - **TTL monitoring** — checked every 5 minutes
 - **Automatic re-auth** — if the token expires or a `403 Forbidden` is received, dotvault triggers re-authentication
 - **Exponential backoff** — on renewal failure, retries with backoff from 1 second to 5 minutes
+- **No repeat lookups on a refused token** — a token Vault has already refused is not presented again until something changes, so a daemon left without a usable credential stops asking rather than polling Vault every 10 seconds indefinitely. Applies to every auth method; see [Tokens Vault has already refused](token.md#tokens-vault-has-already-refused)
 
 In web mode, re-authentication opens the browser to the web UI login page. In CLI mode, re-authentication uses the configured auth method directly.
 
 ## Token persistence
 
-Vault tokens are persisted to `~/.dotvault-token` with `0600` permissions — a dotvault-specific filename rather than Vault's default `~/.vault-token`, so a concurrent `vault` CLI session cannot clobber the daemon's cached token. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `DOTVAULT_TOKEN` environment variable takes precedence if set; the upstream `VAULT_TOKEN` variable is deliberately ignored for the same isolation reason as the filename.
+Vault tokens are persisted to `~/.dotvault-token` with `0600` permissions — with one exception: `mtls+os` writes no token file at all, because the certificate that mints tokens already lives in the OS certificate store and a plaintext copy would undo that protection for no benefit (see [mTLS](mtls.md#no-token-at-rest-mtlsos)). Otherwise — a dotvault-specific filename rather than Vault's default `~/.vault-token`, so a concurrent `vault` CLI session cannot clobber the daemon's cached token. On restart, dotvault attempts to reuse this token before initiating a new authentication flow. The `DOTVAULT_TOKEN` environment variable takes precedence if set; the upstream `VAULT_TOKEN` variable is deliberately ignored for the same isolation reason as the filename.
 
 When the auth method carries the `+tpm` suffix, the token file holds a TPM-sealed envelope instead of the plaintext token. The file is self-describing, so reuse-on-restart and the public `client` library unseal it transparently — no extra configuration on the reader side. The `DOTVAULT_TOKEN` environment variable is always plaintext (an environment value cannot be sealed), so the seal protects the on-disk file only.

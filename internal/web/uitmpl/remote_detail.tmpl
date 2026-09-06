@@ -1,0 +1,42 @@
+{{define "content"}}
+<div data-signals="{confirmDelete: false, showKey: false}">
+  <div class="secret-heading"><h2>{{.Remote.Host}}</h2></div>
+  {{template "remote-state" .Remote}}
+  {{if .FormError}}<div class="error-banner">{{.FormError}}</div>{{end}}
+  <div class="ui-content-card">
+    <form class="ssh-add-form" method="post" action="{{.SaveAction}}">
+      <label class="enrol-prompt-label" for="ssh-host">Host</label>
+      <input id="ssh-host" class="enrol-prompt-input" value="{{.Remote.Host}}" disabled>
+      <label class="enrol-prompt-label" for="ssh-port">Port</label>
+      <input id="ssh-port" name="port" class="enrol-prompt-input" inputmode="numeric" value="{{.Remote.Port}}">
+      <label class="enrol-prompt-label" for="ssh-socket">Remote socket</label>
+      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.sock" value="{{.Remote.RemoteSocket}}">
+      <label class="ui-check-row"><input type="checkbox" name="enabled" value="true" {{if .Remote.Enabled}}checked{{end}}> Enabled</label>
+      <div class="enrol-prompt-actions">
+        <button type="submit" class="enrol-btn-primary">Save</button>
+        <button type="button" class="enrol-btn-danger" data-on:click="$confirmDelete = true">Delete</button>
+      </div>
+    </form>
+    <div class="enrol-warn" data-show="$confirmDelete" style="display: none">
+      <p class="enrol-warn-text">Remove {{.Remote.Host}} and stop its forward?</p>
+      <div class="enrol-warn-actions">
+        <form class="ui-inline-form" method="post" action="{{.DeleteAction}}">
+          <button class="enrol-btn-danger">Confirm delete</button>
+        </form>
+        <button type="button" class="enrol-btn-secondary" data-on:click="$confirmDelete = false">Cancel</button>
+      </div>
+    </div>
+    <div class="config-subsection">
+      <div class="config-subsection-title">Host key</div>
+      {{if .Remote.HostKey}}
+        {{if .Remote.HostKeyFingerprint}}<p class="ssh-fingerprint">{{.Remote.HostKeyFingerprint}}</p>{{end}}
+        <button type="button" class="enrol-btn-secondary" data-on:click="$showKey = !$showKey" data-text="$showKey ? 'Hide key' : 'Reveal key'">Reveal key</button>
+        <pre class="config-json ui-hostkey" data-show="$showKey" style="display: none">{{.Remote.HostKey}}</pre>
+        <p class="config-empty">This is the host&#8217;s public key &mdash; safe to share; it identifies the host, it doesn&#8217;t grant access.</p>
+      {{else}}
+        <p class="config-empty">No pinned host key &mdash; trust comes from a configured certificate authority.</p>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

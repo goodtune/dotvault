@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -20,8 +19,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{
 		"authenticated": authenticated,
 		"auth_method":   s.authMethod,
+		"borrow_only":   s.vaultCfg.BorrowOnly,
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
+		// Bootstrap state, served unauthenticated alongside auth_method
+		// because a client needs it to choose a login form *before* any token
+		// exists — that is the entire point of the bootstrap. "active" is
+		// true only while a BootstrapLogin is waiting; the token itself is
+		// never exposed here or anywhere else.
+		"bootstrap": map[string]any{
+			"active": s.bootstrapActive(),
+			"method": s.bootstrapMethod,
+		},
 	}
 
 	// Only expose Vault connection details to authenticated sessions.
@@ -87,6 +96,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Managed SSH forward state (per-remote connection condition), parallel
+	// to the per-rule sync state above. Not secret — a host key fingerprint
+	// and a socket path are not credentials — so served unauthenticated
+	// like the rest of this block.
+	if sshStatus := s.sshStatusSnapshot(); sshStatus != nil {
+		status["ssh"] = sshStatus()
+	}
+
+	// Mounted-filesystem state (mountpoint, access mode, mount condition).
+	// Unauthenticated like the blocks above: it reports where the
+	// filesystem is mounted and whether it came up, never anything from
+	// inside it.
+	if fuseStatus := s.fuseStatusSnapshot(); fuseStatus != nil {
+		status["fuse"] = fuseStatus()
+	}
+
 	writeJSON(w, status)
 }
 
@@ -97,6 +122,7 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		VaultKey      string `json:"vault_key"`
 		TargetPath    string `json:"target_path"`
 		Format        string `json:"format"`
+		DeleteNulls   bool   `json:"delete_nulls,omitempty"`
 		HasOAuth      bool   `json:"has_oauth,omitempty"`
 		OAuthProvider string `json:"oauth_provider,omitempty"`
 	}
@@ -110,6 +136,7 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 			VaultKey:    r.VaultKey,
 			TargetPath:  r.Target.Path,
 			Format:      r.Target.Format,
+			DeleteNulls: r.Target.DeleteNulls,
 		}
 		if r.OAuth != nil {
 			rules[i].HasOAuth = true
@@ -130,147 +157,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type targetView struct {
-		Path        string `json:"path"`
-		Format      string `json:"format"`
-		Merge       string `json:"merge,omitempty"`
-		HasTemplate bool   `json:"has_template"`
-	}
-	type oauthView struct {
-		Provider   string   `json:"provider"`
-		EnginePath string   `json:"engine_path,omitempty"`
-		Scopes     []string `json:"scopes,omitempty"`
-	}
-	type ruleView struct {
-		Name        string     `json:"name"`
-		Description string     `json:"description,omitempty"`
-		VaultKey    string     `json:"vault_key"`
-		Target      targetView `json:"target"`
-		OAuth       *oauthView `json:"oauth,omitempty"`
-	}
-	type enrolmentView struct {
-		Key        string         `json:"key"`
-		Engine     string         `json:"engine"`
-		EngineName string         `json:"engine_name,omitempty"`
-		Fields     []string       `json:"fields,omitempty"`
-		Settings   map[string]any `json:"settings,omitempty"`
-		Status     string         `json:"status,omitempty"`
-	}
-
-	currentRules := s.getRules()
-	rules := make([]ruleView, len(currentRules))
-	for i, rule := range currentRules {
-		rules[i] = ruleView{
-			Name:        rule.Name,
-			Description: rule.Description,
-			VaultKey:    rule.VaultKey,
-			Target: targetView{
-				Path:        rule.Target.Path,
-				Format:      rule.Target.Format,
-				Merge:       rule.Target.Merge,
-				HasTemplate: rule.Target.Template != "",
-			},
-		}
-		if rule.OAuth != nil {
-			rules[i].OAuth = &oauthView{
-				Provider:   rule.OAuth.Provider,
-				EnginePath: rule.OAuth.EnginePath,
-				Scopes:     rule.OAuth.Scopes,
-			}
-		}
-	}
-
-	statuses := map[string]EnrolStateInfo{}
-	if runner := s.getEnrolRunner(); runner != nil {
-		for _, st := range runner.States() {
-			statuses[st.Key] = st
-		}
-	}
-
-	enrolmentMap := s.getEnrolments()
-	keys := make([]string, 0, len(enrolmentMap))
-	for k := range enrolmentMap {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	enrolments := make([]enrolmentView, 0, len(keys))
-	for _, k := range keys {
-		e := enrolmentMap[k]
-		ev := enrolmentView{
-			Key:      k,
-			Engine:   e.Engine,
-			Settings: redactEnrolmentSettings(e.Settings),
-		}
-		if st, ok := statuses[k]; ok {
-			ev.EngineName = st.EngineName
-			ev.Fields = st.Fields
-			ev.Status = st.Status
-		}
-		enrolments = append(enrolments, ev)
-	}
-
-	currentSync := s.getSyncCfg()
-	syncInterval := currentSync.RawInterval
-	if syncInterval == "" && currentSync.Interval > 0 {
-		syncInterval = formatDuration(currentSync.Interval)
-	}
-
-	web := map[string]any{
-		"enabled": s.cfg.Enabled,
-		"listen":  s.cfg.Listen,
-	}
-	// listen_effective surfaces the actually-bound address, which differs
-	// from the configured value when the user gave a port like ":0".
-	if s.listenAddr != "" {
-		web["listen_effective"] = s.listenAddr
-	}
-
-	resp := map[string]any{
-		"vault": map[string]any{
-			"address":     s.vaultCfg.Address,
-			"kv_mount":    s.kvMount,
-			"user_prefix": s.userPrefix,
-			// The effective-config view shows the raw configured method
-			// (including any "+tpm" suffix) so it matches the lossless
-			// config-download and honestly reflects token-sealing. Only the
-			// SPA login dispatch on /api/v1/status needs the base form.
-			"auth_method":           s.vaultCfg.AuthMethod,
-			"auth_mount":            s.authMount,
-			"auth_role":             s.authRole,
-			"tls_skip_verify":       s.vaultCfg.TLSSkipVerify,
-			"has_ca_cert":           s.vaultCfg.CACert != "",
-			"disable_token_renewal": s.vaultCfg.DisableTokenRenewal,
-		},
-		"sync": map[string]any{
-			"interval": syncInterval,
-		},
-		"web":        web,
-		"rules":      rules,
-		"enrolments": enrolments,
-	}
-
-	// Remote-config overlay summary. The redacted view exposes the header
-	// *names* only — values are operator-defined dimension labels and flow
-	// through the lossless download endpoint instead, mirroring how
-	// observability headers are handled.
-	if s.remoteCfg.URL != "" {
-		rc := map[string]any{
-			"url":              s.remoteCfg.URL,
-			"refresh_interval": s.remoteCfg.RawRefreshInterval,
-			"has_ca_cert":      s.remoteCfg.CACert != "",
-		}
-		if len(s.remoteCfg.Headers) > 0 {
-			names := make([]string, 0, len(s.remoteCfg.Headers))
-			for k := range s.remoteCfg.Headers {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			rc["header_names"] = names
-		}
-		resp["remote_config"] = rc
-	}
-	writeJSON(w, resp)
+	// The view assembly is shared with the server-rendered /ui/config/ page —
+	// see buildConfigViewModel in ui_config.go.
+	writeJSON(w, s.buildConfigViewModel())
 }
 
 // redactEnrolmentSettings returns a copy of settings with values masked for
@@ -534,6 +423,7 @@ func (s *Server) buildEffectiveConfig() *config.Config {
 		Web:           s.cfg,
 		Observability: obsCfg,
 		Agent:         s.agentCfg,
+		API:           s.apiCfg,
 		RemoteConfig:  s.remoteCfg,
 		Rules:         rules,
 		Enrolments:    enrolments,
@@ -616,7 +506,18 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "not authenticated", http.StatusUnauthorized)
 		return
 	}
-	slog.Info("vault token retrieved via web UI", "username", s.username)
+	// Don't lend out a token the daemon already knows has gone invalid. The
+	// borrower would validate it, fail, and fall back to its own auth flow —
+	// which on a headless host means no token at all. A 401 sends it round
+	// the retry loop instead, and the daemon's own recovery path (re-borrow
+	// from its upstream peer, or re-auth) is what fixes the situation for
+	// everyone at once. The borrower still validates what it receives; this
+	// only removes a known-bad answer.
+	if s.needsReauth() {
+		writeError(w, "not authenticated (re-authentication pending)", http.StatusUnauthorized)
+		return
+	}
+	slog.Info("vault token retrieved via web API", "username", s.username)
 	writeJSON(w, map[string]any{"token": s.vault.Token()})
 }
 
@@ -629,53 +530,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	slog.Info("sync triggered via web UI")
 	s.engine.TriggerSync()
 	writeJSON(w, map[string]any{"status": "sync triggered"})
-}
-
-func (s *Server) handleEnrolPrompt(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnrolAuth(w) {
-		return
-	}
-	s.enrolPromptMu.RLock()
-	label := s.enrolPromptLabel
-	pending := s.enrolPromptCh != nil
-	s.enrolPromptMu.RUnlock()
-
-	writeJSON(w, map[string]any{
-		"pending": pending,
-		"label":   label,
-	})
-}
-
-func (s *Server) handleEnrolSecret(w http.ResponseWriter, r *http.Request) {
-	if !s.requireEnrolAuth(w) {
-		return
-	}
-	var req struct {
-		Value string `json:"value"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	s.enrolPromptMu.Lock()
-	ch := s.enrolPromptCh
-	if ch == nil {
-		s.enrolPromptMu.Unlock()
-		writeError(w, "no pending prompt", http.StatusConflict)
-		return
-	}
-
-	select {
-	case ch <- req.Value:
-		s.enrolPromptCh = nil
-		s.enrolPromptLabel = ""
-		s.enrolPromptMu.Unlock()
-		writeJSON(w, map[string]any{"status": "accepted"})
-	default:
-		s.enrolPromptMu.Unlock()
-		writeError(w, "prompt already answered", http.StatusConflict)
-	}
 }
 
 // handleHealthz reports daemon liveness — the process is running and

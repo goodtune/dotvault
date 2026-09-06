@@ -56,7 +56,7 @@ type GHPEngine struct {
 	slowDownBump time.Duration // when set, overrides ghpSlowDownBump
 }
 
-func (e *GHPEngine) Name() string { return "ghp" }
+func (e *GHPEngine) Name() string { return "GitHub Proxy" }
 
 // Fields lists the Vault KV fields a complete ghp enrolment requires.
 // user_token is the "ghpr_" CLI session token; server_url is the ghp

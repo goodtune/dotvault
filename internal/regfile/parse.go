@@ -504,16 +504,29 @@ func canonicalizeKeyPath(path string) string {
 			parts[rootDepth+2] = c
 		}
 	}
-	// Observability\Headers and RemoteConfig\Headers are the fixed segments
-	// at rootDepth+1 (a position otherwise reserved for user-defined
-	// rule/enrolment names, which we never fold). Canonicalise only when the
-	// parent is one of those sections so a hand-authored .reg using
-	// `headers` in any case still matches the exact-string lookups in
-	// applyValues.
-	if len(parts) > rootDepth+1 &&
-		(parts[rootDepth] == "Observability" || parts[rootDepth] == "RemoteConfig") &&
-		strings.EqualFold(parts[rootDepth+1], "Headers") {
-		parts[rootDepth+1] = "Headers"
+	// Observability\Headers and RemoteConfig\Headers are fixed segments at
+	// rootDepth+1 (a position otherwise reserved for user-defined
+	// rule/enrolment names, which we never fold), as are the per-signal
+	// Observability\Metrics and Observability\Logs subkeys — and each
+	// signal's own Headers subtree one level below. Canonicalise only when
+	// the parent is one of those sections so a hand-authored .reg using any
+	// case still matches the exact-string lookups in applyValues.
+	if len(parts) > rootDepth+1 {
+		switch {
+		case (parts[rootDepth] == "Observability" || parts[rootDepth] == "RemoteConfig") &&
+			strings.EqualFold(parts[rootDepth+1], "Headers"):
+			parts[rootDepth+1] = "Headers"
+		case parts[rootDepth] == "Observability" && strings.EqualFold(parts[rootDepth+1], "Metrics"):
+			parts[rootDepth+1] = "Metrics"
+		case parts[rootDepth] == "Observability" && strings.EqualFold(parts[rootDepth+1], "Logs"):
+			parts[rootDepth+1] = "Logs"
+		}
+	}
+	if len(parts) > rootDepth+2 &&
+		parts[rootDepth] == "Observability" &&
+		(parts[rootDepth+1] == "Metrics" || parts[rootDepth+1] == "Logs") &&
+		strings.EqualFold(parts[rootDepth+2], "Headers") {
+		parts[rootDepth+2] = "Headers"
 	}
 	return strings.Join(parts, `\`)
 }
@@ -646,6 +659,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
 		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
+		func() error { return applyBool(&cfg.Vault.BorrowOnly, vaultKey, "BorrowOnly") },
 		func() error {
 			v, ok, err := getMultiString(vaultKey, "Policies")
 			if err != nil {
@@ -675,11 +689,15 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.MTLS.PKIMount, mtlsKey, "PKIMount") },
 		func() error { return apply(&cfg.Vault.MTLS.PKIRole, mtlsKey, "PKIRole") },
 		func() error { return apply(&cfg.Vault.MTLS.KeyType, mtlsKey, "KeyType") },
+		func() error { return applyInt(&cfg.Vault.MTLS.KeyBits, mtlsKey, "KeyBits") },
 		func() error { return apply(&cfg.Vault.MTLS.CommonName, mtlsKey, "CommonName") },
 		func() error { return apply(&cfg.Vault.MTLS.TTL, mtlsKey, "TTL") },
 		func() error { return apply(&cfg.Vault.MTLS.ReissueBefore, mtlsKey, "ReissueBefore") },
 		func() error { return apply(&cfg.Vault.MTLS.StorageDir, mtlsKey, "StorageDir") },
 		func() error { return applyBool(&cfg.Vault.MTLS.SealToPCRs, mtlsKey, "SealToPCRs") },
+		func() error {
+			return applyBoolPtr(&cfg.Vault.MTLS.RevokeSuperseded, mtlsKey, "RevokeSuperseded")
+		},
 		func() error { return apply(&cfg.Vault.MTLS.BYO.Cert, mtlsKey+`\BYO`, "Cert") },
 		func() error { return apply(&cfg.Vault.MTLS.BYO.Key, mtlsKey+`\BYO`, "Key") },
 	} {
@@ -747,6 +765,54 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		cfg.Observability.Headers = headers
 	}
 
+	// Per-signal override blocks. The tri-state Enabled/Insecure only apply
+	// when the value is present (nil = inherit), and each signal's Headers
+	// map is non-nil iff its subkey exists — key presence is what encodes
+	// the "explicitly no headers for this signal" state that must not
+	// collapse into "inherit the shared credentials" across a round-trip.
+	for _, sig := range []struct {
+		name string
+		cfg  *config.ObservabilitySignalConfig
+	}{
+		{"Metrics", &cfg.Observability.Metrics},
+		{"Logs", &cfg.Observability.Logs},
+	} {
+		sigKey := obsKey + `\` + sig.name
+		if err := applyBoolPtr(&sig.cfg.Enabled, sigKey, "Enabled"); err != nil {
+			return err
+		}
+		if err := applyBoolPtr(&sig.cfg.Insecure, sigKey, "Insecure"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Endpoint, sigKey, "Endpoint"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Protocol, sigKey, "Protocol"); err != nil {
+			return err
+		}
+		if err := apply(&sig.cfg.Temporality, sigKey, "Temporality"); err != nil {
+			return err
+		}
+		sigHeadersKey := sigKey + `\Headers`
+		var sigHeaders map[string]string
+		if seenKeys[sigHeadersKey] {
+			sigHeaders = map[string]string{}
+		}
+		for vk, v := range values {
+			if vk.key != sigHeadersKey {
+				continue
+			}
+			if v.kind != rvSZ {
+				return fmt.Errorf("registry value %s\\%s has unsupported type %s for an observability header (only REG_SZ is supported)", sigHeadersKey, vk.name, kindName(v.kind))
+			}
+			if sigHeaders == nil {
+				sigHeaders = map[string]string{}
+			}
+			sigHeaders[vk.name] = v.str
+		}
+		sig.cfg.Headers = sigHeaders
+	}
+
 	// RemoteConfig. Scalar fields mirror the renderer; Headers live in a
 	// dedicated subkey with the same dynamic-map contract as
 	// Observability\Headers.
@@ -773,6 +839,41 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 	}
 	if len(remoteHeaders) > 0 {
 		cfg.RemoteConfig.Headers = remoteHeaders
+	}
+
+	// API (local API socket).
+	apiKey := rootKey + `\API`
+	if err := applyBool(&cfg.API.Enabled, apiKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.API.Unix.Path, apiKey, "UnixPath"); err != nil {
+		return err
+	}
+
+	// FUSE (the filesystem view of the user's secrets).
+	fuseKey := rootKey + `\FUSE`
+	if err := applyBool(&cfg.FUSE.Enabled, fuseKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.FUSE.Mountpoint, fuseKey, "Mountpoint"); err != nil {
+		return err
+	}
+	if err := applyBool(&cfg.FUSE.ReadWrite, fuseKey, "ReadWrite"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.FUSE.RawCacheTTL, fuseKey, "CacheTTL"); err != nil {
+		return err
+	}
+
+	// SSH (admin-owned host-CA trust material).
+	sshKey := rootKey + `\SSH`
+	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {
+		return err
+	}
+	if v, ok, err := getMultiString(sshKey, "CertificateAuthorities"); err != nil {
+		return err
+	} else if ok {
+		cfg.SSH.CertificateAuthorities = v
 	}
 
 	// Agent.
@@ -836,6 +937,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			func() error { return apply(&rule.Target.Format, base, "TargetFormat") },
 			func() error { return apply(&rule.Target.Template, base, "TargetTemplate") },
 			func() error { return apply(&rule.Target.Merge, base, "TargetMerge") },
+			func() error { return applyBool(&rule.Target.DeleteNulls, base, "TargetDeleteNulls") },
 		} {
 			if err := fn(); err != nil {
 				return err
@@ -886,6 +988,11 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			return err
 		} else if ok {
 			en.Engine = v
+		}
+		if v, ok, err := getString(base, "HelpText"); err != nil {
+			return err
+		} else if ok {
+			en.HelpText = v
 		}
 		// Settings subkey: collect the values directly under base\Settings
 		// and recurse into any nested subkeys so structured settings (e.g.

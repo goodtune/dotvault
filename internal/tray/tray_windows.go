@@ -18,19 +18,19 @@ import (
 // Win32 message identifiers and constants used by the tray. Values come
 // from the Windows SDK headers (winuser.h, shellapi.h).
 const (
-	wmDestroy     = 0x0002
-	wmNull        = 0x0000
-	wmCommand     = 0x0111
-	wmRButtonUp   = 0x0205
-	wmLButtonDbl  = 0x0203
-	wmUser        = 0x0400
-	wmTrayCB      = wmUser + 1 // notification callback from Shell_NotifyIcon
-	wmTrayQuit    = wmUser + 2 // posted by Run when ctx is cancelled
-	nimAdd        = 0x00000000
-	nimDelete     = 0x00000002
-	nifMessage    = 0x00000001
-	nifIcon       = 0x00000002
-	nifTip        = 0x00000004
+	wmDestroy      = 0x0002
+	wmNull         = 0x0000
+	wmCommand      = 0x0111
+	wmRButtonUp    = 0x0205
+	wmLButtonDbl   = 0x0203
+	wmUser         = 0x0400
+	wmTrayCB       = wmUser + 1 // notification callback from Shell_NotifyIcon
+	wmTrayQuit     = wmUser + 2 // posted by Run when ctx is cancelled
+	nimAdd         = 0x00000000
+	nimDelete      = 0x00000002
+	nifMessage     = 0x00000001
+	nifIcon        = 0x00000002
+	nifTip         = 0x00000004
 	idiApplication = 32512
 	idcArrow       = 32512
 	tpmRightButton = 0x0002
@@ -49,8 +49,9 @@ const (
 	smCXSmIcon     = 49
 	smCYSmIcon     = 50
 
-	menuIDView = 1001
-	menuIDExit = 1002
+	menuIDView   = 1001
+	menuIDExit   = 1002
+	menuIDReload = 1003
 )
 
 var (
@@ -58,26 +59,26 @@ var (
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
-	procLoadIconW          = user32.NewProc("LoadIconW")
-	procLoadImageW         = user32.NewProc("LoadImageW")
-	procDestroyIcon        = user32.NewProc("DestroyIcon")
-	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
-	procLoadCursorW        = user32.NewProc("LoadCursorW")
-	procRegisterClassExW   = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW    = user32.NewProc("CreateWindowExW")
-	procDestroyWindow      = user32.NewProc("DestroyWindow")
-	procDefWindowProcW     = user32.NewProc("DefWindowProcW")
-	procGetMessageW        = user32.NewProc("GetMessageW")
-	procTranslateMessage   = user32.NewProc("TranslateMessage")
-	procDispatchMessageW   = user32.NewProc("DispatchMessageW")
-	procPostMessageW       = user32.NewProc("PostMessageW")
-	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
-	procCreatePopupMenu    = user32.NewProc("CreatePopupMenu")
-	procAppendMenuW        = user32.NewProc("AppendMenuW")
-	procDestroyMenu        = user32.NewProc("DestroyMenu")
-	procTrackPopupMenu     = user32.NewProc("TrackPopupMenu")
-	procGetCursorPos       = user32.NewProc("GetCursorPos")
+	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
+	procLoadIconW           = user32.NewProc("LoadIconW")
+	procLoadImageW          = user32.NewProc("LoadImageW")
+	procDestroyIcon         = user32.NewProc("DestroyIcon")
+	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
+	procLoadCursorW         = user32.NewProc("LoadCursorW")
+	procRegisterClassExW    = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
+	procDestroyWindow       = user32.NewProc("DestroyWindow")
+	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
+	procGetMessageW         = user32.NewProc("GetMessageW")
+	procTranslateMessage    = user32.NewProc("TranslateMessage")
+	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
+	procPostMessageW        = user32.NewProc("PostMessageW")
+	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
+	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW         = user32.NewProc("AppendMenuW")
+	procDestroyMenu         = user32.NewProc("DestroyMenu")
+	procTrackPopupMenu      = user32.NewProc("TrackPopupMenu")
+	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
@@ -137,11 +138,12 @@ type msg struct {
 // state holds everything the WindowProc needs to react to messages. There
 // is exactly one tray per process, so a package-level singleton is fine.
 type state struct {
-	mu       sync.Mutex
-	hwnd     windows.Handle
-	nid      notifyIconData
-	cfg      Config
-	hasView  bool
+	mu        sync.Mutex
+	hwnd      windows.Handle
+	nid       notifyIconData
+	cfg       Config
+	hasView   bool
+	hasReload bool
 }
 
 var trayState state
@@ -236,6 +238,7 @@ func Run(ctx context.Context, cfg Config) error {
 	trayState.hwnd = windows.Handle(hwnd)
 	trayState.cfg = cfg
 	trayState.hasView = cfg.WebURL != ""
+	trayState.hasReload = cfg.OnReload != nil
 	trayState.nid = notifyIconData{
 		hWnd:             windows.Handle(hwnd),
 		uID:              1,
@@ -331,6 +334,8 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 		switch uint32(wParam & 0xFFFF) {
 		case menuIDView:
 			go triggerView()
+		case menuIDReload:
+			go triggerReload()
 		case menuIDExit:
 			go triggerExit()
 		}
@@ -366,11 +371,18 @@ func showMenu(hwnd windows.Handle) {
 
 	trayState.mu.Lock()
 	hasView := trayState.hasView
+	hasReload := trayState.hasReload
 	trayState.mu.Unlock()
 
 	if hasView {
 		viewPtr, _ := windows.UTF16PtrFromString("&View web UI")
 		procAppendMenuW.Call(hMenu, mfString, uintptr(menuIDView), uintptr(unsafe.Pointer(viewPtr)))
+	}
+	if hasReload {
+		reloadPtr, _ := windows.UTF16PtrFromString("&Reload config")
+		procAppendMenuW.Call(hMenu, mfString, uintptr(menuIDReload), uintptr(unsafe.Pointer(reloadPtr)))
+	}
+	if hasView || hasReload {
 		procAppendMenuW.Call(hMenu, mfSeparator, 0, 0)
 	}
 	exitPtr, _ := windows.UTF16PtrFromString("E&xit")
@@ -405,6 +417,17 @@ func triggerView() {
 	}
 	if err := browser.OpenURL(url); err != nil {
 		slog.Warn("tray: failed to open browser", "url", url, "error", err)
+	}
+}
+
+// triggerReload runs the user-supplied OnReload (token re-read + immediate
+// config-refresh pass) off-thread so wndProc never blocks the pump.
+func triggerReload() {
+	trayState.mu.Lock()
+	onReload := trayState.cfg.OnReload
+	trayState.mu.Unlock()
+	if onReload != nil {
+		onReload()
 	}
 }
 

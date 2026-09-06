@@ -2,7 +2,6 @@ version: 2
 
 before:
   hooks:
-    - sh -c "cd internal/web/frontend && npm ci && npm run build"
     # Embed the Windows .exe icon AND version metadata. goversioninfo emits a
     # COFF object (.syso) carrying the icon plus a VS_VERSIONINFO resource
     # (Explorer Details tab: File/Product version, Company, Description). The
@@ -105,6 +104,41 @@ nfpms:
       # OpenRC-only hosts the file is just dormant.
       - src: packaging/linux/dotvault.service
         dst: /usr/lib/systemd/user/dotvault.service
+        file_info:
+          mode: 0644
+        packager: apk
+      # Optional socket-activation units — shipped, not enabled. With one
+      # enabled, systemd binds the local API / SSH agent socket and holds
+      # it across daemon restarts, so clients queue instead of getting
+      # ECONNREFUSED while the daemon is down. Same three-packager set as
+      # the service unit above and the same APK dormancy caveat.
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: deb
+      - src: packaging/linux/dotvault-api.socket
+        dst: /usr/lib/systemd/user/dotvault-api.socket
+        file_info:
+          mode: 0644
+        packager: apk
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
+        file_info:
+          mode: 0644
+        packager: deb
+      - src: packaging/linux/dotvault-agent.socket
+        dst: /usr/lib/systemd/user/dotvault-agent.socket
         file_info:
           mode: 0644
         packager: apk

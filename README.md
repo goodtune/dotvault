@@ -27,7 +27,8 @@ On desktop environments it can run a local web service. If the current session i
 - **Go templates** — Optionally reshape secret data before writing, with helpers like `env`, `base64encode`, `default`, and `quote`
 - **Hybrid event + poll sync** — Subscribes to the Vault Events API on Enterprise for sub-second reaction to changes; falls back transparently to polling on Community Vault
 - **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
-- **Web UI** — Optional loopback-only dashboard to drive login, view sync status, inspect secrets, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file
+- **Web UI** — Optional loopback-only, server-rendered UI with bookmarkable pages to drive login, view sync status, inspect secrets, run enrolments, manage SSH remotes, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file
+- **Filesystem view** — Optional FUSE mount (Linux/macOS) exposing every secret under your Vault prefix as a `.json` file, so `jq . ~/.dotvault/gh.json` reads a live credential without a sync rule and editors syntax-highlight it; read-only by default, with an opt-in read-write mode
 - **Windows integration** — System-tray icon for double-click launch, plus full Group Policy support via the machine policy registry (`HKLM\SOFTWARE\Policies\goodtune\dotvault`) that overrides the YAML config when present; author the policy with `reg-import`/`reg-export`
 - **Dry-run mode** — Preview what would change without writing any files
 - **Cross-platform** — Static, CGO-free binaries for Linux and macOS (amd64/arm64) and Windows (amd64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
@@ -61,6 +62,8 @@ dotvault status
 | `dotvault login` | Force a fresh login via the configured auth method |
 | `dotvault login-check` | Validate or renew the cached token on interactive shell login |
 | `dotvault enrol` | Interactive enrolment picker (pass a name to run a single enrolment directly) |
+| `dotvault browse` | Open a URL in a browser, preferring the peer over `vault.token_socket` |
+| `dotvault notify` | Raise a desktop notification, preferring the peer over `vault.token_socket` |
 | `dotvault status` | Display auth state, token TTL, and per-rule sync state |
 | `dotvault reg-export` | Convert a Windows `.reg` file to YAML (or canonicalised `.reg`) |
 | `dotvault reg-import` | Convert a YAML config to a Windows `.reg` file |
@@ -120,6 +123,7 @@ Each rule maps a Vault secret to a local file:
 | `target.path` | Local file path (supports `~`) |
 | `target.format` | One of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config` |
 | `target.template` | Optional Go template for formatting |
+| `target.delete_nulls` | Optional (default `false`). Treat a `null` in the template as a tombstone that removes the key from the target file. `json` and `yaml` only |
 
 Managed files are written atomically at `0600`.
 
@@ -132,6 +136,17 @@ web:
   enabled: true
   listen: "127.0.0.1:9000"
 ```
+
+**`fuse`** — Mount your secrets as a filesystem, one `.json` file per secret (Linux/macOS only; see the [filesystem guide](https://goodtune.github.io/dotvault/guide/filesystem/)):
+
+```yaml
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"
+  read_write: false
+```
+
+This is the one section that can also be set per-user, in `~/.config/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`), so you can turn the filesystem on without editing a system config an administrator owns. Every other section is refused there.
 
 **`enrolments`** — Declare service enrolment engines so missing credentials are acquired interactively on first run and refreshed automatically thereafter. See the [service onboarding guides](https://goodtune.github.io/dotvault/services/overview/) for the supported engines.
 

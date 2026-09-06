@@ -27,7 +27,7 @@ func TestEndToEnd(t *testing.T) {
 	// Skip if Vault not available
 	vc, err := vault.NewClient(vault.Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   rootToken(t),
 	})
 	if err != nil {
 		t.Skip("Vault not available")

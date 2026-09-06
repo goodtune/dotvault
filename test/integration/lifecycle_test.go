@@ -36,7 +36,7 @@ func TestLifecycleRecoversFromExpiredToken(t *testing.T) {
 
 	rootClient, err := vault.NewClient(vault.Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   rootToken(t),
 	})
 	if err != nil {
 		t.Fatalf("NewClient (root): %v", err)

@@ -287,3 +287,23 @@ func TestCopyEngine_Run_TemplateRequired(t *testing.T) {
 		t.Fatal("expected error when template is missing")
 	}
 }
+
+// TestCopyEngine_IsUnattended pins the capability the first-run wizard keys
+// on. Copy reads one Vault secret and writes another with no user involved,
+// so it must neither trigger the wizard nor count as the user having been
+// through it.
+func TestCopyEngine_IsUnattended(t *testing.T) {
+	if !EngineUnattended(&CopyEngine{}) {
+		t.Error("copy engine must report itself unattended")
+	}
+	// Interactive engines must not, or the wizard would never appear.
+	for _, name := range []string{"github", "ssh", "jfrog", "databricks", "ghp"} {
+		e, ok := GetEngine(name)
+		if !ok {
+			t.Fatalf("engine %q not registered", name)
+		}
+		if EngineUnattended(e) {
+			t.Errorf("engine %q reports unattended; it needs user interaction", name)
+		}
+	}
+}

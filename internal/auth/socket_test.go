@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -168,10 +169,10 @@ func TestManagerLogin_BorrowsFromSocket(t *testing.T) {
 	}
 
 	m := &Manager{
-		VaultClient: vc,
-		AuthMethod:  "token", // a bare token method would error without a token
-		TokenSocket: sock,
-		Username:    "testuser",
+		VaultClient:  vc,
+		AuthMethod:   "token", // a bare token method would error without a token
+		TokenSockets: []string{sock},
+		Username:     "testuser",
 	}
 	if err := m.Login(context.Background()); err != nil {
 		t.Fatalf("Login: %v", err)
@@ -202,15 +203,144 @@ func TestManagerLogin_SocketTokenRejectedFallsThrough(t *testing.T) {
 	}
 
 	m := &Manager{
-		VaultClient: vc,
-		AuthMethod:  "token",
-		TokenSocket: sock,
-		Username:    "testuser",
+		VaultClient:  vc,
+		AuthMethod:   "token",
+		TokenSockets: []string{sock},
+		Username:     "testuser",
 	}
 	if err := m.Login(context.Background()); err == nil {
 		t.Fatal("expected Login to fall through and error after the borrowed token was rejected")
 	}
 	if got := vc.Token(); got != "" {
 		t.Errorf("in-memory token = %q after rejected borrow, want cleared", got)
+	}
+}
+
+// TestManagerLogin_BorrowOnlySucceedsOnBorrow confirms BorrowOnly does not
+// interfere with a successful borrow: the socket answers, LookupSelf accepts
+// it, and Login returns before ever consulting AuthMethod (set here to
+// something that would fail loudly if dispatched).
+func TestManagerLogin_BorrowOnlySucceedsOnBorrow(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	vaultURL := mockVaultAccepting(t, "peer-token")
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
+	})
+
+	vc, err := vault.NewClient(vault.Config{Address: vaultURL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	m := &Manager{
+		VaultClient:  vc,
+		AuthMethod:   "unsupported-method-should-never-be-reached",
+		TokenSockets: []string{sock},
+		BorrowOnly:   true,
+		Username:     "testuser",
+	}
+	if err := m.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if got := vc.Token(); got != "peer-token" {
+		t.Errorf("client token = %q after borrow, want %q", got, "peer-token")
+	}
+}
+
+// TestManagerLogin_BorrowOnlyRefusesFreshAuth is the headline borrow-only
+// contract: when no token can be borrowed, Login returns ErrBorrowOnly
+// instead of dispatching to AuthMethod's fresh-auth flow.
+func TestManagerLogin_BorrowOnlyRefusesFreshAuth(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "")
+
+	// No socket configured at all — the borrow can't even be attempted.
+	vc, err := vault.NewClient(vault.Config{Address: "https://vault.example.com:8200"})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	m := &Manager{
+		VaultClient: vc,
+		// A real method dispatch would need no config at all to fail loudly
+		// with "token" — proving BorrowOnly short-circuits before reaching it
+		// means asserting the error is ErrBorrowOnly specifically, not just
+		// any error.
+		AuthMethod: "token",
+		BorrowOnly: true,
+		Username:   "testuser",
+	}
+	err = m.Login(context.Background())
+	if !errors.Is(err, ErrBorrowOnly) {
+		t.Fatalf("Login() error = %v, want errors.Is(err, ErrBorrowOnly)", err)
+	}
+}
+
+// TestFetchTokenFromSockets_FirstWins pins the precedence contract: callers
+// pass sockets most-stable-first (local API socket before an SSH-forwarded
+// peer) and the first that answers is used, without dialling the rest.
+func TestFetchTokenFromSockets_FirstWins(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "api.sock")
+	remote := filepath.Join(dir, "peer.sock")
+
+	newUnixTokenServer(t, local, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"local-token"}`))
+	})
+	remoteHits := 0
+	newUnixTokenServer(t, remote, func(w http.ResponseWriter, r *http.Request) {
+		remoteHits++
+		_, _ = w.Write([]byte(`{"token":"remote-token"}`))
+	})
+
+	got, source := FetchTokenFromSockets(context.Background(), []string{local, remote})
+	if got != "local-token" {
+		t.Errorf("token = %q, want local-token", got)
+	}
+	if source != local {
+		t.Errorf("source = %q, want %q", source, local)
+	}
+	if remoteHits != 0 {
+		t.Errorf("remote socket dialled %d times, want 0 once the first answered", remoteHits)
+	}
+}
+
+// TestFetchTokenFromSockets_FallsThrough is the scenario the local socket
+// exists for in reverse: the preferred socket is gone (or holds no token) and
+// the next candidate must still be tried.
+func TestFetchTokenFromSockets_FallsThrough(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent.sock")
+	empty := filepath.Join(dir, "empty.sock")
+	good := filepath.Join(dir, "good.sock")
+
+	newUnixTokenServer(t, empty, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	newUnixTokenServer(t, good, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"token":"third-token"}`))
+	})
+
+	got, source := FetchTokenFromSockets(context.Background(), []string{missing, empty, good})
+	if got != "third-token" {
+		t.Errorf("token = %q, want third-token", got)
+	}
+	if source != good {
+		t.Errorf("source = %q, want %q", source, good)
+	}
+}
+
+func TestFetchTokenFromSockets_AllExhausted(t *testing.T) {
+	dir := t.TempDir()
+	got, source := FetchTokenFromSockets(context.Background(), []string{
+		"", filepath.Join(dir, "absent.sock"),
+	})
+	if got != "" || source != "" {
+		t.Errorf("got (%q, %q), want empty", got, source)
+	}
+	if got, source := FetchTokenFromSockets(context.Background(), nil); got != "" || source != "" {
+		t.Errorf("nil list: got (%q, %q), want empty", got, source)
 	}
 }

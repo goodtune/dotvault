@@ -12,7 +12,48 @@ import (
 )
 
 // SystemConfigPath returns the OS-appropriate path for the system config file.
+// systemConfigOverride relocates the system config path. It is empty in every
+// shipped build and is set only via ldflags:
+//
+//	go build -ldflags "-X github.com/goodtune/dotvault/internal/paths.systemConfigOverride=/path"
+//
+// It exists for tests that must run with no system config present. Several
+// cmd/dotvault tests pass --config, which is refused whenever a system-wide
+// config exists and has not opted into bypass_system_config — so on any machine
+// with dotvault actually installed (macOS hardcodes
+// /Library/Application Support/dotvault/config.yaml) those tests failed, while
+// passing on CI where nothing is installed.
+//
+// Deliberately build-time rather than an environment variable. The bypass gate
+// exists to stop a user overriding managed configuration, and env is
+// user-controlled, so an env override would hand back exactly the escape hatch
+// the gate denies. A build-time value grants nothing new: whoever builds the
+// binary could just as easily remove the gate.
+var systemConfigOverride string
+
+// SetSystemConfigPathForTest points SystemConfigPath at path for the duration
+// of a test, returning a function that restores the previous value.
+//
+// It serves in-process tests the same purpose the ldflags variable above serves
+// for tests that build and exec a binary: letting a test run as though no
+// system-wide configuration were installed. Both exist because the --config
+// gate is (correctly) absolute, so a developer machine with dotvault installed
+// otherwise fails tests that pass --config.
+//
+// Test-only. It lives in internal/, so it can never become part of the public
+// client API, and nothing in the daemon calls it — an environment-variable
+// equivalent is deliberately NOT offered, since env is user-controlled and
+// would hand back the override the gate exists to refuse.
+func SetSystemConfigPathForTest(path string) func() {
+	prev := systemConfigOverride
+	systemConfigOverride = path
+	return func() { systemConfigOverride = prev }
+}
+
 func SystemConfigPath() string {
+	if systemConfigOverride != "" {
+		return systemConfigOverride
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return "/Library/Application Support/dotvault/config.yaml"
@@ -118,6 +159,28 @@ func UID() (string, error) {
 	return u.Uid, nil
 }
 
+// DefaultAPISocket returns the per-user Unix domain socket path for the local
+// API surface when api.unix.path is unset. It follows DefaultAgentSocket's
+// resolution exactly — the runtime dir ($XDG_RUNTIME_DIR/dotvault/api.sock),
+// which is owner-only and cleared on logout, falling back to the cache dir
+// when XDG_RUNTIME_DIR is empty (typical on macOS).
+//
+// Both sides of the borrow resolve the path through this one function: the
+// daemon binds it, and a client on the same machine derives the same value
+// from the same config, so neither has to be told where the other put it.
+//
+// Note for service deployments: /run/user/<uid> is torn down when the user's
+// last session ends unless lingering is enabled (`loginctl enable-linger`),
+// which is exactly the disconnect the local socket exists to survive. The
+// packaged systemd unit declares RuntimeDirectory=dotvault so the directory
+// is owned by the unit; see docs/configuration/config-reference.md.
+func DefaultAPISocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "api.sock")
+	}
+	return filepath.Join(CacheDir(), "api.sock")
+}
+
 // Username returns the current OS username with any domain prefix stripped.
 func Username() (string, error) {
 	u, err := user.Current()
@@ -148,6 +211,67 @@ func ExpandHome(path string) (string, error) {
 		return filepath.Join(home, path[2:]), nil
 	}
 	return path, nil
+}
+
+// UserConfigDir returns the per-user configuration directory for dotvault.
+//
+// This is deliberately distinct from SystemConfigPath's directory. The system
+// config is admin-owned (root on Linux, %ProgramData% on Windows, and on a GPO
+// machine superseded entirely by HKLM policy), and dotvault deliberately does
+// not read user-writable policy. Files here are the opposite: owned by the
+// user, never consulted for policy, and never resolved from a system location.
+//
+// On Linux this is the same directory the packaged systemd unit already uses
+// for its per-user EnvironmentFile (~/.config/dotvault/env).
+func UserConfigDir() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		return filepath.Join(home, "Library", "Application Support", "dotvault"), nil
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return filepath.Join(appData, "dotvault"), nil
+		}
+		return "", fmt.Errorf("APPDATA is not set")
+	default:
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			return filepath.Join(xdg, "dotvault"), nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		return filepath.Join(home, ".config", "dotvault"), nil
+	}
+}
+
+// UserConfigPath returns the path to the per-user preference overlay
+// (config.yaml), a sibling of the env file and ssh.yaml in UserConfigDir.
+//
+// Deliberately distinct from SystemConfigPath: that file is policy, this one
+// is preference. Only the sections config.ParseUserConfig allows may appear
+// here, and each merges by its own ratchet rather than overwriting policy —
+// see config.UserConfig.
+func UserConfigPath() (string, error) {
+	dir, err := UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.yaml"), nil
+}
+
+// SSHConfigPath returns the path to the user-level managed-SSH-forward
+// configuration (ssh.yaml). It is a sibling of the per-user env file and is
+// never resolved from a system location — see UserConfigDir.
+func SSHConfigPath() (string, error) {
+	dir, err := UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ssh.yaml"), nil
 }
 
 // ValidateLoopback checks that addr (host:port) resolves to a loopback address.

@@ -17,7 +17,7 @@ import (
 // endpoint, both share the single backend (the same identity is served on
 // both), and ctx cancellation stops every goroutine so Run returns.
 func TestServiceRunFanOut(t *testing.T) {
-	dir := t.TempDir()
+	dir := sockTempDir(t)
 	primary := filepath.Join(dir, "primary", "agent.sock")
 	secondary := filepath.Join(dir, "secondary", "agent.sock")
 

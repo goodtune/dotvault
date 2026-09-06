@@ -31,7 +31,14 @@ func NewService(agentCfg config.AgentConfig, vc *vault.Client, kvMount, userPref
 		return nil, err
 	}
 	addr := ResolveEndpoint(agentCfg)
-	backend := NewBackend(sources, WithReauthGate(gate), WithEndpoint(addr))
+	// The token probe is what lets Run start before the daemon has
+	// authenticated: pre-auth the backend answers "no identities" instantly
+	// rather than making Vault calls that cannot succeed. See Backend.hasToken.
+	backend := NewBackend(sources,
+		WithReauthGate(gate),
+		WithEndpoint(addr),
+		WithTokenProbe(func() bool { return vc.Token() != "" }),
+	)
 	return &Service{
 		Backend:   backend,
 		addr:      addr,
@@ -53,6 +60,16 @@ func (s *Service) Endpoints() []string { return s.endpoints }
 // Run serves the agent on every configured endpoint until ctx is cancelled,
 // one supervised listener per endpoint. The listeners share the single backend
 // (and its cached identities), so a token refresh does not bounce any of them.
+//
+// Run is started before the daemon authenticates, deliberately. Waiting for a
+// token used to leave the endpoint unaccepted, which is fine for the seconds
+// of a restart and wrong for anything longer: under systemd socket activation
+// the socket exists from boot whether or not we accept on it, so on a host
+// that cannot obtain a token at all (nothing local, no peer to borrow from)
+// every ssh client and every `dotvault status` blocked indefinitely on a
+// connection that had been made and would never be read. An agent that answers
+// "no identities" is one a client moves straight past; the backend's token
+// probe keeps that answer immediate until a token arrives.
 func (s *Service) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, addr := range s.endpoints {

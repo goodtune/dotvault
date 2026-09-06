@@ -12,8 +12,8 @@ import (
 
 func TestGHPEngine_Name(t *testing.T) {
 	e := &GHPEngine{}
-	if got := e.Name(); got != "ghp" {
-		t.Errorf("Name() = %q, want %q", got, "ghp")
+	if got := e.Name(); got != "GitHub Proxy" {
+		t.Errorf("Name() = %q, want %q", got, "GitHub Proxy")
 	}
 }
 

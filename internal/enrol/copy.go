@@ -33,6 +33,11 @@ func (e *CopyEngine) Name() string { return "Copy" }
 // FieldsFromSettings to discover them when the settings are known.
 func (e *CopyEngine) Fields() []string { return nil }
 
+// Unattended marks the copy engine as needing no user interaction: it reads
+// one Vault secret and writes another, so there is nothing for the first-run
+// wizard to walk a user through. See enrol.Unattended.
+func (e *CopyEngine) Unattended() bool { return true }
+
 // FieldsFromSettings extracts the top-level keys of the configured JSON
 // template without executing it. Top-level keys are the fields the
 // engine writes to Vault, and they must be inferable from the template

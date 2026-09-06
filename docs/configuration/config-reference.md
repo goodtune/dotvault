@@ -8,6 +8,16 @@ dotvault uses a YAML configuration file. The file location depends on your platf
 | macOS    | `/Library/Application Support/dotvault/config.yaml` |
 | Windows  | `%ProgramData%\dotvault\config.yaml` |
 
+That file is **system-wide** and normally administrator-owned. There is also an optional **per-user** file, which may carry only the [`fuse`](#filesystem-section) section and is merged over the system configuration:
+
+| Platform | Path |
+|----------|------|
+| Linux    | `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` |
+| macOS    | `~/Library/Application Support/dotvault/config.yaml` |
+| Windows  | `%APPDATA%\dotvault\config.yaml` |
+
+Every other section is a hard error there, so the per-user file can never re-point the Vault, open a listener, or alter telemetry. See [Per-user preferences](#per-user-preferences).
+
 You can override the config path with `--config`:
 
 ```sh
@@ -44,6 +54,17 @@ web:
     Welcome to dotvault. Click **Login** to authenticate via SSO.
   secret_view_text: |
     These secrets are synchronised from Vault to your local machine.
+
+api:
+  enabled: true
+  unix:
+    path: ""    # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"
+  read_write: false
+  cache_ttl: "30s"
 
 rules:
   - name: gh
@@ -96,7 +117,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `address` | string | *(required)* | Vault server URL |
-| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, or `mtls+tpm` (any base method also accepts a `+tpm` suffix) |
+| `auth_method` | string | — | Authentication method: `oidc`, `ldap`, `token`, `mtls`, `mtls+tpm`, or `mtls+os` (any base method also accepts a `+tpm` suffix) |
 | `auth_mount` | string | — | Vault auth mount path (e.g. `oidc`, `ldap`) |
 | `auth_role` | string | — | Vault auth role to request |
 | `oidc_callback_port` | int | `8250` | Fixed local TCP port the OIDC CLI flow (`dotvault login`) binds for the OAuth redirect_uri; falls back to a random port if unavailable. See [OIDC & SSO Authentication](../authentication/oidc.md#redirect-uris) |
@@ -108,6 +129,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `tls_skip_verify` | bool | `false` | Skip TLS certificate verification (development only) |
 | `disable_token_renewal` | bool | `false` | Never call `RenewSelf`; TTL expiry still triggers re-auth |
 | `token_socket` | string | — | Optional path to a peer dotvault's web-API Unix socket to borrow a token from (see below) |
+| `borrow_only` | bool | `false` | Forbid this host from ever running its own fresh-auth flow; it only ever borrows a token via `token_socket` (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
 
@@ -127,6 +149,38 @@ vault:
     - dotvault-sync   # a read-only policy over kv/data/users/<you>/*
   no_default_policy: true
 ```
+
+!!! warning "Your policy must grant token self-management"
+    Stripping the `default` policy also strips the token-self paths dotvault relies on, so **any policy you name in `policies` must grant all three** of the following. This is not optional — two of the three fail in ways that look like something else entirely:
+
+    ```hcl
+    # Downscope exchanges the login token for a least-privilege child.
+    # Missing: login fails closed with "permission denied" on auth/token/create.
+    path "auth/token/create" {
+      capabilities = ["create", "update"]
+    }
+
+    # The token lifecycle manager's health check, every 5 minutes.
+    # Missing: the check returns 403, which dotvault reads as "token invalid",
+    # so the daemon re-authenticates in a permanent loop while holding a
+    # perfectly good token. This is the nastiest of the three to diagnose.
+    path "auth/token/lookup-self" {
+      capabilities = ["read"]
+    }
+
+    # Renewal at 75% of TTL.
+    # Missing: every token runs to expiry and forces an avoidable re-auth.
+    path "auth/token/renew-self" {
+      capabilities = ["update"]
+    }
+    ```
+
+    The dev stack's `dotvault` policy in `docker-compose.yaml` includes these three. The requirement is verified by `test/integration/mtls_test.go`, which exercises a real downscoped login end to end.
+
+!!! warning "Certificate auth needs two more"
+    Under `mtls`, `mtls+tpm`, or `mtls+os` the daemon also rotates its own certificate and retires the one it replaces, both headless and both using this same downscoped token. That needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the superseded certificate) on top of the three above. Without `pki/sign` the certificate runs to expiry and the host needs a fresh human bootstrap; without `pki/revoke` rotation still works but each superseded certificate stays valid at the CA until its own TTL ends.
+
+    `pki/revoke` is not scopeable to a host's own certificates — read the trade-off in [What your Vault admin must set up](../authentication/mtls.md#what-your-vault-admin-must-set-up) before granting it, and note that [`revoke_superseded: false`](../authentication/mtls.md#opting-out-revoke_superseded-false) is the supported way to decline it without collecting a warning on every rotation. The dev stack's `dotvault` policy grants both and is a working reference for the whole cert-auth lifecycle.
 
 This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
 
@@ -155,14 +209,41 @@ The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows t
 
 On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
 
+!!! tip "This socket dies with the SSH session"
+    Everything above depends on the SSH connection being up. A process that outlives the session it was started in — a `tmux` job, a long-running service — will fail its next borrow once the forward is gone. Enable the [`api` section](#api-section) on the remote host so the long-lived daemon serves the borrow endpoint from a stable path, and local clients keep working across disconnects.
+
+One behaviour change for existing deployments: a peer's `/api/v1/token` now returns 401 once that peer's daemon knows its own token has gone invalid and is awaiting re-authentication, instead of handing out a credential it knows is dead. Borrowers already validate what they receive, so this only removes a known-bad answer earlier.
+
 The borrow is **best-effort and never fatal**: if the socket path is empty, the socket file is missing, the socket is stale (left over from a dead SSH session, no listener), the peer is reachable but holds no token, or the response is malformed, dotvault silently carries on with its normal auth flow. A leading `~` is expanded to the user's home directory. The borrowed token is held in memory only — it is not written to the local token file, so the peer remains the single owner and the remote re-borrows on its next login or recovery rather than caching a copy that could go stale.
 
 The same borrow is available to the **dotvault client libraries** (Go `client/` and the Python bindings): their cached-auth entry point (`AuthenticateCached`) borrows from the configured peer socket after the `DOTVAULT_TOKEN` env var and token file come up empty, before reporting that a login is required. Because it is a plain socket read with no browser or prompt, a Go or Python program on a host with no local token but a live peer socket reads secrets without an interactive login of its own.
 
+The socket carries traffic the other way too. [`dotvault browse <url>`](../cli.md#dotvault-browse) posts a URL to the peer's `POST /api/v1/remote/browse` endpoint so the browser opens on the workstation — the machine that actually has one — falling back to the local browser when the peer is unreachable. Set `BROWSER="dotvault browse"` on the headless host and OAuth login pages launched there land in the workstation's browser. [`dotvault notify <level> <title> [description]`](../cli.md#dotvault-notify) is the same shape for desktop notifications (`POST /api/v1/remote/notify`), so a long-running job on the headless box can raise a toast/notification on the workstation where a human is looking. [`dotvault clipboard [text]`](../cli.md#dotvault-clipboard) completes the set (`POST /api/v1/remote/clipboard`): it puts a value — a one-time token, a device code — on the workstation's clipboard, so after `browse` opens a login page the user's paste is already loaded with what the page asks for.
+
 `dotvault status` reflects the borrow too. When no local token is present but the configured peer socket holds one, the auth line reports `authenticated` and adds a `source: borrowed from peer socket (<path>)` line, so a host that authenticates purely by borrowing — with no token file at rest — no longer misreports as `not authenticated`. If the socket is configured but the peer holds no token, status says so explicitly and prints the socket path rather than the bare `no token` message.
 
 !!! warning "The socket grants the token to anyone who can connect"
-    Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it. dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
+    Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it — and, via `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard`, open arbitrary web pages (including phishing pages) in the workstation's browser, raise arbitrary desktop notifications on it, and replace the workstation's clipboard contents (a paste-hijacking primitive — e.g. swapping a copied wallet address or command). dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
+
+### `borrow_only` — forbid a fresh-auth flow entirely
+
+`borrow_only: true` takes the borrow above and makes it the *only* way this host can ever obtain a Vault token. `auth_method` (and the `mtls` block, if present) is simply not consulted: no OIDC browser, no LDAP prompt, no certificate bootstrap, and the web login view shows a waiting card instead of any credential form. Validated to require a non-empty `token_socket`, since without one this host could never authenticate at all.
+
+The use case is a fleet where one machine — an operator's desktop — is the sole holder of a Vault identity, and every other host it reaches must receive that identity only by borrowing it, never by minting one of its own:
+
+```yaml
+# Remote/headless host's config — shares vault.address, kv_mount, etc. with
+# the desktop's config; auth_method can even be left as whatever the desktop
+# uses, since it is ignored here.
+vault:
+  address: "https://vault.example.com:8200"
+  token_socket: "~/.ssh/dotvault.sock"   # forwarded from the desktop
+  borrow_only: true
+```
+
+Reuse of an already-cached token (the token file or `DOTVAULT_TOKEN`) still applies first, exactly as in every other mode. What happens once that reuse comes up empty then differs by caller. The daemon (`dotvault run`) **idles and keeps retrying the borrow**, watching both the token file (for a manually-dropped override) and the socket, rather than failing startup — the same shape a headless host with no interactive facility already uses while waiting for `dotvault login` to run elsewhere. `dotvault sync`/`--once` and `login-check`'s fallback have a job to do that only needs *a* token, borrowed included, so they make one borrow attempt and fail immediately only once that comes up empty. `dotvault login` and the Go `client/` library's `Login` are different: their entire purpose — force a fresh login, ignoring the cache — has no meaning under this mode regardless of whether a borrow would happen to succeed right now, so both refuse unconditionally *without even attempting one* (`AuthenticateCached`, which never runs a fresh-auth flow to begin with, is unaffected and keeps borrowing normally; the Python bindings expose only `AuthenticateCached`, not `Login`).
+
+On Windows GPO the equivalent registry value is a `BorrowOnly` REG_DWORD under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Vault`.
 
 For example, with defaults and username `jane`, the rule `vault_key: "gh"` reads from `kv/data/users/jane/gh`.
 
@@ -186,6 +267,193 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
 
+## API section
+
+The `api` section serves dotvault's web API over a per-user **Unix domain socket**, in addition to (or instead of) the loopback TCP listener the [web section](#web-section) controls.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve the API over a Unix socket |
+| `unix.path` | string | `$XDG_RUNTIME_DIR/dotvault/api.sock` | Socket path; must be absolute (or `~`-relative). Falls back to the cache directory when `XDG_RUNTIME_DIR` is unset (typical on macOS) |
+
+```yaml
+api:
+  enabled: true
+  unix:
+    path: ""    # default: $XDG_RUNTIME_DIR/dotvault/api.sock
+```
+
+### Why it exists: surviving a dropped SSH session
+
+[`vault.token_socket`](#token_socket-dotvault-to-dotvault-token-sharing) lets a headless host borrow a token from a workstation over an SSH `RemoteForward`. That socket **dies with the SSH session**. A process started inside that session but outliving it — a job in `tmux`, a long-running service — succeeds at first and then fails the moment it next needs a token, because the only socket it knew about is gone.
+
+!!! tip "Recommended: let dotvault maintain the forward itself"
+    The `RemoteForward` wiring below is a manual, external `ssh` process — it only exists while a human is sitting in the session that started it, which is the root cause of the problem this section exists to solve. Where the near-side host also runs dotvault (with `agent.enabled`), [managed SSH forwards](../guide/ssh-forwards.md) let the daemon maintain the connection itself instead: `dotvault ssh add <host>` registers the far end once, and the daemon reconnects with backoff on its own from then on, with no external process to babysit. The manual wiring below remains the right choice for a remote host that doesn't run a dotvault daemon at all.
+
+Enabling `api` fixes that by putting a second, stable dotvault on the near side of the problem. The long-lived per-user daemon serves the same borrow endpoint from a path that no disconnect can take away, keeps its own token alive, and re-borrows across the forwarded socket whenever the SSH session comes back. Local clients borrow from the daemon instead of from the forward:
+
+```
+workstation (interactive login)
+   │  SSH RemoteForward → ~/.ssh/dotvault.sock   ← comes and goes with the session
+   ▼
+devbox: dotvault daemon (vault.token_socket + api.enabled)
+   │  $XDG_RUNTIME_DIR/dotvault/api.sock          ← always there while the daemon runs
+   ▼
+devbox: your tmux job, scripts, Python bindings
+```
+
+Configuration on the devbox is both settings together — borrow from the workstation, serve to everything local:
+
+```yaml
+vault:
+  token_socket: ~/.ssh/dotvault.sock   # borrow from the workstation
+api:
+  enabled: true                        # serve the borrow endpoint locally
+```
+
+Clients on that host need no extra configuration: they read the same config and derive the same socket path.
+
+### Borrow order
+
+When both are configured, a token borrow tries the **local API socket first**, then `vault.token_socket`. The local socket is preferred because it is the more stable of the two, which is the entire point. This ordering applies to the daemon, the CLI, the Go `client/` facade and the Python bindings alike. The daemon excludes its *own* socket from its list — it serves that one.
+
+The [peer actions](../cli.md#dotvault-browse) (`browse`, `notify`, `clipboard`) deliberately keep using `vault.token_socket` **only**. Their purpose is to reach the workstation where a human is looking; sending them to the local daemon would open a browser on the headless host nobody is sitting at.
+
+### Separate from `web.enabled`
+
+The two surfaces are enabled independently because they have different audiences and different exposure. The TCP listener serves a browser UI and is reachable by **every user on the machine**; the Unix socket is created `0600` inside a `0700` directory and is reachable only by its owner. A headless host should not have to stand up a web UI to get the borrow endpoint, and turning the socket on does not widen anything `web.enabled` already exposes — if anything it is the tighter of the two.
+
+With `web.enabled: false`, the socket serves the API routes (`/api/v1/token`, `/api/v1/status`, `/healthz`, `/readyz`, the peer actions, …) but **not** the browser-facing routes. The browser pages and the interactive login flows build redirect URIs from a bound TCP address that does not exist in that mode, so they are not registered at all rather than being published as a login flow that cannot complete.
+
+### systemd socket activation
+
+On Linux, the packaged `dotvault-api.socket` unit (optional, not enabled by default) lets **systemd bind this socket and hold the fd across daemon restarts**, so borrowers queue instead of getting connection-refused while the daemon is down. `api.enabled` remains the master switch — the socket unit decides who binds, not whether the surface exists — and under activation the unit's `ListenStream=` path wins over `unix.path`, with the daemon logging any divergence and refusing an inherited socket whose mode is wider than `0600`. See [Socket activation](../admin/deployment.md#socket-activation-optional) in the deployment guide.
+
+### Running as a service
+
+The socket lives in `$XDG_RUNTIME_DIR`, which systemd tears down when the user's last session ends — **unless lingering is enabled**:
+
+```sh
+loginctl enable-linger $USER
+```
+
+This is required for any user service meant to outlive an SSH session, which is exactly the case here. The packaged `dotvault.service` also declares `RuntimeDirectory=dotvault`, so systemd creates `$XDG_RUNTIME_DIR/dotvault` at `0700` before the daemon starts and removes it on stop — a killed daemon leaves no stale socket behind.
+
+`dotvault status` reports the socket path and whether it is currently present, which is the first thing to check when a client on the host cannot get a token.
+
+!!! warning "The socket grants the token to anyone who can open it"
+    Any process that can `connect()` to the socket can read the Vault token. The `0600`/`0700` permissions restrict that to the owning user, and dotvault enforces them on every bind (refusing to clobber a socket a live instance already owns). Do not relax them, and do not forward this socket onward unless you intend the far end to hold your token.
+
+!!! note "Unix only"
+    `api.enabled` has no effect on Windows: the daemon logs a warning and serves nothing, so a config shared across a mixed-platform fleet is safe. The Windows analogue would be a named pipe with a protected DACL, as the [SSH agent](../guide/ssh-agent.md) already serves; it is not implemented yet.
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD) and `UnixPath` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\API`, and the section round-trips through `reg-import`/`reg-export` like every other.
+
+## Filesystem section
+
+The `fuse` section mounts your Vault secrets as a filesystem: each secret becomes a `.json` file whose contents are its `data` section, so `jq . ~/.dotvault/gh.json` works and `stat` reports the secret's version timestamp as the file's mtime. The extension is what makes editors and IDEs treat the file as JSON rather than unknown text; directories carry none. See the [Filesystem guide](../guide/filesystem.md) for the full write-up.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Mount the filesystem |
+| `mountpoint` | string | `~/.dotvault` | Directory to mount on; must be absolute (or `~`-relative). Created at mode `0700` if absent |
+| `read_write` | bool | `false` | Allow writing through the mount (replace, create, delete). Read-only otherwise, regardless of what the Vault token could do |
+| `cache_ttl` | duration | `30s` | How long a listing or a rendered secret is reused before Vault is asked again. `0` disables caching; capped at 10 minutes, since the cache window is also how long a revoked secret stays readable |
+
+```yaml
+fuse:
+  enabled: true
+  mountpoint: "~/.dotvault"
+  read_write: false
+  cache_ttl: "30s"
+```
+
+### Per-user preferences
+
+Unusually for this file, the `fuse` section can also be set per-user, in `${XDG_CONFIG_HOME:-~/.config}/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`) — a sibling of the `env` file and `ssh.yaml`. It is merged over the system configuration, and it is the **only** file a user can use to influence dotvault's configuration: every other section is a hard error there, so it can never re-point the Vault, open a listener, or alter telemetry.
+
+The file must be a single YAML document, and dotvault refuses to read it if the file or its directory is group- or world-writable — it can turn a secrets mount on, so a path another account can rewrite is refused rather than warned about. A parse failure is fatal at startup and a skipped-with-warning overlay on later reloads, so a user's typo can never stop policy reaching the daemon.
+
+Each field ratchets rather than overwriting: `enabled` may be turned **on** but not off, `read_write` may be turned **off** but not on, and `mountpoint` / `cache_ttl` are preferences the user's value simply wins. An omitted key is not a preference — only an explicitly written one is. See the [Filesystem guide](../guide/filesystem.md#per-user-preferences) for the reasoning behind the two booleans ratcheting in opposite directions.
+
+!!! note "Downloads and exports carry the merged result"
+    `GET /api/v1/config/download` and the `/ui/config/` view show the *running* configuration, so a user preference that took effect appears there as though it were policy — the same way remote-config-merged rules do. Re-importing such a download as a system config would bake that preference in.
+
+The mount root is your own KV prefix (`{kv_mount}/{user_prefix}{username}/`), bound at construction — a path through the mount cannot reach another user's secrets. The daemon mounts after its first successful Vault authentication and unmounts on shutdown; a mount failure is logged once and is never fatal.
+
+!!! warning "Read-only is the default for a reason"
+    The daemon's token can usually write to Vault. That capability exists for dotvault's own sync and enrolment work — exposing it through a filesystem makes every process running as you, and every mistyped shell redirect, one `>` away from replacing a credential. `read_write: true` is a separate decision from mounting.
+
+!!! note "One narrow filename collision"
+    A secret and a folder sharing a KV name coexist fine — `users/you/databricks` is `databricks.json` and `users/you/databricks/prod` is `databricks/prod.json`. What does collide is a KV folder whose name already ends in `.json`, which competes with the secret of the same stem. The directory wins so the secrets underneath stay reachable, the daemon warns naming the path, and the shadowed secret has no path in the mount. The mount refuses to create such a directory, so it can only come from a KV tree already laid out that way.
+
+!!! note "Unix only"
+    `fuse.enabled` has no effect on Windows: the daemon logs a warning and mounts nothing, so a config shared across a mixed-platform fleet is safe. There is no Windows equivalent planned — WinFsp is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries. Linux needs `/dev/fuse` and the `fusermount3` helper (`fuse3` package); macOS needs [macFUSE](https://macfuse.github.io/).
+
+Reading a file in the mount calls Vault, so `grep -r` across the mount — or an editor indexing your home directory — reads every secret you have and puts each one in Vault's audit log. Reach for a specific path.
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
+
+## Observability section
+
+Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured in its own nested `metrics:` / `logs:` block, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for both signals. A per-signal `enabled: true` cannot resurrect a disabled subsystem |
+| `endpoint` | string | — | **Deprecated** shared default (see note below). OTLP collector endpoint; same value contract as the per-signal `endpoint` |
+| `protocol` | string | — | **Deprecated** shared default. `grpc` or `http/protobuf`. Empty falls through to the standard `OTEL_EXPORTER_OTLP_*` env vars |
+| `insecure` | bool | `false` | **Deprecated** shared default. Disable transport TLS |
+| `headers` | map | — | **Deprecated** shared default. OTLP headers, typically a vendor bearer token — treat as a credential |
+| `export_interval` | string | SDK default | Metric export cadence as a Go duration (e.g. `30s`). Not deprecated |
+| `metrics` / `logs` | block | — | Per-signal configuration, fields below — the supported home for exporter settings |
+
+!!! warning "Shared exporter fields are deprecated"
+    The top-level `endpoint` / `protocol` / `insecure` / `headers` fields still work as shared defaults the per-signal blocks layer onto, but they are being retired in stages ([#140](https://github.com/goodtune/dotvault/issues/140)): this release warns at startup and counts each use on the `dotvault.config.deprecated` metric (attribute `field`), a later release makes the warning louder, and 1.0 removes them. Configure each signal in its own block, or use the standard `OTEL_EXPORTER_OTLP_*` environment variables for values shared across both signals — the env-var fallthrough remains fully supported.
+
+Per-signal override block (`metrics:` / `logs:`):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | inherit | Tri-state: unset inherits the master switch, explicit `false` turns this signal off |
+| `endpoint` | string | inherit | Non-empty overrides the shared endpoint (separate backend). A **full URL is the recommended form**: the scheme carries TLS intent (`https` → TLS, `http` → plaintext, on both protocols) and an explicit path is used verbatim — no mount path assumed; a path-less URL gets the standard `/v1/metrics` / `/v1/logs` appended (http/protobuf). Bare `host:port` (canonical gRPC) leaves TLS to `insecure`; `dns:///` passes through to the gRPC resolver |
+| `protocol` | string | inherit | Non-empty overrides the shared protocol |
+| `insecure` | bool | inherit | Tri-state: unset inherits the shared value. Meaningful for scheme-less endpoints; an endpoint URL's scheme already carries the TLS intent, and an explicit `true` forces plaintext even over `https://` — prefer stating the intent in the scheme |
+| `headers` | map | inherit | **Replaces** the shared map wholesale — never merged, so one backend's token is not sent to the other. An explicitly empty `headers: {}` means "this signal sends no headers", distinct from omitting the field (inherit) |
+| `temporality` | string | `cumulative` | Metric temporality preference: `cumulative`, `delta`, or `lowmemory` — the `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` vocabulary and instrument-kind mapping (empty falls through to that env var). `delta` reports counters/observable counters/histograms as per-interval deltas, as Datadog and some other vendors expect. **Metrics block only** — setting it under `logs:` is a config error |
+
+```yaml
+observability:
+  enabled: true
+  metrics:
+    endpoint: https://otel.internal.example
+    protocol: http/protobuf
+    temporality: delta                         # e.g. for a Datadog-fronted collector
+    headers:
+      authorization: "Bearer metrics-token"
+  logs:
+    endpoint: https://logs.vendor.example      # separate backend
+    protocol: http/protobuf
+    headers:                                   # with its own credentials
+      x-api-key: "logs-token"
+```
+
+### Resource attributes
+
+Every exported metric **and** every exported log record carries the same OTel resource, because the MeterProvider and the LoggerProvider share one. It identifies the emitting daemon: `service.name` (always `dotvault`), `service.version`, `user.name`, `host.name`, `os.type`, `host.arch`, and the `process.runtime.*` pair. These are process constants, so they add no time series — a backend that surfaces `target_info` (Prometheus, for instance) exposes them as one info series per daemon.
+
+!!! warning "`user.name` and `host.name` leave the host"
+    `user.name` is the OS account the daemon runs as (`paths.Username()`, `DOMAIN\` prefix stripped) and `host.name` is this machine's fully-qualified name. Both are sent to whichever collector you configure, a third-party SaaS included. dotvault is a per-user daemon, so attributing a series to a user is the point of the attribute — a fleet view cannot otherwise answer "whose daemon is failing" — but it is a genuine disclosure of who is running the software and where. **There is no per-attribute opt-out**: the control is `observability.enabled`, which is `false` by default. A disabled deployment emits nothing at all and, per the note below, makes no DNS call either. Neither attribute ever carries secret material — no Vault path, key, or credential. If the account name is itself sensitive in your environment, run the daemon under a non-identifying service account or leave observability off.
+
+`host.name` is resolved once at startup: `os.Hostname()`, and — only when that name has no dot — a single forward `LookupCNAME` to qualify it, the same mechanism `hostname -f` uses. **This is an outbound DNS query at daemon startup**, which matters on a locked-down or air-gapped network. It is bounded at two seconds and never fails startup: a resolver error, a timeout, an unqualified answer, or a `localhost.` alias all fall back to the short name, and an empty hostname omits the attribute entirely (as a failed user lookup omits `user.name`). No lookup happens when `os.Hostname()` is already qualified, and none happens at all when observability is disabled.
+
+!!! note "macOS often stays unqualified"
+    dotvault ships as a pure-Go `CGO_ENABLED=0` binary, so it uses Go's own resolver rather than the system one. On macOS that means `scutil`-managed search domains — the ones a VPN or corporate split-DNS profile installs — are not consulted, so `host.name` can stay the short name even where `hostname -f` in a shell returns the FQDN. The value is still correct, just less specific; treat `host.name` as possibly-short on macOS fleets.
+
+Treat `host.name` as discovered, not attested. The CNAME answer comes from whatever resolver the host is pointed at, so a hostile or compromised one chooses the name your collector attributes the data to. Nothing is executed or connected to on the strength of it, and the guards above reject accidents rather than deliberate answers — a collector that needs trustworthy attribution should take it from the transport (mTLS, a per-host token), not from a resource attribute.
+
+While the deprecated shared fields remain in play, a signal that overrides `endpoint` without setting its own `headers` inherits the shared map — including any shared bearer token, which then goes to the overridden backend. The daemon warns at startup when it sees that combination; state the intent with an explicit per-signal `headers:` (`{}` for none) to silence it. `enabled: true` with both signals explicitly off is rejected at config load.
+
 ## Remote config section
 
 See [Remote Configuration](remote-config.md) for details. When `remote_config.url` is set, the local file/registry config becomes a base that is overlaid with dynamic sections (`rules`, `enrolments`, `sync`) fetched from a `dotvault-config` service.
@@ -207,5 +475,9 @@ dotvault validates the configuration on startup and exits with an error if:
 - Rule names are not unique
 - A rule omits `vault_key` (a [keyless rule](sync-rules.md#rules-without-a-vault-key)) but also omits `target.template` — there is no secret data to write
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
+- A rule sets `target.delete_nulls: true` on a format other than `json` or `yaml` — the others have no null literal a template could render, and silently ignoring the flag would leave you believing a retired credential had been deleted (see [Removing a field](sync-rules.md#removing-a-field))
 - `web.listen` resolves to a non-loopback address (when web is enabled)
 - An enrolment entry has an empty `engine` field
+- `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
+- `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)
+- `fuse.cache_ttl` does not parse as a duration, or is negative

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -413,7 +414,9 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	}
 
 	// Get handler
-	handler, err := handlers.HandlerFor(rule.Target.Format)
+	handler, err := handlers.HandlerWithOptions(rule.Target.Format, handlers.Options{
+		DeleteNulls: rule.Target.DeleteNulls,
+	})
 	if err != nil {
 		return fmt.Errorf("get handler: %w", err)
 	}
@@ -515,7 +518,8 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 
 // ruleRenderHash fingerprints the fields of a rule that determine its rendered,
 // merged output: the vault key it reads and the target's path, format,
-// template, and merge strategy. It is stored in RuleState so the skip gate can
+// template, merge strategy, and null-deletion behaviour. It is stored in
+// RuleState so the skip gate can
 // tell a render-affecting edit (most commonly a changed template) apart from an
 // untouched rule even when the secret version and on-disk file are unchanged —
 // the scenario where a template change would otherwise never re-apply. Each
@@ -529,6 +533,11 @@ func ruleRenderHash(rule config.Rule) string {
 		rule.Target.Format,
 		rule.Target.Template,
 		rule.Target.Merge,
+		// Included because toggling delete_nulls changes the merged output of
+		// an otherwise-identical rule: the same template against the same
+		// secret version stops writing a null and starts removing the key.
+		// Without it, turning the flag on would never re-apply.
+		strconv.FormatBool(rule.Target.DeleteNulls),
 	} {
 		fmt.Fprintf(h, "%d:%s", len(s), s)
 	}

@@ -1,0 +1,34 @@
+[Unit]
+Description=dotvault local API socket (systemd socket activation)
+Documentation=https://github.com/goodtune/dotvault
+
+# Optional and NOT enabled by default. Without this unit, the daemon binds
+# %t/dotvault/api.sock itself (api.enabled in the dotvault config) and the
+# socket disappears whenever the daemon does — a restart is a brief outage
+# for anything borrowing a token at that moment. With it, systemd holds the
+# listening fd across daemon restarts, so borrowers queue in the backlog and
+# are served when the daemon returns. Enable with:
+#
+#   systemctl --user enable --now dotvault-api.socket
+#
+# api.enabled must still be set in the dotvault config: the socket unit
+# provides the fd, the config decides whether the surface exists. A passed
+# fd the daemon is not configured to serve is closed with a warning so
+# clients are refused rather than left hanging.
+
+[Socket]
+# Must match FileDescriptorName exactly: the daemon claims inherited fds by
+# this name (see internal/uds). Renaming it orphans the fd.
+ListenStream=%t/dotvault/api.sock
+FileDescriptorName=api
+Service=dotvault.service
+
+# Owner-only is a hard invariant, enforced twice: set here, and verified by
+# the daemon, which refuses an inherited fd wider than 0600 — SocketMode
+# defaults to 0666, so removing this line does not loosen the socket, it
+# breaks activation loudly.
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

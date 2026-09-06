@@ -19,6 +19,7 @@ func TestSealTokenAtRest(t *testing.T) {
 		"oidc+tpm": true,
 		"ldap+tpm": true,
 		"mtls+tpm": true,
+		"mtls+os":  false, // +os governs cert-key storage, not token sealing
 		"":         false,
 	}
 	for method, want := range cases {
@@ -34,6 +35,7 @@ func TestBaseMethod(t *testing.T) {
 		"oidc+tpm": "oidc",
 		"ldap+tpm": "ldap",
 		"mtls+tpm": "mtls",
+		"mtls+os":  "mtls",
 		"token":    "token",
 	}
 	for method, want := range cases {

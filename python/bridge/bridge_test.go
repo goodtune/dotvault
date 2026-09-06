@@ -26,6 +26,7 @@ func TestCategoryOf(t *testing.T) {
 		{"denied", fmt.Errorf("wrap: %w", client.ErrDenied), catDenied},
 		{"unreachable", fmt.Errorf("wrap: %w", client.ErrUnreachable), catUnreachable},
 		{"auth failed", fmt.Errorf("wrap: %w", client.ErrAuthFailed), catAuthFailed},
+		{"peer unavailable", fmt.Errorf("wrap: %w", client.ErrPeerUnavailable), catPeerUnavailable},
 		{"unknown", errors.New("something else"), catOther},
 		{"unknown handle", errUnknownHandle, catOther},
 	}

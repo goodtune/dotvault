@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 // newTestReader installs a test-local MeterProvider backed by a
@@ -23,9 +24,20 @@ import (
 // `observabilitytest` subpackage rather than promoting it back into
 // the production tree.
 func newTestReader(t *testing.T) *sdkmetric.ManualReader {
+	return newTestReaderWithResource(t, nil)
+}
+
+// newTestReaderWithResource is newTestReader with an explicit resource
+// attached to the provider, so a Collect() observes exactly the
+// attributes the daemon would export. Pass nil for the SDK default.
+func newTestReaderWithResource(t *testing.T, res *resource.Resource) *sdkmetric.ManualReader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	opts := []sdkmetric.Option{sdkmetric.WithReader(reader)}
+	if res != nil {
+		opts = append(opts, sdkmetric.WithResource(res))
+	}
+	provider := sdkmetric.NewMeterProvider(opts...)
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(provider)
 	rebindInstruments()
@@ -50,6 +62,13 @@ func newTestReader(t *testing.T) *sdkmetric.ManualReader {
 type recordingLogProcessor struct {
 	mu      sync.Mutex
 	records []sdklog.Record
+	// enabled backs Enabled below; defaults to true via newTestLogProcessor
+	// so existing callers see no behaviour change. A test can flip it to
+	// false to simulate a LoggerProvider that reports itself disabled
+	// (mirroring the real no-op provider's Logger.Enabled, which always
+	// returns false) and assert emit-side code short-circuits before
+	// OnEmit is ever called.
+	enabled bool
 }
 
 func (p *recordingLogProcessor) OnEmit(_ context.Context, r *sdklog.Record) error {
@@ -60,10 +79,12 @@ func (p *recordingLogProcessor) OnEmit(_ context.Context, r *sdklog.Record) erro
 }
 
 func (p *recordingLogProcessor) Enabled(context.Context, sdklog.EnabledParameters) bool {
-	return true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.enabled
 }
 
-func (p *recordingLogProcessor) Shutdown(context.Context) error  { return nil }
+func (p *recordingLogProcessor) Shutdown(context.Context) error   { return nil }
 func (p *recordingLogProcessor) ForceFlush(context.Context) error { return nil }
 
 func (p *recordingLogProcessor) Snapshot() []sdklog.Record {
@@ -81,7 +102,7 @@ func (p *recordingLogProcessor) Snapshot() []sdklog.Record {
 // global.GetLoggerProvider().
 func newTestLogProcessor(t *testing.T) *recordingLogProcessor {
 	t.Helper()
-	rec := &recordingLogProcessor{}
+	rec := &recordingLogProcessor{enabled: true}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(rec))
 	prev := global.GetLoggerProvider()
 	global.SetLoggerProvider(provider)
@@ -94,10 +115,10 @@ func newTestLogProcessor(t *testing.T) *recordingLogProcessor {
 
 // bodyString returns the record's body as a Go string, asserting the
 // stored Value is a string kind. Test-only helper.
-func bodyString(t *testing.T, v log.Value) string {
+func bodyString(t *testing.T, v attribute.Value) string {
 	t.Helper()
-	if v.Kind() != log.KindString {
-		t.Fatalf("body kind = %v, want String", v.Kind())
+	if v.Type() != attribute.STRING {
+		t.Fatalf("body kind = %v, want String", v.Type())
 	}
 	return v.AsString()
 }

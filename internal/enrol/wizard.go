@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
 )
 
@@ -60,8 +61,9 @@ func runWizard(ctx context.Context, pending []pendingEnrolment, io IO) map[strin
 }
 
 // copyToClipboard attempts to copy the given text to the system clipboard.
-// Best-effort: if no clipboard tool is found, it silently continues.
+// Best-effort: if no clipboard mechanism is available, it silently continues
+// (the device code stays visible in the terminal either way). The writers live
+// in internal/clipboard, shared with the remote-clipboard peer action.
 func copyToClipboard(text string) {
-	// Implemented per-platform in clipboard_*.go
-	tryClipboard(text)
+	_ = clipboard.Set(text)
 }

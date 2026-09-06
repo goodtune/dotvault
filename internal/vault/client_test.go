@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	vaultapi "github.com/hashicorp/vault/api"
+
+	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
 func skipIfNoVault(t *testing.T) {
@@ -32,7 +34,7 @@ func testClient(t *testing.T) *Client {
 	skipIfNoVault(t)
 	c, err := NewClient(Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   vaulttest.RootToken(t),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -44,7 +46,7 @@ func TestNewClient(t *testing.T) {
 	skipIfNoVault(t)
 	c, err := NewClient(Config{
 		Address: "http://127.0.0.1:8200",
-		Token:   "dev-root-token",
+		Token:   vaulttest.RootToken(t),
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

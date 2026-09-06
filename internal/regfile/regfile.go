@@ -49,6 +49,9 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeObservability(cfg.Observability)
 	e.writeRemoteConfig(cfg.RemoteConfig)
 	e.writeAgent(cfg.Agent)
+	e.writeAPI(cfg.API)
+	e.writeFUSE(cfg.FUSE)
+	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
 
@@ -107,6 +110,7 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("KVMount", v.KVMount)
 	e.writeString("UserPrefix", v.UserPrefix)
 	e.writeString("TokenSocket", v.TokenSocket)
+	e.writeBool("BorrowOnly", v.BorrowOnly)
 	// Emit Policies whenever non-nil so an explicit empty list round-trips as an
 	// empty REG_MULTI_SZ rather than being silently dropped, matching the OAuth
 	// Scopes / agent Principals treatment.
@@ -133,11 +137,20 @@ func (e *emitter) writeMTLS(m config.MTLSConfig) {
 	e.writeString("PKIMount", m.PKIMount)
 	e.writeString("PKIRole", m.PKIRole)
 	e.writeString("KeyType", m.KeyType)
+	e.writeDWORD("KeyBits", uint32(m.KeyBits))
 	e.writeString("CommonName", m.CommonName)
 	e.writeString("TTL", m.TTL)
 	e.writeString("ReissueBefore", m.ReissueBefore)
 	e.writeString("StorageDir", m.StorageDir)
 	e.writeBool("SealToPCRs", m.SealToPCRs)
+	// Tri-state: emitted only when explicitly set, following the Agent
+	// WindowsPutty pattern. Always emitting it would pin an unset field to
+	// whatever the export observed, turning "inherit the default" into a
+	// hardcoded value on the next import — and for this field that would
+	// silently freeze a security default an operator never chose.
+	if m.RevokeSuperseded != nil {
+		e.writeBool("RevokeSuperseded", *m.RevokeSuperseded)
+	}
 	e.WriteString("\r\n")
 
 	byoKey := mtlsKey + `\BYO`
@@ -196,19 +209,68 @@ func (e *emitter) writeObservability(o config.ObservabilityConfig) {
 	// Always pre-delete the Headers subtree so removals round-trip. No-op on
 	// a registry that never had it.
 	e.writeKeyDeletion(rootKey + `\Observability\Headers`)
-	if len(o.Headers) == 0 {
-		return
+	if len(o.Headers) > 0 {
+		e.writeKey(rootKey + `\Observability\Headers`)
+		e.writeHeaderValues(o.Headers)
+		e.WriteString("\r\n")
 	}
-	e.writeKey(rootKey + `\Observability\Headers`)
-	names := make([]string, 0, len(o.Headers))
-	for n := range o.Headers {
+
+	e.writeObservabilitySignal("Metrics", o.Metrics)
+	e.writeObservabilitySignal("Logs", o.Logs)
+}
+
+// writeObservabilitySignal emits one per-signal override block as an
+// Observability subkey. The tri-state Enabled/Insecure DWORDs are emitted
+// only when explicitly set, following the Agent WindowsPutty pattern — an
+// unset value must round-trip as "inherit", not be pinned to whatever the
+// export observed.
+//
+// The Headers subtree distinguishes nil from explicitly-empty by KEY
+// PRESENCE: an empty-but-present key means "this signal sends no headers"
+// (suppressing the shared credentials), while an absent key means inherit.
+// Collapsing the two — as is harmless for the shared map, where they mean
+// the same thing — would silently re-attach the shared bearer token to a
+// signal the operator explicitly excluded it from.
+func (e *emitter) writeObservabilitySignal(name string, sig config.ObservabilitySignalConfig) {
+	sigKey := rootKey + `\Observability\` + name
+	// Pre-delete the whole signal subtree (Headers included) before
+	// recreation. The tri-state DWORDs are emitted only when set, so
+	// without the deletion a value cleared in the source would linger in
+	// the registry across a re-import — and a stale Insecure=1 silently
+	// keeping plaintext transport is exactly the kind of leftover this
+	// idempotency pattern exists to prevent.
+	e.writeKeyDeletion(sigKey)
+	e.writeKey(sigKey)
+	if sig.Enabled != nil {
+		e.writeBool("Enabled", *sig.Enabled)
+	}
+	e.writeString("Endpoint", sig.Endpoint)
+	e.writeString("Protocol", sig.Protocol)
+	if sig.Insecure != nil {
+		e.writeBool("Insecure", *sig.Insecure)
+	}
+	e.writeString("Temporality", sig.Temporality)
+	e.WriteString("\r\n")
+
+	if sig.Headers != nil {
+		e.writeKey(sigKey + `\Headers`)
+		e.writeHeaderValues(sig.Headers)
+		e.WriteString("\r\n")
+	}
+}
+
+// writeHeaderValues emits a header map's entries sorted by name, case
+// preserved (HTTP folds case, but a faithful round-trip keeps the authored
+// form).
+func (e *emitter) writeHeaderValues(headers map[string]string) {
+	names := make([]string, 0, len(headers))
+	for n := range headers {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		e.writeString(n, o.Headers[n])
+		e.writeString(n, headers[n])
 	}
-	e.WriteString("\r\n")
 }
 
 // writeRemoteConfig emits the RemoteConfig section: the scalar fields, then
@@ -279,6 +341,60 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 	}
 }
 
+// writeAPI emits the API section (the local API socket). Flat scalars under
+// one key, matching the Agent section's transport treatment: the YAML nests
+// the path under `unix:` so a future `windows:` block has somewhere to go,
+// but the registry has no reason to mirror that nesting for a single value.
+func (e *emitter) writeAPI(a config.APIConfig) {
+	e.writeKey(rootKey + `\API`)
+	e.writeBool("Enabled", a.Enabled)
+	e.writeString("UnixPath", a.Unix.Path)
+	e.WriteString("\r\n")
+}
+
+// writeFUSE emits the filesystem section. Flat scalars under one key, like
+// the API section: the YAML has no nesting to mirror here.
+//
+// Emitted on every platform, including a config exported from Windows where
+// nothing can mount a filesystem. The registry is the GPO surface for the
+// whole configuration, and an admin managing a mixed fleet sets the section
+// for the Linux and macOS machines the same policy covers.
+func (e *emitter) writeFUSE(f config.FUSEConfig) {
+	e.writeKey(rootKey + `\FUSE`)
+	e.writeBool("Enabled", f.Enabled)
+	e.writeString("Mountpoint", f.Mountpoint)
+	e.writeBool("ReadWrite", f.ReadWrite)
+	// The raw string, not the parsed duration: an operator who wrote "1m"
+	// must get "1m" back rather than "1m0s", and an unset value must stay
+	// unset rather than being frozen at whatever the default happened to be
+	// when the config was loaded.
+	e.writeString("CacheTTL", f.RawCacheTTL)
+	e.WriteString("\r\n")
+}
+
+// writeSSH emits the admin-owned SSH host-CA trust material. The remotes
+// list is deliberately absent — it lives in the user-level ssh.yaml, which
+// has no registry surface because it must never act as policy.
+//
+// InsecureIgnoreHostKey is always emitted (even false) so a re-import can
+// clear a previously-set downgrade rather than leaving it stuck. The key is
+// pre-deleted before recreation, matching the Rules/Enrolments/Agent\Keys
+// idempotency pattern, so a CertificateAuthorities list cleared at the
+// source round-trips as absent rather than lingering in the registry.
+func (e *emitter) writeSSH(s config.SSHConfig) {
+	sshKey := rootKey + `\SSH`
+	e.writeKeyDeletion(sshKey)
+	e.writeKey(sshKey)
+	e.writeBool("InsecureIgnoreHostKey", s.InsecureIgnoreHostKey)
+	// Emit whenever non-nil so an explicit empty list round-trips as an
+	// empty REG_MULTI_SZ rather than being silently dropped, matching the
+	// Vault Policies / OAuth Scopes treatment.
+	if s.CertificateAuthorities != nil {
+		e.writeMultiString("CertificateAuthorities", s.CertificateAuthorities)
+	}
+	e.WriteString("\r\n")
+}
+
 func (e *emitter) writeAgentKey(index int, k config.AgentKeySource) {
 	keyPath := fmt.Sprintf(`%s\Agent\Keys\%d`, rootKey, index)
 	e.writeKey(keyPath)
@@ -329,6 +445,7 @@ func (e *emitter) writeRule(r config.Rule) {
 	rulePath := rootKey + `\Rules\` + r.Name
 	e.writeKey(rulePath)
 	e.writeString("Description", r.Description)
+	e.writeBool("TargetDeleteNulls", r.Target.DeleteNulls)
 	e.writeString("TargetFormat", r.Target.Format)
 	e.writeString("TargetMerge", r.Target.Merge)
 	e.writeString("TargetPath", r.Target.Path)
@@ -380,6 +497,10 @@ func (e *emitter) writeEnrolment(name string, en config.Enrolment) {
 	enrolPath := rootKey + `\Enrolments\` + name
 	e.writeKey(enrolPath)
 	e.writeString("Engine", en.Engine)
+	// HelpText is markdown that may span multiple lines; writeString falls
+	// through to hex(1) the same way Web's LoginText/SecretViewText do.
+	// Always emitted (even empty) so a re-import clears a stale value.
+	e.writeString("HelpText", en.HelpText)
 	e.WriteString("\r\n")
 
 	if len(en.Settings) == 0 {

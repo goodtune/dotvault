@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/handlers"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -86,12 +87,18 @@ const (
 	DefaultUserPrefix = "users/"
 
 	// mTLS / cert-auth defaults applied by validate() when auth_method is
-	// "mtls" or "mtls+tpm".
+	// "mtls", "mtls+tpm", or "mtls+os".
 	DefaultCertMount      = "cert"
 	DefaultPKIMount       = "pki"
 	DefaultMTLSKeyType    = "ec"
 	DefaultMTLSCommonName = "{{.user}}"
 	DefaultReissueBefore  = 168 * time.Hour // 7d
+	// DefaultMTLSOSTTL is the certificate TTL requested by mtls+os when ttl is
+	// unset. The OS-store credential is a general-purpose user identity (used by
+	// browsers, not just dotvault), so it defaults to a longer 30d lifetime than
+	// the unset "let the PKI role decide" behaviour of plain mtls/mtls+tpm. The
+	// Vault PKI role's max_ttl remains the authoritative cap.
+	DefaultMTLSOSTTL = "720h" // 30d
 
 	// DefaultAgentPipe is the Windows named pipe the SSH agent listens on
 	// when agent.windows.pipe is unset. dotvault claims its own pipe rather
@@ -107,6 +114,9 @@ type Config struct {
 	Web           WebConfig            `yaml:"web"`
 	Observability ObservabilityConfig  `yaml:"observability,omitempty"`
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
+	API           APIConfig            `yaml:"api,omitempty"`
+	FUSE          FUSEConfig           `yaml:"fuse,omitempty"`
+	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
 	Enrolments    map[string]Enrolment `yaml:"enrolments"`
@@ -132,10 +142,21 @@ type Config struct {
 }
 
 // ObservabilityConfig configures the OpenTelemetry metric and log
-// exporters. A single block drives both signals against the same
-// collector — Endpoint / Protocol / Insecure / Headers are shared.
-// Disabled by default — set Enabled and Endpoint (or the standard
-// OTEL_* env vars) to point the daemon at a local OTel collector.
+// exporters. Each signal is configured in its nested Metrics/Logs block, so
+// the two can go to separate backends or one can be switched off. The
+// top-level Endpoint / Protocol / Insecure / Headers fields are shared
+// defaults the signal blocks layer onto — still functional, but DEPRECATED
+// (staged removal, tracking issue #140): using them draws a startup WARN
+// plus a dotvault.config.deprecated increment per field (see
+// DeprecatedSharedFields), and 1.0 removes them in favour of per-signal-only
+// configuration with the OTEL_* env vars as the cross-signal sharing
+// mechanism. Disabled by default — set Enabled and a signal's Endpoint (or
+// the standard OTEL_* env vars) to point the daemon at an OTel collector.
+//
+// The layering deliberately mirrors the OTel SDK's own environment-variable
+// convention (generic OTEL_EXPORTER_OTLP_* plus signal-specific
+// OTEL_EXPORTER_OTLP_METRICS_* / _LOGS_* overrides), so an operator who
+// knows one model knows both. Resolution lives in ResolveSignal.
 //
 // The inner fields deliberately do NOT carry `omitempty`. The
 // project's YAML/regfile round-trip contract (see
@@ -164,12 +185,231 @@ type ObservabilityConfig struct {
 	Headers        map[string]string `yaml:"headers"`
 	RawInterval    string            `yaml:"export_interval"`
 	ExportInterval time.Duration     `yaml:"-"`
+
+	// Metrics and Logs override the shared fields above per signal. The
+	// zero value inherits everything, so existing configs behave exactly
+	// as before.
+	Metrics ObservabilitySignalConfig `yaml:"metrics"`
+	Logs    ObservabilitySignalConfig `yaml:"logs"`
+}
+
+// ObservabilitySignalConfig is one signal's overrides of the shared
+// observability fields. Empty/nil fields inherit; see ResolveSignal for the
+// exact semantics of each.
+//
+// Enabled and Insecure are pointers for the same tri-state reason as
+// AgentWindowsConfig.Putty: an unset value must stay distinguishable from
+// an explicit false (unset inherits, explicit false overrides), and a nil
+// pointer is the default rather than a "cleared" value that must be
+// re-emitted, so `omitempty` is correct on exactly those two fields. The
+// string and map fields follow the section's round-trip contract and are
+// always emitted.
+type ObservabilitySignalConfig struct {
+	// Enabled switches this signal on or off. Unset (nil) means enabled
+	// whenever the top-level observability.enabled is — the top-level flag
+	// remains the master switch, and a per-signal true can only select,
+	// never resurrect a disabled subsystem.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Endpoint, when non-empty, replaces the shared endpoint for this
+	// signal — the "separate backends" field. A full URL is the
+	// recommended form: the scheme carries the TLS intent and an explicit
+	// path is used verbatim (no assumed mount path); see
+	// observability.Signal.Endpoint for the complete value contract.
+	Endpoint string `yaml:"endpoint"`
+	// Protocol, when non-empty, replaces the shared protocol ("grpc" or
+	// "http/protobuf") for this signal.
+	Protocol string `yaml:"protocol"`
+	// Insecure, when set, replaces the shared insecure flag for this
+	// signal.
+	Insecure *bool `yaml:"insecure,omitempty"`
+	// Headers, when non-nil, REPLACES the shared headers map for this
+	// signal — no merging, matching the OTel env-var convention where a
+	// signal-specific OTEL_EXPORTER_OTLP_LOGS_HEADERS supersedes the
+	// generic value wholesale. Merging credential maps invites sending one
+	// backend's bearer token to the other. An explicitly empty map
+	// (`headers: {}`) therefore means "this signal sends no headers" even
+	// when the shared map is populated.
+	//
+	// nil-vs-empty is semantic (inherit vs suppress), and no struct tag can
+	// express it: `omitempty` collapses both to absent, and no tag emits
+	// `{}` for empty while omitting nil. The custom MarshalYAML below is
+	// what preserves the distinction on emission; without it a single
+	// export→import cycle through the config-download or reg-export YAML
+	// would turn "inherit the shared credentials" into "send none",
+	// silently detaching auth from both signals.
+	Headers map[string]string `yaml:"headers"`
+	// Temporality is the metric temporality preference — "cumulative",
+	// "delta", or "lowmemory", the exact vocabulary of
+	// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE (which an empty
+	// value falls through to). Meaningful on the metrics block only:
+	// temporality is a metric concept with no log analogue, so validation
+	// rejects it on `logs` rather than silently ignoring a setting the
+	// operator believed took effect. It lives on the per-signal struct
+	// (not the deprecated shared layer) because new exporter knobs go
+	// where the config is headed, not where it is leaving.
+	Temporality string `yaml:"temporality"`
+}
+
+// MarshalYAML preserves the Headers nil-vs-empty distinction on the YAML
+// emission path (config download, reg-export): a nil map omits the
+// `headers:` key entirely (inherit), while a non-nil map — including an
+// empty one — emits it (`headers: {}` = this signal sends no headers). The
+// scalar fields keep the section's always-emit round-trip contract, and the
+// tri-state pointers keep their omit-when-unset behaviour.
+func (s ObservabilitySignalConfig) MarshalYAML() (any, error) {
+	// Keep this scalar mirror in lockstep with ObservabilitySignalConfig:
+	// a field added there and forgotten here is silently DROPPED from
+	// every YAML export (config download, reg-export) — the regfile
+	// round-trip tests are what catch the drift.
+	type scalars struct {
+		Enabled     *bool  `yaml:"enabled,omitempty"`
+		Endpoint    string `yaml:"endpoint"`
+		Protocol    string `yaml:"protocol"`
+		Insecure    *bool  `yaml:"insecure,omitempty"`
+		Temporality string `yaml:"temporality"`
+	}
+	base := scalars{
+		Enabled:     s.Enabled,
+		Endpoint:    s.Endpoint,
+		Protocol:    s.Protocol,
+		Insecure:    s.Insecure,
+		Temporality: s.Temporality,
+	}
+	if s.Headers == nil {
+		return base, nil
+	}
+	return struct {
+		scalars `yaml:",inline"`
+		Headers map[string]string `yaml:"headers"`
+	}{base, s.Headers}, nil
+}
+
+// ResolvedSignal is one signal's effective exporter settings after
+// layering its overrides onto the shared observability fields.
+//
+// Keep in lockstep with observability.Signal and the field-by-field copy in
+// cmd/dotvault's initObservability: the two structs are deliberately
+// separate (the observability package must not import this one), so a field
+// added here and forgotten there compiles silently and drops.
+type ResolvedSignal struct {
+	Enabled     bool
+	Endpoint    string
+	Protocol    string
+	Insecure    bool
+	Headers     map[string]string
+	Temporality string
+}
+
+// ResolveSignal layers a signal's overrides onto the shared fields.
+// Semantics per field: Enabled is the top-level master switch AND-ed with
+// the signal's own flag (unset = true); Endpoint and Protocol override when
+// non-empty; Insecure overrides when set; Headers replace wholesale when
+// non-nil. An empty resolved Endpoint still works — the OTel exporters fall
+// through to the standard OTEL_EXPORTER_OTLP_* (and signal-specific)
+// environment variables exactly as before.
+func (o ObservabilityConfig) ResolveSignal(sig ObservabilitySignalConfig) ResolvedSignal {
+	r := ResolvedSignal{
+		Enabled:  o.Enabled && (sig.Enabled == nil || *sig.Enabled),
+		Endpoint: o.Endpoint,
+		Protocol: o.Protocol,
+		Insecure: o.Insecure,
+		Headers:  o.Headers,
+		// Temporality has no shared-layer default to inherit — it is
+		// per-signal-only by design (see the field's godoc), so the
+		// signal's own value passes straight through.
+		Temporality: sig.Temporality,
+	}
+	if sig.Endpoint != "" {
+		r.Endpoint = sig.Endpoint
+	}
+	if sig.Protocol != "" {
+		r.Protocol = sig.Protocol
+	}
+	if sig.Insecure != nil {
+		r.Insecure = *sig.Insecure
+	}
+	if sig.Headers != nil {
+		r.Headers = sig.Headers
+	}
+	return r
+}
+
+// MetricsSignal and LogsSignal are the two concrete resolutions; every
+// consumer (the daemon's exporter wiring, the docs' description of what a
+// config means) goes through these so the layering is defined in exactly
+// one place.
+func (o ObservabilityConfig) MetricsSignal() ResolvedSignal { return o.ResolveSignal(o.Metrics) }
+func (o ObservabilityConfig) LogsSignal() ResolvedSignal    { return o.ResolveSignal(o.Logs) }
+
+// DeprecatedSharedFields reports which of the deprecated shared exporter
+// fields are in use, as dotted YAML paths ("observability.endpoint", …).
+// The shared endpoint/protocol/insecure/headers layer is being retired in
+// stages in favour of the per-signal metrics:/logs: blocks: this release
+// warns and meters the usage, a later release makes the warning louder, and
+// 1.0 removes the fields. Enabled (the master switch) and export_interval
+// (which has no per-signal home yet) are not part of the deprecation.
+//
+// Detection is presence-based, matching what the fields can express:
+// endpoint/protocol when non-empty, insecure only when true (the shared
+// field is a plain bool, so an explicit false is indistinguishable from
+// unset), headers when non-empty (for the shared map, nil and {} mean the
+// same thing — only the per-signal maps carry the presence distinction).
+// The caller decides how to surface the result; this stays a pure query so
+// the config package does not log or meter.
+func (o ObservabilityConfig) DeprecatedSharedFields() []string {
+	var fields []string
+	if o.Endpoint != "" {
+		fields = append(fields, "observability.endpoint")
+	}
+	if o.Protocol != "" {
+		fields = append(fields, "observability.protocol")
+	}
+	if o.Insecure {
+		fields = append(fields, "observability.insecure")
+	}
+	if len(o.Headers) > 0 {
+		fields = append(fields, "observability.headers")
+	}
+	return fields
+}
+
+// validateOTLPProtocol accepts the OTel canonical names from the
+// OTEL_EXPORTER_OTLP_PROTOCOL spec, or empty (inherit / SDK default). One
+// helper for the shared field and both per-signal overrides so the accepted
+// set cannot drift between them.
+func validateOTLPProtocol(field, protocol string) error {
+	switch strings.ToLower(protocol) {
+	case "", "grpc", "http/protobuf":
+		return nil
+	default:
+		return fmt.Errorf("%s %q: must be grpc or http/protobuf", field, protocol)
+	}
+}
+
+// validateOTLPTemporality accepts the vocabulary of
+// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE, or empty (fall through
+// to that env var / the SDK's cumulative default). Kept in lockstep with
+// observability.temporalitySelector, which maps the same names onto the SDK
+// selectors.
+func validateOTLPTemporality(field, temporality string) error {
+	// Identical normalization to observability.temporalitySelector —
+	// lockstep means a value that validates here must resolve there.
+	switch strings.ToLower(strings.TrimSpace(temporality)) {
+	case "", "cumulative", "delta", "lowmemory":
+		return nil
+	default:
+		return fmt.Errorf("%s %q: must be cumulative, delta, or lowmemory", field, temporality)
+	}
 }
 
 // Enrolment declares a credential acquisition flow for a Vault KV key.
 type Enrolment struct {
 	Engine   string         `yaml:"engine"`
 	Settings map[string]any `yaml:"settings"`
+	// HelpText is optional admin-authored markdown, rendered to HTML and
+	// shown alongside this enrolment in the web UI to explain what the
+	// engine does for the user before they run it.
+	HelpText string `yaml:"help_text,omitempty"`
 }
 
 // VaultConfig holds Vault connection settings.
@@ -233,15 +473,45 @@ type VaultConfig struct {
 	// user's home. A missing or stale socket is ignored — the normal auth
 	// flow proceeds — so the field is purely additive and needs no validation.
 	TokenSocket string `yaml:"token_socket"`
+	// BorrowOnly, when true, forces this host to authenticate to Vault
+	// exclusively by borrowing a live token over TokenSocket — it never runs
+	// AuthMethod's own fresh-auth flow (no OIDC browser, no LDAP prompt, no
+	// certificate bootstrap, no web login form). The use case is a remote or
+	// headless host that must never carry its own Vault identity: the
+	// operator's desktop authenticates interactively and is the sole holder
+	// of a credential, and every other host reached from it (over the same
+	// SSH RemoteForward'd socket vault.token_socket already documents)
+	// receives that identity only by borrowing it, never by minting its own.
+	//
+	// AuthMethod (and vault.mtls, if set) is simply ignored in this mode —
+	// deliberately, so the same base config can be shared between the
+	// desktop and its remote hosts with only this flag differing, rather
+	// than requiring the remote hosts to carry a method they must never
+	// actually use. Reuse of an existing cached token (the token file or
+	// DOTVAULT_TOKEN) still applies first, exactly as in every other mode;
+	// this only gates what happens once that comes up empty. Validated to
+	// require a non-empty TokenSocket, since without one there would be
+	// nothing to borrow from and the host could never authenticate at all.
+	//
+	// The daemon idles — watching the token file and the socket, retrying
+	// the borrow — rather than failing when no token is available yet; a
+	// one-shot command (`dotvault login`, `dotvault sync`) instead returns
+	// an error naming the mode, since there is no fresh-auth flow for it to
+	// wait on. `dotvault login`'s "ignore the cache and force a fresh login"
+	// contract has no meaning under this mode and is refused outright.
+	BorrowOnly bool `yaml:"borrow_only"`
 	// MTLS configures the cert auth methods. It is consulted only when
-	// AuthMethod is "mtls" or "mtls+tpm".
+	// AuthMethod drives the cert-auth flow ("mtls", "mtls+tpm", "mtls+os").
+	// Ignored entirely when BorrowOnly is set.
 	MTLS MTLSConfig `yaml:"mtls"`
 }
 
-// MTLSConfig configures certificate-based Vault authentication (the "mtls" and
-// "mtls+tpm" auth methods). A TLS client certificate authenticates instead of
-// a human credential; LDAP/OIDC is demoted to a one-time bootstrap that mints
-// the first certificate via the Vault PKI engine.
+// MTLSConfig configures certificate-based Vault authentication (the "mtls",
+// "mtls+tpm", and "mtls+os" auth methods). A TLS client certificate
+// authenticates instead of a human credential; LDAP/OIDC is demoted to a
+// one-time bootstrap that mints the first certificate via the Vault PKI engine.
+// The key is held on disk ("mtls"), TPM-sealed ("mtls+tpm"), or in the
+// OS-native certificate store where browsers can present it ("mtls+os").
 type MTLSConfig struct {
 	// BootstrapMethod is the human-credential method used only to mint the
 	// first certificate ("ldap" or "oidc"). Default "oidc".
@@ -255,11 +525,23 @@ type MTLSConfig struct {
 	CertRole string `yaml:"cert_role"`
 	// PKIMount is the PKI secrets engine used to issue/sign. Default "pki".
 	PKIMount string `yaml:"pki_mount"`
-	// PKIRole is the PKI role. Required when issuance is possible (no BYO).
+	// PKIRole is the PKI role. Always required: it signs both the bootstrap cert
+	// and every rotation (pki/sign/<role>), including for BYO, which only skips
+	// the first cert's issuance.
 	PKIRole string `yaml:"pki_role"`
-	// KeyType is "ec" (P-256) or "rsa" (2048). Default "ec". The mtls+tpm
-	// backend supports "ec" only.
+	// KeyType is "ec" (P-256) or "rsa". Default "ec". The mtls+tpm backend
+	// supports "ec" only; mtls/mtls+os accept both.
 	KeyType string `yaml:"key_type"`
+	// KeyBits is the RSA modulus size to generate: 2048, 3072, 4096 or 8192.
+	// Zero (the default) leaves it to the backend, which uses 2048.
+	//
+	// It exists because a Vault PKI role's key_bits is a *minimum*, not an
+	// exact match — SignCert rejects a CSR whose key is smaller than the role
+	// requires — so an operator whose role pins RSA at 4096 cannot use
+	// certificate auth at all unless dotvault generates a key at least that
+	// large. Only meaningful with key_type: rsa, and rejected under mtls+tpm,
+	// which is EC-only.
+	KeyBits int `yaml:"key_bits"`
 	// CommonName is a Go template (over {{.user}}) for the certificate CN.
 	// Default "{{.user}}".
 	CommonName string `yaml:"common_name"`
@@ -273,6 +555,24 @@ type MTLSConfig struct {
 	// SealToPCRs binds the TPM unseal to the current boot (PCR) state.
 	// mtls+tpm only.
 	SealToPCRs bool `yaml:"seal_to_pcrs"`
+	// RevokeSuperseded controls whether a rotation revokes the certificate it
+	// replaced, at <pki_mount>/revoke. Default true — a superseded certificate
+	// is a live credential until the CA says otherwise, so the safe behaviour
+	// is the one a config that never mentions this gets.
+	//
+	// It exists because the capability it needs cannot be scoped: Vault takes
+	// the serial as a request-body parameter, so a policy granting pki/revoke
+	// grants it for every certificate in the mount. That is a real trade-off
+	// for a token living unattended on a laptop, and a deployment that declines
+	// it should be able to say so — rather than withhold the capability and
+	// absorb a warning on every rotation, which is indistinguishable from a
+	// misconfiguration.
+	//
+	// A *bool, not a bool: the merge and the registry layer both have to tell
+	// "never mentioned" (inherit the default) from "explicitly off", and a
+	// plain bool's zero value would silently mean off for every existing
+	// config. Same tri-state shape as agent.windows.putty.
+	RevokeSuperseded *bool `yaml:"revoke_superseded,omitempty"`
 	// StorageDir holds the credential envelope. Default {cache_dir}/mtls.
 	StorageDir string `yaml:"storage_dir"`
 	// BYO supplies an existing certificate, skipping bootstrap.
@@ -284,6 +584,11 @@ type MTLSConfig struct {
 type MTLSBYO struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
+}
+
+// RevokeSupersededEnabled resolves the tri-state: unset means enabled.
+func (m MTLSConfig) RevokeSupersededEnabled() bool {
+	return m.RevokeSuperseded == nil || *m.RevokeSuperseded
 }
 
 // SyncConfig holds sync settings.
@@ -314,6 +619,85 @@ type AgentConfig struct {
 	Unix    AgentUnixConfig    `yaml:"unix"`
 	Windows AgentWindowsConfig `yaml:"windows"`
 	Keys    []AgentKeySource   `yaml:"keys"`
+}
+
+// APIConfig configures the local API socket: the daemon's web API served over
+// a per-user Unix domain socket in addition to (or instead of) the loopback
+// TCP listener that web.enabled controls.
+//
+// It exists for the dotvault-to-dotvault token borrow. A workstation forwards
+// its web API to a remote host over an SSH RemoteForward, and processes on
+// that host borrow the live token via vault.token_socket — but the forwarded
+// socket dies with the SSH session, so a long-running process (a tmux job
+// that outlives the connection) loses its only source of tokens. Enabling
+// this makes the long-lived per-user daemon serve the same borrow endpoint
+// from a stable path that no disconnect can take away: the daemon keeps its
+// own token alive (re-borrowing across the forwarded socket when the SSH
+// session returns) and local clients borrow from it instead.
+//
+// Deliberately separate from web.enabled. The two surfaces have different
+// audiences and different exposure: the TCP listener is a browser UI
+// reachable by every uid on the box, while this socket is owner-only (0600 in
+// a 0700 directory) and carries no browser UI. An operator who wants the borrow
+// endpoint on a headless host should not have to stand up a web UI to get it,
+// and enabling it does not widen what web.enabled already exposes.
+//
+// Unix only for now. Windows has no equivalent surface yet — the analogue
+// would be a named pipe with a protected DACL, mirroring the SSH agent's
+// listener — so enabling this on Windows logs a warning and serves nothing.
+// The nested `unix:` block (rather than a flat `path:`) is what leaves room
+// for a sibling `windows:` block to be added without reshaping the section
+// across YAML, the registry, and .reg.
+//
+// The inner fields deliberately omit `omitempty` for the same round-trip
+// reason as AgentConfig: an exported config must re-emit cleared optional
+// values so a re-import can blank a previously-set path. The top-level API
+// field keeps `omitempty` so operators who don't use the socket see no empty
+// block in downloads.
+type APIConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Unix    APIUnixConfig `yaml:"unix"`
+}
+
+// APIUnixConfig holds the Unix-domain-socket transport settings for the local
+// API surface.
+type APIUnixConfig struct {
+	// Path is the socket path. Empty resolves to the per-user runtime path
+	// at daemon-start time (see paths.DefaultAPISocket). A leading ~ is
+	// expanded, as it is for vault.token_socket.
+	Path string `yaml:"path"`
+}
+
+// SSHConfig holds the admin-owned trust material for daemon-managed SSH
+// forwards. The remotes themselves are deliberately *not* here: they live in
+// the user-level ssh.yaml (see paths.SSHConfigPath), which has no registry
+// surface because it is user-writable and must never act as policy.
+//
+// The inner fields omit `omitempty` for the same round-trip reason as
+// AgentConfig: an exported config must re-emit cleared optional values so a
+// re-import can blank a previously-set list. The top-level SSH field keeps
+// `omitempty` so operators who do not use managed forwards see no empty block.
+//
+// The daemon applies a config-refresh-loop change to this section without a
+// restart (see cmd/dotvault's updateSSHPolicyConfig), but only on a remote's
+// *next* connection attempt: an already-established forward keeps using the
+// HostKeyPolicy it dialled with. Removing a CA, or turning
+// InsecureIgnoreHostKey back off, does not retroactively drop or re-verify a
+// forward that is already connected — it only takes effect on the next
+// reconnect.
+type SSHConfig struct {
+	// CertificateAuthorities lists trusted SSH host CAs in known_hosts
+	// @cert-authority form. A host whose certificate one of these signed
+	// needs no per-host pin in ssh.yaml.
+	CertificateAuthorities []string `yaml:"certificate_authorities"`
+
+	// InsecureIgnoreHostKey disables host-key verification entirely.
+	//
+	// It lives in the system config rather than the user's ssh.yaml because
+	// it is a security downgrade; on a personal machine the user is the admin
+	// anyway. Every connection attempt made under it logs a WARN naming the
+	// host, so it cannot be set once and forgotten silently.
+	InsecureIgnoreHostKey bool `yaml:"insecure_ignore_host_key"`
 }
 
 // AgentUnixConfig holds the Unix-domain-socket transport settings.
@@ -410,6 +794,26 @@ type Target struct {
 	Format   string `yaml:"format"`
 	Template string `yaml:"template"`
 	Merge    string `yaml:"merge"`
+
+	// DeleteNulls turns a null in the rendered template into a tombstone:
+	// the corresponding key is removed from the target file instead of being
+	// written as a null value — the equivalent of jq's del(.key). It exists
+	// because a surgical field-level merge is otherwise additive-only, so a
+	// secret that has been retired upstream would linger in the target file
+	// forever: neither writing nothing (the merge preserves existing keys)
+	// nor dropping the rule (which stops managing the file entirely) can
+	// remove it.
+	//
+	// Off by default, and deliberately opt-in per rule rather than always-on,
+	// because a null is far too easy to render by accident. In YAML in
+	// particular, `password: {{ .password }}` over an empty value renders
+	// `password:`, which parses as a null — under an always-on rule that
+	// would silently delete a live credential. Requiring the operator to
+	// name the behaviour on the rule that needs it keeps that failure mode
+	// off every rule that doesn't.
+	//
+	// Only json and yaml can carry it: see nullableFormats.
+	DeleteNulls bool `yaml:"delete_nulls"`
 }
 
 var validFormats = map[string]bool{
@@ -582,11 +986,32 @@ func (c *Config) Validate() error {
 	return c.validate()
 }
 
+// IsMTLSMethod reports whether an auth_method drives the certificate-auth flow:
+// "mtls" (key on disk), "mtls+tpm" (key TPM-sealed), or "mtls+os" (key + cert in
+// the OS-native certificate store). Every site that gates on the cert-auth path
+// (validation, MTLSParams construction) consults this so a new variant is wired
+// in one place rather than enumerated as string literals across the codebase.
+func IsMTLSMethod(method string) bool {
+	switch method {
+	case "mtls", "mtls+tpm", "mtls+os":
+		return true
+	default:
+		return false
+	}
+}
+
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
-// unless auth_method is "mtls" or "mtls+tpm".
+// unless auth_method drives the cert-auth flow (see IsMTLSMethod), and is
+// skipped entirely under vault.borrow_only — that mode never runs any
+// fresh-auth flow, cert-issuing or otherwise, so the block's requirements
+// (cert_role, pki_role, ...) would only obstruct a config that shares its
+// AuthMethod with a non-borrow-only deployment of the same base config.
 func (c *Config) validateMTLS() error {
+	if c.Vault.BorrowOnly {
+		return nil
+	}
 	method := c.Vault.AuthMethod
-	if method != "mtls" && method != "mtls+tpm" {
+	if !IsMTLSMethod(method) {
 		return nil
 	}
 	m := &c.Vault.MTLS
@@ -621,6 +1046,26 @@ func (c *Config) validateMTLS() error {
 	default:
 		return fmt.Errorf("vault.mtls.key_type %q: must be ec or rsa", m.KeyType)
 	}
+	// key_bits is RSA-only and, when set, must be a length Vault itself accepts
+	// (certutil.ValidateKeyTypeLength). Zero means "backend default".
+	//
+	// Both misuses are errors rather than silent no-ops: an operator who sets
+	// key_bits under an EC or TPM configuration believes they have changed the
+	// key size, and quietly ignoring it would leave them debugging a Vault
+	// rejection whose cause is in their own config.
+	if m.KeyBits != 0 {
+		if method == "mtls+tpm" {
+			return fmt.Errorf("vault.mtls.key_bits is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only, so there is no RSA modulus to size)")
+		}
+		if m.KeyType != "rsa" {
+			return fmt.Errorf("vault.mtls.key_bits is only valid with key_type rsa (got key_type %q); EC keys are fixed at P-256", m.KeyType)
+		}
+		switch m.KeyBits {
+		case 2048, 3072, 4096, 8192:
+		default:
+			return fmt.Errorf("vault.mtls.key_bits %d: must be one of 2048, 3072, 4096, 8192 (the RSA lengths Vault accepts)", m.KeyBits)
+		}
+	}
 	if m.CommonName == "" {
 		m.CommonName = DefaultMTLSCommonName
 	}
@@ -629,9 +1074,22 @@ func (c *Config) validateMTLS() error {
 	if (m.BYO.Cert == "") != (m.BYO.Key == "") {
 		return fmt.Errorf("vault.mtls.byo: cert and key must be set together")
 	}
-	// PKI role is required whenever issuance might run (i.e. no BYO cert).
-	if m.BYO.Cert == "" && m.PKIRole == "" {
-		return fmt.Errorf("vault.mtls.pki_role is required unless a BYO certificate is supplied")
+	// mtls+os cannot import an external private key: the OS-native store
+	// (certtostore) installs certificates but offers no key-import path, so the
+	// key must be generated in the store. Reject BYO up front rather than failing
+	// at login time.
+	if method == "mtls+os" && m.BYO.Cert != "" {
+		return fmt.Errorf("vault.mtls.byo is not supported with auth_method mtls+os (the OS-native store cannot import an external key); use auth_method mtls for bring-your-own")
+	}
+	// PKI role is required whenever issuance can run — which is always, BYO
+	// included. BYO only skips the *first* certificate's bootstrap; steady-state
+	// rotation still runs pki/sign/<role> once the cert enters the reissue window
+	// (ReissueIfDue/reissue make no BYO exception, and reissue_before is always
+	// positive), and key_bits sizes the key that rotation generates. A BYO config
+	// without a role would therefore fail every rotation and expire unattended, so
+	// require it up front rather than trapping the operator at cert expiry.
+	if m.PKIRole == "" {
+		return fmt.Errorf("vault.mtls.pki_role is required (it rotates the certificate before expiry, including for BYO seeding)")
 	}
 
 	if m.ReissueBefore == "" {
@@ -647,6 +1105,13 @@ func (c *Config) validateMTLS() error {
 		m.ReissueBeforeDur = d
 	}
 
+	// mtls+os defaults the requested certificate TTL to 30d when unset (the
+	// OS-store credential doubles as a browser-presented user identity, so a
+	// longer-lived cert is the sensible default); plain mtls/mtls+tpm leave it
+	// unset and defer to the PKI role. Either way the role's max_ttl caps it.
+	if method == "mtls+os" && m.TTL == "" {
+		m.TTL = DefaultMTLSOSTTL
+	}
 	if m.TTL != "" {
 		if _, err := ParseDuration(m.TTL); err != nil {
 			return fmt.Errorf("vault.mtls.ttl %q: %w", m.TTL, err)
@@ -679,6 +1144,14 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	// vault.borrow_only forces every fresh-auth attempt onto the borrow
+	// path; without a socket to borrow from, this host could never obtain a
+	// token at all, so require one up front rather than trapping the
+	// operator in a daemon that idles forever with no way to succeed.
+	if c.Vault.BorrowOnly && c.Vault.TokenSocket == "" {
+		return fmt.Errorf("vault.borrow_only requires vault.token_socket (there is nothing to borrow a token from otherwise)")
+	}
+
 	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {
 		return fmt.Errorf("vault.oidc_callback_port %d: must be between 0 and 65535", c.Vault.OIDCCallbackPort)
 	}
@@ -709,14 +1182,32 @@ func (c *Config) validate() error {
 	// defaults (60s export interval, standard env-var fallbacks) so
 	// most fields stay omittable.
 	if c.Observability.Enabled {
-		if c.Observability.Protocol != "" {
-			switch strings.ToLower(c.Observability.Protocol) {
-			case "grpc", "http/protobuf":
-				// accepted — the OTel canonical names from the
-				// OTEL_EXPORTER_OTLP_PROTOCOL spec.
-			default:
-				return fmt.Errorf("observability.protocol %q: must be grpc or http/protobuf", c.Observability.Protocol)
-			}
+		if err := validateOTLPProtocol("observability.protocol", c.Observability.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPProtocol("observability.metrics.protocol", c.Observability.Metrics.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPProtocol("observability.logs.protocol", c.Observability.Logs.Protocol); err != nil {
+			return err
+		}
+		if err := validateOTLPTemporality("observability.metrics.temporality", c.Observability.Metrics.Temporality); err != nil {
+			return err
+		}
+		// Temporality is a metric concept with no log analogue. Rejecting
+		// it on the log signal (rather than silently ignoring it) tells
+		// the operator their setting is on the wrong block instead of
+		// letting them believe it took effect.
+		if c.Observability.Logs.Temporality != "" {
+			return fmt.Errorf("observability.logs.temporality %q: temporality applies to the metrics signal only", c.Observability.Logs.Temporality)
+		}
+		// Both signals explicitly off under an enabled master switch is a
+		// contradiction, not a configuration: the operator's intent is
+		// unclear (did they mean to disable observability, or did a partial
+		// edit leave this behind?), and silently initialising nothing would
+		// hide whichever mistake it was.
+		if !c.Observability.MetricsSignal().Enabled && !c.Observability.LogsSignal().Enabled {
+			return fmt.Errorf("observability.enabled is true but both metrics.enabled and logs.enabled are false; set observability.enabled false instead")
 		}
 		if c.Observability.RawInterval != "" {
 			// Use the project's ParseDuration so observability.export_interval
@@ -752,12 +1243,18 @@ func (c *Config) validate() error {
 	// header smuggling; NUL is rejected because HTTP/2 and gRPC
 	// treat it as a field terminator in some implementations and
 	// proxies vary in handling.
-	for k, v := range c.Observability.Headers {
-		if strings.ContainsAny(k, "\r\n:\x00") {
-			return fmt.Errorf("observability.headers: key %q must not contain CR, LF, NUL, or colon", k)
-		}
-		if strings.ContainsAny(v, "\r\n\x00") {
-			return fmt.Errorf("observability.headers[%q]: value must not contain CR, LF, or NUL", k)
+	for field, headers := range map[string]map[string]string{
+		"observability.headers":         c.Observability.Headers,
+		"observability.metrics.headers": c.Observability.Metrics.Headers,
+		"observability.logs.headers":    c.Observability.Logs.Headers,
+	} {
+		for k, v := range headers {
+			if strings.ContainsAny(k, "\r\n:\x00") {
+				return fmt.Errorf("%s: key %q must not contain CR, LF, NUL, or colon", field, k)
+			}
+			if strings.ContainsAny(v, "\r\n\x00") {
+				return fmt.Errorf("%s[%q]: value must not contain CR, LF, or NUL", field, k)
+			}
 		}
 	}
 
@@ -804,6 +1301,19 @@ func (c *Config) validate() error {
 				return fmt.Errorf("agent.keys[%d]: invalid source %q (must be kv, vault-ca, or agent)", i, k.Source)
 			}
 		}
+	}
+
+	// Local API socket. Validated unconditionally (like the header checks
+	// above): a relative path is a mistake worth naming whether or not the
+	// section is currently enabled.
+	if err := c.validateAPI(); err != nil {
+		return err
+	}
+
+	// Filesystem (FUSE) section. Validated unconditionally for the same
+	// reason as the API socket above.
+	if err := c.validateFUSE(); err != nil {
+		return err
 	}
 
 	// Remote-config validation (URL shape, refresh interval, header
@@ -868,6 +1378,9 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	}
 	if !validFormats[r.Target.Format] {
 		return fmt.Errorf("rules[%d] (%s): invalid format %q (must be yaml, json, ini, toml, text, netrc, or ssh_config)", i, r.Name, r.Target.Format)
+	}
+	if r.Target.DeleteNulls && !handlers.SupportsDeleteNulls(r.Target.Format) {
+		return fmt.Errorf("rules[%d] (%s): target.delete_nulls is not supported for format %q (only json and yaml have a null literal a template can render)", i, r.Name, r.Target.Format)
 	}
 	return nil
 }

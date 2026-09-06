@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/observability"
@@ -79,6 +80,61 @@ func (c *Client) IssueCertificate(ctx context.Context, mount, role, commonName, 
 	}
 	path := fmt.Sprintf("%s/issue/%s", strings.Trim(mount, "/"), role)
 	return c.pkiWrite(ctx, "pki_issue", path, data)
+}
+
+// FormatSerial renders a certificate serial the way Vault does — lowercase hex,
+// byte pairs separated by colons — which is the only form its PKI endpoints
+// accept for serial_number.
+//
+// It lives here, beside the endpoints that consume it, because this package
+// owns what goes on the wire; callers holding an *x509.Certificate should not
+// each re-derive the encoding. big.Int.String() is the tempting shortcut and
+// the wrong one: it produces a decimal string naming nothing Vault has heard
+// of. Bytes() gives the big-endian magnitude, which is what a serial actually
+// is, and sidesteps odd-length hex padding. A zero serial (non-conformant, but
+// parseable) renders as "00" rather than the empty string, so it is never
+// mistaken for "no serial".
+func FormatSerial(n *big.Int) string {
+	if n == nil {
+		return ""
+	}
+	raw := n.Bytes()
+	if len(raw) == 0 {
+		return "00"
+	}
+	pairs := make([]string, 0, len(raw))
+	for _, b := range raw {
+		pairs = append(pairs, fmt.Sprintf("%02x", b))
+	}
+	return strings.Join(pairs, ":")
+}
+
+// RevokeCertificate revokes a previously issued certificate by serial number.
+// The serial must be in Vault's own form — lowercase hex, byte pairs separated
+// by colons — which is what the sign and issue responses return and what
+// FormatSerial produces from a parsed certificate.
+//
+// Revocation is what makes rotation complete: superseding a certificate stops
+// this host presenting it, but the certificate itself stays valid at the CA
+// until its own NotAfter, so anything holding a copy keeps authenticating. Only
+// the CA can close that window.
+//
+// The token must carry update on <mount>/revoke. Vault answers a serial it has
+// already revoked with the original revocation time rather than an error, so a
+// repeated call is harmless.
+func (c *Client) RevokeCertificate(ctx context.Context, mount, serial string) error {
+	if serial == "" {
+		return fmt.Errorf("pki_revoke: no serial number")
+	}
+	path := fmt.Sprintf("%s/revoke", strings.Trim(mount, "/"))
+	if _, err := c.raw.Logical().WriteWithContext(ctx, path, map[string]interface{}{
+		"serial_number": serial,
+	}); err != nil {
+		observability.RecordVaultCall(ctx, "pki_revoke", classifyVaultErr(err))
+		return fmt.Errorf("pki_revoke %s: %w", path, err)
+	}
+	observability.RecordVaultCall(ctx, "pki_revoke", "ok")
+	return nil
 }
 
 func (c *Client) pkiWrite(ctx context.Context, op, path string, data map[string]interface{}) (*IssuedCert, error) {

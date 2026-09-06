@@ -96,11 +96,13 @@ func (t *tpmStorage) Capabilities() Capabilities {
 	return Capabilities{Name: "tpm", HardwareBound: true}
 }
 
-func (t *tpmStorage) Generate(kt KeyType, sealToPCRs bool) (crypto.Signer, []byte, error) {
+// Generate takes bits to satisfy the Storage interface but ignores it: this
+// backend rejects RSA outright below, so there is never a modulus to size.
+func (t *tpmStorage) Generate(kt KeyType, _ int, sealToPCRs bool) (crypto.Signer, []byte, error) {
 	if kt == KeyRSA {
 		return nil, nil, errors.New("securestore: the TPM backend supports key_type ec only (RSA does not fit a sealed-data object)")
 	}
-	signer, err := newSoftwareKey(KeyEC)
+	signer, err := newSoftwareKey(KeyEC, 0)
 	if err != nil {
 		return nil, nil, err
 	}

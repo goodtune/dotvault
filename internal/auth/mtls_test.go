@@ -9,12 +9,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,12 +79,38 @@ func pemCert(der []byte) string {
 // fakeVault serves the two endpoints the cert-auth flow touches: PKI sign and
 // cert-auth login. loginCount/signCount let tests assert what happened.
 type fakeVault struct {
+	mu                 sync.Mutex // guards record; see note
 	ca                 *testCA
 	loginCount         int
 	signCount          int
 	leafTTL            time.Duration
+	failLogin          bool // when set, /v1/auth/cert/login returns 500
 	tokenCreateCount   int
 	tokenCreateSawCert bool
+	// signTokens records the X-Vault-Token presented on each PKI sign call, so
+	// tests can assert which client (and therefore which token) did the signing.
+	signTokens []string
+	// revokedSerials records the serial_number of each pki/revoke call, and
+	// revokeTokens the X-Vault-Token that made it.
+	revokedSerials []string
+	revokeTokens   []string
+	failRevoke     bool // when set, /v1/pki/revoke returns 403
+	// record, when set, is called with an opcode ("sign", "login", "revoke")
+	// as each endpoint is served, so a test can assert the order of a flow
+	// against events it observes elsewhere (e.g. an OS-store removal).
+	record func(op string)
+}
+
+// note logs an opcode when the test asked for ordering to be recorded. The
+// callback runs on httptest's handler goroutines and typically appends to a
+// slice the test goroutine reads, so it is serialised here rather than relying
+// on the request/response happens-before edge to cover every caller.
+func (f *fakeVault) note(op string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.record != nil {
+		f.record(op)
+	}
 }
 
 func (f *fakeVault) handler() http.Handler {
@@ -92,9 +120,30 @@ func (f *fakeVault) handler() http.Handler {
 			http.Error(w, "no client certificate", http.StatusBadRequest)
 			return
 		}
+		if f.failLogin {
+			http.Error(w, "cert auth rejected", http.StatusInternalServerError)
+			return
+		}
 		f.loginCount++
+		f.note("login")
 		json.NewEncoder(w).Encode(map[string]any{
 			"auth": map[string]any{"client_token": "s.operational-token"},
+		})
+	})
+	mux.HandleFunc("/v1/pki/revoke", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SerialNumber string `json:"serial_number"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if f.failRevoke {
+			http.Error(w, "permission denied", http.StatusForbidden)
+			return
+		}
+		f.revokedSerials = append(f.revokedSerials, body.SerialNumber)
+		f.revokeTokens = append(f.revokeTokens, r.Header.Get("X-Vault-Token"))
+		f.note("revoke")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"revocation_time": 1700000000},
 		})
 	})
 	mux.HandleFunc("/v1/auth/token/create", func(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +157,7 @@ func (f *fakeVault) handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("/v1/pki/sign/dotvault", func(w http.ResponseWriter, r *http.Request) {
+		f.signTokens = append(f.signTokens, r.Header.Get("X-Vault-Token"))
 		var body struct {
 			CSR        string `json:"csr"`
 			CommonName string `json:"common_name"`
@@ -120,6 +170,7 @@ func (f *fakeVault) handler() http.Handler {
 			return
 		}
 		f.signCount++
+		f.note("sign")
 		ttl := f.leafTTL
 		if ttl == 0 {
 			ttl = 24 * time.Hour
@@ -179,7 +230,9 @@ func mtlsManager(t *testing.T, srv *httptest.Server, storageDir string) *Manager
 			KeyType:       "ec",
 			CommonName:    "{{.user}}",
 			ReissueBefore: 7 * 24 * time.Hour,
-			StorageDir:    storageDir,
+			// SkipRevokeSuperseded deliberately left unset: its zero value is
+			// "revoke", which is what a default deployment gets.
+			StorageDir: storageDir,
 		},
 	}
 }
@@ -228,6 +281,105 @@ func TestMTLSByoSeedAndLogin(t *testing.T) {
 	}
 	if cred.Identity != "alice" || cred.Backend != "file" {
 		t.Errorf("unexpected credential: %+v", cred)
+	}
+}
+
+// writeBYO produces a valid BYO cert+key on disk and returns their paths.
+func writeBYO(t *testing.T, ca *testCA, dir string) (certPath, keyPath string) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.signLeaf(t, &key.PublicKey, "alice", time.Now().Add(24*time.Hour))
+	certPath = filepath.Join(dir, "byo.crt")
+	keyPath = filepath.Join(dir, "byo.key")
+	os.WriteFile(certPath, []byte(leaf), 0o600)
+	os.WriteFile(keyPath, []byte(newPEMKey(t, key)), 0o600)
+	return certPath, keyPath
+}
+
+// TestMTLSSeedLoginFailureDoesNotClobberEnvelope pins the P1 fix: the new
+// credential must not become authoritative until the replacement cert login
+// succeeds. Before the fix, saveCredential overwrote credential.json before the
+// login was known to work, so a failed login left the on-disk envelope pointing
+// at a credential the store had just rolled back — stranding the next restart or
+// unattended recovery. Reload credential.json on the failure path and assert it
+// still reflects the previous state.
+func TestMTLSSeedLoginFailureDoesNotClobberEnvelope(t *testing.T) {
+	ca := newTestCA(t)
+
+	t.Run("first enrolment leaves no envelope", func(t *testing.T) {
+		f := &fakeVault{ca: ca, failLogin: true}
+		srv := newFakeVaultServer(t, f)
+		dir := t.TempDir()
+		certPath, keyPath := writeBYO(t, ca, dir)
+
+		m := mtlsManager(t, srv, dir)
+		m.MTLS.BYOCert = certPath
+		m.MTLS.BYOKey = keyPath
+
+		if err := m.authenticateMTLS(t.Context()); err == nil {
+			t.Fatal("expected authenticateMTLS to fail when the cert login is rejected")
+		}
+		// No prior credential existed, so a failed login must not write one.
+		if _, err := os.Stat(filepath.Join(dir, "credential.json")); !os.IsNotExist(err) {
+			cred, _ := loadCredential(dir)
+			t.Fatalf("credential.json must not exist after a failed first enrolment; got %+v (stat err %v)", cred, err)
+		}
+	})
+
+	t.Run("re-seed keeps the previous envelope", func(t *testing.T) {
+		f := &fakeVault{ca: ca, failLogin: true}
+		srv := newFakeVaultServer(t, f)
+		dir := t.TempDir()
+		// An expired credential is present: startup reuse fails (expiry check,
+		// no login attempt), so the flow falls through to a BYO re-seed whose
+		// cert login then fails.
+		seedCredentialFile(t, ca, dir, time.Now().Add(-time.Hour))
+		certPath, keyPath := writeBYO(t, ca, dir)
+
+		m := mtlsManager(t, srv, dir)
+		m.MTLS.BYOCert = certPath
+		m.MTLS.BYOKey = keyPath
+
+		if err := m.authenticateMTLS(t.Context()); err == nil {
+			t.Fatal("expected authenticateMTLS to fail when the re-seed cert login is rejected")
+		}
+		// The envelope must still be the previous one, not the abandoned BYO
+		// re-seed. seedCredentialFile stamps serial "old-serial".
+		cred, err := loadCredential(dir)
+		if err != nil || cred == nil {
+			t.Fatalf("previous credential must survive a failed re-seed: %v", err)
+		}
+		if cred.Serial != "old-serial" {
+			t.Errorf("envelope serial = %q, want the preserved old-serial (a failed re-seed must not clobber it)", cred.Serial)
+		}
+	})
+}
+
+// TestCertLoginFromStore_EmptyStorageDirIgnoresCwd pins that an empty
+// StorageDir is treated as "no credential" and never probes a cwd-relative
+// "credential.json". The client facade yields an empty StorageDir on a
+// home-less host (defaultMTLSStorageDir → ""); without the guard, loadCredential
+// would read whatever ./credential.json sits in the working directory and
+// authenticate as it — the same cwd-relative hazard DefaultTokenFile avoids.
+// Chdir into a temp dir holding a valid envelope and assert the login is
+// refused, not performed.
+func TestCertLoginFromStore_EmptyStorageDirIgnoresCwd(t *testing.T) {
+	ca := newTestCA(t)
+	f := &fakeVault{ca: ca}
+	srv := newFakeVaultServer(t, f)
+	dir := t.TempDir()
+	seedCredentialFile(t, ca, dir, time.Now().Add(60*24*time.Hour)) // writes dir/credential.json
+	t.Chdir(dir)                                                    // so "" would resolve to ./credential.json
+
+	m := mtlsManager(t, srv, dir)
+	m.MTLS.StorageDir = "" // the home-less-host case
+
+	err := m.CertLoginFromStore(t.Context())
+	if !errors.Is(err, ErrNoCertCredential) {
+		t.Fatalf("err = %v, want ErrNoCertCredential (an empty StorageDir must not probe cwd)", err)
+	}
+	if f.loginCount != 0 {
+		t.Errorf("login attempted %d times; an empty StorageDir must not read ./credential.json and log in", f.loginCount)
 	}
 }
 
@@ -369,8 +521,11 @@ func TestReissueIfDue(t *testing.T) {
 }
 
 // seedCredentialFile writes a file-backend credential envelope (key + CA-signed
-// cert) into dir, as if a previous run had seeded it.
-func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) {
+// cert) into dir, as if a previous run had seeded it. It returns the seeded
+// certificate's serial in Vault's colon-hex form — what a revocation of this
+// credential must name, which is derived from the certificate rather than from
+// the envelope's recorded (deliberately unrelated) "old-serial" marker.
+func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time) string {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	leaf := ca.signLeaf(t, &key.PublicKey, "alice", notAfter)
@@ -387,4 +542,5 @@ func seedCredentialFile(t *testing.T, ca *testCA, dir string, notAfter time.Time
 	if err := saveCredential(dir, cred); err != nil {
 		t.Fatal(err)
 	}
+	return vault.FormatSerial(mustLeaf(t, leaf).SerialNumber)
 }

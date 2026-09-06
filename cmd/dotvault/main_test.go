@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/spf13/cobra"
 )
 
 // minimalConfigYAML is a config body that passes config validation.
@@ -126,6 +131,115 @@ func TestResolveConfigSourceOverridePolicy(t *testing.T) {
 			t.Errorf("override config did not load: Vault.Address = %q", cfg.Vault.Address)
 		}
 	})
+}
+
+// borrowOnlyConfigYAML builds a minimal, valid config with vault.borrow_only
+// set and vault.token_socket pointing at sockPath. Deliberately not built by
+// string-appending to minimalConfigYAML: that constant's vault: mapping ends
+// before its rules: section starts, so anything appended after it would land
+// under the last rule instead of under vault:.
+func borrowOnlyConfigYAML(sockPath string) string {
+	return `vault:
+  address: "https://vault.example.com:8200"
+  token_socket: "` + sockPath + `"
+  borrow_only: true
+rules:
+  - name: r
+    vault_key: r
+    target:
+      path: "~/.dotvault/r"
+      format: text
+`
+}
+
+// TestRunLoginRefusesUnderBorrowOnly pins the fix for the gap Copilot's PR
+// review found: `dotvault login` must refuse unconditionally under
+// vault.borrow_only, before ever attempting to borrow — not just once a
+// borrow attempt happens to fail. Reverting the early-return in runLogin
+// back to relying on auth.Manager.Login's own borrow-then-refuse behaviour
+// would make this test fail, since here the peer socket doesn't exist and a
+// borrow would fail anyway; the point is that runLogin must not even try —
+// see TestRunLoginBorrowOnlyNeverDialsSocket for that half.
+func TestRunLoginRefusesUnderBorrowOnly(t *testing.T) {
+	origFlag := flagConfig
+	t.Cleanup(func() { flagConfig = origFlag })
+
+	// Same precaution as TestResolveConfigSourceOverridePolicy: a real system
+	// config on this host would make loadConfigLocalOnly ignore flagConfig.
+	t.Setenv("XDG_CONFIG_DIRS", t.TempDir())
+	if _, err := os.Stat(paths.SystemConfigPath()); err == nil {
+		t.Skipf("system config %s exists on this host; cannot exercise the override path", paths.SystemConfigPath())
+	}
+
+	body := borrowOnlyConfigYAML(filepath.Join(t.TempDir(), "peer.sock"))
+	path := filepath.Join(t.TempDir(), "borrow-only.yaml")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	flagConfig = path
+
+	err := runLogin(&cobra.Command{}, nil)
+	if err == nil {
+		t.Fatal("runLogin() = nil, want a refusal under vault.borrow_only")
+	}
+	if !errors.Is(err, auth.ErrBorrowOnly) {
+		// Not required by the fix (the plain error deliberately does not wrap
+		// auth.ErrBorrowOnly — see the comment in runLogin), but confirm the
+		// message still names the mode so an operator isn't left guessing.
+		t.Logf("runLogin() error does not wrap auth.ErrBorrowOnly (expected — see runLogin's comment): %v", err)
+	}
+	if !strings.Contains(err.Error(), "borrow_only") {
+		t.Errorf("runLogin() error = %q, want it to name vault.borrow_only", err)
+	}
+	if strings.Contains(err.Error(), "make sure the peer is reachable") {
+		t.Errorf("runLogin() error = %q, still carries the stale post-borrow-failure wording", err)
+	}
+}
+
+// TestRunLoginBorrowOnlyNeverDialsSocket is the other half of the fix: even
+// when the peer socket IS reachable and holds a token, dotvault login must
+// still refuse rather than borrow-and-succeed. A live socket server proves
+// runLogin never dials it — if it did, this test's fake peer would answer
+// with a token and the command would exit 0.
+func TestRunLoginBorrowOnlyNeverDialsSocket(t *testing.T) {
+	origFlag := flagConfig
+	t.Cleanup(func() { flagConfig = origFlag })
+	t.Setenv("XDG_CONFIG_DIRS", t.TempDir())
+	if _, err := os.Stat(paths.SystemConfigPath()); err == nil {
+		t.Skipf("system config %s exists on this host; cannot exercise the override path", paths.SystemConfigPath())
+	}
+	t.Setenv("DOTVAULT_TOKEN", "") // hermetic: a developer export must not leak in
+
+	sock := filepath.Join(t.TempDir(), "peer.sock")
+	dialed := false
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/token", func(w http.ResponseWriter, r *http.Request) {
+		dialed = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token":"hvs.peer-token"}`))
+	})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	body := borrowOnlyConfigYAML(sock)
+	path := filepath.Join(t.TempDir(), "borrow-only.yaml")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	flagConfig = path
+
+	if err := runLogin(&cobra.Command{}, nil); err == nil {
+		t.Fatal("runLogin() = nil — it borrowed and succeeded, which vault.borrow_only must never let `dotvault login` do")
+	}
+	if dialed {
+		t.Error("runLogin dialed the peer socket; it must refuse before ever attempting a borrow")
+	}
 }
 
 func TestIsGUIBinary(t *testing.T) {
@@ -330,11 +444,7 @@ func TestLoginCheckNoPasswd_Subprocess(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	// Resolve the username exactly as production does (paths.Username
 	// strips any DOMAIN\ prefix) so the fixture entry always matches
@@ -429,11 +539,7 @@ func TestLoginCheckSuppression_SubprocessRoundTrip(t *testing.T) {
 
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "dotvault")
-	build := exec.Command("go", "build", "-o", binPath, ".")
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		t.Fatalf("go build: %v", err)
-	}
+	buildTestBinary(t, binPath)
 
 	workDir := t.TempDir()
 	markerPath := filepath.Join(workDir, "marker")

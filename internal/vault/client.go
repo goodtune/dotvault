@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/observability"
 	vaultapi "github.com/hashicorp/vault/api"
@@ -30,6 +31,13 @@ type Config struct {
 type Secret struct {
 	Data    map[string]any
 	Version int
+
+	// CreatedTime is when the current version was written. It is the
+	// closest thing KVv2 offers to a modification time, and is what the
+	// FUSE filesystem reports as a file's mtime so `ls -l` and `make`-style
+	// staleness checks see something meaningful. Zero when the server
+	// returned no version metadata.
+	CreatedTime time.Time
 }
 
 // Client wraps the Vault API client.
@@ -128,13 +136,16 @@ func (c *Client) ReadKVv2(ctx context.Context, mount, path string) (*Secret, err
 	observability.RecordVaultCall(ctx, "read", "ok")
 
 	version := 0
+	var created time.Time
 	if secret.VersionMetadata != nil {
 		version = secret.VersionMetadata.Version
+		created = secret.VersionMetadata.CreatedTime
 	}
 
 	return &Secret{
-		Data:    secret.Data,
-		Version: version,
+		Data:        secret.Data,
+		Version:     version,
+		CreatedTime: created,
 	}, nil
 }
 

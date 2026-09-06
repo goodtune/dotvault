@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 )
@@ -35,10 +33,15 @@ func (s *Server) WaitForAuth(ctx context.Context) error {
 }
 
 func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
+	// Mirrors the borrow-only guards on the LDAP/token login POSTs: this
+	// path is never linked from the login view under borrow-only mode, but
+	// a direct GET must be closed too — this host has no fresh-auth flow to
+	// start.
+	if s.vaultCfg.BorrowOnly {
+		http.Error(w, "OIDC login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
+		return
 	}
+	mount := s.loginMount("oidc")
 
 	callbackURL := fmt.Sprintf("http://%s/auth/oidc/callback", s.listenAddr)
 
@@ -71,6 +74,18 @@ func (s *Server) handleAuthStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	// Mirrors handleAuthStart's guard: under borrow-only this daemon must
+	// never complete an OIDC login and install a token, regardless of how
+	// the request arrives. handleAuthStart already refuses to initiate the
+	// flow, but the callback is a separate registered route (and a
+	// compatibility surface whose IdP-facing URL can't be renamed — see
+	// CLAUDE.md) — a stale bookmarked callback from before this host was
+	// switched to borrow-only, or any other way a valid code+state pair
+	// reaches here, must not be allowed to finish the login anyway.
+	if s.vaultCfg.BorrowOnly {
+		http.Error(w, "OIDC login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
+		return
+	}
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
@@ -89,10 +104,7 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mount := s.authMount
-	if mount == "" {
-		mount = "oidc"
-	}
+	mount := s.loginMount("oidc")
 
 	callbackPath := fmt.Sprintf("auth/%s/oidc/callback", mount)
 	loginData := map[string][]string{
@@ -112,178 +124,26 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := auth.Downscope(r.Context(), s.vault, loginSecret.Auth.ClientToken, s.policyConstraint())
+	// Token adoption (including the bootstrap divert) is shared with the
+	// LDAP flow — see consumeLoginToken for why a bootstrap token must never
+	// be downscoped, persisted, or installed.
+	bootstrapped, err := s.consumeLoginToken(r.Context(), loginSecret.Auth.ClientToken)
 	if err != nil {
 		slog.Error("downscoping token to least privilege failed", "error", err)
 		http.Error(w, "Authentication failed during token downscoping", http.StatusInternalServerError)
 		return
 	}
-	s.vault.SetToken(token)
-	auth.WarnUnrestrictedPolicy(s.policyConstraint())
-
-	if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
-		slog.Warn("failed to write token file", "error", err)
+	if bootstrapped {
+		slog.Info("OIDC bootstrap login successful via web UI")
+		// issuing=1 tells the login view that the credential step is done
+		// and the daemon is now minting the certificate, so it shows the
+		// issuance message rather than the generic sign-in one.
+		http.Redirect(w, r, "/?issuing=1", http.StatusSeeOther)
+		return
 	}
 
 	slog.Info("OIDC authentication successful via web UI")
-
-	// Signal auth completion (non-blocking).
-	select {
-	case s.authDone <- struct{}{}:
-	default:
-	}
-
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.Username == "" || req.Password == "" {
-		writeError(w, "username and password required", http.StatusBadRequest)
-		return
-	}
-
-	sessionID, err := generateSessionID()
-	if err != nil {
-		slog.Error("failed to generate session ID", "error", err)
-		writeError(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	mount := s.authMount
-	if mount == "" {
-		mount = "ldap"
-	}
-
-	s.login.StartLogin(sessionID, mount, req.Username, req.Password)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{"session_id": sessionID})
-}
-
-func (s *Server) handleLDAPStatus(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.URL.Query().Get("session")
-	if sessionID == "" {
-		writeError(w, "session parameter required", http.StatusBadRequest)
-		return
-	}
-
-	status := s.login.GetStatus(sessionID)
-	if status == nil {
-		writeError(w, "session not found", http.StatusNotFound)
-		return
-	}
-
-	// Clear failed sessions to prevent unbounded growth.
-	if status.State == "failed" {
-		s.login.Clear(sessionID)
-	}
-
-	// If authenticated, consume the token server-side.
-	if status.State == "authenticated" && status.Token != "" {
-		token, err := auth.Downscope(r.Context(), s.vault, status.Token, s.policyConstraint())
-		if err != nil {
-			slog.Error("downscoping token to least privilege failed", "error", err)
-			s.login.Clear(sessionID)
-			writeError(w, "authentication failed during token downscoping", http.StatusInternalServerError)
-			return
-		}
-		s.vault.SetToken(token)
-		auth.WarnUnrestrictedPolicy(s.policyConstraint())
-		if err := auth.WriteTokenFile(s.tokenFilePath, token, s.sealToken); err != nil {
-			slog.Warn("failed to write token file", "error", err)
-		}
-		s.login.Clear(sessionID)
-
-		slog.Info("LDAP authentication successful via web UI")
-
-		// Signal auth completion.
-		select {
-		case s.authDone <- struct{}{}:
-		default:
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
-}
-
-func (s *Server) handleLDAPTOTP(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"session_id"`
-		Passcode  string `json:"passcode"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.SessionID == "" || req.Passcode == "" {
-		writeError(w, "session_id and passcode required", http.StatusBadRequest)
-		return
-	}
-
-	status := s.login.GetStatus(req.SessionID)
-	if status == nil {
-		writeError(w, "session not found", http.StatusNotFound)
-		return
-	}
-	if status.State != "mfa_required" || len(status.MFAMethods) == 0 || !status.MFAMethods[0].UsesPasscode {
-		writeError(w, "passcode not expected for this session", http.StatusBadRequest)
-		return
-	}
-
-	s.login.SubmitTOTP(req.SessionID, req.Passcode)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"status": "submitted"})
-}
-
-func (s *Server) handleTokenLogin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.Token == "" {
-		writeError(w, "token required", http.StatusBadRequest)
-		return
-	}
-
-	// Validate the token, preserving any existing token on failure.
-	prevToken := s.vault.Token()
-	s.vault.SetToken(req.Token)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	if _, err := s.vault.LookupSelf(ctx); err != nil {
-		s.vault.SetToken(prevToken)
-		writeError(w, "invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	if err := auth.WriteTokenFile(s.tokenFilePath, req.Token, s.sealToken); err != nil {
-		slog.Warn("failed to write token file", "error", err)
-	}
-
-	slog.Info("token authentication successful via web UI")
-
-	// Signal auth completion.
-	select {
-	case s.authDone <- struct{}{}:
-	default:
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"state": "authenticated"})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func generateSessionID() (string, error) {

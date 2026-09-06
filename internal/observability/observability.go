@@ -26,14 +26,53 @@
 // newTestLogProcessor) without also serialising through a sync.Once
 // or test-scoped lock.
 //
-// Attribute conventions:
+// Attribute conventions. The rules below are about *instrument*
+// attributes — the per-record labels passed to a Record* helper, which
+// multiply the exported time series. Resource attributes are a
+// different thing and are governed separately: a resource attribute is
+// one fixed value for the whole process, attached once to every metric
+// and log record, and adds no series at all. That is why the resource
+// built in Init legitimately carries user.name and a fully-qualified
+// host.name while the instrument rules forbid the same values as
+// labels.
+//
+// Cardinality is only half of the rule those values used to fall under,
+// though, and the other half is not waived by being on the resource: the
+// scrubbing discipline the slog handlers follow is about *disclosure*,
+// and user.name plainly crosses it — the OS account name and the machine
+// FQDN leave the host on every export, to whatever collector the operator
+// configured, third-party SaaS included. That trade was made
+// deliberately. dotvault is a per-user daemon, so the account it runs as
+// is the identity of the emitting process; attributing a series to a user
+// is the whole point of the attribute, and a fleet view without it cannot
+// answer "whose daemon is failing". The mitigations are that the operator
+// chooses the destination, that observability is off by default (Init
+// returns early when disabled, so nothing is emitted and no resolver call
+// is made), and that the exposure is the deployment's own identity rather
+// than any secret material — never a Vault path, key, or credential.
+// A deployment that cannot accept that disclosure turns observability off;
+// there is no per-attribute opt-out today.
+//
 //   - Outcomes use a small fixed vocabulary ({ok, error, renewed,
 //     reauth_required, failed, completed, denied, …}) so the
 //     exported series stay bounded. See the per-instrument
 //     RecordXxx godoc for the exact set each instrument emits.
 //   - We never attach usernames, Vault paths, secret keys, repo URLs,
-//     or JFrog server hostnames to instruments — the same scrubbing
-//     discipline the slog handlers follow.
+//     or JFrog server hostnames to *instruments* — the same scrubbing
+//     discipline the slog handlers follow. The one deliberate exception is
+//     the `host` label on the SSH forward instruments (dotvault.ssh.*):
+//     unlike a JFrog server URL, it names an entry in the operator's own
+//     small, statically-configured remote list — see
+//     docs/superpowers/specs/2026-08-09-managed-ssh-forwards-design.md — so
+//     the cardinality bound holds for the same reason a Vault path's does
+//     not.
+//   - The identity attributes on the resource (service.name,
+//     service.version, user.name, host.name, os.type, host.arch, the
+//     process runtime pair) are process constants, so they identify the
+//     emitting daemon without inflating cardinality. They ride every
+//     exported metric *and* every exported log record, because the
+//     MeterProvider and the LoggerProvider share one resource — see
+//     buildResource.
 package observability
 
 import (
@@ -41,12 +80,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/paths"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
@@ -71,36 +113,71 @@ type Config struct {
 	// no-op meter.
 	Enabled bool
 
-	// Endpoint is the OTLP collector address shared between metric
-	// and log exports. For gRPC: "host:port" (e.g. "localhost:4317").
-	// For HTTP: a *base* URL with no signal-specific path (e.g.
-	// "https://otel.example") — the exporters append "/v1/metrics"
-	// and "/v1/logs" themselves. Passing a URL that already ends in
-	// "/v1/metrics" (or any other signal-specific path) routes both
-	// signals to the same wrong path on the collector. When empty the
-	// SDK falls through to OTEL_EXPORTER_OTLP_ENDPOINT.
-	Endpoint string
+	// Metrics and Logs carry each signal's RESOLVED exporter settings —
+	// the caller (cmd/dotvault) layers any per-signal config overrides
+	// onto the shared fields via config.ObservabilityConfig.ResolveSignal
+	// before constructing this. Keeping this package on the resolved shape
+	// means the layering semantics live in exactly one place (the config
+	// package) and Init never re-derives them.
+	Metrics Signal
+	Logs    Signal
 
-	// Protocol selects the exporter implementation: "grpc" (default) or
-	// "http/protobuf".
-	Protocol string
-
-	// Insecure disables transport security for the gRPC exporter
-	// (HTTP/protobuf carries this via the endpoint scheme).
-	Insecure bool
-
-	// Headers are attached to every export request — useful for
-	// authenticating to a collector that fronts a vendor backend.
-	Headers map[string]string
-
-	// ExportInterval is the periodic exporter cadence. Zero means the
-	// SDK default (currently 60s).
+	// ExportInterval is the periodic metric exporter cadence. Zero means
+	// the SDK default (currently 60s). Metrics-only: the log signal uses
+	// the SDK's batch processor with its own defaults.
 	ExportInterval time.Duration
 
 	// ServiceVersion is the resource attribute used for service.version.
 	// Pass main.version so the exported series can be partitioned by
 	// release.
 	ServiceVersion string
+}
+
+// Signal is one signal's exporter settings. The two signals may point at
+// entirely separate backends.
+type Signal struct {
+	// Enabled switches this signal's exporter on. With both signals
+	// disabled (or the master switch off) Init returns an inactive
+	// Provider.
+	Enabled bool
+
+	// Endpoint is the OTLP collector address for this signal, and both
+	// signals share one contract. A full URL with a scheme is the
+	// recommended form: the scheme carries the TLS intent (https → TLS,
+	// http → plaintext) and an explicit path is used verbatim — no mount
+	// path is assumed, so a vendor route like
+	// "https://collector.example/tenant/v1/metrics" works as written. A
+	// URL without a path gets the OTLP standard "/v1/metrics" /
+	// "/v1/logs" appended (http/protobuf only; gRPC has no URL path).
+	// Bare "host:port" also works — canonical for gRPC — with TLS then
+	// governed by Insecure. A "grpc://" prefix is tolerated and stripped
+	// (carrying no TLS meaning); "dns:///" is preserved as a gRPC
+	// resolver target. When empty the SDK falls through to
+	// OTEL_EXPORTER_OTLP_ENDPOINT (and the signal-specific
+	// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT / _LOGS_ENDPOINT variants).
+	Endpoint string
+
+	// Protocol selects the exporter implementation: "grpc" (default) or
+	// "http/protobuf".
+	Protocol string
+
+	// Insecure disables transport security. Meaningful for scheme-less
+	// endpoints; an endpoint URL's scheme already carries the TLS intent,
+	// and Insecure true additionally forces plaintext over it.
+	Insecure bool
+
+	// Temporality is the metric temporality preference: "cumulative",
+	// "delta", or "lowmemory", mirroring the vocabulary (and instrument-
+	// kind mapping) of OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE.
+	// Empty falls through to that env var, then the SDK default
+	// (cumulative). Metrics-only — config validation rejects it on the
+	// log signal, and buildLogExporter ignores it.
+	Temporality string
+
+	// Headers are attached to every export request for this signal —
+	// useful for authenticating to a collector that fronts a vendor
+	// backend.
+	Headers map[string]string
 }
 
 // Provider is a thin wrapper over the SDK MeterProvider and
@@ -157,26 +234,228 @@ func (p *Provider) ForceFlush(ctx context.Context) error {
 // unchanged (so instruments back off to the OTel no-op meter and log
 // emissions go to the no-op global logger).
 func Init(ctx context.Context, cfg Config) (*Provider, error) {
-	if !cfg.Enabled {
+	if !cfg.Enabled || (!cfg.Metrics.Enabled && !cfg.Logs.Enabled) {
 		return &Provider{}, nil
 	}
 
-	metricExporter, err := buildMetricExporter(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("build OTLP metric exporter: %w", err)
+	// Record the build version for the dotvault.build_info gauge before
+	// rebindInstruments runs, so the callback registered against the real
+	// provider observes the injected release rather than the "dev" default.
+	setBuildVersion(cfg.ServiceVersion)
+
+	// Each signal's exporter is built only when that signal is enabled; a
+	// disabled signal's global provider is left untouched, so its consumers
+	// — the metric instruments, or the Log* helpers resolving the global
+	// LoggerProvider — stay backed by the OTel no-op implementation exactly
+	// as if observability were off for it.
+	var metricExporter sdkmetric.Exporter
+	var logExporter sdklog.Exporter
+	var err error
+
+	if cfg.Metrics.Enabled {
+		metricExporter, err = buildMetricExporter(ctx, cfg.Metrics)
+		if err != nil {
+			return nil, fmt.Errorf("build OTLP metric exporter: %w", err)
+		}
 	}
 
-	logExporter, err := buildLogExporter(ctx, cfg)
-	if err != nil {
-		// metricExporter already holds a gRPC/HTTP connection; shut it
-		// down before the error escapes so a transient log-exporter
-		// init failure doesn't leak the metric side. Bounded by the
-		// caller's ctx — initObservability passes a 10s budget.
-		_ = metricExporter.Shutdown(ctx)
-		return nil, fmt.Errorf("build OTLP log exporter: %w", err)
+	if cfg.Logs.Enabled {
+		logExporter, err = buildLogExporter(ctx, cfg.Logs)
+		if err != nil {
+			// metricExporter (when built) already holds a gRPC/HTTP
+			// connection; shut it down before the error escapes so a
+			// transient log-exporter init failure doesn't leak the metric
+			// side. Bounded by the caller's ctx — initObservability passes
+			// a 10s budget.
+			if metricExporter != nil {
+				_ = metricExporter.Shutdown(ctx)
+			}
+			return nil, fmt.Errorf("build OTLP log exporter: %w", err)
+		}
 	}
 
-	hostname, _ := os.Hostname()
+	res, err := buildResource(ctx, cfg)
+	if err != nil {
+		// The built exporters are open — clean them up so the process
+		// isn't left with background dialers pointing at a collector for
+		// a daemon that never actually started.
+		if metricExporter != nil {
+			_ = metricExporter.Shutdown(ctx)
+		}
+		if logExporter != nil {
+			_ = logExporter.Shutdown(ctx)
+		}
+		return nil, fmt.Errorf("build resource: %w", err)
+	}
+
+	var mp *sdkmetric.MeterProvider
+	if metricExporter != nil {
+		readerOpts := []sdkmetric.PeriodicReaderOption{}
+		if cfg.ExportInterval > 0 {
+			readerOpts = append(readerOpts, sdkmetric.WithInterval(cfg.ExportInterval))
+		}
+		reader := sdkmetric.NewPeriodicReader(metricExporter, readerOpts...)
+
+		mp = sdkmetric.NewMeterProvider(
+			sdkmetric.WithResource(res),
+			sdkmetric.WithReader(reader),
+		)
+		otel.SetMeterProvider(mp)
+
+		// Rebind instruments so subsequent record-site calls hit the
+		// active MeterProvider rather than the no-op global captured at
+		// process start. The logger handle isn't cached — Log* helpers
+		// resolve it from global.GetLoggerProvider() per call — so no
+		// equivalent rebind is needed for the log signal. Safe to call
+		// repeatedly: instruments are recreated each time, but creation
+		// is cheap and Init runs once per process.
+		rebindInstruments()
+	}
+
+	var lp *sdklog.LoggerProvider
+	if logExporter != nil {
+		lp = sdklog.NewLoggerProvider(
+			sdklog.WithResource(res),
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+		)
+		global.SetLoggerProvider(lp)
+	}
+
+	mpFinal, lpFinal := mp, lp
+	return &Provider{
+		mp: mp,
+		lp: lp,
+		shutdown: func(ctx context.Context) error {
+			// Best-effort flush before shutdown so the last batch makes
+			// it out even when the caller passes a tight context. Each
+			// side may be nil when its signal is disabled.
+			var mErr, lErr error
+			if mpFinal != nil {
+				_ = mpFinal.ForceFlush(ctx)
+				mErr = mpFinal.Shutdown(ctx)
+			}
+			if lpFinal != nil {
+				_ = lpFinal.ForceFlush(ctx)
+				lErr = lpFinal.Shutdown(ctx)
+			}
+			return errors.Join(mErr, lErr)
+		},
+	}, nil
+}
+
+// hostNameLookupTimeout bounds the FQDN resolver call made once at Init.
+// The daemon's startup is behind this, so a laptop on a captive-portal
+// network with a black-holed resolver must not stall it: two seconds is
+// generous for a nameserver that is going to answer at all, and the
+// fallback (the short os.Hostname value) is perfectly usable.
+//
+// A var rather than a const purely so the timeout path can be tested
+// without a test that really sleeps for two seconds; production never
+// assigns it.
+var hostNameLookupTimeout = 2 * time.Second
+
+// Test seams. Package-level vars rather than parameters so the resource
+// stays buildable from cfg alone; tests swap them and restore with
+// t.Cleanup.
+//
+// lookupCNAME resolves the canonical name of a host. LookupCNAME is
+// chosen over the LookupIP+LookupAddr (PTR) route deliberately: it is a
+// single *forward* lookup, so it goes through the same search-domain
+// list the host already uses to resolve its own name — which is exactly
+// what qualifies a short hostname, and what `hostname -f` relies on.
+// The reverse route depends on a PTR record that DHCP-addressed laptops
+// and cloud instances frequently do not have, and when one does exist it
+// is often an ISP- or provider-generated name unrelated to the host's
+// identity; worse, a short name in /etc/hosts commonly resolves to
+// 127.0.0.1, whose PTR is "localhost". Both failure shapes would replace
+// a correct short name with a wrong qualified one, which is worse than
+// not qualifying at all.
+//
+// Note what the answer is trusted for: the CNAME is chosen by whatever
+// resolver the host is pointed at, so a hostile or compromised one picks
+// the host.name every exported metric and log record carries. That is
+// attribution spoofing at the collector, not compromise of this process —
+// nothing is executed, connected to, or authorised on the strength of the
+// name. The guards below (must be qualified, must not be a localhost
+// alias) reject accidents, not deliberate answers, and are not intended
+// to. Treat host.name as discovered, not attested: a collector that needs
+// authenticated attribution must get it from the transport (mTLS, a
+// per-host token), not from a resource attribute.
+var (
+	lookupCNAME     = net.DefaultResolver.LookupCNAME
+	osHostname      = os.Hostname
+	currentUsername = paths.Username
+)
+
+// resolveHostName returns the value for the host.name resource
+// attribute: the FQDN when one can be established, else whatever
+// os.Hostname reported.
+//
+// A name that already contains a dot is treated as qualified and
+// returned as-is — no lookup. Otherwise a single bounded LookupCNAME
+// runs; its result is accepted only if it is actually qualified (has a
+// dot) and is not a localhost alias, since a resolver that answers the
+// short name from /etc/hosts can return exactly that. Every other
+// outcome — resolver error, timeout, empty hostname, unqualified or
+// loopback answer — falls back to the short name. This never returns an
+// error: observability must not fail because DNS did not answer.
+func resolveHostName(ctx context.Context) string {
+	hostname, _ := osHostname()
+	if hostname == "" || strings.Contains(hostname, ".") {
+		return hostname
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, hostNameLookupTimeout)
+	defer cancel()
+
+	cname, err := lookupCNAME(lookupCtx, hostname)
+	if err != nil {
+		slog.Debug("could not qualify hostname for the host.name resource attribute; using the short name", "hostname", hostname, "error", err)
+		return hostname
+	}
+	cname = strings.TrimSuffix(cname, ".")
+	if !strings.Contains(cname, ".") || hasPrefixFold(cname, "localhost.") {
+		return hostname
+	}
+	return cname
+}
+
+// buildResource assembles the OTel resource shared by the MeterProvider
+// and the LoggerProvider, so every exported metric and log record
+// carries the same process identity.
+func buildResource(ctx context.Context, cfg Config) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName("dotvault"),
+		semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
+		semconv.OSTypeKey.String(runtime.GOOS),
+		// Raw GOARCH coincides with semconv's host.arch well-known
+		// values for every target this project ships (amd64, arm64).
+		// They diverge on 32-bit targets (GOARCH "386"/"arm" vs
+		// semconv "x86"/"arm32") — host.arch is an open enum so raw
+		// values remain legal, but add a mapping here before ever
+		// shipping a 32-bit build.
+		semconv.HostArchKey.String(runtime.GOARCH),
+		semconv.ProcessRuntimeName("go"),
+		semconv.ProcessRuntimeVersion(runtime.Version()),
+	}
+
+	// host.name is omitted rather than attached empty when os.Hostname
+	// reports nothing usable, symmetric with user.name below: an empty
+	// string is not a host identity, and a present-but-blank attribute is
+	// harder to reason about at the collector than an absent one.
+	if hostname := resolveHostName(ctx); hostname != "" {
+		attrs = append(attrs, semconv.HostName(hostname))
+	}
+
+	// user.name identifies which per-user daemon emitted a series — the
+	// unit dotvault is deployed as. Omitted rather than fatal when the
+	// OS lookup fails: observability is never allowed to stop the daemon
+	// starting, matching the ignored error on os.Hostname above.
+	if username, err := currentUsername(); err != nil {
+		slog.Debug("could not resolve the current user for the user.name resource attribute; omitting it", "error", err)
+	} else if username != "" {
+		attrs = append(attrs, semconv.UserName(username))
+	}
 
 	// The supplementary resource is deliberately created with an empty
 	// schema URL rather than semconv.SchemaURL. resource.Merge errors with
@@ -189,121 +468,77 @@ func Init(ctx context.Context, cfg Config) (*Provider, error) {
 	// Leaving it empty lets Merge adopt Default()'s schema, so the
 	// attribute keys stay canonical without coupling us to the SDK's
 	// semconv revision.
-	res, err := resource.Merge(
+	return resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(
-			"",
-			semconv.ServiceName("dotvault"),
-			semconv.ServiceVersion(stringOr(cfg.ServiceVersion, "dev")),
-			semconv.HostName(hostname),
-			semconv.OSTypeKey.String(runtime.GOOS),
-		),
+		resource.NewWithAttributes("", attrs...),
 	)
-	if err != nil {
-		// Both exporters are open — clean them up so the process isn't
-		// left with two background dialers pointing at a collector for
-		// a daemon that never actually started.
-		_ = metricExporter.Shutdown(ctx)
-		_ = logExporter.Shutdown(ctx)
-		return nil, fmt.Errorf("build resource: %w", err)
-	}
-
-	readerOpts := []sdkmetric.PeriodicReaderOption{}
-	if cfg.ExportInterval > 0 {
-		readerOpts = append(readerOpts, sdkmetric.WithInterval(cfg.ExportInterval))
-	}
-	reader := sdkmetric.NewPeriodicReader(metricExporter, readerOpts...)
-
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(reader),
-	)
-	otel.SetMeterProvider(mp)
-
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
-	)
-	global.SetLoggerProvider(lp)
-
-	// Rebind instruments so subsequent record-site calls hit the
-	// active MeterProvider rather than the no-op global captured at
-	// process start. The logger handle isn't cached — Log* helpers
-	// resolve it from global.GetLoggerProvider() per call — so no
-	// equivalent rebind is needed for the log signal. Safe to call
-	// repeatedly: instruments are recreated each time, but creation
-	// is cheap and Init runs once per process.
-	rebindInstruments()
-
-	return &Provider{
-		mp: mp,
-		lp: lp,
-		shutdown: func(ctx context.Context) error {
-			// Best-effort flush before shutdown so the last batch makes
-			// it out even when the caller passes a tight context.
-			_ = mp.ForceFlush(ctx)
-			_ = lp.ForceFlush(ctx)
-			return errors.Join(mp.Shutdown(ctx), lp.Shutdown(ctx))
-		},
-	}, nil
 }
 
-func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
-	// Footgun guard: insecure transport + auth headers means a
-	// bearer token (e.g. a Datadog / Grafana Cloud OTLP key) goes
-	// over plaintext to the collector on both the metric and log
-	// exports (the cfg.Headers map is reused for both signals).
-	// Loopback collectors that don't terminate TLS are a legitimate
-	// case, but the combination usually signals a misconfiguration.
-	// Logged once here (rather than duplicated in buildLogExporter)
-	// because buildMetricExporter runs first during Init.
-	if cfg.Insecure && len(cfg.Headers) > 0 {
-		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext on both metric and log exports; use a TLS-protected endpoint for production")
-	}
+func buildMetricExporter(ctx context.Context, sig Signal) (sdkmetric.Exporter, error) {
+	warnInsecureHeaders("metrics", sig)
 
-	protocol := resolveProtocol(cfg.Protocol, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+	protocol := resolveProtocol(sig.Protocol, "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+
+	temporality, err := temporalitySelector(sig.Temporality)
+	if err != nil {
+		return nil, err
+	}
 
 	switch protocol {
 	case "grpc":
 		opts := []otlpmetricgrpc.Option{}
-		if cfg.Endpoint != "" {
-			opts = append(opts, otlpmetricgrpc.WithEndpoint(stripScheme(cfg.Endpoint)))
+		if sig.Endpoint != "" {
+			// An http(s) scheme carries the TLS intent (WithEndpointURL
+			// derives insecure from it), matching the http/protobuf path
+			// below so the scheme means the same thing on every protocol.
+			// Other prefixes keep the historical handling: grpc:// is
+			// stripped, dns:/// passes through as a gRPC resolver target.
+			if hasHTTPScheme(sig.Endpoint) {
+				warnGRPCSchemeDowngrade("metrics", sig)
+				opts = append(opts, otlpmetricgrpc.WithEndpointURL(sig.Endpoint))
+			} else {
+				opts = append(opts, otlpmetricgrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			}
 		}
-		if cfg.Insecure {
+		if sig.Insecure {
 			opts = append(opts, otlpmetricgrpc.WithInsecure())
 		}
-		if len(cfg.Headers) > 0 {
-			opts = append(opts, otlpmetricgrpc.WithHeaders(cfg.Headers))
+		if len(sig.Headers) > 0 {
+			opts = append(opts, otlpmetricgrpc.WithHeaders(sig.Headers))
+		}
+		if temporality != nil {
+			opts = append(opts, otlpmetricgrpc.WithTemporalitySelector(temporality))
 		}
 		return otlpmetricgrpc.New(ctx, opts...)
 	case "http/protobuf":
 		opts := []otlpmetrichttp.Option{}
-		if cfg.Endpoint != "" {
+		if sig.Endpoint != "" {
 			// otlpmetrichttp distinguishes endpoint vs URL: WithEndpoint
 			// takes host[:port], WithEndpointURL takes a fully-qualified
-			// URL. The user-facing config is a single field, so we infer
-			// which to call from the literal presence of "://": url.Parse
-			// will happily report `Scheme: "127.0.0.1"` for `127.0.0.1:4317`
-			// (interpreting the colon as a scheme separator), so a
-			// Scheme-only check would misroute host:port values to
-			// WithEndpointURL and produce a confusing init failure. The
-			// substring check is what the OTel SDK's own env-var loader
-			// does internally for the same reason.
-			if strings.Contains(cfg.Endpoint, "://") {
-				opts = append(opts, otlpmetrichttp.WithEndpointURL(cfg.Endpoint))
+			// URL. The single user-facing field routes on hasHTTPScheme —
+			// the same predicate as the gRPC branch, so the scheme means
+			// the same thing on every protocol — with anything else
+			// treated as a dial target (a stray grpc:// stripped rather
+			// than fed to WithEndpointURL, where its non-https scheme
+			// would silently select plaintext).
+			if hasHTTPScheme(sig.Endpoint) {
+				opts = append(opts, otlpmetrichttp.WithEndpointURL(ensureSignalPath(sig.Endpoint, "/v1/metrics")))
 			} else {
-				opts = append(opts, otlpmetrichttp.WithEndpoint(cfg.Endpoint))
+				opts = append(opts, otlpmetrichttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}
 		}
-		if cfg.Insecure {
+		if sig.Insecure {
 			opts = append(opts, otlpmetrichttp.WithInsecure())
 		}
-		if len(cfg.Headers) > 0 {
-			opts = append(opts, otlpmetrichttp.WithHeaders(cfg.Headers))
+		if len(sig.Headers) > 0 {
+			opts = append(opts, otlpmetrichttp.WithHeaders(sig.Headers))
+		}
+		if temporality != nil {
+			opts = append(opts, otlpmetrichttp.WithTemporalitySelector(temporality))
 		}
 		return otlpmetrichttp.New(ctx, opts...)
 	default:
-		// Report the *resolved* protocol — when cfg.Protocol was
+		// Report the *resolved* protocol — when sig.Protocol was
 		// empty and we picked the value up from OTEL_EXPORTER_OTLP_*
 		// env vars, that's the value the operator actually has in
 		// flight, not the empty config field.
@@ -311,21 +546,136 @@ func buildMetricExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, e
 	}
 }
 
+// warnInsecureHeaders is the per-signal footgun guard: insecure transport
+// plus auth headers means a bearer token (e.g. a Datadog / Grafana Cloud
+// OTLP key) goes over plaintext to that signal's collector. Loopback
+// collectors that don't terminate TLS are a legitimate case, but the
+// combination usually signals a misconfiguration. Evaluated per signal now
+// that the two can point at different backends with different headers —
+// one signal being safely configured must not mask the other's plaintext
+// token.
+func warnInsecureHeaders(signal string, sig Signal) {
+	if insecureHeaderFootgun(sig) {
+		slog.Warn("OTLP insecure transport enabled with auth headers — bearer tokens will be sent in plaintext; use a TLS-protected endpoint for production", "signal", signal)
+	}
+}
+
+// insecureHeaderFootgun is the predicate behind warnInsecureHeaders, split
+// out so the condition is testable without capturing log output. Plaintext
+// transport arrives two ways — the Insecure flag, or an explicit http://
+// scheme on the endpoint (which WithEndpointURL translates to insecure on
+// every protocol) — and the guard must catch both, or the recommended
+// full-URL form would be exactly the shape that ships a bearer token over
+// cleartext unwarned.
+func insecureHeaderFootgun(sig Signal) bool {
+	plaintext := sig.Insecure || hasPrefixFold(sig.Endpoint, "http://")
+	return plaintext && len(sig.Headers) > 0
+}
+
+// warnGRPCSchemeDowngrade flags the one shape whose meaning this release
+// changed: a gRPC endpoint written as "http://host:port". Previous releases
+// stripped the scheme and attempted TLS; the scheme now selects plaintext,
+// matching http/protobuf. A config that was (mis)written that way against a
+// TLS collector will stop exporting and start sending its HTTP/2 preface —
+// headers included — in cleartext, so the change must be loud: one WARN per
+// exporter build naming the fix for each intent.
+func warnGRPCSchemeDowngrade(signal string, sig Signal) {
+	if hasPrefixFold(sig.Endpoint, "http://") {
+		slog.Warn("gRPC OTLP endpoint has an http:// scheme, which now selects PLAINTEXT transport (earlier releases ignored the scheme and used TLS) — use https:// or drop the scheme to keep TLS, or keep http:// if plaintext is intended", "signal", signal)
+	}
+}
+
+// temporalitySelector maps the configured temporality preference onto the
+// SDK selector, using the exact vocabulary and instrument-kind mapping of
+// OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE so an operator who knows
+// the env var knows the config field: "cumulative" (everything cumulative,
+// the OTLP default), "delta" (counters, observable counters, and histograms
+// delta; up-down counters stay cumulative), "lowmemory" (only synchronous
+// counters and histograms delta). Empty returns a nil selector — the option
+// is then not passed at all, so the SDK's own env-var reading applies,
+// consistent with every other empty exporter field. A non-empty value
+// overrides the env var, also like every other field. An unknown value is a
+// config error surfaced at Init rather than the env var's warn-and-ignore,
+// because a config file is validated where an ambient variable is tolerated.
+func temporalitySelector(preference string) (sdkmetric.TemporalitySelector, error) {
+	switch strings.ToLower(strings.TrimSpace(preference)) {
+	case "":
+		return nil, nil
+	case "cumulative":
+		return sdkmetric.DefaultTemporalitySelector, nil
+	case "delta":
+		return sdkmetric.DeltaTemporalitySelector, nil
+	case "lowmemory":
+		return sdkmetric.LowMemoryTemporalitySelector, nil
+	default:
+		return nil, fmt.Errorf("unsupported metric temporality %q (use cumulative, delta, or lowmemory)", preference)
+	}
+}
+
+// hasHTTPScheme reports whether an endpoint is written as a full http(s)
+// URL — the form whose scheme carries the TLS intent on every protocol.
+// Deliberately a prefix check, not url.Parse: parsing "127.0.0.1:4317"
+// yields Scheme "127.0.0.1", so a parse-based check would misclassify the
+// canonical host:port form. Case-insensitive, because URL schemes are:
+// url.Parse canonicalises "HTTP://" to scheme "http", so a case-sensitive
+// check here would route the uppercase form away from WithEndpointURL —
+// and past the plaintext warnings — while the SDK would still have
+// treated it as plaintext had it arrived.
+func hasHTTPScheme(s string) bool {
+	return hasPrefixFold(s, "https://") || hasPrefixFold(s, "http://")
+}
+
+// hasPrefixFold is strings.HasPrefix under Unicode case-folding — the
+// one predicate all scheme checks share so their case handling cannot
+// drift apart.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
 // stripScheme normalises an OTLP gRPC endpoint by removing a
 // URL-style scheme so the underlying gRPC dialer receives a bare
 // host:port (which is what otlpmetricgrpc.WithEndpoint expects).
+// http(s):// endpoints are routed through WithEndpointURL before this
+// runs (their scheme carries TLS intent); this handles the leftovers —
+// grpc:// is stripped as a tolerated no-meaning prefix, in any case
+// (schemes are case-insensitive).
 //
 // dns:/// is deliberately preserved: it is a valid gRPC resolver
 // prefix (not a URL scheme) that enables the DNS resolver for
 // multi-address service discovery / load balancing. Stripping it
 // would change the dial-target semantics and break those setups.
+
 func stripScheme(s string) string {
 	for _, prefix := range []string{"https://", "http://", "grpc://"} {
-		if strings.HasPrefix(s, prefix) {
-			return strings.TrimPrefix(s, prefix)
+		if hasPrefixFold(s, prefix) {
+			return s[len(prefix):]
 		}
 	}
 	return s
+}
+
+// ensureSignalPath upholds the documented endpoint contract on the
+// http/protobuf path: a full URL with an explicit path is used verbatim,
+// and a path-less URL gets the OTLP-standard signal path ("/v1/metrics" /
+// "/v1/logs") appended. Through OTel SDK v1.44 the exporter itself supplied
+// the default (WithEndpointURL left an empty URLPath for its cleanPath step
+// to fill in); v1.45 changed WithEndpointURL to pin a path-less URL to "/",
+// which silently pointed `endpoint: http://host:4318`-style configs at the
+// collector root instead of the signal path. Appending here keeps the
+// contract independent of that SDK behaviour. A bare "/" counts as path-less
+// — OTLP serves nothing at the root, so a trailing slash on a host is spelling,
+// not intent. Unparsable input passes through for WithEndpointURL to report,
+// keeping one error path.
+func ensureSignalPath(endpoint, signalPath string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = signalPath
+		return u.String()
+	}
+	return endpoint
 }
 
 func stringOr(s, fallback string) string {
@@ -336,7 +686,7 @@ func stringOr(s, fallback string) string {
 }
 
 // resolveProtocol honours the OpenTelemetry env-var convention when
-// cfg.Protocol is empty: a signal-specific override (e.g.
+// the configured protocol is empty: a signal-specific override (e.g.
 // OTEL_EXPORTER_OTLP_METRICS_PROTOCOL / _LOGS_PROTOCOL) takes
 // precedence over the generic OTEL_EXPORTER_OTLP_PROTOCOL; both fall
 // back to gRPC when unset. Without this fallthrough, a
@@ -356,42 +706,54 @@ func resolveProtocol(configured, signalEnvVar string) string {
 	return protocol
 }
 
-// buildLogExporter mirrors buildMetricExporter for OTLP log records. It
-// reuses the same Endpoint / Insecure / Headers / Protocol knobs as
-// the metric exporter — a single observability block configures both
-// signals against the same collector — but reads the
-// signal-specific OTEL_EXPORTER_OTLP_LOGS_PROTOCOL override before
-// the generic OTEL_EXPORTER_OTLP_PROTOCOL.
-func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) {
-	protocol := resolveProtocol(cfg.Protocol, "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+// buildLogExporter mirrors buildMetricExporter for OTLP log records,
+// consuming the log signal's resolved settings (which may name an entirely
+// different backend than the metric signal's) and reading the
+// signal-specific OTEL_EXPORTER_OTLP_LOGS_PROTOCOL override before the
+// generic OTEL_EXPORTER_OTLP_PROTOCOL.
+func buildLogExporter(ctx context.Context, sig Signal) (sdklog.Exporter, error) {
+	warnInsecureHeaders("logs", sig)
+
+	protocol := resolveProtocol(sig.Protocol, "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
 
 	switch protocol {
 	case "grpc":
 		opts := []otlploggrpc.Option{}
-		if cfg.Endpoint != "" {
-			opts = append(opts, otlploggrpc.WithEndpoint(stripScheme(cfg.Endpoint)))
+		if sig.Endpoint != "" {
+			// Same scheme contract as the metric exporter: http(s) URLs
+			// carry TLS intent via WithEndpointURL, everything else is a
+			// dial target (grpc:// stripped, dns:/// preserved).
+			if hasHTTPScheme(sig.Endpoint) {
+				warnGRPCSchemeDowngrade("logs", sig)
+				opts = append(opts, otlploggrpc.WithEndpointURL(sig.Endpoint))
+			} else {
+				opts = append(opts, otlploggrpc.WithEndpoint(stripScheme(sig.Endpoint)))
+			}
 		}
-		if cfg.Insecure {
+		if sig.Insecure {
 			opts = append(opts, otlploggrpc.WithInsecure())
 		}
-		if len(cfg.Headers) > 0 {
-			opts = append(opts, otlploggrpc.WithHeaders(cfg.Headers))
+		if len(sig.Headers) > 0 {
+			opts = append(opts, otlploggrpc.WithHeaders(sig.Headers))
 		}
 		return otlploggrpc.New(ctx, opts...)
 	case "http/protobuf":
 		opts := []otlploghttp.Option{}
-		if cfg.Endpoint != "" {
-			if strings.Contains(cfg.Endpoint, "://") {
-				opts = append(opts, otlploghttp.WithEndpointURL(cfg.Endpoint))
+		if sig.Endpoint != "" {
+			// Same routing as the metric http branch: hasHTTPScheme →
+			// full URL, anything else a dial target with stray schemes
+			// stripped.
+			if hasHTTPScheme(sig.Endpoint) {
+				opts = append(opts, otlploghttp.WithEndpointURL(ensureSignalPath(sig.Endpoint, "/v1/logs")))
 			} else {
-				opts = append(opts, otlploghttp.WithEndpoint(cfg.Endpoint))
+				opts = append(opts, otlploghttp.WithEndpoint(stripScheme(sig.Endpoint)))
 			}
 		}
-		if cfg.Insecure {
+		if sig.Insecure {
 			opts = append(opts, otlploghttp.WithInsecure())
 		}
-		if len(cfg.Headers) > 0 {
-			opts = append(opts, otlploghttp.WithHeaders(cfg.Headers))
+		if len(sig.Headers) > 0 {
+			opts = append(opts, otlploghttp.WithHeaders(sig.Headers))
 		}
 		return otlploghttp.New(ctx, opts...)
 	default:
@@ -411,11 +773,34 @@ var (
 	vaultCalls      metric.Int64Counter
 	tokenRenewals   metric.Int64Counter
 	tokenTTLSeconds metric.Float64Histogram
+	tokenDenylist   metric.Int64Counter
 	enrolAttempts   metric.Int64Counter
 	webRequests     metric.Int64Counter
 	configReloads   metric.Int64Counter
 	remoteFetches   metric.Int64Counter
 	sighupAttempts  metric.Int64Counter
+	deprecatedUses  metric.Int64Counter
+
+	// SSH forward instruments (internal/sshfwd's managed remotes). See the
+	// Record* helpers below for the attribute contract each one accepts.
+	sshConnections       metric.Int64Gauge
+	sshReconnects        metric.Int64Counter
+	sshConnectFailures   metric.Int64Counter
+	sshKeepaliveFailures metric.Int64Counter
+	sshForwardActive     metric.Int64UpDownCounter
+	sshForwardConnsTotal metric.Int64Counter
+	sshForwardFailures   metric.Int64Counter
+
+	// buildVersion feeds the dotvault.build_info gauge's version attribute.
+	// Set by Init before it rebinds the instruments; empty (a test calling
+	// rebindInstruments directly, or a hand-rolled build) reports as "dev",
+	// matching the resource's service.version fallback.
+	buildVersion string
+	// buildInfoReg is the previous rebind's callback registration.
+	// Unregistered before re-registering so a repeated rebind (Init after
+	// package init, tests swapping providers) doesn't accumulate duplicate
+	// observations of the gauge on the same meter.
+	buildInfoReg metric.Registration
 )
 
 func init() {
@@ -457,6 +842,19 @@ func rebindInstruments() {
 		metric.WithUnit("s"),
 		metric.WithDescription("Vault token TTL remaining at each lifecycle check"),
 	)
+	tokenDenylist, _ = meter.Int64Counter(
+		"dotvault.token.denylist",
+		// The counterpart to dotvault.vault.calls for a token Vault has
+		// already rejected: "denied" is a token entering suppression,
+		// "suppressed" is one lookup-self that was NOT sent because of it,
+		// and "cleared" is the suppression being dropped after something
+		// changed the credential situation (token file rewritten, peer
+		// socket reconnected, SIGHUP). A rising `suppressed` on a flat
+		// `denied` is the fleet-wide measure of the request storm this
+		// replaced. Bounded cardinality — three fixed event names, and
+		// deliberately no token identity of any kind.
+		metric.WithDescription("Denied-token suppression events by event (denied, suppressed, cleared)"),
+	)
 	enrolAttempts, _ = meter.Int64Counter(
 		"dotvault.enrol.attempts",
 		metric.WithDescription("Enrolment attempts by engine and outcome"),
@@ -476,15 +874,98 @@ func rebindInstruments() {
 	sighupAttempts, _ = meter.Int64Counter(
 		"dotvault.sighup.received",
 		// Permanently zero on Windows (SIGHUP isn't delivered to
-		// processes there); on Linux and macOS each SIGHUP forces
-		// the LifecycleManager to re-read ~/.dotvault-token. This counts
-		// only the manual SIGHUP path: on Linux the steady-state
+		// processes there; the tray's "Reload config" entry drives the
+		// same reload and is not metered here); on Linux and macOS each
+		// SIGHUP forces the LifecycleManager to re-read ~/.dotvault-token
+		// and runs an immediate config-refresh pass. This counts only the
+		// manual SIGHUP path: on Linux the steady-state token-re-read
 		// trigger is the in-process inotify watcher (internal/tokenwatch),
 		// whose re-reads are deliberately not metered here, so this
-		// counter undercounts total token re-reads on Linux. Full
-		// config reload still requires a daemon restart.
-		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate dotvault-token file re-read; full config reload still requires a daemon restart."),
+		// counter undercounts total token re-reads on Linux. The
+		// reload's outcome lands on dotvault.config.reloads; static
+		// config sections still require a daemon restart.
+		metric.WithDescription("SIGHUP signals received (Linux/macOS only; SIGHUP is not delivered on Windows). Triggers an immediate dotvault-token file re-read and config reload; static config sections still require a daemon restart."),
 	)
+	deprecatedUses, _ = meter.Int64Counter(
+		"dotvault.config.deprecated",
+		// The fleet-visibility side of a staged config deprecation:
+		// each process start that finds a deprecated field in active use
+		// adds one per field, so a collector-side sum grouped by `field`
+		// shows how much of the fleet still needs migrating before the
+		// removal release can ship. Bounded cardinality — the attribute
+		// values are a fixed set of config paths, never user content.
+		metric.WithDescription("Deprecated configuration fields in active use, counted once per process start, by field"),
+	)
+
+	sshConnections, _ = meter.Int64Gauge(
+		"dotvault.ssh.connections",
+		metric.WithDescription("Managed SSH remote connection state by host: 1 while connected, 0 otherwise"),
+	)
+	sshReconnects, _ = meter.Int64Counter(
+		"dotvault.ssh.reconnect_total",
+		metric.WithDescription("Managed SSH remote reconnect attempts by host, counted once per dropped connection redial"),
+	)
+	sshConnectFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.connect_failure_total",
+		metric.WithDescription("Managed SSH remote connection-attempt failures by host and error class"),
+	)
+	sshKeepaliveFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.keepalive_failure_total",
+		metric.WithDescription("Managed SSH remote keepalive strike-threshold failures by host"),
+	)
+	sshForwardActive, _ = meter.Int64UpDownCounter(
+		"dotvault.ssh.forward_connections_active",
+		metric.WithDescription("Currently active relayed connections on a managed SSH remote's forward, by host"),
+	)
+	sshForwardConnsTotal, _ = meter.Int64Counter(
+		"dotvault.ssh.forward_connections_total",
+		metric.WithDescription("Total relayed connections accepted on a managed SSH remote's forward, by host"),
+	)
+	sshForwardFailures, _ = meter.Int64Counter(
+		"dotvault.ssh.forward_failure_total",
+		metric.WithDescription("Managed SSH remote forward-target dial failures by host (the local API surface could not be reached for an accepted connection)"),
+	)
+
+	// dotvault.build_info follows the Prometheus *_build_info convention: a
+	// constant-1 gauge whose attributes carry the build identity, there to
+	// be joined against — e.g. dotvault.config.deprecated by version tells
+	// a fleet operator whether deprecated-config stragglers are just old
+	// builds. The same identity also rides every series as OTel resource
+	// attributes (service.version, os.type, host.arch, …), but not every
+	// backend surfaces resource/target_info well, and the join idiom
+	// expects a metric. Attributes mirror `dotvault version --json`;
+	// all values are process constants, so cardinality is one series per
+	// build. The previous registration (if any) is dropped first so
+	// repeated rebinds don't observe the gauge twice on one meter.
+	if buildInfoReg != nil {
+		_ = buildInfoReg.Unregister()
+		buildInfoReg = nil
+	}
+	buildInfo, err := meter.Int64ObservableGauge(
+		"dotvault.build_info",
+		metric.WithDescription("Build identity as a constant-1 gauge: version, go_version, os, arch"),
+	)
+	if err == nil {
+		observation := metric.WithAttributes(
+			attribute.String("version", stringOr(buildVersion, "dev")),
+			attribute.String("go_version", runtime.Version()),
+			attribute.String("os", runtime.GOOS),
+			attribute.String("arch", runtime.GOARCH),
+		)
+		buildInfoReg, _ = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+			o.ObserveInt64(buildInfo, 1, observation)
+			return nil
+		}, buildInfo)
+	}
+}
+
+// setBuildVersion stores the release version the dotvault.build_info gauge
+// reports. Called by Init ahead of its rebindInstruments so the callback
+// registered on the real provider carries the injected main.version.
+func setBuildVersion(v string) {
+	instrMu.Lock()
+	buildVersion = v
+	instrMu.Unlock()
 }
 
 // RecordSyncTick increments the sync-tick counter with the outcome
@@ -554,6 +1035,22 @@ func RecordTokenTTL(ctx context.Context, ttl time.Duration) {
 	h.Record(ctx, ttl.Seconds())
 }
 
+// RecordTokenDenylist records a denied-token suppression event. Events emitted
+// today: "denied" (a token Vault rejected entering suppression), "suppressed"
+// (a lookup-self skipped because the token is suppressed), and "cleared" (the
+// suppressions dropped after the credential situation changed). No token
+// material — not even a digest — is attached: the event name is the whole
+// signal, and the point of the cache is to stop being a place tokens live.
+func RecordTokenDenylist(ctx context.Context, event string) {
+	instrMu.RLock()
+	c := tokenDenylist
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("event", event)))
+}
+
 // RecordEnrolAttempt records an enrolment attempt by engine and outcome.
 // Engine values pass through classifyEngine in internal/enrol, so the
 // label is one of {"copy","databricks","github","jfrog","ssh","unknown"}. Outcomes
@@ -616,8 +1113,9 @@ func RecordRemoteConfigFetch(ctx context.Context, outcome string) {
 }
 
 // RecordSIGHUP records a SIGHUP receipt. Each SIGHUP triggers an
-// immediate ~/.dotvault-token re-read via LifecycleManager.Reload;
-// the counter surfaces how often that path fires.
+// immediate ~/.dotvault-token re-read via LifecycleManager.Reload plus
+// an immediate config-refresh pass; the counter surfaces how often that
+// path fires.
 func RecordSIGHUP(ctx context.Context) {
 	instrMu.RLock()
 	c := sighupAttempts
@@ -626,6 +1124,130 @@ func RecordSIGHUP(ctx context.Context) {
 		return
 	}
 	c.Add(ctx, 1)
+}
+
+// RecordDeprecatedConfig records one deprecated configuration field found
+// in active use, by its dotted YAML path (e.g. "observability.endpoint").
+// Called once per field per process start, so a collector-side sum grouped
+// by `field` measures fleet-wide migration progress ahead of the field's
+// removal release. Pass only fixed config paths — never user-supplied
+// values — to keep the attribute cardinality bounded.
+func RecordDeprecatedConfig(ctx context.Context, field string) {
+	instrMu.RLock()
+	c := deprecatedUses
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("field", field)))
+}
+
+// RecordSSHConnState records a managed SSH remote's connected/disconnected
+// state for dotvault.ssh.connections, a synchronous gauge that reports the
+// instantaneous value (1 while connected, 0 otherwise) rather than a running
+// total. Call this only on an actual state transition — entering
+// StateConnected, or leaving it — never once per run-loop retry attempt, or
+// the series reads as flapping for a remote that is simply redialling a
+// still-dead connection.
+func RecordSSHConnState(ctx context.Context, host string, connected bool) {
+	instrMu.RLock()
+	g := sshConnections
+	instrMu.RUnlock()
+	if g == nil {
+		return
+	}
+	v := int64(0)
+	if connected {
+		v = 1
+	}
+	g.Record(ctx, v, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHReconnect increments dotvault.ssh.reconnect_total for host. Call
+// once per completed reconnect — when a previously established connection
+// has been torn down and the remote redials — not for the very first
+// connection attempt.
+func RecordSSHReconnect(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshReconnects
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHConnectFailure increments dotvault.ssh.connect_failure_total,
+// labelled by host and class. class must be one of sshfwd's fixed
+// ErrorClass values (dns, network-unreachable, connection-refused,
+// handshake, authentication, identity, host-key, remote-socket-bind,
+// remote-socket-dir, home-probe, config, other) — pass sshfwd.Classify(err)'s
+// result converted to a string, never an error message or any other free-form
+// text, or the label cardinality is unbounded.
+func RecordSSHConnectFailure(ctx context.Context, host, class string) {
+	instrMu.RLock()
+	c := sshConnectFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("host", host),
+		attribute.String("class", class),
+	))
+}
+
+// RecordSSHKeepaliveFailure increments dotvault.ssh.keepalive_failure_total
+// for host. Call once when Keepalive's consecutive-strike threshold is
+// reached and the connection is being torn down as a result — not once per
+// individual missed keepalive round-trip, and not for an ordinary shutdown
+// (ctx cancellation), which is not a keepalive failure.
+func RecordSSHKeepaliveFailure(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshKeepaliveFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
+}
+
+// RecordSSHForwardConn records one forward connection accepted (delta > 0)
+// or closed (delta < 0) on a managed SSH remote's forward, by host. It
+// updates dotvault.ssh.forward_connections_active — an up-down counter, so
+// the exported series is the running sum of every delta this function has
+// ever recorded for that host, i.e. the current active count — and, for an
+// accepted connection, increments dotvault.ssh.forward_connections_total.
+// Intended as the direct backing for serveListener's per-connection onConn
+// callback, so it is called once per accept and once per close, not on a
+// timer or a loop.
+func RecordSSHForwardConn(ctx context.Context, host string, delta int) {
+	instrMu.RLock()
+	active := sshForwardActive
+	total := sshForwardConnsTotal
+	instrMu.RUnlock()
+	if active != nil {
+		active.Add(ctx, int64(delta), metric.WithAttributes(attribute.String("host", host)))
+	}
+	if delta > 0 && total != nil {
+		total.Add(ctx, int64(delta), metric.WithAttributes(attribute.String("host", host)))
+	}
+}
+
+// RecordSSHForwardFailure increments dotvault.ssh.forward_failure_total,
+// labelled by host (bounded by the user's configured remote list, like every
+// other SSH instrument's host label). Recorded when an accepted forward
+// connection cannot be relayed because the local target dial failed — the
+// forward's own accept loop keeps running, so this is a per-attempt failure
+// count, not a fatal condition.
+func RecordSSHForwardFailure(ctx context.Context, host string) {
+	instrMu.RLock()
+	c := sshForwardFailures
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("host", host)))
 }
 
 // LogRegistryConfigManaged emits a WARN-severity OTel log record
@@ -646,12 +1268,12 @@ func RecordSIGHUP(ctx context.Context) {
 // global lookup per emit is fine and removes that test-only API from
 // the production surface.
 func LogRegistryConfigManaged(ctx context.Context, path string) {
-	l := global.GetLoggerProvider().Logger("github.com/goodtune/dotvault")
+	l := global.GetLoggerProvider().Logger(loggerName)
 	var rec log.Record
 	rec.SetTimestamp(time.Now())
 	rec.SetSeverity(log.SeverityWarn)
 	rec.SetSeverityText("WARN")
-	rec.SetBody(log.StringValue("configuration loaded from Windows Registry (Group Policy); file-based config is ignored"))
-	rec.AddAttributes(log.String("path", path))
+	rec.SetBody(attribute.StringValue("configuration loaded from Windows Registry (Group Policy); file-based config is ignored"))
+	rec.AddAttributes(attribute.String("path", path))
 	l.Emit(ctx, rec)
 }

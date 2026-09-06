@@ -2,12 +2,21 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/goodtune/dotvault/internal/securestore"
 	"github.com/goodtune/dotvault/internal/vault"
 )
+
+// ErrBorrowOnly is returned by Login when BorrowOnly is set and no token
+// could be borrowed from any of TokenSockets: there is no fresh-auth flow to
+// fall back to, by design (see Manager.BorrowOnly). Callers that must succeed
+// eventually rather than fail (the daemon's startup) treat this the same way
+// they already treat a headless host with no interactive facility — idle and
+// retry the borrow — rather than surfacing it as a fatal error.
+var ErrBorrowOnly = errors.New("borrow-only mode: no token could be borrowed from a peer socket, and this host runs no fresh-auth flow of its own")
 
 // hardwareAvailable is the TPM preflight, indirected for testing. It reports
 // nil when the platform hardware backend can be opened, else why it cannot.
@@ -17,10 +26,12 @@ var hardwareAvailable = securestore.HardwareAvailable
 type Manager struct {
 	VaultClient   *vault.Client
 	TokenFilePath string
-	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls", or
-	// "mtls+tpm". A "+tpm" suffix on any base method (e.g. "oidc+tpm") also
-	// requests TPM-sealing of the cached token file at rest; for "mtls+tpm"
-	// that is in addition to the cert key the cert flow already seals.
+	// AuthMethod is the configured method: "oidc", "ldap", "token", "mtls",
+	// "mtls+tpm", or "mtls+os". A "+tpm" suffix on any base method (e.g.
+	// "oidc+tpm") also requests TPM-sealing of the cached token file at rest;
+	// for "mtls+tpm" that is in addition to the cert key the cert flow already
+	// seals. The "mtls+os" modifier instead stores the cert key in the OS-native
+	// certificate store (it does not seal the token).
 	AuthMethod string
 	AuthMount  string // auth mount path
 	AuthRole   string // optional role
@@ -30,12 +41,19 @@ type Manager struct {
 	// 8250 (the `vault` CLI's own default); if that port is unavailable,
 	// authenticateOIDC falls back to a random port. See oidc.go.
 	OIDCCallbackPort int
-	// TokenSocket is an optional path to a peer dotvault's web-API Unix
-	// socket. When set, Login first tries to borrow a live token from the
-	// peer (dotvault-to-dotvault sharing) before running the configured
-	// interactive flow. A missing or stale socket is ignored. See
-	// FetchTokenFromSocket.
-	TokenSocket string
+	// TokenSockets is an ordered list of peer dotvault web-API Unix sockets.
+	// When non-empty, Login first tries to borrow a live token from each in
+	// turn (dotvault-to-dotvault sharing) before running the configured
+	// interactive flow. Missing or stale entries are skipped. Callers build
+	// the list most-stable-first via config.TokenBorrowSockets — the local
+	// API socket ahead of an SSH-forwarded peer. See FetchTokenFromSockets.
+	TokenSockets []string
+	// BorrowOnly, when true, makes Login refuse to run AuthMethod's
+	// fresh-auth flow at all: if the TokenSockets borrow above does not
+	// produce a usable token, Login returns ErrBorrowOnly instead of falling
+	// through to the oidc/ldap/mtls/token dispatch below. Mirrors
+	// config.VaultConfig.BorrowOnly; see its doc comment for the use case.
+	BorrowOnly bool
 	// Policy narrows a freshly-minted login token to a least-privilege child
 	// token (vault.policies / vault.no_default_policy). The zero value applies
 	// no narrowing — the token carries every policy the auth role granted,
@@ -45,13 +63,38 @@ type Manager struct {
 	Policy PolicyConstraint
 	// MTLS is required when the base auth method is "mtls".
 	MTLS *MTLSParams
+	// BootstrapLogin, when non-nil, supplies the transient bootstrap token for
+	// the mTLS certificate bootstrap instead of running the CLI oidc/ldap flow.
+	// It returns a raw Vault token that MUST NOT have been downscoped (the
+	// bootstrap needs pki/sign, which an operational policy set would strip) and
+	// MUST NOT have been adopted onto any shared client.
+	BootstrapLogin func(ctx context.Context) (string, error)
 }
 
 // Authenticate attempts to authenticate with Vault.
 // It first tries to reuse an existing token, then falls back to the configured method.
 func (m *Manager) Authenticate(ctx context.Context) error {
-	// Step 1: Try existing token
-	token := ResolveToken(m.TokenFilePath)
+	// Step 1: Try existing token.
+	//
+	// Under a method that keeps no token at rest (mtls+os) the file is excluded:
+	// anything found there is stale, and ADOPTING it is worse than merely
+	// leaving it — reuse returns before Login, so certLogin never runs and never
+	// removes it. A sync-only host would then use a plaintext token
+	// indefinitely, which is precisely the exposure this method exists to close.
+	// DOTVAULT_TOKEN still applies: it is operator-supplied in the environment,
+	// not something dotvault persisted.
+	//
+	// BorrowOnly overrides that exclusion even when AuthMethod happens to be
+	// the literal "mtls+os": AuthMethod is ignored entirely under BorrowOnly
+	// (see config.VaultConfig.BorrowOnly), so there is no certLogin that
+	// will ever remove the file, and the file reverts to being an ordinary
+	// manual-override candidate — otherwise a one-shot caller (dotvault
+	// sync/--once, which reaches this via the authenticate() helper) would
+	// never see a token dropped there for it.
+	token := ReadTokenEnv()
+	if m.BorrowOnly || PersistTokenAtRest(m.AuthMethod) {
+		token = ResolveToken(m.TokenFilePath)
+	}
 	if token != "" {
 		m.VaultClient.SetToken(token)
 		_, err := m.VaultClient.LookupSelf(ctx)
@@ -80,16 +123,24 @@ func (m *Manager) Login(ctx context.Context) error {
 	// stays the single owner and we re-borrow on the next login rather than
 	// caching a copy that could go stale — and the "+tpm" sealing question
 	// never arises for it.
-	if m.TokenSocket != "" {
-		if token, _ := FetchTokenFromSocket(ctx, m.TokenSocket); token != "" {
-			m.VaultClient.SetToken(token)
-			if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
-				slog.Info("using vault token borrowed from peer socket", "socket", m.TokenSocket)
-				return nil
-			}
-			slog.Warn("token from peer socket is not usable, proceeding to configured auth flow")
-			m.VaultClient.SetToken("")
+	if token, source := FetchTokenFromSockets(ctx, m.TokenSockets); token != "" {
+		m.VaultClient.SetToken(token)
+		if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
+			slog.Info("using vault token borrowed from peer socket", "socket", source)
+			return nil
 		}
+		slog.Warn("token from peer socket is not usable, proceeding to configured auth flow", "socket", source)
+		m.VaultClient.SetToken("")
+	}
+
+	if m.BorrowOnly {
+		// No fresh-auth flow to fall back to, by design: this host is
+		// configured to carry no Vault identity of its own. Named callers
+		// (the daemon's startup) treat this as "not yet, try again" rather
+		// than a hard failure; one-shot commands (dotvault login, a
+		// one-shot sync) surface it as an error, since there is nothing
+		// further for them to wait on.
+		return ErrBorrowOnly
 	}
 
 	base := BaseMethod(m.AuthMethod)

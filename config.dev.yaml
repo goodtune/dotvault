@@ -5,7 +5,8 @@ vault:
   # Least-privilege token policies (per-deployment; no default provided).
   # When set, dotvault exchanges the login token for a child token restricted
   # to exactly these policies. Left unset here so the dev OIDC role's policies
-  # flow through unchanged — the dev Vault doesn't seed a dedicated policy.
+  # flow through unchanged; the stack's `dotvault` policy (docker-compose.yaml)
+  # is already the least-privilege set, so downscoping to it would be a no-op.
   #
   # policies:
   #   - dotvault-sync
@@ -19,16 +20,69 @@ web:
   listen: "127.0.0.1:9000"
 
 # Observability is opt-in. Uncomment and point at a local OTel
-# collector to exercise the metric exporter end-to-end. The Endpoint
-# field accepts a host:port for gRPC (default) or a full URL for
-# http/protobuf.
+# collector to exercise the exporters end-to-end. Each signal is
+# configured in its own block; a full URL is the recommended endpoint
+# form on both protocols — the scheme carries the TLS intent (http://
+# = plaintext, https:// = TLS) and an explicit path is used verbatim.
+# Bare host:port also works, with TLS then governed by `insecure`.
+# Top-level shared endpoint/protocol/insecure/headers still work but
+# are deprecated (startup WARN + dotvault.config.deprecated metric;
+# see issue #140).
 #
 # observability:
 #   enabled: true
-#   endpoint: "127.0.0.1:4317"
-#   protocol: "grpc"
-#   insecure: true
 #   export_interval: "15s"
+#   metrics:
+#     endpoint: "http://127.0.0.1:4317"   # scheme carries TLS intent; full URLs preferred
+#     protocol: "grpc"
+#     # temporality: delta                # cumulative (default) | delta | lowmemory
+#   # Send logs to a different backend, or switch a signal off with
+#   # enabled: false. Per-signal headers REPLACE any shared map (no merging).
+#   # logs:
+#   #   endpoint: "https://logs.vendor.example"
+#   #   protocol: "http/protobuf"
+#   #   headers:
+#   #     X-Api-Key: "logs-key"
+
+# Local API socket. Serves the daemon's web API over a per-user Unix socket
+# (default $XDG_RUNTIME_DIR/dotvault/api.sock, 0600) in addition to the
+# loopback web UI above. Clients on this machine borrow the live Vault token
+# from it — and because the long-lived daemon owns it, that keeps working
+# after the SSH session a client was started in has gone away. Enabled
+# separately from web: a headless host wants the borrow endpoint without
+# standing up a browser UI.
+api:
+  enabled: true
+  unix:
+    # Deliberately NOT the default path. A dev run and an installed daemon
+    # would otherwise contend for $XDG_RUNTIME_DIR/dotvault/api.sock, and the
+    # loser refuses to start (a bind conflict is a real deployment error, so
+    # it is fatal rather than degraded). Same reasoning as the web port above
+    # being 9000 instead of the usual.
+    path: "~/.cache/dotvault/api-dev.sock"
+
+# Filesystem view of the user's secrets. Each secret under
+# kv/users/<you>/ appears as a `.json` file whose contents are its data
+# section, so `jq . <mountpoint>/gh.json` works and editors treat it as JSON.
+#
+# Enabled here so a dev run exercises the surface, but pointed at a dev-only
+# mountpoint rather than the default ~/.dotvault — the same reasoning as the
+# API socket path above: a dev run must not fight an installed daemon for a
+# shared location, and mounting over a developer's real ~/.dotvault would be
+# a surprising side effect of `go run`.
+#
+# Needs a working FUSE stack (Linux: /dev/fuse plus the fusermount3 helper
+# from the fuse3 package; macOS: macFUSE). Without one the daemon logs the
+# reason once and carries on — nothing else is affected.
+fuse:
+  enabled: true
+  mountpoint: "~/.cache/dotvault/mnt-dev"
+  # Read-only by default. Flip to true to exercise the write path: writing
+  # JSON over a file replaces the secret, and `rm` deletes every version.
+  read_write: false
+  # Short so cache behaviour is observable during development; the shipped
+  # default is 30s.
+  cache_ttl: "5s"
 
 # SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
 # domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
@@ -186,9 +240,13 @@ enrolments:
   # this at a real server you can sign into, or comment the block out to skip
   # it in the dev loop. The enrolment stores user_token (the ghpr_ session
   # token) and server_url — the two fields ghp's own dotvault integration reads
-  # back out of Vault.
+  # back out of Vault. Also doubles as the dev loop's demo of help_text.
   ghp:
     engine: ghp
+    help_text: |
+      Mints a **GitHub Proxy** session token via a device-authorization flow.
+      You'll sign in with GitHub in your browser, then dotvault stores the
+      resulting token so it can keep your local config in sync.
     settings:
       url: "https://ghp.example.com"
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the

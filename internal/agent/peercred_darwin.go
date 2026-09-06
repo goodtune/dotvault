@@ -31,3 +31,8 @@ func peerUID(conn net.Conn) (uid uint32, ok bool) {
 	}
 	return cred.Uid, true
 }
+
+// peerCredentialsAvailable reports whether peerUID can actually answer on this
+// platform. It is what lets shared code state the trust model honestly instead
+// of assuming the strongest one everywhere; see warnRelayDetectionTrust.
+const peerCredentialsAvailable = true

@@ -146,17 +146,25 @@ The `https_proxy` value (or its `http_proxy` alias) is optional. When unset, the
 
 ### SSH agent (`Agent\` subkey)
 
-The scalar transport settings live directly under `Agent\`; the ordered key sources are subkeys under `Agent\Keys\{N}` where `{N}` is the zero-based list index:
+The scalar transport settings live directly under `Agent\`; the relay has its own `Agent\Relay\` subkey; the ordered key sources are subkeys under `Agent\Keys\{N}` where `{N}` is the zero-based list index:
 
 ```
 SOFTWARE\Policies\goodtune\dotvault\Agent\Enabled        (REG_DWORD)
 SOFTWARE\Policies\goodtune\dotvault\Agent\UnixPath       (REG_SZ)
 SOFTWARE\Policies\goodtune\dotvault\Agent\WindowsPipe    (REG_SZ)
+SOFTWARE\Policies\goodtune\dotvault\Agent\WindowsPutty   (REG_DWORD)
+SOFTWARE\Policies\goodtune\dotvault\Agent\Relay\Enabled  (REG_DWORD)
+SOFTWARE\Policies\goodtune\dotvault\Agent\Relay\Socket   (REG_SZ)
+SOFTWARE\Policies\goodtune\dotvault\Agent\Relay\Pipe     (REG_SZ)
 SOFTWARE\Policies\goodtune\dotvault\Agent\Keys\0\Source      (REG_SZ)        "vault-ca"
 SOFTWARE\Policies\goodtune\dotvault\Agent\Keys\0\Mount       (REG_SZ)        "ssh-client-signer"
 SOFTWARE\Policies\goodtune\dotvault\Agent\Keys\0\Role        (REG_SZ)        "dotvault-user"
 SOFTWARE\Policies\goodtune\dotvault\Agent\Keys\0\Principals  (REG_MULTI_SZ)
 ```
+
+`Agent\Relay\Enabled` and `Agent\WindowsPutty` are both **tri-state**: absent means "the policy expresses no preference", which is not the same as `0`, because both default to on. Leave the value out to accept the default; write `0` only to turn the feature off.
+
+That distinction matters most for `Agent\Relay\Enabled`, because it is the **only** control that stops dotvault proxying to the SSH agents the user already runs — and on Windows that is the one place the guarantee is weakest, since a named pipe carries no owner a caller can check. See the [SSH agent guide](../guide/ssh-agent.md#the-ssh-agent-relay) for what that does and does not mean; pinning `Agent\Relay\Pipe` narrows *which* pipe is dialled but establishes nothing about who is listening on it, so it is not a substitute. Because it is an off-switch, its DWORD is read strictly: a value of the wrong type fails the configuration load and names itself, rather than being read as absent and quietly leaving the relay on.
 
 Authoring these by hand is fiddly; prefer `reg-import` from a YAML config.
 

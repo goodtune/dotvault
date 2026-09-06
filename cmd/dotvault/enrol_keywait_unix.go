@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -31,11 +32,32 @@ import (
 // because POLLIN never fires on a closed-empty pipe.
 func waitForMoreInput(fd uintptr, timeout time.Duration) bool {
 	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	n, err := unix.Poll(pfd, int(timeout/time.Millisecond))
-	if err != nil || n <= 0 {
-		return false
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		n, err := unix.Poll(pfd, int(remaining/time.Millisecond))
+		if errors.Is(err, unix.EINTR) {
+			// A signal interrupted the wait, which says nothing about
+			// whether input arrived — retry for what is left of the budget.
+			// This is not a rare case to wave away: the Go runtime delivers
+			// SIGURG to preempt goroutines, so on a busy process poll is
+			// interrupted routinely. Reporting that as "no input" made
+			// drainEscapeTail give up part-way through an arrow key's escape
+			// sequence, so the keystroke was silently dropped (a 2-byte
+			// prefix classifies as keyNone) or, worse, taken as quit (a lone
+			// ESC classifies as keyQuit) — the picker exiting on an arrow
+			// press. It surfaced as a CI flake in the split-escape tests, but
+			// the user-visible bug is on a real terminal.
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0
 	}
-	return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0
 }
 
 // blockUntilInput waits until fd has input ready to read or ctx is

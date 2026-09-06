@@ -28,8 +28,9 @@ func TestNewSourcesUpstreamAgentAutoDetects(t *testing.T) {
 		Enabled: true,
 		Keys: []config.AgentKeySource{
 			{Source: "kv", PathPrefix: "ssh/"},
-			{Source: "agent"}, // empty socket -> auto-detect
 		},
+		// No relay settings at all: the relay is implicit and on by default,
+		// and lands after the configured sources.
 	}
 	sources, err := NewSourcesFromConfig(cfg, vc, "kv", "users/", "me")
 	if err != nil {
@@ -71,7 +72,7 @@ func TestNewSourcesUpstreamAgentExplicitSocketPinsIt(t *testing.T) {
 	vc := testVaultClient(t)
 	cfg := config.AgentConfig{
 		Enabled: true,
-		Keys:    []config.AgentKeySource{{Source: "agent", Socket: explicit}},
+		Relay:   config.AgentRelayConfig{Socket: explicit},
 	}
 	sources, err := NewSourcesFromConfig(cfg, vc, "kv", "users/", "me")
 	if err != nil {

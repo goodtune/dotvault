@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -70,18 +71,25 @@ func NewSourcesFromConfig(agentCfg config.AgentConfig, vc *vault.Client, kvMount
 				return nil, fmt.Errorf("agent.keys[%d]: %w", i, err)
 			}
 			sources = append(sources, src)
-		case "agent":
-			sources = append(sources, newUpstreamSourceFromConfig(i, k, username, uid, self))
 		default:
 			sources = append(sources, newErrSource(fmt.Sprintf("keys[%d]", i), k.Source, fmt.Errorf("unknown source %q", k.Source)))
 		}
 	}
+	// The relay goes last, always, and is not one of the keys[] entries. Last
+	// because dotvault's own identities should be offered first — an ssh client
+	// works down the list against the server's MaxAuthTries budget, so the keys
+	// this daemon is responsible for get the first attempts and the shadowed
+	// agents fill in behind them. Appended here rather than configured because
+	// it is on by default; see config.AgentRelayConfig.Enabled.
+	if agentCfg.RelayEnabled() {
+		sources = append(sources, newRelaySource(agentCfg, username, uid, self))
+	}
 	return sources, nil
 }
 
-// newUpstreamSourceFromConfig builds an `agent` source in one of two modes.
+// newRelaySource builds the implicit upstream-agent relay in one of two modes.
 //
-// With no socket/pipe configured it auto-detects: the source re-scans the
+// With no relay.socket/relay.pipe configured it auto-detects: it re-scans the
 // platform's well-known agent locations on every listing and proxies to
 // whatever this user is actually running. That is the mode the feature exists
 // for — a client pointed at dotvault's endpoint once, permanently, finds the
@@ -89,47 +97,86 @@ func NewSourcesFromConfig(agentCfg config.AgentConfig, vc *vault.Client, kvMount
 // keeps finding them when a keyring daemon or a forwarded socket comes and
 // goes mid-session.
 //
-// With an explicit socket/pipe it proxies to exactly that endpoint (still
-// expanding {{.username}}/{{.uid}}), which is the escape hatch for an agent at
-// a path discovery does not know. A resolution problem there becomes an
-// errSource so it surfaces in status without aborting the daemon — the other
-// sources stay live.
+// With an explicit endpoint it proxies to exactly that one (still expanding
+// {{.username}}/{{.uid}}). That is the escape hatch for an agent at a path
+// detection does not know. It is not a security control and must not be sold
+// as one: pinning names which endpoint is dialled, never who answers, and on
+// Unix it actively gives up the peer-ownership check auto-detection performs —
+// hence the warning. A resolution problem becomes an errSource so it surfaces
+// in status without aborting the daemon; the configured key sources stay live.
 //
-// Both modes are guarded against pointing back at any endpoint this daemon
-// serves the agent on, which would loop List/Sign into itself forever. The
-// explicit mode compares paths here; the auto mode hands the same endpoint
-// list to discovery, which additionally asks each candidate over the wire
-// whether it is us (see IDExtension) — necessary because SSH_AUTH_SOCK
-// commonly *is* dotvault by then, reachable by a path that never string-equals
-// the one we bound.
-func newUpstreamSourceFromConfig(i int, k config.AgentKeySource, username, uid string, selfEndpoints []string) Source {
-	const name = "agent"
-	if !upstreamEndpointConfigured(k) {
+// Both modes are guarded against pointing back at an endpoint this daemon
+// serves, which would loop List/Sign into itself forever. The explicit mode
+// compares paths here; the auto mode hands the same endpoint list to
+// discovery, which additionally asks each candidate over the wire whether it
+// is us (see IDExtension) — necessary because SSH_AUTH_SOCK commonly *is*
+// dotvault by then, reachable by a path that never string-equals the one we
+// bound.
+func newRelaySource(agentCfg config.AgentConfig, username, uid string, selfEndpoints []string) Source {
+	const name = "relay"
+	if !relayEndpointConfigured(agentCfg) {
+		warnRelayDetectionTrust()
 		return newAutoUpstreamSource(name+":auto", selfEndpoints)
 	}
-	endpoint, err := resolveUpstreamEndpoint(k, username, uid)
+	endpoint, err := resolveRelayEndpoint(agentCfg, username, uid)
 	if err != nil {
-		return newErrSource(name, "agent", fmt.Errorf("agent.keys[%d]: %w", i, err))
+		return newErrSource(name, "agent", err)
 	}
 	norm := normalizeEndpoint(endpoint)
 	for _, self := range selfEndpoints {
 		if normalizeEndpoint(self) == norm {
-			return newErrSource(name, "agent", fmt.Errorf("agent.keys[%d]: upstream endpoint %q is dotvault's own agent endpoint (would loop)", i, endpoint))
+			return newErrSource(name, "agent", fmt.Errorf("agent.relay.socket/relay.pipe %q is dotvault's own agent endpoint (would loop)", endpoint))
 		}
 	}
+	// Say out loud what pinning costs. Auto-detection asks the kernel who is
+	// on the other end of each connection and drops anything not owned by this
+	// uid (peerUID, upstreamSource.connect); a named endpoint deliberately
+	// skips that, because the operator may well mean an agent running as
+	// another account. That is a legitimate choice and a quiet one, and
+	// `ssh-add` through dotvault forwards a private key to whatever answers
+	// here — so it is stated at startup rather than left in the docs.
+	slog.Warn("ssh agent: relay pinned to a configured endpoint; the peer-ownership check auto-detection performs is skipped for it",
+		"endpoint", endpoint)
 	return newUpstreamSource(name+":"+endpoint, endpoint)
 }
 
-// upstreamEndpointConfigured reports whether the operator named an explicit
-// endpoint for this platform. Only the field this platform uses counts: a
-// config carrying both `socket` and `pipe` (the portable case — one YAML
-// deployed to a mixed fleet) must auto-detect on neither, and a config
-// carrying only the other platform's field must auto-detect on this one.
-func upstreamEndpointConfigured(k config.AgentKeySource) bool {
-	if runtime.GOOS == "windows" {
-		return strings.TrimSpace(k.Pipe) != ""
+// warnRelayDetectionTrust says, once per daemon, what auto-detection can and
+// cannot verify on this platform.
+//
+// It is a no-op where peer credentials are available (Linux, macOS): there the
+// kernel answers "is this endpoint mine" on the connection itself and there is
+// nothing to caveat. Everywhere else — Windows above all, where peerUID has no
+// implementation at all — detection rests on the endpoint's *name*, and the
+// two well-known Windows agent pipes are not tamper-proof names: the namespace
+// is first-creator-wins, and the Pageant name's per-boot hash comes from
+// CryptProtectMemory(CROSS_PROCESS), which any process on the machine can
+// reverse.
+//
+// The relay is on by default, and forwarding a client's `ssh-add` to a squatted
+// pipe deposits a private key there. That exposure is the one ssh.exe and every
+// PuTTY client already carry when they dial these same names, so dotvault is
+// inheriting it rather than widening it — but it is now inherited by default
+// instead of on request, which is precisely why it gets said rather than
+// documented. relay.enabled: false is the control.
+func warnRelayDetectionTrust() {
+	if peerCredentialsAvailable {
+		return
 	}
-	return strings.TrimSpace(k.Socket) != ""
+	slog.Warn("ssh agent: relaying to auto-detected agents on a platform with no peer-credential check; endpoints are trusted by name, which is not tamper-proof (set agent.relay.enabled: false to turn the relay off)",
+		"os", runtime.GOOS)
+}
+
+// relayEndpointConfigured reports whether the operator pinned the relay to an
+// explicit endpoint for this platform. Only the field this platform uses
+// counts: a config carrying both relay.socket and relay.pipe (the portable
+// case — one YAML deployed to a mixed fleet) must auto-detect on neither, and
+// a config carrying only the other platform's field must auto-detect on this
+// one.
+func relayEndpointConfigured(a config.AgentConfig) bool {
+	if runtime.GOOS == "windows" {
+		return strings.TrimSpace(a.Relay.Pipe) != ""
+	}
+	return strings.TrimSpace(a.Relay.Socket) != ""
 }
 
 // normalizeEndpoint canonicalises an endpoint for the self-reference
@@ -146,16 +193,16 @@ func normalizeEndpoint(s string) string {
 	return filepath.Clean(s)
 }
 
-// resolveUpstreamEndpoint expands an explicitly configured `agent` endpoint:
+// resolveRelayEndpoint expands an explicitly pinned relay endpoint:
 // {{.username}} / {{.uid}} templating, plus ~ expansion for a Unix socket
-// path. It is only reached when the operator named one — an unset socket/pipe
-// auto-detects instead of falling back to a platform default, which is what
-// retired the old "$XDG_RUNTIME_DIR is unset on macOS, so configure it
-// yourself" dead end.
-func resolveUpstreamEndpoint(k config.AgentKeySource, username, uid string) (string, error) {
-	raw := k.Socket
+// path. It is only reached when the operator named one — an unset
+// relay.socket/relay.pipe auto-detects instead of falling back to a platform
+// default, which is what retired the old "$XDG_RUNTIME_DIR is unset on macOS,
+// so configure it yourself" dead end.
+func resolveRelayEndpoint(a config.AgentConfig, username, uid string) (string, error) {
+	raw := a.Relay.Socket
 	if runtime.GOOS == "windows" {
-		raw = k.Pipe
+		raw = a.Relay.Pipe
 	}
 	endpoint, err := renderEndpointTemplate(raw, username, uid)
 	if err != nil {
@@ -165,11 +212,11 @@ func resolveUpstreamEndpoint(k config.AgentKeySource, username, uid string) (str
 	// "{{.uid}}" when the UID lookup failed) rather than letting it become an
 	// empty dial target with a confusing downstream error.
 	if strings.TrimSpace(endpoint) == "" {
-		return "", fmt.Errorf("upstream agent endpoint resolved to empty; check the socket/pipe value and its {{.username}}/{{.uid}} template")
+		return "", fmt.Errorf("agent.relay.socket/relay.pipe resolved to empty; check the value and its {{.username}}/{{.uid}} template")
 	}
 	if runtime.GOOS != "windows" {
 		if expanded, err := paths.ExpandHome(endpoint); err != nil {
-			return "", fmt.Errorf("expand upstream agent socket %q: %w", endpoint, err)
+			return "", fmt.Errorf("expand agent.relay.socket %q: %w", endpoint, err)
 		} else {
 			endpoint = expanded
 		}

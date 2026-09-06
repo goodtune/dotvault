@@ -34,8 +34,9 @@ func TestNewSourcesFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSourcesFromConfig: %v", err)
 	}
-	if len(sources) != 3 {
-		t.Fatalf("want 3 sources, got %d", len(sources))
+	// Three configured entries plus the implicit relay.
+	if len(sources) != 4 {
+		t.Fatalf("want 4 sources (3 configured + the implicit relay), got %d", len(sources))
 	}
 	if sources[0].Type() != "kv" {
 		t.Errorf("source[0] type = %q, want kv", sources[0].Type())
@@ -47,18 +48,59 @@ func TestNewSourcesFromConfig(t *testing.T) {
 	if _, err := sources[2].Identities(context.Background()); err == nil {
 		t.Errorf("unknown source should report an error from Identities")
 	}
+	// The relay is last, and it is last on purpose: an ssh client works down
+	// the advertised list against the server's MaxAuthTries budget, so
+	// dotvault's own identities get the first attempts.
+	if got := sources[len(sources)-1].Type(); got != "agent" {
+		t.Errorf("last source type = %q, want agent (the relay is always appended last)", got)
+	}
+}
+
+// TestRelayIsImplicitAndOptOut covers the two halves of the relay's contract at
+// the factory: it appears with no configuration at all, and `relay.enabled: false` is
+// the one way to be rid of it.
+func TestRelayIsImplicitAndOptOut(t *testing.T) {
+	vc := testVaultClient(t)
+
+	// Nothing configured whatsoever: the relay is still there.
+	sources, err := NewSourcesFromConfig(config.AgentConfig{Enabled: true}, vc, "kv", "users/", "me")
+	if err != nil {
+		t.Fatalf("NewSourcesFromConfig: %v", err)
+	}
+	if len(sources) != 1 || sources[0].Type() != "agent" {
+		t.Fatalf("an agent with no keys[] should get exactly the implicit relay, got %d sources", len(sources))
+	}
+
+	// Opted out: no relay, and the configured sources are untouched.
+	off := false
+	sources, err = NewSourcesFromConfig(config.AgentConfig{
+		Enabled: true,
+		Relay:   config.AgentRelayConfig{Enabled: &off},
+		Keys:    []config.AgentKeySource{{Source: "kv", PathPrefix: "ssh/"}},
+	}, vc, "kv", "users/", "me")
+	if err != nil {
+		t.Fatalf("NewSourcesFromConfig: %v", err)
+	}
+	if len(sources) != 1 || sources[0].Type() != "kv" {
+		t.Fatalf("relay:false should leave only the kv source, got %d sources", len(sources))
+	}
+	for _, src := range sources {
+		if src.Type() == "agent" {
+			t.Error("relay:false still produced a relay source")
+		}
+	}
 }
 
 func TestResolveUpstreamEndpointTemplate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket resolution")
 	}
-	got, err := resolveUpstreamEndpoint(
-		config.AgentKeySource{Source: "agent", Socket: "/run/user/{{.uid}}/agent.{{.username}}"},
+	got, err := resolveRelayEndpoint(
+		config.AgentConfig{Enabled: true, Relay: config.AgentRelayConfig{Socket: "/run/user/{{.uid}}/agent.{{.username}}"}},
 		"alice", "1000",
 	)
 	if err != nil {
-		t.Fatalf("resolveUpstreamEndpoint: %v", err)
+		t.Fatalf("resolveRelayEndpoint: %v", err)
 	}
 	if want := "/run/user/1000/agent.alice"; got != want {
 		t.Errorf("endpoint = %q, want %q", got, want)
@@ -71,8 +113,8 @@ func TestResolveUpstreamEndpointUnknownVariable(t *testing.T) {
 	}
 	// A mis-typed variable ({{.user}} instead of {{.username}}) must fail at
 	// resolution, not silently render "<no value>" into the path.
-	_, err := resolveUpstreamEndpoint(
-		config.AgentKeySource{Source: "agent", Socket: "/run/{{.user}}/agent.sock"},
+	_, err := resolveRelayEndpoint(
+		config.AgentConfig{Enabled: true, Relay: config.AgentRelayConfig{Socket: "/run/{{.user}}/agent.sock"}},
 		"alice", "1000",
 	)
 	if err == nil {
@@ -86,8 +128,8 @@ func TestResolveUpstreamEndpointEmptyRejected(t *testing.T) {
 	}
 	// A socket that renders to empty (a bare {{.uid}} when the UID lookup
 	// failed) must be rejected here rather than becoming an empty dial target.
-	_, err := resolveUpstreamEndpoint(
-		config.AgentKeySource{Source: "agent", Socket: "{{.uid}}"},
+	_, err := resolveRelayEndpoint(
+		config.AgentConfig{Enabled: true, Relay: config.AgentRelayConfig{Socket: "{{.uid}}"}},
 		"alice", "",
 	)
 	if err == nil {
@@ -104,9 +146,8 @@ func TestNewSourcesUpstreamSelfReferenceGuard(t *testing.T) {
 	cfg := config.AgentConfig{
 		Enabled: true,
 		Unix:    config.AgentUnixConfig{Path: self},
-		Keys: []config.AgentKeySource{
-			{Source: "agent", Socket: self}, // points back at dotvault's own socket
-		},
+		// points back at dotvault's own socket
+		Relay: config.AgentRelayConfig{Socket: self},
 	}
 	sources, err := NewSourcesFromConfig(cfg, vc, "kv", "users/", "me")
 	if err != nil {
@@ -130,11 +171,9 @@ func TestNewSourcesUpstreamSelfReferenceNormalized(t *testing.T) {
 	cfg := config.AgentConfig{
 		Enabled: true,
 		Unix:    config.AgentUnixConfig{Path: self},
-		Keys: []config.AgentKeySource{
-			// A non-clean path that normalizes to dotvault's own socket must
-			// still trip the loop guard.
-			{Source: "agent", Socket: "/tmp/./dotvault-self.sock"},
-		},
+		// A non-clean path that normalizes to dotvault's own socket must
+		// still trip the loop guard.
+		Relay: config.AgentRelayConfig{Socket: "/tmp/./dotvault-self.sock"},
 	}
 	sources, err := NewSourcesFromConfig(cfg, vc, "kv", "users/", "me")
 	if err != nil {

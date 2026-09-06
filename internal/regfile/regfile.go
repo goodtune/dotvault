@@ -309,12 +309,19 @@ func (e *emitter) writeRemoteConfig(r config.RemoteConfig) {
 }
 
 // writeAgent emits the Agent section: the scalar Enabled / Unix / Windows
-// transport settings, plus an ordered Keys subtree. The keys list is
-// dynamically sized, so — like Rules and Enrolments — the Keys subtree is
-// deleted before re-creation so a key removed from YAML doesn't linger in the
-// registry on re-import. List order is preserved by naming each key subkey
-// after its zero-based index (`Keys\0`, `Keys\1`, …); the parser sorts those
-// names numerically to rebuild the slice.
+// transport settings, the Relay block, and an ordered Keys subtree.
+//
+// Two subtrees are deleted before re-creation, for the same reason reached by
+// different routes. Keys is dynamically sized, so — like Rules and Enrolments
+// — a key removed from YAML would otherwise linger in the registry on
+// re-import; list order is preserved by naming each key subkey after its
+// zero-based index (`Keys\0`, `Keys\1`, …), which the parser sorts
+// numerically to rebuild the slice. Relay is fixed-shape but holds a
+// tri-state: `Enabled` is written only when the operator expressed a
+// preference, so without the pre-deletion, dropping `relay.enabled: false`
+// from YAML would re-import a document that leaves the old `Enabled=0` in
+// place — the registry keeping the relay off while the config no longer says
+// so, which is exactly the divergence a lossless round trip must not produce.
 func (e *emitter) writeAgent(a config.AgentConfig) {
 	e.writeKey(rootKey + `\Agent`)
 	e.writeBool("Enabled", a.Enabled)
@@ -326,6 +333,22 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 	if a.Windows.Putty != nil {
 		e.writeBool("WindowsPutty", *a.Windows.Putty)
 	}
+	e.WriteString("\r\n")
+
+	// The relay block gets its own subkey, matching the YAML nesting.
+	// Pre-deleted so a dropped `relay.enabled` preference clears rather than
+	// surviving as a stale DWORD; see the doc comment above.
+	e.writeKeyDeletion(rootKey + `\Agent\Relay`)
+	e.writeKey(rootKey + `\Agent\Relay`)
+	// Enabled is tri-state (default true) for the same reason as WindowsPutty:
+	// emitting it unconditionally would pin an unset field to whatever the
+	// export happened to observe, so an operator who never expressed a
+	// preference would come back from a round-trip having expressed one.
+	if a.Relay.Enabled != nil {
+		e.writeBool("Enabled", *a.Relay.Enabled)
+	}
+	e.writeString("Socket", a.Relay.Socket)
+	e.writeString("Pipe", a.Relay.Pipe)
 	e.WriteString("\r\n")
 
 	// Always pre-delete the Keys subtree so removals round-trip. This is a
@@ -342,9 +365,12 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 }
 
 // writeAPI emits the API section (the local API socket). Flat scalars under
-// one key, matching the Agent section's transport treatment: the YAML nests
-// the path under `unix:` so a future `windows:` block has somewhere to go,
-// but the registry has no reason to mirror that nesting for a single value.
+// one key: the YAML nests the path under `unix:` so a future `windows:` block
+// has somewhere to go, but a lone value is not worth a subkey. The Agent
+// section's transports are flat for the same reason, while its Relay block
+// does get one — the dividing line is whether the YAML block groups several
+// related settings an administrator thinks of as one thing, not whether the
+// YAML happens to nest.
 func (e *emitter) writeAPI(a config.APIConfig) {
 	e.writeKey(rootKey + `\API`)
 	e.writeBool("Enabled", a.Enabled)
@@ -403,8 +429,6 @@ func (e *emitter) writeAgentKey(index int, k config.AgentKeySource) {
 	e.writeString("Mount", k.Mount)
 	e.writeString("Role", k.Role)
 	e.writeString("TTL", k.TTL)
-	e.writeString("Socket", k.Socket)
-	e.writeString("Pipe", k.Pipe)
 	e.writeBool("EphemeralKey", k.EphemeralKey)
 	// Emit Principals whenever non-nil so an explicit empty list round-trips
 	// as an empty REG_MULTI_SZ rather than being silently dropped, matching

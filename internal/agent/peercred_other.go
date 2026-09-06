@@ -15,3 +15,9 @@ import "net"
 // candidateEndpoints in discover_windows.go for what Windows relies on
 // instead, and docs/guide/ssh-agent.md for the residual risk.
 func peerUID(net.Conn) (uid uint32, ok bool) { return 0, false }
+
+// peerCredentialsAvailable is false here for the same reason peerUID cannot
+// answer: there is no peer-credential mechanism to consult. Shared code reads
+// it to say so out loud rather than implying a check that never ran; see
+// warnRelayDetectionTrust.
+const peerCredentialsAvailable = false

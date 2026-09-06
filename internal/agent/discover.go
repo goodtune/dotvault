@@ -32,12 +32,30 @@ const discoveryProbeTimeout = 2 * time.Second
 // candidate is dotvault itself, and delegating to it would recurse until the
 // listener ran out of connections.
 //
-// Candidates that do not exist, are not sockets, or are not owned by this uid
-// are dropped by the platform layer (candidateEndpoints), so a world-writable
-// /tmp cannot inject an agent into the fan-out. That ownership check is the
-// security boundary here, and it matters more than it would for a read-only
-// proxy: mutations are forwarded too, so an attacker-controlled endpoint that
-// slipped in would receive private keys from a client's `ssh-add`.
+// What the platform layer (candidateEndpoints) filters out before a candidate
+// gets here differs by platform, and this is a security boundary, so be exact
+// rather than reassuring. It matters more than it would for a read-only proxy:
+// mutations are forwarded too, so an attacker-controlled endpoint that slipped
+// in would receive private keys from a client's `ssh-add`.
+//
+//   - Linux and macOS: candidates that do not exist, are not sockets, or whose
+//     owner is not this uid are dropped, and ownership is then re-checked on
+//     the connection itself (peerUID) — here in probeCandidate, and again in
+//     upstreamSource.connect on every connection actually used, so the
+//     guarantee holds for the dials that carry key material and not only for
+//     the one that discovered the endpoint. A world-writable /tmp therefore
+//     cannot inject an agent into the fan-out, and neither can a symlink
+//     re-pointed between the path check and the dial.
+//   - Windows: neither check exists. A named pipe has no owner a caller can
+//     read without opening it, and peerUID has no implementation, so
+//     candidates are a short fixed list of well-known names and the filter is
+//     only "does this pipe currently exist". Those names are not tamper-proof;
+//     see candidateEndpoints in discover_windows.go for the full statement of
+//     what that leaves, and warnRelayDetectionTrust for the warning the daemon
+//     logs because of it.
+//   - Other platforms (the BSDs, illumos): the path-level owner and socket
+//     check applies, but peerUID fails open, so ownership is established only
+//     as of the moment of the check.
 func discoverUpstreamEndpoints(ctx context.Context, exclude []string, dial dialFunc) []string {
 	excluded := make(map[string]bool, len(exclude))
 	for _, e := range exclude {

@@ -87,6 +87,13 @@ func TestQueryListeningRoundTrip(t *testing.T) {
 			if id.ExpiresAt == "" || id.TTLSeconds <= 0 {
 				t.Errorf("cert identity missing live expiry/ttl: %+v", id)
 			}
+			// The comment survives the round trip through the agent
+			// protocol verbatim, so this pins the exact string a user
+			// sees in `ssh-add -l` / `dotvault status` — source name
+			// plus the user the certificate was minted for.
+			if want := "vault-ca:dotvault-user - by dotvault for alice"; id.Comment != want {
+				t.Errorf("cert comment = %q, want %q", id.Comment, want)
+			}
 		}
 		if id.Fingerprint == "" {
 			t.Errorf("identity missing fingerprint: %+v", id)

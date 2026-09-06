@@ -119,6 +119,14 @@ from Vault at signing time. Certificates are cached until shortly before expiry
 and transparently re-minted on the next request — including over a forwarded
 agent connection, so long-lived forwarded session chains keep working.
 
+The `ssh-add -l` comment for a vault-ca identity is `vault-ca:<role> - by
+dotvault for <user>`, naming both the configured role and the local OS user
+the daemon runs as — the same value `{{.vault_username}}` expands to. That is
+handy when comparing identities across more than one user's agent (e.g. a
+forwarded connection, or a shared host running multiple per-user daemons).
+Note the comment can contain spaces, since a Windows local account name can,
+so don't split `ssh-add -l` output on whitespace to recover it.
+
 ### The SSH agent relay
 
 The relay puts dotvault **in front of** the SSH agents you already run and
@@ -420,7 +428,7 @@ $ dotvault status
 SSH Agent:
   endpoint: /run/user/1000/dotvault/agent.sock
   SHA256:… users/alice/ssh/laptop
-  SHA256:… dotvault-user (cert, expires 2026-05-30T12:15:00Z)
+  SHA256:… vault-ca:dotvault-user - by dotvault for alice (cert, expires 2026-05-30T12:15:00Z)
 ```
 
 Because the agent is only relevant when configured, `dotvault status` consults

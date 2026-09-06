@@ -59,15 +59,22 @@ func candidateEndpoints() []string {
 	out := make([]string, 0, len(raw))
 	seen := make(map[string]bool, len(raw))
 	for _, p := range raw {
-		key := strings.ToLower(p)
-		if seen[key] {
+		// Canonicalise before both the dedupe and the emit. The leaf is the
+		// pipe's actual identity: \\.\pipe\x, //./pipe/x and a bare "x" all
+		// name one pipe, so deduplicating on the raw string let equivalent
+		// spellings through as separate endpoints — and emitting the raw
+		// string could hand dialEndpoint a bare leaf name it cannot open,
+		// which is reachable because $SSH_AUTH_SOCK is whatever the
+		// environment says it is.
+		leaf := pipeLeafName(p)
+		if leaf == "" || seen[leaf] {
 			continue
 		}
-		if enumerated && !existing[pipeLeafName(p)] {
+		if enumerated && !existing[leaf] {
 			continue
 		}
-		seen[key] = true
-		out = append(out, p)
+		seen[leaf] = true
+		out = append(out, pipePrefix+leaf)
 	}
 	return out
 }

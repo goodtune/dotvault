@@ -499,3 +499,54 @@ func TestBackendNoTokenNoUpstreamStillFailsFast(t *testing.T) {
 		t.Errorf("List = (%d keys, %v), want (0, nil)", len(keys), err)
 	}
 }
+
+// TestSignReportsNoTokenForVaultKeyServedFromCache covers the seam between the
+// List cache and the narrowed source set. List deliberately serves a still-fresh
+// cache without consulting the token, so a client can choose a Vault-backed key
+// from that listing and reach Sign in a window where the token has gone. The
+// upstream proxy cannot own that key, and answering ErrKeyNotFound would tell
+// the client the key no longer exists — a claim this call has not earned, since
+// the source that owns it was never asked. It must report the real cause so the
+// client can wait rather than move on to its next authentication method.
+func TestSignReportsNoTokenForVaultKeyServedFromCache(t *testing.T) {
+	priv, _ := genUpstreamKey(t)
+	sock := filepath.Join(t.TempDir(), "upstream.sock")
+	serveUpstreamAgentAt(t, sock, priv)
+
+	_, _, vaultPub, vaultSigner := genEd25519(t, "vault-backed")
+	hasToken := true
+	b := NewBackend([]Source{
+		&fakeSource{name: "kv", ids: []Identity{{PubKey: vaultPub}}, signer: vaultSigner},
+		newUpstreamSource("agent", sock),
+	}, WithTokenProbe(func() bool { return hasToken }))
+
+	// Warm the cache while the token is present, so the Vault-backed key is
+	// genuinely being advertised.
+	keys, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, k := range keys {
+		if keyEqual(k, vaultPub) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("fixture: the Vault-backed key should be advertised while a token is held")
+	}
+
+	// The token goes away mid-session; the cached listing still advertises it.
+	hasToken = false
+	if _, err := b.Sign(vaultPub, []byte("challenge")); !errors.Is(err, ErrNoToken) {
+		t.Errorf("Sign = %v, want ErrNoToken (not ErrKeyNotFound)", err)
+	}
+
+	// A key genuinely owned by nobody, with every source consultable, still
+	// reports key-not-found — the narrowing must not swallow that distinction.
+	hasToken = true
+	_, _, strangerPub, _ := genEd25519(t, "stranger")
+	if _, err := b.Sign(strangerPub, []byte("challenge")); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Sign(unknown key) = %v, want ErrKeyNotFound", err)
+	}
+}

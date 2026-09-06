@@ -450,7 +450,7 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 	// still waits it out — and a config with only Vault-backed sources still
 	// gets ErrNoToken immediately rather than stalling, because the narrowed
 	// set is then empty.
-	sources, _ := b.usableSources()
+	sources, reduced := b.usableSources()
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("ssh agent: %w", ErrNoToken)
 	}
@@ -472,6 +472,17 @@ func (b *Backend) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sign
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("ssh agent: %w", errors.Join(errs...))
+	}
+	if reduced {
+		// Nothing matched, but the token-dependent sources were never asked —
+		// so "no matching key" would be a claim this call has not earned. The
+		// case is reachable and not rare: List serves a still-fresh cache
+		// without consulting the token (deliberately, since web mode clears it
+		// on the re-auth transition), so a client can pick a Vault-backed key
+		// out of that listing and arrive here while the token is briefly gone.
+		// Reporting the real cause is what lets it wait and retry instead of
+		// concluding the key is gone and moving to its next auth method.
+		return nil, fmt.Errorf("ssh agent: %w", ErrNoToken)
 	}
 	return nil, fmt.Errorf("ssh agent: %w", ErrKeyNotFound)
 }

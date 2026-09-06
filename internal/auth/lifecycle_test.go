@@ -517,7 +517,7 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 	}()
 
 	if !waitFor(func() bool { return vc.Token() == "file-token" }, 2*time.Second) {
-		t.Fatalf("client token = %q after reload, want %q (file content); env-first ResolveToken regressed", vc.Token(), "file-token")
+		t.Fatalf("timed out waiting for client token %q after reload (last seen %q); env-first ResolveToken regressed", "file-token", vc.Token())
 	}
 }
 
@@ -589,6 +589,13 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 			t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
 		}
 		t.Error("NeedsReauth() = true after successful socket reload")
+	}
+	// The twin at ReloadFromTokenFile asserts this and reaches it through the
+	// same branch: a borrow that succeeds must not have solicited credentials
+	// on the way. Without the assertion the callback above is instrumentation
+	// that looks like coverage and is none.
+	if onReauthFired.Load() {
+		t.Error("OnReauth callback fired despite successful socket reload")
 	}
 }
 
@@ -855,11 +862,13 @@ func TestLifecycleManager_RecoversAfterTokenCleared(t *testing.T) {
 		}
 	}()
 
-	// Let the manager run a tick or two with the empty token — it should
-	// surface "missing client token" responses but stay on the recovery
-	// path (10s recovery interval, not the transient backoff).
-	time.Sleep(150 * time.Millisecond)
-	if !lm.NeedsReauth() {
+	// Wait for the manager to run a tick or two with the empty token — it
+	// should surface "missing client token" responses but stay on the
+	// recovery path (10s recovery interval, not the transient backoff). A
+	// fixed sleep would assert this had happened within three ticks, which
+	// is the same self-limiting shape as a wait outliving its context: true
+	// on an idle machine, not on a loaded one.
+	if !waitFor(lm.NeedsReauth, 2*time.Second) {
 		t.Error("NeedsReauth() = false after empty-token checks; recovery path was not taken")
 	}
 
@@ -1029,7 +1038,7 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	}()
 
 	if !waitFor(func() bool { return vc.Token() == "fresh-token" }, 2*time.Second) {
-		t.Errorf("client token = %q, want fresh-token (re-borrowed after renewal failed)", vc.Token())
+		t.Errorf("timed out waiting for client token \"fresh-token\" (last seen %q); no re-borrow after renewal failed", vc.Token())
 	}
 }
 

@@ -111,9 +111,11 @@ func TestBackendSignUnknownKey(t *testing.T) {
 func TestBackendSignSkipsUnreachableUpstream(t *testing.T) {
 	_, _, pubA, signerA := genEd25519(t, "a")
 	down := &upstreamSource{
-		name:     "agent",
-		endpoint: "/down.sock",
-		dial:     func(context.Context) (net.Conn, error) { return nil, errors.New("upstream down") },
+		name:    "agent",
+		resolve: func(context.Context) []string { return []string{"/down.sock"} },
+		dial: func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("upstream down")
+		},
 	}
 	owner := &fakeSource{name: "kv", ids: []Identity{{PubKey: pubA}}, signer: signerA}
 	b := NewBackend([]Source{down, owner}) // upstream first, owner second

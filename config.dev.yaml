@@ -109,15 +109,18 @@ agent:
       principals: ["{{.vault_username}}"]
       ttl: "15m"
       ephemeral_key: true
-    # Delegate to an upstream SSH agent (your own ssh-agent / OpenSSH agent /
-    # Pageant) so legacy on-disk keys it already holds are served alongside the
-    # Vault-backed ones. dotvault forwards List/Sign and stores nothing. At most
-    # one such source; socket/pipe accept {{.username}}/{{.uid}} and default to
-    # $XDG_RUNTIME_DIR/ssh-agent.socket (Unix) / \\.\pipe\openssh-ssh-agent
-    # (Windows). If no upstream agent is running it just contributes no keys.
+    # Sit in front of the SSH agents you already run (ssh-agent, gpg-agent, a
+    # keyring daemon, the Windows OpenSSH agent, Pageant) so legacy on-disk
+    # keys they hold are served alongside the Vault-backed ones, and `ssh-add`
+    # against dotvault lands in the agent underneath. dotvault forwards the
+    # protocol and stores nothing.
+    #
+    # Leaving socket/pipe empty (as here) auto-detects every agent this user
+    # owns, re-scanning on each refresh and never delegating to dotvault
+    # itself. Set socket (Unix) / pipe (Windows) to pin one explicitly; both
+    # accept {{.username}}/{{.uid}}. At most one such source. If no other agent
+    # is running it simply contributes no keys.
     - source: agent
-      socket: ""
-      pipe: "\\\\.\\pipe\\openssh-ssh-agent"
 
 rules:
   - name: gh

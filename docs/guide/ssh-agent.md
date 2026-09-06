@@ -12,16 +12,21 @@ Three key sources are supported:
 - **Vault-CA certificates** — short-lived certificates minted on demand by a
   Vault SSH CA secrets engine. The private key is generated in memory and never
   persisted.
-- **Upstream agent** — a second SSH agent (your own `ssh-agent`, the Windows
-  OpenSSH agent, or Pageant) that dotvault delegates `List`/`Sign` to. dotvault
-  never stores or reads its key material — it forwards the agent protocol — so
-  you keep using legacy on-disk keys that already live in your personal agent
-  (the static keys you've registered with GitHub, Bitbucket Server, etc.)
-  alongside dotvault's Vault-backed keys, from one socket.
+- **Upstream agent** — the SSH agents you already run (your own `ssh-agent`, a
+  keyring daemon, gpg-agent, a password manager's agent, the Windows OpenSSH
+  agent, Pageant) that dotvault sits in front of and proxies to. dotvault never
+  stores or reads their key material — it forwards the agent protocol — so you
+  keep using legacy on-disk keys that already live in your personal agent (the
+  static keys you've registered with GitHub, Bitbucket Server, etc.) alongside
+  dotvault's Vault-backed keys, from one socket. Left unconfigured it
+  **auto-detects** them, so you can point every client at dotvault permanently.
 
-The agent is **read-only**: like dotvault's one-way sync, it never accepts keys,
-locks, or removals from clients. `ssh-add -d`, `ssh-add -D`, and `ssh-add`
-(adding) all return an error.
+dotvault's **own** identities are read-only, mirroring its one-way sync: they
+come from Vault and are never added, removed, or locked by a client. With no
+upstream-agent source configured that makes the whole agent read-only —
+`ssh-add`, `ssh-add -d`, and `ssh-add -D` all return an error. With one
+configured, those operations are [forwarded to the agent underneath](#adding-keys-through-dotvault)
+rather than refused.
 
 !!! tip "Cert mode is the recommended direction"
     With Vault-CA certificates the private key never lands on disk, rotation is
@@ -51,9 +56,7 @@ agent:
       principals: ["{{.vault_username}}"]
       ttl: "15m"
       ephemeral_key: true
-    - source: agent
-      socket: ""                   # default: $XDG_RUNTIME_DIR/ssh-agent.socket
-      # pipe: "\\\\.\\pipe\\openssh-ssh-agent"   # Windows upstream agent
+    - source: agent                # empty socket/pipe: auto-detect your agents
 ```
 
 | Field                | Description                                       | Default                     |
@@ -108,61 +111,143 @@ agent connection, so long-lived forwarded session chains keep working.
 
 ### Upstream-agent source
 
-`source: agent` points dotvault at a *second* SSH agent and delegates the
-`List` and `Sign` requests to it. This is how you keep using legacy keys that
-live on disk and are already held by your personal agent — for example a static
-key you've registered with a service that can't take a short-lived cert — while
-still serving dotvault's Vault-backed keys from the same socket. dotvault is a
-pure proxy here: it never stores, reads, or persists the upstream's private
-keys, and it dials a fresh connection per request so the upstream agent can come
-and go without a dotvault restart.
+`source: agent` puts dotvault **in front of** the SSH agents you already run
+and proxies the agent protocol to them. This is how you keep using legacy keys
+that live on disk and are already held by your personal agent — a static key
+registered with a service that can't take a short-lived cert, a key in a
+password manager's agent, a Secure Enclave key — while serving dotvault's
+Vault-backed keys from the same socket. Point every SSH client at dotvault's
+endpoint once and leave it there.
 
-The upstream endpoint is the other agent's socket (Unix) or named pipe
-(Windows):
+dotvault is a pure proxy here: it never stores, reads, or persists the
+upstream's private keys, and it dials a fresh connection per request so an
+upstream agent can come and go without a dotvault restart.
+
+#### Auto-detection (the default)
+
+Leave `socket`/`pipe` empty and dotvault finds your agents itself:
+
+```yaml
+- source: agent      # no socket/pipe: auto-detect
+```
+
+On every identity refresh dotvault re-scans the well-known agent locations for
+the platform and proxies to every one that is a socket owned by your own
+account. Because the scan is repeated rather than resolved once at startup, an
+agent you start, restart, or forward in mid-session is picked up on the next
+request — no config change, no daemon restart.
+
+What it looks at, in priority order:
+
+| Order | Unix                                                                  | Windows                                       |
+|-------|-----------------------------------------------------------------------|-----------------------------------------------|
+| 1     | `$SSH_AUTH_SOCK`                                                      | `$SSH_AUTH_SOCK` (Git-for-Windows / WSL set this) |
+| 2     | `$XDG_RUNTIME_DIR/ssh-agent.socket` (systemd `ssh-agent.service`)      | `\\.\pipe\openssh-ssh-agent` (OpenSSH agent service) |
+| 3     | `$XDG_RUNTIME_DIR/gcr/ssh`, `.../keyring/ssh` (GNOME keyring)          | the Pageant-convention pipe                   |
+| 4     | `$XDG_RUNTIME_DIR/gnupg/S.gpg-agent.ssh`, `~/.gnupg/S.gpg-agent.ssh`   | —                                             |
+| 5     | `~/.1password/agent.sock`; on macOS 1Password's group container and Secretive | —                                     |
+| 6     | `/tmp/ssh-*/agent.*` (a plain `ssh-agent` fork); on macOS the launchd socket and `$TMPDIR` equivalents | — |
+
+On Linux the runtime-dir entries are also looked for under `/run/user/<uid>`
+when `XDG_RUNTIME_DIR` is unset, which is the usual state for a daemon started
+outside a login session.
+
+Two things bound the scan:
+
+- **Ownership.** A Unix candidate must be a socket owned by your uid — checked
+  with `lstat`, so a symlink to another user's socket doesn't pass. That is
+  what makes globbing a shared `/tmp` safe, and it matters more than it would
+  for a read-only proxy because mutations are forwarded too (see below): a
+  foreign endpoint that slipped into the fan-out would receive the private key
+  from your `ssh-add`. Windows enumerates a short fixed list for the same
+  reason — a pipe's owner isn't readable without opening it.
+- **Never itself.** dotvault refuses to delegate to an endpoint it serves,
+  which would loop `List`/`Sign` back into the daemon forever. It checks the
+  paths *and* asks each candidate over the wire whether it is this daemon (a
+  private agent extension). The second check is the one that matters in
+  practice: once you set `SSH_AUTH_SOCK` to dotvault — the whole point — the
+  top candidate *is* dotvault, often reached by a symlink, bind mount, or
+  forwarded socket that no path comparison would catch.
+
+If several agents advertise the same key it is listed once, attributed to the
+first, so a client doesn't burn two of a server's `MaxAuthTries` attempts on
+one key. If one agent is unreachable the others still answer. If none is
+running, the source simply contributes nothing — that is not an error.
+
+The endpoints currently being shadowed are reported per source in the web
+dashboard's agent status (`upstreams` on `GET /api/v1/status`).
+
+#### Naming an endpoint explicitly
+
+Set `socket` (Unix) or `pipe` (Windows) to pin the source to exactly one
+agent — the escape hatch for an agent at a path auto-detection doesn't know.
+Doing so **disables** detection for that platform.
 
 ```yaml
 - source: agent
-  socket: ""    # Unix; default $XDG_RUNTIME_DIR/ssh-agent.socket
-                # (required explicitly on macOS — no XDG_RUNTIME_DIR there)
-  pipe: ""      # Windows; default \\.\pipe\openssh-ssh-agent
+  socket: /run/user/{{.uid}}/ssh-agent.socket   # Unix
+  pipe: \\.\pipe\openssh-ssh-agent               # Windows
 ```
 
-| Field    | Platform | Description                          | Default                                       |
-|----------|----------|--------------------------------------|-----------------------------------------------|
-| `socket` | Unix     | Upstream agent Unix socket path      | `$XDG_RUNTIME_DIR/ssh-agent.socket` (Linux)¹  |
-| `pipe`   | Windows  | Upstream agent named pipe            | `\\.\pipe\openssh-ssh-agent`                  |
+| Field    | Platform | Description                     | Default              |
+|----------|----------|---------------------------------|----------------------|
+| `socket` | Unix     | Upstream agent Unix socket path | *(empty = auto-detect)* |
+| `pipe`   | Windows  | Upstream agent named pipe       | *(empty = auto-detect)* |
 
-¹ The Unix default only exists when `XDG_RUNTIME_DIR` is set — the norm on
-Linux, but **not on macOS**, where it is typically unset. With no
-`XDG_RUNTIME_DIR` and no explicit `socket`, the upstream-agent source resolves
-to an error (reported in status) rather than a bogus path, so macOS users must
-set `socket` explicitly (e.g. the value of `$SSH_AUTH_SOCK`, or a fixed path).
-
-Both accept `{{.username}}` and `{{.uid}}` template variables, so a fleet-wide
-config can resolve to each user's own agent (e.g.
-`socket: "/run/user/{{.uid}}/ssh-agent.socket"`). `{{.username}}` is the bare OS
-account name; `{{.uid}}` is the numeric UID on Unix (and the user's SID on
-Windows, where it is rarely useful in a pipe name). A mis-typed variable
+Only the field matching the running platform is consulted, so a single config
+can carry both for a mixed fleet. Both accept `{{.username}}` and `{{.uid}}`
+template variables, so a fleet-wide config can resolve to each user's own agent
+(e.g. `socket: "/run/user/{{.uid}}/ssh-agent.socket"`). `{{.username}}` is the
+bare OS account name; `{{.uid}}` is the numeric UID on Unix (and the user's SID
+on Windows, where it is rarely useful in a pipe name). A mis-typed variable
 (e.g. `{{.user}}`) is rejected when the source is constructed, not silently left
 in the path. A leading `~` in a socket path is expanded to your home directory.
-The Unix default keeps the upstream socket in the same XDG runtime directory
-dotvault's own socket lives in.
 
-Two constraints apply:
+An endpoint that can't be resolved — a bad template, or a path equal to
+dotvault's own socket — becomes an error reported in status; the other sources
+keep working.
 
-- **At most one upstream-agent source.** An agent advertises *all* of its
-  identities with no path scoping, so a second one would only fan out
-  redundantly and make `Sign` routing ambiguous. Configure one; it surfaces
-  every key the upstream holds.
-- **No self-reference.** dotvault refuses to delegate to its own endpoint — that
-  would loop `List`/`Sign` back into the daemon forever. If the resolved
-  upstream endpoint equals dotvault's own socket/pipe, the source is reported as
-  an error in status (see below) and contributes no keys, while the other
-  sources keep working.
+**At most one upstream-agent source** may be configured. Auto-detection is why:
+the single source already fans out across every agent it finds, so a second one
+could only duplicate the work, and an agent advertises all of its identities
+with no path scoping, leaving nothing for a second source to scope differently.
 
-If the upstream agent isn't running, its source simply contributes no
-identities (and shows an "unreachable" error in the web dashboard); dotvault's
-other sources are unaffected.
+#### Adding keys through dotvault
+
+Because dotvault sits in front of your agent rather than beside it, the
+mutating agent operations are **forwarded upstream** instead of refused:
+
+```sh
+export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/dotvault/agent.sock"
+ssh-add ~/.ssh/id_ed25519    # lands in your own agent, via dotvault
+ssh-add -l                   # lists it alongside dotvault's Vault-backed keys
+ssh-add -d ~/.ssh/id_ed25519 # removes it from your agent
+ssh-add -D                   # clears your agent (not dotvault's Vault keys)
+ssh-add -x / -X              # locks / unlocks your agent
+```
+
+dotvault stores nothing on this path either: the key goes straight out over the
+upstream connection and no copy is retained. Details worth knowing:
+
+- **`ssh-add` targets one agent, not all of them.** The key goes to the
+  most-preferred endpoint — `$SSH_AUTH_SOCK` when it names a real upstream,
+  otherwise the first discovered. Copying a private key into every agent on the
+  machine is not what you asked for and not something you could easily undo.
+- **`-D`, `-x`, `-X` are agent-wide** and do address every shadowed agent, which
+  is what a client locking "the agent" means.
+- **dotvault's own identities are untouched.** They come from Vault and would
+  return regardless, so `ssh-add -d` against a Vault-backed key is refused
+  rather than silently doing nothing.
+- **With no upstream source configured, nothing changes:** every mutating
+  operation returns the same read-only error it always did.
+- **No Vault token is needed.** These operations touch no Vault-backed source,
+  so `ssh-add` works against a daemon that hasn't authenticated yet.
+
+Agent *extensions* are deliberately not proxied. Some are connection-scoped by
+design — OpenSSH's `session-bind@openssh.com` binds the client's own
+connection — and answering one from a proxied connection to a different agent
+would be a lie about what was bound. Clients treat the refusal as "unsupported"
+and carry on.
 
 ## Pointing clients at the agent
 

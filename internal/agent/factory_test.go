@@ -49,38 +49,6 @@ func TestNewSourcesFromConfig(t *testing.T) {
 	}
 }
 
-func TestNewSourcesUpstreamAgent(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix socket resolution")
-	}
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/4321")
-	vc := testVaultClient(t)
-	cfg := config.AgentConfig{
-		Enabled: true,
-		Keys: []config.AgentKeySource{
-			{Source: "kv", PathPrefix: "ssh/"},
-			{Source: "agent"}, // empty socket -> XDG default
-		},
-	}
-	sources, err := NewSourcesFromConfig(cfg, vc, "kv", "users/", "me")
-	if err != nil {
-		t.Fatalf("NewSourcesFromConfig: %v", err)
-	}
-	if len(sources) != 2 {
-		t.Fatalf("want 2 sources, got %d", len(sources))
-	}
-	if sources[1].Type() != "agent" {
-		t.Errorf("source[1] type = %q, want agent", sources[1].Type())
-	}
-	us, ok := sources[1].(*upstreamSource)
-	if !ok {
-		t.Fatalf("source[1] is %T, want *upstreamSource", sources[1])
-	}
-	if want := "/run/user/4321/ssh-agent.socket"; us.endpoint != want {
-		t.Errorf("endpoint = %q, want %q", us.endpoint, want)
-	}
-}
-
 func TestResolveUpstreamEndpointTemplate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket resolution")

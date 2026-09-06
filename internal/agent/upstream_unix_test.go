@@ -37,6 +37,17 @@ func genUpstreamKey(t *testing.T) (ed25519.PrivateKey, ssh.PublicKey) {
 func serveUpstreamAgent(t *testing.T, keys ...ed25519.PrivateKey) string {
 	t.Helper()
 	sock := filepath.Join(t.TempDir(), "upstream.sock")
+	serveUpstreamAgentAt(t, sock, keys...)
+	return sock
+}
+
+// serveUpstreamAgentAt is serveUpstreamAgent at a caller-chosen path, for the
+// discovery tests: auto-detection is about *where* an agent lives, so those
+// tests have to place one at a well-known location rather than a temp name.
+// It returns the keyring so a test can assert what a forwarded mutation did to
+// the agent underneath.
+func serveUpstreamAgentAt(t *testing.T, sock string, keys ...ed25519.PrivateKey) agent.Agent {
+	t.Helper()
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -66,7 +77,7 @@ func serveUpstreamAgent(t *testing.T, keys ...ed25519.PrivateKey) string {
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })
-	return sock
+	return keyring
 }
 
 func TestUpstreamSourceListAndSign(t *testing.T) {
@@ -141,9 +152,9 @@ func TestUpstreamSourceType(t *testing.T) {
 func TestUpstreamSourceDialError(t *testing.T) {
 	_, pub := genUpstreamKey(t)
 	src := &upstreamSource{
-		name:     "agent",
-		endpoint: "/x",
-		dial: func(context.Context) (net.Conn, error) {
+		name:    "agent",
+		resolve: func(context.Context) []string { return []string{"/x"} },
+		dial: func(context.Context, string) (net.Conn, error) {
 			return nil, errors.New("boom")
 		},
 	}
@@ -175,7 +186,7 @@ func TestUpstreamSourceSignFastPathSkipsDial(t *testing.T) {
 
 	// Swap in a dial that fails the test if invoked.
 	dialed := false
-	src.dial = func(context.Context) (net.Conn, error) {
+	src.dial = func(context.Context, string) (net.Conn, error) {
 		dialed = true
 		return nil, errors.New("should not dial for a foreign key")
 	}

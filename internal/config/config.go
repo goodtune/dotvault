@@ -758,16 +758,26 @@ type AgentKeySource struct {
 	EphemeralKey bool     `yaml:"ephemeral_key,omitempty"`
 
 	// Socket, Pipe (agent) point at an upstream SSH agent dotvault delegates
-	// List/Sign to — so a user can keep using legacy on-disk keys held by
-	// their own ssh-agent (or Pageant) alongside dotvault's Vault-backed keys.
-	// dotvault never stores or reads the upstream's key material; it forwards
-	// the agent protocol. Socket is the Unix domain socket path, Pipe the
-	// Windows named pipe; both accept {{.username}} and {{.uid}} template
-	// variables. Empty resolves to a platform default: on Windows always
-	// \\.\pipe\openssh-ssh-agent; on Unix $XDG_RUNTIME_DIR/ssh-agent.socket
-	// when XDG_RUNTIME_DIR is set (Linux), but where it is unset (macOS) an
-	// empty Socket is an error and must be set explicitly. At most one "agent"
-	// source may be configured.
+	// to — so a user can keep using legacy on-disk keys held by their own
+	// ssh-agent (or Pageant) alongside dotvault's Vault-backed keys, and can
+	// `ssh-add` into that agent through dotvault's endpoint. dotvault never
+	// stores or reads the upstream's key material; it forwards the agent
+	// protocol. Socket is the Unix domain socket path, Pipe the Windows named
+	// pipe; both accept {{.username}} and {{.uid}} template variables.
+	//
+	// Leaving the field for the running platform empty — the recommended
+	// setting — turns on auto-detection: dotvault re-scans the well-known
+	// agent locations for this OS on every listing and proxies to every agent
+	// the running user owns, skipping its own endpoints. That is what lets a
+	// client be pointed at dotvault permanently: an agent started, restarted,
+	// or forwarded mid-session is picked up without a config change or a
+	// daemon restart. Naming an endpoint explicitly disables detection for
+	// that platform and pins the source to exactly that one, which is the
+	// escape hatch for an agent at a path detection does not know.
+	//
+	// Only the field matching the running platform is consulted, so one config
+	// can carry both for a mixed fleet. At most one "agent" source may be
+	// configured.
 	Socket string `yaml:"socket,omitempty"`
 	Pipe   string `yaml:"pipe,omitempty"`
 }
@@ -1287,10 +1297,13 @@ func (c *Config) validate() error {
 					}
 				}
 			case "agent":
-				// socket/pipe are optional (empty = platform default). Only one
-				// upstream-agent source is permitted: an agent advertises all of
-				// its identities with no path scoping, so a second one would
-				// fan out redundantly and make Sign routing ambiguous.
+				// socket/pipe are optional (empty = auto-detect every agent
+				// this user owns). Only one upstream-agent source is
+				// permitted, and auto-detection is why it stays that way: the
+				// single source already fans out across every agent it finds,
+				// so a second one could only duplicate that work — and an
+				// agent advertises all of its identities with no path scoping,
+				// leaving nothing for a second source to scope differently.
 				agentSources++
 				if agentSources > 1 {
 					return fmt.Errorf("agent.keys[%d]: only one %q source may be configured", i, k.Source)

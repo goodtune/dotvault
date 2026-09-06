@@ -17,10 +17,26 @@ type Status struct {
 
 // SourceStatus reports one configured source's resolution result.
 type SourceStatus struct {
-	Name       string           `json:"name"`
-	Type       string           `json:"type"`
-	Error      string           `json:"error,omitempty"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Error string `json:"error,omitempty"`
+
+	// Upstreams names the agent endpoints an "agent" source is currently
+	// proxying to. It is the only visible answer to "what did auto-detection
+	// actually find?" — an empty list on an enabled auto source means nothing
+	// was found to shadow, which is a legitimate state (no other agent is
+	// running) and so deliberately not an error.
+	Upstreams []string `json:"upstreams,omitempty"`
+
 	Identities []IdentityStatus `json:"identities"`
+}
+
+// upstreamReporter is implemented by a source that proxies to other agents, so
+// Status can name them. Kept as a local optional interface rather than a
+// method on Source: only the upstream source has anything to say here, and a
+// kv/vault-ca source should not have to carry a stub.
+type upstreamReporter interface {
+	Endpoints() []string
 }
 
 // IdentityStatus describes a single advertised key or certificate.
@@ -45,6 +61,11 @@ func (b *Backend) Status(ctx context.Context) Status {
 		ids, err := src.Identities(ctx)
 		if err != nil {
 			ss.Error = err.Error()
+		}
+		// After Identities, so an auto-detecting source reports the endpoints
+		// from the scan just performed rather than the previous one.
+		if ur, ok := src.(upstreamReporter); ok {
+			ss.Upstreams = ur.Endpoints()
 		}
 		for _, id := range ids {
 			ss.Identities = append(ss.Identities, identityStatus(id))

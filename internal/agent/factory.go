@@ -17,7 +17,7 @@ import (
 )
 
 // defaultWindowsUpstreamPipe is the named pipe served by the built-in Windows
-// OpenSSH agent, used as the upstream-agent default when none is configured.
+// OpenSSH agent service — the first place upstream auto-detection looks.
 const defaultWindowsUpstreamPipe = `\\.\pipe\openssh-ssh-agent`
 
 // errSource is a placeholder for a key source that could not be constructed
@@ -79,13 +79,34 @@ func NewSourcesFromConfig(agentCfg config.AgentConfig, vc *vault.Client, kvMount
 	return sources, nil
 }
 
-// newUpstreamSourceFromConfig resolves an `agent` source's endpoint (applying
-// the platform default and {{.username}}/{{.uid}} templating) and guards
-// against it pointing back at any endpoint this daemon serves the agent on. A
-// resolution problem becomes an errSource so it surfaces in status without
-// aborting the daemon — other sources stay live.
+// newUpstreamSourceFromConfig builds an `agent` source in one of two modes.
+//
+// With no socket/pipe configured it auto-detects: the source re-scans the
+// platform's well-known agent locations on every listing and proxies to
+// whatever this user is actually running. That is the mode the feature exists
+// for — a client pointed at dotvault's endpoint once, permanently, finds the
+// user's other agents without anyone having written their paths down, and
+// keeps finding them when a keyring daemon or a forwarded socket comes and
+// goes mid-session.
+//
+// With an explicit socket/pipe it proxies to exactly that endpoint (still
+// expanding {{.username}}/{{.uid}}), which is the escape hatch for an agent at
+// a path discovery does not know. A resolution problem there becomes an
+// errSource so it surfaces in status without aborting the daemon — the other
+// sources stay live.
+//
+// Both modes are guarded against pointing back at any endpoint this daemon
+// serves the agent on, which would loop List/Sign into itself forever. The
+// explicit mode compares paths here; the auto mode hands the same endpoint
+// list to discovery, which additionally asks each candidate over the wire
+// whether it is us (see IDExtension) — necessary because SSH_AUTH_SOCK
+// commonly *is* dotvault by then, reachable by a path that never string-equals
+// the one we bound.
 func newUpstreamSourceFromConfig(i int, k config.AgentKeySource, username, uid string, selfEndpoints []string) Source {
-	name := "agent"
+	const name = "agent"
+	if !upstreamEndpointConfigured(k) {
+		return newAutoUpstreamSource(name+":auto", selfEndpoints)
+	}
 	endpoint, err := resolveUpstreamEndpoint(k, username, uid)
 	if err != nil {
 		return newErrSource(name, "agent", fmt.Errorf("agent.keys[%d]: %w", i, err))
@@ -97,6 +118,18 @@ func newUpstreamSourceFromConfig(i int, k config.AgentKeySource, username, uid s
 		}
 	}
 	return newUpstreamSource(name+":"+endpoint, endpoint)
+}
+
+// upstreamEndpointConfigured reports whether the operator named an explicit
+// endpoint for this platform. Only the field this platform uses counts: a
+// config carrying both `socket` and `pipe` (the portable case — one YAML
+// deployed to a mixed fleet) must auto-detect on neither, and a config
+// carrying only the other platform's field must auto-detect on this one.
+func upstreamEndpointConfigured(k config.AgentKeySource) bool {
+	if runtime.GOOS == "windows" {
+		return strings.TrimSpace(k.Pipe) != ""
+	}
+	return strings.TrimSpace(k.Socket) != ""
 }
 
 // normalizeEndpoint canonicalises an endpoint for the self-reference
@@ -113,23 +146,16 @@ func normalizeEndpoint(s string) string {
 	return filepath.Clean(s)
 }
 
-// resolveUpstreamEndpoint selects the platform endpoint for an `agent` source,
-// applying the per-platform default when unset and expanding {{.username}} /
-// {{.uid}} templates. A leading ~ in a Unix socket path is expanded too.
+// resolveUpstreamEndpoint expands an explicitly configured `agent` endpoint:
+// {{.username}} / {{.uid}} templating, plus ~ expansion for a Unix socket
+// path. It is only reached when the operator named one — an unset socket/pipe
+// auto-detects instead of falling back to a platform default, which is what
+// retired the old "$XDG_RUNTIME_DIR is unset on macOS, so configure it
+// yourself" dead end.
 func resolveUpstreamEndpoint(k config.AgentKeySource, username, uid string) (string, error) {
-	var raw string
+	raw := k.Socket
 	if runtime.GOOS == "windows" {
 		raw = k.Pipe
-		if raw == "" {
-			raw = defaultWindowsUpstreamPipe
-		}
-	} else {
-		raw = k.Socket
-		if raw == "" {
-			if raw = paths.DefaultUpstreamAgentSocket(); raw == "" {
-				return "", fmt.Errorf("no upstream agent socket configured and XDG_RUNTIME_DIR is unset; set agent.keys[].socket explicitly")
-			}
-		}
 	}
 	endpoint, err := renderEndpointTemplate(raw, username, uid)
 	if err != nil {

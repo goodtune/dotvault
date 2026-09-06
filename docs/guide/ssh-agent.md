@@ -242,8 +242,14 @@ running, the source simply contributes nothing — that is not an error.
 
 The endpoints currently being shadowed are reported per source as `upstreams`
 on `GET /api/v1/status` — the machine-readable answer to "what did detection
-actually find?". They are not rendered in the web UI today; `dotvault status`
-lists the identities being served but not which agent each came from.
+actually find?". The field distinguishes three cases, because "found nothing"
+and "reports no upstreams at all" are different answers: it is absent on a
+source with no upstreams to report, `[]` on a relay that found no agent to
+shadow, and a list of endpoints otherwise. Key off the field rather than the
+source's `type`, which does not imply it — a relay that failed to construct is
+reported with `type: agent` and no `upstreams`. The endpoints are not rendered
+in the web UI today; `dotvault status` lists the identities being served but
+not which agent each came from.
 
 #### Turning it off, or pinning one endpoint
 

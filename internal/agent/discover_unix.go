@@ -96,15 +96,39 @@ func runtimeDirs() []string {
 	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
 		dirs = append(dirs, rt)
 	}
-	if runtime.GOOS == "linux" {
-		if uid, err := paths.UID(); err == nil && uid != "" {
-			if d := filepath.Join("/run", "user", uid); !contains(dirs, d) {
-				dirs = append(dirs, d)
-			}
-		}
+	if d := runUserDir(); d != "" && !contains(dirs, d) {
+		dirs = append(dirs, d)
 	}
 	return dirs
 }
+
+// runUserDir returns the conventional per-user runtime directory on Linux,
+// /run/user/<uid>, or "" where there is none.
+//
+// It is a separate function purely so the discovery tests can neutralise it
+// (runUserDirOverride). That is not cosmetic: this path is real on a
+// developer's machine and on a CI runner alike — a GitHub Actions runner has a
+// live gpg-agent at /run/user/<uid>/gnupg/S.gpg-agent.ssh — so a scan that
+// consults it is a scan whose result depends on the host. Setting
+// XDG_RUNTIME_DIR to a temp tree does not suppress it, because this directory
+// is consulted in *addition* to that variable, not as a fallback for it. Every
+// discovery test failed in CI on exactly that before this seam existed.
+func runUserDir() string {
+	if runUserDirOverride != nil {
+		return runUserDirOverride()
+	}
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	uid, err := paths.UID()
+	if err != nil || uid == "" {
+		return ""
+	}
+	return filepath.Join("/run", "user", uid)
+}
+
+// runUserDirOverride is nil in every shipped build; see runUserDir.
+var runUserDirOverride func() string
 
 func contains(ss []string, s string) bool {
 	for _, v := range ss {

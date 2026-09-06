@@ -14,8 +14,17 @@ import (
 
 // isolateDiscovery points every environment-derived discovery input at a
 // caller-owned temp tree, so a scan sees only what the test put there. Without
-// it a developer machine's real ssh-agent (its /tmp socket, its SSH_AUTH_SOCK)
-// joins the results and the assertions become machine-dependent.
+// it the host's own agents join the results and the assertions become
+// machine-dependent — which is not hypothetical: a GitHub Actions runner has a
+// live gpg-agent under /run/user/<uid>, and every discovery test failed in CI
+// on it while passing locally.
+//
+// Note the environment variables are not sufficient on their own. Two
+// candidate sources are derived from neither the environment nor the config —
+// /run/user/<uid> (consulted in addition to XDG_RUNTIME_DIR, not as a fallback
+// for it) and the /tmp globs — so both need their own overrides. A new
+// host-derived candidate source must be added here at the same time, or it
+// reintroduces exactly this failure.
 //
 // It returns the runtime dir, which is where a test places the agent it wants
 // discovered.
@@ -27,8 +36,63 @@ func isolateDiscovery(t *testing.T) string {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TMPDIR", t.TempDir())
 	tempAgentGlobsOverride = func() []string { return nil }
-	t.Cleanup(func() { tempAgentGlobsOverride = nil })
+	runUserDirOverride = func() string { return "" }
+	t.Cleanup(func() {
+		tempAgentGlobsOverride = nil
+		runUserDirOverride = nil
+	})
 	return rt
+}
+
+// TestIsolateDiscoveryLeavesNothingBehind is the canary for the whole file: an
+// isolated scan with nothing placed in it must find nothing. Every other
+// discovery test asserts an exact set, so any host-derived candidate that
+// isolateDiscovery fails to suppress breaks all of them at once and on some
+// machines only — this one names the cause directly instead.
+func TestIsolateDiscoveryLeavesNothingBehind(t *testing.T) {
+	isolateDiscovery(t)
+	if got := discoverUpstreamEndpoints(context.Background(), nil, dialEndpoint); len(got) != 0 {
+		t.Errorf("an isolated scan found %v; isolateDiscovery is missing a host-derived candidate source", got)
+	}
+}
+
+// TestIsolateDiscoverySuppressesRunUserDir reproduces the CI failure this seam
+// exists for. A GitHub Actions runner has a live gpg-agent at
+// /run/user/<uid>/gnupg/S.gpg-agent.ssh; because that directory is consulted
+// in addition to XDG_RUNTIME_DIR rather than as a fallback for it, setting the
+// variable to a temp tree left the runner's agent in every scan and failed
+// eight tests that pass on a machine without one.
+//
+// Planting an agent in a stand-in for that directory and asserting it does not
+// surface is the check that the override, not luck, is what isolates the
+// tests: point runUserDirOverride at `populated` instead of "" and this fails
+// exactly as CI did.
+func TestIsolateDiscoverySuppressesRunUserDir(t *testing.T) {
+	populated := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(populated, "gnupg"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	priv, _ := genUpstreamKey(t)
+	serveUpstreamAgentAt(t, filepath.Join(populated, "gnupg", "S.gpg-agent.ssh"), priv)
+
+	// Confirm the planted agent is genuinely discoverable, so the assertion
+	// below cannot pass because the fixture was broken.
+	runUserDirOverride = func() string { return populated }
+	t.Cleanup(func() { runUserDirOverride = nil })
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("SSH_AUTH_SOCK", "")
+	t.Setenv("HOME", t.TempDir())
+	tempAgentGlobsOverride = func() []string { return nil }
+	t.Cleanup(func() { tempAgentGlobsOverride = nil })
+	if got := discoverUpstreamEndpoints(context.Background(), nil, dialEndpoint); len(got) != 1 {
+		t.Fatalf("fixture: planted agent should be discoverable, got %v", got)
+	}
+
+	// Now isolate: the same agent must vanish from the scan.
+	isolateDiscovery(t)
+	if got := discoverUpstreamEndpoints(context.Background(), nil, dialEndpoint); len(got) != 0 {
+		t.Errorf("isolated scan found %v; the /run/user/<uid> candidate is not suppressed", got)
+	}
 }
 
 // serveBackendAt serves a real dotvault Backend over a Unix socket, which is

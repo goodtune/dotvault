@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -31,11 +32,56 @@ import (
 // because POLLIN never fires on a closed-empty pipe.
 func waitForMoreInput(fd uintptr, timeout time.Duration) bool {
 	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	n, err := unix.Poll(pfd, int(timeout/time.Millisecond))
-	if err != nil || n <= 0 {
-		return false
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		n, err := unix.Poll(pfd, pollTimeoutMillis(remaining))
+		if errors.Is(err, unix.EINTR) {
+			// A signal interrupted the wait, which says nothing about
+			// whether input arrived — retry for what is left of the budget.
+			// This is not a rare case to wave away: the Go runtime delivers
+			// SIGURG to preempt goroutines, so on a busy process poll is
+			// interrupted routinely. Reporting that as "no input" made
+			// drainEscapeTail give up part-way through an arrow key's escape
+			// sequence, so the keystroke was silently dropped (a 2-byte
+			// prefix classifies as keyNone) or, worse, taken as quit (a lone
+			// ESC classifies as keyQuit) — the picker exiting on an arrow
+			// press. It surfaced as a CI flake in the split-escape tests, but
+			// the user-visible bug is on a real terminal.
+			continue
+		}
+		if err != nil || n <= 0 {
+			return false
+		}
+		return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0
 	}
-	return pfd[0].Revents&(unix.POLLIN|unix.POLLHUP|unix.POLLERR) != 0
+}
+
+// pollTimeoutMillis converts a remaining budget to poll(2)'s whole-millisecond
+// timeout. It floors, with a floor of 1: any positive value below a
+// millisecond becomes 1 rather than 0.
+//
+// Zero is not a short wait but a non-blocking check: poll returns at once,
+// and waitForMoreInput reads that as "no input" even though the budget had
+// time left and the byte may land microseconds later — the same wrong answer
+// the EINTR retry above removes, reached by arithmetic instead of by a signal.
+// Flooring is right everywhere above a millisecond, because a truncated wait
+// still blocks and the loop simply comes round again; only zero is hazardous.
+//
+// Both call sites reject a non-positive budget before calling, so the clamp is
+// unreachable today. It is written as < 1 rather than == 0 anyway, because a
+// negative timeout tells poll to block forever: if a future caller ever let
+// one through, == 0 would trade a wait that ends too early for one that never
+// ends at all.
+func pollTimeoutMillis(remaining time.Duration) int {
+	ms := int(remaining / time.Millisecond)
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
 }
 
 // blockUntilInput waits until fd has input ready to read or ctx is

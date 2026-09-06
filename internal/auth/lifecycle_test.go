@@ -443,18 +443,13 @@ func TestLifecycleManager_ReloadFromTokenFile(t *testing.T) {
 	}()
 
 	// Wait until the manager has had a chance to run a check and reload.
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "new-token" {
-			break
+	// Both conditions: tryReload installs the candidate before LookupSelf
+	// judges it, so waiting on the token alone can release while
+	// NeedsReauth is still legitimately true (see the denylist test).
+	if !waitFor(func() bool { return vc.Token() == "new-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "new-token" {
+			t.Fatalf("client token = %q after reload, want %q", got, "new-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "new-token" {
-		t.Fatalf("client token = %q after reload, want %q", got, "new-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after successful reload")
 	}
 	if onReauthFired.Load() {
@@ -588,18 +583,13 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 		}
 	}()
 
-	deadline := time.Now().Add(900 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if vc.Token() == "peer-token" {
-			break
+	// Both conditions: tryReload installs the candidate before LookupSelf
+	// judges it, so waiting on the token alone can release while
+	// NeedsReauth is still legitimately true (see the denylist test).
+	if !waitFor(func() bool { return vc.Token() == "peer-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "peer-token" {
+			t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := vc.Token(); got != "peer-token" {
-		t.Fatalf("client token = %q after reload, want %q (borrowed from peer socket)", got, "peer-token")
-	}
-	if lm.NeedsReauth() {
 		t.Error("NeedsReauth() = true after successful socket reload")
 	}
 }

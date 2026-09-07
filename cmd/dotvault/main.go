@@ -1110,6 +1110,40 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Sync the keyless rules before authenticating. A rule with no vault_key
+	// reads nothing from Vault — it renders from {{ username }} and literals —
+	// so a token buys it nothing, yet until this ran here it waited for one
+	// anyway: the initial sync is the first thing past a startup with two
+	// indefinite gates in it. Authentication is the obvious one (a headless host
+	// with nothing to borrow yet, a borrow-only host whose forward is not up, a
+	// web-mode daemon with nobody at the browser), and those are exactly the
+	// hosts whose managed ssh_config is wanted *before* the login rather than
+	// after it — it is what carries the RemoteForward that creates the socket
+	// the token is then borrowed over. The first-run enrolment wizard is the
+	// other gate, and it blocks the sync engine even on a host that
+	// authenticated fine, which is why this pass is unconditional rather than
+	// gated on !authenticated.
+	//
+	// Placed *after* the agent and HTTP listeners rather than beside the engine
+	// construction above, and the order is load-bearing: syncRule is synchronous
+	// file I/O observing no deadline, so on a host whose home directory is slow
+	// or hung (NFS, autofs, a Windows rename behind an AV scanner) this pass can
+	// take arbitrarily long — and ahead of the listeners it would delay the very
+	// "answer immediately instead of leaving a client on a connection nobody
+	// reads" guarantee those blocks exist to provide, plus the Windows tray.
+	// Behind them, a stall costs only the thing that was already going to wait.
+	//
+	// RunKeyless logs the start and each rule's failure itself, so only the
+	// summary is reported here — deliberately without the error text, which
+	// would repeat what was already logged per rule, at a level implying a
+	// failure the daemon is in fact carrying on past. Never fails startup: per-
+	// rule isolation is the engine's invariant, and the same rules run again in
+	// the first full cycle, where the state store makes them a no-op unless
+	// something changed.
+	if ok, failed := engine.RunKeyless(ctx); failed > 0 {
+		slog.Warn("some rules that need no vault token could not be synced before authenticating", "synced", ok, "failed", failed)
+	}
+
 	// Authenticate if needed.
 	if !authenticated {
 		if cfg.Vault.BorrowOnly {

@@ -838,6 +838,16 @@ type Rule struct {
 	Target      Target       `yaml:"target"`
 }
 
+// Keyless reports whether the rule names no vault_key. Such a rule manages a
+// file with no Vault-backed content — it renders from {{ username }} and
+// literals with an empty data context — so it never reads a secret, and the
+// daemon can therefore sync it before it holds a Vault token at all. Every
+// consumer asks through this predicate rather than re-spelling the comparison,
+// so the definition of "keyless" lives with the type that owns it.
+func (r Rule) Keyless() bool {
+	return r.VaultKey == ""
+}
+
 // OAuthConfig holds optional OAuth2 settings for a rule.
 type OAuthConfig struct {
 	EnginePath string   `yaml:"engine_path"`
@@ -1428,7 +1438,7 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	// content (e.g. an ssh_config built purely from {{ username }} and
 	// literals). Such a keyless rule renders with an empty data context, so it
 	// must carry a template — there is no secret data to fall back on.
-	if r.VaultKey == "" && r.Target.Template == "" {
+	if r.Keyless() && r.Target.Template == "" {
 		return fmt.Errorf("rules[%d] (%s): a rule without vault_key must supply target.template (no secret data to write otherwise)", i, r.Name)
 	}
 	if r.Target.Path == "" {

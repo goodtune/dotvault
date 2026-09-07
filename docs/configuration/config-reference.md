@@ -205,7 +205,7 @@ Host devbox
     RemoteForward /home/me/.ssh/dotvault.sock 127.0.0.1:9000
 ```
 
-The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows the workstation's token instead of needing its own browser or TTY to authenticate. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
+The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows the workstation's token instead of needing its own browser or TTY to authenticate. If the `RemoteForward` above is itself managed by a [keyless sync rule](sync-rules.md#rules-without-a-vault-key), note the daemon syncs those rules *before* it authenticates — the file that creates the socket cannot be made to wait on the token that arrives over it. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
 
 On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
 

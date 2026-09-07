@@ -548,3 +548,210 @@ func TestEngine_RunLoopAfterInitialSyncHook(t *testing.T) {
 		t.Errorf("target mtime advanced after the hook (%v → %v) — loop performed a redundant second sync", mtimeAtHook, info.ModTime())
 	}
 }
+
+// TestEngine_RunKeyless pins the pre-authentication pass the daemon runs
+// between its listeners coming up and its auth gate: only the rules with no
+// vault_key are synced, and the pass neither contacts Vault nor disturbs the
+// keyed rules it leaves alone. The Vault client points at a closed port, so a
+// read attempted on behalf of the keyed rule would surface as a failure count
+// and a written file — both asserted against.
+func TestEngine_RunKeyless(t *testing.T) {
+	dir := t.TempDir()
+	keylessPath := filepath.Join(dir, "ssh_config")
+	keyedPath := filepath.Join(dir, "hosts.yml")
+	statePath := filepath.Join(dir, "state.json")
+
+	vc, err := vault.NewClient(vault.Config{
+		Address: "http://127.0.0.1:1", // nothing listens here
+		Token:   "unused",
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{
+				Name: "ssh", // keyless
+				Target: config.Target{
+					Path:     keylessPath,
+					Format:   "ssh_config",
+					Template: "Host vault\n    User {{ username }}\n",
+				},
+			},
+			{
+				Name:     "gh",
+				VaultKey: "gh",
+				Target: config.Target{
+					Path:     keyedPath,
+					Format:   "yaml",
+					Template: "github.com:\n  oauth_token: {{ .token }}\n",
+				},
+			},
+		},
+	}
+
+	engine := NewEngine(cfg, vc, "goodtune", statePath)
+
+	ok, failed := engine.RunKeyless(context.Background())
+	if ok != 1 || failed != 0 {
+		t.Fatalf("RunKeyless = (%d ok, %d failed), want (1, 0) — the keyed rule must not be attempted and the keyless one needs no vault", ok, failed)
+	}
+
+	got, err := os.ReadFile(keylessPath)
+	if err != nil {
+		t.Fatalf("keyless rule did not write its target: %v", err)
+	}
+	if !strings.Contains(string(got), "User goodtune") {
+		t.Errorf("username not resolved in keyless rule:\n%s", got)
+	}
+
+	if _, err := os.Stat(keyedPath); !os.IsNotExist(err) {
+		t.Errorf("RunKeyless synced a rule with a vault_key (stat %s: %v)", keyedPath, err)
+	}
+
+	// The state the pass writes is the same state the first full cycle reads,
+	// so that cycle must find nothing to do. This is the claim that keeps the
+	// pass from meaning "every keyless file is written twice on every start".
+	info1, err := os.Stat(keylessPath)
+	if err != nil {
+		t.Fatalf("stat after first pass: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if ok, failed := engine.RunKeyless(context.Background()); ok != 1 || failed != 0 {
+		t.Fatalf("second RunKeyless = (%d ok, %d failed), want (1, 0)", ok, failed)
+	}
+	info2, err := os.Stat(keylessPath)
+	if err != nil {
+		t.Fatalf("stat after second pass: %v", err)
+	}
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Error("second keyless pass rewrote an unchanged file — the state written pre-auth is not being read by the next cycle")
+	}
+
+	// Nothing keyless configured: the pass is a no-op the daemon reports
+	// nothing about, rather than a logged pass that does no work.
+	keyedOnly := NewEngine(&config.Config{
+		Vault: cfg.Vault,
+		Sync:  cfg.Sync,
+		Rules: cfg.Rules[1:],
+	}, vc, "goodtune", filepath.Join(dir, "state-keyed.json"))
+	if ok, failed := keyedOnly.RunKeyless(context.Background()); ok != 0 || failed != 0 {
+		t.Errorf("RunKeyless = (%d ok, %d failed) for a rule set where every rule names a vault_key, want (0, 0)", ok, failed)
+	}
+}
+
+// TestEngine_RunKeylessPerRuleIsolation pins that one unrenderable keyless rule
+// does not cost the others their sync — the engine's per-rule isolation
+// invariant, which an early return on the first error would silently drop.
+func TestEngine_RunKeylessPerRuleIsolation(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad")
+	goodPath := filepath.Join(dir, "good")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{
+			{
+				Name: "bad", // first, so an early return would skip "good"
+				Target: config.Target{
+					Path:     badPath,
+					Format:   "ssh_config",
+					Template: "Host x\n    User {{ .nope | nosuchfunc }}\n",
+				},
+			},
+			{
+				Name: "good",
+				Target: config.Target{
+					Path:     goodPath,
+					Format:   "ssh_config",
+					Template: "Host y\n    User {{ username }}\n",
+				},
+			},
+		},
+	}
+
+	// nil Vault client: neither rule may dereference it.
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+
+	ok, failed := engine.RunKeyless(context.Background())
+	if ok != 1 || failed != 1 {
+		t.Errorf("RunKeyless = (%d ok, %d failed), want (1, 1)", ok, failed)
+	}
+	if _, err := os.Stat(goodPath); err != nil {
+		t.Errorf("a later keyless rule was skipped after an earlier one failed: %v", err)
+	}
+	if _, err := os.Stat(badPath); !os.IsNotExist(err) {
+		t.Errorf("the failing rule wrote a file (stat %s: %v)", badPath, err)
+	}
+}
+
+// TestEngine_RunKeylessDryRun pins that --dry-run suppresses the writes of the
+// pre-authentication pass too. The daemon sets DryRun on the engine before the
+// pass runs, and a pass that ignored it would make --dry-run mutate the very
+// files it promises not to touch.
+func TestEngine_RunKeylessDryRun(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "ssh_config")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{{
+			Name: "ssh",
+			Target: config.Target{
+				Path:     target,
+				Format:   "ssh_config",
+				Template: "Host z\n    User {{ username }}\n",
+			},
+		}},
+	}
+
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+	engine.DryRun = true
+
+	if ok, failed := engine.RunKeyless(context.Background()); ok != 1 || failed != 0 {
+		t.Fatalf("RunKeyless = (%d ok, %d failed), want (1, 0)", ok, failed)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("dry-run keyless pass wrote %s (stat: %v)", target, err)
+	}
+}
+
+// TestEngine_RunKeylessStopsOnCancelledContext pins the between-rules
+// cancellation check: syncRule is synchronous file I/O that observes no
+// deadline, so stopping between rules is the only granularity available — and
+// without it a shutdown would work through the whole rule set writing files it
+// has been told to stop writing.
+func TestEngine_RunKeylessStopsOnCancelledContext(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "ssh_config")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{{
+			Name: "ssh",
+			Target: config.Target{
+				Path:     target,
+				Format:   "ssh_config",
+				Template: "Host z\n    User {{ username }}\n",
+			},
+		}},
+	}
+
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if ok, failed := engine.RunKeyless(ctx); ok != 0 || failed != 0 {
+		t.Errorf("RunKeyless = (%d ok, %d failed) under a cancelled context, want (0, 0)", ok, failed)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("cancelled keyless pass still wrote %s (stat: %v)", target, err)
+	}
+}

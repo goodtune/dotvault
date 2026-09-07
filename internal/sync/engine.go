@@ -131,14 +131,86 @@ func (e *Engine) runOnceLocked(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	var lastErr error
+	_, _, lastErr := e.runRulesLocked(ctx, nil)
+	return lastErr
+}
+
+// runRulesLocked syncs every rule the include predicate accepts, in
+// configuration order, and reports how many were processed without error, how
+// many failed, and the last error seen. A nil predicate means every rule.
+// Callers must already hold e.mu.
+//
+// Per-rule isolation is the invariant it carries for every caller: a rule that
+// fails is logged and the loop continues, so one bad rule never costs the
+// others their sync.
+//
+// It stops early if ctx is cancelled between rules. syncRule itself is
+// synchronous file I/O that observes no deadline, so this is the only
+// granularity available — but it is the one that matters: on shutdown the
+// daemon stops working through a long rule set instead of writing files it has
+// been told to stop writing, and returns to its caller within one rule.
+func (e *Engine) runRulesLocked(ctx context.Context, include func(config.Rule) bool) (ok, failed int, lastErr error) {
 	for _, rule := range e.cfg.Rules {
+		if include != nil && !include(rule) {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		if err := e.syncRule(ctx, rule); err != nil {
 			slog.Error("sync rule failed", "rule", rule.Name, "error", err)
+			failed++
 			lastErr = err
+			continue
+		}
+		ok++
+	}
+	return ok, failed, lastErr
+}
+
+// RunKeyless syncs only the keyless rules — those naming no vault_key — and is
+// safe to call before the daemon holds a Vault token: syncRule skips the secret
+// read entirely for such a rule, so the whole pass renders from {{ username }}
+// and literals and touches Vault not at all. It reports how many rules were
+// processed without error and how many failed, so a caller can say what
+// happened without re-logging errors this already logged per rule.
+//
+// It exists because those rules would otherwise be held hostage by
+// authentication they do not need. A daemon that idles waiting for a token —
+// headless with nothing to borrow yet, borrow-only with the forward not up, or
+// web mode with nobody at the browser — can idle indefinitely, and until now
+// the managed ssh_config that a user's `ssh` needs to reach the very host that
+// would hand it a token was not written until after the token arrived. The
+// files these rules manage are the ones most likely to be needed *to* complete
+// the login.
+//
+// Deliberately not recorded as a sync tick: dotvault.sync.ticks counts full
+// cycles across every rule, and mixing in a partial pre-auth pass would make
+// that rate mean two different things. The rules run again in the first full
+// cycle after authentication, where the state store's skip gate makes them a
+// no-op unless something really changed.
+func (e *Engine) RunKeyless(ctx context.Context) (ok, failed int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	keyless := func(rule config.Rule) bool { return rule.Keyless() }
+	var n int
+	for _, rule := range e.cfg.Rules {
+		if keyless(rule) {
+			n++
 		}
 	}
-	return lastErr
+	if n == 0 {
+		return 0, 0
+	}
+	// Logged here rather than left to the caller so the line lands before the
+	// work does: syncRule is synchronous file I/O, and if a rule stalls on an
+	// unresponsive home directory this is the only evidence of what it stalled
+	// on. Counting first costs one extra pass over a rule list that is already
+	// in memory.
+	slog.Info("syncing keyless rules (no vault token required)", "rules", n)
+	ok, failed, _ = e.runRulesLocked(ctx, keyless)
+	return ok, failed
 }
 
 // RunLoopOption tunes RunLoop's behaviour without exposing the
@@ -363,7 +435,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// in either case, because it is a template function, not a context field.
 	secretData := map[string]any{}
 	secretVersion := 0
-	if rule.VaultKey != "" {
+	if !rule.Keyless() {
 		secretPath := e.cfg.Vault.UserPrefix + e.username + "/" + rule.VaultKey
 		secret, err := e.vault.ReadKVv2(ctx, e.cfg.Vault.KVMount, secretPath)
 		if err != nil {
@@ -392,7 +464,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// which cannot match the non-empty computed hash, forcing the first sync).
 	currentState := e.state.Get(rule.Name)
 	ruleHash := ruleRenderHash(rule)
-	versionUnchanged := rule.VaultKey == "" || (secretVersion == currentState.VaultVersion && currentState.VaultVersion > 0)
+	versionUnchanged := rule.Keyless() || (secretVersion == currentState.VaultVersion && currentState.VaultVersion > 0)
 	if versionUnchanged && currentState.RuleHash == ruleHash {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {

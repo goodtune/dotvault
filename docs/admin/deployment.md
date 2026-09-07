@@ -300,12 +300,15 @@ Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op i
 
 The standard `OTEL_*` environment variables (generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS`, and the signal-specific `_METRICS_*` / `_LOGS_*` variants) are honoured by the SDK whenever the corresponding config field is empty, so endpoint and header configuration can live entirely outside the config file. Put credential-bearing values (`OTEL_EXPORTER_OTLP_HEADERS`) in the per-user `EnvironmentFile` (`~/.config/dotvault/env`, mode 0600) rather than a world-readable location — this is the recommended way to share a token across both signals without it appearing in any config artefact, and it is where the shared-field deprecation steers that use case.
 
+!!! warning "Upgraders: `dotvault.sync.ticks` gained a third `outcome` value"
+    A sync cycle interrupted part-way through — the ordinary shape of a daemon shutting down — used to be recorded as `outcome="ok"`, because the cycle reported no error. It now reports `outcome="cancelled"`. Two kinds of existing query change meaning: one written as `outcome="error"` is unaffected in what it counts but no longer sees the *whole* of "not a clean cycle", and one written as `outcome != "ok"` now counts every daemon restart as an anomaly. Prefer `outcome="error"` for alerting, which is the failure rate and excludes shutdowns by construction. Nothing else about the instrument changed, and no other metric is affected.
+
 The exporter emits a bounded set of instruments:
 
 | Metric                          | Type      | Attributes                                           |
 | ------------------------------- | --------- | ---------------------------------------------------- |
-| `dotvault.sync.ticks`           | counter   | `outcome={ok,error}`                                 |
-| `dotvault.sync.duration`        | histogram | `outcome`                                            |
+| `dotvault.sync.ticks`           | counter   | `outcome={ok,cancelled,error}` — `cancelled` is a cycle the daemon stopped part-way through (a shutdown, almost always), counted apart from both neighbours so it neither inflates the success rate with cycles that never ran every rule nor puts routine shutdowns in the failure rate. A cycle that failed a rule *and* was then cancelled counts as `error`: the failure is the actionable half |
+| `dotvault.sync.duration`        | histogram | `outcome={ok,cancelled,error}` — same vocabulary as the counter above |
 | `dotvault.vault.calls`          | counter   | `op={read,write,lookup_self,renew_self}`, `status`   |
 | `dotvault.token.renewals`       | counter   | `outcome={renewed,reauth_required,failed}`           |
 | `dotvault.token.ttl_remaining`  | histogram | (no attrs)                                           |

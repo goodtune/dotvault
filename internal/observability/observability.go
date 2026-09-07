@@ -822,7 +822,7 @@ func rebindInstruments() {
 
 	syncTicks, _ = meter.Int64Counter(
 		"dotvault.sync.ticks",
-		metric.WithDescription("Total sync cycles executed"),
+		metric.WithDescription("Sync cycle outcomes (ok, cancelled, error)"),
 	)
 	syncDuration, _ = meter.Float64Histogram(
 		"dotvault.sync.duration",

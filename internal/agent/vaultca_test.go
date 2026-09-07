@@ -74,6 +74,14 @@ func TestVaultCASourceIdentities(t *testing.T) {
 	if ca.lastPrinc[0] != "alice" {
 		t.Errorf("principal template not expanded: %v", ca.lastPrinc)
 	}
+	// The ssh-add -l comment names both the source and the local OS user,
+	// so identities from different users' agents are distinguishable
+	// when compared. Name() itself (used for logging/status) stays the
+	// stable "ca" the source was constructed with.
+	wantComment := "ca - by dotvault for alice"
+	if ids[0].Comment != wantComment {
+		t.Errorf("comment = %q, want %q", ids[0].Comment, wantComment)
+	}
 }
 
 func TestVaultCASourceSign(t *testing.T) {

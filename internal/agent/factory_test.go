@@ -54,6 +54,13 @@ func TestNewSourcesFromConfig(t *testing.T) {
 	if got := sources[len(sources)-1].Type(); got != "agent" {
 		t.Errorf("last source type = %q, want agent (the relay is always appended last)", got)
 	}
+	// Name() stays a stable log/status identifier (role only); the
+	// human-facing "by dotvault for <user>" annotation lives on the
+	// ssh-add -l Comment instead — see TestVaultCASourceIdentities.
+	wantName := "vault-ca:dotvault-user"
+	if got := sources[1].Name(); got != wantName {
+		t.Errorf("vault-ca source name = %q, want %q", got, wantName)
+	}
 }
 
 // TestRelayIsImplicitAndOptOut covers the two halves of the relay's contract at

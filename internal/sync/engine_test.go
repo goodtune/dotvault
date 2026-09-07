@@ -3,6 +3,8 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -753,5 +755,102 @@ func TestEngine_RunKeylessStopsOnCancelledContext(t *testing.T) {
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Errorf("cancelled keyless pass still wrote %s (stat: %v)", target, err)
+	}
+}
+
+// TestSyncOutcome pins the label a finished cycle carries on
+// dotvault.sync.ticks. The cancelled case is the one with history: an
+// interrupted cycle used to break out of the rule loop without setting an
+// error, so RunOnce returned nil and recorded the partial cycle as "ok" —
+// inflating the success rate with cycles that never ran their whole rule set.
+// Folding it into "error" instead would be the opposite mistake, putting every
+// daemon shutdown into the failure rate an operator alerts on.
+func TestSyncOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"complete", nil, "ok"},
+		{"rule failed", errors.New("render template: boom"), "error"},
+		{"cancelled", context.Canceled, "cancelled"},
+		{"deadline", context.DeadlineExceeded, "cancelled"},
+		{"wrapped cancellation", fmt.Errorf("sync cycle interrupted after 2 rules: %w", context.Canceled), "cancelled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := syncOutcome(tc.err); got != tc.want {
+				t.Errorf("syncOutcome(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEngine_RunOnceReportsInterruption pins that a cycle cancelled *between*
+// rules is reported as interrupted rather than as a clean sweep. This is the
+// exact shape that previously returned nil: some rules already synced fine, no
+// rule error, and then cancellation — so nothing ever set the error and RunOnce
+// recorded a partial cycle as a completed one.
+//
+// The interleaving is forced through the include predicate rather than raced
+// for: runRulesLocked calls it before the between-rules ctx check, so a
+// predicate that cancels once it has admitted the first rule puts the loop in
+// precisely that state every run.
+func TestEngine_RunOnceReportsInterruption(t *testing.T) {
+	dir := t.TempDir()
+	firstPath := filepath.Join(dir, "first")
+	secondPath := filepath.Join(dir, "second")
+
+	mkRule := func(name, path, host string) config.Rule {
+		return config.Rule{
+			Name: name, // keyless throughout: no vault client is needed
+			Target: config.Target{
+				Path:     path,
+				Format:   "ssh_config",
+				Template: "Host " + host + "\n    User {{ username }}\n",
+			},
+		}
+	}
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{mkRule("first", firstPath, "one"), mkRule("second", secondPath, "two")},
+	}
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var admitted int
+	include := func(config.Rule) bool {
+		admitted++
+		if admitted == 2 {
+			// The first rule has been synced; stop the cycle before the second.
+			cancel()
+		}
+		return true
+	}
+
+	engine.mu.Lock()
+	ok, failed, err := engine.runRulesLocked(ctx, include)
+	engine.mu.Unlock()
+
+	if ok != 1 || failed != 0 {
+		t.Fatalf("runRulesLocked = (%d ok, %d failed), want (1, 0) — the setup must sync one rule cleanly and then be cancelled", ok, failed)
+	}
+	if err == nil {
+		t.Fatal("runRulesLocked returned nil for a cycle stopped by cancellation — RunOnce would record the partial cycle as \"ok\" on dotvault.sync.ticks")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want one wrapping context.Canceled so syncOutcome can label it", err)
+	}
+	if got := syncOutcome(err); got != "cancelled" {
+		t.Errorf("interrupted cycle labelled %q, want \"cancelled\"", got)
+	}
+	if _, statErr := os.Stat(firstPath); statErr != nil {
+		t.Errorf("rule before the cancellation point was not synced: %v", statErr)
+	}
+	if _, statErr := os.Stat(secondPath); !os.IsNotExist(statErr) {
+		t.Errorf("rule after the cancellation point was still synced (stat %s: %v)", secondPath, statErr)
 	}
 }

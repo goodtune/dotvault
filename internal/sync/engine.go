@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -114,10 +115,7 @@ func (e *Engine) currentInterval() time.Duration {
 func (e *Engine) RunOnce(ctx context.Context) error {
 	start := time.Now()
 	lastErr := e.runOnceLocked(ctx)
-	outcome := "ok"
-	if lastErr != nil {
-		outcome = "error"
-	}
+	outcome := syncOutcome(lastErr)
 	// Record outside the mutex: metric ops are independent of the
 	// engine's critical section, and dragging them inside would
 	// inflate the lock-hold window if the OTel exporter (or a
@@ -125,6 +123,29 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	observability.RecordSyncTick(ctx, outcome)
 	observability.RecordSyncDuration(ctx, time.Since(start), outcome)
 	return lastErr
+}
+
+// syncOutcome labels a finished cycle for dotvault.sync.ticks and
+// dotvault.sync.duration.
+//
+// A cancelled cycle gets its own value rather than folding into either
+// neighbour. Counted "ok" it would inflate the success rate with cycles that
+// never ran their whole rule set — the same conflation RunKeyless stays off
+// this counter to avoid, arriving by a different route. Counted "error" it
+// would put every daemon shutdown into the failure rate an operator alerts on.
+// Neither is true of an interruption, so it is reported as what it is.
+//
+// Kept a pure function of the error so the classification is unit-testable
+// without standing up a metric exporter.
+func syncOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "cancelled"
+	default:
+		return "error"
+	}
 }
 
 func (e *Engine) runOnceLocked(ctx context.Context) error {
@@ -154,7 +175,19 @@ func (e *Engine) runRulesLocked(ctx context.Context, include func(config.Rule) b
 		if include != nil && !include(rule) {
 			continue
 		}
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			// Report the interruption rather than breaking silently. A cycle
+			// that stopped early did not run its whole rule set, and a caller
+			// handed nil here cannot tell that from a complete one — RunOnce
+			// would record it as a successful full cycle on
+			// dotvault.sync.ticks, which is precisely the "one rate meaning
+			// two things" this package works to avoid.
+			//
+			// It overwrites an earlier rule's error deliberately: that error
+			// was already logged per rule above and is only ever the *last*
+			// one anyway, whereas the fact that this cycle is incomplete has
+			// no other carrier. syncOutcome keeps the two apart downstream.
+			lastErr = fmt.Errorf("sync cycle interrupted after %d rules: %w", ok+failed, err)
 			break
 		}
 		if err := e.syncRule(ctx, rule); err != nil {
@@ -242,7 +275,11 @@ func (e *Engine) RunLoop(ctx context.Context, opts ...RunLoopOption) error {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	if err := e.RunOnce(ctx); err != nil {
+	// Gated on ctx too: a cancelled initial sync now returns an error (see
+	// runRulesLocked), and "continuing into the loop" is false on the one path
+	// that is about to return instead. Per-rule failures are already logged
+	// individually, so nothing is lost by staying quiet here on shutdown.
+	if err := e.RunOnce(ctx); err != nil && ctx.Err() == nil {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
 	// Don't fire the readiness hook if ctx has been cancelled

@@ -758,63 +758,82 @@ func TestEngine_RunKeylessStopsOnCancelledContext(t *testing.T) {
 	}
 }
 
+// keylessRule builds a rule with no vault_key whose template needs nothing but
+// the username, so a test can exercise the engine with a nil Vault client.
+func keylessRule(name, path, host string) config.Rule {
+	return config.Rule{
+		Name: name,
+		Target: config.Target{
+			Path:     path,
+			Format:   "ssh_config",
+			Template: "Host " + host + "\n    User {{ username }}\n",
+		},
+	}
+}
+
 // TestSyncOutcome pins the label a finished cycle carries on
-// dotvault.sync.ticks. The cancelled case is the one with history: an
-// interrupted cycle used to break out of the rule loop without setting an
-// error, so RunOnce returned nil and recorded the partial cycle as "ok" —
-// inflating the success rate with cycles that never ran their whole rule set.
-// Folding it into "error" instead would be the opposite mistake, putting every
-// daemon shutdown into the failure rate an operator alerts on.
+// dotvault.sync.ticks. Two histories meet here.
+//
+// The cancelled case: an interrupted cycle used to break out of the rule loop
+// without setting an error, so RunOnce returned nil and recorded the partial
+// cycle as "ok" — inflating the success rate with cycles that never ran their
+// whole rule set. Folding it into "error" instead would be the opposite
+// mistake, putting every daemon shutdown into the failure rate.
+//
+// The "vault timeout" case: classification once tested the error chain for
+// context.DeadlineExceeded, which the Vault client's own HTTP timeout
+// satisfies — so a genuinely failing rule was labelled "cancelled" and dropped
+// out of the failure rate. The failure count, not the chain, is what decides.
 func TestSyncOutcome(t *testing.T) {
+	interrupted := fmt.Errorf("%w after 2 rules: %w", errCycleInterrupted, context.Canceled)
+
 	for _, tc := range []struct {
-		name string
-		err  error
-		want string
+		name   string
+		err    error
+		failed int
+		want   string
 	}{
-		{"complete", nil, "ok"},
-		{"rule failed", errors.New("render template: boom"), "error"},
-		{"cancelled", context.Canceled, "cancelled"},
-		{"deadline", context.DeadlineExceeded, "cancelled"},
-		{"wrapped cancellation", fmt.Errorf("sync cycle interrupted after 2 rules: %w", context.Canceled), "cancelled"},
+		{"complete", nil, 0, "ok"},
+		{"rule failed", errors.New("render template: boom"), 1, "error"},
+		{"interrupted", interrupted, 0, "cancelled"},
+		{"interrupted after a failure", errors.New("render template: boom"), 1, "error"},
+		// A rule error carrying a context error in its chain must not be read
+		// as a cancellation: this is a real Vault read timeout, not a shutdown.
+		{"vault timeout", fmt.Errorf("read vault secret: %w", context.DeadlineExceeded), 1, "error"},
+		// Even with no failures, a bare context error that is not our sentinel
+		// is some other fault, not a cycle this package chose to stop.
+		{"foreign context error", context.DeadlineExceeded, 0, "error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := syncOutcome(tc.err); got != tc.want {
-				t.Errorf("syncOutcome(%v) = %q, want %q", tc.err, got, tc.want)
+			if got := syncOutcome(tc.err, tc.failed); got != tc.want {
+				t.Errorf("syncOutcome(%v, failed=%d) = %q, want %q", tc.err, tc.failed, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestEngine_RunOnceReportsInterruption pins that a cycle cancelled *between*
+// TestEngine_RunRulesReportsInterruption pins that a cycle cancelled *between*
 // rules is reported as interrupted rather than as a clean sweep. This is the
-// exact shape that previously returned nil: some rules already synced fine, no
-// rule error, and then cancellation — so nothing ever set the error and RunOnce
+// exact shape that previously returned nil: a rule already synced fine, no rule
+// error, and then cancellation — so nothing ever set the error and RunOnce
 // recorded a partial cycle as a completed one.
 //
 // The interleaving is forced through the include predicate rather than raced
-// for: runRulesLocked calls it before the between-rules ctx check, so a
-// predicate that cancels once it has admitted the first rule puts the loop in
-// precisely that state every run.
-func TestEngine_RunOnceReportsInterruption(t *testing.T) {
+// for: runRulesLocked consults the predicate before its cancellation check
+// (stated in that function's doc, so this is a contract and not a layout
+// accident), which puts the loop in precisely that state on every run.
+func TestEngine_RunRulesReportsInterruption(t *testing.T) {
 	dir := t.TempDir()
 	firstPath := filepath.Join(dir, "first")
 	secondPath := filepath.Join(dir, "second")
 
-	mkRule := func(name, path, host string) config.Rule {
-		return config.Rule{
-			Name: name, // keyless throughout: no vault client is needed
-			Target: config.Target{
-				Path:     path,
-				Format:   "ssh_config",
-				Template: "Host " + host + "\n    User {{ username }}\n",
-			},
-		}
-	}
-
 	cfg := &config.Config{
 		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
 		Sync:  config.SyncConfig{Interval: time.Hour},
-		Rules: []config.Rule{mkRule("first", firstPath, "one"), mkRule("second", secondPath, "two")},
+		Rules: []config.Rule{
+			keylessRule("first", firstPath, "one"),
+			keylessRule("second", secondPath, "two"),
+		},
 	}
 	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
 
@@ -841,10 +860,10 @@ func TestEngine_RunOnceReportsInterruption(t *testing.T) {
 	if err == nil {
 		t.Fatal("runRulesLocked returned nil for a cycle stopped by cancellation — RunOnce would record the partial cycle as \"ok\" on dotvault.sync.ticks")
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("error = %v, want one wrapping context.Canceled so syncOutcome can label it", err)
+	if !errors.Is(err, errCycleInterrupted) {
+		t.Errorf("error = %v, want one wrapping errCycleInterrupted so syncOutcome can label it", err)
 	}
-	if got := syncOutcome(err); got != "cancelled" {
+	if got := syncOutcome(err, failed); got != "cancelled" {
 		t.Errorf("interrupted cycle labelled %q, want \"cancelled\"", got)
 	}
 	if _, statErr := os.Stat(firstPath); statErr != nil {
@@ -852,5 +871,82 @@ func TestEngine_RunOnceReportsInterruption(t *testing.T) {
 	}
 	if _, statErr := os.Stat(secondPath); !os.IsNotExist(statErr) {
 		t.Errorf("rule after the cancellation point was still synced (stat %s: %v)", secondPath, statErr)
+	}
+}
+
+// TestEngine_RunRulesKeepsRuleErrorOverInterruption pins the half the previous
+// test cannot reach: when a rule has genuinely failed *and* the cycle is then
+// cancelled, the failure is what survives. Without this, mutating the
+// interruption branch to overwrite unconditionally passes the whole suite,
+// and a real failure would be relabelled "cancelled" on shutdown — quietly
+// leaving the failure rate an operator alerts on.
+func TestEngine_RunRulesKeepsRuleErrorOverInterruption(t *testing.T) {
+	dir := t.TempDir()
+	badPath := filepath.Join(dir, "bad")
+	goodPath := filepath.Join(dir, "good")
+
+	bad := keylessRule("bad", badPath, "one")
+	bad.Target.Template = "Host {{ .nope | callWhatDoesNotExist }}\n" // fails to parse
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{bad, keylessRule("good", goodPath, "two")},
+	}
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var admitted int
+	include := func(config.Rule) bool {
+		admitted++
+		if admitted == 2 {
+			cancel() // cancel after the failing rule, before the good one
+		}
+		return true
+	}
+
+	engine.mu.Lock()
+	ok, failed, err := engine.runRulesLocked(ctx, include)
+	engine.mu.Unlock()
+
+	if ok != 0 || failed != 1 {
+		t.Fatalf("runRulesLocked = (%d ok, %d failed), want (0, 1) — the setup must fail one rule and then be cancelled", ok, failed)
+	}
+	if errors.Is(err, errCycleInterrupted) {
+		t.Errorf("interruption overwrote the rule failure (%v) — the failure is the actionable half and must survive", err)
+	}
+	if got := syncOutcome(err, failed); got != "error" {
+		t.Errorf("cycle with a failed rule labelled %q, want \"error\" — a real failure must not leave the failure rate because a shutdown followed it", got)
+	}
+}
+
+// TestEngine_RunOnceLabelsCancellation covers the RunOnce path itself — the one
+// that records the metric — rather than runRulesLocked underneath it, so the
+// plumbing of the failure count into syncOutcome is exercised end to end.
+func TestEngine_RunOnceLabelsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+
+	cfg := &config.Config{
+		Vault: config.VaultConfig{KVMount: "secret", UserPrefix: "users/"},
+		Sync:  config.SyncConfig{Interval: time.Hour},
+		Rules: []config.Rule{keylessRule("only", target, "one")},
+	}
+	engine := NewEngine(cfg, nil, "goodtune", filepath.Join(dir, "state.json"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := engine.RunOnce(ctx)
+	if err == nil {
+		t.Fatal("RunOnce returned nil under a cancelled context — the cycle would be counted as a completed one")
+	}
+	if got := syncOutcome(err, 0); got != "cancelled" {
+		t.Errorf("RunOnce error labelled %q, want \"cancelled\"", got)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Errorf("cancelled cycle still wrote %s (stat: %v)", target, statErr)
 	}
 }

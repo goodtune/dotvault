@@ -267,7 +267,7 @@ func (t *Tree) Document(ctx context.Context, path string) (*Document, error) {
 		return nil, nil
 	}
 
-	doc, err := renderDocument(secret)
+	doc, err := RenderDocument(secret)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +316,13 @@ func (t *Tree) Remove(ctx context.Context, path string) error {
 	t.cache.invalidate(kvPath)
 	return nil
 }
+
+// CleanPath validates a slash-separated path relative to the user's KV root
+// and returns it in canonical form (no leading or trailing slash, no empty
+// segments); "" is the root. It is the one definition of what a relative KV
+// path may look like, shared with the Docker volume plugin so a volume's
+// `secrets=` option is judged by exactly the rule the mount applies.
+func CleanPath(p string) (string, error) { return cleanPath(p) }
 
 // cleanPath validates a slash-separated relative path and returns it in
 // canonical form (no leading or trailing slash, no empty segments).

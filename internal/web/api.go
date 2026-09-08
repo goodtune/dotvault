@@ -112,6 +112,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["fuse"] = fuseStatus()
 	}
 
+	// Docker volume plugin state (socket, refresh policy, per-volume
+	// counts and last error). Unauthenticated like the blocks above: it
+	// names volumes and the KV paths they select — visible in any listing
+	// — never a secret's contents.
+	if dockerStatus := s.dockerStatusSnapshot(); dockerStatus != nil {
+		status["docker"] = dockerStatus()
+	}
+
 	writeJSON(w, status)
 }
 

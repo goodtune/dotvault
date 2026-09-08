@@ -419,6 +419,7 @@ type staticSections struct {
 	Agent         config.AgentConfig
 	API           config.APIConfig
 	FUSE          config.FUSEConfig
+	Docker        config.DockerConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
 	Bypass        bool
@@ -431,6 +432,7 @@ func staticSectionsOf(c *config.Config) staticSections {
 		Agent:         c.Agent,
 		API:           c.API,
 		FUSE:          c.FUSE,
+		Docker:        c.Docker,
 		Observability: c.Observability,
 		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
@@ -537,6 +539,9 @@ func changedStaticSections(a, b staticSections) []string {
 	}
 	if !reflect.DeepEqual(a.FUSE, b.FUSE) {
 		out = append(out, "fuse")
+	}
+	if !reflect.DeepEqual(a.Docker, b.Docker) {
+		out = append(out, "docker")
 	}
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")
@@ -1108,6 +1113,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("web server failed to start: %w", err)
 			}
 		}
+	}
+
+	// Serve the Docker volume plugin, before authentication for the same
+	// reason the agent and HTTP listeners start here: the engine's
+	// bookkeeping calls (`docker volume ls`, `create`, `inspect`) need no
+	// token, and a Mount that would have to populate a volume is refused by
+	// the driver with a message naming the cause rather than by an absent
+	// socket the engine reports as "plugin not found". Never fatal — see
+	// startDockerVolumes.
+	dockerDriver := startDockerVolumes(ctx, cfg, vc, username)
+	if dockerDriver != nil && webServer != nil {
+		webServer.SetDockerStatus(dockerDriver.Status)
 	}
 
 	// Sync the keyless rules before authenticating. A rule with no vault_key
@@ -1918,6 +1935,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	printAgentStatus(ctx, cfg)
 
 	printFUSEStatus(cfg)
+
+	printDockerStatus(ctx, cfg)
 
 	return nil
 }

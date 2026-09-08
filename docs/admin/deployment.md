@@ -190,6 +190,20 @@ The unit hard-codes a couple of system paths that the package owns: `ExecStart=/
 
     Note also that anything declaring `After=dotvault.service` now blocks until the first sync completes — a behavioural change from the previous manually-created unit which had no `Type=notify` gate.
 
+#### Hardening and the FUSE mount
+
+Do not add systemd sandboxing to this unit, and check any `systemctl --user edit` drop-in for it. The packaged unit sets no `NoNewPrivileges=`, `RestrictNamespaces=`, `RestrictSUIDSGID=` or `LockPersonality=`, and that is deliberate: `NoNewPrivileges=` makes `execve` ignore the setuid bit and file capabilities for the daemon and every process below it, which disarms the FUSE mount helper and breaks [`fuse.enabled`](../guide/filesystem.md) outright. The daemon asks the kernel to mount directly first, but that needs `CAP_SYS_ADMIN`, which a user manager cannot grant, so the helper is the only path it has.
+
+The constraint covers the whole seccomp-based class, not those four names — `RestrictRealtime=`, `MemoryDenyWriteExecute=`, `SystemCallFilter=`, `ProtectClock=`, `ProtectKernelTunables=`, `PrivateDevices=` and friends all make systemd imply `NoNewPrivileges=yes` in a unit that cannot install the filter otherwise, which is every user-manager service. A drop-in adding any one of them re-breaks the mount, and does so with nothing in the log naming the cause.
+
+Little is given up by leaving them out. A per-user service already runs with the user's own authority — it can read `~/.ssh` and write `~/.bashrc` or `~/.config/systemd/user/` — so a compromised daemon that wants an unconfined process arranges to be run again outside the unit rather than escaping the sandbox. These directives were defence in depth against an exploit that cannot persist, not a boundary. `UMask=0077` is not seccomp-based, has no effect on the mount, and is kept.
+
+If you do not use `fuse.enabled`, the directives are harmless — but the packaged unit is shared, so re-add them only in a drop-in on hosts where you know the filesystem is off.
+
+<!-- TRANSITIONAL: added after v0.35.0 for the systemd sandbox-directive removal. Remove this admonition around v0.38.0 (≈3 minor releases) once upgrading installs are unlikely. -->
+!!! note "Upgrading from v0.35.0 or earlier"
+    Units shipped up to v0.35.0 carried those four directives, and `fuse.enabled` could not have worked under them. A package upgrade replaces the packaged unit, but it will **not** touch a copy you made at `~/.config/systemd/user/dotvault.service` or a drop-in you wrote — both shadow the packaged file. If the filesystem does not mount after upgrading, check those two places first, then `systemctl --user daemon-reload`.
+
 ### launchd (macOS)
 
 ```xml
@@ -346,6 +360,7 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 - **Atomic writes** — all file writes use temp file + rename to prevent partial writes.
 - **Web UI** — loopback only, CSRF-protected, strict Content Security Policy.
 - **Windows** — DACL-based permission checks via the Windows Security API.
+- **systemd sandboxing** — the packaged user unit deliberately carries none, because the seccomp-based directives disarm the FUSE mount helper; see [Hardening and the FUSE mount](#hardening-and-the-fuse-mount) for what that does and does not cost.
 
 ## Config reload
 

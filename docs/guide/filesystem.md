@@ -111,7 +111,7 @@ The file must be a single YAML document — a `---` separator is refused rather 
 
 | Platform | Requirement |
 |----------|-------------|
-| Linux | A FUSE-capable kernel (`/dev/fuse`) and the `fusermount3` helper, from the `fuse3` package on most distributions. A daemon with `CAP_SYS_ADMIN` can mount without the helper |
+| Linux | A FUSE-capable kernel (`/dev/fuse`) and the `fusermount3` helper, from the `fuse3` package on most distributions. The helper is privileged (setuid root, or file capabilities on distros that prefer them), so a service manager that sets `NoNewPrivileges=` will break the mount — see [Troubleshooting](#troubleshooting). A daemon with `CAP_SYS_ADMIN` can mount without the helper |
 | macOS | [macFUSE](https://macfuse.github.io/), installed separately. macOS requires approving its kernel extension in System Settings |
 | FreeBSD | The in-kernel `fusefs` module |
 | Windows | **Not supported.** Setting `fuse.enabled` logs a warning and mounts nothing |
@@ -196,6 +196,12 @@ The mount only shows what your Vault token can read, so a token scoped more tigh
 A policy that grants `read` on specific paths without granting `list` on their parent is handled: `ls` reports the permission error, but opening a path you know the name of still works, because the lookup falls back to reading the path directly.
 
 ## Troubleshooting
+
+**The mount fails under systemd, with a `fusermount` permission error** (Linux) — the daemon reports something like `fusermount exited with code 1`, and the helper's own message on stderr is typically `mount failed: Operation not permitted`. The service unit is setting `NoNewPrivileges=`, directly or by implication. It makes `execve` ignore the setuid bit and file capabilities for the daemon and every process below it, and the mount helper is privileged exactly that way; dotvault asks the kernel to mount directly first, but that needs `CAP_SYS_ADMIN`, which a user manager cannot grant, so the helper is the only path left.
+
+Removing just that one line is usually not enough. `RestrictNamespaces=`, `RestrictSUIDSGID=`, `LockPersonality=` and the other seccomp-based directives (`RestrictRealtime=`, `MemoryDenyWriteExecute=`, `SystemCallFilter=`, `ProtectClock=`, `ProtectKernelTunables=`, `PrivateDevices=` …) each make systemd imply `NoNewPrivileges=yes` in any unit that cannot install the filter otherwise — which is every user-manager service — so the whole class has to come out together. The exception is a directive your systemd is too old to know (`RestrictSUIDSGID=` needs 242+, `LockPersonality=` 235+) or a build without seccomp support: those are ignored, and imply nothing. Do not rely on that, since it varies by distro.
+
+The packaged `dotvault.service` ships without them and explains why in a comment. If you run a hand-rolled unit, or a `systemctl --user edit` drop-in, check it against that one — see [Deployment](../admin/deployment.md#hardening-and-the-fuse-mount).
 
 **`Transport endpoint is not connected`** — a daemon died without unmounting. The next daemon start detects this and clears it automatically. To clear it by hand: `fusermount3 -u ~/.dotvault` (Linux, or `fusermount -u` on older `fuse2` systems) or `umount ~/.dotvault` (macOS).
 

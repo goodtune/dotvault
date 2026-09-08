@@ -1,6 +1,7 @@
 [Unit]
 Description=dotvault — Vault-to-file secret synchronisation daemon
 Documentation=https://github.com/goodtune/dotvault
+Documentation=https://goodtune.github.io/dotvault/admin/deployment/
 
 # Per-user daemon: authenticates to Vault as the OS user, reads
 # ~/.dotvault-token from that user's $HOME, and syncs into
@@ -71,8 +72,8 @@ EnvironmentFile=-/etc/sysconfig/dotvault
 # process and, irrevocably, every descendant. The FUSE mount helper
 # (fusermount3, or fusermount on fuse2 hosts) is privileged exactly that
 # way, and it is the only mount path an unprivileged daemon has: go-fuse
-# asks for mount(2) first (DirectMount, internal/vaultfs/mount_fuse.go),
-# but that needs CAP_SYS_ADMIN, which a user manager cannot grant.
+# asks for mount(2) first (its DirectMount option), but that needs
+# CAP_SYS_ADMIN, which a user manager cannot grant.
 #
 # The trap is that the rest re-imply it. systemd turns NoNewPrivileges=yes
 # on for any seccomp-based directive in a unit that cannot install the
@@ -85,7 +86,8 @@ EnvironmentFile=-/etc/sysconfig/dotvault
 #
 # Little is lost. A per-user service already runs with the user's own
 # authority, so these were defence in depth against an exploit that cannot
-# persist, not a boundary. CLAUDE.md (Filesystem) carries the reasoning.
+# persist, not a boundary. Full reasoning:
+# https://goodtune.github.io/dotvault/admin/deployment/#hardening-and-the-fuse-mount
 #
 # UMask= is plain umask(2) — no seccomp, no capability, no effect on the
 # mount — so the one piece of hardening that does work here stays.

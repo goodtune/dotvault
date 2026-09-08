@@ -48,4 +48,18 @@ jobs:
             echo "::error file=packaging/linux/dotvault.service::seccomp-based sandbox directive present; this breaks fuse.enabled (see the comment in the unit)"
             exit 1
           fi
+          # The unit ships to installed systems where CLAUDE.md and the docs
+          # tree are absent, so it points at the published docs instead. Only
+          # docs/ is covered by `mkdocs build --strict`, so without this a
+          # heading rename would silently strand that link.
+          for anchor in $(grep -oE 'goodtune\.github\.io/dotvault/admin/deployment/#[a-z0-9-]+' \
+                            packaging/linux/dotvault.service | sed 's/.*#//' | sort -u); do
+            heading=$(grep -oiE '^#+ .*' docs/admin/deployment.md \
+                        | sed -E 's/^#+ //; s/[^A-Za-z0-9 -]//g' \
+                        | tr '[:upper:] ' '[:lower:]-' | grep -Fx "$anchor" || true)
+            if [ -z "$heading" ]; then
+              echo "::error file=packaging/linux/dotvault.service::unit links to #$anchor, which is not a heading in docs/admin/deployment.md"
+              exit 1
+            fi
+          done
 

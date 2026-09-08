@@ -58,13 +58,42 @@ EnvironmentFile=-%h/.config/dotvault.env
 EnvironmentFile=-/etc/default/dotvault
 EnvironmentFile=-/etc/sysconfig/dotvault
 
-# Only sandbox directives that work in a non-root user manager. The
-# Protect*/Private* knobs need CAP_SETPCAP / CAP_SYS_ADMIN and would
-# fail the spawn at step CAPABILITIES with exit 218.
-NoNewPrivileges=true
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-LockPersonality=true
+# Deliberately no sandbox directives: they break fuse.enabled. The rule
+# is broader than the four this unit used to carry (NoNewPrivileges=,
+# RestrictNamespaces=, RestrictSUIDSGID=, LockPersonality=) — anything
+# systemd implements with a seccomp filter is off limits here, including
+# RestrictRealtime=, MemoryDenyWriteExecute=, ProtectClock=,
+# ProtectKernelTunables/Modules/Logs=, PrivateDevices=, SystemCallFilter=
+# and SystemCallArchitectures=.
+#
+# NoNewPrivileges= is the mechanism. It sets PR_SET_NO_NEW_PRIVS, which
+# makes execve ignore the setuid bit and file capabilities for this
+# process and, irrevocably, every descendant. The FUSE mount helper
+# (fusermount3, or fusermount on fuse2 hosts) is privileged exactly that
+# way, and it is the only mount path an unprivileged daemon has: go-fuse
+# asks for mount(2) first (DirectMount, internal/vaultfs/mount_fuse.go),
+# but that needs CAP_SYS_ADMIN, which a user manager cannot grant.
+#
+# The trap is that the rest re-imply it. systemd turns NoNewPrivileges=yes
+# on for any seccomp-based directive in a unit that cannot install the
+# filter otherwise, which is every user-manager service — so removing the
+# explicit line while keeping its neighbours leaves the mount broken with
+# nothing naming the cause. Where the running systemd predates a directive
+# (RestrictSUIDSGID= is 242+, LockPersonality= 235+) or was built without
+# seccomp it is ignored instead, giving neither hardening nor implication;
+# that varies by distro, so do not lean on it.
+#
+# Little is lost. A per-user service already runs with the user's own
+# authority, so these were defence in depth against an exploit that cannot
+# persist, not a boundary. CLAUDE.md (Filesystem) carries the reasoning.
+#
+# UMask= is plain umask(2) — no seccomp, no capability, no effect on the
+# mount — so the one piece of hardening that does work here stays.
+UMask=0077
+
+# There is no Protect*/Private* block for a different reason: those need
+# CAP_SETPCAP / CAP_SYS_ADMIN and fail the spawn at step CAPABILITIES with
+# exit 218 in a user manager.
 
 [Install]
 WantedBy=default.target

@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,9 +19,28 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
+// requireUnixPerms skips a test whose assertions rest on Unix mode bits or
+// on renaming over a read-only file, neither of which Windows offers. The
+// plugin is served on Linux only; the package still compiles everywhere.
+func requireUnixPerms(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("volume files rely on unix permissions; the plugin is linux only")
+	}
+}
+
 func newTestDriver(t *testing.T, store *memStore, events EventSource) (*Driver, string) {
 	t.Helper()
+	requireUnixPerms(t)
 	base := t.TempDir()
+	// Run creates and marks the volume dir; tests that drive the driver
+	// without Run need the same starting point.
+	if err := os.MkdirAll(filepath.Join(base, "volumes"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "volumes", volumeDirMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	d, err := New(Options{
 		SocketPath: filepath.Join(base, "docker.sock"),
 		VolumeDir:  filepath.Join(base, "volumes"),
@@ -381,6 +402,9 @@ func TestEnterpriseRefreshesOnEventsNotTicks(t *testing.T) {
 // Enterprise with the subscription down: the ticker takes over until it
 // reconnects, and the reconnect re-renders everything.
 func TestEnterpriseFallsBackToPollingWhenSubscriptionDrops(t *testing.T) {
+	prevMin := reconnectMin
+	reconnectMin = 50 * time.Millisecond
+	t.Cleanup(func() { reconnectMin = prevMin })
 	store := newMemStore()
 	store.put("gh", map[string]any{"a": "1"})
 	events := &fakeEvents{enterprise: true}
@@ -407,7 +431,7 @@ func TestEnterpriseFallsBackToPollingWhenSubscriptionDrops(t *testing.T) {
 	store.put("gh", map[string]any{"a": "2"})
 	eventually(t, "poll-driven refresh while disconnected", func() bool { return fileHas(filepath.Join(mp, "gh.json"), `"2"`) })
 
-	// The watcher reconnects after its backoff (1s) and re-renders.
+	// The watcher reconnects after its backoff and re-renders.
 	store.put("gh", map[string]any{"a": "3"})
 	eventually(t, "reconnect", func() bool { return events.subscribed() >= 2 && d.eventsDriving() })
 	eventually(t, "refresh on reconnect", func() bool { return fileHas(filepath.Join(mp, "gh.json"), `"3"`) })
@@ -452,6 +476,10 @@ func TestCommunityPollsOnTTL(t *testing.T) {
 // The watcher waits for a token before touching Vault, and an edition probe
 // that fails is retried rather than assumed.
 func TestWatcherWaitsForTokenAndRetriesProbe(t *testing.T) {
+	// Shorten the pacing so the test measures ordering, not wall clock.
+	prevPoll, prevMin := tokenPoll, reconnectMin
+	tokenPoll, reconnectMin = 20*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { tokenPoll, reconnectMin = prevPoll, prevMin })
 	events := &fakeEvents{enterprise: true, healthErr: errors.New("connection refused")}
 	d, _ := newTestDriver(t, newMemStore(), events)
 	var hasToken atomic.Bool
@@ -491,5 +519,192 @@ func TestRelPath(t *testing.T) {
 		if got != want || ok != (want != "") {
 			t.Errorf("relPath(%q) = %q,%v want %q", in, got, ok, want)
 		}
+	}
+}
+
+// An event that lands while the first Mount is still rendering is not lost:
+// the loop it starts renders again immediately.
+func TestEventDuringPopulateIsNotDropped(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	d, _ := newTestDriver(t, store, nil)
+	d.setEdition(editionEnterprise)
+	d.setEvents(true, nil)
+	if err := d.Create("v", nil); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	v := d.volumes["v"]
+	v.populating = 1 // as Mount would have set before rendering
+	d.mu.Unlock()
+	d.dispatch(vault.Event{EventType: "kv-v2/data-write", Path: "users/gary/gh"})
+	d.mu.Lock()
+	pending := v.pendingEvent
+	v.populating = 0
+	d.mu.Unlock()
+	if !pending {
+		t.Fatal("event during populate was dropped")
+	}
+	mp, err := d.Mount(context.Background(), "v", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mount rendered "1"; the pending event must force a second render,
+	// which picks up the change made after the first.
+	store.put("gh", map[string]any{"a": "2"})
+	eventually(t, "pending event honoured", func() bool { return fileHas(filepath.Join(mp, "gh.json"), `"2"`) })
+}
+
+// Remove trusts the engine over the driver's own count, and a Mount that
+// loses the race to a Remove leaves no secrets behind.
+func TestRemoveWithOutstandingMountsAndMountAfterRemove(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	d, _ := newTestDriver(t, store, nil)
+	if err := d.Create("v", nil); err != nil {
+		t.Fatal(err)
+	}
+	mp, err := d.Mount(context.Background(), "v", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Remove("v"); err != nil {
+		t.Fatalf("Remove with an outstanding mount must succeed: %v", err)
+	}
+	if _, err := os.Stat(mp); !errors.Is(err, os.ErrNotExist) {
+		t.Error("Remove must delete the directory")
+	}
+
+	// Mount racing Remove: simulate by removing the registry entry while a
+	// Mount is between its two locks.
+	if err := d.Create("w", nil); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	w := d.volumes["w"]
+	d.mu.Unlock()
+	w.opMu.Lock()
+	dir := d.volumePath("w")
+	if _, err := materialise(context.Background(), store, dir, w.Spec); err != nil {
+		t.Fatal(err)
+	}
+	w.opMu.Unlock()
+	if err := d.Remove("w"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(context.Background(), "w", "c1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Mount after Remove = %v, want ErrNotFound", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Error("secrets left on disk for a removed volume")
+	}
+}
+
+// A last Unmount racing a new Mount must not leave the new container an
+// empty directory: the wipe re-checks under the locks and stands down, or
+// the new loop renders immediately.
+func TestUnmountRacingMountKeepsVolumePopulated(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	d, _ := newTestDriver(t, store, nil)
+	if err := d.Create("v", nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for i := range 20 {
+		mp, err := d.Mount(ctx, "v", "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = d.Unmount("v", "a") }()
+		go func() { defer wg.Done(); _, _ = d.Mount(ctx, "v", "b") }()
+		wg.Wait()
+		info, err := d.Get("v")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Status[StatusMounts] != 1 {
+			t.Fatalf("iteration %d: mounts = %v, want 1", i, info.Status[StatusMounts])
+		}
+		eventually(t, "volume populated after the race", func() bool { return fileHas(filepath.Join(mp, "gh.json"), `"1"`) })
+		if err := d.Unmount("v", "b"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(mp); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("iteration %d: directory survived the last unmount", i)
+		}
+	}
+}
+
+func TestProtocolMountWithoutTokenIsAnError(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.HasToken = func() bool { return false }
+	srv := httptest.NewServer(d.Handler())
+	defer srv.Close()
+	call(t, srv, pathCreate, map[string]any{"Name": "v"})
+	code, out := call(t, srv, pathMount, map[string]any{"Name": "v", "ID": "c1"})
+	if code != 500 || !strings.Contains(out["Err"].(string), "not authenticated") {
+		t.Errorf("Mount without a token = %d %v, want a 500 naming the cause", code, out)
+	}
+}
+
+func TestQueryListening(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Run is linux only")
+	}
+	store := newMemStore()
+	d, _ := newTestDriver(t, store, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.Run(ctx)
+	eventually(t, "socket", func() bool { _, err := os.Stat(d.opts.SocketPath); return err == nil })
+	if err := d.Create("v", nil); err != nil {
+		t.Fatal(err)
+	}
+	vols, err := QueryListening(ctx, d.opts.SocketPath)
+	if err != nil {
+		t.Fatalf("QueryListening: %v", err)
+	}
+	if len(vols) != 1 || vols[0].Name != "v" {
+		t.Errorf("volumes = %+v", vols)
+	}
+	if st := d.Status(); !st.Serving {
+		t.Errorf("Status.Serving = false while Run serves: %+v", st)
+	}
+	if _, err := QueryListening(ctx, filepath.Join(t.TempDir(), "absent.sock")); err == nil {
+		t.Error("QueryListening against no socket must fail")
+	}
+}
+
+// A non-empty directory the driver did not create is refused, so a mistyped
+// docker.volume_dir cannot become a startup that prunes the user's files.
+func TestRunRefusesForeignVolumeDir(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Run is linux only")
+	}
+	base := t.TempDir()
+	foreign := filepath.Join(base, "home")
+	os.MkdirAll(filepath.Join(foreign, "Documents"), 0o700)
+	os.WriteFile(filepath.Join(foreign, "notes.txt"), []byte("keep"), 0o600)
+	d, err := New(Options{
+		SocketPath: filepath.Join(base, "docker.sock"),
+		VolumeDir:  foreign,
+		StatePath:  filepath.Join(base, "state.json"),
+		DefaultTTL: time.Minute,
+	}, newMemStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("Run = %v, want a refusal naming the non-empty directory", err)
+	}
+	if _, err := os.Stat(filepath.Join(foreign, "Documents")); err != nil {
+		t.Error("the foreign directory's contents were touched")
+	}
+	if st := d.Status(); st.Serving || st.Error == "" {
+		t.Errorf("Status after a failed Run = %+v, want not serving with the error", st)
 	}
 }

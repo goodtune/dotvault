@@ -140,7 +140,12 @@ func (c *Config) validateDocker() error {
 		{"docker.socket", c.Docker.Socket},
 		{"docker.volume_dir", c.Docker.VolumeDir},
 	} {
-		if f.value == "" || strings.HasPrefix(f.value, "~") {
+		if f.value == "~" {
+			// The driver prunes and chmods the volume directory as its
+			// own; the home directory itself is never that.
+			return fmt.Errorf("%s: must name a path inside the home directory, not %q itself", f.name, f.value)
+		}
+		if f.value == "" || strings.HasPrefix(f.value, "~/") {
 			continue
 		}
 		// A leading slash counts as absolute on every platform, for the

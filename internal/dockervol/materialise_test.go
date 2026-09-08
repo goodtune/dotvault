@@ -14,6 +14,7 @@ import (
 
 func readTree(t *testing.T, dir string) map[string]string {
 	t.Helper()
+	requireUnixPerms(t)
 	out := map[string]string{}
 	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -245,5 +246,77 @@ func TestMaterialiseLayoutChangeReplacesEntries(t *testing.T) {
 	}
 	if _, ok := got["gh.json"]; ok {
 		t.Errorf("stale json file survived the switch: %v", got)
+	}
+}
+
+func TestMaterialiseGroupReadableMode(t *testing.T) {
+	store := newMemStore()
+	store.put("a/b", map[string]any{"a": "1"})
+	dir := filepath.Join(t.TempDir(), "vol")
+	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutJSON, Mode: 0o440, TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	readTree(t, dir)
+	f, _ := os.Stat(filepath.Join(dir, "a", "b.json"))
+	if f.Mode().Perm() != 0o440 {
+		t.Errorf("file mode = %o, want 0440", f.Mode().Perm())
+	}
+	d, _ := os.Stat(filepath.Join(dir, "a"))
+	if d.Mode().Perm() != 0o750 {
+		t.Errorf("dir mode = %o, want 0750", d.Mode().Perm())
+	}
+}
+
+// The directory is owner-writable, and under a rootless engine container
+// root is the owner: a symlink it plants must never lead a refresh outside
+// the volume — not for a chmod, not for a write, not for a read.
+func TestMaterialiseNeverFollowsSymlinksOutOfTheVolume(t *testing.T) {
+	store := newMemStore()
+	store.put("dir/secret", map[string]any{"a": "1"})
+	store.put("top", map[string]any{"a": "1"})
+	base := t.TempDir()
+	dir := filepath.Join(base, "vol")
+	outside := filepath.Join(base, "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "victim"), []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{Layout: LayoutJSON, Mode: 0o444, TTL: time.Minute}
+	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+		t.Fatal(err)
+	}
+	// The container swaps the subdirectory for a link to a host directory
+	// and a file for a link to a host file.
+	os.RemoveAll(filepath.Join(dir, "dir"))
+	if err := os.Symlink(outside, filepath.Join(dir, "dir")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	os.Remove(filepath.Join(dir, "top.json"))
+	os.Symlink(filepath.Join(outside, "victim"), filepath.Join(dir, "top.json"))
+
+	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	info, _ := os.Stat(outside)
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("outside directory mode changed to %o: the refresh followed a symlink", info.Mode().Perm())
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 1 {
+		t.Errorf("outside directory gained entries: %v", entries)
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "victim")); string(b) != "original" {
+		t.Errorf("outside file rewritten to %q", b)
+	}
+	got := readTree(t, dir)
+	for _, want := range []string{"dir/secret.json", "top.json"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("volume not repaired: %v", got)
+		}
+	}
+	if info, err := os.Lstat(filepath.Join(dir, "top.json")); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Error("planted symlink survived the refresh")
 	}
 }

@@ -198,7 +198,37 @@ func ParseOptions(opts map[string]string, defaultTTL time.Duration) (Spec, error
 	if spec.TTL <= 0 {
 		return Spec{}, fmt.Errorf("no refresh window: neither a ttl option nor a configured docker.cache_ttl")
 	}
+	if err := spec.validate(); err != nil {
+		return Spec{}, err
+	}
 	return spec, nil
+}
+
+// validate re-checks a Spec as a whole: the selection entries are canonical
+// paths, the layout is known, the mode sets read bits only, and the ttl is
+// inside the configured bounds. ParseOptions builds specs that pass by
+// construction; the persisted-state loader runs it on what it reads back.
+func (s Spec) validate() error {
+	for _, sel := range s.Secrets {
+		p, folder := strings.CutSuffix(sel, "/")
+		clean, err := vaultfs.CleanPath(p)
+		if err != nil || clean == "" || clean != p {
+			return fmt.Errorf("selection %q is not a canonical path", sel)
+		}
+		_ = folder
+	}
+	switch s.Layout {
+	case LayoutJSON, LayoutFields:
+	default:
+		return fmt.Errorf("layout %q is not one of %s, %s", s.Layout, LayoutJSON, LayoutFields)
+	}
+	if s.Mode == 0 || s.Mode&^modeReadBits != 0 || s.Mode&0o400 == 0 {
+		return fmt.Errorf("mode %04o may only set read bits and must include owner read", s.Mode)
+	}
+	if err := config.ValidateDockerTTL(s.TTL); err != nil {
+		return fmt.Errorf("ttl %s: %w", s.TTL, err)
+	}
+	return nil
 }
 
 // parseSelection splits a comma-separated `secrets=` value into canonical
@@ -245,7 +275,10 @@ func (s Spec) Covers(relPath string) bool {
 	}
 	for _, sel := range s.Secrets {
 		if folder, ok := strings.CutSuffix(sel, "/"); ok {
-			if relPath == folder || strings.HasPrefix(relPath, folder+"/") {
+			// The folder's own name is a different KV object (the secret
+			// "databricks" beside the folder "databricks/"), which render
+			// never emits for a folder selection, so it is not covered.
+			if strings.HasPrefix(relPath, folder+"/") {
 				return true
 			}
 			continue

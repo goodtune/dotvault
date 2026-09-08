@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/vaultfs"
@@ -93,12 +95,24 @@ func render(ctx context.Context, store vaultfs.Store, spec Spec) (*rendered, err
 	// as it does in the mount, so the secrets beneath it stay reachable.
 	for p := range r.files {
 		if r.dirs[p] {
-			slog.Warn("dockervol: a directory and a file claim the same name; the file is not written",
-				"path", displayPath(p))
+			warnCollision(p)
 			delete(r.files, p)
 		}
 	}
 	return r, nil
+}
+
+// collisionWarned records the paths already warned about, so a collision
+// is logged once per process rather than on every refresh — the same
+// once-per-path rule vaultfs.Tree applies.
+var collisionWarned sync.Map
+
+func warnCollision(p string) {
+	if _, seen := collisionWarned.LoadOrStore(p, struct{}{}); seen {
+		return
+	}
+	slog.Warn("dockervol: a directory and a file claim the same name; the file is not written",
+		"path", displayPath(p))
 }
 
 // emitPath reads one secret and adds its rendering to r. A secret that does
@@ -173,14 +187,26 @@ func fieldBytes(v any) ([]byte, bool) {
 // their contents or mode differ, and anything present that r does not
 // describe is removed. dir itself is never removed — a container may hold it
 // bind-mounted, and its inode is the container's view of the volume.
+//
+// Every operation inside dir goes through an os.Root, and that is a security
+// boundary rather than tidiness. Under a rootless engine container root *is*
+// the uid that owns these files, and unless the volume was mounted read-only
+// it can rearrange the directory between two refreshes — replace a
+// subdirectory with a symlink to ~/.ssh, say. Plain os calls would follow
+// that link: chmod the target to the volume's directory mode, or rename a
+// freshly rendered secret into it. An os.Root refuses any path that
+// resolves outside dir, so the worst such a container can do is disturb its
+// own volume, which the next refresh repairs.
 func apply(dir string, r *rendered, spec Spec) error {
 	dirMode := spec.DirMode()
-	if err := os.MkdirAll(dir, dirMode); err != nil {
+	if err := prepareVolumeDir(dir, dirMode); err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, dirMode); err != nil {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
 		return err
 	}
+	defer root.Close()
 
 	dirs := make([]string, 0, len(r.dirs))
 	for d := range r.dirs {
@@ -190,51 +216,77 @@ func apply(dir string, r *rendered, spec Spec) error {
 	// of a longer one.
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) < len(dirs[j]) })
 	for _, d := range dirs {
-		full := filepath.Join(dir, filepath.FromSlash(d))
-		if err := ensureDir(full, dirMode); err != nil {
+		if err := ensureDir(root, filepath.FromSlash(d), dirMode); err != nil {
 			return err
 		}
 	}
 
 	for p, e := range r.files {
-		full := filepath.Join(dir, filepath.FromSlash(p))
-		if unchanged(full, e.data, spec.Mode) {
+		rel := filepath.FromSlash(p)
+		if unchanged(root, rel, e.data, spec.Mode) {
+			// Same bytes in a new KV version still carry a new
+			// created_time; keep the inode and just move its mtime.
+			if !e.modTime.IsZero() {
+				if info, err := root.Lstat(rel); err == nil && !info.ModTime().Truncate(time.Second).Equal(e.modTime.Truncate(time.Second)) {
+					_ = root.Chtimes(rel, e.modTime, e.modTime)
+				}
+			}
 			continue
 		}
-		if err := writeAtomic(full, e, spec.Mode); err != nil {
+		if err := writeAtomic(root, rel, e, spec.Mode); err != nil {
 			return err
 		}
 	}
 
-	return prune(dir, r)
+	return prune(root, r)
 }
 
-// ensureDir creates a directory at full with the given mode, replacing a
-// non-directory that is in the way (a file left by a previous layout).
-func ensureDir(full string, mode os.FileMode) error {
-	info, err := os.Lstat(full)
+// prepareVolumeDir makes sure dir is a real directory at mode. A symlink is
+// refused rather than followed for the same reason vaultfs refuses a
+// symlinked mountpoint: the engine bind-mounts whatever this resolves to.
+func prepareVolumeDir(dir string, mode os.FileMode) error {
+	info, err := os.Lstat(dir)
+	switch {
+	case err == nil && info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("volume directory %s is a symlink", dir)
+	case err == nil && !info.IsDir():
+		return fmt.Errorf("volume directory %s exists and is not a directory", dir)
+	case err == nil:
+		return os.Chmod(dir, mode)
+	case errors.Is(err, fs.ErrNotExist):
+		return os.Mkdir(dir, mode)
+	default:
+		return err
+	}
+}
+
+// ensureDir creates a directory at rel with the given mode, replacing
+// whatever non-directory is in the way (a file left by a previous layout,
+// or a link a container planted).
+func ensureDir(root *os.Root, rel string, mode os.FileMode) error {
+	info, err := root.Lstat(rel)
 	switch {
 	case err == nil && info.IsDir():
-		return os.Chmod(full, mode)
+		return root.Chmod(rel, mode)
 	case err == nil:
-		if err := os.RemoveAll(full); err != nil {
+		if err := root.RemoveAll(rel); err != nil {
 			return err
 		}
 	case !errors.Is(err, fs.ErrNotExist):
 		return err
 	}
-	return os.Mkdir(full, mode)
+	return root.Mkdir(rel, mode)
 }
 
-// unchanged reports whether the regular file at full already holds data at
+// unchanged reports whether the regular file at rel already holds data at
 // mode, so a refresh that found nothing new leaves the inode alone and a
 // reader mid-way through the file is not switched to a new one for nothing.
-func unchanged(full string, data []byte, mode os.FileMode) bool {
-	info, err := os.Lstat(full)
+func unchanged(root *os.Root, rel string, data []byte, mode os.FileMode) bool {
+	info, err := root.Lstat(rel)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode || info.Size() != int64(len(data)) {
 		return false
 	}
-	existing, err := os.ReadFile(full)
+	existing, err := root.ReadFile(rel)
 	return err == nil && bytes.Equal(existing, data)
 }
 
@@ -245,84 +297,95 @@ const tempPrefix = ".dotvault-tmp-"
 // writeAtomic writes a file so a reader sees either the previous contents or
 // the new ones, never a partial write: the bytes land in a temp file in the
 // same directory, get their mode and mtime, and are renamed over the target.
-func writeAtomic(full string, e fileEntry, mode os.FileMode) error {
-	parent := filepath.Dir(full)
-	tmp, err := os.CreateTemp(parent, tempPrefix+"*")
+func writeAtomic(root *os.Root, rel string, e fileEntry, mode os.FileMode) error {
+	parent := filepath.Dir(rel)
+	var (
+		f    *os.File
+		name string
+		err  error
+	)
+	// O_EXCL with a random suffix, retried on collision: the directory is
+	// owner-writable and a leftover from a crash (or anything a container
+	// left there) must never be reused as our temp file.
+	for range 16 {
+		name = filepath.Join(parent, fmt.Sprintf("%s%08x", tempPrefix, rand.Uint32()))
+		f, err = root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
 	fail := func(err error) error {
-		tmp.Close()
-		os.Remove(name)
+		f.Close()
+		root.Remove(name)
 		return err
 	}
-	if _, err := tmp.Write(e.data); err != nil {
+	if _, err := f.Write(e.data); err != nil {
 		return fail(err)
 	}
-	if err := tmp.Chmod(mode); err != nil {
+	if err := f.Chmod(mode); err != nil {
 		return fail(err)
 	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
+	if err := f.Close(); err != nil {
+		root.Remove(name)
 		return err
 	}
 	if !e.modTime.IsZero() {
 		// Best effort: the timestamp is informational (the secret's
 		// version time, as the mount reports it), not something a reader
 		// depends on.
-		_ = os.Chtimes(name, e.modTime, e.modTime)
+		_ = root.Chtimes(name, e.modTime, e.modTime)
 	}
-	// A non-directory in the way (a layout change turned a file into a
-	// directory or back) would make the rename fail or, worse, land inside
-	// a directory; clear it first. rename(2) replaces a plain file
-	// atomically on its own.
-	if info, err := os.Lstat(full); err == nil && info.IsDir() {
-		if err := os.RemoveAll(full); err != nil {
-			os.Remove(name)
+	// A directory in the way (a layout change turned a file into a
+	// directory, or a container planted one) would make the rename fail;
+	// clear it first. rename(2) replaces a plain file atomically on its own.
+	if info, err := root.Lstat(rel); err == nil && info.IsDir() {
+		if err := root.RemoveAll(rel); err != nil {
+			root.Remove(name)
 			return err
 		}
 	}
-	if err := os.Rename(name, full); err != nil {
-		os.Remove(name)
+	if err := root.Rename(name, rel); err != nil {
+		root.Remove(name)
 		return err
 	}
 	return nil
 }
 
-// prune removes everything under dir that r does not describe. Anything
-// that is not a regular file or a directory — a symlink, say — is removed
-// rather than followed: nothing but this daemon writes here, and a link
-// that appeared anyway is not something to resolve.
-func prune(dir string, r *rendered) error {
-	return filepath.WalkDir(dir, func(full string, d fs.DirEntry, err error) error {
+// prune removes everything under the root that r does not describe.
+// Anything that is not a regular file or a directory — a symlink, say — is
+// removed rather than followed: nothing but this daemon writes here, and a
+// link that appeared anyway is not something to resolve.
+func prune(root *os.Root, r *rendered) error {
+	return fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if full == dir {
+		if p == "." {
 			return nil
 		}
-		rel, err := filepath.Rel(dir, full)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
+		rel := filepath.FromSlash(p)
 		switch {
 		case d.IsDir():
-			if r.dirs[rel] {
+			if r.dirs[p] {
 				return nil
 			}
-			if err := os.RemoveAll(full); err != nil {
+			if err := root.RemoveAll(rel); err != nil {
 				return err
 			}
 			return fs.SkipDir
 		case d.Type().IsRegular():
-			if _, ok := r.files[rel]; ok {
+			if _, ok := r.files[p]; ok {
 				return nil
 			}
-			return os.Remove(full)
+			return root.Remove(rel)
 		default:
-			return os.Remove(full)
+			return root.Remove(rel)
 		}
 	})
 }

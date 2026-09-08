@@ -98,7 +98,14 @@ func TestDockerPathsMustBeAbsolute(t *testing.T) {
 			}
 		})
 	}
-	for _, p := range []string{"/run/x.sock", "~/x.sock", "~"} {
+	for _, bare := range []DockerConfig{{Socket: "~"}, {VolumeDir: "~"}} {
+		cfg := dockerBaseConfig()
+		cfg.Docker = bare
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate accepted %+v: the driver prunes and chmods the volume dir as its own", bare)
+		}
+	}
+	for _, p := range []string{"/run/x.sock", "~/x.sock"} {
 		cfg := dockerBaseConfig()
 		cfg.Docker = DockerConfig{Socket: p, VolumeDir: p}
 		if err := cfg.Validate(); err != nil {

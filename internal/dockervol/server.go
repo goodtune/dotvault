@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"runtime"
 	"time"
 
@@ -198,24 +197,29 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 	d.setLifetime(ctx)
 
-	if err := os.MkdirAll(d.opts.VolumeDir, 0o700); err != nil {
-		return fmt.Errorf("dockervol: create volume dir: %w", err)
+	if err := d.prepareVolumeRoot(); err != nil {
+		err = fmt.Errorf("dockervol: %w", err)
+		d.setServing(false, err)
+		return err
 	}
-	// Tighten a pre-existing directory: everything beneath it is secret.
-	if err := os.Chmod(d.opts.VolumeDir, 0o700); err != nil {
-		return fmt.Errorf("dockervol: chmod volume dir: %w", err)
-	}
-	d.resume()
 
+	// Bind before touching any volume directory. The bind is what proves
+	// this is the only driver on the socket; a second instance that resumed
+	// first would rewrite — and prune — the running daemon's volumes and
+	// only then discover it had no business being here.
 	ln, err := uds.Listen(d.opts.SocketPath)
 	if err != nil {
-		d.stopAll()
 		if errors.Is(err, uds.ErrAlreadyListening) {
-			return fmt.Errorf("dotvault docker volume plugin already running at %s", d.opts.SocketPath)
+			err = fmt.Errorf("dotvault docker volume plugin already running at %s", d.opts.SocketPath)
+		} else {
+			err = fmt.Errorf("dockervol: listen: %w", err)
 		}
-		return fmt.Errorf("dockervol: listen: %w", err)
+		d.setServing(false, err)
+		return err
 	}
+	d.setServing(true, nil)
 	slog.Info("docker volume plugin listening", "socket", d.opts.SocketPath, "volume_dir", d.opts.VolumeDir)
+	d.resume()
 
 	srv := &http.Server{
 		Handler:           d.Handler(),
@@ -233,8 +237,9 @@ func (d *Driver) Run(ctx context.Context) error {
 	d.stopAll()
 	uds.Cleanup(d.opts.SocketPath)
 	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+		err = nil
 	}
+	d.setServing(false, err)
 	return err
 }
 

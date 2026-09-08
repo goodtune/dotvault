@@ -45,7 +45,7 @@ Container engines do not look in dotvault's runtime directory on their own, so r
     $ echo "unix://$XDG_RUNTIME_DIR/dotvault/docker.sock" > ~/.local/lib/docker/plugins/dotvault.spec
     ```
 
-    Rootless `dockerd` discovers plugins from `~/.local/lib/docker/plugins`. (Docker's documentation also names `~/.config/docker/plugins`, but released daemons through v28 resolve that path to `/etc/docker/plugins` — the branch is inverted in the source — so use `~/.local/lib`.)
+    Rootless `dockerd` discovers plugins from `~/.local/lib/docker/plugins`. (Docker's documentation also names `~/.config/docker/plugins`, but released daemons through v28 resolve that path to `/etc/docker/plugins` — the error check in `rootlessConfigPluginsPath`, `pkg/plugins/discovery_unix.go` in moby/moby, is inverted — so use `~/.local/lib`.)
 
 === "Rootless Podman"
 
@@ -115,11 +115,11 @@ $ docker volume inspect app-secrets --format '{{json .Status}}' | jq
 }
 ```
 
-`refresh` is `events` (Enterprise, subscription connected), `poll` (Community, or a subscription that is down — `dotvault status` and `/api/v1/status` name the reason), or `probing` (the daemon has not yet learned the edition, typically because it has no token yet; volumes poll meanwhile).
+`refresh` is `events` (Enterprise, subscription connected), `poll` (Community, or a subscription that is down — an `events_error` key here, in `dotvault status` and in `/api/v1/status` names the reason), or `probing` (the daemon has not yet learned the edition, typically because it has no token yet; volumes poll meanwhile).
 
 ## Lifecycle
 
-A volume's files exist only while a container holds it. The first `Mount` renders the directory; the last `Unmount` deletes it. `docker volume rm` deletes it too. Nothing is written to disk for a volume nobody has mounted.
+A volume's files exist only while a container holds it. The first `Mount` renders the directory; the last `Unmount` deletes it. `docker volume rm` deletes it too. No secret is written to disk for a volume nobody has mounted — only its definition, in `{cache_dir}/docker-volumes.json`.
 
 The daemon remembers its volumes and which containers hold them across restarts, so restarting dotvault under a running container keeps that container's directory and resumes refreshing it — the container never sees an empty mount. Stopping the daemon leaves mounted directories in place for the same reason; the next daemon picks them up, and removes any directory that belongs to a volume no container holds.
 
@@ -155,6 +155,6 @@ Volumes are `local` scope and belong to this daemon's user; the plugin is the "l
 
 **`… dotvault has not authenticated with vault yet`** — the daemon is running but holds no token. `dotvault login`, or wait for the peer borrow, then retry.
 
-**`refresh` stuck at `poll` on Enterprise** — the token's policy must allow the subscription: `read` on `sys/events/subscribe/kv-v2/*` and `subscribe` on the secrets with `subscribe_event_types = ["*"]`. The reason is in `dotvault status` and the daemon log; volumes keep refreshing on their `ttl` meanwhile.
+**`refresh` stuck at `poll` on Enterprise** — the token's policy must allow the subscription: `read` on `sys/events/subscribe/kv-v2/*` and `subscribe` on the secrets with `subscribe_event_types = ["*"]` (the dev stack's `dotvault` policy in `docker-compose.yaml` is a reference). The reason is the `events_error` in `dotvault status`, `docker volume inspect` and the daemon log; volumes keep refreshing on their `ttl` meanwhile.
 
 **Container user cannot read the files** — create the volume with `-o mode=0444` (see above); `0400` admits container root only.

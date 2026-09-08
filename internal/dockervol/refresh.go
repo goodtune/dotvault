@@ -3,9 +3,11 @@ package dockervol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,8 +22,9 @@ import (
 // which under the "cache indefinitely" policy is forever.
 const eventPattern = "kv-v2/*"
 
-// Pacing constants for the background loops.
-const (
+// Pacing for the background loops. Variables rather than constants so a
+// test can shorten them; production never writes them.
+var (
 	// tokenPoll is how often the watcher re-checks for a token before its
 	// first subscription attempt.
 	tokenPoll = 2 * time.Second
@@ -41,7 +44,12 @@ func (d *Driver) startLoopLocked(v *volume, initial bool) {
 	v.cancel = cancel
 	v.done = make(chan struct{})
 	v.nudge = make(chan struct{}, 1)
-	go d.runVolume(ctx, v, initial)
+	// The loop is handed its own channels rather than reading the fields:
+	// stopLoopLocked clears them and a later startLoopLocked replaces
+	// them, both under d.mu, and the goroutine may not have run yet when
+	// that happens — an Unmount landing right behind a Mount would
+	// otherwise find v.done already nil and close(nil).
+	go d.runVolume(ctx, v, v.nudge, v.done, initial)
 }
 
 // stopLoopLocked stops a volume's loop and returns the channel that closes
@@ -65,8 +73,8 @@ func (d *Driver) stopLoopLocked(v *volume) chan struct{} {
 // — Community edition, or an Enterprise subscription that has dropped —
 // so on Enterprise with a live subscription a volume is rendered once and
 // then only when Vault says something changed.
-func (d *Driver) runVolume(ctx context.Context, v *volume, initial bool) {
-	defer close(v.done)
+func (d *Driver) runVolume(ctx context.Context, v *volume, nudge <-chan struct{}, done chan struct{}, initial bool) {
+	defer close(done)
 	if initial {
 		d.refresh(ctx, v)
 	}
@@ -76,7 +84,7 @@ func (d *Driver) runVolume(ctx context.Context, v *volume, initial bool) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-v.nudge:
+		case <-nudge:
 			select {
 			case <-time.After(eventDebounce):
 			case <-ctx.Done():
@@ -85,7 +93,7 @@ func (d *Driver) runVolume(ctx context.Context, v *volume, initial bool) {
 			// Drain anything that arrived during the debounce; it is
 			// covered by the render about to happen.
 			select {
-			case <-v.nudge:
+			case <-nudge:
 			default:
 			}
 			d.refresh(ctx, v)
@@ -99,6 +107,14 @@ func (d *Driver) runVolume(ctx context.Context, v *volume, initial bool) {
 }
 
 func (d *Driver) refresh(ctx context.Context, v *volume) {
+	if !d.hasToken() {
+		// A resumed volume can be running before the daemon has
+		// authenticated. Asking Vault without a token would only turn one
+		// known condition into a per-tick 400; record it and try again on
+		// the next tick or nudge.
+		d.recordRefresh(v, 0, ErrNoToken)
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
 	defer cancel()
 	v.opMu.Lock()
@@ -163,9 +179,15 @@ func (d *Driver) dispatch(evt vault.Event) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, v := range d.volumes {
-		if v.cancel != nil && v.Spec.Covers(rel) {
-			slog.Debug("vault event concerns docker volume", "volume", v.Name, "path", displayPath(rel), "type", evt.EventType)
+		if !v.Spec.Covers(rel) {
+			continue
+		}
+		slog.Debug("vault event concerns docker volume", "volume", v.Name, "path", displayPath(rel), "type", evt.EventType)
+		switch {
+		case v.cancel != nil:
 			nudge(v)
+		case v.populating > 0:
+			v.pendingEvent = true
 		}
 	}
 }
@@ -279,6 +301,16 @@ func (d *Driver) consume(ctx context.Context, evCh <-chan vault.Event, errCh <-c
 			return nil
 		case evt, ok := <-evCh:
 			if !ok {
+				// The subscriber closes both channels after sending its
+				// error; the closed event channel can win the select, so
+				// look for the error before calling the close clean.
+				select {
+				case err, ok := <-errCh:
+					if ok && err != nil {
+						return err
+					}
+				default:
+				}
 				return nil
 			}
 			d.dispatch(evt)
@@ -314,8 +346,14 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // resume reconciles the volume dir with the loaded registry at startup:
 // volumes the engine still holds mounted get their loop back (rendering
 // immediately, since the files date from the previous daemon), and every
-// other directory — an unmounted volume's leftovers, or a name no longer
-// known — is removed so no secret outlives the container that needed it.
+// other entry — an unmounted volume's leftovers, or a name no longer known
+// — is removed so no secret outlives the container that needed it.
+//
+// Only entries that could be volume directories are touched: a name that
+// fails ValidateName was never created by this driver, so it is left alone
+// and named in a warning. The stronger guard against removing something
+// that is not ours is prepareVolumeRoot's marker check, which refuses to
+// adopt a non-empty directory the driver did not create.
 func (d *Driver) resume() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -330,14 +368,66 @@ func (d *Driver) resume() {
 		return
 	}
 	for _, e := range entries {
-		if v, ok := d.volumes[e.Name()]; ok && v.cancel != nil {
+		name := e.Name()
+		if name == volumeDirMarker {
 			continue
 		}
-		p := d.volumePath(e.Name())
+		if v, ok := d.volumes[name]; ok && v.cancel != nil {
+			continue
+		}
+		p := d.volumePath(name)
+		if ValidateName(name) != nil || !e.IsDir() {
+			slog.Warn("unexpected entry in the docker volume directory; leaving it alone", "path", p)
+			continue
+		}
 		if err := os.RemoveAll(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			slog.Warn("could not remove stale docker volume directory", "path", p, "error", err)
 		}
 	}
+}
+
+// volumeDirMarker is an empty file the driver leaves in VolumeDir to record
+// that the directory is its own. resume removes entries from that directory
+// wholesale, and a mistyped docker.volume_dir naming an existing directory
+// full of the user's files must not become a startup that deletes them.
+const volumeDirMarker = ".dotvault-volumes"
+
+// prepareVolumeRoot creates VolumeDir at 0700, or adopts an existing one
+// only if it carries the marker or is empty — anything else is refused.
+func (d *Driver) prepareVolumeRoot() error {
+	dir := d.opts.VolumeDir
+	marker := filepath.Join(dir, volumeDirMarker)
+	info, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create volume dir: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("stat volume dir: %w", err)
+	case info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("volume dir %s is a symlink; point docker.volume_dir at a real directory", dir)
+	case !info.IsDir():
+		return fmt.Errorf("volume dir %s exists and is not a directory", dir)
+	default:
+		if _, err := os.Lstat(marker); err != nil {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return fmt.Errorf("read volume dir: %w", err)
+			}
+			if len(entries) > 0 {
+				return fmt.Errorf("volume dir %s is not empty and was not created by dotvault; refusing to manage it (point docker.volume_dir at an empty or new directory)", dir)
+			}
+		}
+	}
+	// Tighten a pre-existing directory: everything beneath it is secret.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod volume dir: %w", err)
+	}
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		return fmt.Errorf("write volume dir marker: %w", err)
+	}
+	return nil
 }
 
 // stopAll stops every loop and waits for them; the directories are left in

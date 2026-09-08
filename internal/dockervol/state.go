@@ -53,6 +53,12 @@ func (d *Driver) load() error {
 		if pv.Spec.Mode == 0 {
 			pv.Spec.Mode = DefaultMode
 		}
+		// The file is 0600 and ours, but its contents become filenames and
+		// modes; re-judge them by the same rule a create request meets
+		// rather than trusting that nothing edited the file.
+		if err := pv.Spec.validate(); err != nil {
+			return fmt.Errorf("dockervol: state %s: volume %q: %w", d.opts.StatePath, pv.Name, err)
+		}
 		v := &volume{Name: pv.Name, Opts: pv.Opts, Spec: pv.Spec, Mounts: map[string]bool{}}
 		for _, id := range pv.Mounts {
 			v.Mounts[id] = true

@@ -77,6 +77,8 @@ type Driver struct {
 	edition    edition
 	eventsLive bool
 	eventsErr  string
+	serving    bool
+	runErr     string
 }
 
 type edition string
@@ -112,6 +114,15 @@ type volume struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	nudge  chan struct{}
+
+	// populating counts Mount calls currently rendering the volume with no
+	// loop running yet; pendingEvent records that a Vault event for the
+	// volume arrived during that window. Without them an event landing
+	// between the render's read and the loop's start would be dropped, and
+	// under "cache indefinitely" the container would stay stale until the
+	// next event. Both guarded by d.mu.
+	populating   int
+	pendingEvent bool
 
 	lastRefresh time.Time
 	lastErr     string
@@ -225,6 +236,12 @@ func (d *Driver) Remove(name string) error {
 
 // Mount populates the volume if it is not already, records the caller, and
 // returns the host directory the engine bind-mounts into the container.
+//
+// The populate-then-register sequence runs under the volume's opMu, and the
+// registration itself under d.mu as well, so the last Unmount's wipe (which
+// re-checks the volume's state under both) can never delete a directory
+// this call has just filled and is about to hand to a container. Lock order
+// is opMu then d.mu, the order every refresh already uses.
 func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 	d.mu.Lock()
 	v, ok := d.volumes[name]
@@ -233,10 +250,19 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 		return "", fmt.Errorf("%w: %s", ErrNotFound, name)
 	}
 	active := v.cancel != nil
+	if !active {
+		v.populating++
+	}
 	d.mu.Unlock()
 
 	dir := d.volumePath(name)
+	populated := false
 	if !active {
+		defer func() {
+			d.mu.Lock()
+			v.populating--
+			d.mu.Unlock()
+		}()
 		// Only the first mount needs Vault: a second container joining a
 		// volume that is already materialised gets the files that exist,
 		// whatever the daemon's token is doing at that moment.
@@ -246,23 +272,36 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 		ctx, cancel := context.WithTimeout(ctx, mountTimeout)
 		defer cancel()
 		v.opMu.Lock()
+		defer v.opMu.Unlock()
 		n, err := materialise(ctx, d.store, dir, v.Spec)
-		v.opMu.Unlock()
 		d.recordRefresh(v, n, err)
 		if err != nil {
 			return "", fmt.Errorf("populate volume %q: %w", name, err)
 		}
+		populated = true
 	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, still := d.volumes[name]; !still {
+		if populated {
+			// Removed while this call was rendering; the secrets it just
+			// wrote have no engine reference and must not stay on disk
+			// until the next restart's resume notices them.
+			d.removeDir(v)
+		}
 		return "", fmt.Errorf("%w: %s (removed while mounting)", ErrNotFound, name)
 	}
 	v.Mounts[id] = true
 	if v.cancel == nil {
-		d.startLoopLocked(v, false)
+		// A loop that is not running here either never was (first mount:
+		// the directory was populated just above) or was stopped by a
+		// last Unmount that raced this call and may already have wiped the
+		// directory — in which case the new loop must render immediately.
+		// So must one whose render raced a Vault event.
+		d.startLoopLocked(v, !populated || v.pendingEvent)
 	}
+	v.pendingEvent = false
 	slog.Info("docker volume mounted", "volume", name, "mounts", len(v.Mounts), "secrets", v.secrets)
 	return dir, d.saveLocked()
 }
@@ -349,6 +388,7 @@ const (
 	StatusLastRefresh = "last_refresh"
 	StatusLastError   = "last_error"
 	StatusSelection   = "selection"
+	StatusEventsError = "events_error"
 )
 
 func (d *Driver) infoLocked(v *volume) VolumeInfo {
@@ -370,6 +410,13 @@ func (d *Driver) infoLocked(v *volume) VolumeInfo {
 	}
 	if v.lastErr != "" {
 		status[StatusLastError] = v.lastErr
+	}
+	if d.eventsErr != "" {
+		// Carried per volume because the protocol's Status map is the
+		// only channel a plugin has: it is how `dotvault status` and
+		// `docker volume inspect` can say why refresh is "poll" on an
+		// Enterprise Vault.
+		status[StatusEventsError] = d.eventsErr
 	}
 	return VolumeInfo{Name: v.Name, Mountpoint: d.volumePath(v.Name), Status: status}
 }
@@ -395,8 +442,12 @@ type Status struct {
 	// "probing" (the edition is not known yet).
 	Refresh string `json:"refresh"`
 	// EventsError is why the subscription is down, when it is.
-	EventsError string       `json:"events_error,omitempty"`
-	Volumes     []VolumeInfo `json:"volumes"`
+	EventsError string `json:"events_error,omitempty"`
+	// Serving reports whether the socket is bound and being served; Error
+	// says why not when it is not (Run failed, or has not started).
+	Serving bool         `json:"serving"`
+	Error   string       `json:"error,omitempty"`
+	Volumes []VolumeInfo `json:"volumes"`
 }
 
 // Status returns the driver's current state.
@@ -409,7 +460,20 @@ func (d *Driver) Status() Status {
 		VolumeDir:   d.opts.VolumeDir,
 		Refresh:     d.refreshModeLocked(),
 		EventsError: d.eventsErr,
+		Serving:     d.serving,
+		Error:       d.runErr,
 		Volumes:     vols,
+	}
+}
+
+// setServing records whether Run is serving the socket, and why not.
+func (d *Driver) setServing(serving bool, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.serving = serving
+	d.runErr = ""
+	if err != nil {
+		d.runErr = err.Error()
 	}
 }
 
@@ -437,7 +501,9 @@ func (d *Driver) recordRefresh(v *volume, secrets int, err error) {
 }
 
 // wipe waits for a stopped loop to exit and then deletes the volume's
-// directory. Called with mu released: the loop may be mid-refresh and about
+// directory — unless, by the time it holds the volume's opMu, a Mount has
+// re-registered the volume, in which case the directory is that container's
+// and stays. Called with mu released: the loop may be mid-refresh and about
 // to call recordRefresh, which needs mu.
 func (d *Driver) wipe(v *volume, done chan struct{}) {
 	if done != nil {
@@ -445,6 +511,16 @@ func (d *Driver) wipe(v *volume, done chan struct{}) {
 	}
 	v.opMu.Lock()
 	defer v.opMu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if current, known := d.volumes[v.Name]; known && current == v && len(v.Mounts) > 0 {
+		return
+	}
+	d.removeDir(v)
+}
+
+// removeDir deletes a volume's directory. Caller holds v.opMu.
+func (d *Driver) removeDir(v *volume) {
 	if err := os.RemoveAll(d.volumePath(v.Name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.Warn("could not remove docker volume directory", "volume", v.Name, "error", err)
 	}

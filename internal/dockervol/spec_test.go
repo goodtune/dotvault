@@ -31,7 +31,7 @@ func TestParseOptionsSelection(t *testing.T) {
 	for path, covered := range map[string]bool{
 		"gh":              true,
 		"gh/sub":          false, // a bare name is one secret, not a folder
-		"databricks":      true,  // the folder's own name is covered too
+		"databricks":      false, // the folder's own name is a different secret, which render never emits
 		"databricks/prod": true,
 		"databricksx":     false,
 		"other":           false,

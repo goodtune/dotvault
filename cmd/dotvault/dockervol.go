@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/dockervol"
@@ -77,12 +79,19 @@ func startDockerVolumes(ctx context.Context, cfg *config.Config, vc *vault.Clien
 		slog.Warn("docker volume plugin not started", "error", err)
 		return nil
 	}
+	// The default lives on the per-user runtime tmpfs so a rendered secret
+	// never touches persistent disk. Say so when that is not where the
+	// volumes are going: an unset XDG_RUNTIME_DIR falls back to the cache
+	// dir silently, and an explicit docker.volume_dir may be anywhere.
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt == "" || !strings.HasPrefix(volumeDir, filepath.Clean(rt)+string(filepath.Separator)) {
+		slog.Warn("docker volumes will be materialised outside the runtime directory; secrets held by a container are written to persistent disk", "volume_dir", volumeDir)
+	}
 	driver, err := dockervol.New(dockervol.Options{
 		SocketPath: socket,
 		VolumeDir:  volumeDir,
 		StatePath:  dockerStatePath(),
 		DefaultTTL: cfg.Docker.CacheTTL,
-		UserPrefix: cfg.Vault.UserPrefix + username + "/",
+		UserPrefix: vaultfs.UserRoot(cfg.Vault.UserPrefix, username),
 		HasToken:   func() bool { return vc.Token() != "" },
 	}, store, vc)
 	if err != nil {
@@ -139,6 +148,9 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 			v.Status[dockervol.StatusMounts], v.Status[dockervol.StatusSecrets], v.Status[dockervol.StatusRefresh])
 		if e, ok := v.Status[dockervol.StatusLastError]; ok {
 			line += fmt.Sprintf(" error=%v", e)
+		}
+		if e, ok := v.Status[dockervol.StatusEventsError]; ok {
+			line += fmt.Sprintf(" events_error=%v", e)
 		}
 		fmt.Println(line)
 	}

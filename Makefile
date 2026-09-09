@@ -90,6 +90,14 @@ python-test: python-lib
 python-wheel:
 	cd python && uv build --wheel
 
+# End-to-end: a rootless Podman engine drives the volume plugin socket against
+# a dev-mode Vault, both under podman. Opt-in because it pulls images and runs
+# containers; needs podman. The test builds its own binary unless
+# DOTVAULT_BIN is set. See test/integration/podman_test.go.
+.PHONY: podman-e2e
+podman-e2e:
+	DOTVAULT_PODMAN_E2E=1 go test ./test/integration -run TestPodmanDrivesVolumePlugin -v -count=1
+
 .PHONY: build
 build:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o dist/dotvault ./cmd/dotvault

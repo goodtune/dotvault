@@ -420,6 +420,8 @@ The socket is deliberately not under an engine's own plugin directory: a rootles
 
 Volume definitions (names and options, never secret data) persist in `{cache_dir}/docker-volumes.json`, so a daemon restart under a running container resumes refreshing the directory that container still holds. The section is static — a change needs a restart — and is refused in a remote-config document, like every other section that opens a listener.
 
+On Linux, the packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an engine call landing mid-restart queues instead of failing. `docker.enabled` remains the master switch, and under activation the unit's `ListenStream=` path wins over `socket` — the `.spec` file must name that path. See [Socket activation](../admin/deployment.md#socket-activation-optional).
+
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Socket` (REG_SZ), `VolumeDir` (REG_SZ) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Docker`, and the section round-trips through `reg-import`/`reg-export` like every other, for the same mixed-fleet reason as `fuse`.
 
 ## Observability section

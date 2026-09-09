@@ -207,18 +207,52 @@ func (d *Driver) Run(ctx context.Context) error {
 	// this is the only driver on the socket; a second instance that resumed
 	// first would rewrite — and prune — the running daemon's volumes and
 	// only then discover it had no business being here.
-	ln, err := uds.Listen(d.opts.SocketPath)
-	if err != nil {
-		if errors.Is(err, uds.ErrAlreadyListening) {
-			err = fmt.Errorf("dotvault docker volume plugin already running at %s", d.opts.SocketPath)
-		} else {
-			err = fmt.Errorf("dockervol: listen: %w", err)
-		}
+	//
+	// systemd socket activation first (Linux; inert elsewhere), exactly as
+	// the API socket and the SSH agent do: an inherited fd means systemd
+	// bound the socket and keeps it across our restarts, so an engine
+	// request landing mid-restart queues in the backlog instead of the
+	// engine reporting the plugin unreachable. An activation *error* is
+	// fatal rather than a fallback — it means the fd exists but violates an
+	// invariant (mode wider than 0600, wrong socket type), and self-binding
+	// would both mask the unit misconfiguration and fail anyway, since
+	// systemd owns the path.
+	var ln net.Listener
+	aln, actual, err := activatedDockerListener()
+	switch {
+	case err != nil:
+		err = fmt.Errorf("dockervol: systemd activation: %w", err)
 		d.setServing(false, err)
 		return err
+	case aln != nil:
+		if actual != d.opts.SocketPath {
+			// The socket unit's ListenStream=, not docker.socket, decides
+			// where the socket lives under activation. Adopt it so status
+			// reports the socket that actually exists — and the operator's
+			// .spec file must name this path, not the configured one.
+			slog.Warn("systemd-activated docker plugin socket path differs from docker.socket; the socket unit wins", "activated", actual, "configured", d.opts.SocketPath)
+			// Under d.mu: Status reads the path concurrently.
+			d.mu.Lock()
+			d.opts.SocketPath = actual
+			d.mu.Unlock()
+		}
+		d.activated = true
+		ln = aln
+		slog.Info("serving docker volume plugin from systemd activation", "socket", actual, "volume_dir", d.opts.VolumeDir)
+	default:
+		ln, err = uds.Listen(d.opts.SocketPath)
+		if err != nil {
+			if errors.Is(err, uds.ErrAlreadyListening) {
+				err = fmt.Errorf("dotvault docker volume plugin already running at %s", d.opts.SocketPath)
+			} else {
+				err = fmt.Errorf("dockervol: listen: %w", err)
+			}
+			d.setServing(false, err)
+			return err
+		}
+		slog.Info("docker volume plugin listening", "socket", d.opts.SocketPath, "volume_dir", d.opts.VolumeDir)
 	}
 	d.setServing(true, nil)
-	slog.Info("docker volume plugin listening", "socket", d.opts.SocketPath, "volume_dir", d.opts.VolumeDir)
 	d.resume()
 
 	srv := &http.Server{
@@ -235,12 +269,32 @@ func (d *Driver) Run(ctx context.Context) error {
 
 	err = srv.Serve(ln)
 	d.stopAll()
-	uds.Cleanup(d.opts.SocketPath)
+	// A systemd-activated node belongs to the socket unit, which keeps
+	// serving it across our restarts; unlinking it would leave systemd
+	// listening on an inode no client can reach.
+	if !d.activated {
+		uds.Cleanup(d.opts.SocketPath)
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
 	d.setServing(false, err)
 	return err
+}
+
+// ActivationName is the FileDescriptorName= the packaged
+// dotvault-docker.socket unit sets, by which the daemon claims the inherited
+// fd — and which cmd/dotvault must keep out of the unclaimed-fd drain when
+// the plugin is enabled.
+const ActivationName = "docker"
+
+// activatedDockerListener claims the systemd-activated "docker" socket, when
+// one exists. An injectable var (matching internal/web's
+// activatedAPIListener) so tests can exercise the activated branch of Run
+// without a real systemd environment — the activation snapshot is
+// process-global and once-guarded, which makes it unfakeable in-process.
+var activatedDockerListener = func() (net.Listener, string, error) {
+	return uds.ActivatedListener(ActivationName)
 }
 
 // queryTimeout bounds the whole status query, dial and reply alike, for the

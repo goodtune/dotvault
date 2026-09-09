@@ -123,6 +123,9 @@ A volume's files exist only while a container holds it. The first `Mount` render
 
 The daemon remembers its volumes and which containers hold them across restarts, so restarting dotvault under a running container keeps that container's directory and resumes refreshing it — the container never sees an empty mount. Stopping the daemon leaves mounted directories in place for the same reason; the next daemon picks them up, and removes any directory that belongs to a volume no container holds.
 
+!!! tip "Socket activation (systemd)"
+    The packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind the plugin socket and hold it across daemon restarts, so a `docker run` that lands mid-restart queues briefly instead of the engine reporting the plugin unreachable. `systemctl --user enable --now dotvault-docker.socket`; `docker.enabled` is still required, and the `.spec` file must name the unit's `ListenStream=` path (the default is the same `$XDG_RUNTIME_DIR/dotvault/docker.sock`). See [Socket activation](../admin/deployment.md#socket-activation-optional).
+
 A `Mount` while the daemon holds no Vault token yet is refused with a message saying so (`docker run` reports it), rather than producing an empty volume. `docker volume create`, `ls` and `inspect` work without a token.
 
 `dotvault status` reports the plugin as the engine sees it:

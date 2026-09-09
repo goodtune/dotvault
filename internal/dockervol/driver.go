@@ -79,6 +79,11 @@ type Driver struct {
 	eventsErr  string
 	serving    bool
 	runErr     string
+
+	// activated records that Run adopted a systemd-passed listener, so
+	// shutdown leaves the socket node to the unit that owns it. Written
+	// once in Run before Serve, read after Serve returns; no lock needed.
+	activated bool
 }
 
 type edition string

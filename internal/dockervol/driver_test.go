@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -706,5 +707,108 @@ func TestRunRefusesForeignVolumeDir(t *testing.T) {
 	}
 	if st := d.Status(); st.Serving || st.Error == "" {
 		t.Errorf("Status after a failed Run = %+v, want not serving with the error", st)
+	}
+}
+
+// fakeActivatedListener installs a stand-in for systemd socket activation
+// that hands out listeners for path, mimicking the retained-master model:
+// one real listener is created once and duplicated per claim via File(),
+// exactly as uds.ActivatedListener dups its retained master.
+func fakeActivatedListener(t *testing.T, path string) func() {
+	t.Helper()
+	master, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closing a claim must not unlink systemd's node.
+	master.(*net.UnixListener).SetUnlinkOnClose(false)
+
+	orig := activatedDockerListener
+	activatedDockerListener = func() (net.Listener, string, error) {
+		f, err := master.(*net.UnixListener).File()
+		if err != nil {
+			return nil, "", err
+		}
+		ln, err := net.FileListener(f)
+		f.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		return ln, path, nil
+	}
+	return func() {
+		activatedDockerListener = orig
+		master.Close()
+	}
+}
+
+// TestSocketActivatedPluginServesAndSurvivesShutdown covers the activated
+// branch of Run end to end: the plugin serves over the inherited listener,
+// adopts the activated path as its own, and — because systemd owns the node
+// — its shutdown must not unlink it. Reverting the activated branch or the
+// Cleanup skip fails this test.
+func TestSocketActivatedPluginServesAndSurvivesShutdown(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Run is linux only")
+	}
+	d, base := newTestDriver(t, newMemStore(), nil)
+	activatedPath := filepath.Join(base, "systemd.sock")
+	restore := fakeActivatedListener(t, activatedPath)
+	defer restore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	eventually(t, "serving", func() bool { return d.Status().Serving })
+
+	// Served over the activated socket, at the activated path, which
+	// Status now reports in place of the configured one.
+	if err := d.Create("v", nil); err != nil {
+		t.Fatal(err)
+	}
+	vols, err := QueryListening(ctx, activatedPath)
+	if err != nil {
+		t.Fatalf("QueryListening over the activated socket: %v", err)
+	}
+	if len(vols) != 1 {
+		t.Errorf("volumes = %+v", vols)
+	}
+	if got := d.Status().Socket; got != activatedPath {
+		t.Errorf("Status.Socket = %q, want the activated path %q (the socket unit wins)", got, activatedPath)
+	}
+	if _, err := os.Stat(filepath.Join(base, "docker.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the configured path was bound as well; under activation the daemon must not self-bind")
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := os.Stat(activatedPath); err != nil {
+		t.Errorf("shutdown unlinked the systemd-owned socket node: %v", err)
+	}
+}
+
+// An activation error is fatal, never a fallback to self-binding.
+func TestSocketActivationErrorIsFatal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Run is linux only")
+	}
+	d, base := newTestDriver(t, newMemStore(), nil)
+	orig := activatedDockerListener
+	activatedDockerListener = func() (net.Listener, string, error) {
+		return nil, "", errors.New("socket mode 0666 is wider than 0600")
+	}
+	defer func() { activatedDockerListener = orig }()
+
+	err := d.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "activation") {
+		t.Fatalf("Run = %v, want the activation error", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "docker.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the daemon self-bound despite an activation error")
+	}
+	if st := d.Status(); st.Serving || st.Error == "" {
+		t.Errorf("Status = %+v, want not serving with the error recorded", st)
 	}
 }

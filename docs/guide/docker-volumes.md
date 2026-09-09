@@ -36,7 +36,7 @@ The daemon then listens on `$XDG_RUNTIME_DIR/dotvault/docker.sock` and materiali
 
 ### Registering the plugin
 
-Container engines do not look in dotvault's runtime directory on their own, so register the socket once with a one-line **spec file**. `dotvault status` prints the exact command for your socket path.
+Container engines do not look in dotvault's runtime directory on their own, so register the socket once with a one-line **spec file**. `dotvault status` prints the file's path and the exact line it should contain for your socket path.
 
 === "Rootless Docker"
 
@@ -136,7 +136,8 @@ $ dotvault status
 Docker Volumes:
   socket:     /run/user/1000/dotvault/docker.sock
   volume dir: /run/user/1000/dotvault/volumes
-  register:   echo unix:///run/user/1000/dotvault/docker.sock > ~/.local/lib/docker/plugins/dotvault.spec
+  spec file:  ~/.local/lib/docker/plugins/dotvault.spec
+  spec body:  unix:///run/user/1000/dotvault/docker.sock
   app-secrets          mounts=1 secrets=2 refresh=events
 ```
 

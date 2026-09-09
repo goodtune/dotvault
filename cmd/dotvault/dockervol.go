@@ -134,9 +134,13 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 	}
 	fmt.Printf("  socket:     %s\n", socket)
 	fmt.Printf("  volume dir: %s\n", volumeDir)
-	// ~/.local/lib rather than ~/.config: released rootless dockerds
-	// (v27, v28) scan only the former — see docs/guide/docker-volumes.md.
-	fmt.Printf("  register:   echo unix://%s > ~/.local/lib/docker/plugins/%s.spec\n", socket, dockervol.DriverName)
+	// Printed as the spec file's path and contents rather than as a shell
+	// command: the socket path is operator data and would need quoting to
+	// be safe to paste, and a data line has nothing to quote. ~/.local/lib
+	// rather than ~/.config: released rootless dockerds (v27, v28) scan
+	// only the former — see docs/guide/docker-volumes.md.
+	fmt.Printf("  spec file:  ~/.local/lib/docker/plugins/%s.spec\n", dockervol.DriverName)
+	fmt.Printf("  spec body:  unix://%s\n", socket)
 
 	vols, err := dockervol.QueryListening(ctx, socket)
 	if err != nil {

@@ -137,7 +137,7 @@ When a token is not found locally but is borrowable from a peer socket, the auth
 
 With the [`fuse` section](configuration/config-reference.md#filesystem-section) enabled, status adds a `Filesystem:` block naming the mountpoint, the access mode, the cache TTL, and whether anything is currently mounted there. The mount state is read from the kernel rather than from the daemon, deliberately: the question is usually asked *because* the directory looks empty, and an answer sourced from the daemon would report nothing at all when the daemon is the thing that is down.
 
-With the [`docker` section](configuration/config-reference.md#docker-volumes-section) enabled, status adds a `Docker Volumes:` block naming the plugin socket, the volume directory, the one-line command that registers the socket with a rootless engine, and — obtained from the running daemon over the plugin protocol, like the SSH agent block — one line per volume with its mount count, secret count, refresh policy (`events`, `poll`, `probing`) and any refresh or subscription error.
+With the [`docker` section](configuration/config-reference.md#docker-volumes-section) enabled, status adds a `Docker Volumes:` block naming the plugin socket, the volume directory, the `.spec` file (path and contents) that registers the socket with a rootless engine, and — obtained from the running daemon over the plugin protocol, like the SSH agent block — one line per volume with its mount count, secret count, refresh policy (`events`, `poll`, `probing`) and any refresh or subscription error.
 
 ### `dotvault browse`
 

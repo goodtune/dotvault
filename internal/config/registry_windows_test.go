@@ -473,6 +473,37 @@ func TestApplyRegistryLayerAPIDefaultPath(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerDocker covers the Docker subkey's four values, and
+// that an absent Enabled DWORD leaves the section off.
+func TestApplyRegistryLayerDocker(t *testing.T) {
+	cfg := &Config{}
+	enabled := uint32(1)
+	applyRegistryLayer(cfg, registryLayer{
+		DockerEnabled:   &enabled,
+		DockerSocket:    "/run/user/1000/dotvault/docker.sock",
+		DockerVolumeDir: "/run/user/1000/dotvault/volumes",
+		DockerCacheTTL:  "2m",
+	})
+	if !cfg.Docker.Enabled {
+		t.Errorf("Docker.Enabled = false, want true")
+	}
+	if cfg.Docker.Socket != "/run/user/1000/dotvault/docker.sock" {
+		t.Errorf("Docker.Socket = %q", cfg.Docker.Socket)
+	}
+	if cfg.Docker.VolumeDir != "/run/user/1000/dotvault/volumes" {
+		t.Errorf("Docker.VolumeDir = %q", cfg.Docker.VolumeDir)
+	}
+	if cfg.Docker.RawCacheTTL != "2m" {
+		t.Errorf("Docker.RawCacheTTL = %q", cfg.Docker.RawCacheTTL)
+	}
+
+	absent := &Config{}
+	applyRegistryLayer(absent, registryLayer{DockerSocket: "/x.sock"})
+	if absent.Docker.Enabled {
+		t.Error("an absent Enabled DWORD must leave the section disabled")
+	}
+}
+
 // TestApplyRegistryLayerAgentPutty confirms an explicit WindowsPutty DWORD
 // maps onto the tri-state pointer (0 => &false, non-zero => &true).
 func TestApplyRegistryLayerAgentPutty(t *testing.T) {

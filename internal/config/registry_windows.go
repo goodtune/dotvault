@@ -322,6 +322,14 @@ type registryLayer struct {
 	FUSEReadWrite  *uint32
 	FUSECacheTTL   string
 
+	// Docker (the volume plugin). Present for the same mixed-fleet reason as
+	// FUSE: nothing serves the plugin on Windows, but the policy an admin
+	// authors here is the one the Linux machines beside it load.
+	DockerEnabled   *uint32
+	DockerSocket    string
+	DockerVolumeDir string
+	DockerCacheTTL  string
+
 	// SSH: the certificate_authorities list and insecure_ignore_host_key flag
 	// are admin-owned policy, so — like every other config section — they
 	// round-trip through this registry loader, .reg, and YAML alike. The
@@ -543,6 +551,19 @@ func readRegistryLayerAt(root registry.Key, policyPath string) (registryLayer, b
 		layer.FUSECacheTTL, _ = readRegString(fusek, "CacheTTL")
 	}
 
+	// Read Docker subkey (the volume plugin).
+	dockerk, err := registry.OpenKey(root, policyPath+`\Docker`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open Docker policy key: %w", err)
+	}
+	if err == nil {
+		defer dockerk.Close()
+		layer.DockerEnabled = readRegDWORD(dockerk, "Enabled")
+		layer.DockerSocket, _ = readRegString(dockerk, "Socket")
+		layer.DockerVolumeDir, _ = readRegString(dockerk, "VolumeDir")
+		layer.DockerCacheTTL, _ = readRegString(dockerk, "CacheTTL")
+	}
+
 	// Read SSH subkey (host-CA trust material).
 	sshk, err := registry.OpenKey(root, policyPath+`\SSH`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
@@ -751,6 +772,18 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.FUSECacheTTL != "" {
 		cfg.FUSE.RawCacheTTL = layer.FUSECacheTTL
+	}
+	if layer.DockerEnabled != nil {
+		cfg.Docker.Enabled = *layer.DockerEnabled != 0
+	}
+	if layer.DockerSocket != "" {
+		cfg.Docker.Socket = layer.DockerSocket
+	}
+	if layer.DockerVolumeDir != "" {
+		cfg.Docker.VolumeDir = layer.DockerVolumeDir
+	}
+	if layer.DockerCacheTTL != "" {
+		cfg.Docker.RawCacheTTL = layer.DockerCacheTTL
 	}
 	// Present (non-nil), not non-empty, gates the merge — same rationale as
 	// VaultPolicies above.

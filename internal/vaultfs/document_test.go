@@ -14,13 +14,13 @@ func TestRenderDocumentIsStableAndNewlineTerminated(t *testing.T) {
 		Version:     3,
 		CreatedTime: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC),
 	}
-	first, err := renderDocument(s)
+	first, err := RenderDocument(s)
 	if err != nil {
-		t.Fatalf("renderDocument: %v", err)
+		t.Fatalf("RenderDocument: %v", err)
 	}
-	second, err := renderDocument(s)
+	second, err := RenderDocument(s)
 	if err != nil {
-		t.Fatalf("renderDocument: %v", err)
+		t.Fatalf("RenderDocument: %v", err)
 	}
 	if string(first.Bytes) != string(second.Bytes) {
 		t.Error("rendering the same secret twice produced different bytes")
@@ -39,9 +39,9 @@ func TestRenderDocumentIsStableAndNewlineTerminated(t *testing.T) {
 }
 
 func TestRenderDocumentHandlesNilData(t *testing.T) {
-	doc, err := renderDocument(&Secret{})
+	doc, err := RenderDocument(&Secret{})
 	if err != nil {
-		t.Fatalf("renderDocument: %v", err)
+		t.Fatalf("RenderDocument: %v", err)
 	}
 	if got := strings.TrimSpace(string(doc.Bytes)); got != "{}" {
 		t.Errorf("rendered nil data as %q, want {}", got)

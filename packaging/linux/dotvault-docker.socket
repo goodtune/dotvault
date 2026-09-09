@@ -1,0 +1,37 @@
+[Unit]
+Description=dotvault Docker volume plugin socket (systemd socket activation)
+Documentation=https://github.com/goodtune/dotvault
+
+# Optional and NOT enabled by default; the volume-plugin sibling of
+# dotvault-api.socket (see that unit for the rationale). With systemd
+# holding the fd, a `docker run` or `docker volume create` that lands during
+# a daemon restart queues in the backlog and is served when the daemon
+# returns, instead of the engine reporting the plugin unreachable. Enable
+# with:
+#
+#   systemctl --user enable --now dotvault-docker.socket
+#
+# docker.enabled must still be set in the dotvault config; a passed fd the
+# daemon is not configured to serve is drained with a warning. The .spec
+# file that registers the plugin with the engine must name this unit's
+# ListenStream= path — under activation it wins over docker.socket. A
+# container already holding a volume never notices a restart either way:
+# the materialised directory survives it and the daemon resumes refreshing
+# it; the socket unit only smooths the engine's own calls.
+
+[Socket]
+# Must match FileDescriptorName exactly: the daemon claims inherited fds by
+# this name (see internal/uds). Renaming it orphans the fd.
+ListenStream=%t/dotvault/docker.sock
+FileDescriptorName=docker
+Service=dotvault.service
+
+# Owner-only is a hard invariant, enforced twice: set here, and verified by
+# the daemon, which refuses an inherited fd wider than 0600. The engine that
+# connects runs as this user (rootless Docker or Podman), so owner-only is
+# also sufficient.
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

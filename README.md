@@ -29,6 +29,7 @@ On desktop environments it can run a local web service. If the current session i
 - **Service enrolment** — Built-in engines acquire credentials from external services (GitHub OAuth device flow, JFrog browser login with refresh-token rotation, Ed25519 SSH keypair generation, and a Copy engine that mirrors existing KVv2 secrets into per-user paths) and persist them to Vault for distribution to every machine where `dotvault` is running
 - **Web UI** — Optional loopback-only, server-rendered UI with bookmarkable pages to drive login, view sync status, inspect secrets, run enrolments, manage SSH remotes, trigger manual syncs, and download the effective config as YAML or a Windows `.reg` file
 - **Filesystem view** — Optional FUSE mount (Linux/macOS) exposing every secret under your Vault prefix as a `.json` file, so `jq . ~/.dotvault/gh.json` reads a live credential without a sync rule and editors syntax-highlight it; read-only by default, with an opt-in read-write mode
+- **Docker volumes** — Optional volume plugin (Linux) so rootless Docker and Podman containers mount your secrets at a path like `/run/secrets/dotvault`, kept current from Vault events on Enterprise and on a refresh window on Community
 - **Windows integration** — System-tray icon for double-click launch, plus full Group Policy support via the machine policy registry (`HKLM\SOFTWARE\Policies\goodtune\dotvault`) that overrides the YAML config when present; author the policy with `reg-import`/`reg-export`
 - **Dry-run mode** — Preview what would change without writing any files
 - **Cross-platform** — Static, CGO-free binaries for Linux and macOS (amd64/arm64) and Windows (amd64), with platform-native file permission checks (Unix mode bits / Windows ACLs)
@@ -147,6 +148,13 @@ fuse:
 ```
 
 This is the one section that can also be set per-user, in `~/.config/dotvault/config.yaml` (macOS: `~/Library/Application Support/dotvault/config.yaml`; Windows: `%APPDATA%\dotvault\config.yaml`), so you can turn the filesystem on without editing a system config an administrator owns. Every other section is refused there.
+
+**`docker`** — Serve your secrets to containers as a Docker volume plugin (Linux only; rootless Docker and Podman; see the [Docker volumes guide](https://goodtune.github.io/dotvault/guide/docker-volumes/)):
+
+```yaml
+docker:
+  enabled: true
+```
 
 **`enrolments`** — Declare service enrolment engines so missing credentials are acquired interactively on first run and refreshed automatically thereafter. See the [service onboarding guides](https://goodtune.github.io/dotvault/services/overview/) for the supported engines.
 

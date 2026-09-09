@@ -154,7 +154,7 @@ Volumes are `local` scope and belong to this daemon's user; the plugin is the "l
 
 ## Troubleshooting
 
-**`docker: Error response from daemon: error looking up volume plugin dotvault: plugin not found`** — the engine has not found the spec file, or it names the wrong socket. Check `~/.local/lib/docker/plugins/dotvault.spec` (rootless) against the socket path `dotvault status` prints.
+**`docker: Error response from daemon: error looking up volume plugin dotvault: plugin not found`** — the engine has not found the spec file, or it names the wrong socket. Check `~/.local/lib/docker/plugins/dotvault.spec` (rootless) against the socket path `dotvault status` prints. Under `dotvault-docker.socket` the unit's `ListenStream=` path is the authoritative one, and `dotvault status` reports `docker.socket` from the config, so keep the two the same.
 
 **`… dotvault has not authenticated with vault yet`** — the daemon is running but holds no token. `dotvault login`, or wait for the peer borrow, then retry.
 

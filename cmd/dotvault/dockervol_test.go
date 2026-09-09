@@ -51,7 +51,31 @@ func TestStartDockerVolumesIsNeverFatal(t *testing.T) {
 		Vault:  config.VaultConfig{KVMount: "kv", UserPrefix: "users/"},
 		Docker: config.DockerConfig{Enabled: true, Socket: "/nonexistent/docker.sock", VolumeDir: "/nonexistent/volumes"},
 	}
-	if driver := startDockerVolumes(t.Context(), cfg, nil, ""); driver != nil {
+	socket, dir := resolveDockerPlugin(cfg)
+	if driver := startDockerVolumes(t.Context(), cfg, socket, dir, nil, ""); driver != nil {
 		t.Error("startDockerVolumes returned a driver for an unbuildable store")
+	}
+}
+
+func TestActivationKeepList(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		agent       bool
+		api, docker string
+		want        []string
+	}{
+		{"nothing enabled", false, "", "", nil},
+		{"api only", false, "/run/api.sock", "", []string{"api"}},
+		{"agent only", true, "", "", []string{"agent"}},
+		{"docker only", false, "", "/run/docker.sock", []string{"docker"}},
+		{"all three", true, "/run/api.sock", "/run/docker.sock", []string{"api", "agent", "docker"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Agent: config.AgentConfig{Enabled: tc.agent}}
+			got := activationKeepList(cfg, tc.api, tc.docker)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("activationKeepList = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

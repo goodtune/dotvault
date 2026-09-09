@@ -68,15 +68,19 @@ func resolveDockerPlugin(cfg *config.Config) (socket, volumeDir string) {
 // Vault work (edition probe, event subscription) waits for a token itself.
 //
 // A failure to serve is never fatal to the daemon; it is logged once, the
-// same way a failed FUSE mount is.
-func startDockerVolumes(ctx context.Context, cfg *config.Config, vc *vault.Client, username string) *dockervol.Driver {
-	socket, volumeDir := resolveDockerPlugin(cfg)
+// same way a failed FUSE mount is. socket and volumeDir come from
+// resolveDockerPlugin, resolved once by the caller because the keep list
+// for systemd activation is built from the same answer — and a plugin that
+// was kept but cannot be built drains its activated fd here, so an engine
+// never hangs on a socket nothing will serve.
+func startDockerVolumes(ctx context.Context, cfg *config.Config, socket, volumeDir string, vc *vault.Client, username string) *dockervol.Driver {
 	if socket == "" {
 		return nil
 	}
 	store, err := vaultfs.NewStore(vc, cfg.Vault.KVMount, cfg.Vault.UserPrefix, username)
 	if err != nil {
 		slog.Warn("docker volume plugin not started", "error", err)
+		dockervol.DrainActivated()
 		return nil
 	}
 	// The default lives on the per-user runtime tmpfs so a rendered secret
@@ -96,6 +100,7 @@ func startDockerVolumes(ctx context.Context, cfg *config.Config, vc *vault.Clien
 	}, store, vc)
 	if err != nil {
 		slog.Warn("docker volume plugin not started", "error", err)
+		dockervol.DrainActivated()
 		return nil
 	}
 	go func() {

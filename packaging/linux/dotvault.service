@@ -38,8 +38,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 # Preserve= is load-bearing, not housekeeping preference. Without it,
 # systemd removes %t/dotvault on every service stop — including
 # Restart=on-failure cycles — and that directory holds the socket nodes the
-# optional dotvault-api.socket / dotvault-agent.socket units are listening
-# on. Deleting them leaves the socket units holding fds for unlinked inodes
+# optional dotvault-api.socket / dotvault-agent.socket /
+# dotvault-docker.socket units are listening on. Deleting them leaves the socket units holding fds for unlinked inodes
 # (clients get ENOENT, not the promised backlog queueing) and makes the
 # restarted daemon's activation check fail on the missing node: socket
 # activation would break itself on the first restart, the exact event it

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -810,5 +812,83 @@ func TestSocketActivationErrorIsFatal(t *testing.T) {
 	}
 	if st := d.Status(); st.Serving || st.Error == "" {
 		t.Errorf("Status = %+v, want not serving with the error recorded", st)
+	}
+}
+
+// Two containers mounting an unpopulated volume at the same moment render
+// it once: the second waits for the first and joins it, even if the token
+// is gone by the time it gets its turn.
+func TestConcurrentFirstMountsPopulateOnce(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	d, _ := newTestDriver(t, store, nil)
+	var tokens atomic.Int32
+	tokens.Store(1) // exactly one mount may see a token
+	d.opts.HasToken = func() bool { return tokens.Add(-1) >= 0 }
+	if err := d.Create("v", map[string]string{OptSecrets: "gh"}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = d.Mount(context.Background(), "v", fmt.Sprintf("c%d", i))
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("mount %d: %v (a concurrent first mount must join the population in progress, not repeat or refuse it)", i, err)
+		}
+	}
+	if reads, _ := store.counts(); reads != 1 {
+		t.Errorf("secret read %d times, want 1", reads)
+	}
+	info, _ := d.Get("v")
+	if info.Status[StatusMounts] != n {
+		t.Errorf("mounts = %v, want %d", info.Status[StatusMounts], n)
+	}
+}
+
+// A plugin kept on the activation list whose Run fails after the claim must
+// not leave systemd's fd with nobody accepting: the engine's calls are
+// drained (connect, then immediate EOF) rather than hung in the backlog.
+func TestActivatedFdIsDrainedWhenRunFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Run is linux only")
+	}
+	base := t.TempDir()
+	foreign := filepath.Join(base, "home")
+	os.MkdirAll(foreign, 0o700)
+	os.WriteFile(filepath.Join(foreign, "notes.txt"), []byte("keep"), 0o600)
+	d, err := New(Options{
+		SocketPath: filepath.Join(base, "docker.sock"),
+		VolumeDir:  foreign, // refused: non-empty and not ours
+		StatePath:  filepath.Join(base, "state.json"),
+		DefaultTTL: time.Minute,
+	}, newMemStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activatedPath := filepath.Join(base, "systemd.sock")
+	restore := fakeActivatedListener(t, activatedPath)
+	defer restore()
+
+	if err := d.Run(context.Background()); err == nil {
+		t.Fatal("Run succeeded against a foreign volume dir")
+	}
+	conn, err := net.DialTimeout("unix", activatedPath, time.Second)
+	if err != nil {
+		t.Fatalf("dial activated socket: %v", err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("read on the activated socket = %v, want EOF from the drain (a timeout means the engine would hang)", err)
 	}
 }

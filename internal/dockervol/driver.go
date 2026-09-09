@@ -81,8 +81,8 @@ type Driver struct {
 	runErr     string
 
 	// activated records that Run adopted a systemd-passed listener, so
-	// shutdown leaves the socket node to the unit that owns it. Written
-	// once in Run before Serve, read after Serve returns; no lock needed.
+	// shutdown leaves the socket node to the unit that owns it. Guarded by
+	// mu like everything else here.
 	activated bool
 }
 
@@ -268,16 +268,26 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 			v.populating--
 			d.mu.Unlock()
 		}()
-		// Only the first mount needs Vault: a second container joining a
-		// volume that is already materialised gets the files that exist,
-		// whatever the daemon's token is doing at that moment.
+		v.opMu.Lock()
+		defer v.opMu.Unlock()
+		// Re-judge under opMu: a concurrent first mount that got here
+		// first has populated the volume and started its loop while
+		// holding this lock, so this call joins it rather than rendering
+		// a second time — or failing, if the token happened to drop in
+		// between, for a volume that is in fact ready.
+		d.mu.Lock()
+		active = v.cancel != nil
+		d.mu.Unlock()
+	}
+	if !active {
+		// Only the first mount needs Vault: a container joining a volume
+		// that is already materialised gets the files that exist, whatever
+		// the daemon's token is doing at that moment.
 		if !d.hasToken() {
 			return "", ErrNoToken
 		}
 		ctx, cancel := context.WithTimeout(ctx, mountTimeout)
 		defer cancel()
-		v.opMu.Lock()
-		defer v.opMu.Unlock()
 		n, err := materialise(ctx, d.store, dir, v.Spec)
 		d.recordRefresh(v, n, err)
 		if err != nil {

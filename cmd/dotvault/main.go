@@ -25,7 +25,6 @@ import (
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
-	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
 	"github.com/goodtune/dotvault/internal/notify"
@@ -990,20 +989,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// accepts. The keep list names the surfaces that claim their fds
 	// themselves: the web server takes "api" when it starts (below), and
 	// the SSH agent takes "agent" when its listener starts (also below).
-	var keepActivated []string
-	if apiSocket != "" {
-		keepActivated = append(keepActivated, "api")
-	}
-	if cfg.Agent.Enabled {
-		keepActivated = append(keepActivated, "agent")
-	}
-	// The Docker volume plugin claims "docker" when it starts (below);
-	// DockerSocketPath is "" when the section is off or the platform has
-	// no plugin, in which case a passed fd is nobody's and is drained.
-	if p, err := cfg.DockerSocketPath(); err == nil && p != "" {
-		keepActivated = append(keepActivated, dockervol.ActivationName)
-	}
-	uds.DrainUnclaimedActivation(keepActivated...)
+	// The Docker volume plugin is resolved here, ahead of the drain, for
+	// the same reason as the API socket: its activated fd is kept on the
+	// strength of the plugin starting below, and startDockerVolumes drains
+	// it itself if it cannot.
+	dockerSocket, dockerVolumeDir := resolveDockerPlugin(cfg)
+	uds.DrainUnclaimedActivation(activationKeepList(cfg, apiSocket, dockerSocket)...)
 	borrowSockets := daemonBorrowSockets(cfg, apiSocket)
 
 	// Peer-socket token borrow. If no local token was usable and a peer socket
@@ -1129,7 +1120,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// the driver with a message naming the cause rather than by an absent
 	// socket the engine reports as "plugin not found". Never fatal — see
 	// startDockerVolumes.
-	dockerDriver := startDockerVolumes(ctx, cfg, vc, username)
+	dockerDriver := startDockerVolumes(ctx, cfg, dockerSocket, dockerVolumeDir, vc, username)
 	if dockerDriver != nil && webServer != nil {
 		webServer.SetDockerStatus(dockerDriver.Status)
 	}

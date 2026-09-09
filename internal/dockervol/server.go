@@ -196,50 +196,73 @@ func (d *Driver) Run(ctx context.Context) error {
 		return ErrUnsupported
 	}
 	d.setLifetime(ctx)
+	d.mu.Lock()
+	d.activated = false
+	d.mu.Unlock()
 
-	if err := d.prepareVolumeRoot(); err != nil {
-		err = fmt.Errorf("dockervol: %w", err)
-		d.setServing(false, err)
-		return err
-	}
-
-	// Bind before touching any volume directory. The bind is what proves
-	// this is the only driver on the socket; a second instance that resumed
-	// first would rewrite — and prune — the running daemon's volumes and
-	// only then discover it had no business being here.
-	//
 	// systemd socket activation first (Linux; inert elsewhere), exactly as
 	// the API socket and the SSH agent do: an inherited fd means systemd
 	// bound the socket and keeps it across our restarts, so an engine
 	// request landing mid-restart queues in the backlog instead of the
-	// engine reporting the plugin unreachable. An activation *error* is
-	// fatal rather than a fallback — it means the fd exists but violates an
-	// invariant (mode wider than 0600, wrong socket type), and self-binding
-	// would both mask the unit misconfiguration and fail anyway, since
-	// systemd owns the path.
-	var ln net.Listener
+	// engine reporting the plugin unreachable. Claimed before anything
+	// else can fail, because cmd/dotvault keeps the fd out of the
+	// unclaimed-fd drain on the strength of this Run: whatever goes wrong
+	// from here on, the fd must end up served or drained, never held by
+	// systemd with nobody accepting — every engine call would hang in the
+	// backlog with no timeout of its own.
+	//
+	// An activation *error* is a refusal, not a fallback: the fd exists
+	// but violates an invariant (mode wider than 0600, wrong socket type),
+	// and self-binding would both mask the unit misconfiguration and fail
+	// anyway, since systemd owns the path. The refused dup is closed and
+	// there is no listener to drain, so this is the one failure that does
+	// leave the engine's calls queued; it is logged at ERROR naming the
+	// unit, the same condition the API socket treats as fatal to the daemon.
 	aln, actual, err := activatedDockerListener()
-	switch {
-	case err != nil:
-		err = fmt.Errorf("dockervol: systemd activation: %w", err)
+	if err != nil {
+		err = fmt.Errorf("dockervol: systemd activation (check dotvault-docker.socket): %w", err)
+		slog.Error("docker volume plugin refused the systemd-activated socket; engine calls will queue until the unit is fixed", "error", err)
 		d.setServing(false, err)
 		return err
-	case aln != nil:
+	}
+	// Any failure between the claim and Serve hands the fd to a drain for
+	// the rest of the process, so the engine fails fast (EOF) instead of
+	// hanging — see uds.DrainListener.
+	drainOnFail := func(err error) error {
+		if aln != nil {
+			go uds.DrainListener(aln)
+		}
+		d.setServing(false, err)
+		return err
+	}
+
+	if err := d.prepareVolumeRoot(); err != nil {
+		return drainOnFail(fmt.Errorf("dockervol: %w", err))
+	}
+
+	// Bind before touching any volume directory. Under self-bind the bind
+	// is what proves this is the only driver on the socket — a second
+	// instance that resumed first would rewrite, and prune, the running
+	// daemon's volumes and only then discover it had no business being
+	// here. Under activation only the service's MainPID inherits the fd,
+	// which serves the same purpose.
+	var ln net.Listener
+	if aln != nil {
 		if actual != d.opts.SocketPath {
 			// The socket unit's ListenStream=, not docker.socket, decides
 			// where the socket lives under activation. Adopt it so status
 			// reports the socket that actually exists — and the operator's
 			// .spec file must name this path, not the configured one.
 			slog.Warn("systemd-activated docker plugin socket path differs from docker.socket; the socket unit wins", "activated", actual, "configured", d.opts.SocketPath)
-			// Under d.mu: Status reads the path concurrently.
-			d.mu.Lock()
-			d.opts.SocketPath = actual
-			d.mu.Unlock()
 		}
+		// Under d.mu: Status reads both concurrently.
+		d.mu.Lock()
+		d.opts.SocketPath = actual
 		d.activated = true
+		d.mu.Unlock()
 		ln = aln
 		slog.Info("serving docker volume plugin from systemd activation", "socket", actual, "volume_dir", d.opts.VolumeDir)
-	default:
+	} else {
 		ln, err = uds.Listen(d.opts.SocketPath)
 		if err != nil {
 			if errors.Is(err, uds.ErrAlreadyListening) {
@@ -272,8 +295,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	// A systemd-activated node belongs to the socket unit, which keeps
 	// serving it across our restarts; unlinking it would leave systemd
 	// listening on an inode no client can reach.
-	if !d.activated {
-		uds.Cleanup(d.opts.SocketPath)
+	d.mu.Lock()
+	activated, socketPath := d.activated, d.opts.SocketPath
+	d.mu.Unlock()
+	if !activated {
+		uds.Cleanup(socketPath)
 	}
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
@@ -287,6 +313,23 @@ func (d *Driver) Run(ctx context.Context) error {
 // fd — and which cmd/dotvault must keep out of the unclaimed-fd drain when
 // the plugin is enabled.
 const ActivationName = "docker"
+
+// DrainActivated claims the systemd-activated plugin socket, if one was
+// passed, and drains it for the rest of the process. cmd/dotvault calls it
+// when the plugin is enabled — so the fd was kept out of the unclaimed
+// drain — but the driver could not be built at all, which would otherwise
+// leave every engine call hanging in systemd's backlog.
+func DrainActivated() {
+	ln, _, err := activatedDockerListener()
+	if err != nil {
+		slog.Error("docker volume plugin refused the systemd-activated socket; engine calls will queue until the unit is fixed", "error", err)
+		return
+	}
+	if ln != nil {
+		slog.Warn("docker volume plugin not started; draining its systemd-activated socket so engine calls fail fast")
+		go uds.DrainListener(ln)
+	}
+}
 
 // activatedDockerListener claims the systemd-activated "docker" socket, when
 // one exists. An injectable var (matching internal/web's

@@ -77,20 +77,27 @@ func (p podmanEnv) cmd(args ...string) *exec.Cmd {
 	return c
 }
 
-// run executes podman and fails the test on a non-zero exit.
+// run executes podman and fails the test on a non-zero exit. It returns
+// stdout alone: podman writes image-pull progress and warnings to stderr,
+// and a caller parsing a document out of a container's output must not see
+// those in front of it.
 func (p podmanEnv) run(args ...string) string {
 	p.t.Helper()
-	out, err := p.cmd(args...).CombinedOutput()
+	stdout, stderr, err := p.try(args...)
 	if err != nil {
-		p.t.Fatalf("podman %s: %v\n%s", strings.Join(args, " "), err, out)
+		p.t.Fatalf("podman %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout, stderr)
 	}
-	return string(out)
+	return stdout
 }
 
-// try executes podman and returns its combined output and error.
-func (p podmanEnv) try(args ...string) (string, error) {
-	out, err := p.cmd(args...).CombinedOutput()
-	return string(out), err
+// try executes podman and returns stdout, stderr and the exit error, so a
+// caller can parse the one and assert on a message in the other.
+func (p podmanEnv) try(args ...string) (stdout, stderr string, err error) {
+	var out, errb strings.Builder
+	c := p.cmd(args...)
+	c.Stdout, c.Stderr = &out, &errb
+	err = c.Run()
+	return out.String(), errb.String(), err
 }
 
 func waitFor(t *testing.T, timeout time.Duration, what string, ok func() bool) {
@@ -269,6 +276,9 @@ docker:
 		return string(out)
 	}
 
+	// Pull once up front so no later step's output or timing includes a pull.
+	pm.run("pull", "-q", podmanAlpineImage)
+
 	t.Log("1. create a volume and read it from a container")
 	pm.run("volume", "create", "-d", "dotvault", "-o", "secrets=gh,db/", "app")
 	if got := strings.TrimSpace(pm.run("volume", "inspect", "app", "--format", "{{.Driver}}")); got != "dotvault" {
@@ -291,7 +301,7 @@ docker:
 	t.Log("2. a rewrite in Vault reaches a container that holds the volume")
 	pm.run("run", "-d", "--name", holderCtr, "-v", "app:/run/secrets/dotvault:ro", podmanAlpineImage, "sleep", "600")
 	holderToken := func() string {
-		out, err := pm.try("exec", holderCtr, "cat", "/run/secrets/dotvault/gh.json")
+		out, _, err := pm.try("exec", holderCtr, "cat", "/run/secrets/dotvault/gh.json")
 		if err != nil {
 			return ""
 		}
@@ -337,12 +347,12 @@ docker:
 	}
 	// Assert on the refusal's cause, not just a non-zero exit: any other
 	// failure (a missing image, a bad mount) would otherwise pass for free.
-	out, err = pm.try("run", "--rm", "--user", "65534:65534", "-v", "app:/s:ro", podmanAlpineImage, "cat", "/s/gh.json")
+	out, stderr, err := pm.try("run", "--rm", "--user", "65534:65534", "-v", "app:/s:ro", podmanAlpineImage, "cat", "/s/gh.json")
 	if err == nil {
 		t.Fatalf("non-root user read a default-mode (0400) volume:\n%s", out)
 	}
-	if !strings.Contains(strings.ToLower(out), "permission denied") {
-		t.Fatalf("expected a permission error for the 0400 volume, got: %v\n%s", err, out)
+	if !strings.Contains(strings.ToLower(stderr), "permission denied") {
+		t.Fatalf("expected a permission error for the 0400 volume, got: %v\n%s", err, stderr)
 	}
 
 	t.Log("6. layout=fields is byte-for-byte; an unknown option is an error")
@@ -351,14 +361,14 @@ docker:
 	if out != "no trailing newline" {
 		t.Fatalf("fields layout wrote %q, want the value with no added newline", out)
 	}
-	out, err = pm.try("volume", "create", "-d", "dotvault", "-o", "secret=gh", "bad")
+	out, stderr, err = pm.try("volume", "create", "-d", "dotvault", "-o", "secret=gh", "bad")
 	if err == nil {
 		t.Fatalf("a volume with an unknown option was created:\n%s", out)
 	}
-	if !strings.Contains(out, `unknown option "secret"`) {
-		t.Fatalf("unknown-option error not surfaced through the engine: %v\n%s", err, out)
+	if !strings.Contains(stderr, `unknown option "secret"`) {
+		t.Fatalf("unknown-option error not surfaced through the engine: %v\n%s", err, stderr)
 	}
-	t.Logf("unknown option refused: %s", strings.TrimSpace(out))
+	t.Logf("unknown option refused: %s", strings.TrimSpace(stderr))
 
 	t.Log("removing volumes")
 	pm.run("volume", "rm", "app", "shared", "fields")

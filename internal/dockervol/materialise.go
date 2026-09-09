@@ -405,7 +405,15 @@ func materialise(ctx context.Context, store vaultfs.Store, dir string, spec Spec
 
 // validComponent reports whether name can be one path component: it must
 // survive CleanPath unchanged and carry no separator.
+// validComponent reports whether name can be one path component of a volume
+// file: a single canonical KV segment. The empty string is refused explicitly
+// because vaultfs.CleanPath("") names the root rather than failing, and a KV
+// secret can carry an empty field name, which the fields layout would
+// otherwise turn into a file at the secret directory's own path.
 func validComponent(name string) bool {
+	if name == "" {
+		return false
+	}
 	clean, err := vaultfs.CleanPath(name)
 	return err == nil && clean == name && !strings.Contains(name, "/")
 }

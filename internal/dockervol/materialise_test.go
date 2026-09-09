@@ -103,6 +103,43 @@ func TestMaterialiseFieldsLayout(t *testing.T) {
 	}
 }
 
+// A KV secret may carry an empty field name, and vaultfs.CleanPath("") names
+// the root rather than failing, so validComponent has to refuse it on its own.
+func TestValidComponentRefusesEmptyAndNonCanonicalNames(t *testing.T) {
+	for _, bad := range []string{"", ".", "..", "a/b", "/a", "a/", "a\x00b"} {
+		if validComponent(bad) {
+			t.Errorf("validComponent(%q) = true, want false", bad)
+		}
+	}
+	for _, good := range []string{"gh", "a.b", "x.json", "-"} {
+		if !validComponent(good) {
+			t.Errorf("validComponent(%q) = false, want true", good)
+		}
+	}
+}
+
+func TestMaterialiseFieldsLayoutSkipsEmptyFieldName(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"": "orphan", "oauth_token": "gho_x"})
+	dir := filepath.Join(t.TempDir(), "vol")
+
+	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
+		t.Fatalf("materialise: %v", err)
+	}
+	got := readTree(t, dir)
+	if got["gh/oauth_token"] != "gho_x" {
+		t.Errorf("oauth_token = %q, want the value", got["gh/oauth_token"])
+	}
+	if _, ok := got["gh/"]; !ok {
+		t.Errorf("secret directory missing: %v", got)
+	}
+	for name, content := range got {
+		if content == "orphan" {
+			t.Errorf("the empty-named field was written as %q", name)
+		}
+	}
+}
+
 func TestMaterialiseSelection(t *testing.T) {
 	store := newMemStore()
 	store.put("gh", map[string]any{"a": "1"})

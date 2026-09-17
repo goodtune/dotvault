@@ -48,12 +48,19 @@
      The value is a <textarea>, not an <input>: the HTML value sanitization
      algorithm strips CR and LF from a text input, which would silently
      flatten a PEM private key the moment anything on the page was saved.
-     See normalizeFormNewlines for the other half of that round trip. */}}
+     See normalizeFormNewlines for the other half of that round trip.
+
+     The literal newline before {{.Value}} is the idiom the HTML standard
+     prescribes, not stray formatting: the parser drops a newline immediately
+     following a <textarea> start tag, so a value that itself begins with one
+     would lose it. The emitted newline is the one that gets dropped. Removing
+     it silently corrupts exactly those values and nothing else. */}}
 {{define "secret-field-row"}}<div class="secret-field-row">
   <input class="secret-field-name" name="field_name" value="{{.Name}}"
          autocomplete="off" spellcheck="false" placeholder="field" aria-label="Field name">
   <textarea class="secret-field-value" name="field_value" rows="{{.Rows}}" wrap="off"
-            autocomplete="off" spellcheck="false" placeholder="value" aria-label="Field value">{{.Value}}</textarea>
+            autocomplete="off" spellcheck="false" placeholder="value" aria-label="Field value">
+{{- "\n"}}{{.Value}}</textarea>
 </div>{{end}}
 
 {{/* secret-add-field-btn re-points itself at the next row index each time it

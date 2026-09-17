@@ -26,6 +26,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -74,6 +75,32 @@ func valueRows(v string) int {
 	default:
 		return n
 	}
+}
+
+// hasLineBreak reports whether s carries a CR or LF.
+//
+// It is the editor's dividing line between the two kinds of text on the form.
+// A *value* may contain line breaks and is carried in a <textarea>, which
+// preserves them. A *name* — a field name, or the secret's own path segment —
+// is carried in an <input>, whose value sanitization algorithm strips CR and
+// LF outright. So a name containing one cannot survive this form: the browser
+// would submit a different name than the page rendered, and the save would
+// read that as a deliberate rename and silently move the field. Refusing is
+// the only honest answer; the JSON API and the filesystem mount can still
+// edit such a secret losslessly.
+func hasLineBreak(s string) bool { return strings.ContainsAny(s, "\r\n") }
+
+// unrenderableNames counts the field names this form cannot round-trip. The
+// count, not the names: a field name can itself be telling, and this feeds a
+// user-visible message.
+func unrenderableNames(fields map[string]any) int {
+	n := 0
+	for name := range fields {
+		if hasLineBreak(name) {
+			n++
+		}
+	}
+	return n
 }
 
 // normalizeFormNewlines undoes the line-ending conversion HTML form
@@ -220,6 +247,19 @@ func (s *Server) handleUISecretEdit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "failed to read secret", http.StatusBadGateway)
 		return
 	}
+	// Refuse before rendering rather than corrupting on save. Both halves
+	// matter: a path segment with a line break would come back stripped from
+	// the name input and rename the secret, and a field name with one would
+	// come back stripped and rename the field. Neither is something the user
+	// asked for, and both are silent.
+	if hasLineBreak(clean) {
+		writeError(w, "this secret's name contains a line break, which this form cannot edit without renaming it", http.StatusUnprocessableEntity)
+		return
+	}
+	if n := unrenderableNames(fields); n > 0 {
+		writeError(w, fmt.Sprintf("%d of this secret's field names contain a line break, which this form cannot edit without renaming them; use the API or the filesystem mount", n), http.StatusUnprocessableEntity)
+		return
+	}
 	// Logged like a reveal, and for the same reason: this is the moment the
 	// values leave Vault for a screen, and an operator auditing that should
 	// see it whichever gesture caused it.
@@ -308,6 +348,12 @@ func parseFieldRows(r *http.Request) (fieldPatch, error) {
 		if name == "" {
 			continue
 		}
+		if hasLineBreak(name) {
+			// A browser cannot send this — the input strips it — so it means
+			// a hand-made request. Refusing keeps the form's round trip
+			// honest rather than storing a name it could never render back.
+			return fieldPatch{}, errors.New("a field name may not contain a line break")
+		}
 		if _, dup := p.Submitted[name]; dup {
 			// Content-free by the same rule the rest of this path follows: a
 			// field name can itself be telling, and an error string is one
@@ -317,9 +363,18 @@ func parseFieldRows(r *http.Request) (fieldPatch, error) {
 		p.Submitted[name] = normalizeFormNewlines(values[i])
 	}
 	for _, name := range r.PostForm["original_field"] {
-		if name != "" {
-			p.Original[name] = struct{}{}
+		if name == "" {
+			continue
 		}
+		if hasLineBreak(name) {
+			// The editor refuses to render such a secret, so a browser could
+			// never produce this marker — and a marker naming a field the
+			// form could not have shown is a claim to delete something the
+			// user was never given the chance to see. Refuse rather than
+			// honour it.
+			return fieldPatch{}, errors.New("a field name may not contain a line break")
+		}
+		p.Original[name] = struct{}{}
 	}
 	return p, nil
 }
@@ -362,6 +417,10 @@ func (s *Server) handleUISecretCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if name == "" {
 		renderErr(http.StatusUnprocessableEntity, "a name is required")
+		return
+	}
+	if hasLineBreak(name) {
+		renderErr(http.StatusUnprocessableEntity, "a name may not contain a line break")
 		return
 	}
 	if len(patch.Submitted) == 0 {
@@ -421,6 +480,10 @@ func (s *Server) handleUISecretSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if name == "" {
 		renderErr(http.StatusUnprocessableEntity, "a name is required")
+		return
+	}
+	if hasLineBreak(name) {
+		renderErr(http.StatusUnprocessableEntity, "a name may not contain a line break")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), secretEditTimeout)

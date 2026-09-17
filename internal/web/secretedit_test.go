@@ -1277,7 +1277,9 @@ func TestEditorRendersFieldRowsAndOriginals(t *testing.T) {
 		"personal/token": {"user": "gary", "value": "s3cret"},
 	})
 	body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Ftoken"))
-	for _, want := range []string{">gary</textarea>", ">s3cret</textarea>", `name="original_field"`} {
+	// The leading newline is the one the HTML parser eats (see
+	// TestTextareaPreservesLeadingNewline), so the value follows it.
+	for _, want := range []string{"\ngary</textarea>", "\ns3cret</textarea>", `name="original_field"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("editor body is missing %s", want)
 		}
@@ -1349,4 +1351,149 @@ func TestNormalizeFormNewlines(t *testing.T) {
 			t.Errorf("normalizeFormNewlines(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
+}
+
+// An enrolment's target is off limits through every route that writes, not
+// just the one the UI happens to offer. Notably `personal/gh` is NOT seeded
+// here: a configured enrolment that has not run yet is exactly when a user
+// might try to create it by hand, and the policy refuses on the configuration
+// rather than on what Vault currently holds.
+func TestEnrolmentPathsClosedOnEveryWriteRoute(t *testing.T) {
+	enrolments := map[string]config.Enrolment{"personal/gh": {Engine: "github"}}
+	s, ts, fake := editTestServer(t, []string{"personal"}, enrolments, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+
+	t.Run("create at an enrolment path", func(t *testing.T) {
+		resp := uiPost(t, ts, "/ui/secret-editor/create", editForm("personal", "gh", "a", "b"))
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("rename onto an enrolment path", func(t *testing.T) {
+		f := editForm("personal", "gh", "value", "v")
+		f.Set("path", "personal/token")
+		f.Add("original_field", "value")
+		if resp := uiPost(t, ts, "/ui/secret-editor/save", f); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("delete an enrolment path", func(t *testing.T) {
+		resp := uiPost(t, ts, "/ui/secret-editor/delete", url.Values{
+			"path": {"personal/gh"}, "confirm": {"gh"},
+		})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("open the editor on an enrolment path", func(t *testing.T) {
+		if resp := uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Fgh"); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
+		}
+	})
+
+	t.Run("API write at an enrolment path", func(t *testing.T) {
+		for _, method := range []string{"POST", "PUT"} {
+			w := httptest.NewRecorder()
+			s.handleSecretWrite(w, httptest.NewRequest(method, "/api/v1/secrets/personal/gh",
+				strings.NewReader(`{"fields":{"a":"b"}}`)))
+			if w.Code != http.StatusForbidden {
+				t.Errorf("%s status = %d, want 403", method, w.Code)
+			}
+		}
+	})
+
+	t.Run("API delete at an enrolment path", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.handleSecretDelete(w, httptest.NewRequest("DELETE", "/api/v1/secrets/personal/gh", nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+	})
+
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v to an enrolment-managed path", got)
+	}
+	if got := fake.deleted(); len(got) != 0 {
+		t.Errorf("deleted %v at an enrolment-managed path", got)
+	}
+}
+
+// A <textarea> preserves line breaks in a VALUE, but a name rides an
+// <input>, whose value sanitization algorithm strips CR and LF. So a field
+// name containing one cannot survive this form: the browser would submit a
+// different name than the page rendered, and the save would read that as a
+// rename and silently move the field. The editor refuses to open instead.
+func TestEditorRefusesNamesItCannotRoundTrip(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"a\nb": "secret-value", "ok": "v"},
+	})
+
+	resp := uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Ftoken")
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("editor status = %d, want 422", resp.StatusCode)
+	}
+	// The complaint counts the offending fields; it never names them.
+	if body := uiBody(t, resp); strings.Contains(body, "a\nb") || strings.Contains(body, "secret-value") {
+		t.Error("the refusal named the field or leaked its value")
+	}
+
+	// And the save path refuses the submission a browser could never have
+	// produced, so the field cannot be renamed out from under the user.
+	f := url.Values{}
+	f.Set("prefix", "personal")
+	f.Set("name", "token")
+	f.Set("path", "personal/token")
+	f.Add("field_name", "ab") // what an <input> would have stripped it to
+	f.Add("field_value", "secret-value")
+	f.Add("original_field", "a\nb") // what a hidden input would have kept
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", f); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("save status = %d, want 400", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v, silently renaming a field", got)
+	}
+}
+
+// A path segment carrying a line break has the same problem as a field name,
+// and is refused rather than written.
+func TestSecretNameRejectsLineBreaks(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", editForm("personal", "to\nken", "a", "b")); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a name containing a line break", got)
+	}
+}
+
+// The HTML parser drops a newline immediately after a <textarea> start tag,
+// so the fragment emits one of its own. Without it a value that legitimately
+// begins with a newline loses it — silently, and only for those values.
+func TestTextareaPreservesLeadingNewline(t *testing.T) {
+	if err := uiInitTemplates(); err != nil {
+		t.Fatal(err)
+	}
+	frag, err := uiFragment("secret-field-row", uiFieldRow{Name: "k", Value: "\nleading", Rows: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := strings.Index(frag, "<textarea")
+	if open < 0 {
+		t.Fatal("no textarea in the field row")
+	}
+	body := frag[strings.Index(frag[open:], ">")+open+1:]
+	if !strings.HasPrefix(body, "\n\n") {
+		t.Errorf("textarea body starts %q; the parser will eat the value's own newline", body[:min(8, len(body))])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

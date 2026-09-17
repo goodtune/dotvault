@@ -70,6 +70,27 @@ func (s *Server) editPolicy() kvpath.EditPolicy {
 	return kvpath.NewEditPolicy(s.cfg.EditablePaths, managed)
 }
 
+// secretEditability reports whether rel may be edited and, when it may not,
+// whether the reason is that dotvault manages the path itself.
+//
+// Both answers come from one Allow call rather than from the UI inferring a
+// reason. Inferring it was wrong: "not editable but inside an editable
+// subtree" is true of a secret sitting at *exactly* a configured root, which
+// is refused because the root is a direct child of the key space and not
+// because any enrolment owns it — so the page told the user it was managed by
+// an enrolment that did not exist. Only the policy knows which rule refused.
+func (s *Server) secretEditability(rel string) (editable, managed bool) {
+	_, err := s.editPolicy().Allow(rel)
+	switch {
+	case err == nil:
+		return true, false
+	case errors.Is(err, kvpath.ErrManaged):
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // writeEditableSecret replaces the secret at rel with data, creating it when
 // mustBeNew. It returns the cleaned path so callers can log and redirect
 // using the canonical spelling rather than whatever the request carried.
@@ -200,10 +221,19 @@ func apiSecretPath(r *http.Request) string {
 func decodeSecretEdit(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, secretBodyLimit)
 	var req secretEditRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
 		// The body is secret material, so the decoder's error — which quotes
 		// the offending token — must not reach the response or a log line.
 		writeError(w, "request body is not valid JSON", http.StatusBadRequest)
+		return nil, false
+	}
+	// Decode stops at the end of the first complete value and ignores
+	// whatever follows, so a body carrying two objects would silently write
+	// the first. ParseDocument makes the same check for the inner document;
+	// this is the outer envelope's half of it.
+	if dec.More() {
+		writeError(w, "request body carries trailing content", http.StatusBadRequest)
 		return nil, false
 	}
 	if len(req.Fields) == 0 {
@@ -242,8 +272,10 @@ func (s *Server) handleSecretWrite(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		status = http.StatusCreated
 	}
-	w.WriteHeader(status)
-	writeJSON(w, map[string]any{"path": clean, "status": "written"})
+	// writeJSONStatus, not WriteHeader-then-writeJSON: net/http snapshots the
+	// header map at WriteHeader, so setting Content-Type afterwards is a
+	// no-op and the 201 would go out untyped.
+	writeJSONStatus(w, status, map[string]any{"path": clean, "status": "written"})
 }
 
 // handleSecretDelete serves DELETE on /api/v1/secrets/{path}, removing the

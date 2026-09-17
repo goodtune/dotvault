@@ -17,7 +17,7 @@ If you distribute system-level configuration to a fleet of machines — via NixO
 - **Seven output formats** — YAML, JSON, INI, TOML, text, netrc, and ssh_config with format-appropriate merge strategies
 - **Go templates** — reshape secret data before writing, with helpers for encoding and defaults
 - **Daemon or one-shot** — runs as a long-lived service with automatic token refresh, or a single sync cycle
-- **Web UI** — optional local dashboard for login, status, and secret inspection
+- **Web UI** — optional local dashboard for login, status, and secret inspection, with editing for key spaces an administrator opts in
 - **Filesystem view** — optional FUSE mount (Linux/macOS) exposing each secret as a `.json` file, read-only by default
 - **Docker volumes** — optional volume plugin (Linux) so rootless Docker and Podman containers mount your secrets, kept current from Vault events or on a refresh window
 - **Service onboarding** — automated credential acquisition via OAuth device flows (e.g. GitHub)

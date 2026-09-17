@@ -82,11 +82,12 @@ func (s *Server) handleUISecretNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefill := defaultNewSecretPath(policy.Roots())
-	if dir := r.URL.Query().Get("path"); dir != "" && policy.AllowsWithin(dir) {
-		clean, err := kvpath.Clean(dir)
-		if err == nil {
-			prefill = clean + "/"
-		}
+	// AllowsWithin has already established that the directory is a valid
+	// relative path inside a root, so Clean cannot fail here — the error
+	// branch a second check would need is unreachable.
+	if dir := r.URL.Query().Get("path"); policy.AllowsWithin(dir) {
+		clean, _ := kvpath.Clean(dir)
+		prefill = clean + "/"
 	}
 	s.uiRenderPage(w, "secret_edit", uiSecretEditData{
 		uiPageData: s.uiBase(r.Context(), "New secret", "secrets", ""),
@@ -182,8 +183,7 @@ func (s *Server) handleUISecretSave(w http.ResponseWriter, r *http.Request) {
 			data.Title = rel
 			data.CancelURL = "/ui/secrets/" + uiEscapePath(rel)
 		}
-		w.WriteHeader(status)
-		s.uiRenderPage(w, "secret_edit", data)
+		s.uiRenderPageStatus(w, "secret_edit", data, status)
 	}
 
 	if strings.TrimSpace(rel) == "" {
@@ -214,7 +214,7 @@ func (s *Server) handleUISecretDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.requireUIWrite(w, r) {
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, sshBodyLimit)
+	r.Body = http.MaxBytesReader(w, r.Body, secretBodyLimit)
 	rel := uiFormValue(r, "path")
 	confirm := uiFormValue(r, "confirm")
 
@@ -226,14 +226,15 @@ func (s *Server) handleUISecretDelete(w http.ResponseWriter, r *http.Request) {
 	if leaf := clean[strings.LastIndex(clean, "/")+1:]; confirm != leaf {
 		// Re-render the detail page carrying the complaint rather than a bare
 		// error, so the user is still standing in front of the secret.
-		s.renderUISecretDetailError(w, r, clean, "type the secret's name ("+leaf+") to confirm deletion")
+		s.renderUISecretDetailError(w, r, clean, http.StatusConflict,
+			"type the secret's name ("+leaf+") to confirm deletion")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), secretEditTimeout)
 	defer cancel()
 
 	if _, err := s.deleteEditableSecret(ctx, clean); err != nil {
-		s.renderUISecretDetailError(w, r, clean, err.Error())
+		s.renderUISecretDetailError(w, r, clean, secretEditStatus(err), err.Error())
 		return
 	}
 	// The secret is gone, so its own URL would 404; land the user on the

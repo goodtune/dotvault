@@ -165,7 +165,11 @@ type uiSecretDetailData struct {
 	FormError string
 }
 
-func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context, path string, version int, fields map[string]any) {
+// uiSecretDetail builds the detail view model for a secret. It is the one
+// place the view's editing state is derived, so the detail page and the
+// re-render after a refused delete cannot disagree about whether a secret is
+// editable.
+func (s *Server) uiSecretDetail(ctx context.Context, path string, version int, fields map[string]any) uiSecretDetailData {
 	names := make([]string, 0, len(fields))
 	for k := range fields {
 		names = append(names, k)
@@ -175,7 +179,8 @@ func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context
 	for i, name := range names {
 		rows = append(rows, uiSecretFieldRefs(path, name, i))
 	}
-	data := uiSecretDetailData{
+	editable, managed := s.secretEditability(path)
+	return uiSecretDetailData{
 		uiPageData:     s.uiBase(ctx, path, "secrets", path),
 		Path:           path,
 		VaultSecretURL: s.uiVaultSecretURL(path),
@@ -183,19 +188,22 @@ func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context
 		Fields:         rows,
 		Leaf:           path[strings.LastIndex(path, "/")+1:],
 		EditURL:        "/ui/secret-editor/edit?" + url.Values{"path": {path}}.Encode(),
+		Editable:       editable,
+		Managed:        managed,
 	}
-	policy := s.editPolicy()
-	data.Editable = policy.Allows(path)
-	data.Managed = !data.Editable && policy.AllowsWithin(path)
-	s.uiRenderPage(w, "secret", data)
+}
+
+func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context, path string, version int, fields map[string]any) {
+	s.uiRenderPage(w, "secret", s.uiSecretDetail(ctx, path, version, fields))
 }
 
 // renderUISecretDetailError re-renders the detail page carrying a complaint,
 // used when a delete is refused (a mistyped confirmation, a Vault failure).
 // Re-reading the secret rather than threading state through a redirect keeps
 // the user in front of the thing they were acting on, with its live version
-// number.
-func (s *Server) renderUISecretDetailError(w http.ResponseWriter, r *http.Request, path, msg string) {
+// number. The status is the caller's, not a fixed 409: a Vault failure and a
+// mistyped confirmation are not the same answer.
+func (s *Server) renderUISecretDetailError(w http.ResponseWriter, r *http.Request, path string, status int, msg string) {
 	ctx, cancel := context.WithTimeout(r.Context(), secretEditTimeout)
 	defer cancel()
 
@@ -204,33 +212,12 @@ func (s *Server) renderUISecretDetailError(w http.ResponseWriter, r *http.Reques
 		// The secret is unreadable now, so there is no detail page to return
 		// to; report the original complaint plainly rather than masking it
 		// with a read failure.
-		writeError(w, msg, http.StatusConflict)
+		writeError(w, msg, status)
 		return
 	}
-	names := make([]string, 0, len(secret.Data))
-	for k := range secret.Data {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	rows := make([]uiSecretField, 0, len(names))
-	for i, name := range names {
-		rows = append(rows, uiSecretFieldRefs(path, name, i))
-	}
-	policy := s.editPolicy()
-	data := uiSecretDetailData{
-		uiPageData:     s.uiBase(ctx, path, "secrets", path),
-		Path:           path,
-		VaultSecretURL: s.uiVaultSecretURL(path),
-		SecretVersion:  secret.Version,
-		Fields:         rows,
-		Leaf:           path[strings.LastIndex(path, "/")+1:],
-		EditURL:        "/ui/secret-editor/edit?" + url.Values{"path": {path}}.Encode(),
-		FormError:      msg,
-	}
-	data.Editable = policy.Allows(path)
-	data.Managed = !data.Editable && policy.AllowsWithin(path)
-	w.WriteHeader(http.StatusConflict)
-	s.uiRenderPage(w, "secret", data)
+	data := s.uiSecretDetail(ctx, path, secret.Version, secret.Data)
+	data.FormError = msg
+	s.uiRenderPageStatus(w, "secret", data, status)
 }
 
 func (s *Server) renderUISecretFolder(w http.ResponseWriter, ctx context.Context, folder string, children []string) {

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -53,13 +54,7 @@ func (v *editVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.URL.Query().Get("list") == "true":
-		var keys []string
-		for k := range v.secrets {
-			if rel == "" && !strings.Contains(k, "/") {
-				keys = append(keys, k)
-			}
-		}
-		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": keys}})
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": v.childrenOf(rel)}})
 	case r.Method == http.MethodDelete:
 		v.deletes = append(v.deletes, rel)
 		delete(v.secrets, rel)
@@ -87,6 +82,39 @@ func (v *editVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+}
+
+// childrenOf returns the direct children of a folder the way Vault's LIST
+// does: leaf names for secrets, trailing-slash names for folders, each once.
+// Implemented faithfully rather than approximately because the UI's folder
+// page only renders when LIST returns something, so a fake that under-reports
+// would silently turn a folder assertion into a "secret not found" page that
+// happens to contain whatever the test grepped for.
+func (v *editVault) childrenOf(rel string) []string {
+	prefix := ""
+	if rel != "" {
+		prefix = rel + "/"
+	}
+	seen := map[string]bool{}
+	keys := []string{}
+	for k := range v.secrets {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		name := strings.TrimPrefix(k, prefix)
+		if name == "" {
+			continue
+		}
+		if i := strings.Index(name, "/"); i >= 0 {
+			name = name[:i+1] // a folder, per Vault's convention
+		}
+		if !seen[name] {
+			seen[name] = true
+			keys = append(keys, name)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (v *editVault) wrote() []string {
@@ -245,9 +273,12 @@ func TestSecretEditFollowsEnrolmentReload(t *testing.T) {
 		t.Fatalf("pre-reload save status = %d, want 303", resp.StatusCode)
 	}
 
-	s.rulesMu.Lock()
+	// enrolRunnerMu, matching getEnrolments and InitEnrolments — rulesMu
+	// guards a different field and taking it here would model the wrong
+	// discipline for anyone copying this helper.
+	s.enrolRunnerMu.Lock()
 	s.enrolments = map[string]config.Enrolment{"personal/gh": {Engine: "github"}}
-	s.rulesMu.Unlock()
+	s.enrolRunnerMu.Unlock()
 
 	if resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
 		"create": "0", "path": "personal/gh", "document": `{"oauth_token":"b"}`,
@@ -370,8 +401,10 @@ func TestSecretAPIWriteRequiresCSRF(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusCreated {
-		t.Error("a POST with no CSRF token was accepted")
+	// Asserted exactly, not as "anything but 201": a != check would also pass
+	// on a 404 from a route that was never registered.
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
 	if got := fake.wrote(); len(got) != 0 {
 		t.Errorf("wrote %v without a CSRF token", got)
@@ -556,5 +589,208 @@ func TestSecretEditRejectsTraversal(t *testing.T) {
 	}
 	if got := fake.wrote(); len(got) != 0 {
 		t.Errorf("wrote %v for a traversal path", got)
+	}
+}
+
+// The JSON API's own success and not-found paths, which the browser tests do
+// not reach: the UI only ever creates through the form and replaces through
+// the editor, so PUT-on-absent and DELETE have no browser equivalent.
+func TestSecretAPILifecycle(t *testing.T) {
+	s, _, fake := editTestServer(t, []string{"personal"}, nil, nil)
+
+	t.Run("create returns 201", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.handleSecretWrite(w, httptest.NewRequest("POST", "/api/v1/secrets/personal/token",
+			strings.NewReader(`{"fields":{"value":"v"}}`)))
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("replace returns 200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.handleSecretWrite(w, httptest.NewRequest("PUT", "/api/v1/secrets/personal/token",
+			strings.NewReader(`{"fields":{"value":"v2"}}`)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+	})
+
+	// Replace is not a create: naming nothing is a 404, so a typo'd path does
+	// not quietly conjure a secret somewhere the user did not mean.
+	t.Run("replace on an absent path is 404", func(t *testing.T) {
+		before := len(fake.wrote())
+		w := httptest.NewRecorder()
+		s.handleSecretWrite(w, httptest.NewRequest("PUT", "/api/v1/secrets/personal/nothing",
+			strings.NewReader(`{"fields":{"value":"v"}}`)))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+		if got := fake.wrote(); len(got) != before {
+			t.Errorf("wrote %v for an absent path", got[before:])
+		}
+	})
+
+	t.Run("delete removes it", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.handleSecretDelete(w, httptest.NewRequest("DELETE", "/api/v1/secrets/personal/token", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+		if got := fake.deleted(); len(got) != 1 || got[0] != "personal/token" {
+			t.Errorf("deleted = %v, want [personal/token]", got)
+		}
+	})
+
+	t.Run("delete on an absent path is 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.handleSecretDelete(w, httptest.NewRequest("DELETE", "/api/v1/secrets/personal/token", nil))
+		if w.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", w.Code)
+		}
+	})
+
+	t.Run("delete refuses an uneditable path", func(t *testing.T) {
+		before := len(fake.deleted())
+		w := httptest.NewRecorder()
+		s.handleSecretDelete(w, httptest.NewRequest("DELETE", "/api/v1/secrets/gh", nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+		if got := fake.deleted(); len(got) != before {
+			t.Errorf("deleted %v for an uneditable path", got[before:])
+		}
+	})
+}
+
+// With several editable roots the create form leaves the path blank rather
+// than picking one arbitrarily, which a user might not notice.
+func TestCreateFormPrefillWithSeveralRoots(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal", "scratch"}, nil, nil)
+	body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new"))
+	if strings.Contains(body, `value="personal/"`) {
+		t.Error("create form picked one of several roots to pre-fill")
+	}
+	// It still says where a path is allowed to go.
+	if !strings.Contains(body, "personal/") || !strings.Contains(body, "scratch/") {
+		t.Error("create form does not list the editable roots")
+	}
+}
+
+// The folder page offers "New secret" for a configured root and inside it,
+// but not for a folder outside every root — AllowsWithin over the HTTP
+// surface rather than only as a unit test.
+func TestFolderPageOffersCreateOnlyWhereAllowed(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+		"other/thing":    {"value": "v"},
+	})
+	// Matched on the ?path= form, which only the folder page's own button
+	// carries: the sidebar's New secret entry is deliberately global and
+	// appears on every secrets page, so a bare-path match would pass here
+	// whatever the folder template did.
+	const folderBtn = "/ui/secret-editor/new?path="
+	if body := uiBody(t, uiGet(t, ts, "/ui/secrets/personal/")); !strings.Contains(body, folderBtn) {
+		t.Error("editable folder has no New secret control")
+	}
+	if body := uiBody(t, uiGet(t, ts, "/ui/secrets/other/")); strings.Contains(body, folderBtn) {
+		t.Error("folder outside every root offers a New secret control")
+	}
+}
+
+// The editor's re-render after a refusal is the one page in the UI whose body
+// carries plaintext secret material, so it must not be cacheable. net/http
+// snapshots the header map at WriteHeader, so a handler that sets the status
+// before rendering silently loses the Cache-Control the renderer sets —
+// which is exactly what this used to do.
+func TestSecretEditorErrorPageIsNotCacheable(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
+		"create": "0", "path": "personal/token", "document": `{"value": "unclosed`,
+	})
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", got)
+	}
+}
+
+// Same ordering trap on the detail page's refused-delete re-render.
+func TestSecretDetailErrorPageKeepsHeaders(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	resp := uiPost(t, ts, "/ui/secret-editor/delete", map[string]string{
+		"path": "personal/token", "confirm": "wrong",
+	})
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", got)
+	}
+}
+
+// The API's 201 must still be typed: WriteHeader-then-set-Content-Type is a
+// no-op, so this pins the writeJSONStatus call rather than the status alone.
+func TestSecretAPIWriteResponseIsTypedJSON(t *testing.T) {
+	s, _, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	w := httptest.NewRecorder()
+	s.handleSecretWrite(w, httptest.NewRequest("POST", "/api/v1/secrets/personal/token",
+		strings.NewReader(`{"fields":{"value":"v"}}`)))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+}
+
+// A secret sitting at exactly a configured root is refused because the root
+// is a direct child of the key space, not because an enrolment owns it. The
+// page must not claim otherwise — inferring the reason from "not editable but
+// inside an editable subtree" got this wrong.
+func TestSecretAtRootIsNotLabelledEnrolmentManaged(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal": {"value": "v"},
+	})
+	body := uiBody(t, uiGet(t, ts, "/ui/secrets/personal"))
+	if strings.Contains(body, "Managed by an enrolment") {
+		t.Error("a secret at a configured root is labelled as enrolment-managed")
+	}
+	if strings.Contains(body, "/ui/secret-editor/edit") {
+		t.Error("a secret at a configured root offers an Edit control")
+	}
+}
+
+// Trailing content after the JSON envelope must be refused, not silently
+// ignored: Decode stops at the first complete value, so a body carrying two
+// objects would otherwise write the first.
+func TestSecretAPIRefusesTrailingContent(t *testing.T) {
+	s, _, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	w := httptest.NewRecorder()
+	s.handleSecretWrite(w, httptest.NewRequest("POST", "/api/v1/secrets/personal/token",
+		strings.NewReader(`{"fields":{"a":"1"}}{"fields":{"b":"2"}}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a body with trailing content", got)
+	}
+}
+
+// Opening the editor on a path that holds no secret is a 404 rather than an
+// empty form that would create one on save.
+func TestSecretEditorOnMissingSecretIs404(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	resp := uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Fnothing")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
 }

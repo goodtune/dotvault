@@ -626,7 +626,12 @@ type WebConfig struct {
 	// credentials other tooling consumes, where the overlay's one precedent
 	// (fuse) grants a read-only view. See the per-user overlay notes in
 	// CLAUDE.md before reconsidering.
-	EditablePaths []string `yaml:"editable_paths,omitempty"`
+	// No `omitempty`, matching vault.policies and ssh.certificate_authorities:
+	// internal/regfile's MarshalYAML contract is that an empty optional field
+	// is emitted explicitly so a re-import can clear a previously-set value,
+	// and this is a list whose *empty* state is a deliberate answer — it is
+	// how a policy revokes editing a base config granted.
+	EditablePaths []string `yaml:"editable_paths"`
 }
 
 // AgentConfig configures the SSH agent surface. Disabled by default; when
@@ -1574,7 +1579,7 @@ func validateEditablePaths(entries []string) error {
 	for i, raw := range entries {
 		clean, err := kvpath.Clean(raw)
 		if err != nil {
-			return fmt.Errorf("web.editable_paths[%d] %q: %w", i, raw, err)
+			return fmt.Errorf("web.editable_paths[%d] %q: %w (a path segment may not be empty, \".\", \"..\", or contain NUL)", i, raw, err)
 		}
 		if clean == "" {
 			return fmt.Errorf("web.editable_paths[%d] %q: names the key space root; give a subdirectory of it", i, raw)

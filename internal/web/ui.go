@@ -340,6 +340,20 @@ func (s *Server) uiRenderPage(w http.ResponseWriter, page string, data any) {
 	s.uiRender(w, page, "layout", data)
 }
 
+// uiRenderPageStatus is uiRenderPage with a non-200 status — a form
+// re-rendered after a refusal, say.
+//
+// It exists because a caller cannot simply WriteHeader first: net/http
+// snapshots the header map at WriteHeader, so the Content-Type and
+// Cache-Control: no-store that uiRender sets would be silently discarded.
+// That is not cosmetic — the secret editor's re-render is the one page whose
+// body carries plaintext secret material, so losing no-store there would put
+// it in a shared cache. The status therefore has to travel *into* the
+// renderer rather than being applied around it.
+func (s *Server) uiRenderPageStatus(w http.ResponseWriter, page string, data any, status int) {
+	s.uiRenderWithStatus(w, page, "layout", data, status)
+}
+
 // uiRenderStandalone executes a page inside the chrome-less shell used by the
 // login view and the first-run wizard — the surfaces that exist before there
 // is a dashboard to frame them.
@@ -351,6 +365,14 @@ func (s *Server) uiRenderStandalone(w http.ResponseWriter, page string, data any
 // errors after the first byte cannot become a clean 500, so the page is
 // rendered to a buffer first.
 func (s *Server) uiRender(w http.ResponseWriter, page, shell string, data any) {
+	s.uiRenderWithStatus(w, page, shell, data, http.StatusOK)
+}
+
+// uiRenderWithStatus is uiRender's implementation. The status is written
+// after the headers and only once the template has executed cleanly, so a
+// render failure can still become an honest 500 (see uiRenderPageStatus for
+// why the status cannot be applied by the caller instead).
+func (s *Server) uiRenderWithStatus(w http.ResponseWriter, page, shell string, data any, status int) {
 	tmpl, ok := uiPages[page]
 	if !ok {
 		writeError(w, "unknown page", http.StatusInternalServerError)
@@ -364,6 +386,9 @@ func (s *Server) uiRender(w http.ResponseWriter, page, shell string, data any) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
 	fmt.Fprint(w, b.String())
 }
 

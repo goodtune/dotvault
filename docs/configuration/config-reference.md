@@ -290,7 +290,7 @@ With `user_prefix: users/` and a user of `gary`, that makes everything under `us
 Three things are **never** editable, whatever this is set to:
 
 - **The root of your key space.** `personal/token` is editable; a secret sitting at exactly `users/gary/personal` is not, and neither is `users/gary/gh`. A root names a folder, and the secret that happens to share its name is a direct child of the key-space root like any other. Admitting the root would put every enrolment credential and every sync rule's source one gesture away from being replaced, which is the blast radius this setting exists to bound — so an entry naming it (`""`, `"/"`) is rejected at config load rather than quietly ignored.
-- **Anything an enrolment writes.** If `personal/gh` is a configured enrolment key, it stays read-only even though `personal` is editable: the credential there belongs to the enrolment engine, which will overwrite an edit at its next run or refresh. The UI says so on the page rather than just omitting the controls. This is evaluated live, so an enrolment added by a [remote config](remote-config.md) refresh takes a path out of reach without a restart.
+- **Anything an enrolment writes.** If `personal/gh` is a configured enrolment key — a [grouped enrolment](#enrolments-section) whose group happens to be an editable subtree; a flat key like `gh` sits at the key-space root and is already excluded by the rule above — it stays read-only even though `personal` is editable: the credential there belongs to the enrolment engine, which will overwrite an edit at its next run or refresh. The UI says so on the page rather than just omitting the controls. This is evaluated live, so an enrolment added by a [remote config](remote-config.md) refresh takes a path out of reach without a restart.
 - **Any other user's secrets.** The path is always resolved beneath your own prefix, and `..` segments are rejected rather than collapsed.
 
 `editable_paths` is validated whether or not `web.enabled` is set, so a bad entry is reported when you stage the config rather than on the restart that turns the UI on. Entries are canonicalised (`/personal/` becomes `personal`), and a duplicate is an error.
@@ -538,6 +538,9 @@ dotvault validates the configuration on startup and exits with an error if:
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
 - A rule sets `target.delete_nulls: true` on a format other than `json` or `yaml` — the others have no null literal a template could render, and silently ignoring the flag would leave you believing a retired credential had been deleted (see [Removing a field](sync-rules.md#removing-a-field))
 - `web.listen` resolves to a non-loopback address (when web is enabled)
+- A `web.editable_paths` entry names the root of your key space (`""`, `"/"`) rather than a subdirectory of it — silently ignoring it would leave you believing you had granted editing that you had not
+- A `web.editable_paths` entry is not a valid relative KV path (an empty segment, `.`, `..`, or an embedded NUL)
+- Two `web.editable_paths` entries name the same subtree once canonicalised (`personal` and `/personal/`)
 - An enrolment entry has an empty `engine` field
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
 - `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)

@@ -745,3 +745,27 @@ func TestEditablePathsRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestEditablePathsEmptyListSurvivesYAML closes the third leg of the
+// round-trip: a policy that revokes editing does so with an *empty* list, and
+// an `omitempty` yaml tag would drop it on the reg→YAML conversion that
+// `reg-export` and the config-download endpoint both perform. The registry
+// and .reg legs are covered above; this one pins the YAML emitter.
+func TestEditablePathsEmptyListSurvivesYAML(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example:8200"},
+		Web:   config.WebConfig{Enabled: true, EditablePaths: []string{}},
+		Rules: []config.Rule{{
+			Name:     "r",
+			VaultKey: "gh",
+			Target:   config.Target{Path: "~/.config/gh", Format: "yaml"},
+		}},
+	}
+	out, err := MarshalYAML(cfg)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	if !strings.Contains(string(out), "editable_paths:") {
+		t.Errorf("an explicitly empty editable_paths was omitted from the YAML:\n%s", out)
+	}
+}

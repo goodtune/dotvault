@@ -637,8 +637,8 @@ func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
 	if err := uiInitTemplates(); err != nil {
 		t.Fatal(err)
 	}
-	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3)
-	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL} {
+	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3, 7)
+	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL, f.EditURL, f.CancelURL} {
 		if strings.ContainsAny(u, `'"\`+"`") {
 			t.Errorf("fragment URL %q carries raw JS-string metacharacters", u)
 		}
@@ -658,19 +658,19 @@ func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
 		t.Errorf("expected percent-encoded field name in fragment: %s", frag)
 	}
 
-	// The secret editor's "Add field" button is the other datastar attribute
-	// on this surface. Its URL carries only a row index today, so nothing
-	// hostile can reach it — but the rule is about the attribute, not about
-	// what happens to be interpolated into it this week.
-	addBtn, err := uiFragment("secret-add-field-btn", uiSecretEditData{AddRowURL: addRowURL(2)})
+	// The pencil is the editor's own datastar attribute, and it interpolates
+	// the same hostile path and field name.
+	pencil, err := uiFragment("pencil-btn", f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.ContainsAny(addRowURL(2), `'"\`+"`") {
-		t.Errorf("add-field URL carries raw JS-string metacharacters: %q", addRowURL(2))
+	for _, raw := range []string{`we"ird`, `fi'eld`, `na\me`} {
+		if strings.Contains(pencil, raw) {
+			t.Errorf("pencil carries unencoded value %q: %s", raw, pencil)
+		}
 	}
-	if !strings.Contains(addBtn, "i=2") {
-		t.Errorf("add-field button does not carry its row index: %s", addBtn)
+	if !strings.Contains(pencil, "fi%27eld%22na%5Cme") {
+		t.Errorf("expected percent-encoded field name in the pencil: %s", pencil)
 	}
 }
 

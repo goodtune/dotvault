@@ -124,7 +124,7 @@ func uiInitTemplates() error {
 			return
 		}
 		names := []string{
-			"dashboard", "secret", "secret_edit", "folder", "enrolments",
+			"dashboard", "secret", "folder", "enrolments",
 			"enrol_detail", "remotes", "remote_detail", "config",
 			// Chrome-less pages: they render through "standalone" rather
 			// than "layout" (see uiRenderStandalone).
@@ -250,11 +250,6 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("GET /ui/{$}", s.handleUIDashboard)
 	s.mux.HandleFunc("GET /ui/secrets/{$}", s.handleUISecretsIndex)
 	s.mux.HandleFunc("GET /ui/secrets/{path...}", s.handleUISecret)
-	// Secret editing (web.editable_paths). Deliberately NOT under
-	// /ui/secrets/, whose page route is a {path...} wildcard a literal
-	// sibling would shadow — see ui_secret_edit.go.
-	s.mux.HandleFunc("GET /ui/secret-editor/new", s.handleUISecretNew)
-	s.mux.HandleFunc("GET /ui/secret-editor/edit", s.handleUISecretEdit)
 	s.mux.HandleFunc("GET /ui/enrolments/{$}", s.handleUIEnrolmentsIndex)
 	s.mux.HandleFunc("GET /ui/enrolments/{engine}/{key...}", s.handleUIEnrolDetail)
 	s.mux.HandleFunc("GET /ui/remotes/{$}", s.handleUIRemotesIndex)
@@ -271,7 +266,12 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("GET /ui/fragments/secrets/mask", s.handleUISecretMask)
 	s.mux.HandleFunc("GET /ui/fragments/secrets/copy-btn", s.handleUISecretCopyBtn)
 	s.mux.HandleFunc("GET /ui/fragments/enrol-card", s.handleUIEnrolCardFragment)
-	s.mux.HandleFunc("GET /ui/fragments/secret-editor/field-row", s.handleUISecretFieldRow)
+	// Secret editing (web.editable_paths) is in-place on the detail page:
+	// these turn one row editable and back. The fragment prefix is outside
+	// /ui/secrets/, whose page route is a {path...} wildcard a literal
+	// sibling would shadow.
+	s.mux.HandleFunc("GET /ui/fragments/secrets/edit-row", s.handleUISecretEditRow)
+	s.mux.HandleFunc("GET /ui/fragments/secrets/row", s.handleUISecretRow)
 
 	// Mutations (same-origin POSTs; see requireUIWrite).
 	s.mux.HandleFunc("POST /ui/actions/sync", s.handleUIActionSync)
@@ -281,9 +281,9 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("POST /ui/enrol/skip", s.handleUIEnrolSkip)
 	s.mux.HandleFunc("POST /ui/enrol/reset", s.handleUIEnrolReset)
 	s.mux.HandleFunc("POST /ui/enrol/secret", s.handleUIEnrolSecret)
-	s.mux.HandleFunc("POST /ui/secret-editor/create", s.handleUISecretCreate)
-	s.mux.HandleFunc("POST /ui/secret-editor/save", s.handleUISecretSave)
-	s.mux.HandleFunc("POST /ui/secret-editor/delete", s.handleUISecretDelete)
+	s.mux.HandleFunc("POST /ui/secrets-edit/field", s.handleUISecretFieldSave)
+	s.mux.HandleFunc("POST /ui/secrets-edit/goto", s.handleUISecretGoto)
+	s.mux.HandleFunc("POST /ui/secrets-edit/delete", s.handleUISecretDelete)
 	s.mux.HandleFunc("POST /ui/remotes/add", s.handleUIRemoteAdd)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/save", s.handleUIRemoteSave)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/delete", s.handleUIRemoteDelete)
@@ -407,7 +407,62 @@ func uiFragment(name string, data any) (string, error) {
 // uiPatchElements sends rendered elements as a datastar patch-elements SSE
 // response. A write failure just means the client went away mid-patch, so it
 // is logged at debug and not surfaced.
+// noStoreSSEWriter forces Cache-Control: no-store onto an SSE response.
+//
+// It exists because datastar's NewSSE sets "no-cache" and flushes the headers
+// itself, so a plain Set before or after it is either overwritten or too
+// late. Some of these fragments carry a revealed secret — the eye's cell and
+// the pencil's edit row — and "no-cache" permits a shared cache to *store*
+// the response and merely revalidate it. The pages that carry the same values
+// say no-store; a value should not become more storable for arriving as a
+// fragment.
+//
+// Buffering the header map and applying it at first write is what lets the
+// last word be ours. Flush is implemented rather than inherited because
+// http.ResponseController tries the outermost writer first, and datastar
+// flushes through one — without it the implicit WriteHeader would happen on
+// the wrapped writer and skip this.
+type noStoreSSEWriter struct {
+	http.ResponseWriter
+	hdr     http.Header
+	written bool
+}
+
+func newNoStoreSSEWriter(w http.ResponseWriter) *noStoreSSEWriter {
+	return &noStoreSSEWriter{ResponseWriter: w, hdr: w.Header().Clone()}
+}
+
+func (w *noStoreSSEWriter) Header() http.Header { return w.hdr }
+
+func (w *noStoreSSEWriter) WriteHeader(code int) {
+	if w.written {
+		return
+	}
+	w.written = true
+	dst := w.ResponseWriter.Header()
+	for k, v := range w.hdr {
+		dst[k] = v
+	}
+	dst.Set("Cache-Control", "no-store, max-age=0")
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *noStoreSSEWriter) Write(b []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *noStoreSSEWriter) Flush() {
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *noStoreSSEWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func uiPatchElements(w http.ResponseWriter, r *http.Request, elements string) {
+	w = newNoStoreSSEWriter(w)
 	sse := datastar.NewSSE(w, r)
 	if err := sse.PatchElements(elements); err != nil {
 		slog.Debug("patch elements failed", "error", err)

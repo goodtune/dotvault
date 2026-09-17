@@ -39,34 +39,78 @@
 
 {{define "copy-btn-done"}}<button id="ui-copy-{{.ID}}" class="copy-btn copied" title="Copied!" data-init__delay.2s="@get('{{.CopyBtnURL}}')">&#9989;</button>{{end}}
 
-{{/* secret-field-row is one name/value pair in the secret editor. The form
-     posts repeated field_name/field_value controls and pairs them
-     positionally, so Index only distinguishes the DOM ids — nothing parses
-     it. A row left with a blank name is dropped on save, which is what makes
-     the always-present blank rows free.
+{{/* A row of the secret's field table has two shapes. secret-row is the
+     read-only one, masked like every other secret on this surface. Its
+     pencil is gated on .Editable — set from the same predicate the edit-row
+     handler enforces — because offering an edit the request would refuse is
+     precisely what EditPolicy.Allows exists to prevent, and with the default
+     empty web.editable_paths that would be every row of every secret;
+     secret-row-edit is the same row turned into inputs by the pencil. They
+     replace each other in place (both carry the same id) so nothing else on
+     the page — including another row mid-edit — is disturbed. */}}
+{{define "secret-row"}}<tr id="secret-row-{{.ID}}">
+  <td class="field-name">{{.Name}}</td>
+  {{template "masked-cell" .}}
+  <td class="field-actions">{{template "eye-btn" .}}{{template "copy-btn" .}}{{if .Editable}}{{template "pencil-btn" .}}{{end}}</td>
+</tr>{{end}}
 
-     The value is a <textarea>, not an <input>: the HTML value sanitization
+{{/* The value is a <textarea>, not an <input>: the HTML value sanitization
      algorithm strips CR and LF from a text input, which would silently
-     flatten a PEM private key the moment anything on the page was saved.
-     See normalizeFormNewlines for the other half of that round trip.
+     flatten a PEM private key. The literal newline before {{.Value}} is the
+     idiom the HTML standard prescribes — the parser drops a newline right
+     after the start tag, so a value that itself begins with one would lose
+     it; the emitted newline is the one that gets dropped.
 
-     The literal newline before {{.Value}} is the idiom the HTML standard
-     prescribes, not stray formatting: the parser drops a newline immediately
-     following a <textarea> start tag, so a value that itself begins with one
-     would lose it. The emitted newline is the one that gets dropped. Removing
-     it silently corrupts exactly those values and nothing else. */}}
-{{define "secret-field-row"}}<div class="secret-field-row">
-  <input class="secret-field-name" name="field_name" value="{{.Name}}"
-         autocomplete="off" spellcheck="false" placeholder="field" aria-label="Field name">
-  <textarea class="secret-field-value" name="field_value" rows="{{.Rows}}" wrap="off"
-            autocomplete="off" spellcheck="false" placeholder="value" aria-label="Field value">
+     `version` is the point of the whole row: it is the version the row was
+     rendered from, and the save is a check-and-set against it, so an edit
+     made against a stale view is refused rather than overwriting whoever
+     wrote in between. */}}
+{{define "secret-row-edit"}}<tr id="secret-row-{{.ID}}" class="field-row-editing">
+  <td colspan="3">
+    <form class="field-edit-form" method="post" action="/ui/secrets-edit/field">
+      <input type="hidden" name="path" value="{{.Path}}">
+      <input type="hidden" name="version" value="{{.Version}}">
+      <input type="hidden" name="was" value="{{.Name}}">
+      <div class="field-edit-row">
+        <input class="secret-field-name" name="field" value="{{.Name}}"
+               autocomplete="off" spellcheck="false" placeholder="field" aria-label="Field name" required>
+        <textarea class="secret-field-value" name="value" rows="{{.Rows}}" wrap="off"
+                  autocomplete="off" spellcheck="false" aria-label="Field value">
 {{- "\n"}}{{.Value}}</textarea>
-</div>{{end}}
+      </div>
+      <div class="field-edit-actions">
+        <button type="submit" class="enrol-btn-primary">Save</button>
+        <button type="button" class="enrol-btn-secondary" data-on:click="@get('{{.CancelURL}}')">Cancel</button>
+        <button type="submit" name="delete" value="1" class="enrol-btn-danger field-remove">Remove field</button>
+      </div>
+    </form>
+  </td>
+</tr>{{end}}
 
-{{/* secret-add-field-btn re-points itself at the next row index each time it
-     is clicked, so repeated clicks append distinct rows. It is patched
-     alongside the new row rather than being static for exactly that reason. */}}
-{{define "secret-add-field-btn"}}<div id="secret-add-field">
-  <button type="button" class="enrol-btn-secondary secret-add-field"
-          data-on:click="@get('{{.AddRowURL}}')">Add field</button>
-</div>{{end}}
+{{/* The blank row that adds a field. Same form, no `was`, so the save is an
+     addition rather than a rename. */}}
+{{define "secret-add-row"}}<tr id="secret-add-row" data-signals="{addOpen: false}">
+  <td colspan="3">
+    <button type="button" class="enrol-btn-secondary" data-show="!$addOpen"
+            data-on:click="$addOpen = true">Add field</button>
+    <form class="field-edit-form" method="post" action="/ui/secrets-edit/field"
+          data-show="$addOpen" style="display: none">
+      <input type="hidden" name="path" value="{{.Path}}">
+      <input type="hidden" name="version" value="{{.Version}}">
+      <div class="field-edit-row">
+        <input class="secret-field-name" name="field" value=""
+               autocomplete="off" spellcheck="false" placeholder="field" aria-label="Field name" required>
+        <textarea class="secret-field-value" name="value" rows="1" wrap="off"
+                  autocomplete="off" spellcheck="false" placeholder="value" aria-label="Field value">
+{{- "\n"}}</textarea>
+      </div>
+      <div class="field-edit-actions">
+        <button type="submit" class="enrol-btn-primary">Add</button>
+        <button type="button" class="enrol-btn-secondary" data-on:click="$addOpen = false">Cancel</button>
+      </div>
+    </form>
+  </td>
+</tr>{{end}}
+
+{{define "pencil-btn"}}<button class="icon-btn" title="Edit this field"
+  data-on:click="@get('{{.EditURL}}')" aria-label="Edit field">&#9998;</button>{{end}}

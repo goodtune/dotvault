@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/observability"
@@ -194,7 +195,14 @@ func (c *Client) EnableKVv2(ctx context.Context, path string) error {
 	return nil
 }
 
-// WriteKVv2 writes data to a KVv2 secret. Used for testing/seeding.
+// WriteKVv2 writes data to a KVv2 secret unconditionally, overwriting
+// whatever is there.
+//
+// It is the right call for a single-writer path — the enrolment engines and
+// their refresh/watch loops own their secrets outright, and the FUSE mount's
+// write is the user's own shell. Anywhere a *second* writer is possible, and
+// especially anywhere a human is looking at a stale copy, use WriteKVv2CAS
+// instead: this one cannot tell that it clobbered anything.
 func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[string]any) error {
 	_, err := c.raw.KVv2(mount).Put(ctx, path, data)
 	if err != nil {
@@ -203,6 +211,54 @@ func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[str
 	}
 	observability.RecordVaultCall(ctx, "write", "ok")
 	return nil
+}
+
+// ErrCASMismatch reports a check-and-set write refused because the secret had
+// moved on since the caller read it. It is a distinct sentinel because it is
+// not a failure so much as an answer: somebody else wrote first, and the
+// caller has to re-read before it can decide what its change still means.
+var ErrCASMismatch = errors.New("the secret was modified by someone else")
+
+// WriteKVv2CAS writes data only if the secret is still at version cas, and
+// reports ErrCASMismatch when it is not. cas == 0 additionally means "only if
+// this secret does not exist", which is KVv2's own spelling of a create.
+//
+// This is what lets the web editor promise it will not clobber a concurrent
+// change. A read-then-write with an existence probe cannot: the window
+// between the two is exactly where the other writer lands, and the losing
+// change disappears with nothing to show for it. Vault settles it server-side
+// instead, so the race has one outcome rather than two.
+func (c *Client) WriteKVv2CAS(ctx context.Context, mount, path string, data map[string]any, cas int) error {
+	_, err := c.raw.KVv2(mount).Put(ctx, path, data, vaultapi.WithCheckAndSet(cas))
+	if err != nil {
+		if isCASMismatch(err) {
+			observability.RecordVaultCall(ctx, "write", "cas_mismatch")
+			return fmt.Errorf("write kv %s/%s: %w", mount, path, ErrCASMismatch)
+		}
+		observability.RecordVaultCall(ctx, "write", classifyVaultErr(err))
+		return fmt.Errorf("write kv %s/%s: %w", mount, path, err)
+	}
+	observability.RecordVaultCall(ctx, "write", "ok")
+	return nil
+}
+
+// isCASMismatch recognises Vault's refusal of a check-and-set write.
+//
+// Matched on the response body rather than the status alone: Vault answers a
+// CAS failure with 400, the same status a malformed request gets, so the
+// status by itself would turn a client bug into "somebody else edited this"
+// and send the user round a retry loop that could never succeed.
+func isCASMismatch(err error) bool {
+	var respErr *vaultapi.ResponseError
+	if !errors.As(err, &respErr) || respErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	for _, e := range respErr.Errors {
+		if strings.Contains(e, "check-and-set parameter did not match") {
+			return true
+		}
+	}
+	return false
 }
 
 // DeleteKVv2 deletes all versions of a KVv2 secret (the full metadata

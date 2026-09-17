@@ -778,21 +778,13 @@ body {
   word-break: break-all;
 }
 
-/* Secret editor (web.editable_paths). The name input sits beside its
-   implicit prefix, and fields are name/value rows rather than a JSON blob. */
-.secret-edit-form { display: flex; flex-direction: column; gap: 4px; max-width: 620px; }
+/* Secret editing (web.editable_paths) happens in place: a pencil swaps one
+   row of the field table for this form, so the page never leaves the secret. */
+.field-row-editing > td { background: #fafbfc; }
 
-.secret-name-row { display: flex; align-items: center; gap: 6px; }
-.secret-name-prefix {
-  font-family: 'SF Mono', Monaco, monospace;
-  font-size: 13px;
-  color: #888;
-  white-space: nowrap;
-}
-.secret-name-row .enrol-prompt-input { flex: 1; }
-
-.secret-field-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
-.secret-field-row { display: flex; gap: 6px; }
+.field-edit-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.field-edit-row { display: flex; gap: 8px; align-items: flex-start; }
+.field-edit-actions { display: flex; gap: 8px; align-items: center; }
 
 .secret-field-name, .secret-field-value {
   font-family: 'SF Mono', Monaco, monospace;
@@ -804,14 +796,23 @@ body {
   color: #222;
   min-width: 0;
 }
-.secret-field-name { flex: 0 0 30%; align-self: flex-start; }
+.secret-field-name { flex: 0 0 30%; }
 /* A textarea rather than an input, so a PEM private key survives the round
-   trip (see the secret-field-row fragment). One row reads as a text box;
-   resize lets a long value be worked with. */
+   trip (see the secret-row-edit fragment). */
 .secret-field-value { flex: 1; resize: vertical; line-height: 1.5; overflow: auto; }
 .secret-field-name:focus, .secret-field-value:focus { outline: none; border-color: #3a86ff; }
 
-.secret-add-field { align-self: flex-start; margin-bottom: 12px; }
+.field-remove { margin-left: auto; }
+
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  opacity: 0.6;
+}
+.icon-btn:hover { opacity: 1; }
 
 .secret-delete-card { margin-top: 24px; max-width: 480px; }
 .secret-delete-form { display: flex; flex-direction: column; gap: 6px; }

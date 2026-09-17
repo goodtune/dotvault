@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1432,9 +1433,11 @@ func TestEditorRefusesNamesItCannotRoundTrip(t *testing.T) {
 		"personal/token": {"a\nb": "secret-value", "ok": "v"},
 	})
 
+	// 409, not 422: nothing is wrong with the request — the stored secret is
+	// simply in a shape this form cannot represent.
 	resp := uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Ftoken")
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Errorf("editor status = %d, want 422", resp.StatusCode)
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("editor status = %d, want 409", resp.StatusCode)
 	}
 	// The complaint counts the offending fields; it never names them.
 	if body := uiBody(t, resp); strings.Contains(body, "a\nb") || strings.Contains(body, "secret-value") {
@@ -1491,9 +1494,227 @@ func TestTextareaPreservesLeadingNewline(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// Every input that can carry a name reaches one validator. Each of these was
+// found open in a separate review round, which is why they are pinned
+// together: the previous shape checked one field at a time and kept growing
+// another hole.
+func TestEditorRefusesUnrenderableNamesOnEveryInput(t *testing.T) {
+	base := func() url.Values {
+		f := editForm("personal", "token", "value", "v")
+		f.Set("path", "personal/token")
+		f.Add("original_field", "value")
+		return f
 	}
-	return b
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(url.Values)
+		route  string
+		status int
+	}{
+		{
+			// `prefix` rides a hidden input, which has NO value sanitization
+			// algorithm — the easiest half for a hand-made request to reach.
+			name:   "create with a line break in the prefix",
+			mutate: func(f url.Values) { f.Set("prefix", "personal/a\nb") },
+			route:  "/ui/secret-editor/create",
+			status: http.StatusUnprocessableEntity,
+		},
+		{
+			name:   "create with a line break in the name",
+			mutate: func(f url.Values) { f.Set("name", "to\nken") },
+			route:  "/ui/secret-editor/create",
+			status: http.StatusUnprocessableEntity,
+		},
+		{
+			// The source path is a hidden input too: unguarded, the 422
+			// re-render handed it back beside a stripped name and the second
+			// submit was the silent rename this exists to prevent.
+			name:   "save with a line break in the hidden path",
+			mutate: func(f url.Values) { f.Set("path", "personal/to\nken") },
+			route:  "/ui/secret-editor/save",
+			status: http.StatusUnprocessableEntity,
+		},
+		{
+			name:   "save renaming to a name with a line break",
+			mutate: func(f url.Values) { f.Set("name", "to\nken") },
+			route:  "/ui/secret-editor/save",
+			status: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "submitted field name with a line break",
+			mutate: func(f url.Values) {
+				f.Del("field_name")
+				f.Add("field_name", "a\nb")
+			},
+			route:  "/ui/secret-editor/save",
+			status: http.StatusBadRequest,
+		},
+		{
+			// The other half of the pair, so reverting either refusal fails a
+			// test rather than hiding behind the one that remains.
+			name: "previously-rendered field name with a line break",
+			mutate: func(f url.Values) {
+				f.Del("original_field")
+				f.Add("original_field", "a\nb")
+			},
+			route:  "/ui/secret-editor/save",
+			status: http.StatusBadRequest,
+		},
+		{
+			// Surrounding whitespace is the same corruption by a different
+			// character: the submit path trims, so an untrimmed original was
+			// read as "the user renamed this field".
+			name: "previously-rendered field name with surrounding whitespace",
+			mutate: func(f url.Values) {
+				f.Del("original_field")
+				f.Add("original_field", " value")
+			},
+			route:  "/ui/secret-editor/save",
+			status: http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+				"personal/token": {"value": "v"},
+			})
+			f := base()
+			tc.mutate(f)
+			if resp := uiPost(t, ts, tc.route, f); resp.StatusCode != tc.status {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.status)
+			}
+			if got := fake.wrote(); len(got) != 0 {
+				t.Errorf("wrote %v", got)
+			}
+			if got := fake.deleted(); len(got) != 0 {
+				t.Errorf("deleted %v", got)
+			}
+		})
+	}
+}
+
+// A secret the editor cannot open must not show an Edit button that would
+// bounce — kvpath.EditPolicy.Allows is documented as the reason a screen can
+// never offer an edit the request refuses, and the editor's own refusal is a
+// second gate the policy knows nothing about. Delete stays offered: it needs
+// no name rendered back.
+func TestDetailPageWithholdsEditWhenTheEditorWouldRefuse(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"a\nb": "v"},
+	})
+	body := uiBody(t, uiGet(t, ts, "/ui/secrets/personal/token"))
+	if strings.Contains(body, "/ui/secret-editor/edit") {
+		t.Error("detail page offers an Edit control the editor would refuse")
+	}
+	if !strings.Contains(body, "Not editable here") {
+		t.Error("detail page does not say why editing is withheld")
+	}
+	// The explanation carries a count, not a name. Asserted on the
+	// explanation line rather than the whole body: the detail table has
+	// always listed field names (only values are masked), so a body-wide
+	// check would be testing the wrong thing.
+	if !strings.Contains(body, "Not editable here &mdash; 1 of this secret&#39;s field names") {
+		t.Errorf("explanation is not the count form: %s", body)
+	}
+	if !strings.Contains(body, `action="/ui/secret-editor/delete"`) {
+		t.Error("delete was withheld too, though it needs no name rendered back")
+	}
+}
+
+// checkEditorFields reports how many names are unrenderable, not merely that
+// some are — the count is what the message carries, so a bool would let it
+// drift to "1" for any number of them.
+func TestCheckEditorFieldsCountsThem(t *testing.T) {
+	err := checkEditorFields(map[string]any{"a\nb": 1, " c": 2, "ok": 3, "d\re": 4})
+	if err == nil {
+		t.Fatal("no error for unrenderable field names")
+	}
+	if !errors.Is(err, errUnrenderableName) {
+		t.Errorf("error %v does not wrap errUnrenderableName", err)
+	}
+	if !strings.Contains(err.Error(), "3 of") {
+		t.Errorf("error = %q, want it to count all three", err)
+	}
+	// Only the control-character names are checked for leakage: " c" would
+	// false-positive against ordinary prose ("form cannot"), which would make
+	// the assertion about English rather than about the message.
+	for _, leaked := range []string{"a\nb", "d\re"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Errorf("error names the field %q", leaked)
+		}
+	}
+	if err := checkEditorFields(map[string]any{"fine": 1}); err != nil {
+		t.Errorf("checkEditorFields on renderable names = %v, want nil", err)
+	}
+}
+
+// Every refusal must say where to go instead — the docs promise a pointer to
+// the API and the mount, and a dead-end message is how that promise rots.
+func TestUnrenderableMessagesNameTheEscapeHatch(t *testing.T) {
+	for _, err := range []error{
+		checkEditorPath("a\nb"),
+		checkEditorFields(map[string]any{"a\nb": 1}),
+	} {
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), "JSON API") || !strings.Contains(err.Error(), "filesystem mount") {
+			t.Errorf("message gives no escape hatch: %q", err)
+		}
+	}
+}
+
+// A secret stored with CRLF must not be rewritten to LF just by being opened
+// and saved. The browser submits every textarea as CRLF whatever the value
+// held, so the comparison has to normalize both sides or an untouched value
+// never matches itself.
+func TestCRLFValueSurvivesAnUnrelatedEdit(t *testing.T) {
+	const crlf = "line one\r\nline two\r\n"
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/blob": {"body": crlf, "note": "before"},
+	})
+	f := url.Values{}
+	f.Set("prefix", "personal")
+	f.Set("name", "blob")
+	f.Set("path", "personal/blob")
+	f.Add("field_name", "body")
+	f.Add("field_value", crlf) // what the browser sends back untouched
+	f.Add("field_name", "note")
+	f.Add("field_value", "after") // the field actually edited
+	f.Add("original_field", "body")
+	f.Add("original_field", "note")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", f); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if got := fake.secrets["personal/blob"]["body"]; got != crlf {
+		t.Errorf("CRLF value became %q, want it byte-for-byte", got)
+	}
+	if got := fake.secrets["personal/blob"]["note"]; got != "after" {
+		t.Errorf("note = %q, want the edited value", got)
+	}
+}
+
+// And a no-op save on such a secret writes nothing at all.
+func TestCRLFValueNoOpSaveWritesNothing(t *testing.T) {
+	const crlf = "a\r\nb"
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/blob": {"body": crlf},
+	})
+	f := url.Values{}
+	f.Set("prefix", "personal")
+	f.Set("name", "blob")
+	f.Set("path", "personal/blob")
+	f.Add("field_name", "body")
+	f.Add("field_value", crlf)
+	f.Add("original_field", "body")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", f); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a no-op save on a CRLF value", got)
+	}
 }

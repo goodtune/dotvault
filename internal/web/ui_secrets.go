@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -163,6 +164,16 @@ type uiSecretDetailData struct {
 	// user would otherwise see editing work on the secret beside this one and
 	// have no way to learn why it does not work here.
 	Managed bool
+	// EditBlocked, when set, is why the Edit control is withheld on a secret
+	// the policy *does* permit writing: its name or one of its field names is
+	// a shape the form cannot round-trip. Delete is still offered, since it
+	// needs no name rendered back.
+	//
+	// It exists because kvpath.EditPolicy.Allows is documented as the reason a
+	// screen can never offer an edit the request would refuse — and the
+	// editor's own refusal is a second gate the policy knows nothing about.
+	// Rendering the button anyway would have made that promise false.
+	EditBlocked string
 	// Leaf is the final path segment, which the delete form asks the user to
 	// type back. DeleteKVv2 removes every version with no undelete, so the
 	// gesture is deliberately more than one click.
@@ -186,6 +197,12 @@ func (s *Server) uiSecretDetail(ctx context.Context, path string, version int, f
 		rows = append(rows, uiSecretFieldRefs(path, name, i))
 	}
 	editable, managed := s.secretEditability(path)
+	blocked := ""
+	if editable {
+		if err := errors.Join(checkEditorPath(path), checkEditorFields(fields)); err != nil {
+			blocked = err.Error()
+		}
+	}
 	return uiSecretDetailData{
 		uiPageData:     s.uiBase(ctx, path, "secrets", path),
 		Path:           path,
@@ -196,6 +213,7 @@ func (s *Server) uiSecretDetail(ctx context.Context, path string, version int, f
 		EditURL:        "/ui/secret-editor/edit?" + url.Values{"path": {path}}.Encode(),
 		Editable:       editable,
 		Managed:        managed,
+		EditBlocked:    blocked,
 	}
 }
 

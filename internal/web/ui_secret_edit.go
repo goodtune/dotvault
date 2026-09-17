@@ -77,33 +77,69 @@ func valueRows(v string) int {
 	}
 }
 
-// hasLineBreak reports whether s carries a CR or LF.
-//
-// It is the editor's dividing line between the two kinds of text on the form.
-// A *value* may contain line breaks and is carried in a <textarea>, which
-// preserves them. A *name* — a field name, or the secret's own path segment —
-// is carried in an <input>, whose value sanitization algorithm strips CR and
-// LF outright. So a name containing one cannot survive this form: the browser
-// would submit a different name than the page rendered, and the save would
-// read that as a deliberate rename and silently move the field. Refusing is
-// the only honest answer; the JSON API and the filesystem mount can still
-// edit such a secret losslessly.
-func hasLineBreak(s string) bool { return strings.ContainsAny(s, "\r\n") }
+// errUnrenderableName reports a name this form cannot show and get back
+// unchanged. It is a sentinel so the refusal reads the same wherever it is
+// raised, and so `errors.Is` can find it.
+var errUnrenderableName = errors.New("this form cannot edit a name containing a line break or leading/trailing whitespace without renaming it; use the JSON API or the filesystem mount, which edit it losslessly")
 
-// unrenderableNames counts the field names this form cannot round-trip. The
-// count, not the names: a field name can itself be telling, and this feeds a
-// user-visible message.
-func unrenderableNames(fields map[string]any) int {
+// editorSafeName reports whether the editor can render name into an <input>
+// and receive the identical bytes back.
+//
+// This is the dividing line between the two kinds of text on the form. A
+// *value* may contain anything and rides a <textarea>, which preserves it. A
+// *name* — a field name, or one segment of the secret's path — is an
+// identifier in an <input>, and two things happen to it there: the HTML value
+// sanitization algorithm strips CR and LF outright, and the handler trims
+// surrounding whitespace so a user's stray space is not a new field. Either
+// one turns a name the page rendered into a different name on submit, which
+// the patch then reads as a deliberate rename and acts on — silently moving a
+// field, or the whole secret.
+//
+// So the rule is not "no line breaks" but the stronger, honest one: a name
+// must survive the round trip exactly. TrimSpace is the predicate rather than
+// a hand-written character set because it is the *same* function the submit
+// path applies, which is what makes the two sides agree by construction —
+// and it happens to cover U+0085, U+2028 and the rest of unicode.IsSpace for
+// free, where an enumerated set would have missed them.
+func editorSafeName(name string) bool {
+	return name != "" && name == strings.TrimSpace(name) && !strings.ContainsAny(name, "\r\n")
+}
+
+// checkEditorPath rejects a relative path any of whose segments the editor
+// cannot round-trip. Every route into the editor funnels through here — the
+// source path, the joined create/rename target, and the page load — because
+// the previous shape checked one input at a time and every review found a
+// different one still open (`prefix`, the hidden `path`, the untrimmed
+// original). One chokepoint beside EditPolicy.Allow is the shape that cannot
+// grow another hole.
+//
+// The error names nothing: a path segment is as telling as a field name.
+func checkEditorPath(rel string) error {
+	for _, seg := range strings.Split(rel, "/") {
+		if !editorSafeName(seg) {
+			return fmt.Errorf("the secret's name: %w", errUnrenderableName)
+		}
+	}
+	return nil
+}
+
+// checkEditorFields rejects a secret whose field names the editor cannot
+// round-trip, reporting how many rather than which — a field name can itself
+// be telling, and this feeds a user-visible message.
+func checkEditorFields(fields map[string]any) error {
 	n := 0
 	for name := range fields {
-		if hasLineBreak(name) {
+		if !editorSafeName(name) {
 			n++
 		}
 	}
-	return n
+	if n > 0 {
+		return fmt.Errorf("%d of this secret's field names: %w", n, errUnrenderableName)
+	}
+	return nil
 }
 
-// normalizeFormNewlines undoes the line-ending conversion HTML form
+// normalizeFormNewlines undoes the line-ending conversion HTML form// normalizeFormNewlines undoes the line-ending conversion HTML form
 // submission performs, so a multi-line secret survives a round trip.
 //
 // A <textarea> is the only control that can carry a newline at all — the
@@ -247,17 +283,11 @@ func (s *Server) handleUISecretEdit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "failed to read secret", http.StatusBadGateway)
 		return
 	}
-	// Refuse before rendering rather than corrupting on save. Both halves
-	// matter: a path segment with a line break would come back stripped from
-	// the name input and rename the secret, and a field name with one would
-	// come back stripped and rename the field. Neither is something the user
-	// asked for, and both are silent.
-	if hasLineBreak(clean) {
-		writeError(w, "this secret's name contains a line break, which this form cannot edit without renaming it", http.StatusUnprocessableEntity)
-		return
-	}
-	if n := unrenderableNames(fields); n > 0 {
-		writeError(w, fmt.Sprintf("%d of this secret's field names contain a line break, which this form cannot edit without renaming them; use the API or the filesystem mount", n), http.StatusUnprocessableEntity)
+	// Refuse before rendering rather than corrupting on save. 409 rather than
+	// 422: nothing is wrong with the request, the stored secret is simply in
+	// a shape this form cannot represent.
+	if err := errors.Join(checkEditorPath(clean), checkEditorFields(fields)); err != nil {
+		writeError(w, err.Error(), http.StatusConflict)
 		return
 	}
 	// Logged like a reveal, and for the same reason: this is the moment the
@@ -348,11 +378,12 @@ func parseFieldRows(r *http.Request) (fieldPatch, error) {
 		if name == "" {
 			continue
 		}
-		if hasLineBreak(name) {
-			// A browser cannot send this — the input strips it — so it means
-			// a hand-made request. Refusing keeps the form's round trip
-			// honest rather than storing a name it could never render back.
-			return fieldPatch{}, errors.New("a field name may not contain a line break")
+		if !editorSafeName(name) {
+			// Unreachable from a browser (the input strips line breaks and
+			// TrimSpace has just run), so this is a hand-made request.
+			// Refusing keeps the round trip honest rather than storing a name
+			// the form could never render back.
+			return fieldPatch{}, fmt.Errorf("a submitted field name: %w", errUnrenderableName)
 		}
 		if _, dup := p.Submitted[name]; dup {
 			// Content-free by the same rule the rest of this path follows: a
@@ -366,13 +397,15 @@ func parseFieldRows(r *http.Request) (fieldPatch, error) {
 		if name == "" {
 			continue
 		}
-		if hasLineBreak(name) {
+		if !editorSafeName(name) {
 			// The editor refuses to render such a secret, so a browser could
 			// never produce this marker — and a marker naming a field the
 			// form could not have shown is a claim to delete something the
-			// user was never given the chance to see. Refuse rather than
-			// honour it.
-			return fieldPatch{}, errors.New("a field name may not contain a line break")
+			// user was never given the chance to see. The check is the same
+			// one the submitted names get, deliberately: when the two sides
+			// disagreed about whitespace, a stored " a" came back as "a" and
+			// was silently renamed.
+			return fieldPatch{}, fmt.Errorf("a previously-rendered field name: %w", errUnrenderableName)
 		}
 		p.Original[name] = struct{}{}
 	}
@@ -419,8 +452,11 @@ func (s *Server) handleUISecretCreate(w http.ResponseWriter, r *http.Request) {
 		renderErr(http.StatusUnprocessableEntity, "a name is required")
 		return
 	}
-	if hasLineBreak(name) {
-		renderErr(http.StatusUnprocessableEntity, "a name may not contain a line break")
+	if err := checkEditorPath(joinSecretPath(prefix, name)); err != nil {
+		// The joined path, not just the name: `prefix` rides a hidden input,
+		// which has no sanitization algorithm at all, so it is the half a
+		// hand-made request reaches most easily.
+		renderErr(http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	if len(patch.Submitted) == 0 {
@@ -482,8 +518,10 @@ func (s *Server) handleUISecretSave(w http.ResponseWriter, r *http.Request) {
 		renderErr(http.StatusUnprocessableEntity, "a name is required")
 		return
 	}
-	if hasLineBreak(name) {
-		renderErr(http.StatusUnprocessableEntity, "a name may not contain a line break")
+	// Both ends: the path being edited (a hidden input, unsanitized) and the
+	// target the submission names.
+	if err := errors.Join(checkEditorPath(path), checkEditorPath(joinSecretPath(prefix, name))); err != nil {
+		renderErr(http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), secretEditTimeout)

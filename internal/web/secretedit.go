@@ -202,7 +202,7 @@ func (s *Server) readEditableFields(ctx context.Context, rel string) (map[string
 // a string verbatim, anything else as compact JSON.
 //
 // The round trip through this function is what lets an *unedited* field keep
-// its original type. A key/value form can only carry strings, so re-submitting
+// its original type and line endings. A key/value form can only carry strings, so re-submitting
 // a number would otherwise quietly rewrite 3 as "3"; applyFieldPatch compares
 // the submitted string against this rendering and, when they match, keeps the
 // value it already had rather than the string standing in for it.
@@ -246,9 +246,20 @@ func applyFieldPatch(current map[string]any, p fieldPatch) (result map[string]an
 	}
 	for name, value := range p.Submitted {
 		existing, present := current[name]
-		if present && displayFieldValue(existing) == value {
-			// Untouched: keep the value with its original type rather than
-			// the string the form round-tripped it through.
+		if present && normalizeFormNewlines(displayFieldValue(existing)) == value {
+			// Untouched: keep the stored value, with its original type *and*
+			// its original line endings, rather than the string the form
+			// round-tripped it through.
+			//
+			// Both sides are normalized before comparing, and that is the
+			// whole point. A browser submits every textarea with CRLF line
+			// endings whatever the value actually held, so a secret stored
+			// with CRLF comes back as CRLF, is normalized to LF, and would
+			// never equal its own raw stored form — every save would rewrite
+			// it, including a save that touched a different field or nothing
+			// at all. Comparing like with like is what makes "a value you do
+			// not edit is written back byte for byte" true rather than nearly
+			// true.
 			continue
 		}
 		result[name] = value
@@ -347,6 +358,10 @@ func secretEditStatus(err error) int {
 	case errors.Is(err, kvpath.ErrInvalidName), errors.Is(err, vaultfs.ErrInvalidDocument),
 		errors.Is(err, errNoFields):
 		return http.StatusBadRequest
+	case errors.Is(err, errUnrenderableName):
+		// The request is well-formed; it just names something this form
+		// cannot represent.
+		return http.StatusUnprocessableEntity
 	case errors.Is(err, errSecretExists):
 		return http.StatusConflict
 	case errors.Is(err, errSecretMissing):

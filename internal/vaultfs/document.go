@@ -55,9 +55,19 @@ func RenderDocument(s *Secret) (*Document, error) {
 	}, nil
 }
 
-// parseDocument turns the bytes written to a secret file back into a KVv2 data
-// map. It is the inverse of RenderDocument and the only path by which the
+// ParseDocument turns a rendered secret document back into a KVv2 data map.
+// It is the inverse of RenderDocument and the only path by which the
 // filesystem can produce a Vault write.
+//
+// Exported for the same reason as RenderDocument: the web UI's secret editor
+// edits exactly the document the mount serves, so accepting it through this
+// one parser is what makes "what you can write through the mount" and "what
+// you can save in the browser" the same set — including the refusal of an
+// empty object, which is a truncate the caller never finished rather than an
+// intentional erasure of every field.
+func ParseDocument(b []byte) (map[string]any, error) { return parseDocument(b) }
+
+// parseDocument is the package-local spelling of ParseDocument.
 //
 // Numbers are decoded as json.Number rather than float64 so a round trip is
 // lossless: without it, reading and rewriting a secret unchanged would turn

@@ -54,6 +54,8 @@ web:
     Welcome to dotvault. Click **Login** to authenticate via SSO.
   secret_view_text: |
     These secrets are synchronised from Vault to your local machine.
+  editable_paths:
+    - personal
 
 api:
   enabled: true
@@ -263,9 +265,38 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 | `listen` | string | — | Listen address (must be loopback, e.g. `127.0.0.1:9000`) |
 | `login_text` | string | — | Markdown text displayed on the login page |
 | `secret_view_text` | string | — | Markdown text displayed on the secret view page |
+| `editable_paths` | list of strings | — | Subtrees of your own key space the web UI may create, edit and delete secrets in. Empty (the default) keeps the UI read-only |
 
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
+
+### Editable key spaces
+
+By default the web UI only reads. `editable_paths` opts a named part of your key space into full CRUD — see [Editing secrets](../web-ui.md#editing-secrets) for what that looks like in the browser.
+
+Each entry is a path relative to `kv/{user_prefix}{username}/`, and it names a **subtree**:
+
+```yaml
+web:
+  enabled: true
+  listen: "127.0.0.1:9000"
+  editable_paths:
+    - personal
+    - scratch/notes
+```
+
+With `user_prefix: users/` and a user of `gary`, that makes everything under `users/gary/personal/` and `users/gary/scratch/notes/` editable — `personal/token`, `personal/aws/dev` and so on, to any depth.
+
+Three things are **never** editable, whatever this is set to:
+
+- **The root of your key space.** `personal/token` is editable; a secret sitting at exactly `users/gary/personal` is not, and neither is `users/gary/gh`. A root names a folder, and the secret that happens to share its name is a direct child of the key-space root like any other. Admitting the root would put every enrolment credential and every sync rule's source one gesture away from being replaced, which is the blast radius this setting exists to bound — so an entry naming it (`""`, `"/"`) is rejected at config load rather than quietly ignored.
+- **Anything an enrolment writes.** If `personal/gh` is a configured enrolment key, it stays read-only even though `personal` is editable: the credential there belongs to the enrolment engine, which will overwrite an edit at its next run or refresh. The UI says so on the page rather than just omitting the controls. This is evaluated live, so an enrolment added by a [remote config](remote-config.md) refresh takes a path out of reach without a restart.
+- **Any other user's secrets.** The path is always resolved beneath your own prefix, and `..` segments are rejected rather than collapsed.
+
+`editable_paths` is validated whether or not `web.enabled` is set, so a bad entry is reported when you stage the config rather than on the restart that turns the UI on. Entries are canonicalised (`/personal/` becomes `personal`), and a duplicate is an error.
+
+!!! note "This is a UI capability, not a Vault permission"
+    dotvault refuses a write outside these subtrees; Vault does not know about them. The token still carries whatever the auth role granted it, so this bounds what the *browser* can do, not what the daemon could. Narrow the token itself with [`vault.policies`](#vault-section) if that is what you need.
 
 ## API section
 

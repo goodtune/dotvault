@@ -164,7 +164,7 @@ func TestWebTextRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got.Web != src.Web {
+	if !reflect.DeepEqual(got.Web, src.Web) {
 		t.Errorf("Web mismatch:\ngot:  %+v\nwant: %+v", got.Web, src.Web)
 	}
 }

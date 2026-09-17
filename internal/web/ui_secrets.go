@@ -141,6 +141,30 @@ func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 	s.uiRenderPage(w, "dashboard", data)
 }
 
+// uiSecretDetailData is the /ui/secrets/<key> view model. The editing fields
+// are all derived from one kvpath.EditPolicy call, so the controls a screen
+// offers and the refusals the handlers behind them issue cannot disagree.
+type uiSecretDetailData struct {
+	uiPageData
+	Path           string
+	VaultSecretURL string
+	SecretVersion  int
+	Fields         []uiSecretField
+	// Editable enables the Edit and Delete controls.
+	Editable bool
+	// Managed marks a secret that sits inside an editable subtree but is an
+	// enrolment's target. Saying so beats silently omitting the controls: the
+	// user would otherwise see editing work on the secret beside this one and
+	// have no way to learn why it does not work here.
+	Managed bool
+	// Leaf is the final path segment, which the delete form asks the user to
+	// type back. DeleteKVv2 removes every version with no undelete, so the
+	// gesture is deliberately more than one click.
+	Leaf      string
+	EditURL   string
+	FormError string
+}
+
 func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context, path string, version int, fields map[string]any) {
 	names := make([]string, 0, len(fields))
 	for k := range fields {
@@ -151,19 +175,61 @@ func (s *Server) renderUISecretDetail(w http.ResponseWriter, ctx context.Context
 	for i, name := range names {
 		rows = append(rows, uiSecretFieldRefs(path, name, i))
 	}
-	data := struct {
-		uiPageData
-		Path           string
-		VaultSecretURL string
-		SecretVersion  int
-		Fields         []uiSecretField
-	}{
+	data := uiSecretDetailData{
 		uiPageData:     s.uiBase(ctx, path, "secrets", path),
 		Path:           path,
 		VaultSecretURL: s.uiVaultSecretURL(path),
 		SecretVersion:  version,
 		Fields:         rows,
+		Leaf:           path[strings.LastIndex(path, "/")+1:],
+		EditURL:        "/ui/secret-editor/edit?" + url.Values{"path": {path}}.Encode(),
 	}
+	policy := s.editPolicy()
+	data.Editable = policy.Allows(path)
+	data.Managed = !data.Editable && policy.AllowsWithin(path)
+	s.uiRenderPage(w, "secret", data)
+}
+
+// renderUISecretDetailError re-renders the detail page carrying a complaint,
+// used when a delete is refused (a mistyped confirmation, a Vault failure).
+// Re-reading the secret rather than threading state through a redirect keeps
+// the user in front of the thing they were acting on, with its live version
+// number.
+func (s *Server) renderUISecretDetailError(w http.ResponseWriter, r *http.Request, path, msg string) {
+	ctx, cancel := context.WithTimeout(r.Context(), secretEditTimeout)
+	defer cancel()
+
+	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+path)
+	if err != nil || secret == nil {
+		// The secret is unreadable now, so there is no detail page to return
+		// to; report the original complaint plainly rather than masking it
+		// with a read failure.
+		writeError(w, msg, http.StatusConflict)
+		return
+	}
+	names := make([]string, 0, len(secret.Data))
+	for k := range secret.Data {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	rows := make([]uiSecretField, 0, len(names))
+	for i, name := range names {
+		rows = append(rows, uiSecretFieldRefs(path, name, i))
+	}
+	policy := s.editPolicy()
+	data := uiSecretDetailData{
+		uiPageData:     s.uiBase(ctx, path, "secrets", path),
+		Path:           path,
+		VaultSecretURL: s.uiVaultSecretURL(path),
+		SecretVersion:  secret.Version,
+		Fields:         rows,
+		Leaf:           path[strings.LastIndex(path, "/")+1:],
+		EditURL:        "/ui/secret-editor/edit?" + url.Values{"path": {path}}.Encode(),
+		FormError:      msg,
+	}
+	data.Editable = policy.Allows(path)
+	data.Managed = !data.Editable && policy.AllowsWithin(path)
+	w.WriteHeader(http.StatusConflict)
 	s.uiRenderPage(w, "secret", data)
 }
 
@@ -183,10 +249,18 @@ func (s *Server) renderUISecretFolder(w http.ResponseWriter, ctx context.Context
 		uiPageData
 		Folder  string
 		Entries []uiNavItem
+		// CanCreate offers "New secret" pre-filled with this folder, which
+		// is a weaker question than whether the folder's own path is
+		// editable — a configured root is not itself an editable secret, but
+		// secrets may certainly be created inside it.
+		CanCreate bool
+		NewURL    string
 	}{
 		uiPageData: s.uiBase(ctx, folder, "secrets", folder+"/"),
 		Folder:     folder,
 		Entries:    entries,
+		CanCreate:  s.editPolicy().AllowsWithin(folder),
+		NewURL:     "/ui/secret-editor/new?" + url.Values{"path": {folder}}.Encode(),
 	}
 	s.uiRenderPage(w, "folder", data)
 }

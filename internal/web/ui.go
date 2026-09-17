@@ -124,7 +124,7 @@ func uiInitTemplates() error {
 			return
 		}
 		names := []string{
-			"dashboard", "secret", "folder", "enrolments",
+			"dashboard", "secret", "secret_edit", "folder", "enrolments",
 			"enrol_detail", "remotes", "remote_detail", "config",
 			// Chrome-less pages: they render through "standalone" rather
 			// than "layout" (see uiRenderStandalone).
@@ -250,6 +250,11 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("GET /ui/{$}", s.handleUIDashboard)
 	s.mux.HandleFunc("GET /ui/secrets/{$}", s.handleUISecretsIndex)
 	s.mux.HandleFunc("GET /ui/secrets/{path...}", s.handleUISecret)
+	// Secret editing (web.editable_paths). Deliberately NOT under
+	// /ui/secrets/, whose page route is a {path...} wildcard a literal
+	// sibling would shadow — see ui_secret_edit.go.
+	s.mux.HandleFunc("GET /ui/secret-editor/new", s.handleUISecretNew)
+	s.mux.HandleFunc("GET /ui/secret-editor/edit", s.handleUISecretEdit)
 	s.mux.HandleFunc("GET /ui/enrolments/{$}", s.handleUIEnrolmentsIndex)
 	s.mux.HandleFunc("GET /ui/enrolments/{engine}/{key...}", s.handleUIEnrolDetail)
 	s.mux.HandleFunc("GET /ui/remotes/{$}", s.handleUIRemotesIndex)
@@ -275,6 +280,8 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("POST /ui/enrol/skip", s.handleUIEnrolSkip)
 	s.mux.HandleFunc("POST /ui/enrol/reset", s.handleUIEnrolReset)
 	s.mux.HandleFunc("POST /ui/enrol/secret", s.handleUIEnrolSecret)
+	s.mux.HandleFunc("POST /ui/secret-editor/save", s.handleUISecretSave)
+	s.mux.HandleFunc("POST /ui/secret-editor/delete", s.handleUISecretDelete)
 	s.mux.HandleFunc("POST /ui/remotes/add", s.handleUIRemoteAdd)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/save", s.handleUIRemoteSave)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/delete", s.handleUIRemoteDelete)
@@ -477,6 +484,12 @@ func (s *Server) buildUINav(ctx context.Context, active, selected string) []uiNa
 			if active == "secrets" {
 				sections[i].Active, sections[i].Expanded = true, true
 				s.fillSecretsNav(ctx, &sections[i], selected)
+				// Appended here rather than inside fillSecretsNav, which
+				// returns early on a listing failure and on an empty key
+				// space — the second being exactly when a user most needs
+				// the link, since a configured editable root holds nothing
+				// until the first secret is written into it.
+				s.appendNewSecretNavItem(&sections[i])
 			}
 		}
 	}
@@ -548,6 +561,22 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 			Selected: entry == selected,
 		})
 	}
+}
+
+// appendNewSecretNavItem puts "New secret" at the foot of the Secrets section
+// when any subtree is editable. The sidebar is the one place reachable from
+// every secrets page, and without it creating a secret would require first
+// navigating to a folder that may not exist yet — a configured root holds
+// nothing until the first secret is written into it.
+func (s *Server) appendNewSecretNavItem(sec *uiNavSection) {
+	if !s.editPolicy().Enabled() {
+		return
+	}
+	sec.Items = append(sec.Items, uiNavItem{
+		Name: "New secret",
+		Icon: "\u2795",
+		Href: "/ui/secret-editor/new",
+	})
 }
 
 // uiEnrolDot maps an enrolment status to its quick-glance dot.

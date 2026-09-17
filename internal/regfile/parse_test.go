@@ -31,8 +31,9 @@ func TestParseTextRoundTrip(t *testing.T) {
 		},
 		Sync: config.SyncConfig{RawInterval: "30m"},
 		Web: config.WebConfig{
-			Enabled: true,
-			Listen:  "127.0.0.1:9000",
+			Enabled:       true,
+			Listen:        "127.0.0.1:9000",
+			EditablePaths: []string{"personal", "scratch/notes"},
 		},
 		Rules: []config.Rule{
 			{
@@ -79,7 +80,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 	if got.Sync.RawInterval != src.Sync.RawInterval {
 		t.Errorf("Sync.RawInterval = %q, want %q", got.Sync.RawInterval, src.Sync.RawInterval)
 	}
-	if got.Web != src.Web {
+	if !reflect.DeepEqual(got.Web, src.Web) {
 		t.Errorf("Web mismatch:\ngot:  %+v\nwant: %+v", got.Web, src.Web)
 	}
 	if !reflect.DeepEqual(got.Rules, src.Rules) {
@@ -703,5 +704,44 @@ func TestParseRejectsMalformedHex(t *testing.T) {
 		"\"TargetTemplate\"=hex(1):zz,zz\r\n"
 	if _, err := Parse([]byte(bad)); err == nil {
 		t.Errorf("expected error for malformed hex bytes")
+	}
+}
+
+// TestEditablePathsRoundTrip pins the three states web.editable_paths has to
+// survive, because the one that matters is the middle one: an explicitly
+// empty list is how a GPO revokes editing a base config granted, and a
+// renderer that dropped it (or a parser that read it as absent) would
+// silently restore the capability it was written to remove.
+func TestEditablePathsRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want []string
+	}{
+		{"absent", nil},
+		{"explicitly empty", []string{}},
+		{"populated", []string{"personal", "scratch/notes"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &config.Config{
+				Vault: config.VaultConfig{Address: "https://vault.example:8200"},
+				Web:   config.WebConfig{Enabled: true, EditablePaths: tc.want},
+				Rules: []config.Rule{{
+					Name:     "r",
+					VaultKey: "gh",
+					Target:   config.Target{Path: "~/.config/gh", Format: "yaml"},
+				}},
+			}
+			text, err := GenerateText(src)
+			if err != nil {
+				t.Fatalf("GenerateText: %v", err)
+			}
+			got, err := Parse([]byte(text))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if !reflect.DeepEqual(got.Web.EditablePaths, tc.want) {
+				t.Errorf("EditablePaths = %#v, want %#v", got.Web.EditablePaths, tc.want)
+			}
+		})
 	}
 }

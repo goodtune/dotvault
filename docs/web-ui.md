@@ -59,6 +59,19 @@ Shows at a glance:
 
 Browse and inspect secrets synced by dotvault. Secrets are hidden by default and require explicit reveal (`?reveal=true`). Nested Vault paths — such as a grouped enrolment written under `databricks/prod` — render in the sidebar as expandable folders that lazy-load their contents on first open, mirroring the grouped layout on the enrolment screen.
 
+### Editing secrets
+
+The secret browser is read-only until an administrator names one or more editable subtrees in [`web.editable_paths`](configuration/config-reference.md#editable-key-spaces). With that set, secrets inside those subtrees gain **Edit** and **Delete** controls, folders inside them gain **New secret**, and a **New secret** entry appears at the foot of the Secrets sidebar — the sidebar being the one route that works when a configured subtree is still empty, which is how it starts out.
+
+A secret is edited as **the JSON object its fields make up** — the same document the [filesystem mount](guide/filesystem.md) serves for that secret, accepted by the same parser. The object's keys become the secret's fields, and saving writes a new KVv2 version replacing all of them. An empty object is refused rather than treated as "delete every field", exactly as it is through the mount.
+
+Two things are worth knowing before you use it:
+
+- **The editor shows values.** Everywhere else in the UI a secret is masked until you reveal one field at a time; there is no way to edit a value you cannot see, so opening the editor puts the whole document on screen. Reaching it is a deliberate navigation and is logged the same way a reveal is.
+- **Delete removes every version.** It is the same operation as `rm` on the filesystem mount — a KVv2 metadata delete, with no undelete. The form asks you to type the secret's name back before it will run.
+
+Secrets an enrolment owns stay read-only even inside an editable subtree, and the page says so rather than silently dropping the controls: dotvault rewrites those at the engine's next run, so an edit there would be lost without warning. Nothing outside the configured subtrees is editable, including the root of your key space.
+
 ### Manual sync
 
 Trigger an immediate sync cycle from the dashboard without waiting for the next poll interval.

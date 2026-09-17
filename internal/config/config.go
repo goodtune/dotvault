@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/handlers"
+	"github.com/goodtune/dotvault/internal/kvpath"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -604,6 +605,28 @@ type WebConfig struct {
 	Listen         string `yaml:"listen"`
 	LoginText      string `yaml:"login_text"`
 	SecretViewText string `yaml:"secret_view_text"`
+
+	// EditablePaths names the subtrees of the user's own key space the web
+	// UI may create, replace and delete secrets in. Empty (the default)
+	// means the UI stays read-only, exactly as it was before this existed.
+	//
+	// Each entry is a path relative to kv/{user_prefix}{username}/, and it
+	// names a *subtree*: "personal" makes personal/token and
+	// personal/aws/dev editable and leaves a secret at exactly "personal"
+	// alone. The key-space root is never editable however this is set —
+	// admitting it would put every enrolment target and every sync rule's
+	// source one gesture away from being replaced, which is the blast radius
+	// the section exists to bound. The rule is kvpath.EditPolicy, shared with
+	// the handlers so a screen cannot offer an edit the request would refuse.
+	//
+	// It is deliberately NOT user-overridable via the per-user overlay: the
+	// overlay's test is whether a user turning the section on could reach
+	// anything their own Vault token could not, and while the answer here is
+	// no, "no" is not the only question — this grants *write* reach over
+	// credentials other tooling consumes, where the overlay's one precedent
+	// (fuse) grants a read-only view. See the per-user overlay notes in
+	// CLAUDE.md before reconsidering.
+	EditablePaths []string `yaml:"editable_paths,omitempty"`
 }
 
 // AgentConfig configures the SSH agent surface. Disabled by default; when
@@ -1244,6 +1267,13 @@ func (c *Config) validate() error {
 			return fmt.Errorf("web.listen: %w", err)
 		}
 	}
+	// Checked whether or not the section is enabled, matching the
+	// api.unix.path / fuse.mountpoint convention: an operator staging a
+	// config before flipping `enabled` should learn about a bad path now,
+	// not on the restart that turns the surface on.
+	if err := validateEditablePaths(c.Web.EditablePaths); err != nil {
+		return err
+	}
 
 	// Observability validation. The block is optional — only validate
 	// shape when the user opted in. The OTel SDK applies its own
@@ -1524,6 +1554,36 @@ func validateEnrolmentKey(key string) error {
 		if seg == "." || seg == ".." {
 			return fmt.Errorf("key segment must not be %q (got %q)", seg, key)
 		}
+	}
+	return nil
+}
+
+// validateEditablePaths checks web.editable_paths and rewrites each entry in
+// canonical form, so everything downstream — the policy, the UI, the config
+// download — sees one spelling of a given subtree rather than whichever of
+// "personal", "personal/" or "/personal/" the operator happened to type.
+//
+// The path grammar is kvpath.Clean, the same rule the filesystem mount and
+// the Docker volume plugin apply, rather than a second implementation here.
+// The one extra rule is that an entry may not name the key-space root: "" and
+// "/" would make every secret editable, which is precisely what the section
+// exists to prevent, and silently ignoring such an entry would leave an
+// operator believing they had granted something.
+func validateEditablePaths(entries []string) error {
+	seen := make(map[string]int, len(entries))
+	for i, raw := range entries {
+		clean, err := kvpath.Clean(raw)
+		if err != nil {
+			return fmt.Errorf("web.editable_paths[%d] %q: %w", i, raw, err)
+		}
+		if clean == "" {
+			return fmt.Errorf("web.editable_paths[%d] %q: names the key space root; give a subdirectory of it", i, raw)
+		}
+		if first, dup := seen[clean]; dup {
+			return fmt.Errorf("web.editable_paths[%d] %q: duplicates entry %d", i, raw, first)
+		}
+		seen[clean] = i
+		entries[i] = clean
 	}
 	return nil
 }

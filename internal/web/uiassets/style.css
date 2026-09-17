@@ -777,3 +777,34 @@ body {
   margin: 8px 0;
   word-break: break-all;
 }
+
+/* Secret editor (web.editable_paths). The document is edited as the same
+   JSON the FUSE mount serves for that secret, so the textarea is monospace
+   and does not soft-wrap — a wrapped line makes a long credential impossible
+   to read back. */
+.secret-edit-form { display: flex; flex-direction: column; gap: 4px; }
+
+.secret-edit-doc {
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  color: #222;
+  resize: vertical;
+  overflow: auto;
+}
+.secret-edit-doc:focus { outline: none; border-color: #3a86ff; }
+
+.secret-edit-hint { font-size: 12px; color: #888; margin: 2px 0 10px; }
+.secret-edit-hint code {
+  background: #f0f0f0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+.secret-delete-card { margin-top: 24px; max-width: 480px; }
+.secret-delete-form { display: flex; flex-direction: column; gap: 6px; }

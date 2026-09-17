@@ -480,6 +480,14 @@ func (s *Server) registerAPIRoutes() {
 	s.mux.HandleFunc("GET /api/v1/config/download", s.handleConfigDownload)
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
+	// Secret CRUD for the subtrees web.editable_paths names. Ordinary CSRF
+	// protection, like the SSH routes below and for the same reason. With no
+	// editable subtrees configured every one of these refuses with 403, so
+	// registering them unconditionally widens nothing: the policy, not the
+	// route table, is what grants the capability.
+	s.mux.HandleFunc("POST /api/v1/secrets/", s.requireCSRF(s.handleSecretWrite))
+	s.mux.HandleFunc("PUT /api/v1/secrets/", s.requireCSRF(s.handleSecretWrite))
+	s.mux.HandleFunc("DELETE /api/v1/secrets/", s.requireCSRF(s.handleSecretDelete))
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
 	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
 	// rationale (bare-curl consumer over a forwarded socket; nothing

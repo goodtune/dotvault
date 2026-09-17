@@ -61,8 +61,19 @@ func NewStore(client KVClient, kvMount, userPrefix, username string) (Store, err
 	return &vaultStore{
 		client: client,
 		mount:  kvMount,
-		prefix: userPrefix + username + "/",
+		prefix: UserRoot(userPrefix, username),
 	}, nil
+}
+
+// UserRoot composes the KV path prefix of one user's subtree —
+// "{user_prefix}{username}/" — the one place the two are joined for the
+// mount, and shared with the Docker volume plugin so the prefix it strips
+// from a Vault event's path is the same string the store reads under.
+func UserRoot(userPrefix, username string) string {
+	if userPrefix != "" && !strings.HasSuffix(userPrefix, "/") {
+		userPrefix += "/"
+	}
+	return userPrefix + username + "/"
 }
 
 // path joins the user prefix onto a relative path. relPath is always a

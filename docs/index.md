@@ -19,6 +19,7 @@ If you distribute system-level configuration to a fleet of machines — via NixO
 - **Daemon or one-shot** — runs as a long-lived service with automatic token refresh, or a single sync cycle
 - **Web UI** — optional local dashboard for login, status, and secret inspection
 - **Filesystem view** — optional FUSE mount (Linux/macOS) exposing each secret as a `.json` file, read-only by default
+- **Docker volumes** — optional volume plugin (Linux) so rootless Docker and Podman containers mount your secrets, kept current from Vault events or on a refresh window
 - **Service onboarding** — automated credential acquisition via OAuth device flows (e.g. GitHub)
 - **Cross-platform** — Linux, macOS, and Windows with platform-native permission checks
 - **Enterprise Vault support** — event-driven sync via the Vault Events API (WebSocket), with fallback to polling

@@ -394,6 +394,36 @@ Reading a file in the mount calls Vault, so `grep -r` across the mount — or an
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
 
+## Docker volumes section
+
+The `docker` section serves your secrets to containers as a Docker volume plugin (rootless Docker and Podman both consume the same protocol). A volume is a directory of plain files — `gh.json` per secret, rendered exactly as the [filesystem](#filesystem-section) renders it — that the daemon materialises when a container first mounts it, keeps current from Vault events (Enterprise) or on a refresh window (Community), and deletes when the last container lets go. See the [Docker volumes guide](../guide/docker-volumes.md) for registration, the per-volume `secrets`/`layout`/`mode`/`ttl` options, and the refresh policy.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve the plugin |
+| `socket` | string | `$XDG_RUNTIME_DIR/dotvault/docker.sock` | Unix socket the engine connects to (`0600` in a `0700` directory); must be absolute (or `~`-relative). Register it with the engine via a one-line spec file — see the guide |
+| `volume_dir` | string | `$XDG_RUNTIME_DIR/dotvault/volumes` | Directory volumes are materialised under, one subdirectory each. Created at mode `0700` |
+| `cache_ttl` | duration | `1m` | Default refresh window for a volume without its own `ttl` option. Governs Community, and Enterprise while the event subscription is down; must be positive and at most 10 minutes, since the window is also how long a rotated secret keeps being served to a container |
+
+```yaml
+docker:
+  enabled: true
+  socket: ""        # default: $XDG_RUNTIME_DIR/dotvault/docker.sock
+  volume_dir: ""    # default: $XDG_RUNTIME_DIR/dotvault/volumes
+  cache_ttl: "1m"
+```
+
+The socket is deliberately not under an engine's own plugin directory: a rootless `dockerd` scans `/run/docker/plugins` inside its own mount namespace, which nothing outside it can populate, and a rootful one's is root-owned. Both engines accept a `.spec` file naming any socket, and `dotvault status` prints the command that writes it. dotvault never writes the file itself.
+
+!!! note "Linux only"
+    `docker.enabled` has no effect on macOS or Windows: the daemon logs a warning and serves nothing. Docker Desktop and Podman machine run the engine in a virtual machine, where a host-side socket is unreachable, so there is nothing a build for those platforms could usefully bind. A config shared across a mixed-platform fleet is safe.
+
+Volume definitions (names and options, never secret data) persist in `{cache_dir}/docker-volumes.json`, so a daemon restart under a running container resumes refreshing the directory that container still holds. The section is static — a change needs a restart — and is refused in a remote-config document, like every other section that opens a listener.
+
+On Linux, the packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an engine call landing mid-restart queues instead of failing. `docker.enabled` remains the master switch, and under activation the unit's `ListenStream=` path wins over `socket` — the `.spec` file must name that path. See [Socket activation](../admin/deployment.md#socket-activation-optional).
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Socket` (REG_SZ), `VolumeDir` (REG_SZ) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Docker`, and the section round-trips through `reg-import`/`reg-export` like every other, for the same mixed-fleet reason as `fuse`.
+
 ## Observability section
 
 Exports OpenTelemetry **metrics and logs** over OTLP. Each signal is configured in its own nested `metrics:` / `logs:` block, so the two signals can go to separate backends or one can be switched off. See [Observability](../admin/deployment.md#observability) in the deployment guide for the exported instruments and worked examples.
@@ -481,3 +511,5 @@ dotvault validates the configuration on startup and exits with an error if:
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
 - `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)
 - `fuse.cache_ttl` does not parse as a duration, or is negative
+- `docker.socket` or `docker.volume_dir` is set to a relative path (same reason as `api.unix.path`)
+- `docker.cache_ttl` does not parse as a duration, is zero or negative, or exceeds 10 minutes

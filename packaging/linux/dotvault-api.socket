@@ -13,8 +13,9 @@ Documentation=https://github.com/goodtune/dotvault
 #
 # api.enabled must still be set in the dotvault config: the socket unit
 # provides the fd, the config decides whether the surface exists. A passed
-# fd the daemon is not configured to serve is closed with a warning so
-# clients are refused rather than left hanging.
+# fd the daemon is not configured to serve is drained with a warning —
+# connections accepted and closed at once — so clients fail fast rather
+# than hang in a backlog systemd keeps open.
 
 [Socket]
 # Must match FileDescriptorName exactly: the daemon claims inherited fds by

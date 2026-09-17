@@ -101,7 +101,7 @@ func TestMountReadsSecretAsJSON(t *testing.T) {
 		t.Errorf("oauth_token = %v, want gho_example", got["oauth_token"])
 	}
 	// The trailing newline is what makes `cat` behave; assert it explicitly
-	// so a future change to renderDocument cannot drop it silently.
+	// so a future change to RenderDocument cannot drop it silently.
 	if len(b) == 0 || b[len(b)-1] != '\n' {
 		t.Error("rendered document does not end in a newline")
 	}

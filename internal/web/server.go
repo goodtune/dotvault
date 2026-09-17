@@ -19,6 +19,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
@@ -198,6 +199,12 @@ type Server struct {
 	// (or the platform has none). Guarded by fuseMu; read through
 	// fuseStatusSnapshot.
 	fuseStatus func() vaultfs.Status
+
+	// dockerStatus reports the Docker volume plugin's state for
+	// /api/v1/status's "docker" block. Nil when the plugin is not served.
+	// Guarded by fuseMu alongside fuseStatus — both are post-construction
+	// wirings of the same shape; read through dockerStatusSnapshot.
+	dockerStatus func() dockervol.Status
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
@@ -744,6 +751,22 @@ func (s *Server) SetFUSEStatus(status func() vaultfs.Status) {
 	s.fuseMu.Lock()
 	defer s.fuseMu.Unlock()
 	s.fuseStatus = status
+}
+
+// SetDockerStatus wires the volume plugin's status query in after
+// construction, for the same reason SetFUSEStatus exists.
+func (s *Server) SetDockerStatus(status func() dockervol.Status) {
+	s.fuseMu.Lock()
+	defer s.fuseMu.Unlock()
+	s.dockerStatus = status
+}
+
+// dockerStatusSnapshot returns the currently wired plugin status query, or
+// nil if none is configured.
+func (s *Server) dockerStatusSnapshot() func() dockervol.Status {
+	s.fuseMu.RLock()
+	defer s.fuseMu.RUnlock()
+	return s.dockerStatus
 }
 
 // fuseStatusSnapshot returns the currently wired filesystem status query, or

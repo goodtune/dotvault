@@ -865,6 +865,21 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 
+	// Docker (the volume plugin).
+	dockerKey := rootKey + `\Docker`
+	if err := applyBool(&cfg.Docker.Enabled, dockerKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.Socket, dockerKey, "Socket"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.VolumeDir, dockerKey, "VolumeDir"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.RawCacheTTL, dockerKey, "CacheTTL"); err != nil {
+		return err
+	}
+
 	// SSH (admin-owned host-CA trust material).
 	sshKey := rootKey + `\SSH`
 	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {

@@ -303,3 +303,37 @@ func mustHomeDir() string {
 	}
 	return home
 }
+
+// DefaultDockerSocket returns the per-user Unix domain socket path the Docker
+// volume plugin listens on when docker.socket is unset. It follows
+// DefaultAPISocket exactly — $XDG_RUNTIME_DIR/dotvault/docker.sock, falling
+// back to the cache dir when XDG_RUNTIME_DIR is empty.
+//
+// Deliberately NOT under the engine's own plugin directory. A rootless
+// dockerd scans /run/docker/plugins inside its own mount namespace (a private
+// copy-up of /run), which no process outside RootlessKit can populate, and a
+// rootful dockerd's /run/docker/plugins is root-owned, which a per-user daemon
+// cannot write. Both engines accept a .spec file naming an arbitrary socket
+// instead, so dotvault binds inside its own owner-only runtime directory and
+// the operator registers it with a one-line spec — see docs/guide/docker-volumes.md.
+func DefaultDockerSocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "docker.sock")
+	}
+	return filepath.Join(CacheDir(), "docker.sock")
+}
+
+// DefaultDockerVolumeDir returns the directory under which the Docker volume
+// plugin materialises each volume when docker.volume_dir is unset:
+// $XDG_RUNTIME_DIR/dotvault/volumes, falling back to the cache dir.
+//
+// The runtime dir is preferred for the same reason Docker keeps its own
+// secrets on a tmpfs: it is owner-only, typically memory-backed, and cleared
+// when the user's last session ends, so a rendered secret never outlives the
+// login that produced it.
+func DefaultDockerVolumeDir() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "volumes")
+	}
+	return filepath.Join(CacheDir(), "volumes")
+}

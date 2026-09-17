@@ -63,3 +63,25 @@ jobs:
             fi
           done
 
+  podman-e2e:
+    name: Podman drives the volume plugin
+    # ubuntu-24.04 rather than -latest: the job needs the rootless Podman the
+    # image ships (4.9, which honours CONTAINERS_CONF_OVERRIDE), and pinning
+    # keeps a runner-image change from silently altering what is tested.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The unit tests post JSON at the plugin handler; this is the one place
+      # a real container engine drives the socket end to end — volume create,
+      # mount into a container, an in-place refresh under a held volume, the
+      # non-root mode story, and removal — against a real Vault. Opt-in via
+      # the env var because it pulls images and runs containers, which
+      # `go test ./...` in the unit-tests job must not do. See the test's
+      # package comment for the full list.
+      - name: Run the Podman end-to-end test
+        run: make podman-e2e

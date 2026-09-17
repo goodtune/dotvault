@@ -116,8 +116,14 @@ services:
 
         echo "==> Writing dotvault policy..."
         vault policy write dotvault - <<'POLICY'
+        # `subscribe` + subscribe_event_types is what the Events API (Vault
+        # 1.16+) checks per secret path when the sync engine or the Docker
+        # volume plugin subscribes; sys/events/subscribe below is the
+        # endpoint itself. Inert against the Community image this stack
+        # runs, harmless to carry, and the reference for a production policy.
         path "kv/data/users/*" {
-          capabilities = ["create", "read", "update", "delete", "list"]
+          capabilities = ["create", "read", "update", "delete", "list", "subscribe"]
+          subscribe_event_types = ["*"]
         }
         path "kv/metadata/users/*" {
           capabilities = ["read", "list", "delete"]

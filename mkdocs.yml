@@ -74,6 +74,7 @@ nav:
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
   - Filesystem: guide/filesystem.md
+  - Docker Volumes: guide/docker-volumes.md
   - SSH Agent: guide/ssh-agent.md
   - Managed SSH Forwards: guide/ssh-forwards.md
   - Web UI: web-ui.md

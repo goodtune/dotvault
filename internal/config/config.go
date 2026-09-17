@@ -116,6 +116,7 @@ type Config struct {
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	API           APIConfig            `yaml:"api,omitempty"`
 	FUSE          FUSEConfig           `yaml:"fuse,omitempty"`
+	Docker        DockerConfig         `yaml:"docker,omitempty"`
 	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
@@ -1381,6 +1382,12 @@ func (c *Config) validate() error {
 	// Filesystem (FUSE) section. Validated unconditionally for the same
 	// reason as the API socket above.
 	if err := c.validateFUSE(); err != nil {
+		return err
+	}
+
+	// Docker volume plugin section. Validated unconditionally for the same
+	// reason as the two above.
+	if err := c.validateDocker(); err != nil {
 		return err
 	}
 

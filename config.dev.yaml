@@ -84,6 +84,24 @@ fuse:
   # default is 30s.
   cache_ttl: "5s"
 
+# Docker volume plugin. Serves the Docker volume plugin protocol on a per-user
+# Unix socket so a rootless Docker or Podman container can mount your secrets
+# (`docker volume create -d dotvault -o secrets=gh myvol`). Linux only; the
+# engine has to be told about the socket once via a spec file — `dotvault
+# status` prints the command.
+#
+# Pointed at dev-only paths for the same reason as the API socket and the
+# mountpoint above: a dev run must not fight an installed daemon for the
+# shared runtime-directory defaults.
+docker:
+  enabled: true
+  socket: "~/.cache/dotvault/docker-dev.sock"
+  volume_dir: "~/.cache/dotvault/volumes-dev"
+  # Short so the Community-edition refresh is observable during development;
+  # the shipped default is 1m. Against the Enterprise dev image, volumes
+  # refresh on events instead and this only governs the disconnected case.
+  cache_ttl: "10s"
+
 # SSH agent surface. Serves an agent.ExtendedAgent over a Unix domain socket
 # (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the live Vault
 # token. Point SSH_AUTH_SOCK at the socket to use it. dotvault's own

@@ -5,6 +5,7 @@ import (
 	"runtime"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/paths"
 )
 
@@ -29,6 +30,27 @@ func resolveAPISocket(cfg *config.Config) string {
 		return ""
 	}
 	return path
+}
+
+// activationKeepList names the systemd-activated fds the daemon's enabled
+// surfaces will claim, so uds.DrainUnclaimedActivation leaves them alone.
+// The web server claims "api" when it starts and the SSH agent "agent" from
+// its listener; the Docker volume plugin claims "docker" in its Run — and,
+// because it is kept on the strength of that, drains the fd itself when it
+// cannot start (see startDockerVolumes). Every name here must be matched by
+// a claim or a drain, or engine clients hang in systemd's backlog.
+func activationKeepList(cfg *config.Config, apiSocket, dockerSocket string) []string {
+	var keep []string
+	if apiSocket != "" {
+		keep = append(keep, "api")
+	}
+	if cfg.Agent.Enabled {
+		keep = append(keep, "agent")
+	}
+	if dockerSocket != "" {
+		keep = append(keep, dockervol.ActivationName)
+	}
+	return keep
 }
 
 // borrowSocketsExcluding returns config.TokenBorrowSockets with one path

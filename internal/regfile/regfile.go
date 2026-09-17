@@ -51,6 +51,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeAgent(cfg.Agent)
 	e.writeAPI(cfg.API)
 	e.writeFUSE(cfg.FUSE)
+	e.writeDocker(cfg.Docker)
 	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -395,6 +396,18 @@ func (e *emitter) writeFUSE(f config.FUSEConfig) {
 	// unset rather than being frozen at whatever the default happened to be
 	// when the config was loaded.
 	e.writeString("CacheTTL", f.RawCacheTTL)
+	e.WriteString("\r\n")
+}
+
+// writeDocker emits the volume plugin section — flat scalars under one key,
+// like FUSE, and emitted on every platform for the same mixed-fleet reason.
+func (e *emitter) writeDocker(d config.DockerConfig) {
+	e.writeKey(rootKey + `\Docker`)
+	e.writeBool("Enabled", d.Enabled)
+	e.writeString("Socket", d.Socket)
+	e.writeString("VolumeDir", d.VolumeDir)
+	// The raw string, not the parsed duration — see writeFUSE.
+	e.writeString("CacheTTL", d.RawCacheTTL)
 	e.WriteString("\r\n")
 }
 

@@ -778,33 +778,40 @@ body {
   word-break: break-all;
 }
 
-/* Secret editor (web.editable_paths). The document is edited as the same
-   JSON the FUSE mount serves for that secret, so the textarea is monospace
-   and does not soft-wrap — a wrapped line makes a long credential impossible
-   to read back. */
-.secret-edit-form { display: flex; flex-direction: column; gap: 4px; }
+/* Secret editor (web.editable_paths). The name input sits beside its
+   implicit prefix, and fields are name/value rows rather than a JSON blob. */
+.secret-edit-form { display: flex; flex-direction: column; gap: 4px; max-width: 620px; }
 
-.secret-edit-doc {
+.secret-name-row { display: flex; align-items: center; gap: 6px; }
+.secret-name-prefix {
   font-family: 'SF Mono', Monaco, monospace;
   font-size: 13px;
-  line-height: 1.5;
-  padding: 10px;
+  color: #888;
+  white-space: nowrap;
+}
+.secret-name-row .enrol-prompt-input { flex: 1; }
+
+.secret-field-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.secret-field-row { display: flex; gap: 6px; }
+
+.secret-field-name, .secret-field-value {
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 13px;
+  padding: 6px 8px;
   border: 1px solid #ddd;
   border-radius: 6px;
   background: #fff;
   color: #222;
-  resize: vertical;
-  overflow: auto;
+  min-width: 0;
 }
-.secret-edit-doc:focus { outline: none; border-color: #3a86ff; }
+.secret-field-name { flex: 0 0 30%; align-self: flex-start; }
+/* A textarea rather than an input, so a PEM private key survives the round
+   trip (see the secret-field-row fragment). One row reads as a text box;
+   resize lets a long value be worked with. */
+.secret-field-value { flex: 1; resize: vertical; line-height: 1.5; overflow: auto; }
+.secret-field-name:focus, .secret-field-value:focus { outline: none; border-color: #3a86ff; }
 
-.secret-edit-hint { font-size: 12px; color: #888; margin: 2px 0 10px; }
-.secret-edit-hint code {
-  background: #f0f0f0;
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-family: 'SF Mono', Monaco, monospace;
-}
+.secret-add-field { align-self: flex-start; margin-bottom: 12px; }
 
 .secret-delete-card { margin-top: 24px; max-width: 480px; }
 .secret-delete-form { display: flex; flex-direction: column; gap: 6px; }

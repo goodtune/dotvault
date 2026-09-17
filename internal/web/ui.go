@@ -271,6 +271,7 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("GET /ui/fragments/secrets/mask", s.handleUISecretMask)
 	s.mux.HandleFunc("GET /ui/fragments/secrets/copy-btn", s.handleUISecretCopyBtn)
 	s.mux.HandleFunc("GET /ui/fragments/enrol-card", s.handleUIEnrolCardFragment)
+	s.mux.HandleFunc("GET /ui/fragments/secret-editor/field-row", s.handleUISecretFieldRow)
 
 	// Mutations (same-origin POSTs; see requireUIWrite).
 	s.mux.HandleFunc("POST /ui/actions/sync", s.handleUIActionSync)
@@ -280,6 +281,7 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("POST /ui/enrol/skip", s.handleUIEnrolSkip)
 	s.mux.HandleFunc("POST /ui/enrol/reset", s.handleUIEnrolReset)
 	s.mux.HandleFunc("POST /ui/enrol/secret", s.handleUIEnrolSecret)
+	s.mux.HandleFunc("POST /ui/secret-editor/create", s.handleUISecretCreate)
 	s.mux.HandleFunc("POST /ui/secret-editor/save", s.handleUISecretSave)
 	s.mux.HandleFunc("POST /ui/secret-editor/delete", s.handleUISecretDelete)
 	s.mux.HandleFunc("POST /ui/remotes/add", s.handleUIRemoteAdd)
@@ -509,12 +511,6 @@ func (s *Server) buildUINav(ctx context.Context, active, selected string) []uiNa
 			if active == "secrets" {
 				sections[i].Active, sections[i].Expanded = true, true
 				s.fillSecretsNav(ctx, &sections[i], selected)
-				// Appended here rather than inside fillSecretsNav, which
-				// returns early on a listing failure and on an empty key
-				// space — the second being exactly when a user most needs
-				// the link, since a configured editable root holds nothing
-				// until the first secret is written into it.
-				s.appendNewSecretNavItem(&sections[i])
 			}
 		}
 	}
@@ -525,12 +521,24 @@ func (s *Server) buildUINav(ctx context.Context, active, selected string) []uiNa
 // path to the selected secret (one folder level, matching the enrolment key
 // grammar).
 func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected string) {
+	roots := s.editPolicy().Roots()
 	keys, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix())
 	if err != nil {
 		sec.Note, sec.NoteIsError = "failed to list secrets", true
 		slog.Warn("ui: list secrets for nav failed", "error", err)
-		return
+		// Not a return: the configured editable subtrees are known from
+		// configuration, not from Vault, so they stay reachable even when
+		// the root listing is denied. That is the case this has to survive
+		// — a policy granting write inside a subtree need not grant LIST on
+		// the user prefix above it, and without this the one path the user
+		// is invited to create in would be unreachable. The note stays, so
+		// the failure is reported rather than papered over.
+		keys = nil
+		if len(roots) == 0 {
+			return
+		}
 	}
+	keys = mergeEditableRoots(keys, roots)
 	if len(keys) == 0 {
 		sec.Note = "No secrets found"
 		return
@@ -550,7 +558,7 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 			if name == expandFolder {
 				item.Expanded = true
 				item.Href = "/ui/secrets/"
-				children, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix()+entry)
+				children, err := s.listSecretKeys(ctx, name)
 				switch {
 				case err != nil:
 					item.Note, item.NoteIsError = "failed to list", true
@@ -588,20 +596,68 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 	}
 }
 
-// appendNewSecretNavItem puts "New secret" at the foot of the Secrets section
-// when any subtree is editable. The sidebar is the one place reachable from
-// every secrets page, and without it creating a secret would require first
-// navigating to a folder that may not exist yet — a configured root holds
-// nothing until the first secret is written into it.
-func (s *Server) appendNewSecretNavItem(sec *uiNavSection) {
-	if !s.editPolicy().Enabled() {
-		return
+// mergeEditableRoots folds the configured editable subtrees into a LIST
+// result so they appear in the sidebar before anything has been written into
+// them. A configured root holds nothing until the first secret is created, and
+// a folder you cannot see is a folder you cannot create in — the entry *is*
+// the way in.
+//
+// A root is added at its full path rather than its first segment, so a
+// multi-segment root like "scratch/notes" is reachable in one click. The nav's
+// expansion only ever nests one level, and re-deriving the intermediate
+// folders to nest deeper would list folders that need not exist; a flat entry
+// naming the whole path says exactly where it goes.
+func mergeEditableRoots(keys []string, roots []string) []string {
+	if len(roots) == 0 {
+		return keys
 	}
-	sec.Items = append(sec.Items, uiNavItem{
-		Name: "New secret",
-		Icon: "\u2795",
-		Href: "/ui/secret-editor/new",
-	})
+	have := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		have[strings.TrimSuffix(k, "/")] = struct{}{}
+	}
+	out := append([]string(nil), keys...)
+	for _, root := range roots {
+		if _, dup := have[root]; dup {
+			continue
+		}
+		have[root] = struct{}{}
+		out = append(out, root+"/")
+	}
+	sort.Strings(out)
+	return out
+}
+
+// listSecretKeys lists the children of a folder under this user's prefix,
+// reporting an empty folder inside an editable subtree as empty rather than as
+// a failure.
+//
+// A Vault policy that grants write on a path need not grant LIST on the folder
+// above it, and a KVv2 LIST of a prefix holding nothing is a 404 besides. Both
+// are the normal state of a configured editable root nobody has written to
+// yet, and surfacing either as an error would put a red note on the one folder
+// the user is being invited to create in. The tolerance is deliberately scoped
+// to paths the edit policy admits — a listing failure anywhere else is still a
+// real failure and still reported.
+func (s *Server) listSecretKeys(ctx context.Context, rel string) ([]string, error) {
+	p := s.userKVPrefix()
+	if rel != "" {
+		p += rel + "/"
+	}
+	keys, err := s.vault.ListKVv2(ctx, s.kvMount, p)
+	if err == nil {
+		return keys, nil
+	}
+	if s.editPolicy().AllowsWithin(rel) {
+		// WARN, not DEBUG. ListKVv2 already maps a 404 to (nil, nil), so an
+		// empty prefix never reaches here at all — what does is a real
+		// failure, in practice a policy granting write on this subtree
+		// without `list` on it. Tolerating that keeps the folder usable;
+		// hiding it below the default log level would make a genuine ACL
+		// problem invisible.
+		slog.Warn("ui: list of editable path failed; treating as empty", "path", rel, "error", err)
+		return nil, nil
+	}
+	return nil, err
 }
 
 // uiEnrolDot maps an enrolment status to its quick-glance dot.

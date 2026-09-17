@@ -38,3 +38,28 @@
 {{define "remote-state"}}<div class="secret-meta" id="ui-remote-state"><span class="ui-dot ui-dot-{{.Dot}} ui-dot-inline"></span><span class="{{.PillClass}}">{{.StateLabel}}</span>{{if .LastError}} <span class="ssh-error-text">{{.LastError}}</span>{{end}}</div>{{end}}
 
 {{define "copy-btn-done"}}<button id="ui-copy-{{.ID}}" class="copy-btn copied" title="Copied!" data-init__delay.2s="@get('{{.CopyBtnURL}}')">&#9989;</button>{{end}}
+
+{{/* secret-field-row is one name/value pair in the secret editor. The form
+     posts repeated field_name/field_value controls and pairs them
+     positionally, so Index only distinguishes the DOM ids — nothing parses
+     it. A row left with a blank name is dropped on save, which is what makes
+     the always-present blank rows free.
+
+     The value is a <textarea>, not an <input>: the HTML value sanitization
+     algorithm strips CR and LF from a text input, which would silently
+     flatten a PEM private key the moment anything on the page was saved.
+     See normalizeFormNewlines for the other half of that round trip. */}}
+{{define "secret-field-row"}}<div class="secret-field-row">
+  <input class="secret-field-name" name="field_name" value="{{.Name}}"
+         autocomplete="off" spellcheck="false" placeholder="field" aria-label="Field name">
+  <textarea class="secret-field-value" name="field_value" rows="{{.Rows}}" wrap="off"
+            autocomplete="off" spellcheck="false" placeholder="value" aria-label="Field value">{{.Value}}</textarea>
+</div>{{end}}
+
+{{/* secret-add-field-btn re-points itself at the next row index each time it
+     is clicked, so repeated clicks append distinct rows. It is patched
+     alongside the new row rather than being static for exactly that reason. */}}
+{{define "secret-add-field-btn"}}<div id="secret-add-field">
+  <button type="button" class="enrol-btn-secondary secret-add-field"
+          data-on:click="@get('{{.AddRowURL}}')">Add field</button>
+</div>{{end}}

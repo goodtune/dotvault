@@ -92,11 +92,11 @@ func TestHostAllowed(t *testing.T) {
 		{"127.0.0.1", true},
 		// Other loopback IP forms — accepted via net.IP.IsLoopback so
 		// equivalent textual representations don't trip the allowlist.
-		{"127.0.0.5", true},                           // anywhere in 127.0.0.0/8
-		{"[0:0:0:0:0:0:0:1]:9000", true},              // long-form IPv6 loopback
-		{"0:0:0:0:0:0:0:1", true},                     // same, no port/brackets
-		{"[::ffff:127.0.0.1]:9000", true},             // IPv4-mapped IPv6 loopback
-		{"[::ffff:127.0.0.1]", true},                  // same, no port (regression: To4-aware unwrap)
+		{"127.0.0.5", true},               // anywhere in 127.0.0.0/8
+		{"[0:0:0:0:0:0:0:1]:9000", true},  // long-form IPv6 loopback
+		{"0:0:0:0:0:0:0:1", true},         // same, no port/brackets
+		{"[::ffff:127.0.0.1]:9000", true}, // IPv4-mapped IPv6 loopback
+		{"[::ffff:127.0.0.1]", true},      // same, no port (regression: To4-aware unwrap)
 		// Non-loopback IPs must still be rejected.
 		{"8.8.8.8:9000", false},
 		{"[2001:db8::1]:9000", false},
@@ -160,9 +160,9 @@ type stubWriter struct {
 	body   []byte
 }
 
-func newStubWriter() *stubWriter { return &stubWriter{header: http.Header{}} }
-func (s *stubWriter) Header() http.Header   { return s.header }
-func (s *stubWriter) WriteHeader(c int)     { s.code = c }
+func newStubWriter() *stubWriter          { return &stubWriter{header: http.Header{}} }
+func (s *stubWriter) Header() http.Header { return s.header }
+func (s *stubWriter) WriteHeader(c int)   { s.code = c }
 func (s *stubWriter) Write(b []byte) (int, error) {
 	s.body = append(s.body, b...)
 	return len(b), nil
@@ -211,8 +211,8 @@ func (s *stubWriterFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // stubWriterFR advertises Flusher + ReaderFrom.
 type stubWriterFR struct{ *stubWriter }
 
-func (s *stubWriterFR) Flush()                                  {}
-func (s *stubWriterFR) ReadFrom(r io.Reader) (int64, error)     { return io.Copy(s.stubWriter, r) }
+func (s *stubWriterFR) Flush()                              {}
+func (s *stubWriterFR) ReadFrom(r io.Reader) (int64, error) { return io.Copy(s.stubWriter, r) }
 
 // stubWriterHR advertises Hijacker + ReaderFrom.
 type stubWriterHR struct{ *stubWriter }

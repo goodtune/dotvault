@@ -631,6 +631,12 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 // quotes, backslashes, and other JS-string metacharacters in a field or path
 // name can never appear raw inside a data-on:* / data-init attribute value.
 func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
+	// Rendering a fragment needs the template set, which nothing else in this
+	// test builds — without it an isolated `go test -run` panics on a nil
+	// template rather than reporting anything useful.
+	if err := uiInitTemplates(); err != nil {
+		t.Fatal(err)
+	}
 	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3)
 	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL} {
 		if strings.ContainsAny(u, `'"\`+"`") {
@@ -650,6 +656,21 @@ func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
 	}
 	if !strings.Contains(frag, "fi%27eld%22na%5Cme") {
 		t.Errorf("expected percent-encoded field name in fragment: %s", frag)
+	}
+
+	// The secret editor's "Add field" button is the other datastar attribute
+	// on this surface. Its URL carries only a row index today, so nothing
+	// hostile can reach it — but the rule is about the attribute, not about
+	// what happens to be interpolated into it this week.
+	addBtn, err := uiFragment("secret-add-field-btn", uiSecretEditData{AddRowURL: addRowURL(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(addRowURL(2), `'"\`+"`") {
+		t.Errorf("add-field URL carries raw JS-string metacharacters: %q", addRowURL(2))
+	}
+	if !strings.Contains(addBtn, "i=2") {
+		t.Errorf("add-field button does not carry its row index: %s", addBtn)
 	}
 }
 

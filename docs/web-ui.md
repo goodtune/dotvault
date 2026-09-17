@@ -61,14 +61,30 @@ Browse and inspect secrets synced by dotvault. Secrets are hidden by default and
 
 ### Editing secrets
 
-The secret browser is read-only until an administrator names one or more editable subtrees in [`web.editable_paths`](configuration/config-reference.md#editable-key-spaces). With that set, secrets inside those subtrees gain **Edit** and **Delete** controls, folders inside them gain **New secret**, and a **New secret** entry appears at the foot of the Secrets sidebar — the sidebar being the one route that works when a configured subtree is still empty, which is how it starts out.
+The secret browser is read-only until an administrator names one or more editable subtrees in [`web.editable_paths`](configuration/config-reference.md#editable-key-spaces). With that set, secrets inside those subtrees gain **Edit** and **Delete** controls, and their folders gain **New secret**.
 
-A secret is edited as **the JSON object its fields make up** — the same document the [filesystem mount](guide/filesystem.md) serves for that secret, accepted by the same parser. The object's keys become the secret's fields, and saving writes a new KVv2 version replacing all of them. An empty object is refused rather than treated as "delete every field", exactly as it is through the mount.
+**The editable subtrees are listed in the Secrets sidebar whether or not they exist yet.** A configured subtree holds nothing until the first secret is written into it, and a folder you cannot see is a folder you cannot create in — so the entry is the way in. Opening an empty one shows an empty folder with a **New secret** button rather than an error. (If your Vault policy grants write on those paths without granting `list` on the folder above them, that is fine: a listing failure inside a configured subtree is treated as "empty" rather than reported. Everywhere else it is still an error.)
+
+### Creating a secret
+
+**New secret** on a folder opens a form with a **name** and a set of **field rows**. The folder is implicit — it is shown beside the name box, and you type only the part that follows it, so creating `personal/aws/dev` from the `personal` folder means typing `aws/dev`. Each row is a field name and its value; **Add field** appends another row without disturbing what you have already typed, so several fields go in at once. Blank rows are ignored, so the spare ones cost nothing.
+
+### Editing a secret
+
+The editor shows the name and one row per existing field, filled in. You can change any value, rename a field, add rows, or clear a row's name to remove that field.
+
+- **Only what you changed is written.** A save that changes nothing writes nothing — no new KVv2 version is minted. A field somebody else added to the same secret while you had the page open survives your save, because the editor writes the difference rather than the whole document.
+- **Changing the name renames the secret.** It is written to the new path first and removed from the old one after, so an interrupted rename leaves the original (and at worst a copy) rather than nothing. Renaming onto a path that already holds a secret is refused.
+- **Clearing every field is refused.** Vault does not store a fieldless secret, and an empty form is far more likely a slip than an intention — deleting is its own gesture.
+- **A value you do not touch keeps its type.** The form carries strings, so a field holding the number `1000000` is shown as `1000000` and left as a number if you leave it alone. Editing it makes it a string.
+- **Multi-line values are safe.** A PEM private key or certificate keeps its line breaks — the value boxes are resizable text areas, not single-line inputs, and a value you do not edit is written back byte for byte.
+
+A submission is refused, with the form and everything you typed preserved, if two rows name the same field, if you clear every field (deleting is its own gesture), or if the name is empty. **Add field** needs JavaScript; without it the form still works with the rows it was rendered with — three on the create form, one spare on the editor.
 
 Two things are worth knowing before you use it:
 
-- **The editor shows values.** Everywhere else in the UI a secret is masked until you reveal one field at a time; there is no way to edit a value you cannot see, so opening the editor puts the whole document on screen. Reaching it is a deliberate navigation and is logged the same way a reveal is.
-- **Delete removes every version.** It is the same operation as `rm` on the filesystem mount — a KVv2 metadata delete, with no undelete. The form asks you to type the secret's name back before it will run.
+- **The editor shows values.** Everywhere else in the UI a secret is masked until you reveal one field at a time; there is no way to edit a value you cannot see, so opening the editor puts them on screen. Reaching it is a deliberate navigation and is logged the same way a reveal is.
+- **Delete removes every version.** It is the same operation as `rm` on the [filesystem mount](guide/filesystem.md) — a KVv2 metadata delete, with no undelete. The form asks you to type the secret's name back before it will run.
 
 Secrets an enrolment owns stay read-only even inside an editable subtree, and the page says so rather than silently dropping the controls: dotvault rewrites those at the engine's next run, so an edit there would be lost without warning. Nothing outside the configured subtrees is editable, including the root of your key space.
 

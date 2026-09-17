@@ -295,6 +295,8 @@ Three things are **never** editable, whatever this is set to:
 
 `editable_paths` is validated whether or not `web.enabled` is set, so a bad entry is reported when you stage the config rather than on the restart that turns the UI on. Entries are canonicalised (`/personal/` becomes `personal`), and a duplicate is an error.
 
+Each configured subtree is listed in the web UI's Secrets sidebar whether or not it exists in Vault yet — a subtree holds nothing until the first secret is written into it, and it has to be reachable for that first write to happen. A `list` denial or a 404 on a configured subtree is therefore treated as "empty" rather than reported, so a Vault policy that grants write on those paths without granting `list` on the folder above them still works. Listing failures outside the configured subtrees are still errors.
+
 !!! note "This is a UI capability, not a Vault permission"
     dotvault refuses a write outside these subtrees; Vault does not know about them. The token still carries whatever the auth role granted it, so this bounds what the *browser* can do, not what the daemon could. Narrow the token itself with [`vault.policies`](#vault-section) if that is what you need.
 

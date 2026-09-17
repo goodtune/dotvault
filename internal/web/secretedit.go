@@ -8,10 +8,12 @@
 // edit the request behind it would refuse, and a future CLI gets the
 // behaviour for free.
 //
-// The document a caller supplies is parsed by vaultfs.ParseDocument, the same
-// parser the FUSE mount's write path uses. That is what makes "what you can
-// write through the mount" and "what you can save in the browser" one set
-// rather than two that drift.
+// The two surfaces write differently on purpose. The JSON API takes a whole
+// document and *replaces*, parsed by vaultfs.ParseDocument — the same parser
+// the FUSE mount's write path uses, so what a programmatic caller can write
+// here is exactly what it could write through the mount. The browser posts
+// name/value rows and *patches* (see applyFieldPatch), because a form is what
+// a person wants and a document is what a machine wants.
 package web
 
 import (
@@ -49,6 +51,19 @@ var errSecretExists = errors.New("a secret already exists at this path")
 
 // errSecretMissing is returned when a replace or delete names nothing.
 var errSecretMissing = errors.New("no secret exists at this path")
+
+// errRenameOrphan reports a rename whose copy succeeded but whose delete did
+// not, so the secret now exists at both paths. It is its own sentinel because
+// the caller must send the user to the *new* path — the secret is there and
+// correct — rather than to the old one, where a retry would meet the
+// rename-target probe and fail forever.
+var errRenameOrphan = errors.New("the secret was copied but the original could not be removed")
+
+// errNoFields is returned when a submission would leave a secret with no
+// fields at all. Vault rejects such a write, and an empty form is far more
+// likely a mistake than a deliberate erasure — deleting is its own gesture,
+// behind its own confirmation.
+var errNoFields = errors.New("a secret must have at least one field")
 
 // editPolicy builds the current policy: the statically-configured editable
 // subtrees, minus whatever dotvault currently writes for itself.
@@ -91,6 +106,19 @@ func (s *Server) secretEditability(rel string) (editable, managed bool) {
 	}
 }
 
+// secretExists probes whether a secret is present. A read failure is not
+// evidence either way, and guessing would mean either refusing a legitimate
+// create or clobbering on a blip — so it is reported rather than resolved.
+// Shared by create and by rename so the two cannot drift apart.
+func (s *Server) secretExists(ctx context.Context, rel string) (bool, error) {
+	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+rel)
+	if err != nil {
+		slog.Error("secret edit: existence check failed", "path", rel, "error", err)
+		return false, fmt.Errorf("could not check whether a secret already exists at %q", rel)
+	}
+	return secret != nil, nil
+}
+
 // writeEditableSecret replaces the secret at rel with data, creating it when
 // mustBeNew. It returns the cleaned path so callers can log and redirect
 // using the canonical spelling rather than whatever the request carried.
@@ -108,17 +136,14 @@ func (s *Server) writeEditableSecret(ctx context.Context, rel string, data map[s
 	if err != nil {
 		return "", err
 	}
-	existing, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+clean)
+	exists, err := s.secretExists(ctx, clean)
 	if err != nil {
-		// A read failure is not evidence either way, and guessing would mean
-		// either refusing a legitimate create or clobbering on a blip.
-		slog.Error("secret edit: existence check failed", "path", clean, "error", err)
-		return "", fmt.Errorf("could not check whether a secret already exists at %q", clean)
+		return "", err
 	}
 	switch {
-	case mustBeNew && existing != nil:
+	case mustBeNew && exists:
 		return "", fmt.Errorf("%q: %w", clean, errSecretExists)
-	case !mustBeNew && existing == nil:
+	case !mustBeNew && !exists:
 		return "", fmt.Errorf("%q: %w", clean, errSecretMissing)
 	}
 	if err := s.vault.WriteKVv2(ctx, s.kvMount, s.userKVPrefix()+clean, data); err != nil {
@@ -158,26 +183,157 @@ func (s *Server) deleteEditableSecret(ctx context.Context, rel string) (string, 
 	return clean, nil
 }
 
-// readEditableDocument reads the secret at rel and renders it as the JSON
-// document the editor edits — the same bytes the FUSE mount serves for that
-// secret, via the same renderer.
-func (s *Server) readEditableDocument(ctx context.Context, rel string) (string, error) {
+// readEditableFields reads the secret at rel and returns its data section.
+func (s *Server) readEditableFields(ctx context.Context, rel string) (map[string]any, error) {
 	secret, err := s.vault.ReadKVv2(ctx, s.kvMount, s.userKVPrefix()+rel)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if secret == nil {
-		return "", errSecretMissing
+		return nil, errSecretMissing
 	}
-	doc, err := vaultfs.RenderDocument(&vaultfs.Secret{
-		Data:        secret.Data,
-		Version:     secret.Version,
-		CreatedTime: secret.CreatedTime,
-	})
+	if secret.Data == nil {
+		return map[string]any{}, nil
+	}
+	return secret.Data, nil
+}
+
+// displayFieldValue renders one KVv2 value as the string an input box holds:
+// a string verbatim, anything else as compact JSON.
+//
+// The round trip through this function is what lets an *unedited* field keep
+// its original type. A key/value form can only carry strings, so re-submitting
+// a number would otherwise quietly rewrite 3 as "3"; applyFieldPatch compares
+// the submitted string against this rendering and, when they match, keeps the
+// value it already had rather than the string standing in for it.
+func displayFieldValue(v any) string {
+	if str, ok := v.(string); ok {
+		return str
+	}
+	b, err := json.Marshal(v)
 	if err != nil {
-		return "", err
+		return fmt.Sprint(v)
 	}
-	return string(doc.Bytes), nil
+	return string(b)
+}
+
+// fieldPatch is one editor submission, expressed as the change the user made
+// rather than as the document they ended up with.
+//
+// Submitted holds every row the form posted, keyed by field name. Original
+// holds the names the form was *rendered* from. The difference between them
+// is what carries the deletions: a name in Original with no row in Submitted
+// is a field the user cleared, where a name in neither is simply one the form
+// never knew about.
+type fieldPatch struct {
+	Submitted map[string]string
+	Original  map[string]struct{}
+}
+
+// applyFieldPatch folds a submission onto the secret's live data and reports
+// whether anything actually changed.
+//
+// The live data is read at save time, not carried through the form, so a field
+// another writer added between the page load and the save survives: it is in
+// neither Submitted nor Original, and this leaves it alone. That is the whole
+// reason the editor patches rather than replacing — a whole-document write
+// would silently delete it, and the concurrent writer here is not hypothetical
+// (the same secret is reachable through the FUSE mount and the JSON API).
+func applyFieldPatch(current map[string]any, p fieldPatch) (result map[string]any, changed bool) {
+	result = make(map[string]any, len(current)+len(p.Submitted))
+	for k, v := range current {
+		result[k] = v
+	}
+	for name, value := range p.Submitted {
+		existing, present := current[name]
+		if present && displayFieldValue(existing) == value {
+			// Untouched: keep the value with its original type rather than
+			// the string the form round-tripped it through.
+			continue
+		}
+		result[name] = value
+		changed = true
+	}
+	for name := range p.Original {
+		if _, kept := p.Submitted[name]; kept {
+			continue
+		}
+		if _, present := result[name]; present {
+			delete(result, name)
+			changed = true
+		}
+	}
+	return result, changed
+}
+
+// patchEditableSecret applies a field patch to the secret at rel, optionally
+// renaming it to newRel. It returns the path the secret now lives at and
+// whether a write happened at all.
+//
+// A rename is a copy-then-delete because KVv2 has no rename: the new path is
+// written first so a failure between the two leaves the original intact (and
+// at worst a duplicate) rather than losing the secret. Renaming onto an
+// existing path is refused for the same reason create is — it would destroy a
+// credential the user never saw.
+func (s *Server) patchEditableSecret(ctx context.Context, rel, newRel string, p fieldPatch) (string, bool, error) {
+	clean, err := s.editPolicy().Allow(rel)
+	if err != nil {
+		return "", false, err
+	}
+	target := clean
+	if newRel != "" {
+		if target, err = s.editPolicy().Allow(newRel); err != nil {
+			return "", false, err
+		}
+	}
+	current, err := s.readEditableFields(ctx, clean)
+	if err != nil {
+		if errors.Is(err, errSecretMissing) {
+			return "", false, fmt.Errorf("%q: %w", clean, errSecretMissing)
+		}
+		slog.Error("secret edit: read failed", "path", clean, "error", err)
+		return "", false, fmt.Errorf("failed to read secret %q", clean)
+	}
+	result, changed := applyFieldPatch(current, p)
+	renaming := target != clean
+	if !changed && !renaming {
+		// Nothing to do, so nothing is refused either: a secret whose data
+		// section is already empty must not turn a no-op save into an error.
+		return clean, false, nil
+	}
+	if len(result) == 0 {
+		// The same rule the mount applies: KVv2 does not store a fieldless
+		// secret, and clearing every field is far more likely a mistake than
+		// a deliberate erasure. Deleting is a separate, confirmed gesture.
+		return "", false, fmt.Errorf("%q: %w", clean, errNoFields)
+	}
+	if renaming {
+		exists, err := s.secretExists(ctx, target)
+		if err != nil {
+			return "", false, err
+		}
+		if exists {
+			return "", false, fmt.Errorf("%q: %w", target, errSecretExists)
+		}
+	}
+	if err := s.vault.WriteKVv2(ctx, s.kvMount, s.userKVPrefix()+target, result); err != nil {
+		slog.Error("secret edit: write failed", "path", target, "error", err)
+		return "", false, fmt.Errorf("failed to write secret %q", target)
+	}
+	if renaming {
+		// Only after the new copy is durable. A failure here leaves both
+		// paths populated, which is visible and recoverable; the reverse
+		// order could leave neither.
+		if err := s.vault.DeleteKVv2(ctx, s.kvMount, s.userKVPrefix()+clean); err != nil {
+			slog.Error("secret edit: delete of renamed original failed", "path", clean, "error", err)
+			return target, true, fmt.Errorf("%w: it is now at %q, but %q could not be removed and still holds a copy",
+				errRenameOrphan, target, clean)
+		}
+		slog.Info("secret renamed via web UI", "from", clean, "to", target, "fields", len(result))
+		return target, true, nil
+	}
+	slog.Info("secret patched via web UI", "path", target, "fields", len(result))
+	return target, true, nil
 }
 
 // secretEditStatus maps a service-layer error onto an HTTP status. The policy
@@ -188,7 +344,8 @@ func secretEditStatus(err error) int {
 	switch {
 	case errors.Is(err, kvpath.ErrNotEditable), errors.Is(err, kvpath.ErrManaged):
 		return http.StatusForbidden
-	case errors.Is(err, kvpath.ErrInvalidName), errors.Is(err, vaultfs.ErrInvalidDocument):
+	case errors.Is(err, kvpath.ErrInvalidName), errors.Is(err, vaultfs.ErrInvalidDocument),
+		errors.Is(err, errNoFields):
 		return http.StatusBadRequest
 	case errors.Is(err, errSecretExists):
 		return http.StatusConflict

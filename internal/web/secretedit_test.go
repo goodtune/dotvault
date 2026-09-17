@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,14 @@ type editVault struct {
 	// lose exactly the property worth pinning: json.Number survives to the
 	// wire, where a plain decode turns 1000000 back into a float64.
 	bodies []string
+	// listFails makes every LIST answer 403, standing in for a Vault policy
+	// that grants write on a path without granting LIST on the folder above.
+	listFails bool
+	// deleteFails makes every DELETE answer 403, which is what turns a rename
+	// into the half-completed state the orphan path has to handle. A 4xx
+	// rather than a 5xx deliberately: the Vault SDK retries 5xx with backoff,
+	// which would make this test pay several seconds for nothing.
+	deleteFails bool
 }
 
 func newEditVault(seed map[string]map[string]any) *editVault {
@@ -54,8 +64,18 @@ func (v *editVault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case r.URL.Query().Get("list") == "true":
+		if v.listFails {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": v.childrenOf(rel)}})
 	case r.Method == http.MethodDelete:
+		if v.deleteFails {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
 		v.deletes = append(v.deletes, rel)
 		delete(v.secrets, rel)
 		w.WriteHeader(http.StatusNoContent)
@@ -145,13 +165,12 @@ func editTestServer(t *testing.T, roots []string, enrolments map[string]config.E
 }
 
 // uiPost issues a same-origin form POST, which is what requireUIWrite demands.
-func uiPost(t *testing.T, ts *httptest.Server, path string, form map[string]string) *http.Response {
+// It takes url.Values rather than a map because the editor form posts repeated
+// field_name/field_value controls, which a map cannot express — and their
+// order is load-bearing, since the handler pairs them positionally.
+func uiPost(t *testing.T, ts *httptest.Server, path string, form url.Values) *http.Response {
 	t.Helper()
-	values := make([]string, 0, len(form))
-	for k, v := range form {
-		values = append(values, k+"="+urlQueryEscape(v))
-	}
-	req, err := http.NewRequest("POST", ts.URL+path, strings.NewReader(strings.Join(values, "&")))
+	req, err := http.NewRequest("POST", ts.URL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,25 +188,19 @@ func uiPost(t *testing.T, ts *httptest.Server, path string, form map[string]stri
 	return resp
 }
 
-func urlQueryEscape(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r == ' ':
-			b.WriteByte('+')
-		case r == '-' || r == '_' || r == '.' || r == '~' || r == '/' ||
-			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
-			b.WriteRune(r)
-		default:
-			for _, c := range []byte(string(r)) {
-				b.WriteString("%")
-				const hex = "0123456789ABCDEF"
-				b.WriteByte(hex[c>>4])
-				b.WriteByte(hex[c&0xf])
-			}
-		}
+// editForm builds a save/create submission: the implicit prefix, the name,
+// and one field_name/field_value pair per field. Field order is stable so the
+// positional pairing the handler relies on is exercised as a browser would
+// produce it.
+func editForm(prefix, name string, fields ...string) url.Values {
+	v := url.Values{}
+	v.Set("prefix", prefix)
+	v.Set("name", name)
+	for i := 0; i+1 < len(fields); i += 2 {
+		v.Add("field_name", fields[i])
+		v.Add("field_value", fields[i+1])
 	}
-	return b.String()
+	return v
 }
 
 // The default — no editable_paths — must leave the UI exactly as read-only as
@@ -197,9 +210,9 @@ func TestSecretEditDisabledByDefault(t *testing.T) {
 		"personal/token": {"value": "s3cret"},
 	})
 
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/token", "document": `{"value":"new"}`,
-	})
+	form := editForm("personal", "token", "value", "new")
+	form.Set("path", "personal/token")
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("save status = %d, want 403", resp.StatusCode)
 	}
@@ -219,9 +232,9 @@ func TestSecretEditRefusesKeySpaceRoot(t *testing.T) {
 	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"gh": {"oauth_token": "ghp_x"},
 	})
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "gh", "document": `{"oauth_token":"stolen"}`,
-	})
+	form := editForm("", "gh", "oauth_token", "stolen")
+	form.Set("path", "gh")
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
@@ -241,9 +254,9 @@ func TestSecretEditRefusesEnrolmentManagedPath(t *testing.T) {
 		"personal/other": {"value": "v"},
 	})
 
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/gh", "document": `{"oauth_token":"stolen"}`,
-	})
+	managed := editForm("personal", "gh", "oauth_token", "stolen")
+	managed.Set("path", "personal/gh")
+	resp := uiPost(t, ts, "/ui/secret-editor/save", managed)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("enrolment path save status = %d, want 403", resp.StatusCode)
 	}
@@ -253,9 +266,9 @@ func TestSecretEditRefusesEnrolmentManagedPath(t *testing.T) {
 
 	// Its neighbour in the same subtree is still editable, so the refusal is
 	// the enrolment's and not the subtree's.
-	resp = uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/other", "document": `{"value":"new"}`,
-	})
+	neighbour := editForm("personal", "other", "value", "new")
+	neighbour.Set("path", "personal/other")
+	resp = uiPost(t, ts, "/ui/secret-editor/save", neighbour)
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Errorf("neighbour save status = %d, want 303", resp.StatusCode)
 	}
@@ -267,9 +280,9 @@ func TestSecretEditFollowsEnrolmentReload(t *testing.T) {
 	s, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"personal/gh": {"oauth_token": "ghp_x"},
 	})
-	if resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/gh", "document": `{"oauth_token":"a"}`,
-	}); resp.StatusCode != http.StatusSeeOther {
+	before := editForm("personal", "gh", "oauth_token", "a")
+	before.Set("path", "personal/gh")
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", before); resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("pre-reload save status = %d, want 303", resp.StatusCode)
 	}
 
@@ -280,9 +293,9 @@ func TestSecretEditFollowsEnrolmentReload(t *testing.T) {
 	s.enrolments = map[string]config.Enrolment{"personal/gh": {Engine: "github"}}
 	s.enrolRunnerMu.Unlock()
 
-	if resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/gh", "document": `{"oauth_token":"b"}`,
-	}); resp.StatusCode != http.StatusForbidden {
+	after := editForm("personal", "gh", "oauth_token", "b")
+	after.Set("path", "personal/gh")
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", after); resp.StatusCode != http.StatusForbidden {
 		t.Errorf("post-reload save status = %d, want 403", resp.StatusCode)
 	}
 	if got := fake.wrote(); len(got) != 1 {
@@ -296,9 +309,7 @@ func TestSecretCreateRefusesExistingPath(t *testing.T) {
 	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"personal/token": {"value": "original"},
 	})
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "1", "path": "personal/token", "document": `{"value":"clobber"}`,
-	})
+	resp := uiPost(t, ts, "/ui/secret-editor/create", editForm("personal", "token", "value", "clobber"))
 	// 409, not the generic 422 a form error takes: the form is fine, the
 	// path is taken. The UI re-renders either way, but the status is the
 	// service layer's own verdict so the JSON API and the browser agree.
@@ -310,21 +321,21 @@ func TestSecretCreateRefusesExistingPath(t *testing.T) {
 	}
 }
 
-// A document that fails validation must come back with the user's text
-// intact: on this page it may be the only copy of a credential they have.
-func TestSecretSaveKeepsDocumentOnValidationError(t *testing.T) {
+// A submission that fails validation must come back with the user's rows
+// intact: on this page they may be the only copy of a credential just typed.
+func TestSecretSaveKeepsRowsOnValidationError(t *testing.T) {
 	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"personal/token": {"value": "v"},
 	})
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/token", "document": `{"value": "typed-but-unclosed"`,
-	})
+	form := editForm("personal", "", "value", "typed-but-unsaved")
+	form.Set("path", "personal/token")
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "typed-but-unclosed") {
-		t.Error("the rejected document was not returned to the user")
+	if !strings.Contains(string(body), "typed-but-unsaved") {
+		t.Error("the rejected field value was not returned to the user")
 	}
 }
 
@@ -334,8 +345,8 @@ func TestSecretDeleteRequiresTypedConfirmation(t *testing.T) {
 		"personal/token": {"value": "v"},
 	})
 
-	resp := uiPost(t, ts, "/ui/secret-editor/delete", map[string]string{
-		"path": "personal/token", "confirm": "wrong",
+	resp := uiPost(t, ts, "/ui/secret-editor/delete", url.Values{
+		"path": {"personal/token"}, "confirm": {"wrong"},
 	})
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("mis-typed confirm status = %d, want 409", resp.StatusCode)
@@ -344,8 +355,8 @@ func TestSecretDeleteRequiresTypedConfirmation(t *testing.T) {
 		t.Fatalf("deleted %v without a matching confirmation", got)
 	}
 
-	resp = uiPost(t, ts, "/ui/secret-editor/delete", map[string]string{
-		"path": "personal/token", "confirm": "token",
+	resp = uiPost(t, ts, "/ui/secret-editor/delete", url.Values{
+		"path": {"personal/token"}, "confirm": {"token"},
 	})
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("confirmed delete status = %d, want 303", resp.StatusCode)
@@ -484,14 +495,25 @@ func TestSecretEditorPagesRender(t *testing.T) {
 	})
 
 	t.Run("create form", func(t *testing.T) {
-		body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new"))
-		// With exactly one editable root the path input starts inside it,
-		// rather than making the user guess where a path is allowed to go.
-		if !strings.Contains(body, `value="personal/"`) {
-			t.Error("create form does not pre-fill the sole editable root")
+		body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new?path=personal"))
+		if !strings.Contains(body, `action="/ui/secret-editor/create"`) {
+			t.Error("create form does not post to the create endpoint")
 		}
-		if !strings.Contains(body, `action="/ui/secret-editor/save"`) {
-			t.Error("create form does not post to the save endpoint")
+		// The prefix is context, not something to retype: it is shown as
+		// static text and carried in a hidden field.
+		if !strings.Contains(body, `name="prefix"`) {
+			t.Error("create form does not carry the prefix")
+		}
+		if !strings.Contains(body, `name="field_name"`) {
+			t.Error("create form renders no field rows")
+		}
+	})
+
+	// A folder outside every editable subtree cannot be created in, and the
+	// form says so rather than rendering something that would be refused.
+	t.Run("create form refuses an uneditable folder", func(t *testing.T) {
+		if resp := uiGet(t, ts, "/ui/secret-editor/new?path=other"); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", resp.StatusCode)
 		}
 	})
 
@@ -533,10 +555,15 @@ func TestSecretEditorPagesRender(t *testing.T) {
 		}
 	})
 
-	t.Run("sidebar offers New secret", func(t *testing.T) {
+	// The sidebar carries no "New secret" action of its own — creating starts
+	// from the folder it lands in, which is why the folders have to be there.
+	t.Run("sidebar lists editable roots, not a New secret action", func(t *testing.T) {
 		body := uiBody(t, uiGet(t, ts, "/ui/secrets/"))
-		if !strings.Contains(body, "/ui/secret-editor/new") {
-			t.Error("Secrets sidebar has no New secret entry")
+		if !strings.Contains(body, "/ui/secrets/personal/") {
+			t.Error("Secrets sidebar does not list the editable root")
+		}
+		if strings.Contains(body, "/ui/secret-editor/new\"") {
+			t.Error("Secrets sidebar still carries a bare New secret entry")
 		}
 	})
 }
@@ -546,15 +573,19 @@ func TestSecretEditorPagesRender(t *testing.T) {
 func TestSecretCreateFlowEndToEnd(t *testing.T) {
 	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
 
-	if body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new")); !strings.Contains(body, "secret-document") {
-		t.Fatal("create form did not render its document field")
+	form := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new?path=personal"))
+	if !strings.Contains(form, `name="field_name"`) || !strings.Contains(form, `name="field_value"`) {
+		t.Fatal("create form did not render field rows")
+	}
+	// The prefix is implicit: shown, but not something the user retypes.
+	if !strings.Contains(form, "personal/") {
+		t.Error("create form does not show the implicit prefix")
 	}
 
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "1", "path": "personal/aws/dev", "document": `{"key_id":"AKIA","secret":"s3cret"}`,
-	})
+	resp := uiPost(t, ts, "/ui/secret-editor/create",
+		editForm("personal", "aws/dev", "key_id", "AKIA", "secret", "s3cret"))
 	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("save status = %d, want 303; body = %s", resp.StatusCode, uiBody(t, resp))
+		t.Fatalf("create status = %d, want 303; body = %s", resp.StatusCode, uiBody(t, resp))
 	}
 	loc := resp.Header.Get("Location")
 	if loc != "/ui/secrets/personal/aws/dev" {
@@ -579,10 +610,8 @@ func TestSecretCreateFlowEndToEnd(t *testing.T) {
 // attempt is rejected rather than collapsed.
 func TestSecretEditRejectsTraversal(t *testing.T) {
 	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
-	for _, bad := range []string{"personal/../../otheruser/gh", "personal/./x"} {
-		resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-			"create": "1", "path": bad, "document": `{"a":"b"}`,
-		})
+	for _, bad := range []string{"../../otheruser/gh", "./x"} {
+		resp := uiPost(t, ts, "/ui/secret-editor/create", editForm("personal", bad, "a", "b"))
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("path %q: status = %d, want 400", bad, resp.StatusCode)
 		}
@@ -663,17 +692,63 @@ func TestSecretAPILifecycle(t *testing.T) {
 	})
 }
 
-// With several editable roots the create form leaves the path blank rather
-// than picking one arbitrarily, which a user might not notice.
-func TestCreateFormPrefillWithSeveralRoots(t *testing.T) {
-	_, ts, _ := editTestServer(t, []string{"personal", "scratch"}, nil, nil)
-	body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/new"))
-	if strings.Contains(body, `value="personal/"`) {
-		t.Error("create form picked one of several roots to pre-fill")
+// An editable root holds nothing until the first secret is written into it,
+// so the sidebar has to list it from configuration rather than from a Vault
+// listing — a folder you cannot see is a folder you cannot create in.
+func TestSidebarListsEditableRootsThatDoNotExistYet(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal", "scratch/notes"}, nil, map[string]map[string]any{
+		"gh": {"oauth_token": "ghp_x"},
+	})
+	body := uiBody(t, uiGet(t, ts, "/ui/secrets/"))
+	// A multi-segment root is listed at its full path: the nav nests one
+	// level, so naming the whole path is what keeps it one click away.
+	for _, want := range []string{"/ui/secrets/personal/", "/ui/secrets/scratch/notes/"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sidebar does not link %s", want)
+		}
 	}
-	// It still says where a path is allowed to go.
-	if !strings.Contains(body, "personal/") || !strings.Contains(body, "scratch/") {
-		t.Error("create form does not list the editable roots")
+}
+
+// An empty editable folder must render as a folder with a create control,
+// not fall through to "secret not found" — that is its normal starting state.
+func TestEmptyEditableFolderRendersWithCreateControl(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	resp := uiGet(t, ts, "/ui/secrets/personal/")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := uiBody(t, resp)
+	if !strings.Contains(body, "/ui/secret-editor/new?path=") {
+		t.Error("empty editable folder offers no New secret control")
+	}
+	if strings.Contains(body, "secret not found") {
+		t.Error("empty editable folder rendered as a missing secret")
+	}
+}
+
+// A Vault policy granting write need not grant LIST, and a KVv2 LIST of a
+// prefix holding nothing is a 404 besides. Both are the normal state of a
+// fresh editable root, so neither may surface as an error on the one folder
+// the user is being invited to create in — while a failure anywhere else
+// still does.
+func TestListFailureToleratedOnlyInsideEditablePaths(t *testing.T) {
+	fake := newEditVault(nil)
+	fake.listFails = true
+	s := testServerWithVault(t, fake)
+	s.cfg.Listen = "127.0.0.1:9000"
+	s.cfg.EditablePaths = []string{"personal"}
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+
+	if resp := uiGet(t, ts, "/ui/secrets/personal/"); resp.StatusCode != http.StatusOK {
+		t.Errorf("editable folder status = %d, want 200", resp.StatusCode)
+	}
+	if keys, err := s.listSecretKeys(t.Context(), "personal"); err != nil || keys != nil {
+		t.Errorf("listSecretKeys(personal) = %v, %v; want nil, nil", keys, err)
+	}
+	if _, err := s.listSecretKeys(t.Context(), "elsewhere"); err == nil {
+		t.Error("a listing failure outside every editable path was swallowed")
 	}
 }
 
@@ -707,9 +782,9 @@ func TestSecretEditorErrorPageIsNotCacheable(t *testing.T) {
 	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"personal/token": {"value": "v"},
 	})
-	resp := uiPost(t, ts, "/ui/secret-editor/save", map[string]string{
-		"create": "0", "path": "personal/token", "document": `{"value": "unclosed`,
-	})
+	form := editForm("personal", "", "value", "v")
+	form.Set("path", "personal/token")
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422", resp.StatusCode)
 	}
@@ -726,8 +801,8 @@ func TestSecretDetailErrorPageKeepsHeaders(t *testing.T) {
 	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
 		"personal/token": {"value": "v"},
 	})
-	resp := uiPost(t, ts, "/ui/secret-editor/delete", map[string]string{
-		"path": "personal/token", "confirm": "wrong",
+	resp := uiPost(t, ts, "/ui/secret-editor/delete", url.Values{
+		"path": {"personal/token"}, "confirm": {"wrong"},
 	})
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", got)
@@ -792,5 +867,486 @@ func TestSecretEditorOnMissingSecretIs404(t *testing.T) {
 	resp := uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Fnothing")
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// applyFieldPatch is the heart of "only patch what changed", so its rules are
+// pinned directly rather than only through the HTTP surface.
+func TestApplyFieldPatch(t *testing.T) {
+	orig := func(names ...string) map[string]struct{} {
+		m := map[string]struct{}{}
+		for _, n := range names {
+			m[n] = struct{}{}
+		}
+		return m
+	}
+
+	t.Run("an unchanged submission writes nothing", func(t *testing.T) {
+		current := map[string]any{"a": "1", "b": "2"}
+		_, changed := applyFieldPatch(current, fieldPatch{
+			Submitted: map[string]string{"a": "1", "b": "2"},
+			Original:  orig("a", "b"),
+		})
+		if changed {
+			t.Error("changed reported for an identical submission")
+		}
+	})
+
+	t.Run("a cleared field is deleted", func(t *testing.T) {
+		current := map[string]any{"a": "1", "b": "2"}
+		got, changed := applyFieldPatch(current, fieldPatch{
+			Submitted: map[string]string{"a": "1"},
+			Original:  orig("a", "b"),
+		})
+		if !changed {
+			t.Error("changed not reported for a deletion")
+		}
+		if _, still := got["b"]; still {
+			t.Error("b survived being cleared")
+		}
+	})
+
+	// The reason the editor patches instead of replacing: a field another
+	// writer added between the page load and the save is in neither Submitted
+	// nor Original, and a whole-document write would silently delete it.
+	t.Run("a concurrently added field survives", func(t *testing.T) {
+		current := map[string]any{"a": "1", "added_elsewhere": "x"}
+		got, _ := applyFieldPatch(current, fieldPatch{
+			Submitted: map[string]string{"a": "2"},
+			Original:  orig("a"),
+		})
+		if got["added_elsewhere"] != "x" {
+			t.Errorf("concurrently added field = %#v, want preserved", got["added_elsewhere"])
+		}
+		if got["a"] != "2" {
+			t.Errorf("a = %#v, want the submitted value", got["a"])
+		}
+	})
+
+	// Renaming a *field* (clearing a row's name and typing another) is a
+	// delete plus an add, which only works because the two halves are driven
+	// by different inputs: the new name comes from Submitted, the old one
+	// goes because it is in Original with no row.
+	t.Run("renaming a field moves its value", func(t *testing.T) {
+		current := map[string]any{"old": "v", "keep": "k"}
+		got, changed := applyFieldPatch(current, fieldPatch{
+			Submitted: map[string]string{"new": "v", "keep": "k"},
+			Original:  orig("old", "keep"),
+		})
+		if !changed {
+			t.Error("a field rename was not reported as a change")
+		}
+		if _, still := got["old"]; still {
+			t.Error("the old field name survived")
+		}
+		if got["new"] != "v" || got["keep"] != "k" {
+			t.Errorf("result = %#v, want the value moved and the neighbour kept", got)
+		}
+	})
+
+	// A key/value form can only carry strings, so an untouched number must
+	// keep its type rather than being rewritten as its own string form.
+	t.Run("an untouched non-string value keeps its type", func(t *testing.T) {
+		current := map[string]any{"count": json.Number("1000000"), "name": "x"}
+		got, changed := applyFieldPatch(current, fieldPatch{
+			Submitted: map[string]string{"count": "1000000", "name": "x"},
+			Original:  orig("count", "name"),
+		})
+		if changed {
+			t.Error("round-tripping a number through the form counted as a change")
+		}
+		if _, isString := got["count"].(string); isString {
+			t.Error("an untouched number was rewritten as a string")
+		}
+	})
+}
+
+// Saving must write only the difference, and write nothing at all when there
+// is none — a no-op save should not mint a KVv2 version.
+func TestSecretSavePatchesOnlyWhatChanged(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"user": "gary", "value": "old"},
+	})
+
+	unchanged := editForm("personal", "token", "user", "gary", "value", "old")
+	unchanged.Set("path", "personal/token")
+	unchanged.Add("original_field", "user")
+	unchanged.Add("original_field", "value")
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", unchanged); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("no-op save status = %d, want 303", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a save that changed nothing", got)
+	}
+
+	changed := editForm("personal", "token", "user", "gary", "value", "new")
+	changed.Set("path", "personal/token")
+	changed.Add("original_field", "user")
+	changed.Add("original_field", "value")
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", changed); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("save status = %d, want 303", resp.StatusCode)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if got := fake.secrets["personal/token"]; got["value"] != "new" || got["user"] != "gary" {
+		t.Errorf("secret = %#v, want value updated and user preserved", got)
+	}
+}
+
+// Renaming is a copy-then-delete, in that order, so a failure between the two
+// leaves the original rather than nothing.
+func TestSecretSaveRenames(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	form := editForm("personal", "renamed", "value", "v")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body = %s", resp.StatusCode, uiBody(t, resp))
+	}
+	if loc := resp.Header.Get("Location"); loc != "/ui/secrets/personal/renamed" {
+		t.Errorf("Location = %q, want the new path", loc)
+	}
+	if got := fake.wrote(); len(got) != 1 || got[0] != "personal/renamed" {
+		t.Errorf("wrote = %v, want [personal/renamed]", got)
+	}
+	if got := fake.deleted(); len(got) != 1 || got[0] != "personal/token" {
+		t.Errorf("deleted = %v, want [personal/token]", got)
+	}
+}
+
+// A rename onto an occupied path would destroy a credential the user never
+// saw, exactly as a create over one would.
+func TestSecretSaveRenameRefusesOccupiedPath(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+		"personal/other": {"value": "keep-me"},
+	})
+	form := editForm("personal", "other", "value", "v")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", form); resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v over an occupied rename target", got)
+	}
+	if got := fake.deleted(); len(got) != 0 {
+		t.Errorf("deleted %v on a refused rename", got)
+	}
+}
+
+// A rename out of the editable subtree is refused by the same policy the
+// original path went through — the target is checked, not just the source.
+func TestSecretSaveRenameRefusesEscapingTheSubtree(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	form := editForm("", "gh", "value", "v")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", form); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a rename out of the subtree", got)
+	}
+}
+
+// A rename whose copy lands but whose delete fails leaves the secret at both
+// paths. The user has to be sent to the NEW one — it is there and correct —
+// because re-rendering the old path would hide the move and make every retry
+// meet the rename-target probe and fail forever.
+func TestSecretSaveRenameOrphanSendsUserToTheNewPath(t *testing.T) {
+	fake := newEditVault(map[string]map[string]any{"personal/token": {"value": "v"}})
+	fake.deleteFails = true
+	s := testServerWithVault(t, fake)
+	s.cfg.Listen = "127.0.0.1:9000"
+	s.cfg.EditablePaths = []string{"personal"}
+	s.registerRoutes()
+	ts := httptest.NewServer(s.middleware(s.mux))
+	t.Cleanup(ts.Close)
+
+	form := editForm("personal", "moved", "value", "v")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	resp := uiPost(t, ts, "/ui/secret-editor/save", form)
+	body := uiBody(t, resp)
+	// The copy succeeded, so the secret exists at the new path.
+	if got := fake.wrote(); len(got) != 1 || got[0] != "personal/moved" {
+		t.Fatalf("wrote = %v, want [personal/moved]", got)
+	}
+	// The page shown is the new path's, carrying the complaint — not the old
+	// path's, and not a form the user would resubmit into a permanent 409.
+	if !strings.Contains(body, "personal/moved") {
+		t.Error("the user was not shown the new path")
+	}
+	if !strings.Contains(body, "could not be removed") {
+		t.Error("the leftover copy was not reported")
+	}
+}
+
+// Clearing every field is refused rather than written: Vault rejects a
+// fieldless secret, and an empty form is far more likely a mistake than a
+// deliberate erasure. Deleting is its own confirmed gesture.
+func TestSecretSaveRefusesEmptyingEveryField(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	form := editForm("personal", "token")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", form); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a submission with no fields", got)
+	}
+}
+
+// Blank rows are what make "Add field" cheap, so they must cost nothing: the
+// form always carries some, and they must not become empty-named fields.
+func TestSecretCreateIgnoresBlankRows(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	form := editForm("personal", "token", "value", "v", "", "", "  ", "")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	got := fake.secrets["personal/token"]
+	if len(got) != 1 || got["value"] != "v" {
+		t.Errorf("secret = %#v, want exactly the one named field", got)
+	}
+}
+
+// Two rows naming the same field are refused rather than silently collapsed
+// to whichever won — the user cannot see which value they kept.
+func TestSecretCreateRefusesDuplicateFieldNames(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	form := editForm("personal", "token", "value", "a", "value", "b")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", form); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for a duplicate field name", got)
+	}
+}
+
+// Renaming the secret while changing no field still has to write: the field
+// patch reports "nothing changed", and only the rename flag keeps it going.
+func TestSecretSaveRenameWithNoFieldChanges(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"value": "v"},
+	})
+	form := editForm("personal", "moved", "value", "v")
+	form.Set("path", "personal/token")
+	form.Add("original_field", "value")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 1 || got[0] != "personal/moved" {
+		t.Errorf("wrote = %v, want [personal/moved]", got)
+	}
+	if got := fake.deleted(); len(got) != 1 || got[0] != "personal/token" {
+		t.Errorf("deleted = %v, want [personal/token]", got)
+	}
+}
+
+// The add-a-row fragment bounds its index: it is a query parameter, so it is
+// caller-supplied like any other.
+func TestAddFieldRowRejectsBadIndex(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	for _, q := range []string{"", "?i=", "?i=-1", "?i=abc", "?i=999999"} {
+		resp := uiGet(t, ts, "/ui/fragments/secret-editor/field-row"+q)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("i=%q: status = %d, want 400", q, resp.StatusCode)
+		}
+	}
+}
+
+// A field value must arrive byte-for-byte: it is typically a credential, and
+// only field *names* are trimmed.
+func TestSecretCreatePreservesValueWhitespace(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	const padded = "  s3cret	with space  "
+	form := editForm("personal", "token", "  value  ", padded)
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	got := fake.secrets["personal/token"]
+	if got["value"] != padded {
+		t.Errorf("value = %q, want the submitted value verbatim", got["value"])
+	}
+}
+
+// maxFieldRows is the only bound on a scripted POST, so it is pinned rather
+// than trusted.
+func TestSecretCreateRefusesTooManyRows(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	form := url.Values{"prefix": {"personal"}, "name": {"token"}}
+	for i := 0; i <= maxFieldRows; i++ {
+		form.Add("field_name", "f"+strconv.Itoa(i))
+		form.Add("field_value", "v")
+	}
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", form); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for an oversized submission", got)
+	}
+}
+
+// Editing a structured value turns it into a string — the form can only carry
+// strings, and pretending otherwise would mean guessing at the user's intent.
+// Pinned so it stays a documented trade-off rather than drifting into the
+// untouched-value path, where a type change would be a silent corruption.
+func TestEditingStructuredValueStoresAString(t *testing.T) {
+	current := map[string]any{"cfg": map[string]any{"k": "v"}}
+	got, changed := applyFieldPatch(current, fieldPatch{
+		Submitted: map[string]string{"cfg": `{"k":"other"}`},
+		Original:  map[string]struct{}{"cfg": {}},
+	})
+	if !changed {
+		t.Fatal("editing a structured value was not reported as a change")
+	}
+	if _, isString := got["cfg"].(string); !isString {
+		t.Errorf("cfg = %#v, want the submitted string", got["cfg"])
+	}
+}
+
+// The rows are paired positionally, which only holds if the counts match.
+// A mismatched body was not produced by this form, so it is refused rather
+// than guessed at — guessing would pair a name with someone else's value.
+func TestSecretCreateRefusesUnpairedRows(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+	form := url.Values{"prefix": {"personal"}, "name": {"token"}}
+	form.Add("field_name", "a")
+	form.Add("field_name", "b")
+	form.Add("field_value", "only-one")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/create", form); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v for an unpaired submission", got)
+	}
+}
+
+// "Add field" appends a row rather than re-rendering the form, because a
+// re-render would discard everything already typed.
+func TestAddFieldRowAppendsWithoutReRendering(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	body := uiBody(t, uiGet(t, ts, "/ui/fragments/secret-editor/field-row?i=3"))
+	if !strings.Contains(body, `name="field_name"`) || !strings.Contains(body, `name="field_value"`) {
+		t.Error("field-row fragment does not carry a name/value pair")
+	}
+	// Appended into the row container, not replacing it — asserting the mode
+	// as well as the selector, since a selector alone passes even if
+	// WithMode(ElementPatchModeAppend) is dropped and the patch starts
+	// replacing everything the user has typed.
+	if !strings.Contains(body, "selector #secret-field-rows") {
+		t.Errorf("field-row fragment does not target the row container: %s", body)
+	}
+	if !strings.Contains(body, "mode append") {
+		t.Errorf("field-row fragment does not append: %s", body)
+	}
+	// The button re-points at the next index so repeated clicks keep adding.
+	if !strings.Contains(body, "i=4") {
+		t.Error("add-field button was not advanced to the next index")
+	}
+}
+
+// The editor renders one row per existing field, pre-filled, plus the hidden
+// original_field markers the patch needs to detect a deletion.
+func TestEditorRendersFieldRowsAndOriginals(t *testing.T) {
+	_, ts, _ := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/token": {"user": "gary", "value": "s3cret"},
+	})
+	body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Ftoken"))
+	for _, want := range []string{">gary</textarea>", ">s3cret</textarea>", `name="original_field"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("editor body is missing %s", want)
+		}
+	}
+	// The name is editable — that is how a rename is expressed.
+	if !strings.Contains(body, `name="name"`) {
+		t.Error("editor does not offer an editable name")
+	}
+}
+
+// A multi-line credential must survive the editor untouched. <input
+// type=text> strips CR and LF per the HTML value-sanitization algorithm, so
+// rendering a PEM into one and saving anything on the page would silently
+// flatten the key — which the SSH enrolment engine writes for real.
+func TestSecretEditPreservesMultiLineValues(t *testing.T) {
+	const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA\nAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----\n"
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/key": {"private_key": pem, "comment": "gary@dotvault"},
+	})
+
+	// The editor must carry the newlines to the browser at all, which only a
+	// textarea can do.
+	body := uiBody(t, uiGet(t, ts, "/ui/secret-editor/edit?path=personal%2Fkey"))
+	if !strings.Contains(body, "<textarea") {
+		t.Error("editor renders values in an input, which would strip newlines")
+	}
+	if !strings.Contains(body, "BEGIN OPENSSH PRIVATE KEY") {
+		t.Fatal("editor did not carry the multi-line value")
+	}
+
+	// A browser submits a textarea with CRLF line endings. Editing only the
+	// neighbouring field must leave the key exactly as it was.
+	form := url.Values{}
+	form.Set("prefix", "personal")
+	form.Set("name", "key")
+	form.Set("path", "personal/key")
+	form.Add("field_name", "private_key")
+	form.Add("field_value", strings.ReplaceAll(pem, "\n", "\r\n"))
+	form.Add("field_name", "comment")
+	form.Add("field_value", "changed")
+	form.Add("original_field", "private_key")
+	form.Add("original_field", "comment")
+
+	if resp := uiPost(t, ts, "/ui/secret-editor/save", form); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	got := fake.secrets["personal/key"]
+	if got["private_key"] != pem {
+		t.Errorf("private_key round-tripped to %q, want the original bytes", got["private_key"])
+	}
+	if got["comment"] != "changed" {
+		t.Errorf("comment = %q, want the edited value", got["comment"])
+	}
+}
+
+// The CRLF the browser adds is undone, so a genuinely edited multi-line value
+// is stored with the newlines it appears to have rather than \r\n per line.
+func TestNormalizeFormNewlines(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"plain", "plain"},
+		{"a\r\nb", "a\nb"},
+		{"a\rb", "a\nb"},
+		{"a\nb", "a\nb"},
+		{"", ""},
+	} {
+		if got := normalizeFormNewlines(tc.in); got != tc.want {
+			t.Errorf("normalizeFormNewlines(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

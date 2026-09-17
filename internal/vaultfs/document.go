@@ -59,12 +59,14 @@ func RenderDocument(s *Secret) (*Document, error) {
 // It is the inverse of RenderDocument and the only path by which the
 // filesystem can produce a Vault write.
 //
-// Exported for the same reason as RenderDocument: the web UI's secret editor
-// edits exactly the document the mount serves, so accepting it through this
-// one parser is what makes "what you can write through the mount" and "what
-// you can save in the browser" the same set — including the refusal of an
-// empty object, which is a truncate the caller never finished rather than an
-// intentional erasure of every field.
+// Exported for the same reason as RenderDocument: the web API's secret-write
+// endpoints (POST/PUT /api/v1/secrets/{path}) accept a whole document, and
+// routing them through this one parser is what makes "what a caller can write
+// through the mount" and "what it can write through the API" the same set —
+// including the refusal of an empty object, which is a truncate the caller
+// never finished rather than an intentional erasure of every field. (The
+// browser's editor patches individual fields instead and does not come
+// through here.)
 func ParseDocument(b []byte) (map[string]any, error) { return parseDocument(b) }
 
 // parseDocument is the package-local spelling of ParseDocument.

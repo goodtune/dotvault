@@ -100,8 +100,14 @@ func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
+	// A folder inside an editable subtree renders even when it holds nothing:
+	// that is the normal state of a configured root nobody has written to
+	// yet, and it is exactly where the user needs the "New secret" control.
+	// Everywhere else an empty listing still means "not a folder" and falls
+	// through to the read.
+	canCreate := s.editPolicy().AllowsWithin(trimmed)
 	list := func() bool {
-		children, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix()+trimmed+"/")
+		children, err := s.listSecretKeys(ctx, trimmed)
 		if err != nil {
 			// Fall through to the read, but leave a trace: a transient LIST
 			// failure here would otherwise be masked by whatever the read
@@ -109,7 +115,7 @@ func (s *Server) handleUISecret(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("ui: list secrets failed", "path", trimmed, "error", err)
 			return false
 		}
-		if len(children) == 0 {
+		if len(children) == 0 && !canCreate {
 			return false
 		}
 		s.renderUISecretFolder(w, ctx, trimmed, children)

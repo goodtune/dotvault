@@ -33,7 +33,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 		Web: config.WebConfig{
 			Enabled:       true,
 			Listen:        "127.0.0.1:9000",
-			EditablePaths: []string{"personal", "scratch/notes"},
+			EditablePaths: []string{"personal", "scratch"},
 		},
 		Rules: []config.Rule{
 			{
@@ -719,7 +719,7 @@ func TestEditablePathsRoundTrip(t *testing.T) {
 	}{
 		{"absent", nil},
 		{"explicitly empty", []string{}},
-		{"populated", []string{"personal", "scratch/notes"}},
+		{"populated", []string{"personal", "scratch"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := &config.Config{

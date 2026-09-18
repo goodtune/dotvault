@@ -31,8 +31,6 @@ import (
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/vault"
-
-	"github.com/goodtune/dotvault/internal/kvpath"
 )
 
 // maxFieldValue caps a submitted field value, so a scripted POST cannot make
@@ -218,8 +216,12 @@ func uiSecretRowParams(r *http.Request) (row uiFieldRow, ok bool) {
 // the turning and the template flag that offers the gesture, so the pencil
 // cannot appear on a row whose edit-row request would be refused.
 func (s *Server) editableRow(path, field string) error {
-	if !s.editPolicy().Allows(path) {
-		return kvpath.ErrNotEditable
+	// Return Allow's own error rather than a flattened ErrNotEditable: a path
+	// inside an editable folder but too deep is a different thing to tell a
+	// user than one outside every folder, and inventing a sentinel here would
+	// be a second definition of a rule the policy already owns.
+	if _, err := s.editPolicy().Allow(path); err != nil {
+		return err
 	}
 	if err := checkEditorPath(path); err != nil {
 		return err

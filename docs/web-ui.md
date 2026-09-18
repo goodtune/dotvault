@@ -71,7 +71,9 @@ The editable subtrees are listed in the Secrets sidebar **whether or not they ex
 
 #### Creating a secret
 
-**New secret** on a folder asks for a name relative to that folder and takes you to it — `personal` plus `aws/dev` lands on `/ui/secrets/personal/aws/dev`. Naming a secret does not create it: that URL simply holds nothing yet, which is what makes the page there a create form. Add the first field and the secret comes into being. The URL is the whole state, so there is nothing to keep in step between "new" and "existing".
+**New secret** on a folder asks for a name relative to that folder and takes you to it — `personal` plus `aws` lands on `/ui/secrets/personal/aws`. Naming a secret does not create it: that URL simply holds nothing yet, which is what makes the page there a create form. Add the first field and the secret comes into being. The URL is the whole state, so there is nothing to keep in step between "new" and "existing".
+
+The name is a single segment, because your key space is one folder deep — the same shape an enrolment key has, flat or grouped exactly once. A nested name like `aws/dev` is refused rather than taking you to a page that could never save.
 
 #### Versions, and not clobbering each other
 

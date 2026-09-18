@@ -13,7 +13,10 @@
   <div class="enrol-card" data-show="$showNew" style="display: none">
     <form class="ssh-add-form" method="post" action="/ui/secrets-edit/goto">
       <input type="hidden" name="folder" value="{{.Folder}}">
-      <label class="enrol-prompt-label" for="new-secret-name">Name, relative to <code>{{.Folder}}/</code></label>
+      {{/* The key space is one folder deep, so the name is a single segment.
+           Saying so here is what keeps a nested name from costing the user
+           their typing to a bare 403 from the handler. */}}
+      <label class="enrol-prompt-label" for="new-secret-name">Name, directly inside <code>{{.Folder}}/</code> &mdash; no <code>/</code></label>
       <input id="new-secret-name" name="name" class="enrol-prompt-input" placeholder="my-secret"
              autocomplete="off" spellcheck="false" required>
       <div class="enrol-prompt-actions">

@@ -1,9 +1,10 @@
-// Secret editing: create, replace and delete for the subtrees named by
+// Secret editing: create, replace and delete for the folders named by
 // web.editable_paths.
 //
-// Everything here funnels through editPolicy, which owns the two rules — the
-// path must sit strictly inside a configured subtree, and it must not be a
-// path dotvault writes for itself. Both the JSON API and the browser's form
+// Everything here funnels through editPolicy, which owns the three rules — the
+// path must be a direct child of a configured folder (the key space is one
+// folder deep), it must not be the folder itself, and it must not be a path
+// dotvault writes for itself. Both the JSON API and the browser's form
 // POSTs call the same two service methods below, so a screen cannot offer an
 // edit the request behind it would refuse, and a future CLI gets the
 // behaviour for free.
@@ -374,7 +375,11 @@ func displayFieldValue(v any) string {
 // a read-only path indistinguishable from a typo.
 func secretEditStatus(err error) int {
 	switch {
-	case errors.Is(err, kvpath.ErrNotEditable), errors.Is(err, kvpath.ErrManaged):
+	case errors.Is(err, kvpath.ErrNotEditable), errors.Is(err, kvpath.ErrManaged),
+		errors.Is(err, kvpath.ErrSecretDepth):
+		// A depth refusal sits with the other policy refusals rather than with
+		// the malformed-request cases: the path is well-formed and may well
+		// exist, it is simply not somewhere this configuration grants editing.
 		return http.StatusForbidden
 	case errors.Is(err, kvpath.ErrInvalidName), errors.Is(err, vaultfs.ErrInvalidDocument),
 		errors.Is(err, errNoFields):

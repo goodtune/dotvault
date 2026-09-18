@@ -610,10 +610,13 @@ type WebConfig struct {
 	// UI may create, replace and delete secrets in. Empty (the default)
 	// means the UI stays read-only, exactly as it was before this existed.
 	//
-	// Each entry is a path relative to kv/{user_prefix}{username}/, and it
-	// names a *subtree*: "personal" makes personal/token and
-	// personal/aws/dev editable and leaves a secret at exactly "personal"
-	// alone. The key-space root is never editable however this is set —
+	// Each entry is a single folder relative to kv/{user_prefix}{username}/:
+	// "personal" makes personal/token editable and leaves a secret at exactly
+	// "personal" alone. The key space is one folder deep — the same shape
+	// validateEnrolmentKey enforces — so an entry names one segment and an
+	// editable secret is one segment below it; "personal/aws/dev" is not a
+	// path this grants, and "scratch/notes" is not an entry it accepts.
+	// The key-space root is never editable however this is set —
 	// admitting it would put every enrolment target and every sync rule's
 	// source one gesture away from being replaced, which is the blast radius
 	// the section exists to bound. The rule is kvpath.EditPolicy, shared with
@@ -1568,21 +1571,36 @@ func validateEnrolmentKey(key string) error {
 // download — sees one spelling of a given subtree rather than whichever of
 // "personal", "personal/" or "/personal/" the operator happened to type.
 //
-// The path grammar is kvpath.Clean, the same rule the filesystem mount and
-// the Docker volume plugin apply, rather than a second implementation here.
-// The one extra rule is that an entry may not name the key-space root: "" and
-// "/" would make every secret editable, which is precisely what the section
-// exists to prevent, and silently ignoring such an entry would leave an
-// operator believing they had granted something.
+// The path grammar is kvpath.CleanEditableRoot, which wraps the kvpath.Clean
+// the filesystem mount and the Docker volume plugin apply, rather than a
+// second implementation here. It adds the two rules this section needs:
+//
+//   - An entry may not name the key-space root. "" and "/" would make every
+//     secret editable, which is precisely what the section exists to prevent,
+//     and silently ignoring such an entry would leave an operator believing
+//     they had granted something.
+//   - An entry is a single path segment, and carries no backslash. The user's
+//     key space is one folder deep — an enrolment key is flat ("gh") or
+//     grouped exactly once ("databricks/prod", see validateEnrolmentKey) — so
+//     "scratch/notes" names a secret, not a folder, and accepting it as a root
+//     would grant editing over a subtree that cannot exist. validateEnrolmentKey
+//     refuses a backslash for the same reason this does: it is not a separator
+//     in a Vault path, so it would silently become part of a folder's name.
 func validateEditablePaths(entries []string) error {
 	seen := make(map[string]int, len(entries))
 	for i, raw := range entries {
-		clean, err := kvpath.Clean(raw)
+		clean, err := kvpath.CleanEditableRoot(raw)
 		if err != nil {
-			return fmt.Errorf("web.editable_paths[%d] %q: %w (a path segment may not be empty, \".\", \"..\", or contain NUL)", i, raw, err)
-		}
-		if clean == "" {
-			return fmt.Errorf("web.editable_paths[%d] %q: names the key space root; give a subdirectory of it", i, raw)
+			switch {
+			case errors.Is(err, kvpath.ErrNotEditable):
+				return fmt.Errorf("web.editable_paths[%d] %q: names the key space root; give a folder in it, such as \"personal\"", i, raw)
+			case errors.Is(err, kvpath.ErrRootDepth):
+				return fmt.Errorf("web.editable_paths[%d] %q: %w; the key space is one folder deep, so an entry names a single folder such as \"personal\"", i, raw, err)
+			case errors.Is(err, kvpath.ErrRootSeparator):
+				return fmt.Errorf("web.editable_paths[%d] %q: %w; Vault paths are slash-separated, so a backslash would be part of the folder's name rather than a separator", i, raw, err)
+			default:
+				return fmt.Errorf("web.editable_paths[%d] %q: %w (a path segment may not be empty, \".\", \"..\", or contain NUL)", i, raw, err)
+			}
 		}
 		if first, dup := seen[clean]; dup {
 			return fmt.Errorf("web.editable_paths[%d] %q: duplicates entry %d", i, raw, first)

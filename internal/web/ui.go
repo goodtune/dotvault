@@ -657,11 +657,9 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 // a folder you cannot see is a folder you cannot create in — the entry *is*
 // the way in.
 //
-// A root is added at its full path rather than its first segment, so a
-// multi-segment root like "scratch/notes" is reachable in one click. The nav's
-// expansion only ever nests one level, and re-deriving the intermediate
-// folders to nest deeper would list folders that need not exist; a flat entry
-// naming the whole path says exactly where it goes.
+// A root is a single path segment (kvpath.CleanEditableRoot), so it sits at
+// the same level as every other folder the listing returns and the nav's
+// one-level expansion covers it without any special case.
 func mergeEditableRoots(keys []string, roots []string) []string {
 	if len(roots) == 0 {
 		return keys

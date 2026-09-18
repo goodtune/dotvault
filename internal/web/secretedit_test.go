@@ -405,23 +405,23 @@ func TestCreateFlowFromFolderDialog(t *testing.T) {
 	}
 
 	resp := uiPost(t, ts, "/ui/secrets-edit/goto", url.Values{
-		"folder": {"personal"}, "name": {"aws/dev"},
+		"folder": {"personal"}, "name": {"aws"},
 	})
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("goto status = %d, want 303", resp.StatusCode)
 	}
 	// It navigates rather than creating: nothing is written yet.
-	if loc := resp.Header.Get("Location"); loc != "/ui/secrets/personal/aws/dev" {
+	if loc := resp.Header.Get("Location"); loc != "/ui/secrets/personal/aws" {
 		t.Fatalf("Location = %q, want the secret's own URL", loc)
 	}
 	if got := fake.wrote(); len(got) != 0 {
 		t.Errorf("naming a secret wrote %v; it should only navigate", got)
 	}
 
-	if resp := uiPost(t, ts, "/ui/secrets-edit/field", fieldForm("personal/aws/dev", 0, "key_id", "AKIA")); resp.StatusCode != http.StatusSeeOther {
+	if resp := uiPost(t, ts, "/ui/secrets-edit/field", fieldForm("personal/aws", 0, "key_id", "AKIA")); resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("first field status = %d, want 303", resp.StatusCode)
 	}
-	body := uiBody(t, uiGet(t, ts, "/ui/secrets/personal/aws/dev"))
+	body := uiBody(t, uiGet(t, ts, "/ui/secrets/personal/aws"))
 	if !strings.Contains(body, "key_id") {
 		t.Error("the new secret does not list its field")
 	}
@@ -857,15 +857,92 @@ func TestFieldSaveRequiresAVersion(t *testing.T) {
 	}
 }
 
+// The key space is one folder deep, so a nested name typed into the folder
+// dialog is refused rather than navigating to a URL whose page could never
+// save. Refused as a policy decision (403), not as a malformed request: the
+// path is well-formed, it is simply not somewhere editing is granted.
+func TestFolderDialogRefusesANestedName(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+
+	resp := uiPost(t, ts, "/ui/secrets-edit/goto", url.Values{
+		"folder": {"personal"}, "name": {"aws/dev"},
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("goto status = %d, want 403", resp.StatusCode)
+	}
+	if body := uiBody(t, resp); !strings.Contains(body, "directly inside") {
+		t.Errorf("the refusal does not explain the depth rule: %s", body)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("a refused name wrote %v", got)
+	}
+}
+
+// The same rule on the save path, which a caller can reach without the dialog.
+func TestSavingATooDeepSecretIsRefused(t *testing.T) {
+	_, ts, fake := editTestServer(t, []string{"personal"}, nil, nil)
+
+	resp := uiPost(t, ts, "/ui/secrets-edit/field", fieldForm("personal/aws/dev", 0, "key_id", "AKIA"))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	if got := fake.wrote(); len(got) != 0 {
+		t.Errorf("wrote %v below the one legal folder level", got)
+	}
+}
+
+// And on the JSON API, so the two surfaces agree about depth as they do about
+// every other part of the policy.
+//
+// The handlers are called directly, as the sibling API tests do: routing
+// through s.mux would answer 403 for a missing CSRF token long before the
+// policy is consulted, and the test would pass against any path at all.
+func TestAPIRefusesATooDeepSecret(t *testing.T) {
+	body := func() *strings.Reader { return strings.NewReader(`{"fields":{"a":"b"}}`) }
+	for _, method := range []string{"POST", "PUT"} {
+		s, _, fake := editTestServer(t, []string{"personal"}, nil, nil)
+		w := httptest.NewRecorder()
+		s.handleSecretWrite(w, httptest.NewRequest(method, "/api/v1/secrets/personal/aws/dev", body()))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s status = %d, want 403; body = %s", method, w.Code, w.Body.String())
+		}
+		if got := fake.wrote(); len(got) != 0 {
+			t.Errorf("%s wrote %v below the one legal folder level", method, got)
+		}
+	}
+
+	// DELETE too: a path the policy will not write is not one it will remove.
+	s, _, fake := editTestServer(t, []string{"personal"}, nil, map[string]map[string]any{
+		"personal/aws/dev": {"a": "b"},
+	})
+	w := httptest.NewRecorder()
+	s.handleSecretDelete(w, httptest.NewRequest("DELETE", "/api/v1/secrets/personal/aws/dev", nil))
+	if w.Code != http.StatusForbidden {
+		t.Errorf("DELETE status = %d, want 403; body = %s", w.Code, w.Body.String())
+	}
+	if got := fake.deleted(); len(got) != 0 {
+		t.Errorf("DELETE removed %v below the one legal folder level", got)
+	}
+
+	// The same request one level shallower succeeds, so the 403 above is the
+	// depth rule talking and not something incidental to the request.
+	s2, _, _ := editTestServer(t, []string{"personal"}, nil, nil)
+	w2 := httptest.NewRecorder()
+	s2.handleSecretWrite(w2, httptest.NewRequest("POST", "/api/v1/secrets/personal/aws", body()))
+	if w2.Code != http.StatusOK && w2.Code != http.StatusCreated {
+		t.Errorf("a legal create got %d; body = %s", w2.Code, w2.Body.String())
+	}
+}
+
 // The sidebar lists the configured subtrees whether or not Vault has them: a
 // subtree holds nothing until the first write, and a folder you cannot see is
 // one you cannot create in.
 func TestSidebarListsEditableRootsThatDoNotExistYet(t *testing.T) {
-	_, ts, _ := editTestServer(t, []string{"personal", "scratch/notes"}, nil, map[string]map[string]any{
+	_, ts, _ := editTestServer(t, []string{"personal", "scratch"}, nil, map[string]map[string]any{
 		"gh": {"oauth_token": "x"},
 	})
 	body := uiBody(t, uiGet(t, ts, "/ui/secrets/"))
-	for _, want := range []string{"/ui/secrets/personal/", "/ui/secrets/scratch/notes/"} {
+	for _, want := range []string{"/ui/secrets/personal/", "/ui/secrets/scratch/"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("sidebar does not link %s", want)
 		}

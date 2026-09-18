@@ -36,7 +36,7 @@ The daemon then listens on `$XDG_RUNTIME_DIR/dotvault/docker.sock` and materiali
 
 ### Registering the plugin
 
-Container engines do not look in dotvault's runtime directory on their own, so the socket is registered with a one-line **spec file**. On Linux the RPM, DEB and APK packages set this up for rootless Docker for you; everywhere else it is one command. `dotvault status` prints the file's path and the exact line it should contain for your socket path.
+Container engines do not look in dotvault's runtime directory on their own, so the socket is registered with a one-line **spec file**. On Linux the RPM, DEB and APK packages set this up for rootless Docker for you; Podman and rootful Docker are configured by hand, as is any non-packaged install. `dotvault status` prints the file's path and the exact line it should contain for your socket path.
 
 === "Rootless Docker"
 
@@ -47,14 +47,14 @@ Container engines do not look in dotvault's runtime directory on their own, so t
     unix:///run/user/1000/dotvault/docker.sock
     ```
 
-    If the file is not there, see [the plugin is not registered](#troubleshooting) below. For a non-packaged install — a `go install`, a tarball, or a socket path you have customised — write it yourself:
+    If the file is not there, see [Troubleshooting](#troubleshooting) below — most often the user-manager tmpfiles unit is not enabled on your distro. For a non-packaged install — a `go install`, a tarball, or a socket path you have customised — write it yourself:
 
     ```console
     $ mkdir -p ~/.local/lib/docker/plugins
     $ echo "unix://$XDG_RUNTIME_DIR/dotvault/docker.sock" > ~/.local/lib/docker/plugins/dotvault.spec
     ```
 
-    A spec file that already exists is never overwritten, so a hand-written one for a custom socket path survives the packaged drop-in and every later login.
+    A spec file that already exists is never overwritten, and its permissions are not reset either, so a hand-written one for a custom socket path survives the packaged drop-in and every later login exactly as you left it.
 
     Rootless `dockerd` discovers plugins from `~/.local/lib/docker/plugins`. (Docker's documentation also names `~/.config/docker/plugins`, but released daemons through v28 resolve that path to `/etc/docker/plugins` — the error check in `rootlessConfigPluginsPath`, `pkg/plugins/discovery_unix.go` in moby/moby, is inverted — so use `~/.local/lib`.)
 
@@ -79,7 +79,7 @@ Container engines do not look in dotvault's runtime directory on their own, so t
 
 The **daemon** still never writes the spec — it does not edit another tool's configuration, the same way it never sets `SSH_AUTH_SOCK`. The **Linux packages** do, and that is a real change of posture worth stating plainly: a drop-in shipped by dotvault creates a file in a directory Docker owns, so that the common case works without a manual step nobody discovers until `docker volume create` fails.
 
-Two things keep it from being presumptuous. The drop-in uses tmpfiles' `f` type, which writes its line only when it creates the file — it never truncates or rewrites an existing spec, so a hand-written one for a customised socket survives. And the opt-out is tmpfiles' own vendor-override convention, a same-named symlink to `/dev/null` in a directory of higher precedence than `/usr/share/user-tmpfiles.d`:
+Two things keep it from being presumptuous. The drop-in uses tmpfiles' `f` type and `:`-prefixed modes, both of which apply only when the item is created — it never truncates an existing spec and never resets its permissions, so a hand-written one for a customised socket survives untouched. And the opt-out is tmpfiles' own vendor-override convention, a same-named symlink to `/dev/null` in a directory of higher precedence than `/usr/share/user-tmpfiles.d`:
 
 ```sh
 ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf

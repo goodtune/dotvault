@@ -82,12 +82,13 @@ func TestActivationKeepList(t *testing.T) {
 	}
 }
 
-// The spec-file annotation in `dotvault status` has to tell three states
+// The spec-file annotation in `dotvault status` has to tell five states
 // apart: absent (the packaged tmpfiles drop-in has not run and nobody wrote
-// one), agreeing with the resolved socket, and naming a different one — which
-// is what a customised docker.socket looks like, since the drop-in writes the
-// default. The guide's two troubleshooting symptoms map onto the first and
-// third, so collapsing any pair would make the line useless.
+// one), agreeing with the resolved socket, naming a different one (what a
+// customised docker.socket looks like from here), empty, and not a regular
+// file. The guide's two troubleshooting symptoms map onto the first and
+// third, so collapsing any pair would make the line useless — and the last
+// two exist because status output is something users paste into issues.
 func TestDockerSpecState(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -97,28 +98,78 @@ func TestDockerSpecState(t *testing.T) {
 	}
 
 	const socket = "/run/user/1000/dotvault/docker.sock"
-	path := dockerSpecPath()
 
-	if got := dockerSpecState(path, socket); !strings.Contains(got, "missing") {
+	if got := dockerSpecState(spec, socket); !strings.Contains(got, "missing") {
 		t.Errorf("no spec file: state = %q, want a missing notice", got)
 	}
 
 	// tmpfiles' `f` writes no trailing newline, `echo` writes one, and moby
 	// TrimSpace's the body — both must read as agreeing.
 	for _, body := range []string{"unix://" + socket, "unix://" + socket + "\n"} {
-		if err := os.WriteFile(spec, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if got := dockerSpecState(path, socket); !strings.Contains(got, "present") || strings.Contains(got, "names") {
+		writeSpec(t, spec, body)
+		if got := dockerSpecState(spec, socket); !strings.Contains(got, "present") || strings.Contains(got, "names") {
 			t.Errorf("spec %q: state = %q, want a plain present notice", body, got)
 		}
 	}
 
-	if err := os.WriteFile(spec, []byte("unix:///run/user/1000/elsewhere.sock"), 0o644); err != nil {
+	writeSpec(t, spec, "unix:///run/user/1000/elsewhere.sock")
+	if got := dockerSpecState(spec, socket); !strings.Contains(got, "names") || !strings.Contains(got, "elsewhere.sock") {
+		t.Errorf("diverging spec: state = %q, want the other socket named", got)
+	}
+
+	// A truncated or half-written file must not render as `names ""`.
+	for _, body := range []string{"", "  \n\t "} {
+		writeSpec(t, spec, body)
+		got := dockerSpecState(spec, socket)
+		if !strings.Contains(got, "empty") || strings.Contains(got, "names") {
+			t.Errorf("empty spec %q: state = %q, want an empty notice", body, got)
+		}
+	}
+}
+
+// The read must not follow a symlink: tmpfiles opens its target O_NOFOLLOW,
+// and status output is pasted into issues, so a spec path pointed at the token
+// file must not print it.
+func TestDockerSpecStateRefusesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privilege on windows")
+	}
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret")
+	writeSpec(t, secret, "hvs.super-secret-token")
+	spec := filepath.Join(dir, "dotvault.spec")
+	if err := os.Symlink(secret, spec); err != nil {
 		t.Fatal(err)
 	}
-	got := dockerSpecState(path, socket)
-	if !strings.Contains(got, "names") || !strings.Contains(got, "elsewhere.sock") {
-		t.Errorf("diverging spec: state = %q, want the other socket named", got)
+	got := dockerSpecState(spec, "/run/user/1000/dotvault/docker.sock")
+	if strings.Contains(got, "secret") || strings.Contains(got, "hvs.") {
+		t.Fatalf("symlinked spec: state = %q, must not disclose the target's contents", got)
+	}
+	if !strings.Contains(got, "not a regular file") {
+		t.Errorf("symlinked spec: state = %q, want a not-a-regular-file notice", got)
+	}
+}
+
+// A file that is not a spec must not be able to push terminal escapes through
+// the status output, nor an unbounded amount of text.
+func TestDockerSpecStateQuotesAndCapsContents(t *testing.T) {
+	dir := t.TempDir()
+	spec := filepath.Join(dir, "dotvault.spec")
+	const beyondCap = "PAST-THE-CAP"
+	writeSpec(t, spec, "\x1b[2Junix://evil"+strings.Repeat("A", 32*1024)+beyondCap)
+
+	got := dockerSpecState(spec, "/run/user/1000/dotvault/docker.sock")
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("state = %q, want the escape rendered inert by %%q", got)
+	}
+	if strings.Contains(got, beyondCap) {
+		t.Errorf("state reached past the %d-byte read cap", maxSpecRead)
+	}
+}
+
+func writeSpec(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

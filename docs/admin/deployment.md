@@ -152,6 +152,21 @@ Things to know:
 - Requires systemd ≥ 227 (`FileDescriptorName=` support). On older systemd the fds arrive unnamed, and the daemon drains them with a warning rather than serving them.
 - Not applicable on macOS (launchd has its own, incompatible mechanism) or Alpine/OpenRC; on those the daemon's self-bind path runs unchanged.
 
+#### Docker volume plugin registration (automatic, per user)
+
+The Linux packages also ship a **systemd user-tmpfiles drop-in** at `/usr/share/user-tmpfiles.d/dotvault-docker.conf`. When a user's manager runs `systemd-tmpfiles --user --create` at login, it creates `~/.local/lib/docker/plugins/dotvault.spec` containing `unix://$XDG_RUNTIME_DIR/dotvault/docker.sock`, which is what registers the [Docker volume plugin](../guide/docker-volumes.md) with that user's rootless Docker engine. Without it every user has to write that file by hand, and the path and contents are both per-user — the home directory and the uid — so a package cannot simply install the file.
+
+Note that this is `/usr/share/user-tmpfiles.d`, not `/usr/lib/tmpfiles.d`: the system tmpfiles directories are under `/usr/lib`, the *user* ones under `/usr/share`. Nothing else about the packaging changes — there is no `%post` scriptlet, and the drop-in is inert on Alpine, which runs OpenRC.
+
+Things to know:
+
+- **It runs from `systemd-tmpfiles-setup.service` in the user manager**, which — unlike the system unit of the same name — is not symlinked at install time and relies on the distro applying systemd's shipped preset (`90-systemd-user.preset` does `enable systemd-tmpfiles-setup.service`). Where a distro does not, it simply never runs and nothing says so. `systemctl --user is-enabled systemd-tmpfiles-setup.service` is the check; `systemd-tmpfiles --user --create` applies it without a re-login.
+- **An existing spec file is never overwritten.** The drop-in uses tmpfiles' `f` type, which writes its line only when it creates the file, so a user who wrote their own spec for a customised `docker.socket` keeps it.
+- **The path is correct under socket activation too.** `dotvault-docker.socket`'s `ListenStream=%t/dotvault/docker.sock` and the daemon's own default socket are the same path, so the registered spec is right whichever binds it. It is wrong only when an operator has customised one of them, which is the case the previous point covers.
+- **The spec is created regardless of `docker.enabled`.** For a user who has not enabled the plugin, `docker volume create -d dotvault` then fails with a connection error instead of `plugin not found`. There is no exposure — the socket is `0600` in a `0700` directory, and an unconfigured daemon binds nothing — only a less obvious error message.
+- **Opting out** uses tmpfiles' vendor-override convention: a same-named symlink to `/dev/null` in a directory of higher precedence. A user does `ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf`; to opt a whole machine out, put the same symlink at `/usr/local/share/user-tmpfiles.d/dotvault-docker.conf`. The user search path, highest precedence first, is `~/.config/user-tmpfiles.d`, `$XDG_RUNTIME_DIR/user-tmpfiles.d`, `~/.local/share/user-tmpfiles.d`, `/usr/local/share/user-tmpfiles.d`, `/usr/share/user-tmpfiles.d` — note it does not include `/etc/user-tmpfiles.d`, which serves the system instance only. The installed basename is fixed for exactly this reason.
+- Podman and rootful Docker are unaffected: Podman is registered in `containers.conf` and rootful Docker in `/etc/docker/plugins`, neither of which dotvault writes. See the [Docker volumes guide](../guide/docker-volumes.md#registering-the-plugin).
+
 !!! tip "Enable lingering if the daemon must outlive a login session"
     A `--user` service normally stops when the user's last session ends, and `$XDG_RUNTIME_DIR` (where the SSH agent and [local API socket](../configuration/config-reference.md#api-section) live) is torn down with it. For a machine people reach over SSH — where a `tmux` job or the local API socket is expected to survive a disconnect — enable lingering so the user manager keeps running:
 

@@ -139,7 +139,17 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 	// be safe to paste, and a data line has nothing to quote. ~/.local/lib
 	// rather than ~/.config: released rootless dockerds (v27, v28) scan
 	// only the former — see docs/guide/docker-volumes.md.
-	fmt.Printf("  spec file:  ~/.local/lib/docker/plugins/%s.spec\n", dockervol.DriverName)
+	//
+	// The file now has two provenances — the packaged user-tmpfiles drop-in
+	// writes it at login, or the operator does — so its state is reported
+	// alongside the hint. That distinguishes the two failure modes the
+	// guide documents ("plugin not found" when it is absent, a connection
+	// error when it is present and points somewhere else) at the point
+	// where the socket path is already on screen. Reporting only: status
+	// never creates the file, which stays the operator's (or the package's)
+	// step.
+	specPath := dockerSpecPath()
+	fmt.Printf("  spec file:  %s%s\n", specPath, dockerSpecState(specPath, socket))
 	fmt.Printf("  spec body:  unix://%s\n", socket)
 
 	vols, err := dockervol.QueryListening(ctx, socket)
@@ -163,4 +173,37 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 		}
 		fmt.Println(line)
 	}
+}
+
+// dockerSpecPath is where a rootless Docker engine reads the plugin
+// registration from, and where the packaged user-tmpfiles drop-in writes it.
+func dockerSpecPath() string {
+	return filepath.Join("~", ".local", "lib", "docker", "plugins", dockervol.DriverName+".spec")
+}
+
+// dockerSpecState annotates the spec-file line with what is actually on disk:
+// nothing when the file cannot be examined (an unreadable home is not this
+// command's problem to report), and otherwise whether it is absent, agrees
+// with socket, or names a different one.
+//
+// The comparison trims surrounding whitespace because moby does
+// (pkg/plugins/discovery.go, readPluginInfo) — a spec written by `echo` ends
+// in a newline and one written by tmpfiles does not, and both are valid.
+func dockerSpecState(specPath, socket string) string {
+	expanded, err := paths.ExpandHome(specPath)
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(expanded)
+	switch {
+	case os.IsNotExist(err):
+		return "  (missing — see the Docker volumes guide)"
+	case err != nil:
+		return ""
+	}
+	got := strings.TrimSpace(string(b))
+	if want := "unix://" + socket; got != want {
+		return fmt.Sprintf("  (present, but names %s)", got)
+	}
+	return "  (present)"
 }

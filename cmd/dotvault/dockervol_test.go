@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -77,5 +79,46 @@ func TestActivationKeepList(t *testing.T) {
 				t.Errorf("activationKeepList = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The spec-file annotation in `dotvault status` has to tell three states
+// apart: absent (the packaged tmpfiles drop-in has not run and nobody wrote
+// one), agreeing with the resolved socket, and naming a different one — which
+// is what a customised docker.socket looks like, since the drop-in writes the
+// default. The guide's two troubleshooting symptoms map onto the first and
+// third, so collapsing any pair would make the line useless.
+func TestDockerSpecState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	spec := filepath.Join(home, ".local", "lib", "docker", "plugins", "dotvault.spec")
+	if err := os.MkdirAll(filepath.Dir(spec), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const socket = "/run/user/1000/dotvault/docker.sock"
+	path := dockerSpecPath()
+
+	if got := dockerSpecState(path, socket); !strings.Contains(got, "missing") {
+		t.Errorf("no spec file: state = %q, want a missing notice", got)
+	}
+
+	// tmpfiles' `f` writes no trailing newline, `echo` writes one, and moby
+	// TrimSpace's the body — both must read as agreeing.
+	for _, body := range []string{"unix://" + socket, "unix://" + socket + "\n"} {
+		if err := os.WriteFile(spec, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := dockerSpecState(path, socket); !strings.Contains(got, "present") || strings.Contains(got, "names") {
+			t.Errorf("spec %q: state = %q, want a plain present notice", body, got)
+		}
+	}
+
+	if err := os.WriteFile(spec, []byte("unix:///run/user/1000/elsewhere.sock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := dockerSpecState(path, socket)
+	if !strings.Contains(got, "names") || !strings.Contains(got, "elsewhere.sock") {
+		t.Errorf("diverging spec: state = %q, want the other socket named", got)
 	}
 }

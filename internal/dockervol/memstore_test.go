@@ -22,6 +22,10 @@ type memStore struct {
 	readErr error
 	reads   int
 	lists   int
+
+	// One-shot armed by swapOnNextRead; see there.
+	swapPath string
+	swapData map[string]any
 }
 
 func newMemStore() *memStore {
@@ -45,6 +49,23 @@ func (m *memStore) counts() (reads, lists int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.reads, m.lists
+}
+
+// swapOnNextRead arms a one-shot: the next Read of path returns what is
+// stored now, and the stored value becomes data as part of that same read.
+// It is how a test makes "the value changed between two renders"
+// deterministic. A plain put cannot: a render already running reads on its
+// own goroutine, so the put lands either side of it and the test asserts
+// against whichever won.
+//
+// It fires on the first Read of path whether or not the secret exists yet,
+// so it covers a secret appearing as well as one changing, and a nil data
+// removes it — the read-timed equivalents of put and remove. Until that
+// read happens it stays armed, and only one can be armed at a time.
+func (m *memStore) swapOnNextRead(path string, data map[string]any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.swapPath, m.swapData = path, maps.Clone(data)
 }
 
 func (m *memStore) setErr(err error) {
@@ -94,15 +115,29 @@ func (m *memStore) Read(ctx context.Context, relPath string) (*vaultfs.Secret, e
 	if m.readErr != nil {
 		return nil, m.readErr
 	}
-	data, ok := m.secrets[relPath]
-	if !ok {
-		return nil, nil
+	var secret *vaultfs.Secret
+	if data, ok := m.secrets[relPath]; ok {
+		secret = &vaultfs.Secret{
+			Data:        maps.Clone(data),
+			Version:     m.version[relPath],
+			CreatedTime: time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
+		}
 	}
-	return &vaultfs.Secret{
-		Data:        maps.Clone(data),
-		Version:     m.version[relPath],
-		CreatedTime: time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
-	}, nil
+	// After the value being returned is captured, so this read sees what
+	// was stored before it and the next one sees the swap. Deliberately
+	// outside the not-found branch above: arming a path that does not
+	// exist yet is the secret-appears case, and leaving the one-shot
+	// armed through it would fire it on some unrelated later read.
+	if m.swapPath == relPath {
+		if m.swapData == nil {
+			delete(m.secrets, relPath)
+		} else {
+			m.secrets[relPath] = m.swapData
+			m.version[relPath]++
+		}
+		m.swapPath, m.swapData = "", nil
+	}
+	return secret, nil
 }
 
 func (m *memStore) Write(ctx context.Context, relPath string, data map[string]any) error {

@@ -280,6 +280,7 @@ type registryLayer struct {
 	WebListen         string
 	WebLoginText      string
 	WebSecretViewText string
+	WebEditablePaths  []string
 
 	// Observability (scalar fields; the Headers map is read separately by
 	// readRegistryObservabilityHeaders).
@@ -451,6 +452,7 @@ func readRegistryLayerAt(root registry.Key, policyPath string) (registryLayer, b
 		layer.WebListen, _ = readRegString(wk, "Listen")
 		layer.WebLoginText, _ = readRegString(wk, "LoginText")
 		layer.WebSecretViewText, _ = readRegString(wk, "SecretViewText")
+		layer.WebEditablePaths = readRegMultiString(wk, "EditablePaths")
 	}
 
 	// Read Observability subkey (scalar fields only; Headers is a nested
@@ -711,6 +713,13 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.WebSecretViewText != "" {
 		cfg.Web.SecretViewText = layer.WebSecretViewText
+	}
+	// Present (non-nil), not non-empty — see the VaultPolicies merge above
+	// for why: an explicitly-set empty REG_MULTI_SZ must be able to revoke a
+	// list the base config granted, and for this list in particular the
+	// override direction that matters is *removing* editable subtrees.
+	if layer.WebEditablePaths != nil {
+		cfg.Web.EditablePaths = layer.WebEditablePaths
 	}
 	if layer.ObservabilityEnabled != nil {
 		cfg.Observability.Enabled = *layer.ObservabilityEnabled != 0

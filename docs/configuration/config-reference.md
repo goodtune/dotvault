@@ -54,6 +54,8 @@ web:
     Welcome to dotvault. Click **Login** to authenticate via SSO.
   secret_view_text: |
     These secrets are synchronised from Vault to your local machine.
+  editable_paths:
+    - personal
 
 api:
   enabled: true
@@ -263,9 +265,41 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 | `listen` | string | — | Listen address (must be loopback, e.g. `127.0.0.1:9000`) |
 | `login_text` | string | — | Markdown text displayed on the login page |
 | `secret_view_text` | string | — | Markdown text displayed on the secret view page |
+| `editable_paths` | list of strings | — | Folders of your own key space the web UI may create, edit and delete secrets in — one folder name per entry. Empty (the default) keeps the UI read-only |
 
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
+
+### Editable key spaces
+
+By default the web UI only reads. `editable_paths` opts a named part of your key space into full CRUD — see [Editing secrets](../web-ui.md#editing-secrets) for what that looks like in the browser.
+
+Each entry is a single **folder** name relative to `kv/{user_prefix}{username}/` — your key space is one folder deep, so an entry names a folder and the secrets directly inside it become editable:
+
+```yaml
+web:
+  enabled: true
+  listen: "127.0.0.1:9000"
+  editable_paths:
+    - personal
+    - scratch
+```
+
+With `user_prefix: users/` and a user of `gary`, that makes the secrets in `users/gary/personal/` and `users/gary/scratch/` editable — `personal/token`, `scratch/todo` and so on.
+
+Four things are **never** editable, whatever this is set to:
+
+- **Anything more than one folder deep.** Your key space is one folder deep and this setting is a view onto that layout, not a second one: an [enrolment key](#enrolments-section) is flat (`gh`) or grouped exactly once (`databricks/prod`), so an entry here names a single folder and an editable secret sits directly inside it. `personal/token` is editable; `personal/aws/dev` is not, and it says so rather than reporting the path as outside the subtree. An entry that is itself nested (`scratch/notes`) names a *secret*, not a folder, and is rejected at config load — accepting it would grant editing over a subtree that cannot exist.
+- **The root of your key space.** `personal/token` is editable; a secret sitting at exactly `users/gary/personal` is not, and neither is `users/gary/gh`. A root names a folder, and the secret that happens to share its name is a direct child of the key-space root like any other. Admitting the root would put every enrolment credential and every sync rule's source one gesture away from being replaced, which is the blast radius this setting exists to bound — so an entry naming it (`""`, `"/"`) is rejected at config load rather than quietly ignored.
+- **Anything an enrolment writes.** If `personal/gh` is a configured enrolment key — a [grouped enrolment](#enrolments-section) whose group happens to be an editable subtree; a flat key like `gh` sits at the key-space root and is already excluded by the root rule below — it stays read-only even though `personal` is editable: the credential there belongs to the enrolment engine, which will overwrite an edit at its next run or refresh. The rule reads the *configuration*, not Vault, so it holds before the enrolment has ever run — the path cannot be created by hand and then silently overwritten the first time the engine claims it. The UI says so on the page rather than just omitting the controls. This is evaluated live, so an enrolment added by a [remote config](remote-config.md) refresh takes a path out of reach without a restart.
+- **Any other user's secrets.** The path is always resolved beneath your own prefix, and `..` segments are rejected rather than collapsed.
+
+`editable_paths` is validated whether or not `web.enabled` is set, so a bad entry is reported when you stage the config rather than on the restart that turns the UI on. Entries are canonicalised (`/personal/` becomes `personal`), and a duplicate is an error.
+
+Each configured subtree is listed in the web UI's Secrets sidebar whether or not it exists in Vault yet — a subtree holds nothing until the first secret is written into it, and it has to be reachable for that first write to happen. A `list` denial or a 404 on a configured subtree is therefore treated as "empty" rather than reported, so a Vault policy that grants write on those paths without granting `list` on the folder above them still works. Listing failures outside the configured subtrees are still errors.
+
+!!! note "This is a UI capability, not a Vault permission"
+    dotvault refuses a write outside these subtrees; Vault does not know about them. The token still carries whatever the auth role granted it, so this bounds what the *browser* can do, not what the daemon could. Narrow the token itself with [`vault.policies`](#vault-section) if that is what you need.
 
 ## API section
 
@@ -507,6 +541,10 @@ dotvault validates the configuration on startup and exits with an error if:
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
 - A rule sets `target.delete_nulls: true` on a format other than `json` or `yaml` — the others have no null literal a template could render, and silently ignoring the flag would leave you believing a retired credential had been deleted (see [Removing a field](sync-rules.md#removing-a-field))
 - `web.listen` resolves to a non-loopback address (when web is enabled)
+- A `web.editable_paths` entry names the root of your key space (`""`, `"/"`) rather than a folder in it — silently ignoring it would leave you believing you had granted editing that you had not
+- A `web.editable_paths` entry is more than one segment deep (`scratch/notes`) — your key space is one folder deep, so that names a secret rather than a folder; write `scratch`
+- A `web.editable_paths` entry is not a valid relative KV path (an empty segment, `.`, `..`, or an embedded NUL)
+- Two `web.editable_paths` entries name the same folder once canonicalised (`personal` and `/personal/`)
 - An enrolment entry has an empty `engine` field
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
 - `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)

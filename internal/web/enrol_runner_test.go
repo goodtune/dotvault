@@ -20,8 +20,8 @@ type mockEngine struct {
 	err    error
 }
 
-func (e *mockEngine) Name() string      { return e.name }
-func (e *mockEngine) Fields() []string   { return e.fields }
+func (e *mockEngine) Name() string     { return e.name }
+func (e *mockEngine) Fields() []string { return e.fields }
 func (e *mockEngine) Run(_ context.Context, _ map[string]any, _ enrol.IO) (map[string]string, error) {
 	if e.err != nil {
 		return nil, e.err

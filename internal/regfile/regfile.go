@@ -181,6 +181,14 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 	// non-ASCII byte, so they round-trip the same way rule templates do.
 	e.writeString("LoginText", w.LoginText)
 	e.writeString("SecretViewText", w.SecretViewText)
+	// Emit whenever non-nil so an explicit empty list round-trips as an empty
+	// REG_MULTI_SZ rather than being dropped, matching the Vault Policies /
+	// OAuth Scopes / agent Principals treatment. Here that matters twice
+	// over: an empty list is how a policy revokes editing a base config
+	// granted, and a dropped value would silently restore it.
+	if w.EditablePaths != nil {
+		e.writeMultiString("EditablePaths", w.EditablePaths)
+	}
 	e.WriteString("\r\n")
 }
 

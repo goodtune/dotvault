@@ -18,6 +18,12 @@ sync:
 web:
   enabled: true
   listen: "127.0.0.1:9000"
+  # Editable key spaces. Named subtrees of kv/users/<you>/ the web UI may
+  # create, edit and delete secrets in; everything else — the root of the key
+  # space included, so every enrolment credential — stays read-only. Set here
+  # so a dev run exercises the CRUD surface.
+  editable_paths:
+    - personal
 
 # Observability is opt-in. Uncomment and point at a local OTel
 # collector to exercise the exporters end-to-end. Each signal is

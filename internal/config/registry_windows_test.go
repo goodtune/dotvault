@@ -1005,3 +1005,45 @@ func TestReadRegistryLayerRejectsLegacyFlatRelay(t *testing.T) {
 		t.Errorf("error %q should name the subkey the value must move to", err)
 	}
 }
+
+// web.editable_paths is the one three-surface field whose GPO leg CI can never
+// compile, and this loader's values now have to satisfy a stricter rule than
+// kvpath.Clean. Pins the same present-vs-non-empty merge the Policies test
+// pins — the empty list is how a policy *revokes* editing, so a dropped value
+// would silently restore the capability — plus that a GPO-sourced entry is
+// judged by validate() rather than trusted because it came from policy.
+func TestApplyRegistryLayerWebEditablePaths(t *testing.T) {
+	cfg := &Config{}
+	applyRegistryLayer(cfg, registryLayer{WebEditablePaths: []string{"personal", "scratch"}})
+	if len(cfg.Web.EditablePaths) != 2 ||
+		cfg.Web.EditablePaths[0] != "personal" || cfg.Web.EditablePaths[1] != "scratch" {
+		t.Errorf("EditablePaths = %v, want [personal scratch]", cfg.Web.EditablePaths)
+	}
+
+	// Explicitly empty (non-nil) clears a base that granted editing.
+	cfg2 := &Config{Web: WebConfig{EditablePaths: []string{"personal"}}}
+	applyRegistryLayer(cfg2, registryLayer{WebEditablePaths: []string{}})
+	if len(cfg2.Web.EditablePaths) != 0 {
+		t.Errorf("EditablePaths = %v, want empty (an explicit empty list revokes editing)", cfg2.Web.EditablePaths)
+	}
+
+	// Absent (nil) leaves the base alone.
+	cfg3 := &Config{Web: WebConfig{EditablePaths: []string{"keep"}}}
+	applyRegistryLayer(cfg3, registryLayer{})
+	if len(cfg3.Web.EditablePaths) != 1 || cfg3.Web.EditablePaths[0] != "keep" {
+		t.Errorf("EditablePaths = %v, want [keep] (absent must not clear the base)", cfg3.Web.EditablePaths)
+	}
+}
+
+// A too-deep or backslash-bearing root arriving from GPO is a hard start
+// failure, not something the policy quietly drops: LoadSystem runs validate()
+// over the registry layer exactly as it does over YAML.
+func TestRegistrySourcedEditablePathsAreValidated(t *testing.T) {
+	for _, entry := range []string{"scratch/notes", `personal\notes`} {
+		cfg := minimalConfigForTest()
+		applyRegistryLayer(cfg, registryLayer{WebEditablePaths: []string{entry}})
+		if err := cfg.validate(); err == nil {
+			t.Errorf("a registry-sourced %q was accepted", entry)
+		}
+	}
+}

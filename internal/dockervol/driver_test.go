@@ -548,13 +548,20 @@ func TestEventDuringPopulateIsNotDropped(t *testing.T) {
 	if !pending {
 		t.Fatal("event during populate was dropped")
 	}
+	// The change lands exactly as Mount's own render reads, so that render
+	// necessarily writes "1" and only a second one can put "2" on disk.
+	store.swapOnNextRead("gh", map[string]any{"a": "2"})
+	if reads, _ := store.counts(); reads != 0 {
+		// The oracle below rests on Mount's render being the first read.
+		// Were anything to read earlier, the swap would fire there and
+		// Mount itself would write "2", passing without a second render.
+		t.Fatalf("the store was read %d times before Mount", reads)
+	}
 	mp, err := d.Mount(context.Background(), "v", "c1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Mount rendered "1"; the pending event must force a second render,
-	// which picks up the change made after the first.
-	store.put("gh", map[string]any{"a": "2"})
+	// Mount rendered "1"; the pending event must force that second render.
 	eventually(t, "pending event honoured", func() bool { return fileHas(filepath.Join(mp, "gh.json"), `"2"`) })
 }
 

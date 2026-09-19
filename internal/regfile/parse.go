@@ -720,6 +720,16 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Web.Listen, webKey, "Listen") },
 		func() error { return apply(&cfg.Web.LoginText, webKey, "LoginText") },
 		func() error { return apply(&cfg.Web.SecretViewText, webKey, "SecretViewText") },
+		func() error {
+			v, ok, err := getMultiString(webKey, "EditablePaths")
+			if err != nil {
+				return err
+			}
+			if ok {
+				cfg.Web.EditablePaths = v
+			}
+			return nil
+		},
 	} {
 		if err := fn(); err != nil {
 			return err

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/kvpath"
 )
 
 // Kind distinguishes the two things a name in the mount can be.
@@ -322,38 +324,17 @@ func (t *Tree) Remove(ctx context.Context, path string) error {
 // segments); "" is the root. It is the one definition of what a relative KV
 // path may look like, shared with the Docker volume plugin so a volume's
 // `secrets=` option is judged by exactly the rule the mount applies.
-func CleanPath(p string) (string, error) { return cleanPath(p) }
-
-// cleanPath validates a slash-separated relative path and returns it in
-// canonical form (no leading or trailing slash, no empty segments).
 //
-// It deliberately does not use path.Clean: Vault treats logical path segments
-// literally and does not collapse "..", so cleaning a path here would let
-// "a/../b" resolve to a different Vault path than the one the caller named.
-// Anything that is not already canonical is rejected instead.
-func cleanPath(p string) (string, error) {
-	p = strings.Trim(p, "/")
-	if p == "" {
-		return "", nil
-	}
-	for _, seg := range strings.Split(p, "/") {
-		if err := validateName(seg); err != nil {
-			return "", err
-		}
-	}
-	return p, nil
-}
+// The rule itself lives in internal/kvpath, a leaf package, so internal/config
+// can apply it to the web UI's editable-subtree list without taking on this
+// package's Vault dependency.
+func CleanPath(p string) (string, error) { return kvpath.Clean(p) }
+
+// cleanPath is the package-local spelling of CleanPath.
+func cleanPath(p string) (string, error) { return kvpath.Clean(p) }
 
 // validateName checks a single path component.
-func validateName(name string) error {
-	if name == "" || name == "." || name == ".." {
-		return ErrInvalidName
-	}
-	if strings.ContainsAny(name, "/\x00") {
-		return ErrInvalidName
-	}
-	return nil
-}
+func validateName(name string) error { return kvpath.ValidateName(name) }
 
 func joinPath(dir, name string) string {
 	if dir == "" {

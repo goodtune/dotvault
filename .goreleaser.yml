@@ -158,6 +158,21 @@ nfpms:
         file_info:
           mode: 0644
         packager: apk
+      - src: packaging/linux/dotvault-docker.tmpfiles.conf
+        dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
+        file_info:
+          mode: 0644
+        packager: rpm
+      - src: packaging/linux/dotvault-docker.tmpfiles.conf
+        dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
+        file_info:
+          mode: 0644
+        packager: deb
+      - src: packaging/linux/dotvault-docker.tmpfiles.conf
+        dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
+        file_info:
+          mode: 0644
+        packager: apk
 
 checksum:
   name_template: checksums.txt

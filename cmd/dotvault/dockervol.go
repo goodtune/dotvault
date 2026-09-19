@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -120,6 +121,7 @@ func startDockerVolumes(ctx context.Context, cfg *config.Config, socket, volumeD
 // an engine looks on its own (see paths.DefaultDockerSocket).
 func printDockerStatus(ctx context.Context, cfg *config.Config) {
 	if !cfg.Docker.Enabled {
+		printDockerSpecOnlyNotice()
 		return
 	}
 	fmt.Println("\nDocker Volumes:")
@@ -139,7 +141,17 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 	// be safe to paste, and a data line has nothing to quote. ~/.local/lib
 	// rather than ~/.config: released rootless dockerds (v27, v28) scan
 	// only the former — see docs/guide/docker-volumes.md.
-	fmt.Printf("  spec file:  ~/.local/lib/docker/plugins/%s.spec\n", dockervol.DriverName)
+	//
+	// The file now has two provenances — the packaged user-tmpfiles drop-in
+	// writes it at login, or the operator does — so its state is reported
+	// alongside the hint. That distinguishes the two failure modes the
+	// guide documents ("plugin not found" when it is absent, a connection
+	// error when it is present and points somewhere else) at the point
+	// where the socket path is already on screen. Reporting only: status
+	// never creates the file, which stays the operator's (or the package's)
+	// step.
+	specPath := paths.DefaultDockerSpecPath()
+	fmt.Printf("  spec file:  %s%s\n", specPath, dockerSpecState(specPath, socket))
 	fmt.Printf("  spec body:  unix://%s\n", socket)
 
 	vols, err := dockervol.QueryListening(ctx, socket)
@@ -163,4 +175,78 @@ func printDockerStatus(ctx context.Context, cfg *config.Config) {
 		}
 		fmt.Println(line)
 	}
+}
+
+// maxSpecRead caps the spec-file read. A valid spec is one short line; the cap
+// exists for the file that is not one, so status cannot be made to print an
+// arbitrary amount of another file's contents.
+const maxSpecRead = 4096
+
+// printDockerSpecOnlyNotice covers the one case the rest of this function
+// cannot: docker.enabled is off, so there is no plugin to describe, but the
+// packaged user-tmpfiles drop-in has registered one with the engine anyway
+// (it runs at login and knows nothing about the config). `docker volume
+// create -d dotvault` then fails with a connection error rather than "plugin
+// not found", and a silent status block is no help in telling those apart.
+// Off linux there is no plugin surface at all and the drop-in is not shipped,
+// so there is nothing to say.
+func printDockerSpecOnlyNotice() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	specPath := paths.DefaultDockerSpecPath()
+	if _, err := os.Lstat(specPath); err != nil {
+		return
+	}
+	fmt.Println("\nDocker Volumes:")
+	fmt.Println("  disabled:   docker.enabled is not set, so no plugin is served")
+	fmt.Printf("  spec file:  %s  (present — an engine will try this socket and fail to connect)\n", specPath)
+}
+
+// dockerSpecState annotates the spec-file line with what is actually on disk:
+// nothing when the file cannot be examined (an unreadable home is not this
+// command's problem to report), and otherwise whether it is absent, empty,
+// agrees with socket, or names a different one.
+//
+// The comparison trims surrounding whitespace because moby does
+// (pkg/plugins/discovery.go, readPluginInfo) — a spec written by `echo` ends
+// in a newline and one written by tmpfiles does not, and both are valid.
+//
+// Two precautions on the read, because status output is something users paste
+// into issues. Lstat-and-refuse-non-regular: tmpfiles opens its target
+// O_NOFOLLOW, this read would not, so a spec path that is a symlink could
+// otherwise print the contents of any file this user can read. And the body
+// is rendered with %q and read under a cap, so a file that is not in fact a
+// spec cannot push terminal escapes or a megabyte of noise through the
+// terminal.
+func dockerSpecState(specPath, socket string) string {
+	fi, err := os.Lstat(specPath)
+	switch {
+	case os.IsNotExist(err):
+		return "  (missing — see the Docker volumes guide)"
+	case err != nil:
+		return ""
+	case !fi.Mode().IsRegular():
+		return "  (not a regular file — an engine will not read it)"
+	}
+
+	f, err := os.Open(specPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, maxSpecRead)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return ""
+	}
+
+	got := strings.TrimSpace(string(buf[:n]))
+	switch {
+	case got == "":
+		return "  (present but empty — an engine will not read it)"
+	case got != "unix://"+socket:
+		return fmt.Sprintf("  (present, but names %q)", got)
+	}
+	return "  (present)"
 }

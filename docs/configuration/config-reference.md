@@ -435,7 +435,7 @@ The `docker` section serves your secrets to containers as a Docker volume plugin
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Serve the plugin |
-| `socket` | string | `$XDG_RUNTIME_DIR/dotvault/docker.sock` | Unix socket the engine connects to (`0600` in a `0700` directory); must be absolute (or `~`-relative). Register it with the engine via a one-line spec file — see the guide |
+| `socket` | string | `$XDG_RUNTIME_DIR/dotvault/docker.sock` | Unix socket the engine connects to (`0600` in a `0700` directory); must be absolute (or `~`-relative). The engine is told about it by a one-line spec file, which the Linux packages create per user for rootless Docker — see the guide. Change this and you must write that file yourself, since the packaged drop-in names the default |
 | `volume_dir` | string | `$XDG_RUNTIME_DIR/dotvault/volumes` | Directory volumes are materialised under, one subdirectory each. Created at mode `0700` |
 | `cache_ttl` | duration | `1m` | Default refresh window for a volume without its own `ttl` option. Governs Community, and Enterprise while the event subscription is down; must be positive and at most 10 minutes, since the window is also how long a rotated secret keeps being served to a container |
 
@@ -447,14 +447,14 @@ docker:
   cache_ttl: "1m"
 ```
 
-The socket is deliberately not under an engine's own plugin directory: a rootless `dockerd` scans `/run/docker/plugins` inside its own mount namespace, which nothing outside it can populate, and a rootful one's is root-owned. Both engines accept a `.spec` file naming any socket, and `dotvault status` prints the command that writes it. dotvault never writes the file itself.
+The socket is deliberately not under an engine's own plugin directory: a rootless `dockerd` scans `/run/docker/plugins` inside its own mount namespace, which nothing outside it can populate, and a rootful one's is root-owned. Both engines accept a `.spec` file naming any socket, and `dotvault status` prints its path and contents. The **daemon** never writes that file — it does not edit another tool's configuration. The Linux **packages** do, for the rootless Docker case only, via a systemd user-tmpfiles drop-in that creates `~/.local/lib/docker/plugins/dotvault.spec` at login; it never overwrites a file that already exists, and it is opted out of with `ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf`. Note it names the *default* socket path, so a customised `socket` needs a hand-written spec. See [Registering the plugin](../guide/docker-volumes.md#registering-the-plugin).
 
 !!! note "Linux only"
     `docker.enabled` has no effect on macOS or Windows: the daemon logs a warning and serves nothing. Docker Desktop and Podman machine run the engine in a virtual machine, where a host-side socket is unreachable, so there is nothing a build for those platforms could usefully bind. A config shared across a mixed-platform fleet is safe.
 
 Volume definitions (names and options, never secret data) persist in `{cache_dir}/docker-volumes.json`, so a daemon restart under a running container resumes refreshing the directory that container still holds. The section is static — a change needs a restart — and is refused in a remote-config document, like every other section that opens a listener.
 
-On Linux, the packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an engine call landing mid-restart queues instead of failing. `docker.enabled` remains the master switch, and under activation the unit's `ListenStream=` path wins over `socket` — the `.spec` file must name that path. See [Socket activation](../admin/deployment.md#socket-activation-optional).
+On Linux, the packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an engine call landing mid-restart queues instead of failing. `docker.enabled` remains the master switch, and under activation the unit's `ListenStream=` path wins over `socket` — the `.spec` file must name that path. The unit's default `ListenStream=` and the default `socket` are the same path, so the packaged spec drop-in above is correct in both modes. See [Socket activation](../admin/deployment.md#socket-activation-optional) and [plugin registration](../admin/deployment.md#docker-volume-plugin-registration-automatic-per-user).
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Socket` (REG_SZ), `VolumeDir` (REG_SZ) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Docker`, and the section round-trips through `reg-import`/`reg-export` like every other, for the same mixed-fleet reason as `fuse`.
 

@@ -36,16 +36,29 @@ The daemon then listens on `$XDG_RUNTIME_DIR/dotvault/docker.sock` and materiali
 
 ### Registering the plugin
 
-Container engines do not look in dotvault's runtime directory on their own, so register the socket once with a one-line **spec file**. `dotvault status` prints the file's path and the exact line it should contain for your socket path.
+Container engines do not look in dotvault's runtime directory on their own, so the socket is registered with a one-line **spec file**. On Linux the RPM, DEB and APK packages set this up for rootless Docker for you; Podman and rootful Docker are configured by hand, as is any non-packaged install. `dotvault status` prints the file's path and the exact line it should contain for your socket path.
 
 === "Rootless Docker"
+
+    **If you installed from the RPM, DEB or APK package, this is already done.** The package ships a systemd user-tmpfiles drop-in at `/usr/share/user-tmpfiles.d/dotvault-docker.conf`, which your user manager applies at login:
+
+    ```console
+    $ cat ~/.local/lib/docker/plugins/dotvault.spec
+    unix:///run/user/1000/dotvault/docker.sock
+    ```
+
+    If the file is not there, see [Troubleshooting](#troubleshooting) below — most often the user-manager tmpfiles unit is not enabled on your distro. For a non-packaged install — a `go install`, a tarball, or a socket path you have customised — write it yourself:
 
     ```console
     $ mkdir -p ~/.local/lib/docker/plugins
     $ echo "unix://$XDG_RUNTIME_DIR/dotvault/docker.sock" > ~/.local/lib/docker/plugins/dotvault.spec
     ```
 
+    A spec file that already exists is never overwritten, and its permissions are not reset either, so a hand-written one for a custom socket path survives the packaged drop-in and every later login exactly as you left it.
+
     Rootless `dockerd` discovers plugins from `~/.local/lib/docker/plugins`. (Docker's documentation also names `~/.config/docker/plugins`, but released daemons through v28 resolve that path to `/etc/docker/plugins` — the error check in `rootlessConfigPluginsPath`, `pkg/plugins/discovery_unix.go` in moby/moby, is inverted — so use `~/.local/lib`.)
+
+    If you set `$XDG_LIB_HOME`, the drop-in does not apply to you: `dockerd` honours that variable but tmpfiles has no specifier for it, so the drop-in hardcodes `~/.local/lib`. Write the spec by hand under your own lib home.
 
 === "Rootless Podman"
 
@@ -62,7 +75,21 @@ Container engines do not look in dotvault's runtime directory on their own, so r
 
     As root, `echo "unix:///run/user/1000/dotvault/docker.sock" > /etc/docker/plugins/dotvault.spec`. A root daemon can reach a user's socket, but think before doing this: every container that daemon runs can then mount that user's secrets, and the container's root is real root.
 
-dotvault deliberately does not write the spec file itself — it never edits another tool's configuration, the same way it never sets `SSH_AUTH_SOCK`.
+#### Who writes the spec file, and how to opt out
+
+The **daemon** still never writes the spec — it does not edit another tool's configuration, the same way it never sets `SSH_AUTH_SOCK`. The **Linux packages** do, and that is a real change of posture worth stating plainly: a drop-in shipped by dotvault creates a file in a directory Docker owns, so that the common case works without a manual step nobody discovers until `docker volume create` fails.
+
+Two things keep it from being presumptuous. The drop-in uses tmpfiles' `f` type and `:`-prefixed modes, both of which apply only when the item is created — it never truncates an existing spec and never resets its permissions, so a hand-written one for a customised socket survives untouched. And the opt-out is tmpfiles' own vendor-override convention, a same-named symlink to `/dev/null` in a directory of higher precedence than `/usr/share/user-tmpfiles.d`:
+
+```sh
+ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf
+```
+
+The installed basename `dotvault-docker.conf` is therefore part of the contract: it is what you name to opt out, and it will not be renamed.
+
+The accepted cost is that the spec exists whether or not you set `docker.enabled`. There is no exposure — the socket is `0600` inside a `0700` directory, and an unconfigured daemon binds nothing at all — but an engine that now finds the driver registered reports a connection error rather than `plugin not found`. See the [troubleshooting](#troubleshooting) entry for both symptoms.
+
+Under `dotvault-docker.socket` the unit's `ListenStream=` path wins over `docker.socket`, and the spec must name the path that actually exists. The default agrees in both modes — `ListenStream=%t/dotvault/docker.sock` is the same path the daemon self-binds — so the drop-in is correct whether the daemon binds the socket itself or inherits the fd from systemd. It is wrong only if you have customised one of them, which is exactly the case `f` protects: your hand-written spec is left alone.
 
 ## Creating volumes
 
@@ -136,10 +163,12 @@ $ dotvault status
 Docker Volumes:
   socket:     /run/user/1000/dotvault/docker.sock
   volume dir: /run/user/1000/dotvault/volumes
-  spec file:  ~/.local/lib/docker/plugins/dotvault.spec
+  spec file:  ~/.local/lib/docker/plugins/dotvault.spec  (present)
   spec body:  unix:///run/user/1000/dotvault/docker.sock
   app-secrets          mounts=1 secrets=2 refresh=events
 ```
+
+The `spec file` line reports what is on disk — `(present)` when it names this socket, `(missing — see the Docker volumes guide)` when the packaged drop-in has not run and you have not written one, or `(present, but names …)` when it points somewhere else, which is what a customised `docker.socket` looks like from here. Status only reports it; it never writes the file.
 
 ## Requirements and limits
 
@@ -155,7 +184,19 @@ Volumes are `local` scope and belong to this daemon's user; the plugin is the "l
 
 ## Troubleshooting
 
-**`docker: Error response from daemon: error looking up volume plugin dotvault: plugin not found`** — the engine has not found the spec file, or it names the wrong socket. Check `~/.local/lib/docker/plugins/dotvault.spec` (rootless) against the socket path `dotvault status` prints. Under `dotvault-docker.socket` the unit's `ListenStream=` path is the authoritative one, and `dotvault status` reports `docker.socket` from the config, so keep the two the same.
+**`docker: Error response from daemon: error looking up volume plugin dotvault: plugin not found`** — the engine has not found the spec file. Check that `~/.local/lib/docker/plugins/dotvault.spec` (rootless) exists.
+
+If you installed from a Linux package it should have been created at login by the shipped user-tmpfiles drop-in. That runs from `systemd-tmpfiles-setup.service` in your *user* manager, which — unlike its system counterpart — is not symlinked at install time and relies on the distro applying systemd's shipped preset. It fails silently when it is not enabled, so check it:
+
+```console
+$ systemctl --user is-enabled systemd-tmpfiles-setup.service
+enabled
+$ systemd-tmpfiles --user --create        # apply now, without logging out
+```
+
+If it reports `disabled`, `systemctl --user enable --now systemd-tmpfiles-setup.service`. If you opted out with a `/dev/null` symlink, or you set `$XDG_LIB_HOME`, write the spec by hand (see [Registering the plugin](#registering-the-plugin)). `dockerd` rescans the plugin directory when it looks a driver up, not only at startup, so a spec written after the engine started is picked up on the next `docker volume create` with no restart.
+
+**`docker: Error response from daemon: … connect: no such file or directory` (or `connection refused`) for driver `dotvault`** — the opposite symptom: the engine *did* find the spec and tried to reach dotvault. The spec is created whether or not you enabled the plugin, so this is the expected error when `docker.enabled` is unset, or when the daemon is not running. Set `docker.enabled: true` and start `dotvault run`. If both are true, the spec names the wrong socket: compare it against the path `dotvault status` prints. Under `dotvault-docker.socket` the unit's `ListenStream=` path is the authoritative one, and `dotvault status` reports `docker.socket` from the config, so keep the two the same.
 
 **`… dotvault has not authenticated with vault yet`** — the daemon is running but holds no token. `dotvault login`, or wait for the peer borrow, then retry.
 

@@ -323,6 +323,27 @@ func DefaultDockerSocket() string {
 	return filepath.Join(CacheDir(), "docker.sock")
 }
 
+// DefaultDockerSpecPath returns the plugin registration file a rootless Docker
+// engine reads to learn where DefaultDockerSocket is:
+// ~/.local/lib/docker/plugins/dotvault.spec, holding the single line
+// "unix://<socket>".
+//
+// ~/.local/lib rather than the ~/.config/docker/plugins the Docker
+// documentation names: moby's rootlessConfigPluginsPath has an inverted error
+// check in every release through v28, so the config-home location resolves to
+// /etc/docker/plugins in practice while the lib-home one works.
+//
+// The daemon never writes this file — see DefaultDockerSocket for why
+// registration is not its step. The Linux packages do, through the
+// user-tmpfiles drop-in in packaging/linux, whose `f` line must stay in step
+// with this path; cmd/dotvault/packaging_test.go pins the two together. The
+// drop-in hardcodes ~/.local/lib because tmpfiles has no specifier for
+// $XDG_LIB_HOME, which rootlessLibPluginsPath does honour — a user who sets it
+// writes the spec by hand, and so is not served by this default either.
+func DefaultDockerSpecPath() string {
+	return filepath.Join(mustHomeDir(), ".local", "lib", "docker", "plugins", "dotvault.spec")
+}
+
 // DefaultDockerVolumeDir returns the directory under which the Docker volume
 // plugin materialises each volume when docker.volume_dir is unset:
 // $XDG_RUNTIME_DIR/dotvault/volumes, falling back to the cache dir.

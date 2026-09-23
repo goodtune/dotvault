@@ -198,3 +198,25 @@ func TestRemove(t *testing.T) {
 }
 
 func runtimeIsUnix() bool { return os.PathSeparator == '/' }
+
+func TestValidateRemoteSocketTemplateToken(t *testing.T) {
+	if err := ValidateRemoteSocket("~/.ssh/dotvault.{{HOSTNAME}}.sock"); err != nil {
+		t.Errorf("exact token rejected: %v", err)
+	}
+	for _, bad := range []string{
+		"~/.ssh/dotvault.{{HOST}}.sock",
+		"~/.ssh/dotvault.{{hostname}}.sock",
+		"~/.ssh/{{.sock",
+		"~/.ssh/dotvault.}}.sock",
+	} {
+		if err := ValidateRemoteSocket(bad); err == nil {
+			t.Errorf("%q: expected rejection", bad)
+		}
+	}
+}
+
+func TestDefaultRemoteSocketIsPerHost(t *testing.T) {
+	if DefaultRemoteSocket != "~/.ssh/dotvault.{{HOSTNAME}}.sock" {
+		t.Errorf("DefaultRemoteSocket = %q", DefaultRemoteSocket)
+	}
+}

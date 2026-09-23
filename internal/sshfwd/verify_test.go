@@ -372,8 +372,12 @@ func TestVerifierMatchedPinLeavesHostKeyEmpty(t *testing.T) {
 	if !result.Verified {
 		t.Error("Verified = false for a key that matched the stored pin; the pin was genuinely checked")
 	}
-	if result.ResolvedSocket != "/home/test/.ssh/dotvault.sock" {
-		t.Errorf("ResolvedSocket = %q, want the ~ expansion against the fake sshd's $HOME", result.ResolvedSocket)
+	label, err := LocalHostnameLabel()
+	if err != nil {
+		t.Fatalf("LocalHostnameLabel() = %v", err)
+	}
+	if want := "/home/test/.ssh/dotvault." + label + ".sock"; result.ResolvedSocket != want {
+		t.Errorf("ResolvedSocket = %q, want %q (the ~ expansion against the fake sshd's $HOME, with {{HOSTNAME}} substituted)", result.ResolvedSocket, want)
 	}
 }
 

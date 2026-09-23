@@ -3,6 +3,7 @@ package sshfwd
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 )
@@ -11,6 +12,39 @@ import (
 // shell echo rather than an SFTP realpath: the forward needs no subsystem, and
 // requiring sftp-server would exclude hosts that only allow exec.
 const homeProbeCommand = "echo $HOME"
+
+// hostnameFn is os.Hostname, replaceable in tests.
+var hostnameFn = os.Hostname
+
+// LocalHostnameLabel returns this host's name as a socket-safe label: the
+// first DNS label of os.Hostname(), lowercased, with every byte outside
+// [a-z0-9-] replaced by '-'. Lowercasing matters because the borrower's
+// pattern is a filename glob and macOS hostnames are routinely mixed-case.
+// An empty result is an error rather than a silent "dotvault..sock".
+func LocalHostnameLabel() (string, error) {
+	h, err := hostnameFn()
+	if err != nil {
+		return "", fmt.Errorf("resolve local hostname: %w", err)
+	}
+	if i := strings.IndexByte(h, '.'); i >= 0 {
+		h = h[:i]
+	}
+	h = strings.ToLower(h)
+	var b strings.Builder
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "", fmt.Errorf("local hostname %q yields no usable label for %s", h, HostnameToken)
+	}
+	return out, nil
+}
 
 // CommandRunner runs a single command on the remote and returns its stdout.
 // Abstracted so expansion is testable without an SSH server.
@@ -24,12 +58,20 @@ type CommandRunner interface {
 // An absolute path is returned verbatim and never probes — a needless exec
 // channel per connection would be both slow and a reason for the connection to
 // fail on a host that restricts commands. Only a "~/" prefix triggers the
-// probe. "~user/" is rejected rather than guessed: resolving another account's
+// probe; the {{HOSTNAME}} token is substituted locally first and never needs
+// one. "~user/" is rejected rather than guessed: resolving another account's
 // home would need NSS access dotvault does not have, and binding the wrong
 // path silently is worse than refusing.
 func ExpandRemotePath(ctx context.Context, r CommandRunner, p string) (string, error) {
 	if err := ValidateRemoteSocket(p); err != nil {
 		return "", err
+	}
+	if strings.Contains(p, HostnameToken) {
+		label, err := LocalHostnameLabel()
+		if err != nil {
+			return "", err
+		}
+		p = strings.ReplaceAll(p, HostnameToken, label)
 	}
 	if !strings.HasPrefix(p, "~/") {
 		return p, nil

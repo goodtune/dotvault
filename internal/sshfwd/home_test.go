@@ -173,3 +173,56 @@ func TestExpandRemotePathRejectsDELInHome(t *testing.T) {
 		t.Fatal("accepted a $HOME with a DEL character; must reject")
 	}
 }
+
+func TestExpandRemotePathSubstitutesHostname(t *testing.T) {
+	old := hostnameFn
+	hostnameFn = func() (string, error) { return "Gary-MBP.local", nil }
+	t.Cleanup(func() { hostnameFn = old })
+
+	r := &fakeRunner{out: "/home/me\n"}
+	got, err := ExpandRemotePath(context.Background(), r, "~/.ssh/dotvault.{{HOSTNAME}}.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/home/me/.ssh/dotvault.gary-mbp.sock" {
+		t.Errorf("got %q", got)
+	}
+	// Absolute paths substitute too, without a home probe: the runner errors
+	// if it's ever called.
+	fr := &fakeRunner{err: errors.New("must not be called")}
+	got, err = ExpandRemotePath(context.Background(), fr, "/srv/dotvault.{{HOSTNAME}}.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/srv/dotvault.gary-mbp.sock" {
+		t.Errorf("got %q", got)
+	}
+	if fr.calls != 0 {
+		t.Errorf("probed %d times for an absolute path, want 0", fr.calls)
+	}
+}
+
+func TestExpandRemotePathHostnameSanitised(t *testing.T) {
+	old := hostnameFn
+	t.Cleanup(func() { hostnameFn = old })
+	cases := map[string]string{
+		"desktop":       "desktop",
+		"My Box_1.corp": "my-box-1",
+		"UPPER":         "upper",
+		"":              "", // error
+		"...":           "", // error: empty after sanitising
+	}
+	for in, want := range cases {
+		hostnameFn = func() (string, error) { return in, nil }
+		got, err := LocalHostnameLabel()
+		if want == "" {
+			if err == nil {
+				t.Errorf("%q: expected error, got %q", in, got)
+			}
+			continue
+		}
+		if err != nil || got != want {
+			t.Errorf("%q: got (%q, %v), want %q", in, got, err, want)
+		}
+	}
+}

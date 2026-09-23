@@ -1,7 +1,6 @@
 package client
 
 import (
-	"context"
 	"path/filepath"
 	"strings"
 
@@ -174,43 +173,24 @@ func (v VaultConfig) borrowSockets() []string {
 	return append(out, v.TokenSockets...)
 }
 
-// borrowChain tries each borrower in turn and takes the first token offered.
-// A nil chain borrows nothing, so a caller with nothing configured needs no
-// branch.
-type borrowChain []peer.Borrower
-
-func (bc borrowChain) Borrow(ctx context.Context) (string, string) {
-	for _, b := range bc {
-		if token, source := b.Borrow(ctx); token != "" {
-			return token, source
-		}
-	}
-	return "", ""
-}
-
-// borrower is what the token-borrow paths resolve through: the local API
-// socket first, then the peers most-recently-seen first. No watcher — a library
-// consumer is a short-lived process, so on-demand re-resolution is the whole
-// mechanism.
+// borrower is what the token-borrow paths resolve through: the local API socket
+// tier first, then the peer tier, most-recently-seen first within it. No
+// watcher — a library consumer is a short-lived process, so on-demand
+// re-resolution is the whole mechanism.
 //
-// It is two pools in a chain rather than one pool over borrowSockets(), because
-// a single pool orders every member by recency and that systematically inverts
-// the local-first rule this ordering exists for: the local API socket is bound
-// once when the long-lived daemon starts, while a forwarded peer socket is
-// re-created on every SSH reconnect, so the peer would almost always look
-// fresher and win. Chaining keeps recency deciding *within* the peers — which
-// is what it is for, since a freshly reconnected workstation is the live one —
-// while the tier boundary keeps the stable local socket ahead of the one that
-// disappears with a session. See VaultConfig.APISocket.
+// Two tiers rather than one pool over borrowSockets(), because local-first is a
+// stability rule and a pool can only sort by recency. See peer.Chain for why
+// those are not the same thing, and VaultConfig.APISocket for why this order.
 func (v VaultConfig) borrower() peer.Borrower {
-	var chain borrowChain
+	var apiTier *peer.Pool
 	if v.APISocket != "" {
-		chain = append(chain, peer.NewPool([]string{v.APISocket}))
+		apiTier = peer.NewPool([]string{v.APISocket})
 	}
+	var peerTier *peer.Pool
 	if len(v.TokenSockets) > 0 {
-		chain = append(chain, peer.NewPool(v.TokenSockets))
+		peerTier = peer.NewPool(v.TokenSockets)
 	}
-	return chain
+	return peer.NewChain(apiTier, peerTier)
 }
 
 // peerPool is the pool the peer actions (Browse / Notify / Clipboard) fan out

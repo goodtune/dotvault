@@ -141,3 +141,44 @@ func TestNewPeerPoolNilWhenNoPatterns(t *testing.T) {
 		t.Errorf("Patterns() = %v, want the configured pattern", got)
 	}
 }
+
+// TestNewBorrowChainTiers pins the local-first borrow order for the one-shot
+// commands that may borrow from this host's own daemon. The tiers, not a sort
+// key, are what carry it: the local socket is bound once when the long-lived
+// daemon starts while a forwarded peer socket is re-created on every SSH
+// reconnect, so a single pool over both would order the peer first by recency.
+func TestNewBorrowChainTiers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no local API socket on windows; apiSocketCandidate gates it")
+	}
+	cfg := &config.Config{
+		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.*.sock"}},
+	}
+	tiers := newBorrowChain(cfg).Status()
+	if len(tiers) != 2 {
+		t.Fatalf("Status() = %d tiers, want 2 (local API socket, then peers)", len(tiers))
+	}
+	if got := tiers[0].Patterns; !reflect.DeepEqual(got, []string{"/run/dotvault/api.sock"}) {
+		t.Errorf("tier 0 = %v, want the local API socket first", got)
+	}
+	if got := tiers[1].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.*.sock"}) {
+		t.Errorf("tier 1 = %v, want the peer pattern", got)
+	}
+}
+
+// TestNewBorrowChainWithoutLocalSocket: with the local socket disabled the
+// chain is the peer tier alone — not an empty tier reported as "none present",
+// which would have an operator looking for a socket that can never exist.
+func TestNewBorrowChainWithoutLocalSocket(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
+	}
+	tiers := newBorrowChain(cfg).Status()
+	if len(tiers) != 1 {
+		t.Fatalf("Status() = %d tiers, want 1 (peers only)", len(tiers))
+	}
+	if got := tiers[0].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.sock"}) {
+		t.Errorf("tier 0 = %v, want the peer socket", got)
+	}
+}

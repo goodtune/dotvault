@@ -1725,7 +1725,8 @@ func reportCertCredential(cfg *config.Config) {
 	}
 }
 
-// printPeerPoolStatus renders the peer socket pool for `dotvault status`.
+// printPeerPoolStatus renders the borrow chain for `dotvault status`, one tier
+// at a time and in borrow order.
 //
 // Both the patterns and the resolved members are printed, because they answer
 // different questions: the pattern says what was configured, while a member
@@ -1734,20 +1735,22 @@ func reportCertCredential(cfg *config.Config) {
 // to borrow from", which a pattern-only view collapsed into one unhelpful line.
 // Evicted members are shown deliberately: eviction is a re-probe window, not a
 // verdict, so a socket in that state is still part of the picture.
-func printPeerPoolStatus(st peer.Status) {
-	for _, p := range st.Patterns {
-		fmt.Printf("  token socket pattern: %s\n", p)
-	}
-	if len(st.Members) == 0 {
-		fmt.Println("  peer sockets: none present")
-		return
-	}
-	for _, m := range st.Members {
-		state := "active"
-		if m.Evicted {
-			state = "evicted " + m.EvictedAt.Format("15:04:05")
+func printPeerPoolStatus(tiers []peer.Status) {
+	for _, st := range tiers {
+		for _, p := range st.Patterns {
+			fmt.Printf("  token socket pattern: %s\n", p)
 		}
-		fmt.Printf("  peer socket: %s (%s, last seen %s)\n", m.Path, state, m.LastSeen.Format("2006-01-02 15:04:05"))
+		if len(st.Members) == 0 {
+			fmt.Println("    none present")
+			continue
+		}
+		for _, m := range st.Members {
+			state := "active"
+			if m.Evicted {
+				state = "evicted " + m.EvictedAt.Format("15:04:05")
+			}
+			fmt.Printf("    %s (%s, last seen %s)\n", m.Path, state, m.LastSeen.Format("2006-01-02 15:04:05"))
+		}
 	}
 }
 
@@ -1793,10 +1796,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	persistsToken := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
 	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
 	borrowSockets := cfg.TokenBorrowSockets()
-	pool := newPeerPool(borrowSockets)
+	borrowChain := newBorrowChain(cfg)
 	borrowedFrom := ""
 	if token == "" {
-		if peerToken, source := pool.Borrow(ctx); peerToken != "" {
+		if peerToken, source := borrowChain.Borrow(ctx); peerToken != "" {
 			token = peerToken
 			borrowedFrom = source
 		}
@@ -1810,7 +1813,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		reportCertCredential(cfg)
 	case token == "" && len(borrowSockets) > 0:
 		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
-		printPeerPoolStatus(pool.Status())
+		printPeerPoolStatus(borrowChain.Status())
 	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
 	default:
@@ -1824,7 +1827,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			if borrowedFrom != "" {
 				fmt.Printf("  source: borrowed from peer socket (%s)\n", borrowedFrom)
 				fmt.Println("  (no token file at rest — the peer is the sole owner; re-borrowed on each login/refresh)")
-				printPeerPoolStatus(pool.Status())
+				printPeerPoolStatus(borrowChain.Status())
 			}
 		}
 	}
@@ -2312,7 +2315,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		Borrower:         newPeerPool(cfg.TokenBorrowSockets()),
+		Borrower:         newBorrowChain(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2548,7 +2551,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		Borrower:         newPeerPool(cfg.TokenBorrowSockets()),
+		Borrower:         newBorrowChain(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),

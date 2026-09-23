@@ -95,3 +95,27 @@ func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
 	}
 	return peer.NewPool(patterns, opts...)
 }
+
+// newBorrowChain builds the two-tier borrower the one-shot commands that may
+// borrow from this host's own daemon use — `status`, `sync`, `enrol`: the local
+// API socket first, then the peers.
+//
+// It is a chain rather than a single pool over cfg.TokenBorrowSockets(), even
+// though that list is already in the right order, because a pool sorts its
+// members by recency and the local socket is the *older* of the two in steady
+// state — bound once when the long-lived daemon started, against a forwarded
+// peer socket re-created on every SSH reconnect. Flattening the tiers would
+// therefore invert the documented local-first order rather than preserve it.
+// See peer.Chain.
+//
+// The daemon (daemonBorrowSockets) and `dotvault login`
+// (freshLoginBorrowSockets) deliberately do NOT use this: both exclude the local
+// socket outright, so their lists are peers-only and a single pool is already
+// the whole story.
+func newBorrowChain(cfg *config.Config) *peer.Chain {
+	var apiTier *peer.Pool
+	if local, err := cfg.APISocketPath(); err == nil && local != "" {
+		apiTier = peer.NewPool([]string{local})
+	}
+	return peer.NewChain(apiTier, newPeerPool(cfg.PeerActionSockets()))
+}

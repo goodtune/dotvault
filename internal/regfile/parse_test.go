@@ -23,7 +23,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 			KVMount:             "kv",
 			UserPrefix:          "users/",
 			OIDCCallbackPort:    8251,
-			TokenSocket:         "~/.ssh/dotvault.sock",
+			TokenSockets:        config.SocketList{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"},
 			Policies:            []string{"dotvault", "kv-read"},
 			NoDefaultPolicy:     true,
 			DisableTokenRenewal: true,
@@ -702,5 +702,25 @@ func TestParseRejectsMalformedHex(t *testing.T) {
 		"\"TargetTemplate\"=hex(1):zz,zz\r\n"
 	if _, err := Parse([]byte(bad)); err == nil {
 		t.Errorf("expected error for malformed hex bytes")
+	}
+}
+
+// TestParseLegacyTokenSocketREGSZ covers a policy pushed before the
+// TokenSockets REG_MULTI_SZ existed: a lone legacy TokenSocket REG_SZ value
+// must still parse, wrapped as a one-element SocketList.
+//
+// TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
+func TestParseLegacyTokenSocketREGSZ(t *testing.T) {
+	in := "Windows Registry Editor Version 5.00\r\n\r\n" +
+		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
+		"\"Address\"=\"http://127.0.0.1:8200\"\r\n" +
+		"\"AuthMethod\"=\"token\"\r\n" +
+		"\"TokenSocket\"=\"~/.ssh/dotvault.sock\"\r\n"
+	cfg, err := Parse([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (config.SocketList{"~/.ssh/dotvault.sock"}); !reflect.DeepEqual(cfg.Vault.TokenSockets, want) {
+		t.Errorf("got %v, want %v", cfg.Vault.TokenSockets, want)
 	}
 }

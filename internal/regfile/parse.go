@@ -658,7 +658,25 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Vault.CACert, vaultKey, "CACert") },
 		func() error { return apply(&cfg.Vault.KVMount, vaultKey, "KVMount") },
 		func() error { return apply(&cfg.Vault.UserPrefix, vaultKey, "UserPrefix") },
-		func() error { return apply(&cfg.Vault.TokenSocket, vaultKey, "TokenSocket") },
+		func() error {
+			v, ok, err := getMultiString(vaultKey, "TokenSockets")
+			if err != nil {
+				return err
+			}
+			if ok {
+				cfg.Vault.TokenSockets = config.SocketList(v)
+				return nil
+			}
+			// TODO(pre-1.0, #ISSUE): drop the REG_SZ fallback.
+			var legacy string
+			if err := apply(&legacy, vaultKey, "TokenSocket"); err != nil {
+				return err
+			}
+			if legacy != "" {
+				cfg.Vault.TokenSockets = config.SocketList{legacy}
+			}
+			return nil
+		},
 		func() error {
 			v, ok, err := getMultiString(vaultKey, "Policies")
 			if err != nil {

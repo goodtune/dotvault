@@ -23,6 +23,7 @@ import (
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
 	"github.com/goodtune/dotvault/internal/sshfwd"
 	internalsync "github.com/goodtune/dotvault/internal/sync"
@@ -198,6 +199,12 @@ type Server struct {
 	// (or the platform has none). Guarded by fuseMu; read through
 	// fuseStatusSnapshot.
 	fuseStatus func() vaultfs.Status
+
+	// peerMu guards peerStatus, wired post-construction like fuseStatus.
+	peerMu sync.RWMutex
+	// peerStatus reports the peer socket pool for /api/v1/status's
+	// "peer_sockets" block. Nil when the daemon borrows from no peer.
+	peerStatus func() peer.Status
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
@@ -753,6 +760,19 @@ func (s *Server) fuseStatusSnapshot() func() vaultfs.Status {
 	s.fuseMu.RLock()
 	defer s.fuseMu.RUnlock()
 	return s.fuseStatus
+}
+
+// SetPeerStatus wires the peer socket pool's status query.
+func (s *Server) SetPeerStatus(fn func() peer.Status) {
+	s.peerMu.Lock()
+	defer s.peerMu.Unlock()
+	s.peerStatus = fn
+}
+
+func (s *Server) peerStatusSnapshot() func() peer.Status {
+	s.peerMu.RLock()
+	defer s.peerMu.RUnlock()
+	return s.peerStatus
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {

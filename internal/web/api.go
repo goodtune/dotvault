@@ -111,6 +111,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["fuse"] = fuseStatus()
 	}
 
+	// Peer socket pool (patterns, members, eviction). Unauthenticated like the
+	// blocks above: it names socket files in this user's own home and reports
+	// whether they answered, never anything from behind them. This is the
+	// block that shows "two sockets, one evicted" when a borrow has nowhere
+	// to go.
+	if peerStatus := s.peerStatusSnapshot(); peerStatus != nil {
+		status["peer_sockets"] = peerStatus()
+	}
+
 	writeJSON(w, status)
 }
 

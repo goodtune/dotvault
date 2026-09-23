@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -911,5 +912,32 @@ func TestHandleSecrets_SlowVaultReturnsWithinTimeout(t *testing.T) {
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestStatusCarriesPeerSockets(t *testing.T) {
+	s := testServer(t)
+	s.SetPeerStatus(func() peer.Status {
+		return peer.Status{
+			Patterns: []string{"~/.ssh/dotvault.*.sock"},
+			Members:  []peer.Member{{Path: "/home/u/.ssh/dotvault.laptop.sock", Evicted: true}},
+		}
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	ps, ok := body["peer_sockets"].(map[string]any)
+	if !ok {
+		t.Fatalf("no peer_sockets block: %s", w.Body.String())
+	}
+	members := ps["members"].([]any)
+	if len(members) != 1 || members[0].(map[string]any)["evicted"] != true {
+		t.Errorf("members = %v", members)
 	}
 }

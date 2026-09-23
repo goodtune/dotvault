@@ -1345,6 +1345,10 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		webServer.SetFUSEStatus(fuseSvc.Status)
 	}
 
+	if peerPool != nil && webServer != nil {
+		webServer.SetPeerStatus(peerPool.Status)
+	}
+
 	// Build and start the managed-SSH-forward subsystem now that we hold a
 	// Vault token: its SSH identity (the agent backend's Signers) may need
 	// to mint a Vault-CA certificate or read a KV-stored key, either of

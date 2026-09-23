@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -47,9 +48,11 @@ func TestAPISocketPath(t *testing.T) {
 }
 
 // TestTokenBorrowSocketsOrder pins the ordering decision: the local API
-// socket is tried before vault.token_socket because the SSH-forwarded peer is
-// the one that disappears when the session drops, and a process that outlives
-// its session must not depend on it.
+// socket is tried before the peer socket patterns because the SSH-forwarded
+// peer is the one that disappears when the session drops, and a process that
+// outlives its session must not depend on it. An absent vault.token_socket
+// applies DefaultPeerSocketPatterns (see TestTokenBorrowSocketsDefaultsPeerPatterns);
+// only an explicit, non-nil list overrides it.
 func TestTokenBorrowSocketsOrder(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")
 
@@ -62,23 +65,28 @@ func TestTokenBorrowSocketsOrder(t *testing.T) {
 			name: "both configured: local first",
 			cfg: Config{
 				API:   APIConfig{Enabled: true, Unix: APIUnixConfig{Path: "/run/dotvault/api.sock"}},
-				Vault: VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"},
+				Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/dotvault.sock"}},
 			},
 			want: []string{"/run/dotvault/api.sock", "~/.ssh/dotvault.sock"},
 		},
 		{
-			name: "api enabled without a path contributes the default",
+			name: "api enabled without a path contributes the default, absent token_socket applies its own default",
 			cfg:  Config{API: APIConfig{Enabled: true}},
-			want: []string{"/run/user/1234/dotvault/api.sock"},
+			want: []string{"/run/user/1234/dotvault/api.sock", "~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"},
 		},
 		{
 			name: "api disabled leaves only the peer socket",
-			cfg:  Config{Vault: VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}},
+			cfg:  Config{Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/dotvault.sock"}}},
 			want: []string{"~/.ssh/dotvault.sock"},
 		},
 		{
-			name: "neither configured",
+			name: "neither configured: peer defaults still apply",
 			cfg:  Config{},
+			want: []string{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"},
+		},
+		{
+			name: "explicit empty token_socket disables peer sockets",
+			cfg:  Config{Vault: VaultConfig{TokenSockets: SocketList{}}},
 			want: nil,
 		},
 	}
@@ -150,5 +158,47 @@ rules:
 	}
 	if want := "/run/user/1000/dotvault/api.sock"; cfg.API.Unix.Path != want {
 		t.Errorf("API.Unix.Path = %q, want %q", cfg.API.Unix.Path, want)
+	}
+}
+
+func TestTokenBorrowSocketsDefaultsPeerPatterns(t *testing.T) {
+	cfg := &Config{}
+	got := cfg.TokenBorrowSockets()
+	if !reflect.DeepEqual(got, DefaultPeerSocketPatterns) {
+		t.Errorf("absent token_socket: got %v, want defaults %v", got, DefaultPeerSocketPatterns)
+	}
+}
+
+func TestTokenBorrowSocketsExplicitEmptyDisables(t *testing.T) {
+	cfg := &Config{Vault: VaultConfig{TokenSockets: SocketList{}}}
+	if got := cfg.TokenBorrowSockets(); len(got) != 0 {
+		t.Errorf("explicit empty list: got %v, want none", got)
+	}
+}
+
+func TestTokenBorrowSocketsLocalFirstThenPeers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no local API socket on windows")
+	}
+	cfg := &Config{
+		API:   APIConfig{Enabled: true, Unix: APIUnixConfig{Path: "/run/dotvault/api.sock"}},
+		Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/a.sock", "~/.ssh/b.*.sock"}},
+	}
+	want := []string{"/run/dotvault/api.sock", "~/.ssh/a.sock", "~/.ssh/b.*.sock"}
+	if got := cfg.TokenBorrowSockets(); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestPeerActionSocketsExcludesLocalAPISocket(t *testing.T) {
+	cfg := &Config{
+		API:   APIConfig{Enabled: true, Unix: APIUnixConfig{Path: "/run/dotvault/api.sock"}},
+		Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/a.sock"}},
+	}
+	if got := cfg.PeerActionSockets(); !reflect.DeepEqual(got, []string{"~/.ssh/a.sock"}) {
+		t.Errorf("got %v, want peers only", got)
+	}
+	if got := (&Config{}).PeerActionSockets(); !reflect.DeepEqual(got, DefaultPeerSocketPatterns) {
+		t.Errorf("absent: got %v, want defaults", got)
 	}
 }

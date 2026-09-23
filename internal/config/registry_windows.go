@@ -251,7 +251,7 @@ type registryLayer struct {
 	VaultPolicies            []string
 	VaultNoDefaultPolicy     *uint32
 	VaultDisableTokenRenewal *uint32
-	VaultTokenSocket         string
+	VaultTokenSockets        []string
 
 	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
 	MTLSBootstrapMethod  string
@@ -369,7 +369,7 @@ func readRegistryLayer(root registry.Key) (registryLayer, bool, error) {
 		layer.VaultPolicies = readRegMultiString(vk, "Policies")
 		layer.VaultNoDefaultPolicy = readRegDWORD(vk, "NoDefaultPolicy")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
-		layer.VaultTokenSocket, _ = readRegString(vk, "TokenSocket")
+		layer.VaultTokenSockets = readRegistryVaultTokenSockets(vk)
 	}
 
 	// Read Vault\MTLS subkey (cert auth) and its nested BYO subkey.
@@ -567,8 +567,8 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.VaultDisableTokenRenewal != nil {
 		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
 	}
-	if layer.VaultTokenSocket != "" {
-		cfg.Vault.TokenSocket = layer.VaultTokenSocket
+	if layer.VaultTokenSockets != nil {
+		cfg.Vault.TokenSockets = SocketList(layer.VaultTokenSockets)
 	}
 	if layer.MTLSBootstrapMethod != "" {
 		cfg.Vault.MTLS.BootstrapMethod = layer.MTLSBootstrapMethod
@@ -852,6 +852,24 @@ func readRegMultiString(key registry.Key, name string) []string {
 		return nil
 	}
 	return val
+}
+
+// readRegistryVaultTokenSockets reads vault.token_socket from the open Vault
+// policy key: a TokenSockets REG_MULTI_SZ if present, else a legacy
+// TokenSocket REG_SZ wrapped in a single-element list. Returns nil (not an
+// empty, non-nil slice) when neither value is present, so the caller's
+// nil-means-absent convention (config.SocketList) round-trips through the
+// registry the same way it does through YAML.
+//
+// TODO(pre-1.0, #ISSUE): drop the REG_SZ fallback.
+func readRegistryVaultTokenSockets(vk registry.Key) []string {
+	if v := readRegMultiString(vk, "TokenSockets"); v != nil {
+		return v
+	}
+	if legacy, ok := readRegString(vk, "TokenSocket"); ok && legacy != "" {
+		return []string{legacy}
+	}
+	return nil
 }
 
 // readRegistryEnrolments reads enrolments from the Enrolments subkey under

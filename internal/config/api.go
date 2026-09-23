@@ -68,15 +68,16 @@ func (c *Config) APISocketPath() (string, error) {
 // where a human is looking — posting those to the local daemon would open a
 // browser on the headless host nobody is sitting at. Those keep using
 // vault.token_socket directly.
+//
+// Peer entries are patterns — literal paths or final-segment globs —
+// resolved by internal/peer.Pool; the default set applies when
+// vault.token_socket is absent.
 func (c *Config) TokenBorrowSockets() []string {
 	var out []string
 	if p := c.apiSocketCandidate(); p != "" {
 		out = append(out, p)
 	}
-	if c.Vault.TokenSocket != "" {
-		out = append(out, c.Vault.TokenSocket)
-	}
-	return out
+	return append(out, c.peerSocketPatterns()...)
 }
 
 // validateAPI checks the local API socket section. The only genuine footgun

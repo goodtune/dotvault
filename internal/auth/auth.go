@@ -37,7 +37,7 @@ type Manager struct {
 	// turn (dotvault-to-dotvault sharing) before running the configured
 	// interactive flow. Missing or stale entries are skipped. Callers build
 	// the list most-stable-first via config.TokenBorrowSockets — the local
-	// API socket ahead of an SSH-forwarded peer. See FetchTokenFromSockets.
+	// API socket ahead of an SSH-forwarded peer. See BorrowFromSockets.
 	TokenSockets []string
 	// Policy narrows a freshly-minted login token to a least-privilege child
 	// token (vault.policies / vault.no_default_policy). The zero value applies
@@ -100,7 +100,7 @@ func (m *Manager) Login(ctx context.Context) error {
 	// stays the single owner and we re-borrow on the next login rather than
 	// caching a copy that could go stale — and the "+tpm" sealing question
 	// never arises for it.
-	if token, source := FetchTokenFromSockets(ctx, m.TokenSockets); token != "" {
+	if token, source := BorrowFromSockets(ctx, m.TokenSockets); token != "" {
 		m.VaultClient.SetToken(token)
 		if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
 			slog.Info("using vault token borrowed from peer socket", "socket", source)

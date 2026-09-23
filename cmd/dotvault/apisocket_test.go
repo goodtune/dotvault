@@ -17,7 +17,7 @@ import (
 func TestDaemonBorrowSocketsExcludesOwn(t *testing.T) {
 	cfg := &config.Config{
 		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
-		Vault: config.VaultConfig{TokenSocket: "/home/u/.ssh/dotvault.sock"},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
 	}
 
 	got := daemonBorrowSockets(cfg, "/run/dotvault/api.sock")
@@ -45,7 +45,8 @@ func TestDaemonBorrowSocketsMatchesTildePath(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		API: config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "~/dotvault/api.sock"}},
+		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "~/dotvault/api.sock"}},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{}}, // explicit "no peer sockets"; nil would apply the defaults
 	}
 	own := filepath.Join(home, "dotvault", "api.sock")
 
@@ -57,7 +58,7 @@ func TestDaemonBorrowSocketsMatchesTildePath(t *testing.T) {
 // TestDaemonBorrowSocketsWithoutOwnSocket: with the local socket disabled the
 // list is unchanged, so an existing deployment behaves exactly as before.
 func TestDaemonBorrowSocketsWithoutOwnSocket(t *testing.T) {
-	cfg := &config.Config{Vault: config.VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}}
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSockets: config.SocketList{"~/.ssh/dotvault.sock"}}}
 	got := daemonBorrowSockets(cfg, "")
 	want := []string{"~/.ssh/dotvault.sock"}
 	if !reflect.DeepEqual(got, want) {
@@ -100,7 +101,7 @@ func TestResolveAPISocketEnabled(t *testing.T) {
 func TestFreshLoginBorrowSocketsExcludesLocal(t *testing.T) {
 	cfg := &config.Config{
 		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
-		Vault: config.VaultConfig{TokenSocket: "/home/u/.ssh/dotvault.sock"},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
 	}
 	got := freshLoginBorrowSockets(cfg)
 	want := []string{"/home/u/.ssh/dotvault.sock"}
@@ -112,7 +113,7 @@ func TestFreshLoginBorrowSocketsExcludesLocal(t *testing.T) {
 // TestFreshLoginBorrowSocketsKeepsPeerOnly confirms the ordinary headless
 // deployment (no local socket) is untouched by that exclusion.
 func TestFreshLoginBorrowSocketsKeepsPeerOnly(t *testing.T) {
-	cfg := &config.Config{Vault: config.VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}}
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSockets: config.SocketList{"~/.ssh/dotvault.sock"}}}
 	got := freshLoginBorrowSockets(cfg)
 	want := []string{"~/.ssh/dotvault.sock"}
 	if !reflect.DeepEqual(got, want) {

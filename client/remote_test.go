@@ -32,7 +32,7 @@ func newUnixActionServer(t *testing.T, sockPath string, handler http.HandlerFunc
 
 func newBrowseClient(t *testing.T, sock string) *Client {
 	t.Helper()
-	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200", TokenSocket: sock}})
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200", TokenSockets: []string{sock}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestClipboard_PostsToPeer(t *testing.T) {
 }
 
 func TestClipboard_NoSocketConfigured(t *testing.T) {
-	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}}) // no TokenSocket
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}}) // no TokenSockets
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestClipboard_PeerActionFailedIsUnavailable(t *testing.T) {
 }
 
 func TestBrowse_NoSocketConfigured(t *testing.T) {
-	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}}) // no TokenSocket
+	c, err := New(&Config{Vault: VaultConfig{Address: "http://127.0.0.1:8200"}}) // no TokenSockets
 	if err != nil {
 		t.Fatal(err)
 	}

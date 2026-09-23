@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/web"
 )
 
@@ -68,8 +68,10 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	socket := ""
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; opening locally", "error", err)
-	} else {
-		socket = cfg.Vault.TokenSocket
+	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
+		// TODO(#pool): fan out to every configured socket instead of just
+		// the first once internal/peer.Pool lands.
+		socket = sockets[0]
 	}
 
 	if socket != "" {
@@ -87,8 +89,8 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 }
 
 // postBrowseToSocket posts the URL to a peer dotvault's remote-browse
-// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
+// endpoint over its Unix-domain socket, via the shared peer.PostForm
 // transport. The caller falls back to the local browser on any error.
 func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
+	return peer.PostForm(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
 }

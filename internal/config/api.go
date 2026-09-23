@@ -60,7 +60,7 @@ func (c *Config) APISocketPath() (string, error) {
 // started inside an SSH session keeps borrowing successfully after that
 // session ends — the whole point of the local socket.
 //
-// Paths are returned unexpanded; FetchTokenFromSocket expands a leading ~ at
+// Paths are returned unexpanded; peer.FetchToken expands a leading ~ at
 // fetch time.
 //
 // This is the borrow direction only. It is NOT the right order for the peer

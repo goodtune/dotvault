@@ -133,27 +133,28 @@ type VaultConfig struct {
 	// token to exactly the capabilities the consumer needs.
 	NoDefaultPolicy bool
 
-	// TokenSocket is an optional path to a peer dotvault daemon's web-API
-	// Unix socket. When set, an interactive Login first tries to borrow a
-	// live token from the peer over the socket (the equivalent of
+	// TokenSockets is an ordered list of peer dotvault daemon web-API Unix
+	// socket patterns. When non-empty, an interactive Login first tries to
+	// borrow a live token from each in turn (the equivalent of
 	// `curl --unix-socket <path> http://localhost/api/v1/token`) before
 	// running the configured auth flow — the dotvault-to-dotvault sharing
 	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
-	TokenSocket string
+	// Mirrors vault.token_socket (config.SocketList).
+	TokenSockets []string
 
 	// APISocket is an optional path to the *local* dotvault daemon's API
 	// socket (mirrors the api section: the resolved api.unix.path, or the
 	// per-user runtime default when api.enabled is set without a path).
 	//
-	// It is the same endpoint as TokenSocket and is tried ahead of it,
-	// because the two differ in lifetime rather than capability: the local
-	// socket is served by the long-lived per-user daemon, while TokenSocket
-	// is typically an SSH RemoteForward that vanishes when the session drops.
-	// A consumer started inside an SSH session therefore keeps borrowing
-	// successfully after that session ends.
+	// It is the same endpoint as TokenSockets and is tried ahead of them,
+	// because they differ in lifetime rather than capability: the local
+	// socket is served by the long-lived per-user daemon, while a
+	// TokenSockets entry is typically an SSH RemoteForward that vanishes when
+	// the session drops. A consumer started inside an SSH session therefore
+	// keeps borrowing successfully after that session ends.
 	//
 	// Borrow direction only. The peer actions (Browse / Notify / Clipboard)
-	// deliberately keep using TokenSocket: their whole purpose is to reach
+	// deliberately keep using TokenSockets: their whole purpose is to reach
 	// the workstation where a human is looking, and sending them to the local
 	// daemon would open a browser on the headless host nobody is sitting at.
 	APISocket string
@@ -166,10 +167,7 @@ func (v VaultConfig) borrowSockets() []string {
 	if v.APISocket != "" {
 		out = append(out, v.APISocket)
 	}
-	if v.TokenSocket != "" {
-		out = append(out, v.TokenSocket)
-	}
-	return out
+	return append(out, v.TokenSockets...)
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -241,7 +239,7 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthMount:        cfg.Vault.AuthMount,
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-			TokenSocket:      cfg.Vault.TokenSocket,
+			TokenSockets:     cfg.PeerActionSockets(),
 			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,
 			NoDefaultPolicy:  cfg.Vault.NoDefaultPolicy,

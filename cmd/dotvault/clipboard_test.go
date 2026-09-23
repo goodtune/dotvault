@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/clipboard"
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // newUnixClipboardServer starts an httptest server bound to a Unix socket at
@@ -60,6 +61,10 @@ func TestPostClipboardToSocket_MissingSocket(t *testing.T) {
 // stdin, and the given --config override, returning the command error and the
 // text (if any) the local writer received.
 func runClipboardWith(t *testing.T, cfgPath, stdin string, args ...string) (error, *string) {
+	// Run as though no system-wide config were installed: --config is
+	// refused whenever one exists without bypass_system_config, which is
+	// the case on any machine running the product.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	t.Helper()
 	prevCfg := flagConfig
 	flagConfig = cfgPath

@@ -10,8 +10,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clipboard"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // setLocalClipboard is the local fallback writer. Indirected so tests can
@@ -76,8 +76,10 @@ func runClipboard(cmd *cobra.Command, args []string) error {
 	socket := ""
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; using the local clipboard", "error", err)
-	} else {
-		socket = cfg.Vault.TokenSocket
+	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
+		// TODO(#pool): fan out to every configured socket instead of just
+		// the first once internal/peer.Pool lands.
+		socket = sockets[0]
 	}
 
 	if socket != "" {
@@ -86,7 +88,7 @@ func runClipboard(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		// Scrub the text from the logged error: a peer's non-200 body is
-		// echoed into PeerStatusError.Message, so a hostile or buggy peer
+		// echoed into peer.StatusError.Message, so a hostile or buggy peer
 		// could otherwise reflect the secret into this host's logs.
 		slog.Debug("peer clipboard unavailable; using the local clipboard",
 			"socket", socket, "error", strings.ReplaceAll(err.Error(), text, "<text>"))
@@ -132,8 +134,8 @@ func clipboardText(cmd *cobra.Command, args []string) (string, error) {
 }
 
 // postClipboardToSocket posts the text to a peer dotvault's remote-clipboard
-// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
+// endpoint over its Unix-domain socket, via the shared peer.PostForm
 // transport. The caller falls back to the local clipboard on any error.
 func postClipboardToSocket(ctx context.Context, socketPath, text string) error {
-	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/clipboard", url.Values{"text": {text}})
+	return peer.PostForm(ctx, socketPath, "/api/v1/remote/clipboard", url.Values{"text": {text}})
 }

@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/notify"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // sendLocalNotification is the local fallback notifier. Indirected so tests
@@ -79,8 +79,10 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	socket := ""
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; notifying locally", "error", err)
-	} else {
-		socket = cfg.Vault.TokenSocket
+	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
+		// TODO(#pool): fan out to every configured socket instead of just
+		// the first once internal/peer.Pool lands.
+		socket = sockets[0]
 	}
 
 	if socket != "" {
@@ -98,7 +100,7 @@ func runNotify(cmd *cobra.Command, args []string) error {
 }
 
 // postNotifyToSocket posts a notification to a peer dotvault's remote-notify
-// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
+// endpoint over its Unix-domain socket, via the shared peer.PostForm
 // transport. The caller falls back to a local notification on any error.
 func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Message) error {
 	form := url.Values{
@@ -109,5 +111,5 @@ func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Messa
 	if msg.ActionURL != "" {
 		form.Set("action_url", msg.ActionURL)
 	}
-	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/notify", form)
+	return peer.PostForm(ctx, socketPath, "/api/v1/remote/notify", form)
 }

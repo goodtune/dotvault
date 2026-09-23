@@ -298,7 +298,7 @@ func TestAuthenticateCached_SocketBorrow(t *testing.T) {
 	newUnixTokenServer(t, sock, "borrowed-token")
 
 	c, err := New(&Config{
-		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		Vault: VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSockets: []string{sock}},
 		// No token file present (path points at an empty temp dir entry).
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
@@ -323,7 +323,7 @@ func TestAuthenticateCached_SocketBorrowMissing(t *testing.T) {
 
 	sock := filepath.Join(t.TempDir(), "absent.sock")
 	c, err := New(&Config{
-		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSockets: []string{sock}},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
 	if err != nil {
@@ -351,7 +351,7 @@ func TestAuthenticateCached_StaleTokenBorrowsFromSocket(t *testing.T) {
 	newUnixTokenServer(t, sock, "borrowed-token")
 
 	c, err := New(&Config{
-		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSockets: []string{sock}},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
 	if err != nil {
@@ -378,7 +378,7 @@ func TestAuthenticateCached_StaleTokenUnreachableShortCircuits(t *testing.T) {
 	newUnixTokenServer(t, sock, "borrowed-token")
 
 	c, err := New(&Config{
-		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSocket: sock},
+		Vault:     VaultConfig{Address: fv.srv.URL, AuthMethod: "token", TokenSockets: []string{sock}},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
 	if err != nil {
@@ -623,10 +623,10 @@ func TestAuthenticateCached_PrefersAPISocket(t *testing.T) {
 
 	c, err := New(&Config{
 		Vault: VaultConfig{
-			Address:     fv.srv.URL,
-			AuthMethod:  "token",
-			APISocket:   local,
-			TokenSocket: remote,
+			Address:      fv.srv.URL,
+			AuthMethod:   "token",
+			APISocket:    local,
+			TokenSockets: []string{remote},
 		},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
@@ -654,10 +654,10 @@ func TestAuthenticateCached_FallsBackToPeerSocket(t *testing.T) {
 
 	c, err := New(&Config{
 		Vault: VaultConfig{
-			Address:     fv.srv.URL,
-			AuthMethod:  "token",
-			APISocket:   filepath.Join(dir, "absent.sock"),
-			TokenSocket: remote,
+			Address:      fv.srv.URL,
+			AuthMethod:   "token",
+			APISocket:    filepath.Join(dir, "absent.sock"),
+			TokenSockets: []string{remote},
 		},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})

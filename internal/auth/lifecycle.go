@@ -55,7 +55,7 @@ type LifecycleManager struct {
 	// (after the file and env candidates) so a daemon whose token has gone
 	// invalid can recover by borrowing a peer's live token instead of
 	// forcing a re-auth. Empty disables the socket candidates. See
-	// FetchTokenFromSockets.
+	// BorrowFromSockets.
 	tokenSockets []string
 
 	// OnReauth, when non-nil, is invoked exactly once each time the
@@ -195,7 +195,7 @@ func (lm *LifecycleManager) SetTokenFilePath(p string) {
 // SetTokenSockets wires the ordered peer dotvault web-API Unix sockets so the
 // recovery path can borrow a peer's live token (dotvault-to-dotvault sharing)
 // before declaring re-auth necessary. Empty disables it. See
-// FetchTokenFromSockets.
+// BorrowFromSockets.
 func (lm *LifecycleManager) SetTokenSockets(paths []string) {
 	lm.tokenSockets = paths
 }
@@ -541,7 +541,7 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 	// e.g. from a parallel `dotvault login`) takes precedence over a borrowed
 	// one. Best-effort — missing/stale sockets yield no candidate.
 	if len(lm.tokenSockets) > 0 {
-		sockToken, _ := FetchTokenFromSockets(ctx, lm.tokenSockets)
+		sockToken, _ := BorrowFromSockets(ctx, lm.tokenSockets)
 		addCandidate(sockToken)
 	}
 	if len(candidates) == 0 {

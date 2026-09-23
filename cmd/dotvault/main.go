@@ -998,7 +998,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// the normal flow continues. The borrowed token is held in memory only
 	// (never written to the token file) so the peer stays the single owner.
 	if !authenticated {
-		if token, source := auth.FetchTokenFromSockets(ctx, borrowSockets); token != "" {
+		if token, source := auth.BorrowFromSockets(ctx, borrowSockets); token != "" {
 			vc.SetToken(token)
 			if _, err := vc.LookupSelf(ctx); err == nil {
 				slog.Info("using vault token borrowed from peer socket", "socket", source)
@@ -1751,7 +1751,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	borrowSockets := cfg.TokenBorrowSockets()
 	borrowedFrom := ""
 	if token == "" {
-		if peerToken, source := auth.FetchTokenFromSockets(ctx, borrowSockets); peerToken != "" {
+		if peerToken, source := auth.BorrowFromSockets(ctx, borrowSockets); peerToken != "" {
 			token = peerToken
 			borrowedFrom = source
 		}
@@ -3067,7 +3067,7 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 		if tryPromote() {
 			return true
 		}
-		if sockToken, source := auth.FetchTokenFromSockets(ctx, socketPaths); sockToken != "" {
+		if sockToken, source := auth.BorrowFromSockets(ctx, socketPaths); sockToken != "" {
 			if adopt(sockToken) {
 				slog.Info("using vault token borrowed from peer socket", "socket", source)
 				return true

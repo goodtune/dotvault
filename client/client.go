@@ -50,6 +50,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -269,7 +270,7 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 	// and re-validating an identical value would just be a wasted round trip.
 	sockets := c.cfg.Vault.borrowSockets()
 	for _, sock := range sockets {
-		borrowed, _ := auth.FetchTokenFromSocket(ctx, sock)
+		borrowed, _ := peer.FetchToken(ctx, sock)
 		if borrowed == "" || seen[borrowed] {
 			continue
 		}

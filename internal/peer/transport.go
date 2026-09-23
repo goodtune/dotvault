@@ -1,4 +1,12 @@
-package auth
+// Package peer speaks to another dotvault daemon's web API over a Unix-domain
+// socket: the token borrow (GET /api/v1/token) and the peer actions
+// (POST /api/v1/remote/{browse,notify,clipboard}). It owns the transport
+// (Client, FetchToken, PostForm) and the Pool that resolves a list of socket
+// patterns into live members, orders them, and evicts the unreachable.
+//
+// It sits below internal/auth: auth borrows through the Borrower interface
+// and never sees a path or a glob.
+package peer
 
 import (
 	"context"
@@ -10,25 +18,27 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/paths"
 )
 
-// socketFetchTimeout bounds a single token fetch over a peer socket so a hung
+// FetchTimeout bounds a single token fetch over a peer socket so a hung
 // or slow peer cannot stall a login or a lifecycle reload. The endpoint is a
 // local IPC socket (typically an SSH RemoteForward'd Unix socket), so the
 // round-trip is near-instant in the healthy case; a few seconds is generous
 // while still keeping the shell-startup login-check path responsive.
-const socketFetchTimeout = 3 * time.Second
+const FetchTimeout = 3 * time.Second
 
 // socketTokenBodyLimit caps how much of the peer's response we read before
 // decoding. The body is a tiny JSON object ({"token":"hvs.…"}); the limit just
 // guards against a misbehaving or hostile peer streaming an unbounded body.
 const socketTokenBodyLimit = 1 << 16 // 64 KiB
 
-// PeerSocketClient builds an http.Client that dials the peer dotvault web-API
+// Client builds an http.Client that dials the peer dotvault web-API
 // Unix-domain socket at socketPath (a leading ~ is expanded), returning the
 // client and the expanded path. It is the shared transport seam for every
 // peer-socket consumer — the token borrow below and `dotvault browse` — so
@@ -38,7 +48,7 @@ const socketTokenBodyLimit = 1 << 16 // 64 KiB
 // (browse falls back to the local browser) or silently skipped (the borrow).
 // A missing socket file is checked here so callers neither log a connection
 // error nor pay a dial timeout for the common "peer not connected" case.
-func PeerSocketClient(socketPath string) (*http.Client, string, error) {
+func Client(socketPath string) (*http.Client, string, error) {
 	if socketPath == "" {
 		return nil, "", errors.New("no peer socket configured")
 	}
@@ -68,7 +78,7 @@ func PeerSocketClient(socketPath string) (*http.Client, string, error) {
 	return client, expanded, nil
 }
 
-// FetchTokenFromSocket retrieves a Vault token from a peer dotvault daemon's
+// FetchToken retrieves a Vault token from a peer dotvault daemon's
 // web API exposed over a Unix-domain socket — the programmatic equivalent of
 //
 //	curl --unix-socket <socketPath> http://localhost/api/v1/token
@@ -84,39 +94,14 @@ func PeerSocketClient(socketPath string) (*http.Client, string, error) {
 // to ("", nil) so the caller simply carries on with its normal auth flow. The
 // returned token is deliberately NOT validated here — callers run LookupSelf
 // before adopting it, exactly as they do for the token file and DOTVAULT_TOKEN.
-// FetchTokenFromSockets tries each socket in order and returns the first
-// token any peer yields, together with the socket path it came from (both ""
-// when no peer produced one). Callers pass the list in most-stable-first
-// order — see config.TokenBorrowSockets, which puts the long-lived local API
-// socket ahead of an SSH-forwarded peer precisely because the forwarded one
-// disappears when the session drops.
-//
-// Like FetchTokenFromSocket it is best-effort and never fatal: unusable
-// entries are skipped and an exhausted list is ("", ""). The returned token
-// is NOT validated here; callers run LookupSelf before adopting it, exactly
-// as they do for the token file and DOTVAULT_TOKEN. Returning the source lets
-// them say which peer answered, which is the difference between a diagnosable
-// borrow and a mystery.
-func FetchTokenFromSockets(ctx context.Context, socketPaths []string) (string, string) {
-	for _, p := range socketPaths {
-		if p == "" {
-			continue
-		}
-		if token, _ := FetchTokenFromSocket(ctx, p); token != "" {
-			return token, p
-		}
-	}
-	return "", ""
-}
-
-func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error) {
+func FetchToken(ctx context.Context, socketPath string) (string, error) {
 	if socketPath == "" {
 		return "", nil
 	}
 	// An unusable socket (unexpandable ~, missing file — the common "peer not
 	// connected" case) means the peer simply isn't reachable: skip silently
 	// rather than failing the auth flow.
-	client, expanded, err := PeerSocketClient(socketPath)
+	client, expanded, err := Client(socketPath)
 	if err != nil {
 		// A missing socket file is routine (the SSH forward isn't up) and
 		// stays silent. Everything else — an unresolvable ~, a permission
@@ -128,7 +113,7 @@ func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error
 		return "", nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, socketFetchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	defer cancel()
 
 	// The unix dialer ignores the URL host, but it must still be a valid
@@ -159,4 +144,89 @@ func FetchTokenFromSocket(ctx context.Context, socketPath string) (string, error
 		return "", nil
 	}
 	return body.Token, nil
+}
+
+// PostTimeout bounds a form POST to a peer dotvault over the forwarded
+// socket. Deliberately looser than the token-borrow timeout: the peer performs
+// a synchronous launch (opening a browser, delivering a notification) inside
+// the request — itself bounded on the peer side — so the round-trip includes an
+// actual process launch, not just a JSON read. A shorter caller deadline on ctx
+// still wins.
+const PostTimeout = 10 * time.Second
+
+// peerResponseBodyLimit caps how much of the peer's response we read — the body
+// is a tiny JSON envelope either way.
+const peerResponseBodyLimit = 1 << 16 // 64 KiB
+
+// ErrPeerUnreachable is returned by PostForm when the peer could not be
+// contacted at all: the socket path is empty, the socket file is missing or
+// stale, or the dial failed. It is distinct from a *StatusError, which
+// means the peer answered but with a non-200 status.
+var ErrPeerUnreachable = errors.New("peer socket unreachable")
+
+// StatusError reports that the peer's web API answered a PostForm
+// request with a non-200 status. Message carries the peer's {"error": …} body
+// when present. Callers distinguish a 400 (the peer rejected the request as
+// invalid) from a 5xx/502/503 (the peer could not perform the action) via
+// Status.
+type StatusError struct {
+	Status  int
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("peer returned %d: %s", e.Status, e.Message)
+	}
+	return fmt.Sprintf("peer returned %d", e.Status)
+}
+
+// PostForm posts form values to a peer dotvault's web API over its
+// Unix-domain socket — the programmatic equivalent of
+//
+//	curl --unix-socket <socketPath> http://localhost/<apiPath> -d k=v …
+//
+// It is the shared transport for the remote peer-action surfaces: the
+// `dotvault browse`/`dotvault notify` CLIs and the client facade's
+// Browse/Notify. It reuses Client (the same stat-before-dial unix
+// transport the token borrow uses).
+//
+// It lives here with Client and FetchToken because all three speak the
+// peer's web API over one unix transport.
+//
+// Errors are typed so callers can react: ErrPeerUnreachable (wrapped) when the
+// peer could not be contacted, or a *StatusError when it answered non-200.
+// The request is bounded by PostTimeout unless ctx carries a shorter
+// deadline.
+func PostForm(ctx context.Context, socketPath, apiPath string, form url.Values) error {
+	client, _, err := Client(socketPath)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrPeerUnreachable, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, PostTimeout)
+	defer cancel()
+
+	// The unix dialer ignores the URL host, but "localhost" is on the peer web
+	// server's DNS-rebinding Host allowlist.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://localhost/"+strings.TrimPrefix(apiPath, "/"), strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrPeerUnreachable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var body struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, peerResponseBodyLimit)).Decode(&body)
+		return &StatusError{Status: resp.StatusCode, Message: body.Error}
+	}
+	return nil
 }

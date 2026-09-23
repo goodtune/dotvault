@@ -6,14 +6,14 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
-// Browse asks the peer dotvault named by the configured TokenSocket to open
+// Browse asks the peer dotvault named by the configured TokenSockets to open
 // rawURL in a browser on the peer's host — the programmatic equivalent of
 // `dotvault browse <url>` and of
 //
-//	curl --unix-socket <TokenSocket> http://localhost/api/v1/remote/browse -d url=<rawURL>
+//	curl --unix-socket <TokenSockets> http://localhost/api/v1/remote/browse -d url=<rawURL>
 //
 // It is for the headless-consumer topology: a program on a machine with no
 // browser hands a URL back over the same SSH-forwarded socket it borrows its
@@ -32,7 +32,7 @@ func (c *Client) Browse(ctx context.Context, rawURL string) error {
 	return c.peerAction(ctx, "browse", "/api/v1/remote/browse", url.Values{"url": {rawURL}})
 }
 
-// Notify asks the peer dotvault named by the configured TokenSocket to raise a
+// Notify asks the peer dotvault named by the configured TokenSockets to raise a
 // native desktop notification on the peer's host — the programmatic equivalent
 // of `dotvault notify <level> <title> [body]`. It is the notification sibling
 // of Browse over the same socket: a long-running job on a headless box surfaces
@@ -60,7 +60,7 @@ func (c *Client) Notify(ctx context.Context, level, title, body, actionURL strin
 	return c.peerAction(ctx, "notify", "/api/v1/remote/notify", form)
 }
 
-// Clipboard asks the peer dotvault named by the configured TokenSocket to put
+// Clipboard asks the peer dotvault named by the configured TokenSockets to put
 // text on the clipboard of the peer's host — the programmatic equivalent of
 // `dotvault clipboard` and the third peer action over the same socket. Where
 // Browse opens a login page on the workstation and Notify tells the user
@@ -81,7 +81,7 @@ func (c *Client) Clipboard(ctx context.Context, text string) error {
 }
 
 // peerAction posts a peer-action form to apiPath over the configured
-// TokenSocket and maps the shared transport's typed errors onto the facade's
+// TokenSockets and maps the shared transport's typed errors onto the facade's
 // taxonomy:
 //
 //   - no socket configured, or the peer could not be contacted at all
@@ -97,15 +97,18 @@ func (c *Client) Clipboard(ctx context.Context, text string) error {
 // future 4xx the endpoint might grow — a 403, 405, 415 — correctly classified
 // as a permanent request error rather than a retryable one.
 func (c *Client) peerAction(ctx context.Context, action, apiPath string, form url.Values) error {
-	socket := c.cfg.Vault.TokenSocket
-	if socket == "" {
+	sockets := c.cfg.Vault.TokenSockets
+	if len(sockets) == 0 {
 		return fmt.Errorf("%w: no peer socket configured (set vault.token_socket)", ErrPeerUnavailable)
 	}
-	err := auth.PostFormToPeer(ctx, socket, apiPath, form)
+	// TODO(#pool): fan out to every configured socket instead of just the
+	// first once internal/peer.Pool lands (Task 7).
+	socket := sockets[0]
+	err := peer.PostForm(ctx, socket, apiPath, form)
 	if err == nil {
 		return nil
 	}
-	var se *auth.PeerStatusError
+	var se *peer.StatusError
 	if errors.As(err, &se) && se.Status < 500 {
 		return fmt.Errorf("dotvault: peer rejected %s request: %s", action, se.Message)
 	}

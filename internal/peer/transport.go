@@ -95,6 +95,22 @@ func Client(socketPath string) (*http.Client, string, error) {
 // returned token is deliberately NOT validated here — callers run LookupSelf
 // before adopting it, exactly as they do for the token file and DOTVAULT_TOKEN.
 func FetchToken(ctx context.Context, socketPath string) (string, error) {
+	if token, err := fetchTokenDetailed(ctx, socketPath); err == nil {
+		return token, nil
+	}
+	return "", nil
+}
+
+// fetchTokenDetailed is FetchToken without the swallowing: it returns the
+// transport error — an unusable socket path (including the file having
+// vanished) or a failed round trip — so a caller that keeps state about the
+// peer can act on it. internal/peer.Pool evicts a member on exactly these,
+// and on nothing else: a non-200 or a malformed body still resolves to
+// ("", nil), because the peer answered and is merely holding no token.
+//
+// The debug logs live here rather than in the wrapper because two of them
+// describe outcomes the wrapper cannot tell apart from a plain empty token.
+func fetchTokenDetailed(ctx context.Context, socketPath string) (string, error) {
 	if socketPath == "" {
 		return "", nil
 	}
@@ -110,7 +126,7 @@ func FetchToken(ctx context.Context, socketPath string) (string, error) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			slog.Debug("peer token socket unusable; continuing", "socket", socketPath, "error", err)
 		}
-		return "", nil
+		return "", err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, FetchTimeout)
@@ -127,7 +143,7 @@ func FetchToken(ctx context.Context, socketPath string) (string, error) {
 	if err != nil {
 		// Stale socket (no listener), timeout, connection reset, etc.
 		slog.Debug("could not reach peer token socket; continuing", "socket", expanded, "error", err)
-		return "", nil
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

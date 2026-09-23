@@ -1,0 +1,298 @@
+package peer
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// sockDir returns a temporary directory with a short path. t.TempDir() names
+// the directory after the test, and on macOS that plus the socket name exceeds
+// the 103-byte sun_path limit, so the bind would fail before the behaviour
+// under test ever ran.
+func sockDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "dv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}
+
+// tokenServer serves GET /api/v1/token returning token (401 when empty) and
+// POST /api/v1/remote/* answering postStatus, on a Unix socket at path.
+func tokenServer(t *testing.T, path, token string, postStatus int) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets unavailable: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/token", func(w http.ResponseWriter, r *http.Request) {
+		if token == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"token":"` + token + `"}`))
+	})
+	mux.HandleFunc("POST /api/v1/remote/", func(w http.ResponseWriter, r *http.Request) {
+		if postStatus == 400 {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":"bad input"}`))
+			return
+		}
+		w.WriteHeader(postStatus)
+	})
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// hangingServer accepts connections and never answers — the shape of an SSH
+// forward whose far end has gone away while sshd still holds the socket.
+func hangingServer(t *testing.T, path string) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix sockets unavailable: %v", err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { <-time.After(time.Hour); c.Close() }()
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return ln
+}
+
+func setMtime(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPoolResolveOrdersByLastSeen(t *testing.T) {
+	dir := sockDir(t)
+	old := filepath.Join(dir, "dotvault.desktop.sock")
+	fresh := filepath.Join(dir, "dotvault.laptop.sock")
+	tokenServer(t, old, "hvs.desktop", 200)
+	tokenServer(t, fresh, "hvs.laptop", 200)
+	now := time.Now()
+	setMtime(t, old, now.Add(-time.Hour))
+	setMtime(t, fresh, now)
+
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	got := p.Resolve()
+	if len(got) != 2 || got[0].Path != fresh || got[1].Path != old {
+		t.Fatalf("order = %+v, want laptop first", got)
+	}
+	tok, src := p.Borrow(context.Background())
+	if tok != "hvs.laptop" || src != fresh {
+		t.Errorf("Borrow = (%q, %q), want laptop", tok, src)
+	}
+}
+
+func TestPoolLiteralBeforeGlobOnTie(t *testing.T) {
+	dir := sockDir(t)
+	lit := filepath.Join(dir, "dotvault.sock")
+	glob := filepath.Join(dir, "dotvault.x.sock")
+	tokenServer(t, lit, "a", 200)
+	tokenServer(t, glob, "b", 200)
+	at := time.Now()
+	setMtime(t, lit, at)
+	setMtime(t, glob, at)
+	p := NewPool([]string{lit, filepath.Join(dir, "dotvault.*.sock")})
+	got := p.Resolve()
+	if len(got) != 2 || got[0].Path != lit {
+		t.Fatalf("order = %+v, want literal first on tie", got)
+	}
+}
+
+func TestPoolBorrowSkipsUnauthenticatedPeerWithoutEvicting(t *testing.T) {
+	dir := sockDir(t)
+	noTok := filepath.Join(dir, "dotvault.a.sock")
+	hasTok := filepath.Join(dir, "dotvault.b.sock")
+	tokenServer(t, noTok, "", 200)
+	tokenServer(t, hasTok, "hvs.b", 200)
+	setMtime(t, noTok, time.Now())
+	setMtime(t, hasTok, time.Now().Add(-time.Minute))
+
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	tok, src := p.Borrow(context.Background())
+	if tok != "hvs.b" || src != hasTok {
+		t.Fatalf("Borrow = (%q, %q)", tok, src)
+	}
+	for _, m := range p.Status().Members {
+		if m.Evicted {
+			t.Errorf("%s evicted after a 401; a live peer with no token must stay", m.Path)
+		}
+	}
+}
+
+func TestPoolEvictsOnTransportFailureAndReadmitsOnRecreate(t *testing.T) {
+	dir := sockDir(t)
+	hung := filepath.Join(dir, "dotvault.laptop.sock")
+	good := filepath.Join(dir, "dotvault.desktop.sock")
+	hangingServer(t, hung)
+	tokenServer(t, good, "hvs.desktop", 200)
+	setMtime(t, hung, time.Now())
+	setMtime(t, good, time.Now().Add(-time.Minute))
+
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}, withFetchTimeout(300*time.Millisecond))
+	ctx := context.Background()
+	if tok, _ := p.Borrow(ctx); tok != "hvs.desktop" {
+		t.Fatalf("first borrow = %q", tok)
+	}
+	if !memberEvicted(p, hung) {
+		t.Fatal("hung socket should be evicted after a timeout")
+	}
+	// Evicted members are not dialled: the borrow is now fast.
+	start := time.Now()
+	if tok, _ := p.Borrow(ctx); tok != "hvs.desktop" {
+		t.Fatalf("second borrow = %q", tok)
+	}
+	if time.Since(start) > 200*time.Millisecond {
+		t.Errorf("second borrow dialled the evicted socket (took %v)", time.Since(start))
+	}
+
+	// Recreate the socket (new inode) with a healthy server: readmitted.
+	if err := os.Remove(hung); err != nil {
+		t.Fatal(err)
+	}
+	tokenServer(t, hung, "hvs.laptop", 200)
+	setMtime(t, hung, time.Now())
+	if tok, src := p.Borrow(ctx); tok != "hvs.laptop" || src != hung {
+		t.Fatalf("after recreate Borrow = (%q, %q), want laptop", tok, src)
+	}
+}
+
+func TestPoolReadmitsAfterProbeWindow(t *testing.T) {
+	dir := sockDir(t)
+	sock := filepath.Join(dir, "dotvault.sock")
+	hangingServer(t, sock)
+	now := time.Now()
+	clock := func() time.Time { return now }
+	p := NewPool([]string{sock}, WithClock(clock), withFetchTimeout(300*time.Millisecond))
+	p.Borrow(context.Background())
+	if !memberEvicted(p, sock) {
+		t.Fatal("expected eviction")
+	}
+	now = now.Add(EvictProbeInterval + time.Second)
+	if got := p.Resolve(); len(got) != 1 {
+		t.Fatalf("after probe window, active = %+v, want the socket back", got)
+	}
+}
+
+func TestPoolBroadcastAnySuccess(t *testing.T) {
+	dir := sockDir(t)
+	ok := filepath.Join(dir, "dotvault.a.sock")
+	bad := filepath.Join(dir, "dotvault.b.sock")
+	tokenServer(t, ok, "", 200)
+	tokenServer(t, bad, "", 503)
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	if err := p.Broadcast(context.Background(), "/api/v1/remote/notify", url.Values{"title": {"x"}}); err != nil {
+		t.Fatalf("Broadcast = %v, want nil when one peer accepted", err)
+	}
+}
+
+func TestPoolBroadcast4xxWins(t *testing.T) {
+	dir := sockDir(t)
+	ok := filepath.Join(dir, "dotvault.a.sock")
+	bad := filepath.Join(dir, "dotvault.b.sock")
+	tokenServer(t, ok, "", 200)
+	tokenServer(t, bad, "", 400)
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	err := p.Broadcast(context.Background(), "/api/v1/remote/notify", url.Values{"title": {"x"}})
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 400 {
+		t.Fatalf("Broadcast = %v, want *StatusError 400", err)
+	}
+}
+
+func TestPoolBroadcastNoPeers(t *testing.T) {
+	p := NewPool([]string{filepath.Join(sockDir(t), "dotvault.*.sock")})
+	err := p.Broadcast(context.Background(), "/api/v1/remote/notify", nil)
+	if !errors.Is(err, ErrNoPeers) || !errors.Is(err, ErrPeerUnreachable) {
+		t.Fatalf("Broadcast = %v, want ErrNoPeers wrapping ErrPeerUnreachable", err)
+	}
+}
+
+func TestPoolBroadcastAllFailedWrapsUnreachable(t *testing.T) {
+	dir := sockDir(t)
+	sock := filepath.Join(dir, "dotvault.sock")
+	hangingServer(t, sock)
+	p := NewPool([]string{sock}, withPostTimeout(300*time.Millisecond))
+	err := p.Broadcast(context.Background(), "/api/v1/remote/notify", nil)
+	if !errors.Is(err, ErrPeerUnreachable) || errors.Is(err, ErrNoPeers) {
+		t.Fatalf("Broadcast = %v, want ErrPeerUnreachable (not ErrNoPeers)", err)
+	}
+	if !memberEvicted(p, sock) {
+		t.Error("hung socket should be evicted by Broadcast too")
+	}
+}
+
+func TestPoolNilReceiver(t *testing.T) {
+	var p *Pool
+	if tok, src := p.Borrow(context.Background()); tok != "" || src != "" {
+		t.Error("nil pool must borrow nothing")
+	}
+	if err := p.Broadcast(context.Background(), "/x", nil); !errors.Is(err, ErrNoPeers) {
+		t.Errorf("nil pool Broadcast = %v, want ErrNoPeers", err)
+	}
+	if err := p.Watch(context.Background()); err != nil {
+		t.Errorf("nil pool Watch = %v", err)
+	}
+	if s := p.Status(); len(s.Members) != 0 {
+		t.Error("nil pool Status must be empty")
+	}
+}
+
+func TestPoolWatchOnChangeFires(t *testing.T) {
+	if !watchSupported() {
+		t.Skip("no inotify on this platform")
+	}
+	dir := sockDir(t)
+	var fired atomic.Int32
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}, WithOnChange(func() { fired.Add(1) }))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = p.Watch(ctx) }()
+	time.Sleep(50 * time.Millisecond) // let the watch register
+	tokenServer(t, filepath.Join(dir, "dotvault.laptop.sock"), "t", 200)
+	deadline := time.Now().Add(2 * time.Second)
+	for fired.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fired.Load() == 0 {
+		t.Fatal("OnChange did not fire on socket creation")
+	}
+	m := p.Status().Members
+	if len(m) != 1 || m[0].LastSeen.Before(time.Now().Add(-time.Second)) {
+		t.Errorf("member not admitted with a fresh LastSeen: %+v", m)
+	}
+}
+
+func memberEvicted(p *Pool, path string) bool {
+	for _, m := range p.Status().Members {
+		if m.Path == path {
+			return m.Evicted
+		}
+	}
+	return false
+}

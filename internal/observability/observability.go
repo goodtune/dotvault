@@ -774,6 +774,7 @@ var (
 	tokenRenewals   metric.Int64Counter
 	tokenTTLSeconds metric.Float64Histogram
 	tokenDenylist   metric.Int64Counter
+	peerPool        metric.Int64Counter
 	enrolAttempts   metric.Int64Counter
 	webRequests     metric.Int64Counter
 	configReloads   metric.Int64Counter
@@ -854,6 +855,10 @@ func rebindInstruments() {
 		// replaced. Bounded cardinality — three fixed event names, and
 		// deliberately no token identity of any kind.
 		metric.WithDescription("Denied-token suppression events by event (denied, suppressed, cleared)"),
+	)
+	peerPool, _ = meter.Int64Counter(
+		"dotvault.peer.pool",
+		metric.WithDescription("Peer socket pool membership events: admitted, evicted, readmitted"),
 	)
 	enrolAttempts, _ = meter.Int64Counter(
 		"dotvault.enrol.attempts",
@@ -1044,6 +1049,21 @@ func RecordTokenTTL(ctx context.Context, ttl time.Duration) {
 func RecordTokenDenylist(ctx context.Context, event string) {
 	instrMu.RLock()
 	c := tokenDenylist
+	instrMu.RUnlock()
+	if c == nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attribute.String("event", event)))
+}
+
+// RecordPeerPool records a peer socket pool membership event: "admitted" (a
+// socket matched a pattern for the first time), "evicted" (a transport
+// failure took it out of rotation), "readmitted" (it came back — recreated,
+// watched, or past the probe window). A rising evicted/readmitted pair on one
+// host is a flapping SSH forward.
+func RecordPeerPool(ctx context.Context, event string) {
+	instrMu.RLock()
+	c := peerPool
 	instrMu.RUnlock()
 	if c == nil {
 		return

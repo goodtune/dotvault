@@ -10,7 +10,7 @@
       <label class="enrol-prompt-label" for="ssh-port">Port</label>
       <input id="ssh-port" name="port" class="enrol-prompt-input" inputmode="numeric" value="{{.Remote.Port}}">
       <label class="enrol-prompt-label" for="ssh-socket">Remote socket</label>
-      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.sock" value="{{.Remote.RemoteSocket}}">
+      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.{{"{{HOSTNAME}}"}}.sock" value="{{.Remote.RemoteSocket}}">
       <label class="ui-check-row"><input type="checkbox" name="enabled" value="true" {{if .Remote.Enabled}}checked{{end}}> Enabled</label>
       <div class="enrol-prompt-actions">
         <button type="submit" class="enrol-btn-primary">Save</button>

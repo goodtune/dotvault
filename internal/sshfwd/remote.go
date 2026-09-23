@@ -65,6 +65,16 @@ type ManagedRemote struct {
 	reconnects     int
 	activeConns    int
 
+	// resolvedSocket is the last socket path ExpandRemotePath actually bound
+	// to — cfg.RemoteSocket with its "~/" and {{HOSTNAME}} substitutions
+	// applied. It is set once per successful connect and deliberately left
+	// in place across a later reconnect/offline transition, so a status row
+	// for a remote that has connected at least once keeps showing the real
+	// bound path rather than reverting to the unexpanded template the moment
+	// the connection drops. A remote that has never connected has no
+	// resolved value yet, so status() falls back to the configured literal.
+	resolvedSocket string
+
 	// clientReady is closed exactly once, when a client is installed via
 	// setClient, and replaced with a fresh unclosed channel by clearClient —
 	// so WaitForClient can block on whichever instance was current when it
@@ -206,10 +216,19 @@ func (r *ManagedRemote) onConn(delta int) {
 func (r *ManagedRemote) status(target string) RemoteStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	socket := r.cfg.RemoteSocket
+	if r.resolvedSocket != "" {
+		// Report what was actually bound, not the unexpanded template — a
+		// remote that has connected at least once knows its real path even
+		// while reconnecting or offline. A remote that has never connected
+		// has nothing resolved yet, so it falls back to the configured
+		// literal above.
+		socket = r.resolvedSocket
+	}
 	return RemoteStatus{
 		Host:              r.cfg.Host,
 		State:             string(r.state),
-		RemoteSocket:      r.cfg.RemoteSocket,
+		RemoteSocket:      socket,
 		Target:            target,
 		ConnectedSince:    r.connectedSince,
 		Reconnects:        r.reconnects,
@@ -400,6 +419,10 @@ func (r *ManagedRemote) run(ctx context.Context) {
 			r.fail(ctx, err)
 			continue
 		}
+
+		r.mu.Lock()
+		r.resolvedSocket = socket
+		r.mu.Unlock()
 
 		r.serveConnected(ctx, client, socket)
 	}

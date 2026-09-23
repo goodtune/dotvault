@@ -182,3 +182,99 @@ func TestRunReResolvesSignersUserPolicyPerAttempt(t *testing.T) {
 		t.Fatal("run() did not exit after ctx cancellation")
 	}
 }
+
+// TestStatusReportsResolvedSocketAfterConnect drives a real connect through
+// run() (the same fakeTransport seam as the other composition tests) and
+// checks that status() reports the socket ExpandRemotePath actually resolved
+// to — {{HOSTNAME}} substituted — rather than the unexpanded configured
+// literal. This is the regression test for the bug where RemoteStatus always
+// echoed cfg.RemoteSocket verbatim, so every ssh list row and status.ssh
+// entry showed the literal template string instead of the bound path. The
+// configured socket is absolute (no leading "~/") so ExpandRemotePath never
+// probes the remote for $HOME, letting this test use the same bare
+// &ssh.Client{} fake as TestRunConnectServeDropReconnectCycle.
+func TestStatusReportsResolvedSocketAfterConnect(t *testing.T) {
+	fakeTransport(t)
+
+	oldHostnameFn := hostnameFn
+	hostnameFn = func() (string, error) { return "Test-Host.local", nil }
+	t.Cleanup(func() { hostnameFn = oldHostnameFn })
+
+	dialRemote = func(ctx context.Context, c DialConfig) (*ssh.Client, error) {
+		return &ssh.Client{}, nil
+	}
+	closeRemoteClient = func(c *ssh.Client) error { return nil }
+	var boundSocket atomic.Value // string, written once forwardRemote is called
+	forwardRemote = func(ctx context.Context, cl *ssh.Client, host, socket string, target Dialer, onConn func(int)) error {
+		boundSocket.Store(socket)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	keepaliveRemote = blockingKeepalive
+
+	mr := newManagedRemote(Remote{Host: "foo.example.com", RemoteSocket: "/run/dotvault-test.{{HOSTNAME}}.sock"}, Deps{
+		Signers: func() ([]ssh.Signer, error) { return nil, nil },
+		User:    func() (string, error) { return "u", nil },
+		Policy:  func(Remote) *HostKeyPolicy { return &HostKeyPolicy{} },
+		Target:  func(ctx context.Context) (net.Conn, error) { return nil, errors.New("not used by this test") },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		mr.run(ctx)
+		close(done)
+	}()
+
+	var got RemoteStatus
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got = mr.status("")
+		if got.State == string(StateConnected) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got.State != string(StateConnected) {
+		t.Fatalf("state = %q, want %q", got.State, StateConnected)
+	}
+
+	const want = "/run/dotvault-test.test-host.sock"
+	if got.RemoteSocket != want {
+		t.Errorf("status().RemoteSocket = %q, want %q (the resolved, hostname-substituted path, not the configured template)", got.RemoteSocket, want)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not exit after ctx cancellation")
+	}
+
+	// Read boundSocket only after run() has returned: forwardRemote's
+	// goroutine (serveConnected's connWG) is guaranteed done by then, so
+	// there is no concurrent writer left to race with this read.
+	if got, _ := boundSocket.Load().(string); got != want {
+		t.Errorf("forwardRemote was bound to %q, want %q", got, want)
+	}
+}
+
+// TestStatusRetainsResolvedSocketAcrossReconnect is the narrower unit test
+// for the "leave it set across reconnect attempts" half of resolvedSocket's
+// contract: once a connect has resolved a socket, a later transition to
+// StateReconnecting or StateOffline must not blank it back to the
+// unexpanded configured literal, since setState (unlike run's dial
+// sequence) never touches resolvedSocket.
+func TestStatusRetainsResolvedSocketAcrossReconnect(t *testing.T) {
+	mr := newManagedRemote(Remote{Host: "foo.example.com", RemoteSocket: "/run/dotvault-test.{{HOSTNAME}}.sock"}, Deps{})
+
+	mr.mu.Lock()
+	mr.resolvedSocket = "/run/dotvault-test.workstation.sock"
+	mr.mu.Unlock()
+
+	mr.setState(StateReconnecting, errors.New("connection reset"))
+
+	if got := mr.status("").RemoteSocket; got != "/run/dotvault-test.workstation.sock" {
+		t.Errorf("status().RemoteSocket after a reconnect transition = %q, want the last resolved path retained", got)
+	}
+}

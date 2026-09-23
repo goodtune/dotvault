@@ -3,35 +3,12 @@ package auth
 import (
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/vault"
 )
-
-// newUnixTokenServer starts an httptest server bound to a Unix socket at
-// sockPath, serving GET /api/v1/token with the given handler. It returns the
-// server so the caller can Close it. If the platform cannot bind a Unix-domain
-// socket (some Windows configurations lack AF_UNIX server support) the test is
-// skipped rather than failed — the borrow feature's listener side is Linux/macOS
-// in the documented topology, and the pure-logic cases run regardless.
-func newUnixTokenServer(t *testing.T, sockPath string, handler http.HandlerFunc) *httptest.Server {
-	t.Helper()
-	ln, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/token", handler)
-	srv := httptest.NewUnstartedServer(mux)
-	srv.Listener = ln
-	srv.Start()
-	t.Cleanup(srv.Close)
-	return srv
-}
 
 // mockVaultAccepting starts an httptest server standing in for Vault that
 // accepts only the given token on lookup-self (any other token gets 403). It
@@ -54,19 +31,14 @@ func mockVaultAccepting(t *testing.T, accepted string) string {
 }
 
 // TestManagerLogin_BorrowsFromSocket covers the headline production path: a
-// Login with no usable local credential borrows the peer's token over the
-// socket (via BorrowFromSockets), validates it via LookupSelf, and returns
-// without running the configured auth flow (here "token", which would
-// otherwise error).
+// Login with no usable local credential borrows a peer's token through the
+// configured Borrower, validates it via LookupSelf, and returns without
+// running the configured auth flow (here "token", which would otherwise
+// error).
 func TestManagerLogin_BorrowsFromSocket(t *testing.T) {
-	t.Setenv("DOTVAULT_TOKEN", "") // hermetic: the socket is the only source
+	t.Setenv("DOTVAULT_TOKEN", "") // hermetic: the borrower is the only source
 
 	vaultURL := mockVaultAccepting(t, "peer-token")
-
-	sock := filepath.Join(t.TempDir(), "peer.sock")
-	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
-	})
 
 	vc, err := vault.NewClient(vault.Config{Address: vaultURL})
 	if err != nil {
@@ -74,10 +46,10 @@ func TestManagerLogin_BorrowsFromSocket(t *testing.T) {
 	}
 
 	m := &Manager{
-		VaultClient:  vc,
-		AuthMethod:   "token", // a bare token method would error without a token
-		TokenSockets: []string{sock},
-		Username:     "testuser",
+		VaultClient: vc,
+		AuthMethod:  "token", // a bare token method would error without a token
+		Borrower:    &fakeBorrower{token: "peer-token", source: "/tmp/peer.sock"},
+		Username:    "testuser",
 	}
 	if err := m.Login(context.Background()); err != nil {
 		t.Fatalf("Login: %v", err)
@@ -97,21 +69,16 @@ func TestManagerLogin_SocketTokenRejectedFallsThrough(t *testing.T) {
 	// The mock Vault accepts no token, so the borrowed one is rejected.
 	vaultURL := mockVaultAccepting(t, "")
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
-	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"rejected-token"}`))
-	})
-
 	vc, err := vault.NewClient(vault.Config{Address: vaultURL})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
 	m := &Manager{
-		VaultClient:  vc,
-		AuthMethod:   "token",
-		TokenSockets: []string{sock},
-		Username:     "testuser",
+		VaultClient: vc,
+		AuthMethod:  "token",
+		Borrower:    &fakeBorrower{token: "rejected-token", source: "/tmp/peer.sock"},
+		Username:    "testuser",
 	}
 	if err := m.Login(context.Background()); err == nil {
 		t.Fatal("expected Login to fall through and error after the borrowed token was rejected")

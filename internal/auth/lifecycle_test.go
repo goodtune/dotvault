@@ -17,6 +17,17 @@ import (
 	"github.com/goodtune/dotvault/internal/vaulttest"
 )
 
+// fakeBorrower is a peer.Borrower returning a fixed token.
+type fakeBorrower struct {
+	token, source string
+	calls         int
+}
+
+func (f *fakeBorrower) Borrow(ctx context.Context) (string, string) {
+	f.calls++
+	return f.token, f.source
+}
+
 func TestLifecycleManager_Start(t *testing.T) {
 	skipIfNoVault(t)
 
@@ -535,7 +546,7 @@ func TestLifecycleManager_ReloadPrefersFileOverStaleEnv(t *testing.T) {
 // recovery path borrows a live token from a peer dotvault over the configured
 // Unix socket (dotvault-to-dotvault sharing) instead of forcing a re-auth.
 func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
-	// Hermetic: with no token file and no env token, the socket must be the
+	// Hermetic: with no token file and no env token, the borrower must be the
 	// sole reload candidate. Clear any ambient DOTVAULT_TOKEN so a developer's
 	// or CI's exported value can't sneak in as a candidate.
 	t.Setenv("DOTVAULT_TOKEN", "")
@@ -561,20 +572,14 @@ func TestLifecycleManager_ReloadFromSocket(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// The peer daemon serves its live token over the socket.
-	sock := filepath.Join(t.TempDir(), "peer.sock")
-	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"peer-token"}`))
-	})
-
 	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "stale-token"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
-	// No token file and no DOTVAULT_TOKEN: the socket is the only candidate.
-	lm.SetTokenSockets([]string{sock})
+	// No token file and no DOTVAULT_TOKEN: the borrower is the only candidate.
+	lm.SetBorrower(&fakeBorrower{token: "peer-token", source: "/tmp/peer.sock"})
 
 	var onReauthFired atomic.Bool
 	lm.SetOnReauth(func() { onReauthFired.Store(true) })
@@ -1022,18 +1027,13 @@ func TestLifecycleManager_ReborrowsWhenRenewalFails(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
-	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token":"fresh-token"}`))
-	})
-
 	vc, err := vault.NewClient(vault.Config{Address: ts.URL, Token: "expiring-token"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 
 	lm := NewLifecycleManager(vc, 50*time.Millisecond, false)
-	lm.SetTokenSockets([]string{sock})
+	lm.SetBorrower(&fakeBorrower{token: "fresh-token", source: "/tmp/peer.sock"})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()

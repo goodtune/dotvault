@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/securestore"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -32,13 +33,11 @@ type Manager struct {
 	// 8250 (the `vault` CLI's own default); if that port is unavailable,
 	// authenticateOIDC falls back to a random port. See oidc.go.
 	OIDCCallbackPort int
-	// TokenSockets is an ordered list of peer dotvault web-API Unix sockets.
-	// When non-empty, Login first tries to borrow a live token from each in
-	// turn (dotvault-to-dotvault sharing) before running the configured
-	// interactive flow. Missing or stale entries are skipped. Callers build
-	// the list most-stable-first via config.TokenBorrowSockets — the local
-	// API socket ahead of an SSH-forwarded peer. See BorrowFromSockets.
-	TokenSockets []string
+	// Borrower, when non-nil, is tried first by Login: a live token borrowed
+	// from a peer dotvault (dotvault-to-dotvault sharing) means no browser,
+	// TTY or TPM is needed. Callers pass a *peer.Pool built from
+	// config.TokenBorrowSockets. Best-effort; a nil Borrower is skipped.
+	Borrower peer.Borrower
 	// Policy narrows a freshly-minted login token to a least-privilege child
 	// token (vault.policies / vault.no_default_policy). The zero value applies
 	// no narrowing — the token carries every policy the auth role granted,
@@ -86,21 +85,28 @@ func (m *Manager) Authenticate(ctx context.Context) error {
 	return m.Login(ctx)
 }
 
+// borrow is a nil-safe Borrow.
+func borrow(ctx context.Context, b peer.Borrower) (string, string) {
+	if b == nil {
+		return "", ""
+	}
+	return b.Borrow(ctx)
+}
+
 // Login runs the configured fresh-auth flow unconditionally, without
 // attempting to reuse an existing token. Used by `dotvault login` and as
 // the fallback path inside Authenticate.
 func (m *Manager) Login(ctx context.Context) error {
-	// Peer-socket token borrow. Before running an interactive flow, try to
-	// fetch a live token from a peer dotvault over the configured Unix socket
-	// (dotvault-to-dotvault sharing). This runs ahead of the TPM preflight and
-	// the method switch so a host that can borrow never needs a browser, a TTY,
-	// or a TPM. Best-effort: a missing/stale socket or an unusable token falls
-	// through to the configured auth method exactly as before. The borrowed
-	// token is held in memory only (not written to the token file), so the peer
-	// stays the single owner and we re-borrow on the next login rather than
-	// caching a copy that could go stale — and the "+tpm" sealing question
-	// never arises for it.
-	if token, source := BorrowFromSockets(ctx, m.TokenSockets); token != "" {
+	// Peer token borrow. Before running an interactive flow, try to fetch a
+	// live token from a peer dotvault (dotvault-to-dotvault sharing). This
+	// runs ahead of the TPM preflight and the method switch so a host that
+	// can borrow never needs a browser, a TTY, or a TPM. Best-effort: no
+	// borrower, or an unusable token, falls through to the configured auth
+	// method exactly as before. The borrowed token is held in memory only
+	// (not written to the token file), so the peer stays the single owner
+	// and we re-borrow on the next login rather than caching a copy that
+	// could go stale — and the "+tpm" sealing question never arises for it.
+	if token, source := borrow(ctx, m.Borrower); token != "" {
 		m.VaultClient.SetToken(token)
 		if _, err := m.VaultClient.LookupSelf(ctx); err == nil {
 			slog.Info("using vault token borrowed from peer socket", "socket", source)

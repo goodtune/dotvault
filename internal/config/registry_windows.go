@@ -855,16 +855,33 @@ func readRegMultiString(key registry.Key, name string) []string {
 }
 
 // readRegistryVaultTokenSockets reads vault.token_socket from the open Vault
-// policy key: a TokenSockets REG_MULTI_SZ if present, else a legacy
-// TokenSocket REG_SZ wrapped in a single-element list. Returns nil (not an
-// empty, non-nil slice) when neither value is present, so the caller's
-// nil-means-absent convention (config.SocketList) round-trips through the
-// registry the same way it does through YAML.
+// policy key: a TokenSockets REG_MULTI_SZ if present — including an
+// explicitly empty one, which means "disabled" and must not be confused
+// with an absent value — else a legacy TokenSocket REG_SZ wrapped in a
+// single-element list. Returns nil (not an empty, non-nil slice) only when
+// neither value is present, so the caller's nil-means-absent convention
+// (config.SocketList) round-trips through the registry the same way it does
+// through YAML.
+//
+// Presence of TokenSockets has to be checked independently of its content:
+// GetStringsValue decodes a zero-byte REG_MULTI_SZ to a nil []string, the
+// same nil a missing value also produces, so readRegMultiString alone
+// cannot tell "explicitly empty" from "absent". GetValue(name, nil) can —
+// with no destination buffer the underlying RegQueryValueEx still succeeds
+// (it just reports the required size) whenever the value exists, and fails
+// with ErrNotExist only when it does not, regardless of the value's length
+// or type.
 //
 // TODO(pre-1.0, #ISSUE): drop the REG_SZ fallback.
 func readRegistryVaultTokenSockets(vk registry.Key) []string {
-	if v := readRegMultiString(vk, "TokenSockets"); v != nil {
-		return v
+	if _, _, err := vk.GetValue("TokenSockets", nil); err == nil {
+		if v := readRegMultiString(vk, "TokenSockets"); v != nil {
+			return v
+		}
+		// Present but empty (or an unexpected type readRegMultiString
+		// already warned about): "explicitly empty" wins over the legacy
+		// fallback below rather than reading it as absent.
+		return []string{}
 	}
 	if legacy, ok := readRegString(vk, "TokenSocket"); ok && legacy != "" {
 		return []string{legacy}

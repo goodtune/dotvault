@@ -920,3 +920,46 @@ func TestReadRegistryVaultTokenSocketsAbsent(t *testing.T) {
 		t.Errorf("readRegistryVaultTokenSockets = %v, want nil", got)
 	}
 }
+
+// TestReadRegistryVaultTokenSocketsExplicitEmptyWinsOverLegacy pins the
+// distinction an explicit empty REG_MULTI_SZ must preserve: it means peer
+// sockets are disabled, and that must hold even when a stale legacy
+// TokenSocket REG_SZ value is still sitting next to it (e.g. a policy push
+// that set the new value but never cleaned up the old one). Without the
+// presence check in readRegistryVaultTokenSockets, GetStringsValue decodes
+// the empty REG_MULTI_SZ to a nil slice indistinguishable from "absent",
+// and the legacy value would win — silently re-enabling default peer
+// sockets against the operator's explicit intent.
+func TestReadRegistryVaultTokenSocketsExplicitEmptyWinsOverLegacy(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensockets-empty\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringsValue("TokenSockets", []string{}); err != nil {
+		t.Fatalf("set empty TokenSockets: %v", err)
+	}
+	if err := k.SetStringValue("TokenSocket", "~/.ssh/stale.sock"); err != nil {
+		t.Fatalf("set legacy TokenSocket: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	got := readRegistryVaultTokenSockets(vk)
+	if got == nil || len(got) != 0 {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want non-nil empty (explicit empty must win over the legacy fallback)", got)
+	}
+}

@@ -110,8 +110,11 @@ func TestPoolResolveOrdersByLastSeen(t *testing.T) {
 
 func TestPoolLiteralBeforeGlobOnTie(t *testing.T) {
 	dir := sockDir(t)
-	lit := filepath.Join(dir, "dotvault.sock")
-	glob := filepath.Join(dir, "dotvault.x.sock")
+	// The names are chosen so the path tiebreak points the *other* way: the
+	// glob's match sorts first alphabetically, so only the pattern-index rule
+	// can put the literal ahead of it.
+	lit := filepath.Join(dir, "dotvault.z.sock")
+	glob := filepath.Join(dir, "dotvault.a.sock")
 	tokenServer(t, lit, "a", 200)
 	tokenServer(t, glob, "b", 200)
 	at := time.Now()
@@ -179,6 +182,55 @@ func TestPoolEvictsOnTransportFailureAndReadmitsOnRecreate(t *testing.T) {
 	setMtime(t, hung, time.Now())
 	if tok, src := p.Borrow(ctx); tok != "hvs.laptop" || src != hung {
 		t.Fatalf("after recreate Borrow = (%q, %q), want laptop", tok, src)
+	}
+}
+
+// TestPoolEvictIgnoresStaleIdentity covers the window where a fetch hangs for
+// its whole timeout while the forward underneath it reconnects: the failure
+// that finally surfaces names a socket that no longer exists, and must not
+// evict the healthy replacement that took its name.
+func TestPoolEvictIgnoresStaleIdentity(t *testing.T) {
+	dir := sockDir(t)
+	sock := filepath.Join(dir, "dotvault.sock")
+	tokenServer(t, sock, "hvs.a", 200)
+	p := NewPool([]string{sock})
+	ctx := context.Background()
+
+	// Snapshot exactly as Borrow does: the identity it is about to dial.
+	p.mu.Lock()
+	p.resolveLocked(ctx)
+	act := p.activeLocked()
+	p.mu.Unlock()
+	if len(act) != 1 {
+		t.Fatalf("active = %+v, want one member", act)
+	}
+	stale := act[0].id
+	if stale == (identity{}) {
+		t.Skip("no filesystem identity on this platform; eviction cannot be identity-guarded")
+	}
+
+	// The forward reconnects mid-dial: same name, new inode.
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	tokenServer(t, sock, "hvs.b", 200)
+	if got := p.Resolve(); len(got) != 1 {
+		t.Fatalf("after recreate, active = %+v, want the replacement", got)
+	}
+
+	p.evict(ctx, sock, stale, errors.New("i/o timeout"))
+	if memberEvicted(p, sock) {
+		t.Error("a stale in-flight failure evicted the recreated socket")
+	}
+
+	// A failure carrying the current identity still evicts, so the guard has
+	// not simply disabled eviction.
+	p.mu.Lock()
+	current := p.members[sock].id
+	p.mu.Unlock()
+	p.evict(ctx, sock, current, errors.New("i/o timeout"))
+	if !memberEvicted(p, sock) {
+		t.Error("a failure naming the current socket must still evict")
 	}
 }
 

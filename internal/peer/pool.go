@@ -200,11 +200,17 @@ func (p *Pool) resolveLocked(ctx context.Context) {
 }
 
 // activeLocked returns the active members, ordered. Caller holds p.mu.
-func (p *Pool) activeLocked() []*member {
-	out := make([]*member, 0, len(p.members))
+//
+// It returns value copies rather than pointers deliberately: callers use the
+// snapshot after releasing the lock, and resolveLocked refreshes a member's
+// identity and lastSeen in place, so handing out pointers would be a data
+// race. The copy is also what lets Borrow and Broadcast carry the identity
+// they dialled into evict.
+func (p *Pool) activeLocked() []member {
+	out := make([]member, 0, len(p.members))
 	for _, m := range p.members {
 		if m.evictedAt.IsZero() {
-			out = append(out, m)
+			out = append(out, *m)
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -237,11 +243,26 @@ func (p *Pool) Resolve() []Member {
 }
 
 // evict takes path out of rotation after a transport failure. Idempotent.
-func (p *Pool) evict(ctx context.Context, path string, cause error) {
+//
+// id is the identity the failing caller actually dialled, and a mismatch is a
+// no-op: a fetch that hung for its whole timeout can outlive the socket it was
+// dialling, and in that window a concurrent resolve may have readmitted (or
+// freshly admitted) a *recreated* socket at the same name — exactly the
+// reconnect the pool exists to follow. Keying eviction on the name alone would
+// let that stale failure take the healthy replacement dark for a whole
+// EvictProbeInterval, having already consumed the inotify event that would
+// have brought it back. Note statIdentity is a stub on Windows, so the guard
+// is inert there; that platform resolves no Unix peer sockets anyway.
+func (p *Pool) evict(ctx context.Context, path string, id identity, cause error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	m, ok := p.members[path]
 	if !ok || !m.evictedAt.IsZero() {
+		return
+	}
+	if m.id != id {
+		slog.Debug("ignoring stale peer socket failure; socket was recreated meanwhile",
+			"socket", path, "error", cause)
 		return
 	}
 	m.evictedAt = p.clock()
@@ -268,7 +289,7 @@ func (p *Pool) Borrow(ctx context.Context) (string, string) {
 		token, err := fetchTokenDetailed(fctx, m.path)
 		cancel()
 		if err != nil {
-			p.evict(ctx, m.path, err)
+			p.evict(ctx, m.path, m.id, err)
 			continue
 		}
 		if token != "" {
@@ -297,16 +318,17 @@ func (p *Pool) Broadcast(ctx context.Context, apiPath string, form url.Values) e
 
 	type result struct {
 		path string
+		id   identity
 		err  error
 	}
 	// A pool holds a handful of sockets, so the member count is the bound.
 	results := make(chan result, len(act))
 	for _, m := range act {
-		go func(path string) {
+		go func(path string, id identity) {
 			pctx, cancel := context.WithTimeout(ctx, p.postTimeout)
 			defer cancel()
-			results <- result{path, PostForm(pctx, path, apiPath, form)}
-		}(m.path)
+			results <- result{path, id, PostForm(pctx, path, apiPath, form)}
+		}(m.path, m.id)
 	}
 
 	var (
@@ -320,7 +342,7 @@ func (p *Pool) Broadcast(ctx context.Context, apiPath string, form url.Values) e
 		case r.err == nil:
 			accepted = true
 		case errors.Is(r.err, ErrPeerUnreachable):
-			p.evict(ctx, r.path, r.err)
+			p.evict(ctx, r.path, r.id, r.err)
 			failures = append(failures, fmt.Errorf("%s: %w", r.path, r.err))
 		default:
 			var se *StatusError
@@ -366,8 +388,10 @@ func (p *Pool) Watch(ctx context.Context) error {
 			return false
 		}
 		w, err := tokenwatch.NewMatch(dir, match, func(name string) {
-			p.noteSeen(ctx, filepath.Join(dir, name))
-			if p.onChange != nil {
+			// Only nudge when the event actually moved a member: a
+			// non-socket file created under a matching name would
+			// otherwise wake the daemon for nothing.
+			if p.noteSeen(ctx, filepath.Join(dir, name)) && p.onChange != nil {
 				p.onChange()
 			}
 		})
@@ -389,14 +413,15 @@ func (p *Pool) Watch(ctx context.Context) error {
 }
 
 // noteSeen records a watch event for path: admit or refresh the member with
-// lastSeen = now and clear any eviction.
-func (p *Pool) noteSeen(ctx context.Context, path string) {
+// lastSeen = now and clear any eviction. It reports whether it did either, so
+// the caller can tell a real socket appearing from an event it discarded.
+func (p *Pool) noteSeen(ctx context.Context, path string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.clock()
 	fi, err := os.Stat(path)
 	if err != nil || fi.Mode()&os.ModeSocket == 0 {
-		return
+		return false
 	}
 	m, ok := p.members[path]
 	if !ok {
@@ -409,7 +434,7 @@ func (p *Pool) noteSeen(ctx context.Context, path string) {
 		}
 		p.members[path] = &member{path: path, pattern: idx, id: statIdentity(fi), lastSeen: now}
 		observability.RecordPeerPool(ctx, "admitted")
-		return
+		return true
 	}
 	m.id = statIdentity(fi)
 	m.lastSeen = now
@@ -417,6 +442,7 @@ func (p *Pool) noteSeen(ctx context.Context, path string) {
 		m.evictedAt = time.Time{}
 		observability.RecordPeerPool(ctx, "readmitted")
 	}
+	return true
 }
 
 // Status reports the pool for diagnostics; evicted members are included,

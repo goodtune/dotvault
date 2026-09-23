@@ -31,6 +31,7 @@ import (
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/passwd"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/regfile"
 	"github.com/goodtune/dotvault/internal/remoteconfig"
 	"github.com/goodtune/dotvault/internal/sshfwd"
@@ -988,6 +989,33 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	uds.DrainUnclaimedActivation(keepActivated...)
 	borrowSockets := daemonBorrowSockets(cfg, apiSocket)
 
+	// One pool for the daemon's lifetime: the startup borrow below, the
+	// headless idle, auth.Manager and the lifecycle recovery path all share it,
+	// and its watcher replaces the two per-socket tokenwatch loops that used to
+	// live here and in waitForHeadlessToken. vault is a static section, so the
+	// pattern set is fixed for the process lifetime and the config-refresh loop
+	// needs no new plumbing.
+	//
+	// The OnChange hook has to reach two things that do not exist yet — the
+	// headless idle's wake channel and the lifecycle manager — so it goes
+	// through an indirection each of them publishes itself into once it is
+	// ready. A hook that fires before either has is a no-op, which is correct:
+	// there is nothing to wake.
+	var peerChanged atomic.Pointer[func()]
+	peerPool := newPeerPool(borrowSockets, peer.WithOnChange(func() {
+		if fn := peerChanged.Load(); fn != nil {
+			(*fn)()
+		}
+	}))
+	// Started once, not supervised: Watch blocks until ctx is done and returns
+	// nil immediately when it has nothing watchable (a nil pool, no patterns,
+	// or a platform without inotify), so a restart loop would hot-spin.
+	go func() {
+		if err := peerPool.Watch(ctx); err != nil {
+			slog.Debug("peer socket watch ended", "error", err)
+		}
+	}()
+
 	// Peer-socket token borrow. If no local token was usable and a peer socket
 	// is configured, try borrowing a live token from the peer before any
 	// method-specific flow. This runs for every startup mode (web, headless,
@@ -998,7 +1026,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// the normal flow continues. The borrowed token is held in memory only
 	// (never written to the token file) so the peer stays the single owner.
 	if !authenticated {
-		if token, source := auth.BorrowFromSockets(ctx, borrowSockets); token != "" {
+		if token, source := peerPool.Borrow(ctx); token != "" {
 			vc.SetToken(token)
 			if _, err := vc.LookupSelf(ctx); err == nil {
 				slog.Info("using vault token borrowed from peer socket", "socket", source)
@@ -1102,7 +1130,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				TokenSockets:     borrowSockets,
+				Borrower:         peerPool,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
@@ -1174,8 +1202,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// through into normal startup. The watch is registered
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
-			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from the peer socket")
-			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrowSockets, denyList) {
+			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from a peer socket")
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), peerPool, &peerChanged, denyList) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -1196,7 +1224,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				TokenSockets:     borrowSockets,
+				Borrower:         peerPool,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
@@ -1225,7 +1253,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
 		lm.SetTokenFilePath(tokenPath)
 	}
-	lm.SetTokenSockets(borrowSockets)
+	lm.SetBorrower(peerPool)
 	// Hand over the cache startup has been populating, so a token the reuse
 	// check or the headless idle already watched Vault reject is not presented
 	// again by the recovery poll.
@@ -1277,7 +1305,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			AuthMount:        cfg.Vault.AuthMount,
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-			TokenSockets:     borrowSockets,
+			Borrower:         peerPool,
 			Policy:           vaultPolicyConstraint(cfg),
 			Username:         username,
 			MTLS:             mtlsP,
@@ -1369,41 +1397,31 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	// Watch each configured peer token socket for materialisation or
-	// replacement and, *only when the daemon actually needs a token*, nudge the
-	// lifecycle manager to re-borrow. An SSH RemoteForward that reconnects
-	// re-creates the socket; if the daemon's borrowed token expired while the
-	// socket was stale (so the lifecycle manager is already in its needs-reauth
-	// recovery state), this picks up a fresh peer token the moment the socket
-	// comes back rather than waiting out the 10s recovery poll. The
-	// NeedsReauth gate is deliberate: tryReload adopts any *different* valid
-	// candidate, so an unconditional nudge would demote a still-healthy token
-	// to a borrowed one every time the forwarder flapped. lm.Reload triggers
-	// tryReload, which already consults the socket after the file/env
-	// candidates. Linux-only (inotify); a no-op elsewhere, where the recovery
-	// poll already re-borrows within 10s. The watch is on the socket's parent
-	// directory because a reconnecting forwarder replaces the inode.
-	for _, configured := range borrowSockets {
-		if socketPath, err := paths.ExpandHome(configured); err != nil {
-			slog.Debug("could not expand peer token socket path for watching; relying on periodic re-borrow", "socket", configured, "error", err)
-		} else if sw, err := tokenwatch.New(socketPath, func() {
-			if !lm.NeedsReauth() {
-				// Current token is healthy; don't demote it to a borrowed one.
-				return
-			}
-			slog.Debug("peer token socket changed and re-auth is pending, re-borrowing", "socket", socketPath)
-			lm.Reload()
-		}); err != nil {
-			slog.Debug("token-socket watcher unavailable; relying on periodic re-borrow", "socket", configured, "error", err)
-		} else {
-			go func() {
-				defer sw.Close()
-				if err := sw.Run(ctx); err != nil && ctx.Err() == nil {
-					slog.Debug("token-socket watcher stopped", "error", err)
-				}
-			}()
+	// Now that lm exists, publish it as the pool watcher's destination. An SSH
+	// RemoteForward that reconnects re-creates its socket; if the daemon's
+	// borrowed token expired while the socket was stale (so the lifecycle
+	// manager is already in its needs-reauth recovery state), this picks up a
+	// fresh peer token the moment the socket comes back rather than waiting out
+	// the 10s recovery poll. lm.Reload triggers tryReload, which already
+	// consults the pool after the file/env candidates.
+	//
+	// The NeedsReauth gate is deliberate: tryReload adopts any *different*
+	// valid candidate, so an unconditional nudge would demote a still-healthy
+	// token to a borrowed one every time the forwarder flapped.
+	//
+	// The watcher itself is Linux-only (inotify) and a no-op elsewhere, where
+	// the recovery poll already re-borrows within 10s; the pool watches each
+	// pattern's parent directory because a reconnecting forwarder replaces the
+	// inode.
+	reborrow := func() {
+		if !lm.NeedsReauth() {
+			// Current token is healthy; don't demote it to a borrowed one.
+			return
 		}
+		slog.Debug("peer socket changed and re-auth is pending, re-borrowing")
+		lm.Reload()
 	}
+	peerChanged.Store(&reborrow)
 
 	// Start refresh manager for any enrolment whose engine rotates its own
 	// credentials (currently JFrog). Failures are logged and retried on the
@@ -1707,6 +1725,32 @@ func reportCertCredential(cfg *config.Config) {
 	}
 }
 
+// printPeerPoolStatus renders the peer socket pool for `dotvault status`.
+//
+// Both the patterns and the resolved members are printed, because they answer
+// different questions: the pattern says what was configured, while a member
+// says which socket actually exists right now — and it is the member list that
+// distinguishes "two workstations forwarded, one of them evicted" from "nowhere
+// to borrow from", which a pattern-only view collapsed into one unhelpful line.
+// Evicted members are shown deliberately: eviction is a re-probe window, not a
+// verdict, so a socket in that state is still part of the picture.
+func printPeerPoolStatus(st peer.Status) {
+	for _, p := range st.Patterns {
+		fmt.Printf("  token socket pattern: %s\n", p)
+	}
+	if len(st.Members) == 0 {
+		fmt.Println("  peer sockets: none present")
+		return
+	}
+	for _, m := range st.Members {
+		state := "active"
+		if m.Evicted {
+			state = "evicted " + m.EvictedAt.Format("15:04:05")
+		}
+		fmt.Printf("  peer socket: %s (%s, last seen %s)\n", m.Path, state, m.LastSeen.Format("2006-01-02 15:04:05"))
+	}
+}
+
 func runStatus(cmd *cobra.Command, args []string) error {
 	setupLogging()
 
@@ -1749,9 +1793,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	persistsToken := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
 	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
 	borrowSockets := cfg.TokenBorrowSockets()
+	pool := newPeerPool(borrowSockets)
 	borrowedFrom := ""
 	if token == "" {
-		if peerToken, source := auth.BorrowFromSockets(ctx, borrowSockets); peerToken != "" {
+		if peerToken, source := pool.Borrow(ctx); peerToken != "" {
 			token = peerToken
 			borrowedFrom = source
 		}
@@ -1765,9 +1810,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		reportCertCredential(cfg)
 	case token == "" && len(borrowSockets) > 0:
 		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
-		for _, s := range borrowSockets {
-			fmt.Printf("  token socket: %s\n", s)
-		}
+		printPeerPoolStatus(pool.Status())
 	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
 	default:
@@ -1781,6 +1824,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			if borrowedFrom != "" {
 				fmt.Printf("  source: borrowed from peer socket (%s)\n", borrowedFrom)
 				fmt.Println("  (no token file at rest — the peer is the sole owner; re-borrowed on each login/refresh)")
+				printPeerPoolStatus(pool.Status())
 			}
 		}
 	}
@@ -1929,7 +1973,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSockets:     freshLoginBorrowSockets(cfg),
+		Borrower:         newPeerPool(freshLoginBorrowSockets(cfg)),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2268,7 +2312,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSockets:     cfg.TokenBorrowSockets(),
+		Borrower:         newPeerPool(cfg.TokenBorrowSockets()),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2504,7 +2548,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		TokenSockets:     cfg.TokenBorrowSockets(),
+		Borrower:         newPeerPool(cfg.TokenBorrowSockets()),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2922,15 +2966,17 @@ func headlessTokenPath(method, tokenPath string) string {
 
 // waitForHeadlessToken blocks until a usable Vault token becomes available —
 // either written to tokenPath (by an external facility such as a login profile
-// running `dotvault login`) or borrowable from a peer dotvault over one of
-// socketPaths (an empty list disables the borrow) — or ctx is cancelled. An
-// empty tokenPath likewise disables the file half, which is how a no-persist
-// auth method (auth.PersistTokenAtRest) idles on the socket alone rather than
-// adopting a file it has just guaranteed will not be used.
+// running `dotvault login`) or borrowable from pool (a nil pool disables the
+// borrow) — or ctx is cancelled. An empty tokenPath likewise disables the file
+// half, which is how a no-persist auth method (auth.PersistTokenAtRest) idles
+// on the peer sockets alone rather than adopting a file it has just guaranteed
+// will not be used.
 // Returns true once a candidate validates against Vault and is set on vc;
-// false if ctx is cancelled first. The watches are registered synchronously
-// before the first read so a token written, or a socket created, during
-// startup cannot be missed.
+// false if ctx is cancelled first. The token-file watch is registered
+// synchronously before the first read so a token written during startup cannot
+// be missed; the peer sockets are covered by the pool's own watcher, which
+// runDaemon starts and which fires through peerChanged (published below, and
+// unpublished on the way out so a wake cannot reach a dead channel).
 //
 // denyList suppresses candidates Vault has already rejected. Without it this
 // loop re-presented the same expired token file to lookup-self every 10s for as
@@ -2939,7 +2985,7 @@ func headlessTokenPath(method, tokenPath string) string {
 // suppression, so a rewritten file is retried immediately; a poll-only platform
 // (no inotify) still picks up a rewrite, because the cache is keyed on the
 // token's value and a new token is simply not in it. May be nil.
-func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, socketPaths []string, denyList *auth.TokenDenylist) bool {
+func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, pool *peer.Pool, peerChanged *atomic.Pointer[func()], denyList *auth.TokenDenylist) bool {
 	// The watcher goroutines below can outlive a *successful* return: a token
 	// arrives while the parent ctx is still live, so cancellation can't be
 	// what stops them. Give them a child context we cancel on the way out, and
@@ -2966,6 +3012,14 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 		}
 	}
 
+	// Publish the wake as the pool watcher's destination while this idle owns
+	// the daemon, and withdraw it on the way out: runDaemon replaces it with the
+	// lifecycle manager's NeedsReauth-gated re-borrow, and a wake delivered to a
+	// channel nobody is reading again would be a silent leak of an event that
+	// should have reached lm.
+	peerChanged.Store(&notify)
+	defer peerChanged.Store(nil)
+
 	if tokenPath == "" {
 		// No-persist method: nothing to watch, and filepath.Dir("") would
 		// otherwise put an inotify watch on the working directory.
@@ -2979,25 +3033,6 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 				slog.Warn("token-file watcher stopped while waiting for token", "error", err)
 			}
 		}()
-	}
-
-	// Watch each peer socket's directory too: an SSH RemoteForward that connects
-	// after the daemon started materialises the socket, and we want to borrow
-	// immediately rather than waiting out the 10s poll. Linux-only (inotify); a
-	// no-op elsewhere. A failure to expand or watch degrades to the poll below.
-	for _, socketPath := range socketPaths {
-		if expanded, err := paths.ExpandHome(socketPath); err != nil {
-			slog.Debug("could not expand peer token socket path for watching; relying on poll", "socket", socketPath, "error", err)
-		} else if sw, err := tokenwatch.New(expanded, notify); err != nil {
-			slog.Debug("peer-socket watcher unavailable; relying on poll", "socket", socketPath, "error", err)
-		} else {
-			go func() {
-				defer sw.Close()
-				if err := sw.Run(watchCtx); err != nil && watchCtx.Err() == nil {
-					slog.Debug("peer-socket watcher stopped while waiting for token", "error", err)
-				}
-			}()
-		}
 	}
 
 	// adopt validates a candidate token and, on success, leaves it set on vc.
@@ -3061,13 +3096,13 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 
 	// tryAcquire prefers a locally-written token (file/env) over a borrowed one,
 	// mirroring LifecycleManager.tryReload's candidate ordering, then falls back
-	// to borrowing from the peer socket. Best-effort: a missing/stale socket
+	// to borrowing from the peer pool. Best-effort: a missing/stale socket
 	// yields no candidate.
 	tryAcquire := func() bool {
 		if tryPromote() {
 			return true
 		}
-		if sockToken, source := auth.BorrowFromSockets(ctx, socketPaths); sockToken != "" {
+		if sockToken, source := pool.Borrow(ctx); sockToken != "" {
 			if adopt(sockToken) {
 				slog.Info("using vault token borrowed from peer socket", "socket", source)
 				return true

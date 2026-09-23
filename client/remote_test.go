@@ -6,8 +6,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -37,6 +39,47 @@ func newBrowseClient(t *testing.T, sock string) *Client {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// clientSockDir returns a temporary directory with a short path. t.TempDir()
+// names the directory after the test, and on macOS that plus the socket name
+// can exceed the 103-byte sun_path limit, so the bind would fail before the
+// behaviour under test ever ran.
+func clientSockDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "dv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}
+
+// TestPeerActionFansOutToEveryPeer is the facade half of the pool's purpose on
+// the peer-action side: with several workstations forwarded, the value must
+// reach all of them, since the user may be sitting at any one.
+func TestPeerActionFansOutToEveryPeer(t *testing.T) {
+	dir := clientSockDir(t)
+	var hits atomic.Int32
+	for _, name := range []string{"dotvault.a.sock", "dotvault.b.sock"} {
+		newUnixActionServer(t, filepath.Join(dir, name), func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			_, _ = w.Write([]byte(`{"status":"clipboard set"}`))
+		})
+	}
+	c, err := New(&Config{Vault: VaultConfig{
+		Address:      "http://127.0.0.1:8200",
+		TokenSockets: []string{filepath.Join(dir, "dotvault.*.sock")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Clipboard(context.Background(), "s3cr3t"); err != nil {
+		t.Fatalf("Clipboard: %v", err)
+	}
+	if hits.Load() != 2 {
+		t.Errorf("hits = %d, want 2", hits.Load())
+	}
 }
 
 func TestBrowse_PostsToPeer(t *testing.T) {

@@ -73,25 +73,25 @@ func runClipboard(cmd *cobra.Command, args []string) error {
 	// Config is only needed to locate the peer socket. Local-only load, same
 	// rationale as `dotvault browse`: a load failure downgrades to the local
 	// clipboard rather than failing.
-	socket := ""
+	var pool *peer.Pool
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; using the local clipboard", "error", err)
-	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
-		// TODO(#pool): fan out to every configured socket instead of just
-		// the first once internal/peer.Pool lands.
-		socket = sockets[0]
+	} else {
+		pool = newPeerPool(cfg.PeerActionSockets())
 	}
 
-	if socket != "" {
-		err := postClipboardToSocket(cmd.Context(), socket, text)
+	if pool != nil {
+		err := postClipboardToPeers(cmd.Context(), pool, text)
 		if err == nil {
 			return nil
 		}
 		// Scrub the text from the logged error: a peer's non-200 body is
 		// echoed into peer.StatusError.Message, so a hostile or buggy peer
-		// could otherwise reflect the secret into this host's logs.
+		// could otherwise reflect the secret into this host's logs. The
+		// broadcast joins every peer's failure, so one error may carry several
+		// such bodies — all the more reason to scrub rather than trust.
 		slog.Debug("peer clipboard unavailable; using the local clipboard",
-			"socket", socket, "error", strings.ReplaceAll(err.Error(), text, "<text>"))
+			"error", strings.ReplaceAll(err.Error(), text, "<text>"))
 	}
 
 	if err := setLocalClipboard(text); err != nil {
@@ -133,9 +133,9 @@ func clipboardText(cmd *cobra.Command, args []string) (string, error) {
 	return text, nil
 }
 
-// postClipboardToSocket posts the text to a peer dotvault's remote-clipboard
-// endpoint over its Unix-domain socket, via the shared peer.PostForm
-// transport. The caller falls back to the local clipboard on any error.
-func postClipboardToSocket(ctx context.Context, socketPath, text string) error {
-	return peer.PostForm(ctx, socketPath, "/api/v1/remote/clipboard", url.Values{"text": {text}})
+// postClipboardToPeers posts the text to every active peer dotvault's
+// remote-clipboard endpoint, via the pool's broadcast. Any peer accepting it is
+// success; the caller falls back to the local clipboard on any error.
+func postClipboardToPeers(ctx context.Context, pool *peer.Pool, text string) error {
+	return pool.Broadcast(ctx, "/api/v1/remote/clipboard", url.Values{"text": {text}})
 }

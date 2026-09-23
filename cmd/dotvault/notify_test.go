@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // newUnixNotifyServer starts an httptest server bound to a Unix socket at
@@ -29,8 +31,8 @@ func newUnixNotifyServer(t *testing.T, sockPath string, handler http.HandlerFunc
 	t.Cleanup(srv.Close)
 }
 
-func TestPostNotifyToSocket_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+func TestPostNotifyToPeers_Success(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	var level, title, body, host string
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -39,8 +41,8 @@ func TestPostNotifyToSocket_Success(t *testing.T) {
 	})
 
 	msg := notify.Message{Level: notify.LevelError, Title: "Backup failed", Body: "see logs"}
-	if err := postNotifyToSocket(context.Background(), sock, msg); err != nil {
-		t.Fatalf("postNotifyToSocket: %v", err)
+	if err := postNotifyToPeers(context.Background(), peer.NewPool([]string{sock}), msg); err != nil {
+		t.Fatalf("postNotifyToPeers: %v", err)
 	}
 	if level != "error" || title != "Backup failed" || body != "see logs" {
 		t.Errorf("peer got level=%q title=%q body=%q, want the message fields", level, title, body)
@@ -50,16 +52,16 @@ func TestPostNotifyToSocket_Success(t *testing.T) {
 	}
 }
 
-func TestPostNotifyToSocket_MissingSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+func TestPostNotifyToPeers_MissingSocket(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "absent.sock")
 	msg := notify.Message{Level: notify.LevelInfo, Title: "t"}
-	if err := postNotifyToSocket(context.Background(), sock, msg); err == nil {
+	if err := postNotifyToPeers(context.Background(), peer.NewPool([]string{sock}), msg); err == nil {
 		t.Fatal("expected an error for a missing socket so the caller falls back locally")
 	}
 }
 
-func TestPostNotifyToSocket_PeerError(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+func TestPostNotifyToPeers_PeerError(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
@@ -67,11 +69,11 @@ func TestPostNotifyToSocket_PeerError(t *testing.T) {
 	})
 
 	msg := notify.Message{Level: notify.LevelInfo, Title: "t"}
-	err := postNotifyToSocket(context.Background(), sock, msg)
+	err := postNotifyToPeers(context.Background(), peer.NewPool([]string{sock}), msg)
 	if err == nil {
 		t.Fatal("expected an error for a non-200 peer response")
 	}
-	if got := err.Error(); got != "peer returned 502: failed to deliver notification: no daemon" {
+	if got := err.Error(); !strings.Contains(got, "peer returned 502: failed to deliver notification: no daemon") {
 		t.Errorf("error = %q, want the peer's message included", got)
 	}
 }
@@ -105,7 +107,7 @@ func runNotifyWith(t *testing.T, cfgPath string, args ...string) (error, *notify
 }
 
 func TestRunNotify_PrefersPeerSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	var peerTitle string
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -132,7 +134,7 @@ func TestRunNotify_ActionURLFlagReachesPeer(t *testing.T) {
 	// machine with a system config installed refuses --config, config load fails,
 	// and the peer sees an empty action_url.
 	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	var peerActionURL string
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -179,7 +181,7 @@ func TestRunNotify_RejectsBadActionURLFlag(t *testing.T) {
 }
 
 func TestRunNotify_FallsBackWhenPeerUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, localMsg := runNotifyWith(t, writeBrowseConfig(t, sock), "warning", "Local title", "desc")
 	if err != nil {
@@ -197,7 +199,7 @@ func TestRunNotify_FallsBackWhenPeerErrors(t *testing.T) {
 	// The peer is reachable but returns a non-200 (e.g. its notification
 	// backend failed): runNotify must fall back to the local notifier rather
 	// than surfacing the peer error.
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	newUnixNotifyServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":"no daemon"}`))
@@ -235,7 +237,7 @@ func TestRunNotify_RejectsBadLevelBeforeAnything(t *testing.T) {
 }
 
 func TestRunNotify_BodyOptional(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, localMsg := runNotifyWith(t, writeBrowseConfig(t, sock), "info", "No body")
 	if err != nil {

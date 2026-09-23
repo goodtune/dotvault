@@ -1,11 +1,13 @@
 package client
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // Config is the connectivity-and-auth view of dotvault's system config. It is
@@ -133,13 +135,15 @@ type VaultConfig struct {
 	// token to exactly the capabilities the consumer needs.
 	NoDefaultPolicy bool
 
-	// TokenSockets is an ordered list of peer dotvault daemon web-API Unix
-	// socket patterns. When non-empty, an interactive Login first tries to
-	// borrow a live token from each in turn (the equivalent of
+	// TokenSockets lists peer dotvault socket patterns — literal paths or
+	// final-segment globs (`~/.ssh/dotvault.*.sock`) — mirroring
+	// vault.token_socket with its default applied. An interactive Login and
+	// AuthenticateCached borrow from the most recently seen live peer first
+	// (the equivalent of
 	// `curl --unix-socket <path> http://localhost/api/v1/token`) before
 	// running the configured auth flow — the dotvault-to-dotvault sharing
-	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
-	// Mirrors vault.token_socket (config.SocketList).
+	// seam. Browse/Notify/Clipboard fan out to every live peer. Missing or
+	// stale sockets are skipped. A leading ~ is expanded.
 	TokenSockets []string
 
 	// APISocket is an optional path to the *local* dotvault daemon's API
@@ -168,6 +172,58 @@ func (v VaultConfig) borrowSockets() []string {
 		out = append(out, v.APISocket)
 	}
 	return append(out, v.TokenSockets...)
+}
+
+// borrowChain tries each borrower in turn and takes the first token offered.
+// A nil chain borrows nothing, so a caller with nothing configured needs no
+// branch.
+type borrowChain []peer.Borrower
+
+func (bc borrowChain) Borrow(ctx context.Context) (string, string) {
+	for _, b := range bc {
+		if token, source := b.Borrow(ctx); token != "" {
+			return token, source
+		}
+	}
+	return "", ""
+}
+
+// borrower is what the token-borrow paths resolve through: the local API
+// socket first, then the peers most-recently-seen first. No watcher — a library
+// consumer is a short-lived process, so on-demand re-resolution is the whole
+// mechanism.
+//
+// It is two pools in a chain rather than one pool over borrowSockets(), because
+// a single pool orders every member by recency and that systematically inverts
+// the local-first rule this ordering exists for: the local API socket is bound
+// once when the long-lived daemon starts, while a forwarded peer socket is
+// re-created on every SSH reconnect, so the peer would almost always look
+// fresher and win. Chaining keeps recency deciding *within* the peers — which
+// is what it is for, since a freshly reconnected workstation is the live one —
+// while the tier boundary keeps the stable local socket ahead of the one that
+// disappears with a session. See VaultConfig.APISocket.
+func (v VaultConfig) borrower() peer.Borrower {
+	var chain borrowChain
+	if v.APISocket != "" {
+		chain = append(chain, peer.NewPool([]string{v.APISocket}))
+	}
+	if len(v.TokenSockets) > 0 {
+		chain = append(chain, peer.NewPool(v.TokenSockets))
+	}
+	return chain
+}
+
+// peerPool is the pool the peer actions (Browse / Notify / Clipboard) fan out
+// over: TokenSockets only, deliberately excluding APISocket. Their purpose is
+// to reach the workstation where a human is looking, and routing them to the
+// local daemon would open a browser on the headless host nobody is sitting at.
+// Returns nil when nothing is configured, which peerAction reports as
+// ErrPeerUnavailable rather than silently succeeding at nothing.
+func (v VaultConfig) peerPool() *peer.Pool {
+	if len(v.TokenSockets) == 0 {
+		return nil
+	}
+	return peer.NewPool(v.TokenSockets)
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's

@@ -76,21 +76,19 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	// Config is only needed to locate the peer socket. Local-only load, same
 	// rationale as `dotvault browse`: a load failure downgrades to a local
 	// notification rather than failing.
-	socket := ""
+	var pool *peer.Pool
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; notifying locally", "error", err)
-	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
-		// TODO(#pool): fan out to every configured socket instead of just
-		// the first once internal/peer.Pool lands.
-		socket = sockets[0]
+	} else {
+		pool = newPeerPool(cfg.PeerActionSockets())
 	}
 
-	if socket != "" {
-		err := postNotifyToSocket(cmd.Context(), socket, msg)
+	if pool != nil {
+		err := postNotifyToPeers(cmd.Context(), pool, msg)
 		if err == nil {
 			return nil
 		}
-		slog.Debug("peer notify unavailable; notifying locally", "socket", socket, "error", err)
+		slog.Debug("peer notify unavailable; notifying locally", "error", err)
 	}
 
 	if err := sendLocalNotification(msg); err != nil {
@@ -99,10 +97,10 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// postNotifyToSocket posts a notification to a peer dotvault's remote-notify
-// endpoint over its Unix-domain socket, via the shared peer.PostForm
-// transport. The caller falls back to a local notification on any error.
-func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Message) error {
+// postNotifyToPeers posts a notification to every active peer dotvault's
+// remote-notify endpoint, via the pool's broadcast. Any peer accepting it is
+// success; the caller falls back to a local notification on any error.
+func postNotifyToPeers(ctx context.Context, pool *peer.Pool, msg notify.Message) error {
 	form := url.Values{
 		"level": {string(msg.Level)},
 		"title": {msg.Title},
@@ -111,5 +109,5 @@ func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Messa
 	if msg.ActionURL != "" {
 		form.Set("action_url", msg.ActionURL)
 	}
-	return peer.PostForm(ctx, socketPath, "/api/v1/remote/notify", form)
+	return pool.Broadcast(ctx, "/api/v1/remote/notify", form)
 }

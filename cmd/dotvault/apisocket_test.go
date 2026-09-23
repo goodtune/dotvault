@@ -120,3 +120,24 @@ func TestFreshLoginBorrowSocketsKeepsPeerOnly(t *testing.T) {
 		t.Errorf("freshLoginBorrowSockets = %v, want %v", got, want)
 	}
 }
+
+// TestNewPeerPoolNilWhenNoPatterns pins the property every call site leans on:
+// with nothing configured there is no pool, and a nil *peer.Pool is
+// nil-receiver safe throughout — so `Borrower: newPeerPool(...)` stays correct
+// for an operator who has configured no peers at all, with no branch at the
+// wiring site.
+func TestNewPeerPoolNilWhenNoPatterns(t *testing.T) {
+	if got := newPeerPool(nil); got != nil {
+		t.Errorf("newPeerPool(nil) = %v, want nil", got)
+	}
+	if got := newPeerPool([]string{}); got != nil {
+		t.Errorf("newPeerPool(empty) = %v, want nil", got)
+	}
+	pool := newPeerPool([]string{"/run/dotvault/api.sock"})
+	if pool == nil {
+		t.Fatal("newPeerPool returned nil for a non-empty pattern list")
+	}
+	if got := pool.Patterns(); !reflect.DeepEqual(got, []string{"/run/dotvault/api.sock"}) {
+		t.Errorf("Patterns() = %v, want the configured pattern", got)
+	}
+}

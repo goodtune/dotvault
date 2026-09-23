@@ -6,6 +6,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // resolveAPISocket returns the path the daemon should bind for the local API
@@ -82,4 +83,15 @@ func freshLoginBorrowSockets(cfg *config.Config) []string {
 		local = ""
 	}
 	return borrowSocketsExcluding(cfg, local)
+}
+
+// newPeerPool builds a transient pool — resolve on demand, no watcher — for
+// one-shot commands and the daemon's startup. It returns nil for an empty
+// pattern list, which every consumer handles: *peer.Pool is nil-receiver safe,
+// so a caller with nothing configured needs no branch.
+func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
+	if len(patterns) == 0 {
+		return nil
+	}
+	return peer.NewPool(patterns, opts...)
 }

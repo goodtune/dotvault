@@ -65,21 +65,19 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	// A load failure downgrades to the local browser rather than failing —
 	// `dotvault browse` should still open URLs on a host with a broken or
 	// absent config.
-	socket := ""
+	var pool *peer.Pool
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; opening locally", "error", err)
-	} else if sockets := cfg.PeerActionSockets(); len(sockets) > 0 {
-		// TODO(#pool): fan out to every configured socket instead of just
-		// the first once internal/peer.Pool lands.
-		socket = sockets[0]
+	} else {
+		pool = newPeerPool(cfg.PeerActionSockets())
 	}
 
-	if socket != "" {
-		err := postBrowseToSocket(cmd.Context(), socket, target)
+	if pool != nil {
+		err := postBrowseToPeers(cmd.Context(), pool, target)
 		if err == nil {
 			return nil
 		}
-		slog.Debug("peer browse unavailable; opening locally", "socket", socket, "error", err)
+		slog.Debug("peer browse unavailable; opening locally", "error", err)
 	}
 
 	if err := openLocalBrowser(target); err != nil {
@@ -88,9 +86,9 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// postBrowseToSocket posts the URL to a peer dotvault's remote-browse
-// endpoint over its Unix-domain socket, via the shared peer.PostForm
-// transport. The caller falls back to the local browser on any error.
-func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	return peer.PostForm(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
+// postBrowseToPeers posts the URL to every active peer dotvault's remote-browse
+// endpoint, via the pool's broadcast. Any peer accepting it is success; the
+// caller falls back to the local browser on any error.
+func postBrowseToPeers(ctx context.Context, pool *peer.Pool, target string) error {
+	return pool.Broadcast(ctx, "/api/v1/remote/browse", url.Values{"url": {target}})
 }

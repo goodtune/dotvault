@@ -1016,6 +1016,36 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// TODO(pre-1.0, #ISSUE): remove with peermigrate.go.
+	//
+	// A borrow that lands on the pre-0.34 shared default socket is the one
+	// moment this host can tell the workstation to rename its forward — it is
+	// reaching us through that very forward, and the PATCH it sends is the
+	// request `dotvault ssh edit --socket` already makes. Wrap the pool rather
+	// than teaching internal/peer about it: the lifecycle manager and
+	// internal/auth borrow through the Borrower seam and never see a path, so
+	// the wrapper is the only place that observes which member answered.
+	//
+	// Expanded through paths.ExpandHome, the same function NewPool expands its
+	// patterns with, because the whole migration hinges on that string being
+	// byte-identical to the member path Borrow reports.
+	var migrator *peerMigrator
+	if oldDefault, err := paths.ExpandHome(legacyRemoteSocket); err == nil {
+		migrator = newPeerMigrator(oldDefault)
+	} else {
+		slog.Debug("cannot resolve the legacy peer socket path; forward migration disabled", "error", err)
+	}
+	// borrower is what everything downstream borrows through. It is an
+	// interface, so unlike *peer.Pool it is not nil-receiver safe — a nil pool
+	// leaves it nil and every use is guarded.
+	var borrower peer.Borrower
+	if peerPool != nil {
+		borrower = peerPool
+		if migrator != nil {
+			borrower = &migratingBorrower{pool: peerPool, mig: migrator}
+		}
+	}
+
 	// Peer-socket token borrow. If no local token was usable and a peer socket
 	// is configured, try borrowing a live token from the peer before any
 	// method-specific flow. This runs for every startup mode (web, headless,
@@ -1025,8 +1055,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// missing/stale socket or an unusable token leaves authenticated false and
 	// the normal flow continues. The borrowed token is held in memory only
 	// (never written to the token file) so the peer stays the single owner.
-	if !authenticated {
-		if token, source := peerPool.Borrow(ctx); token != "" {
+	if !authenticated && borrower != nil {
+		if token, source := borrower.Borrow(ctx); token != "" {
 			vc.SetToken(token)
 			if _, err := vc.LookupSelf(ctx); err == nil {
 				slog.Info("using vault token borrowed from peer socket", "socket", source)
@@ -1130,7 +1160,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				Borrower:         peerPool,
+				Borrower:         borrower,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
@@ -1203,7 +1233,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			// synchronously before the first read so a token written
 			// during startup cannot be missed.
 			slog.Warn("no vault token available and no interactive facility (web UI unavailable, stdin is not a terminal); idling until a token is written to the token file or borrowable from a peer socket")
-			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), peerPool, &peerChanged, denyList) {
+			if !waitForHeadlessToken(ctx, vc, headlessTokenPath(cfg.Vault.AuthMethod, tokenPath), borrower, &peerChanged, denyList) {
 				// ctx was cancelled (SIGTERM/SIGINT, i.e. a normal service
 				// stop) before any usable token arrived. Return nil, not
 				// ctx.Err(): rootCmd.Execute maps a non-nil error to
@@ -1224,7 +1254,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 				AuthMount:        cfg.Vault.AuthMount,
 				AuthRole:         cfg.Vault.AuthRole,
 				OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-				Borrower:         peerPool,
+				Borrower:         borrower,
 				Policy:           vaultPolicyConstraint(cfg),
 				Username:         username,
 				MTLS:             mtlsParams(cfg, username),
@@ -1253,7 +1283,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
 		lm.SetTokenFilePath(tokenPath)
 	}
-	lm.SetBorrower(peerPool)
+	lm.SetBorrower(borrower)
 	// Hand over the cache startup has been populating, so a token the reuse
 	// check or the headless idle already watched Vault reject is not presented
 	// again by the recovery poll.
@@ -1305,7 +1335,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			AuthMount:        cfg.Vault.AuthMount,
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-			Borrower:         peerPool,
+			Borrower:         borrower,
 			Policy:           vaultPolicyConstraint(cfg),
 			Username:         username,
 			MTLS:             mtlsP,
@@ -2992,7 +3022,7 @@ func headlessTokenPath(method, tokenPath string) string {
 // suppression, so a rewritten file is retried immediately; a poll-only platform
 // (no inotify) still picks up a rewrite, because the cache is keyed on the
 // token's value and a new token is simply not in it. May be nil.
-func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, pool *peer.Pool, peerChanged *atomic.Pointer[func()], denyList *auth.TokenDenylist) bool {
+func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath string, pool peer.Borrower, peerChanged *atomic.Pointer[func()], denyList *auth.TokenDenylist) bool {
 	// The watcher goroutines below can outlive a *successful* return: a token
 	// arrives while the parent ctx is still live, so cancellation can't be
 	// what stops them. Give them a child context we cancel on the way out, and
@@ -3108,6 +3138,12 @@ func waitForHeadlessToken(ctx context.Context, vc *vault.Client, tokenPath strin
 	tryAcquire := func() bool {
 		if tryPromote() {
 			return true
+		}
+		if pool == nil {
+			// peer.Borrower is an interface, so unlike *peer.Pool it is not
+			// nil-receiver safe: a host with no peer sockets configured
+			// passes nil and idles on the token file alone.
+			return false
 		}
 		if sockToken, source := pool.Borrow(ctx); sockToken != "" {
 			if adopt(sockToken) {

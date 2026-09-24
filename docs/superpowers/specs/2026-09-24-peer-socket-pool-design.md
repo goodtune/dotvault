@@ -87,6 +87,8 @@ A member whose file has vanished is dropped from the pool outright; there is not
 
 Transport failures evict exactly as in `Borrow`. Because both "nothing to talk to" and "everything failed" wrap `ErrPeerUnreachable`, the CLIs' local fallback and the facade's `ErrPeerUnavailable` mapping are unchanged.
 
+**A refusal inside `ReadinessGrace` (2s of the member being seen) does not evict.** inotify reports a forward's `bind()`, the `listen()` that follows leaves no event, and a borrow woken by the create can dial in between and be refused by a healthy peer; evicting on that would take the socket dark for the whole probe window with nothing left to bring it back. The next attempt after the grace applies the normal rule.
+
 **Eviction is a re-probe window, not a verdict**, for the same reason the token denylist's `DenyProbeInterval` is. An evicted member is readmitted when any of the following holds:
 
 1. inotify reports the path created or written (Linux, daemon only);

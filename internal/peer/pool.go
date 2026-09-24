@@ -40,6 +40,15 @@ var ErrNoPeers = fmt.Errorf("no active peer sockets: %w", ErrPeerUnreachable)
 // dark until the process restarted.
 const EvictProbeInterval = 5 * time.Minute
 
+// ReadinessGrace is how long after a socket was last seen a transport failure
+// is *not* treated as grounds for eviction. A forward's socket appears on
+// bind() and only becomes connectable on the listen() that follows; the
+// inotify event (and the mtime a re-resolve seeds lastSeen from) marks the
+// former, so a borrow woken by that event can race the latter and be refused
+// by a peer that is about to be fine. Two seconds is far longer than that gap
+// on any real host and far shorter than the recovery poll that retries.
+const ReadinessGrace = 2 * time.Second
+
 // Member is one resolved socket, as reported by Status.
 //
 // EvictedAt is a pointer so `omitempty` actually works: a zero time.Time is a
@@ -276,7 +285,20 @@ func (p *Pool) evict(ctx context.Context, path string, id identity, cause error)
 			"socket", path, "error", cause)
 		return
 	}
-	m.evictedAt = p.clock()
+	now := p.clock()
+	if now.Sub(m.lastSeen) < ReadinessGrace {
+		// A socket seen this recently may not be listening yet: inotify
+		// reports the bind(), and the listen() that follows leaves no
+		// trace, so a dial in that gap is refused by a perfectly healthy
+		// peer. Evicting it here would take it dark for the whole probe
+		// window with no later event to bring it back. Leave it in
+		// rotation; a socket that is genuinely dead is evicted by the
+		// next attempt once the grace has passed.
+		slog.Debug("peer socket failed within its readiness grace; not evicting yet",
+			"socket", path, "error", cause)
+		return
+	}
+	m.evictedAt = now
 	observability.RecordPeerPool(ctx, "evicted")
 	slog.Debug("peer socket evicted from pool", "socket", path, "error", cause)
 }

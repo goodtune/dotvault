@@ -85,7 +85,11 @@ func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, targ
 			// actively listening at this path right now. Unlinking here would
 			// silently hijack that session — exactly the outcome this probe
 			// exists to prevent.
-			return fail(fmt.Errorf("%w: %s: %w (a live listener already owns this path)", ErrBind, socket, bindErr))
+			// A live listener that is not ours is most often another
+			// workstation whose {{HOSTNAME}} label expands to the same
+			// name — two machines both called "laptop" — so name the
+			// fix rather than leave the operator to infer it.
+			return fail(fmt.Errorf("%w: %s: %w (a live listener already owns this path; if another workstation with the same hostname label forwards to this remote, give this one a distinct path with `dotvault ssh edit %s --socket`)", ErrBind, socket, bindErr, host))
 		}
 
 		if rmErr := removeRemoteFile(ctx, cl, socket); rmErr != nil {

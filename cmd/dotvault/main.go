@@ -1125,6 +1125,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			slog.Error("failed to create web server", "error", err)
 		} else {
+			// The peer pool exists before any auth, so its status is
+			// wired here rather than with the post-auth blocks below:
+			// "which sockets am I waiting on, and is one evicted" is
+			// precisely the question a headless daemon idling for its
+			// first peer token needs answered.
+			if peerPool != nil {
+				webServer.SetPeerStatus(peerPool.Status)
+			}
 			go func() {
 				if err := webServer.Start(); err != nil {
 					slog.Error("web server error", "error", err)
@@ -1373,10 +1381,6 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// happened to look at the directory. Never fatal — see startFUSE.
 	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
 		webServer.SetFUSEStatus(fuseSvc.Status)
-	}
-
-	if peerPool != nil && webServer != nil {
-		webServer.SetPeerStatus(peerPool.Status)
 	}
 
 	// Build and start the managed-SSH-forward subsystem now that we hold a

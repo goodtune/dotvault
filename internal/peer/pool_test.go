@@ -184,7 +184,7 @@ func TestPoolEvictsOnTransportFailureAndReadmitsOnRecreate(t *testing.T) {
 	good := filepath.Join(dir, "dotvault.desktop.sock")
 	hangingServer(t, hung)
 	tokenServer(t, good, "hvs.desktop", 200)
-	setMtime(t, hung, time.Now())
+	setMtime(t, hung, time.Now().Add(-10*time.Second)) // fresher than good, past ReadinessGrace
 	setMtime(t, good, time.Now().Add(-time.Minute))
 
 	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}, withFetchTimeout(300*time.Millisecond))
@@ -223,6 +223,7 @@ func TestPoolEvictIgnoresStaleIdentity(t *testing.T) {
 	dir := sockDir(t)
 	sock := filepath.Join(dir, "dotvault.sock")
 	tokenServer(t, sock, "hvs.a", 200)
+	setMtime(t, sock, time.Now().Add(-time.Minute)) // past ReadinessGrace
 	p := NewPool([]string{sock})
 	ctx := context.Background()
 
@@ -244,6 +245,7 @@ func TestPoolEvictIgnoresStaleIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	tokenServer(t, sock, "hvs.b", 200)
+	setMtime(t, sock, time.Now().Add(-time.Minute)) // past ReadinessGrace
 	if got := p.Resolve(); len(got) != 1 {
 		t.Fatalf("after recreate, active = %+v, want the replacement", got)
 	}
@@ -268,6 +270,7 @@ func TestPoolReadmitsAfterProbeWindow(t *testing.T) {
 	dir := sockDir(t)
 	sock := filepath.Join(dir, "dotvault.sock")
 	hangingServer(t, sock)
+	setMtime(t, sock, time.Now().Add(-time.Minute)) // past ReadinessGrace
 	now := time.Now()
 	clock := func() time.Time { return now }
 	p := NewPool([]string{sock}, WithClock(clock), withFetchTimeout(300*time.Millisecond))
@@ -319,6 +322,7 @@ func TestPoolBroadcastAllFailedWrapsUnreachable(t *testing.T) {
 	dir := sockDir(t)
 	sock := filepath.Join(dir, "dotvault.sock")
 	hangingServer(t, sock)
+	setMtime(t, sock, time.Now().Add(-time.Minute)) // past ReadinessGrace
 	p := NewPool([]string{sock}, withPostTimeout(300*time.Millisecond))
 	err := p.Broadcast(context.Background(), "/api/v1/remote/notify", nil)
 	if !errors.Is(err, ErrPeerUnreachable) || errors.Is(err, ErrNoPeers) {
@@ -393,6 +397,7 @@ func TestStatusEvictedAtSetOnlyWhenEvicted(t *testing.T) {
 	dir := sockDir(t)
 	sock := filepath.Join(dir, "dotvault.a.sock")
 	hangingServer(t, sock)
+	setMtime(t, sock, time.Now().Add(-time.Minute)) // past ReadinessGrace
 
 	now := time.Now()
 	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")},

@@ -667,7 +667,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 				cfg.Vault.TokenSockets = config.SocketList(v)
 				return nil
 			}
-			// TODO(pre-1.0, #ISSUE): drop the REG_SZ fallback.
+			// TODO(pre-1.0, #172): drop the REG_SZ fallback.
 			var legacy string
 			if err := apply(&legacy, vaultKey, "TokenSocket"); err != nil {
 				return err

@@ -861,7 +861,7 @@ func TestReadRegistryVaultTokenSocketsMultiSZ(t *testing.T) {
 // value on a host whose policy hasn't been re-pushed with the new
 // REG_MULTI_SZ shape yet.
 //
-// TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
 func TestReadRegistryVaultTokenSocketsLegacyREGSZ(t *testing.T) {
 	t.Cleanup(func() {
 		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-legacy\Vault`)
@@ -901,7 +901,7 @@ func TestReadRegistryVaultTokenSocketsLegacyREGSZ(t *testing.T) {
 // the rule: a REG_SZ naming something that is not the pre-list default is the
 // admin's own choice and stays a one-element list.
 //
-// TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
 func TestReadRegistryVaultTokenSocketsLegacyREGSZOtherValue(t *testing.T) {
 	t.Cleanup(func() {
 		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other\Vault`)

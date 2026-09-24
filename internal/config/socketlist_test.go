@@ -25,7 +25,7 @@ func TestSocketListUnmarshalScalar(t *testing.T) {
 // this, such a host borrows once, triggers the forward rename, and then matches
 // no socket at all with no borrow left to recover through.
 //
-// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+// TODO(pre-1.0, #172): drop with the scalar form.
 func TestSocketListUnmarshalLegacyScalarExpandsToPair(t *testing.T) {
 	var v struct {
 		S SocketList `yaml:"token_socket"`

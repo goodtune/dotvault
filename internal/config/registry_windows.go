@@ -872,7 +872,7 @@ func readRegMultiString(key registry.Key, name string) []string {
 // with ErrNotExist only when it does not, regardless of the value's length
 // or type.
 //
-// TODO(pre-1.0, #ISSUE): drop the REG_SZ fallback.
+// TODO(pre-1.0, #172): drop the REG_SZ fallback.
 func readRegistryVaultTokenSockets(vk registry.Key) []string {
 	if _, _, err := vk.GetValue("TokenSockets", nil); err == nil {
 		if v := readRegMultiString(vk, "TokenSockets"); v != nil {

@@ -712,7 +712,7 @@ func TestParseRejectsMalformedHex(t *testing.T) {
 // unable to find its forward once the workstation renamed it); any other value
 // is the admin's own choice and stays one element.
 //
-// TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
 func TestParseLegacyTokenSocketREGSZ(t *testing.T) {
 	parse := func(t *testing.T, value string) config.SocketList {
 		t.Helper()

@@ -18,7 +18,7 @@ import (
 // empty list — `token_socket: []` or `token_socket: ""` — means the operator
 // explicitly disabled peer sockets.
 //
-// TODO(pre-1.0, #ISSUE): drop the scalar form.
+// TODO(pre-1.0, #172): drop the scalar form.
 type SocketList []string
 
 // UnmarshalYAML accepts a scalar or a sequence of scalars.
@@ -91,7 +91,7 @@ func ValidateSocketPattern(p string) error {
 // scalar vault.token_socket almost always held, and the path an un-upgraded
 // workstation's managed forward still binds.
 //
-// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+// TODO(pre-1.0, #172): drop with the scalar form.
 const LegacyPeerSocket = "~/.ssh/dotvault.sock"
 
 // PerHostPeerSocketGlob matches the per-hostname socket every upgraded
@@ -103,7 +103,7 @@ const PerHostPeerSocketGlob = "~/.ssh/dotvault.*.sock"
 // been upgraded keeps working, plus the per-hostname pattern every upgraded
 // one binds.
 //
-// TODO(pre-1.0, #ISSUE): drop LegacyPeerSocket from the defaults.
+// TODO(pre-1.0, #172): drop LegacyPeerSocket from the defaults.
 var DefaultPeerSocketPatterns = []string{LegacyPeerSocket, PerHostPeerSocketGlob}
 
 // ExpandLegacyScalar turns a single pre-list peer socket value into the list
@@ -124,7 +124,7 @@ var DefaultPeerSocketPatterns = []string{LegacyPeerSocket, PerHostPeerSocketGlob
 // default so an exported config shows what is in force instead of the lossy
 // absent form.
 //
-// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+// TODO(pre-1.0, #172): drop with the scalar form.
 func ExpandLegacyScalar(v string) SocketList {
 	if v == LegacyPeerSocket {
 		return SocketList{LegacyPeerSocket, PerHostPeerSocketGlob}

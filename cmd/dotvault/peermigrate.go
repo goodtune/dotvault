@@ -1,4 +1,4 @@
-// TODO(pre-1.0, #ISSUE): delete this file. It exists only to move fleets
+// TODO(pre-1.0, #172): delete this file. It exists only to move fleets
 // off the shared ~/.ssh/dotvault.sock forward without a human touching each
 // workstation.
 

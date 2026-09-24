@@ -1016,7 +1016,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// TODO(pre-1.0, #ISSUE): remove with peermigrate.go.
+	// TODO(pre-1.0, #172): remove with peermigrate.go.
 	//
 	// A borrow that lands on the pre-0.34 shared default socket is the one
 	// moment this host can tell the workstation to rename its forward — it is

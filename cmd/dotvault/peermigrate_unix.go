@@ -1,6 +1,6 @@
 //go:build !windows
 
-// TODO(pre-1.0, #ISSUE): delete this file with peermigrate.go.
+// TODO(pre-1.0, #172): delete this file with peermigrate.go.
 
 package main
 

@@ -33,21 +33,21 @@ These are thin clients of the running daemon's own web API — they do not write
 
 `add` does not persist an entry it hasn't proven works. Before writing anything to `ssh.yaml` it performs a full dry run against the target host: resolve an identity from the agent, dial and authenticate, verify the host key, probe the remote `$HOME` if the socket path needs expanding, and request the forward. Only once that succeeds does the entry get written and the daemon reconcile immediately. This catches the failures that would otherwise show up an hour later as a mute `offline` row — no agent identity, an unauthorised principal, `AllowStreamLocalForwarding no` on the remote `sshd`, a socket path in an unwritable directory.
 
-`add` is idempotent on the host: running it again updates the existing entry rather than creating a duplicate. `--port` and `--socket` override the SSH port (default `22`) and the remote Unix socket path (default `~/.ssh/dotvault.sock`) respectively. `--force` skips the verification dial and persists the entry as given — the documented escape for registering a host that happens to be offline right now; it does not bypass the host-key confirmation on a later re-add, only the verification dial itself.
+`add` is idempotent on the host: running it again updates the existing entry rather than creating a duplicate. `--port` and `--socket` override the SSH port (default `22`) and the remote Unix socket path (default `~/.ssh/dotvault.{{HOSTNAME}}.sock`) respectively. `--force` skips the verification dial and persists the entry as given — the documented escape for registering a host that happens to be offline right now; it does not bypass the host-key confirmation on a later re-add, only the verification dial itself.
 
 A remote whose `sshd` has `AllowStreamLocalForwarding no` cannot be managed at all — the verification dial's forward request fails outright, and `ssh add` refuses to persist the entry (`--force` doesn't help here either, since a persisted entry could never connect).
 
 ### `dotvault ssh edit`
 
-`edit` is the CLI counterpart of the web UI's per-remote form. Only the flags you pass change — everything else keeps its current value: `--port 0` resets the port to the default `22`, `--socket ""` resets the remote socket path to the default `~/.ssh/dotvault.sock`, and `--enable`/`--disable` flip the forward without removing it. The daemon persists `ssh.yaml` and reconciles the forward immediately, so an enable or disable takes effect without a restart. Passing no change flags is refused before any request is made; on success the resulting entry is printed with defaults applied.
+`edit` is the CLI counterpart of the web UI's per-remote form. Only the flags you pass change — everything else keeps its current value: `--port 0` resets the port to the default `22`, `--socket ""` resets the remote socket path to the default `~/.ssh/dotvault.{{HOSTNAME}}.sock`, and `--enable`/`--disable` flip the forward without removing it. The daemon persists `ssh.yaml` and reconciles the forward immediately, so an enable or disable takes effect without a restart. Passing no change flags is refused before any request is made; on success the resulting entry is printed with defaults applied.
 
 ### `dotvault ssh list`
 
 ```
-HOST                 STATUS         REMOTE SOCKET                    RECONNECTS  LAST ERROR
-foo.example.com      connected      /home/me/.ssh/dotvault.sock      2           -
-bar.example.com      reconnecting   /home/me/.ssh/dotvault.sock      5           connection refused
-baz.example.com      host-key-error /home/me/.ssh/dotvault.sock      0           host key is not pinned and no configured CA signed it
+HOST                 STATUS         REMOTE SOCKET                          RECONNECTS  LAST ERROR
+foo.example.com      connected      /home/me/.ssh/dotvault.desktop.sock    2           -
+bar.example.com      reconnecting   /home/me/.ssh/dotvault.desktop.sock    5           connection refused
+baz.example.com      host-key-error /home/me/.ssh/dotvault.desktop.sock    0           host key is not pinned and no configured CA signed it
 ```
 
 The remote socket column reports the **expanded** path once known, so you see what was actually bound rather than the literal `~/`-prefixed value in `ssh.yaml`.
@@ -74,7 +74,7 @@ Managed remotes are stored in a user-level file, `ssh.yaml`, a sibling of the pe
 remotes:
   - host: foo.example.com
     port: 22
-    remote_socket: ~/.ssh/dotvault.sock
+    remote_socket: ~/.ssh/dotvault.{{HOSTNAME}}.sock
     host_key: "ssh-ed25519 AAAA…"
     enabled: true
 ```
@@ -83,11 +83,13 @@ remotes:
 |-------|-------------|---------|
 | `host` | The remote's identity — `add` is idempotent on it, `remove` keys on it | — (required) |
 | `port` | SSH port | `22` |
-| `remote_socket` | Unix socket path bound on the remote. Absolute, or `~/`-prefixed for the remote account's home | `~/.ssh/dotvault.sock` |
+| `remote_socket` | Unix socket path bound on the remote. Absolute, or `~/`-prefixed for the remote account's home | `~/.ssh/dotvault.{{HOSTNAME}}.sock` |
 | `host_key` | Pinned host key in `authorized_keys` form, written by `ssh add`. Empty when a configured certificate authority covers the host instead | — |
 | `enabled` | Whether the daemon should maintain this remote | `true` |
 
 A leading `~/` in `remote_socket` is expanded **at connect time** against the remote account's home (probed once per connection via `echo $HOME` on an exec channel), not at `add` time — so the entry stays portable if the remote account's home ever moves. `~user/`-style paths are rejected at validation, as is any path that is neither absolute nor `~/`-prefixed.
+
+`{{HOSTNAME}}` is the one template token `remote_socket` accepts. It is substituted at connect time with the forwarding workstation's own hostname — first label, lowercased, non-`[a-z0-9-]` characters replaced by `-` — so two workstations forwarding to the same remote bind two sockets instead of fighting over one. The borrower's default `token_socket` pattern `~/.ssh/dotvault.*.sock` finds them all. Any other `{{`/`}}` in the path is rejected. **Remotes running dotvault older than 0.34** only look for `~/.ssh/dotvault.sock`: pass `--socket ~/.ssh/dotvault.sock` when adding one, and drop the flag once it is upgraded. Conversely, an upgraded remote that borrows through a forward still bound at the old path will, once per connection, ask this workstation to rename that forward to the template on its behalf — the same PATCH `dotvault ssh edit --socket` sends — provided this workstation reports version 0.34.0 or newer; this migration is removed before 1.0 (see [issue #172](https://github.com/goodtune/dotvault/issues/172)).
 
 The file is written atomically at `0600` inside a `0700` directory, and unrecognised top-level keys are preserved across a rewrite so a future dotvault version's fields aren't silently dropped by an older one editing the same file. Hand-editing `ssh.yaml` is fully supported — the daemon picks up changes on the next config-refresh tick — but the daemon (via `Registry`) is the only writer dotvault itself uses; there's no lock to coordinate a second one.
 
@@ -128,7 +130,7 @@ The socket's parent directory is created on the remote before the first bind, by
 
 Creating it is **best-effort**: an absolute `remote_socket` needs no exec channel at all, so a remote that permits streamlocal forwarding but forbids command execution — an `authorized_keys` `command="…"` restriction, `ForceCommand`, a restricted shell, a Windows OpenSSH account whose shell is `cmd.exe` — keeps working exactly as it did. A `mkdir` that fails is retained, not raised: the bind is attempted regardless, and if the bind succeeds the forward is healthy and the failure is only a debug log. Only when the bind *also* fails is the `mkdir` failure reported, folded into the bind error as the likely root cause (with whatever the remote wrote to stderr), and the remote's error class is `remote-socket-dir` rather than `remote-socket-bind`.
 
-One caveat worth knowing if you nest the socket deeper than one directory: POSIX applies `-m` to the *final* operand only, so intermediate directories `-p` creates get the remote account's umask instead of `0700`. For the default `~/.ssh/dotvault.sock` there are no intermediates and the point is moot, but a `remote_socket` of, say, `~/a/b/dotvault.sock` can leave `~/a` group- or world-traversable. If that matters to you, create and mode the intermediate directories yourself; dotvault deliberately doesn't chmod path components it may not have created.
+One caveat worth knowing if you nest the socket deeper than one directory: POSIX applies `-m` to the *final* operand only, so intermediate directories `-p` creates get the remote account's umask instead of `0700`. For the default `~/.ssh/dotvault.{{HOSTNAME}}.sock` there are no intermediates and the point is moot, but a `remote_socket` of, say, `~/a/b/dotvault.sock` can leave `~/a` group- or world-traversable. If that matters to you, create and mode the intermediate directories yourself; dotvault deliberately doesn't chmod path components it may not have created.
 
 ## Stale sockets
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -64,10 +65,19 @@ func testHostKey(t *testing.T) (key, fingerprint string) {
 // file-mutation and confirmation-gate behaviour, not real connections.
 func newSSHRegistry(t *testing.T, v sshfwd.Verifier) *sshfwd.Registry {
 	t.Helper()
+	reg, _ := newSSHRegistryWithManager(t, v)
+	return reg
+}
+
+// newSSHRegistryWithManager is newSSHRegistry for the tests that need to see
+// the running set as well as the file — reconcile_delay's whole observable
+// effect is that the Manager lags ssh.yaml for a while.
+func newSSHRegistryWithManager(t *testing.T, v sshfwd.Verifier) (*sshfwd.Registry, *sshfwd.Manager) {
+	t.Helper()
 	mgr := sshfwd.NewManager(context.Background(), sshfwd.Deps{})
 	t.Cleanup(mgr.Close)
 	path := filepath.Join(t.TempDir(), "ssh.yaml")
-	return sshfwd.NewRegistry(path, mgr, v)
+	return sshfwd.NewRegistry(path, mgr, v), mgr
 }
 
 // sshTestServer builds a Server with the SSH CRUD routes registered and its
@@ -292,6 +302,99 @@ func TestSSHRemotesPatchUnknownHost(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body = %s", w.Code, w.Body.String())
+	}
+}
+
+// sshManagerSocket reports the remote_socket the running Manager currently
+// has for host, or "" when it has no entry.
+func sshManagerSocket(mgr *sshfwd.Manager, host string) string {
+	for _, st := range mgr.Status() {
+		if strings.EqualFold(st.Host, host) {
+			return st.RemoteSocket
+		}
+	}
+	return ""
+}
+
+// TestSSHRemotesPatchDefersReconcile: reconcile_delay must reach
+// sshfwd.Patch, whose one observable effect is that the file moves
+// immediately while the running set follows later. The migration depends on
+// exactly that ordering — its request arrives through the forward being
+// rebound.
+func TestSSHRemotesPatchDefersReconcile(t *testing.T) {
+	s := testServer(t)
+	reg, mgr := newSSHRegistryWithManager(t, noopVerifier)
+	s.sshRegistry = reg
+	s.registerRoutes()
+
+	if _, err := reg.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{}); err != nil {
+		t.Fatalf("seeding Add: %v", err)
+	}
+
+	const want = "/tmp/dotvault-web-deferred.sock"
+	req := httptest.NewRequest("PATCH", "/api/v1/ssh/remotes/example.com",
+		jsonBody(t, map[string]any{"remote_socket": want, "reconcile_delay": "50ms"}))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("host", "example.com")
+	w := httptest.NewRecorder()
+	s.handleSSHPatch(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	remotes, err := reg.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotes) != 1 || remotes[0].RemoteSocket != want {
+		t.Fatalf("List() = %+v, want the patch saved immediately", remotes)
+	}
+	if got := sshManagerSocket(mgr, "example.com"); got != sshfwd.DefaultRemoteSocket {
+		t.Fatalf("running set socket = %q before the delay elapsed, want the pre-patch %q", got, sshfwd.DefaultRemoteSocket)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if sshManagerSocket(mgr, "example.com") == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("running set socket = %q, want %q once the deferred reconcile fired", sshManagerSocket(mgr, "example.com"), want)
+}
+
+// TestSSHRemotesPatchRejectsBadReconcileDelay: a value that will not parse,
+// or that exceeds sshfwd.MaxReconcileDelay, is a malformed request — 400,
+// with ssh.yaml untouched.
+func TestSSHRemotesPatchRejectsBadReconcileDelay(t *testing.T) {
+	for _, delay := range []string{"90s", "nonsense", "-1s"} {
+		t.Run(delay, func(t *testing.T) {
+			s := sshTestServer(t, noopVerifier)
+			if _, err := s.sshRegistry.Add(context.Background(), sshfwd.Remote{Host: "example.com"}, sshfwd.AddOptions{}); err != nil {
+				t.Fatalf("seeding Add: %v", err)
+			}
+
+			req := httptest.NewRequest("PATCH", "/api/v1/ssh/remotes/example.com",
+				jsonBody(t, map[string]any{"remote_socket": "/tmp/nope.sock", "reconcile_delay": delay}))
+			req.Header.Set("Content-Type", "application/json")
+			req.SetPathValue("host", "example.com")
+			w := httptest.NewRecorder()
+			s.handleSSHPatch(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "reconcile_delay") {
+				t.Errorf("body = %s, want an error naming reconcile_delay", w.Body.String())
+			}
+			remotes, err := s.sshRegistry.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(remotes) != 1 || remotes[0].RemoteSocket != sshfwd.DefaultRemoteSocket {
+				t.Errorf("List() = %+v, want the entry untouched", remotes)
+			}
+		})
 	}
 }
 

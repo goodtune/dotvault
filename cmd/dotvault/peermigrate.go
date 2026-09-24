@@ -54,12 +54,31 @@ const legacyRemoteSocket = config.LegacyPeerSocket
 // lifetime.
 const migrateTimeout = 15 * time.Second
 
-// migrateProbeLabel stands in for the workstation's future hostname label when
-// checking that this host has a borrow pattern covering the renamed socket.
-// The workstation's label is unknowable from here — {{HOSTNAME}} is expanded
-// at its end — and it is not the question anyway: what matters is whether the
-// borrower carries a glob over dotvault.<anything>.sock.
-const migrateProbeLabel = "x"
+// migrateReconcileDelay is the window the workstation is asked to hold its
+// forwards still for after saving the patch. Long enough for the PATCH
+// response to travel back over the connection that is about to be rebound,
+// short enough that the running set is only briefly out of step with the file.
+const migrateReconcileDelay = 10 * time.Second
+
+// migrateConfirmWait and migrateConfirmPoll bound the wait for the renamed
+// socket to appear and answer. They are vars, not consts, purely so a test can
+// shorten them: nothing else assigns to them.
+//
+// The wait is generous because the workstation has to run out its own
+// reconcile delay, tear the old connection down and dial the new forward, and
+// an SSH reconnect on a slow link is not instant. Expiring is not a failure —
+// it means the migration is unconfirmed, and the next reconnect re-checks the
+// workstation's configuration.
+var (
+	migrateConfirmWait = 45 * time.Second
+	migrateConfirmPoll = 500 * time.Millisecond
+)
+
+// migrateProbeTimeout bounds a single status request against the renamed
+// socket. A socket that exists but has nobody behind it (a stale node the
+// forward has not rebound yet) must not consume the whole confirmation window
+// on one attempt.
+const migrateProbeTimeout = 3 * time.Second
 
 // maxMigratedIdentities bounds the once-per-identity bookkeeping. A daemon
 // only ever sees one old-default socket path, re-created each time the forward
@@ -75,6 +94,12 @@ const maxMigratedIdentities = 64
 type peerMigrator struct {
 	oldDefault string   // expanded $HOME/.ssh/dotvault.sock
 	patterns   []string // this host's expanded borrow patterns
+
+	// outcome, when set, is told how each migrated host's confirmation ended.
+	// Nil in production — the logs are the product there — and set by tests,
+	// which must not have to parse log output to see whether the renamed
+	// socket was ever proved to work.
+	outcome func(host string, confirmed bool)
 
 	mu    sync.Mutex
 	done  map[peerIdentity]bool
@@ -100,8 +125,15 @@ func newPeerMigrator(oldDefault string, patterns []string) *peerMigrator {
 	}
 }
 
-// canFindRenamedSocket reports whether any of this host's borrow patterns would
-// match the socket the workstation is about to rename its forward to.
+// renamedSocket is the exact path the workstation's forward will bind once it
+// expands {{HOSTNAME}} with label — the same directory as the old default,
+// since only the filename changes.
+func (m *peerMigrator) renamedSocket(label string) string {
+	return filepath.Join(filepath.Dir(m.oldDefault), "dotvault."+label+".sock")
+}
+
+// canFindRenamedSocket reports whether any of this host's borrow patterns
+// would match the socket the workstation is about to rename its forward to.
 //
 // This is the guard against the migration severing its own borrow source. A
 // config that spells the pre-list default as a one-element list — which every
@@ -113,15 +145,23 @@ func newPeerMigrator(oldDefault string, patterns []string) *peerMigrator {
 // spelling; an explicit one-element list is the operator's own words, so it is
 // left alone and this refusal is what keeps it safe.
 //
-// The probe path uses a stand-in label (see migrateProbeLabel) because the
-// question is whether a glob covers the shape, not what the workstation will
-// actually be called.
-func (m *peerMigrator) canFindRenamedSocket() bool {
-	probe := filepath.Join(filepath.Dir(m.oldDefault), "dotvault."+migrateProbeLabel+".sock")
+// label is the workstation's own hostname label, read from its status
+// response. The check is against the exact path that produces and nothing
+// else: an earlier version probed a stand-in "x" on the reasoning that the
+// question was only whether a glob covered the shape, and that is wrong. A
+// pattern can match the stand-in and miss the real name — `dotvault.?.sock`
+// and `dotvault.[a-z].sock` both match "x" and neither matches "desktop" —
+// so the stand-in could pass a host whose one and only token source the
+// migration was about to move out of reach.
+func (m *peerMigrator) canFindRenamedSocket(label string) bool {
+	if label == "" {
+		return false
+	}
+	expected := m.renamedSocket(label)
 	for _, pat := range m.patterns {
 		// A malformed pattern reports an error and no match; nothing to do
 		// about it here, and the pool has already logged it.
-		if ok, _ := filepath.Match(pat, probe); ok {
+		if ok, _ := filepath.Match(pat, expected); ok {
 			return true
 		}
 	}
@@ -171,6 +211,15 @@ func (b *migratingBorrower) Borrow(ctx context.Context) (string, string) {
 // default socket and this identity has not been handled yet. Nil-safe, and
 // never blocks its caller: it sits on the borrow path, which a login and the
 // lifecycle poll both wait on.
+//
+// A migration whose outcome could not be confirmed — the PATCH response was
+// lost, or the renamed socket never appeared — is retried safely rather than
+// repeated blindly. The latch is per socket identity, so the next time the
+// old-default socket is re-created (a new inode: the forward reconnected,
+// which is also the event that would follow a workstation that never applied
+// the patch) the whole exchange runs again from the workstation's *current*
+// configuration. The candidate filter is exact-default-only, so a re-run
+// against an entry that did migrate finds nothing to do and patches nothing.
 func (m *peerMigrator) maybeMigrate(ctx context.Context, source string) {
 	if m == nil || source == "" || source != m.oldDefault {
 		return
@@ -204,6 +253,9 @@ func (m *peerMigrator) migrate(ctx context.Context, socket string) error {
 
 	var status struct {
 		Version string `json:"version"`
+		// HostnameLabel is what the peer expands {{HOSTNAME}} to, so this
+		// host can work out the exact path the forward is about to move to.
+		HostnameLabel string `json:"hostname_label"`
 	}
 	if err := getJSON(ctx, client, "/api/v1/status", &status); err != nil {
 		return fmt.Errorf("status: %w", err)
@@ -216,9 +268,20 @@ func (m *peerMigrator) migrate(ctx context.Context, socket string) error {
 	// Checked before the remotes list is fetched: it costs no network, and
 	// refusing early keeps the WARN about this host's own configuration
 	// separate from anything the peer reports.
-	if !m.canFindRenamedSocket() {
-		slog.Warn("not migrating the peer forward: vault.token_socket has no pattern matching the renamed socket, so this host would lose its only token source; add "+config.PerHostPeerSocketGlob+" to vault.token_socket",
+	if status.HostnameLabel == "" {
+		// Conservative by design: without the label there is no way to know
+		// the path the forward will move to, so there is no way to know this
+		// host still has a pattern matching it. Refusing costs a migration
+		// that the next reconnect can attempt again; guessing costs the only
+		// token source this host has.
+		slog.Warn("not migrating the peer forward: the peer did not report its hostname label, so the renamed socket cannot be checked against vault.token_socket",
 			"socket", socket, "patterns", m.patterns)
+		return nil
+	}
+	expected := m.renamedSocket(status.HostnameLabel)
+	if !m.canFindRenamedSocket(status.HostnameLabel) {
+		slog.Warn("not migrating the peer forward: vault.token_socket has no pattern matching the renamed socket, so this host would lose its only token source; add "+config.PerHostPeerSocketGlob+" to vault.token_socket",
+			"socket", socket, "expected_socket", expected, "patterns", m.patterns)
 		return nil
 	}
 
@@ -232,6 +295,7 @@ func (m *peerMigrator) migrate(ctx context.Context, socket string) error {
 		return fmt.Errorf("list remotes: %w", err)
 	}
 
+	var asked []string
 	for _, r := range list.Remotes {
 		if r.RemoteSocket != legacyRemoteSocket || !hostIsSelf(ctx, r.Host) {
 			continue
@@ -239,16 +303,33 @@ func (m *peerMigrator) migrate(ctx context.Context, socket string) error {
 		if err := m.patch(ctx, client, r.Host); err != nil {
 			return fmt.Errorf("patch %s: %w", r.Host, err)
 		}
+		asked = append(asked, r.Host)
+	}
+	if len(asked) > 0 {
+		// One wait covers every patched entry: aliases for this machine are
+		// separate entries on the same workstation, so they all rename to the
+		// same socket path.
+		m.confirm(ctx, asked, expected)
 	}
 	return nil
 }
 
+// patch asks the peer to rename one entry's remote_socket, telling it to defer
+// the reconcile so this response can get home before the forward carrying it
+// is rebound. It returns an error only for a refusal the peer articulated; a
+// lost response is not one, and is resolved by the confirmation wait instead.
 func (m *peerMigrator) patch(ctx context.Context, client *http.Client, host string) error {
 	csrf, err := sshCSRFToken(ctx, client, "http://localhost")
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(map[string]string{"remote_socket": sshfwd.DefaultRemoteSocket})
+	body, err := json.Marshal(map[string]string{
+		"remote_socket": sshfwd.DefaultRemoteSocket,
+		// Without this the peer saves and reconciles in one breath, tearing
+		// down the connection carrying the reply — leaving this end unable to
+		// tell an applied patch from a peer that died.
+		"reconcile_delay": migrateReconcileDelay.String(),
+	})
 	if err != nil {
 		return err
 	}
@@ -261,14 +342,12 @@ func (m *peerMigrator) patch(ctx context.Context, client *http.Client, host stri
 	req.Header.Set("X-CSRF-Token", csrf)
 	resp, err := client.Do(req)
 	if err != nil {
-		// Applying the patch rebinds the forward, which tears down the
-		// connection carrying this response — so a transport error is the
-		// expected shape of success here, and treating it as a failure would
-		// mean warning on every migration that worked. It cannot be told apart
-		// from a genuine failure before the request was written (the peer going
-		// away mid-exchange), so say both: the new socket appearing is the
-		// confirmation, and if it does not, the next reconnect tries again.
-		slog.Info("peer forward migration may have been applied: the connection dropped, which is what rebinding the forward looks like, but is also what a peer going away looks like", "host", host, "socket", sshfwd.DefaultRemoteSocket, "error", err)
+		// The deferred reconcile makes this rare rather than routine — the
+		// response is meant to arrive well before the forward moves — but a
+		// connection can still be lost for ordinary reasons. It is no longer
+		// ambiguous: the renamed socket answering is the evidence, and the
+		// confirmation wait goes looking for it either way.
+		slog.Info("peer forward migration request did not return a response; waiting for the renamed socket", "host", host, "error", err)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -276,8 +355,74 @@ func (m *peerMigrator) patch(ctx context.Context, client *http.Client, host stri
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("peer returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	slog.Info("migrated peer forward to the per-hostname socket", "host", host, "socket", sshfwd.DefaultRemoteSocket)
+	slog.Info("peer accepted forward migration; waiting for the renamed socket", "host", host, "socket", sshfwd.DefaultRemoteSocket)
 	return nil
+}
+
+// confirm waits for the renamed socket to appear and answer, then says so for
+// every host that was asked.
+//
+// This is what replaces the old "probably applied" hedge. The question is not
+// whether the PATCH returned but whether this host can still borrow, and only
+// a live status response over the new path answers it. Failing to see one is
+// reported as uncertain rather than failed: the workstation may well have
+// applied the change, and the next reconnect re-checks its configuration
+// either way.
+func (m *peerMigrator) confirm(ctx context.Context, hosts []string, expected string) {
+	// Detached and separately bounded: migrateTimeout bounds the exchange,
+	// and the wait for a forward to be torn down and re-established is a
+	// different, much longer thing.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), migrateConfirmWait)
+	defer cancel()
+
+	ok := m.awaitSocket(ctx, expected)
+	for _, host := range hosts {
+		if ok {
+			slog.Info("peer forward migration confirmed", "host", host, "socket", expected)
+		} else {
+			slog.Warn("peer forward migration uncertain: the renamed socket did not appear; the next reconnect re-checks the peer's configuration",
+				"host", host, "expected_socket", expected)
+		}
+		if m.outcome != nil {
+			m.outcome(host, ok)
+		}
+	}
+}
+
+// awaitSocket polls until expected is a socket that answers a status request,
+// or ctx expires.
+func (m *peerMigrator) awaitSocket(ctx context.Context, expected string) bool {
+	for {
+		if probePeerSocket(ctx, expected) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(migrateConfirmPoll):
+		}
+	}
+}
+
+// probePeerSocket reports whether path is a socket node with a dotvault daemon
+// answering behind it. The node existing is not enough: a forward that has not
+// rebound yet can leave one lying about, and this host's whole reason for
+// caring is that it can borrow through the new path.
+func probePeerSocket(ctx context.Context, path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return false
+	}
+	client, _, err := peer.Client(path)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, migrateProbeTimeout)
+	defer cancel()
+	var status struct {
+		Version string `json:"version"`
+	}
+	return getJSON(ctx, client, "/api/v1/status", &status) == nil
 }
 
 func getJSON(ctx context.Context, client *http.Client, path string, out any) error {

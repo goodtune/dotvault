@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
@@ -69,6 +70,20 @@ type sshPatchRequest struct {
 	Enabled      *bool   `json:"enabled,omitempty"`
 	RemoteSocket *string `json:"remote_socket,omitempty"`
 	Port         *int    `json:"port,omitempty"`
+
+	// ReconcileDelay is a Go duration string ("10s") carrying
+	// sshfwd.Patch.ReconcileDelay: save now, rebind the forwards that long
+	// afterwards. Omitted or empty means the ordinary inline reconcile.
+	//
+	// It exists so a caller reached *through* the forward it is changing —
+	// the pre-1.0 migration, PATCHing over the very socket that forward binds
+	// — gets its response before the forward is rebound underneath it.
+	// Without it the caller sees a dropped connection and cannot tell an
+	// applied patch from a peer that died.
+	//
+	// TODO(pre-1.0, #172): remove along with the migration that is its only
+	// caller.
+	ReconcileDelay string `json:"reconcile_delay,omitempty"`
 }
 
 // handleSSHList returns every configured remote.
@@ -157,6 +172,11 @@ func (s *Server) handleSSHAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSSHPatch applies a partial update to an existing remote.
+//
+// The body's optional reconcile_delay field defers the rebinding of the
+// forwards by that long, so a caller reached *through* the forward it is
+// changing gets its response before the connection carrying it is torn down.
+// See sshPatchRequest.ReconcileDelay.
 func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 	reg := s.sshRegistrySnapshot()
 	if reg == nil {
@@ -183,10 +203,29 @@ func (s *Server) handleSSHPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Range-checked here as well as in Registry.Patch: a value that does not
+	// parse as a duration, or that asks the running set to sit stale for
+	// longer than the registry permits, is a malformed request and deserves a
+	// 400 naming the field rather than the registry's own phrasing.
+	var delay time.Duration
+	if req.ReconcileDelay != "" {
+		d, err := time.ParseDuration(req.ReconcileDelay)
+		if err != nil {
+			writeError(w, "reconcile_delay is not a valid duration", http.StatusBadRequest)
+			return
+		}
+		if d < 0 || d > sshfwd.MaxReconcileDelay {
+			writeError(w, "reconcile_delay must be between 0 and "+sshfwd.MaxReconcileDelay.String(), http.StatusBadRequest)
+			return
+		}
+		delay = d
+	}
+
 	got, err := reg.Patch(r.Context(), host, sshfwd.Patch{
-		Enabled:      req.Enabled,
-		RemoteSocket: req.RemoteSocket,
-		Port:         req.Port,
+		Enabled:        req.Enabled,
+		RemoteSocket:   req.RemoteSocket,
+		Port:           req.Port,
+		ReconcileDelay: delay,
 	})
 	if err != nil {
 		if errors.Is(err, sshfwd.ErrHostNotFound) {

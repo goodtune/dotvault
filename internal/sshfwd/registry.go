@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -118,7 +120,37 @@ type Patch struct {
 	Enabled      *bool
 	RemoteSocket *string
 	Port         *int
+
+	// ReconcileDelay, when positive, holds the running set still for that
+	// long after ssh.yaml is saved and hands the reconcile to a background
+	// goroutine, so Patch returns to its caller before the forwards are
+	// rebound. Zero — the default — reconciles inline as every other
+	// mutation does.
+	//
+	// It exists for exactly one caller: a request that arrives *through* the
+	// forward it is changing (the pre-1.0 migration in
+	// cmd/dotvault/peermigrate.go, which PATCHes a workstation's own entry
+	// for the borrowing host over that host's forwarded socket). Reconciling
+	// inline tears that connection down mid-response, so the caller cannot
+	// tell an applied patch from a peer that died — it sees a dropped
+	// connection either way. The delay is the window in which the response
+	// gets home.
+	//
+	// The deferred reconcile re-reads ssh.yaml rather than replaying the
+	// entry this Patch committed: a mutation landing inside the window must
+	// not be undone by a reconcile that was queued before it.
+	//
+	// TODO(pre-1.0, #172): the migration is this field's only caller, so
+	// revisit whether it stays when the migration goes.
+	ReconcileDelay time.Duration
 }
+
+// MaxReconcileDelay bounds Patch.ReconcileDelay. The delay leaves the running
+// set knowingly out of step with the file it was just told to match, so it is
+// capped at a value comfortably above the one caller's need (10s) and far
+// below anything that would let a client park a stale forward for as long as
+// it liked.
+const MaxReconcileDelay = 60 * time.Second
 
 // ErrConfirmHostKey is returned by Add when the host's key is neither pinned
 // nor CA-signed. It is not a failure: it is the one point at which a human
@@ -455,7 +487,19 @@ func (g *Registry) Add(ctx context.Context, r Remote, opts AddOptions) (*Remote,
 // Patch applies non-nil fields of p to the existing entry for host. It
 // returns an error, and leaves ssh.yaml untouched, if host is not
 // configured or the patched entry fails validation.
+//
+// p.ReconcileDelay defers the reconcile instead of running it inline; see
+// that field. The save is never deferred — a patch that returns success has
+// always been written durably, whichever way the running set is brought into
+// line.
 func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, error) {
+	// Checked before the transaction so an out-of-range delay leaves
+	// ssh.yaml untouched: it is a malformed request, not a partially
+	// applicable one.
+	if p.ReconcileDelay < 0 || p.ReconcileDelay > MaxReconcileDelay {
+		return nil, fmt.Errorf("reconcile delay %s is out of range: must be between 0 and %s", p.ReconcileDelay, MaxReconcileDelay)
+	}
+
 	g.txMu.Lock()
 	defer g.txMu.Unlock()
 
@@ -486,6 +530,11 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 	if err := g.saveFile(f); err != nil {
 		return nil, err
 	}
+	if p.ReconcileDelay > 0 {
+		g.deferReconcile(ctx, p.ReconcileDelay)
+		got := r
+		return &got, nil
+	}
 	if rerr := g.mgr.Reconcile(ctx, f.Remotes); rerr != nil {
 		got := r
 		return &got, fmt.Errorf("saved %s but could not apply it to the running set: %w", g.path, rerr)
@@ -493,6 +542,45 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 
 	got := r
 	return &got, nil
+}
+
+// deferReconcile waits delay and then reconciles the Manager against whatever
+// ssh.yaml says at that moment, under the same transaction lock every other
+// mutation holds.
+//
+// The context is detached: the only caller is an HTTP handler, whose context
+// Go cancels the moment it returns — which is the whole point of deferring,
+// so inheriting that cancellation would defeat it. The Registry has no
+// lifetime context of its own to use instead, and Manager.Reconcile rejects
+// anything that arrives after Close, so a goroutine outliving shutdown fails
+// cleanly rather than resurrecting remotes.
+//
+// It re-loads the file rather than closing over the slice this Patch
+// committed: a second mutation inside the window must win, not be quietly
+// reverted by an older snapshot arriving late.
+func (g *Registry) deferReconcile(ctx context.Context, delay time.Duration) {
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+
+		g.txMu.Lock()
+		defer g.txMu.Unlock()
+
+		f, err := g.loadFile()
+		if err != nil {
+			// Warn rather than return: the caller is long gone, and this is
+			// the only place the failure can be reported.
+			slog.Warn("could not re-read managed SSH forwards for a deferred reconcile", "path", g.path, "error", err)
+			return
+		}
+		if err := g.mgr.Reconcile(ctx, f.Remotes); err != nil {
+			slog.Warn("deferred reconcile of managed SSH forwards failed", "path", g.path, "error", err)
+		}
+	}()
 }
 
 // Remove deletes the entry for host, reporting whether one was present.

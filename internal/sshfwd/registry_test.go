@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -767,4 +768,143 @@ type fakeVerifierFunc struct {
 
 func (f *fakeVerifierFunc) Verify(ctx context.Context, r Remote, o VerifyOptions) (VerifyResult, error) {
 	return f.fn(ctx, r, o)
+}
+
+// socketOf returns the RemoteSocket and state the running Manager currently
+// has for host, or empty strings when it has no entry. It goes through Status
+// rather than reaching into m.remotes because a deferred reconcile mutates
+// that map from its own goroutine.
+func socketOf(g *Registry, host string) (socket, state string) {
+	for _, st := range g.mgr.Status() {
+		if strings.EqualFold(st.Host, host) {
+			return st.RemoteSocket, st.State
+		}
+	}
+	return "", ""
+}
+
+func waitForSocket(t *testing.T, g *Registry, host, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, _ := socketOf(g, host); got == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	got, _ := socketOf(g, host)
+	t.Fatalf("running set socket = %q, want %q within the deferred window", got, want)
+}
+
+// TestPatchDeferredReconcileReturnsBeforeReconciling is the whole point of
+// ReconcileDelay: the caller — a migration reached through the very forward
+// being changed — must have its response before the running set moves.
+func TestPatchDeferredReconcileReturnsBeforeReconciling(t *testing.T) {
+	g, _ := newTestRegistry(t, &fakeVerifier{result: VerifyResult{Verified: true}})
+	ctx := context.Background()
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, AddOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if before, _ := socketOf(g, "foo.example.com"); before != DefaultRemoteSocket {
+		t.Fatalf("seeded running socket = %q, want %q", before, DefaultRemoteSocket)
+	}
+
+	want := "/tmp/dotvault-deferred.sock"
+	got, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Patch() = %v", err)
+	}
+	if got.RemoteSocket != want {
+		t.Errorf("Patch() returned socket %q, want %q", got.RemoteSocket, want)
+	}
+	if live, _ := socketOf(g, "foo.example.com"); live != DefaultRemoteSocket {
+		t.Fatalf("running set already reconciled to %q before Patch returned; the delay did nothing", live)
+	}
+
+	// The file is durable immediately, whatever the running set is doing.
+	f, err := Load(g.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i, ok := f.Find("foo.example.com"); !ok || f.Remotes[i].RemoteSocket != want {
+		t.Fatalf("ssh.yaml = %+v, want the patch saved before the reconcile", f.Remotes)
+	}
+
+	waitForSocket(t, g, "foo.example.com", want)
+}
+
+// TestPatchDeferredReconcileUsesLatestFile: the deferred reconcile re-reads
+// ssh.yaml rather than replaying the entry its own Patch committed, so an edit
+// that lands inside the window is not silently reverted by a stale snapshot
+// firing late.
+func TestPatchDeferredReconcileUsesLatestFile(t *testing.T) {
+	g, _ := newTestRegistry(t, &fakeVerifier{result: VerifyResult{Verified: true}})
+	ctx := context.Background()
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, AddOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "/tmp/dotvault-latest.sock"
+	if _, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: 150 * time.Millisecond}); err != nil {
+		t.Fatalf("deferred Patch() = %v", err)
+	}
+
+	// A second, ordinary mutation inside the deferred window. If the deferred
+	// reconcile replayed the list it saw, this would be undone and the remote
+	// would come back up enabled.
+	off := false
+	if _, err := g.Patch(ctx, "foo.example.com", Patch{Enabled: &off}); err != nil {
+		t.Fatalf("synchronous Patch() = %v", err)
+	}
+	if _, state := socketOf(g, "foo.example.com"); state != string(StateDisabled) {
+		t.Fatalf("running state = %q after the synchronous patch, want %q", state, StateDisabled)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	socket, state := socketOf(g, "foo.example.com")
+	if state != string(StateDisabled) {
+		t.Errorf("running state = %q after the deferred reconcile fired, want %q: it reverted a later edit", state, StateDisabled)
+	}
+	if socket != want {
+		t.Errorf("running socket = %q, want %q: both changes should be present", socket, want)
+	}
+}
+
+// TestPatchRejectsOutOfRangeReconcileDelay: an unusable delay is a malformed
+// request, so nothing is written — the file must be untouched, not saved with
+// the reconcile quietly skipped.
+func TestPatchRejectsOutOfRangeReconcileDelay(t *testing.T) {
+	g, path := newTestRegistry(t, &fakeVerifier{result: VerifyResult{Verified: true}})
+	ctx := context.Background()
+
+	if _, err := g.Add(ctx, Remote{Host: "foo.example.com"}, AddOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		name  string
+		delay time.Duration
+	}{
+		{"above the cap", MaxReconcileDelay + time.Second},
+		{"negative", -time.Second},
+	} {
+		want := "/tmp/dotvault-rejected.sock"
+		got, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: c.delay})
+		if err == nil {
+			t.Fatalf("%s: Patch() = (%+v, nil), want a validation error", c.name, got)
+		}
+		if !strings.Contains(err.Error(), "reconcile delay") {
+			t.Errorf("%s: Patch() = %v, want an error naming the reconcile delay", c.name, err)
+		}
+		f, loadErr := Load(path)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if i, ok := f.Find("foo.example.com"); !ok || f.Remotes[i].RemoteSocket == want {
+			t.Errorf("%s: ssh.yaml = %+v, want it untouched", c.name, f.Remotes)
+		}
+	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/peer"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -29,6 +30,36 @@ func TestHandleStatus(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&resp)
 	if _, ok := resp["authenticated"]; !ok {
 		t.Error("response missing 'authenticated' field")
+	}
+}
+
+// TestHandleStatusReportsHostnameLabel: the migration in cmd/dotvault reads
+// hostname_label to work out the exact path a forward will move to, and
+// refuses to migrate when it is absent — so it has to be served, and served
+// unauthenticated, since the borrower asks before any token is involved.
+func TestHandleStatusReportsHostnameLabel(t *testing.T) {
+	want, err := sshfwd.LocalHostnameLabel()
+	if err != nil {
+		t.Skipf("this host has no usable hostname label: %v", err)
+	}
+
+	s := testServer(t)
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp["hostname_label"]; got != want {
+		t.Errorf("hostname_label = %v, want %q", got, want)
+	}
+	if resp["authenticated"] != false {
+		t.Fatal("fixture is authenticated; this test must prove the label is served without a token")
 	}
 }
 

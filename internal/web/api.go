@@ -12,6 +12,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/regfile"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 )
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +31,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"active": s.bootstrapActive(),
 			"method": s.bootstrapMethod,
 		},
+	}
+
+	// TODO(pre-1.0, #172): this field exists for the forward migration in
+	// cmd/dotvault/peermigrate.go and goes away with it.
+	//
+	// hostname_label is the socket-safe first label of this machine's own
+	// hostname — exactly the value {{HOSTNAME}} expands to in a managed
+	// forward's remote_socket. A borrower about to ask this daemon to rename
+	// its forward needs it to work out the path the socket will move to, and
+	// so to check its own vault.token_socket patterns still match before it
+	// severs its only token source. Unauthenticated like version: it is
+	// already the visible half of every socket name this daemon binds on the
+	// remote. Omitted when the label cannot be derived, so a caller that
+	// cannot verify the rename refuses rather than guessing.
+	if label, err := sshfwd.LocalHostnameLabel(); err == nil {
+		status["hostname_label"] = label
 	}
 
 	// Only expose Vault connection details to authenticated sessions.

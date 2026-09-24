@@ -47,6 +47,14 @@ const EvictProbeInterval = 5 * time.Minute
 // former, so a borrow woken by that event can race the latter and be refused
 // by a peer that is about to be fine. Two seconds is far longer than that gap
 // on any real host and far shorter than the recovery poll that retries.
+//
+// The window is lastSeen-relative, not attempt-bounded, and lastSeen only
+// moves on an inotify event or a fresh stat of a recreated socket: a forward
+// that flaps faster than the grace keeps shielding itself, which costs one
+// bounded dial per borrow rather than correctness, since Borrow and
+// Broadcast fall through to the next member anyway. It also assumes mtime
+// resolution finer than the grace, which every filesystem a runtime or ~/.ssh
+// directory lives on provides.
 const ReadinessGrace = 2 * time.Second
 
 // Member is one resolved socket, as reported by Status.

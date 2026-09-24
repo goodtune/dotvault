@@ -49,8 +49,9 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // ServeForward binds socket on the remote and relays every accepted connection
 // to target, returning when ctx is cancelled or the transport dies. host
 // labels the forward-failure metric recorded for a target dial that fails
-// mid-accept-loop (see serveListener) — it is otherwise unused here, so a
-// caller with no meaningful host identity may pass "".
+// mid-accept-loop (see serveListener) and names the `dotvault ssh edit`
+// override in the live-listener bind error below; it is otherwise unused
+// here, so a caller with no meaningful host identity may pass "".
 //
 // A bind failure alone does not prove the path is stale. sshd's default
 // StreamLocalBindUnlink=no makes bind() fail EADDRINUSE for *any* existing

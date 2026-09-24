@@ -42,11 +42,14 @@ func TestPoolReadinessGraceKeepsFreshSocket(t *testing.T) {
 
 	now := time.Now()
 	clock := func() time.Time { return now }
+	// Pin the socket's mtime to the fake clock so lastSeen == now exactly;
+	// the first refused dial then lands inside the grace by construction
+	// rather than by the bind-to-stat gap staying under two seconds on a
+	// loaded CI runner.
+	setMtime(t, sock, now)
 	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}, WithClock(clock))
 	ctx := context.Background()
 
-	// lastSeen is seeded from the socket's mtime, which is "just now" on
-	// the fake clock too, so the first refused dial lands inside the grace.
 	if tok, src := p.Borrow(ctx); tok != "" || src != "" {
 		t.Fatalf("Borrow = (%q, %q), want nothing from a not-yet-listening socket", tok, src)
 	}

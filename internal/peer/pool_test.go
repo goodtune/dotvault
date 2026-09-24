@@ -22,7 +22,9 @@ func sockDir(t *testing.T) string {
 	t.Helper()
 	d, err := os.MkdirTemp("/tmp", "dv")
 	if err != nil {
-		t.Fatal(err)
+		// Windows has no /tmp; the short path only matters where a socket is
+		// bound, so fall back rather than failing a test that may not bind one.
+		return t.TempDir()
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
 	return d
@@ -337,6 +339,52 @@ func TestPoolWatchOnChangeFires(t *testing.T) {
 	m := p.Status().Members
 	if len(m) != 1 || m[0].LastSeen.Before(time.Now().Add(-time.Second)) {
 		t.Errorf("member not admitted with a fresh LastSeen: %+v", m)
+	}
+}
+
+// TestStatusEvictedAtSetOnlyWhenEvicted pins the pointer invariant: a zero
+// time.Time is a struct, so `omitempty` never elided it and an active member
+// reported a meaningless "evicted_at":"0001-01-01T00:00:00Z" on
+// GET /api/v1/status. EvictedAt must be non-nil if and only if Evicted.
+func TestStatusEvictedAtSetOnlyWhenEvicted(t *testing.T) {
+	dir := sockDir(t)
+	sock := filepath.Join(dir, "dotvault.a.sock")
+	hangingServer(t, sock)
+
+	now := time.Now()
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")},
+		WithClock(func() time.Time { return now }), withFetchTimeout(200*time.Millisecond))
+
+	for _, m := range p.Status().Members {
+		if m.Evicted {
+			t.Fatalf("%s: evicted before any failure", m.Path)
+		}
+		if m.EvictedAt != nil {
+			t.Errorf("%s: active member carries EvictedAt = %v, want nil", m.Path, *m.EvictedAt)
+		}
+	}
+
+	// The dial times out against a socket nothing answers on, which evicts it.
+	p.Borrow(context.Background())
+
+	var found bool
+	for _, m := range p.Status().Members {
+		if m.Path != sock {
+			continue
+		}
+		found = true
+		if !m.Evicted {
+			t.Fatalf("%s: not evicted after a failed dial", m.Path)
+		}
+		if m.EvictedAt == nil {
+			t.Fatal("evicted member carries no EvictedAt")
+		}
+		if !m.EvictedAt.Equal(now) {
+			t.Errorf("EvictedAt = %v, want the eviction clock %v", *m.EvictedAt, now)
+		}
+	}
+	if !found {
+		t.Fatalf("%s not present in Status()", sock)
 	}
 }
 

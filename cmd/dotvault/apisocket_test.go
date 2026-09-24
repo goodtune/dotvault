@@ -155,7 +155,8 @@ func TestNewBorrowChainTiers(t *testing.T) {
 		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
 		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.*.sock"}},
 	}
-	tiers := newBorrowChain(cfg).Status()
+	chain, labels := newBorrowChain(cfg)
+	tiers := chain.Status()
 	if len(tiers) != 2 {
 		t.Fatalf("Status() = %d tiers, want 2 (local API socket, then peers)", len(tiers))
 	}
@@ -164,6 +165,13 @@ func TestNewBorrowChainTiers(t *testing.T) {
 	}
 	if got := tiers[1].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.*.sock"}) {
 		t.Errorf("tier 1 = %v, want the peer pattern", got)
+	}
+	// The labels are what `dotvault status` prints against each pattern, so
+	// they must stay positionally aligned with the tiers and name them
+	// distinctly — one shared label read as though the local socket were just
+	// another peer pattern.
+	if want := []string{borrowTierLocalAPI, borrowTierPeers}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("labels = %v, want %v", labels, want)
 	}
 }
 
@@ -174,11 +182,17 @@ func TestNewBorrowChainWithoutLocalSocket(t *testing.T) {
 	cfg := &config.Config{
 		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
 	}
-	tiers := newBorrowChain(cfg).Status()
+	chain, labels := newBorrowChain(cfg)
+	tiers := chain.Status()
 	if len(tiers) != 1 {
 		t.Fatalf("Status() = %d tiers, want 1 (peers only)", len(tiers))
 	}
 	if got := tiers[0].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.sock"}) {
 		t.Errorf("tier 0 = %v, want the peer socket", got)
+	}
+	// A dropped tier must drop its label too, or every subsequent pattern
+	// would be printed under the wrong tier's name.
+	if want := []string{borrowTierPeers}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("labels = %v, want %v", labels, want)
 	}
 }

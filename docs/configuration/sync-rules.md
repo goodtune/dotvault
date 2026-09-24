@@ -96,6 +96,8 @@ Host *
 
 keeps the `User` and the `RemoteForward` listen path stable across syncs (the `username` function resolves to the OS account dotvault runs as), so the forward is updated in place rather than duplicated each cycle. See [Templates](templates.md#template-functions) for the `username` function.
 
+> **One workstation only.** The socket path here is shared, so with more than one workstation forwarding to the same remote the last forward to connect wins it and the others are silently unbound. Prefer the [daemon-managed forwards](../guide/ssh-forwards.md) (`dotvault ssh add`), which bind a per-workstation `~/.ssh/dotvault.<host>.sock` that the borrower's default `token_socket` glob finds.
+
 > **Ordering note.** ssh_config takes the *first* obtained value for each parameter. Directives placed in the global section (no `Host` block) sit at the top of the file and therefore win over any host-specific value below them — keep that in mind when choosing whether a template targets the global section or a specific `Host`/`Match` block.
 
 ## Removing a field

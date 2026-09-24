@@ -21,10 +21,34 @@ import (
 // TODO(pre-1.0, #172): drop the scalar form.
 type SocketList []string
 
+// MarshalYAML keeps the nil/empty distinction on the way out, which the
+// default slice encoding loses: yaml.v3 renders a nil slice as `[]`, which
+// re-parses as a non-nil empty list — "peer sockets explicitly disabled". Both
+// `reg-export` and GET /api/v1/config/download?format=yaml marshal the whole
+// *config.Config through internal/regfile, so without this every host that
+// never set the key exported a config that switched peer borrowing off.
+//
+// The receiver is a value, not a pointer, so this applies when the enclosing
+// VaultConfig is marshalled by value — which is how regfile hands it over.
+func (s SocketList) MarshalYAML() (any, error) {
+	if s == nil {
+		return nil, nil // yaml.v3 emits `token_socket: null`
+	}
+	return []string(s), nil
+}
+
 // UnmarshalYAML accepts a scalar or a sequence of scalars.
 func (s *SocketList) UnmarshalYAML(n *yaml.Node) error {
 	switch n.Kind {
 	case yaml.ScalarNode:
+		// An explicit null is the absent key, not the empty list: it is what
+		// MarshalYAML writes for a nil list, so the round trip has to read it
+		// back as nil or an export/import cycle would silently disable peer
+		// sockets. `token_socket: ""` remains the explicit-disable spelling.
+		if n.Tag == "!!null" {
+			*s = nil
+			return nil
+		}
 		var v string
 		if err := n.Decode(&v); err != nil {
 			return err
@@ -80,7 +104,10 @@ func ValidateSocketPattern(p string) error {
 	case !filepath.IsAbs(p):
 		return errors.New("must be an absolute path (or ~/-relative)")
 	}
-	dir := p[:strings.LastIndex(p, "/")+1]
+	// LastIndexAny, not LastIndex on "/": a Windows pattern is separated by
+	// backslashes, and splitting on "/" alone would treat the whole of
+	// `C:\foo\*\bar.sock` as the final segment and accept a directory glob.
+	dir := p[:strings.LastIndexAny(p, `/\`)+1]
 	if strings.ContainsAny(dir, "*?[") {
 		return errors.New("glob metacharacters are allowed only in the final path segment")
 	}

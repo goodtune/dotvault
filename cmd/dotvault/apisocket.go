@@ -112,10 +112,46 @@ func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
 // (freshLoginBorrowSockets) deliberately do NOT use this: both exclude the local
 // socket outright, so their lists are peers-only and a single pool is already
 // the whole story.
-func newBorrowChain(cfg *config.Config) *peer.Chain {
-	var apiTier *peer.Pool
-	if local, err := cfg.APISocketPath(); err == nil && local != "" {
-		apiTier = peer.NewPool([]string{local})
+//
+// It returns the tier labels alongside the chain, in the same order
+// Chain.Status() reports them, so `dotvault status` can say which tier a
+// pattern belongs to. The two are built in one pass rather than derived
+// separately precisely so they cannot drift: a tier that is not appended
+// contributes no label either.
+func newBorrowChain(cfg *config.Config) (*peer.Chain, []string) {
+	var (
+		tiers  []peer.Borrower
+		labels []string
+	)
+	if local, err := cfg.APISocketPath(); err != nil {
+		// Not fatal — the peers below are still borrowable — but silently
+		// dropping the tier would leave an operator with a misconfigured
+		// api.unix.path wondering why the local daemon is never consulted.
+		slog.Warn("could not resolve api.unix.path; local API socket excluded from borrow", "error", err)
+	} else if local != "" {
+		tiers = append(tiers, peer.NewPool([]string{local}))
+		labels = append(labels, borrowTierLocalAPI)
 	}
-	return peer.NewChain(apiTier, newPeerPool(cfg.PeerActionSockets()))
+	if peers := newPeerPool(cfg.PeerActionSockets()); peers != nil {
+		tiers = append(tiers, peers)
+		labels = append(labels, borrowTierPeers)
+	}
+	return peer.NewChain(tiers...), labels
+}
+
+// borrowTierLocalAPI and borrowTierPeers label the two tiers newBorrowChain
+// builds. They are distinct because the tiers answer different questions: the
+// first is this host's own daemon, the second the workstations forwarding to
+// it, and one shared label made a `dotvault status` listing read as though the
+// local socket were just another peer pattern.
+const (
+	borrowTierLocalAPI = "local API socket"
+	borrowTierPeers    = "peer socket pattern"
+)
+
+// authBorrowChain is newBorrowChain for the callers that want the borrower
+// alone — the auth.Manager wiring, which has no status listing to label.
+func authBorrowChain(cfg *config.Config) *peer.Chain {
+	chain, _ := newBorrowChain(cfg)
+	return chain
 }

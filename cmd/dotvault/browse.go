@@ -19,21 +19,22 @@ import (
 var openLocalBrowser = browser.OpenURL
 
 // newBrowseCmd defines `dotvault browse <url>` — a $BROWSER-shaped wrapper
-// over the remote-browse endpoint. It prefers handing the URL to the peer
-// dotvault named by vault.token_socket (the same SSH-forwarded socket the
+// over the remote-browse endpoint. It prefers handing the URL to every live
+// peer dotvault matching vault.token_socket (the same SSH-forwarded sockets the
 // token borrow uses, so an already-wired headless host needs no new config),
-// and falls back to opening the URL locally when no peer is reachable.
+// and falls back to opening the URL locally when no peer accepted it.
 func newBrowseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "browse <url>",
-		Short: "Open a URL in a browser, preferring the peer over vault.token_socket",
+		Short: "Open a URL in a browser, preferring the peers over vault.token_socket",
 		Long: `Open a URL in a browser.
 
-When vault.token_socket names a reachable peer dotvault (typically an SSH
-RemoteForward from a workstation running the web UI), the URL is posted to
-the peer's /api/v1/remote/browse endpoint so the browser opens on the machine
-that actually has one. When the peer is not configured or not reachable, the
-URL is opened in this host's default browser instead.
+vault.token_socket is a list of socket patterns (by default ~/.ssh/dotvault.sock
+and ~/.ssh/dotvault.*.sock, the paths a workstation's SSH RemoteForward binds).
+The URL is posted to the /api/v1/remote/browse endpoint of every live peer
+socket, so the page opens on each workstation forwarding here and the user finds
+it wherever they are sitting. Only when no peer accepted it is the URL opened in
+this host's default browser instead.
 
 Suitable as a BROWSER environment variable target:
 

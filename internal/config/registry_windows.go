@@ -857,8 +857,10 @@ func readRegMultiString(key registry.Key, name string) []string {
 // readRegistryVaultTokenSockets reads vault.token_socket from the open Vault
 // policy key: a TokenSockets REG_MULTI_SZ if present — including an
 // explicitly empty one, which means "disabled" and must not be confused
-// with an absent value — else a legacy TokenSocket REG_SZ wrapped in a
-// single-element list. Returns nil (not an empty, non-nil slice) only when
+// with an absent value — else a legacy TokenSocket REG_SZ read through
+// ExpandLegacyScalar (the default pair when it names the pre-list default,
+// otherwise the one pattern the operator wrote). Returns nil (not an empty,
+// non-nil slice) only when
 // neither value is present, so the caller's nil-means-absent convention
 // (config.SocketList) round-trips through the registry the same way it does
 // through YAML.

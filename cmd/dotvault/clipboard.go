@@ -21,20 +21,21 @@ var setLocalClipboard = clipboard.Set
 
 // newClipboardCmd defines `dotvault clipboard [text]` — the third peer action
 // alongside `dotvault browse` and `dotvault notify`. It prefers posting to
-// the peer dotvault named by vault.token_socket (the same forwarded socket
-// the token borrow uses), and falls back to this host's clipboard when no
-// peer is reachable.
+// every live peer dotvault matching vault.token_socket (the same forwarded
+// sockets the token borrow uses), and falls back to this host's clipboard when
+// no peer accepted it.
 func newClipboardCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "clipboard [text]",
-		Short: "Put text on the clipboard, preferring the peer over vault.token_socket",
+		Short: "Put text on the clipboard, preferring the peers over vault.token_socket",
 		Long: `Put text on the system clipboard.
 
-When vault.token_socket names a reachable peer dotvault (typically an SSH
-RemoteForward from a workstation running the web UI), the text is posted to
-the peer's /api/v1/remote/clipboard endpoint so it lands on the clipboard of
-the machine the user is actually pasting on. When the peer is not configured
-or not reachable, the text is placed on this host's clipboard instead.
+The text is posted to the /api/v1/remote/clipboard endpoint of every live peer
+socket matching vault.token_socket (by default ~/.ssh/dotvault.sock and
+~/.ssh/dotvault.*.sock), so it lands on the clipboard of each workstation
+forwarding here. With several connected that means ALL of their clipboards, so
+stage a one-time value rather than a long-lived secret. Only when no peer
+accepted it is the text placed on this host's clipboard instead.
 
 With no positional argument (or with "-"), the text is read from stdin; a
 single trailing newline is stripped so shell piping does not paste a stray

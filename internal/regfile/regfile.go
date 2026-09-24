@@ -111,6 +111,11 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	e.writeString("UserPrefix", v.UserPrefix)
 	// Emit TokenSockets whenever non-nil so an explicit empty list round-trips
 	// as an empty REG_MULTI_SZ, matching Policies; nil (absent) emits nothing.
+	//
+	// No `-` deletion stanza is emitted for the legacy Vault\TokenSocket REG_SZ:
+	// a `.reg` merge cannot express the absence of a single value, and it does
+	// not need to — a present TokenSockets always wins on read, so a stale
+	// TokenSocket left behind is inert. It is removed outright with #172.
 	if v.TokenSockets != nil {
 		e.writeMultiString("TokenSockets", v.TokenSockets)
 	}

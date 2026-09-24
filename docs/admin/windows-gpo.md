@@ -29,7 +29,7 @@ Both commands round-trip the **entire** configuration without loss — including
 
 ## Registry schema
 
-Every YAML field has a registry equivalent. The tables below give the value names; `reg-import` writes exactly these, and the live loader reads exactly these.
+Every YAML field has a registry equivalent. The tables below give the value names; `reg-import` writes exactly these, and the live loader reads exactly these. The one exception is `Vault\TokenSocket`, marked as legacy below: the loader still reads it for compatibility, but `reg-import` only ever writes the `Vault\TokenSockets` list that supersedes it.
 
 ### Top-level settings (policy root key)
 
@@ -53,7 +53,8 @@ Every YAML field has a registry equivalent. The tables below give the value name
 | `Vault\Policies` | REG_MULTI_SZ | Least-privilege policy set the working token is downscoped to (empty = carry every granted policy) |
 | `Vault\NoDefaultPolicy` | REG_DWORD | Strip the implicit `default` policy from the working token (0/1) |
 | `Vault\DisableTokenRenewal` | REG_DWORD | Disable RenewSelf (0/1) |
-| `Vault\TokenSocket` | REG_SZ | Path to a peer dotvault web-API Unix socket to borrow a token from |
+| `Vault\TokenSockets` | REG_MULTI_SZ | Peer dotvault socket patterns to borrow a token from and fan peer actions out to (literal paths or final-segment globs); an explicitly empty value disables peer sockets, absent applies the defaults |
+| `Vault\TokenSocket` | REG_SZ | Legacy single-path form, read only when `TokenSockets` is absent; the value `~/.ssh/dotvault.sock` expands to the default pair. Removed before 1.0 ([#172](https://github.com/goodtune/dotvault/issues/172)). |
 
 ### Sync settings (`Sync\` subkey)
 

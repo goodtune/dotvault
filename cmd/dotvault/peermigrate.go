@@ -29,6 +29,14 @@ import (
 // remoteSocketTemplateSince is the first release whose sshfwd expands
 // {{HOSTNAME}}. A peer reporting an older version is left alone: handing it
 // the template would bind a literal-braced socket.
+//
+// RELEASE REQUIREMENT: this constant must equal the release that actually
+// ships {{HOSTNAME}} expansion, so the branch introducing it has to be tagged
+// v0.34.0. Ship it under any lower tag and every peer fails the version gate —
+// the migration then never fires anywhere, and says so only at debug level, so
+// a whole fleet would quietly stay on the shared default socket with nothing in
+// the logs to suggest why. Not covered by a test: main.version is injected at
+// link time, so no unit test can see the tag this builds under.
 const remoteSocketTemplateSince = "0.34.0"
 
 // legacyRemoteSocket is the pre-0.34 default, the only stored value the

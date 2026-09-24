@@ -66,8 +66,8 @@ func (c *Config) APISocketPath() (string, error) {
 // This is the borrow direction only. It is NOT the right order for the peer
 // actions (browse / notify / clipboard), which must reach the workstation
 // where a human is looking — posting those to the local daemon would open a
-// browser on the headless host nobody is sitting at. Those keep using
-// vault.token_socket directly.
+// browser on the headless host nobody is sitting at. Those go through
+// PeerActionSockets, which is this list without the local socket.
 //
 // Peer entries are patterns — literal paths or final-segment globs —
 // resolved by internal/peer.Pool; the default set applies when

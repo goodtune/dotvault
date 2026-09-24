@@ -1352,3 +1352,39 @@ func TestTokenSocketsEmptyVersusAbsent(t *testing.T) {
 		t.Errorf("absent list must not be emitted:\n%s", got)
 	}
 }
+
+// TestTokenSocketsAbsentSurvivesYAMLExport is the same absent-vs-empty
+// distinction on the YAML side, which is the surface an operator actually
+// meets: `reg-export` and GET /api/v1/config/download?format=yaml both marshal
+// the whole *config.Config through MarshalYAML. yaml.v3 renders a nil slice as
+// `[]`, which re-parses as the non-nil empty list meaning "peer sockets
+// explicitly disabled" — so without config.SocketList.MarshalYAML every host
+// that never set the key exported a config that switched borrowing off.
+func TestTokenSocketsAbsentSurvivesYAMLExport(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
+	cfg.Vault.TokenSockets = nil
+
+	yamlBytes, err := MarshalYAML(cfg)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	if strings.Contains(string(yamlBytes), "token_socket: []") {
+		t.Errorf("nil list must not export as an explicit empty list:\n%s", yamlBytes)
+	}
+
+	yamlPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if loaded.Vault.TokenSockets != nil {
+		t.Errorf("absent token_socket reparsed as %#v, want nil (the defaults apply)", loaded.Vault.TokenSockets)
+	}
+	if got, want := loaded.PeerActionSockets(), config.DefaultPeerSocketPatterns; !reflect.DeepEqual(got, want) {
+		t.Errorf("peer sockets after export/import: got %v, want the defaults %v", got, want)
+	}
+}

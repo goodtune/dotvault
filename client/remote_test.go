@@ -49,7 +49,9 @@ func clientSockDir(t *testing.T) string {
 	t.Helper()
 	d, err := os.MkdirTemp("/tmp", "dv")
 	if err != nil {
-		t.Fatal(err)
+		// Windows has no /tmp; the short path only matters where a socket is
+		// bound, so fall back rather than failing a test that may not bind one.
+		return t.TempDir()
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
 	return d

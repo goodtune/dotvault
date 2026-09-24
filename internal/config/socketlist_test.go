@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -108,6 +109,64 @@ func TestSocketListUnmarshalEmptyForms(t *testing.T) {
 	}
 }
 
+// The nil/empty distinction has to survive a marshal too: `reg-export` and the
+// web config download both marshal the whole *config.Config, and yaml.v3's
+// default rendering of a nil slice is `[]` — which re-parses as the non-nil
+// empty list meaning "peer sockets explicitly disabled". So every host that
+// never set the key exported a config that switched borrowing off.
+func TestSocketListYAMLRoundTripPreservesNilVersusEmpty(t *testing.T) {
+	type doc struct {
+		S SocketList `yaml:"token_socket"`
+	}
+	cases := []struct {
+		name    string
+		in      SocketList
+		wantOut string
+		wantNil bool
+		wantLen int
+	}{
+		{name: "nil stays nil", in: nil, wantOut: "token_socket: null\n", wantNil: true},
+		{name: "explicit empty stays non-nil empty", in: SocketList{}, wantOut: "token_socket: []\n"},
+		{
+			name:    "two elements survive",
+			in:      SocketList{LegacyPeerSocket, PerHostPeerSocketGlob},
+			wantOut: "token_socket:\n    - " + LegacyPeerSocket + "\n    - " + PerHostPeerSocketGlob + "\n",
+			wantLen: 2,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Marshalled by value, as internal/regfile hands the config over.
+			out, err := yaml.Marshal(doc{S: c.in})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != c.wantOut {
+				t.Errorf("marshal: got %q, want %q", out, c.wantOut)
+			}
+			var back doc
+			if err := yaml.Unmarshal(out, &back); err != nil {
+				t.Fatal(err)
+			}
+			if c.wantNil {
+				if back.S != nil {
+					t.Fatalf("reparse: got %#v, want nil", back.S)
+				}
+				return
+			}
+			if back.S == nil {
+				t.Fatal("reparse: got nil, want non-nil")
+			}
+			if len(back.S) != c.wantLen {
+				t.Fatalf("reparse: got %#v, want %d elements", back.S, c.wantLen)
+			}
+			if c.wantLen > 0 && !reflect.DeepEqual(back.S, c.in) {
+				t.Errorf("reparse: got %v, want %v", back.S, c.in)
+			}
+		})
+	}
+}
+
 func TestSocketListUnmarshalRejectsMapping(t *testing.T) {
 	var v struct {
 		S SocketList `yaml:"token_socket"`
@@ -144,6 +203,28 @@ func TestValidateSocketPattern(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 			t.Errorf("%q: got %v, want error containing %q", c.in, err, c.wantErr)
 		}
+	}
+}
+
+// A Windows pattern is backslash-separated, so the final-segment split must use
+// LastIndexAny rather than LastIndex on "/" — otherwise the whole of
+// `C:\foo\*\bar.sock` reads as one final segment and a directory glob is
+// accepted. The rejection is asserted on every platform (the *reason* differs:
+// off Windows filepath.IsAbs rejects `C:\…` as relative first), while the
+// accepted spelling is only accepted where it is genuinely absolute.
+func TestValidateSocketPatternWindowsSeparator(t *testing.T) {
+	if err := ValidateSocketPattern(`C:\foo\*\bar.sock`); err == nil {
+		t.Error(`C:\foo\*\bar.sock: got nil, want a rejection`)
+	}
+	err := ValidateSocketPattern(`C:\foo\dotvault.*.sock`)
+	if runtime.GOOS == "windows" {
+		if err != nil {
+			t.Errorf(`C:\foo\dotvault.*.sock: unexpected error %v`, err)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), "must be an absolute path") {
+		t.Errorf(`C:\foo\dotvault.*.sock off windows: got %v, want a non-absolute rejection`, err)
 	}
 }
 

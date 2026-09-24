@@ -210,10 +210,14 @@ func Save(path string, f *File) error {
 // mishandling it would bind somewhere the user did not intend. Paths containing
 // .. segments are rejected to prevent escape to parent directories.
 func ValidateRemoteSocket(p string) error {
-	// Only the exact token is a template. Any other brace would bind a
-	// literal-braced socket that happens to match the borrower's glob.
+	// Only the exact token is a template. Any other brace would bind a socket
+	// whose literal braces still match the borrower's dotvault.*.sock glob, so
+	// the typo would look like a working forward while every peer bound the
+	// same path — the exact collision the token exists to end. A single brace
+	// is rejected too, not just a doubled one: `{HOSTNAME}` is the likeliest
+	// spelling of the mistake and survives the token strip untouched.
 	stripped := strings.ReplaceAll(p, HostnameToken, "x")
-	if strings.Contains(stripped, "{{") || strings.Contains(stripped, "}}") {
+	if strings.ContainsAny(stripped, "{}") {
 		return fmt.Errorf("remote_socket may contain only the %s template token", HostnameToken)
 	}
 	switch {

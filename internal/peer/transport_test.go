@@ -34,7 +34,7 @@ func newUnixTokenServer(t *testing.T, sockPath string, handler http.HandlerFunc)
 }
 
 func TestFetchToken_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"token":"hvs.peer-token"}`))
@@ -59,7 +59,7 @@ func TestFetchToken_EmptyPath(t *testing.T) {
 func TestFetchToken_MissingSocket(t *testing.T) {
 	// A path that does not exist must resolve to ("", nil) — the peer simply
 	// isn't connected, and the caller carries on with its normal auth flow.
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 	got, err := FetchToken(context.Background(), sock)
 	if err != nil || got != "" {
 		t.Errorf("got (%q, %v), want (\"\", nil)", got, err)
@@ -69,7 +69,7 @@ func TestFetchToken_MissingSocket(t *testing.T) {
 func TestFetchToken_StaleSocket(t *testing.T) {
 	// A regular file at the socket path (no listener) stands in for a stale
 	// socket left behind by a dead SSH session: the dial fails and we carry on.
-	sock := filepath.Join(t.TempDir(), "stale.sock")
+	sock := filepath.Join(sockDir(t), "stale.sock")
 	if err := os.WriteFile(sock, []byte("not a socket"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestFetchToken_StaleSocket(t *testing.T) {
 func TestFetchToken_PeerUnauthenticated(t *testing.T) {
 	// The peer is reachable but holds no token (mirrors handleToken's 401):
 	// best-effort, so we return ("", nil) rather than an error.
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"not authenticated"}`, http.StatusUnauthorized)
 	})
@@ -94,7 +94,7 @@ func TestFetchToken_PeerUnauthenticated(t *testing.T) {
 }
 
 func TestFetchToken_MalformedBody(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixTokenServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`this is not json`))
 	})
@@ -145,7 +145,7 @@ func newUnixServer(t *testing.T, sockPath, pattern string, handler http.HandlerF
 }
 
 func TestPostForm_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	var gotPath, gotField, gotHost string
 	newUnixServer(t, sock, "POST /api/v1/remote/browse", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -169,7 +169,7 @@ func TestPostForm_Success(t *testing.T) {
 }
 
 func TestPostForm_MissingSocketIsUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 	err := PostForm(context.Background(), sock, "/api/v1/remote/browse", url.Values{})
 	if !errors.Is(err, ErrPeerUnreachable) {
 		t.Fatalf("err = %v, want it to wrap ErrPeerUnreachable", err)
@@ -177,7 +177,7 @@ func TestPostForm_MissingSocketIsUnreachable(t *testing.T) {
 }
 
 func TestPostForm_StaleSocketIsUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "stale.sock")
+	sock := filepath.Join(sockDir(t), "stale.sock")
 	if err := os.WriteFile(sock, []byte("not a socket"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestPostForm_StaleSocketIsUnreachable(t *testing.T) {
 }
 
 func TestPostForm_NonOKIsStatusError(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixServer(t, sock, "POST /api/v1/remote/browse", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":"unsupported url scheme"}`))

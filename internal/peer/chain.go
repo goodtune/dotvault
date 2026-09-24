@@ -37,6 +37,16 @@ func NewChain(borrowers ...Borrower) *Chain {
 		if b == nil {
 			continue
 		}
+		// A caller that declares `var p *Pool` and passes it unassigned hands
+		// over a non-nil interface holding a nil pointer, which the check
+		// above cannot see. *Pool is nil-receiver safe so keeping it would
+		// borrow nothing rather than panic, but it would still count as a
+		// tier — and Status() skips it, so the tier list and the status list
+		// would be different lengths. Drop it here instead, which is what
+		// makes "nil borrowers are dropped" true for both spellings.
+		if p, ok := b.(*Pool); ok && p == nil {
+			continue
+		}
 		c.tiers = append(c.tiers, b)
 	}
 	return c
@@ -58,10 +68,12 @@ func (c *Chain) Borrow(ctx context.Context) (string, string) {
 }
 
 // Status reports each pool tier's status, in tier order, for diagnostics
-// (`dotvault status`). A tier that is not a *Pool — or is a nil one, which is
-// what a caller building a tier it has no config for ends up with — is skipped
-// rather than reported as an empty tier, since "no sockets present" and "this
-// tier does not exist" are different answers and only the first is useful.
+// (`dotvault status`). A tier that is not a *Pool is skipped rather than
+// reported as an empty tier, since "no sockets present" and "this tier does
+// not exist" are different answers and only the first is useful. A nil *Pool
+// never reaches here — NewChain drops it — so the tiers Status reports are
+// positionally aligned with the ones NewChain kept, which is what lets a
+// caller label them (see cmd/dotvault newBorrowChain).
 func (c *Chain) Status() []Status {
 	if c == nil {
 		return nil

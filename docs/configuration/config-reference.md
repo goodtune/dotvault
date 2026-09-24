@@ -296,10 +296,18 @@ devbox: your tmux job, scripts, Python bindings
 Configuration on the devbox is both settings together — borrow from the workstation, serve to everything local:
 
 ```yaml
-vault:
-  token_socket: ~/.ssh/dotvault.sock   # borrow from the workstation
 api:
-  enabled: true                        # serve the borrow endpoint locally
+  enabled: true   # serve the borrow endpoint locally
+```
+
+`token_socket` is deliberately absent here: the default pattern list already covers both the per-workstation sockets (`~/.ssh/dotvault.*.sock`) and the pre-0.34 shared path, so a devbox only needs the `api` half. Set it explicitly when the forwards live somewhere other than `~/.ssh`, and set it as a **list** when you do:
+
+```yaml
+vault:
+  token_socket:
+    - ~/.ssh/dotvault.*.sock   # one socket per forwarding workstation
+api:
+  enabled: true
 ```
 
 Clients on that host need no extra configuration: they read the same config and derive the same socket path.

@@ -1769,10 +1769,17 @@ func reportCertCredential(cfg *config.Config) {
 // to borrow from", which a pattern-only view collapsed into one unhelpful line.
 // Evicted members are shown deliberately: eviction is a re-probe window, not a
 // verdict, so a socket in that state is still part of the picture.
-func printPeerPoolStatus(tiers []peer.Status) {
-	for _, st := range tiers {
+// labels names each tier (newBorrowChain supplies them in Status order); a
+// tier with no label falls back to the generic wording rather than going
+// unnamed, since the labels are cosmetic and must not gate the diagnostics.
+func printPeerPoolStatus(labels []string, tiers []peer.Status) {
+	for i, st := range tiers {
+		label := "token socket pattern"
+		if i < len(labels) {
+			label = labels[i]
+		}
 		for _, p := range st.Patterns {
-			fmt.Printf("  token socket pattern: %s\n", p)
+			fmt.Printf("  %s: %s\n", label, p)
 		}
 		if len(st.Members) == 0 {
 			fmt.Println("    none present")
@@ -1780,8 +1787,10 @@ func printPeerPoolStatus(tiers []peer.Status) {
 		}
 		for _, m := range st.Members {
 			state := "active"
-			if m.Evicted {
+			if m.Evicted && m.EvictedAt != nil {
 				state = "evicted " + m.EvictedAt.Format("15:04:05")
+			} else if m.Evicted {
+				state = "evicted"
 			}
 			fmt.Printf("    %s (%s, last seen %s)\n", m.Path, state, m.LastSeen.Format("2006-01-02 15:04:05"))
 		}
@@ -1830,7 +1839,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	persistsToken := auth.PersistTokenAtRest(cfg.Vault.AuthMethod)
 	token := resolveTokenForMethod(paths.VaultTokenPath(), persistsToken)
 	borrowSockets := cfg.TokenBorrowSockets()
-	borrowChain := newBorrowChain(cfg)
+	borrowChain, borrowTiers := newBorrowChain(cfg)
 	borrowedFrom := ""
 	if token == "" {
 		if peerToken, source := borrowChain.Borrow(ctx); peerToken != "" {
@@ -1847,7 +1856,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		reportCertCredential(cfg)
 	case token == "" && len(borrowSockets) > 0:
 		fmt.Println("Auth: not authenticated (no local token; no peer socket holds a token)")
-		printPeerPoolStatus(borrowChain.Status())
+		printPeerPoolStatus(borrowTiers, borrowChain.Status())
 	case token == "":
 		fmt.Println("Auth: not authenticated (no token)")
 	default:
@@ -1861,7 +1870,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			if borrowedFrom != "" {
 				fmt.Printf("  source: borrowed from peer socket (%s)\n", borrowedFrom)
 				fmt.Println("  (no token file at rest — the peer is the sole owner; re-borrowed on each login/refresh)")
-				printPeerPoolStatus(borrowChain.Status())
+				printPeerPoolStatus(borrowTiers, borrowChain.Status())
 			}
 		}
 	}
@@ -2349,7 +2358,7 @@ func runLoginCheck(cmd *cobra.Command, args []string) error {
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		Borrower:         newBorrowChain(cfg),
+		Borrower:         authBorrowChain(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),
@@ -2585,7 +2594,7 @@ func authenticate(ctx context.Context, cfg *config.Config) (string, *vault.Clien
 		AuthMount:        cfg.Vault.AuthMount,
 		AuthRole:         cfg.Vault.AuthRole,
 		OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-		Borrower:         newBorrowChain(cfg),
+		Borrower:         authBorrowChain(cfg),
 		Policy:           vaultPolicyConstraint(cfg),
 		Username:         username,
 		MTLS:             mtlsParams(cfg, username),

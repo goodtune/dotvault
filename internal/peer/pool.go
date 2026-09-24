@@ -42,11 +42,16 @@ var ErrNoPeers = fmt.Errorf("no active peer sockets: %w", ErrPeerUnreachable)
 const EvictProbeInterval = 5 * time.Minute
 
 // Member is one resolved socket, as reported by Status.
+//
+// EvictedAt is a pointer so `omitempty` actually works: a zero time.Time is a
+// struct, which encoding/json emits regardless, so an active member reported
+// itself with a meaningless "evicted_at":"0001-01-01T00:00:00Z". It is set if
+// and only if Evicted.
 type Member struct {
-	Path      string    `json:"path"`
-	LastSeen  time.Time `json:"last_seen"`
-	Evicted   bool      `json:"evicted"`
-	EvictedAt time.Time `json:"evicted_at,omitempty"`
+	Path      string     `json:"path"`
+	LastSeen  time.Time  `json:"last_seen"`
+	Evicted   bool       `json:"evicted"`
+	EvictedAt *time.Time `json:"evicted_at,omitempty"`
 }
 
 // Status is the pool's externally visible state (GET /api/v1/status
@@ -251,8 +256,9 @@ func (p *Pool) Resolve() []Member {
 // reconnect the pool exists to follow. Keying eviction on the name alone would
 // let that stale failure take the healthy replacement dark for a whole
 // EvictProbeInterval, having already consumed the inotify event that would
-// have brought it back. Note statIdentity is a stub on Windows, so the guard
-// is inert there; that platform resolves no Unix peer sockets anyway.
+// have brought it back. Note statIdentity is a stub on Windows, so every
+// identity compares equal there and the guard is inert; the cost is only a
+// redundant eviction, and EvictProbeInterval still readmits.
 func (p *Pool) evict(ctx context.Context, path string, id identity, cause error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -457,10 +463,13 @@ func (p *Pool) Status() Status {
 	p.resolveLocked(context.Background())
 	out := Status{Patterns: append([]string(nil), p.raw...)}
 	for _, m := range p.members {
-		out.Members = append(out.Members, Member{
-			Path: m.path, LastSeen: m.lastSeen,
-			Evicted: !m.evictedAt.IsZero(), EvictedAt: m.evictedAt,
-		})
+		entry := Member{Path: m.path, LastSeen: m.lastSeen}
+		if !m.evictedAt.IsZero() {
+			at := m.evictedAt
+			entry.Evicted = true
+			entry.EvictedAt = &at
+		}
+		out.Members = append(out.Members, entry)
 	}
 	sort.Slice(out.Members, func(i, j int) bool { return out.Members[i].Path < out.Members[j].Path })
 	return out

@@ -811,7 +811,12 @@ func TestPatchDeferredReconcileReturnsBeforeReconciling(t *testing.T) {
 	}
 
 	want := "/tmp/dotvault-deferred.sock"
-	got, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: 20 * time.Millisecond})
+	// 400ms, not a handful: the assertion immediately below is a negative one
+	// ("has not reconciled yet"), and a window measured in tens of
+	// milliseconds is one scheduling hiccup away from a false pass. The
+	// positive half polls with its own deadline, so the larger delay costs
+	// the test nothing.
+	got, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: 400 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Patch() = %v", err)
 	}
@@ -846,8 +851,9 @@ func TestPatchDeferredReconcileUsesLatestFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	const deferred = 400 * time.Millisecond
 	want := "/tmp/dotvault-latest.sock"
-	if _, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: 150 * time.Millisecond}); err != nil {
+	if _, err := g.Patch(ctx, "foo.example.com", Patch{RemoteSocket: &want, ReconcileDelay: deferred}); err != nil {
 		t.Fatalf("deferred Patch() = %v", err)
 	}
 
@@ -862,14 +868,22 @@ func TestPatchDeferredReconcileUsesLatestFile(t *testing.T) {
 		t.Fatalf("running state = %q after the synchronous patch, want %q", state, StateDisabled)
 	}
 
-	time.Sleep(400 * time.Millisecond)
-
-	socket, state := socketOf(g, "foo.example.com")
-	if state != string(StateDisabled) {
-		t.Errorf("running state = %q after the deferred reconcile fired, want %q: it reverted a later edit", state, StateDisabled)
-	}
-	if socket != want {
-		t.Errorf("running socket = %q, want %q: both changes should be present", socket, want)
+	// Polled across the window rather than sampled once after a fixed sleep.
+	// A correct deferred pass converges on the state the synchronous patch
+	// already produced, so there is nothing new to wait *for* — the property
+	// is that the earlier snapshot is never replayed, and checking
+	// continuously catches a revert that a single late sample could miss
+	// (a resurrected runner moves through several states of its own).
+	deadline := time.Now().Add(deferred + time.Second)
+	for time.Now().Before(deadline) {
+		socket, state := socketOf(g, "foo.example.com")
+		if state != string(StateDisabled) {
+			t.Fatalf("running state = %q, want %q: the deferred reconcile reverted a later edit", state, StateDisabled)
+		}
+		if socket != want {
+			t.Fatalf("running socket = %q, want %q: both changes should be present throughout", socket, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

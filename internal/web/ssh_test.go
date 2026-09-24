@@ -331,9 +331,13 @@ func TestSSHRemotesPatchDefersReconcile(t *testing.T) {
 		t.Fatalf("seeding Add: %v", err)
 	}
 
+	// 400ms, not a handful of milliseconds: the "has not reconciled yet"
+	// assertion below is a negative one, and a tiny window is one scheduling
+	// hiccup away from passing for the wrong reason. The positive half polls
+	// with its own deadline, so the larger delay costs nothing.
 	const want = "/tmp/dotvault-web-deferred.sock"
 	req := httptest.NewRequest("PATCH", "/api/v1/ssh/remotes/example.com",
-		jsonBody(t, map[string]any{"remote_socket": want, "reconcile_delay": "50ms"}))
+		jsonBody(t, map[string]any{"remote_socket": want, "reconcile_delay": "400ms"}))
 	req.Header.Set("Content-Type", "application/json")
 	req.SetPathValue("host", "example.com")
 	w := httptest.NewRecorder()

@@ -178,22 +178,32 @@ func (o *outcomes) snapshot() []migrateOutcome {
 // renamedSocketServer stands the workstation's renamed forward up on demand:
 // a status-answering socket at a path, which is exactly what the migrator's
 // confirmation probe goes looking for.
+// It reports a hostname label of its own, because the probe requires the
+// renamed socket to answer as the *same* peer.
 type renamedSocketServer struct {
-	mu  sync.Mutex
-	srv *http.Server
+	mu     sync.Mutex
+	srv    *http.Server
+	closed bool
 }
 
-func (r *renamedSocketServer) start(path string) {
+func (r *renamedSocketServer) start(path, label string) {
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"version":"0.34.0"}`))
+		_, _ = w.Write([]byte(`{"version":"0.34.0","hostname_label":"` + label + `"}`))
 	})
 	s := &http.Server{Handler: mux}
 	r.mu.Lock()
+	// A test that fails early runs its cleanup before this goroutine gets
+	// here; serving anyway would leak the Serve goroutine past the test.
+	if r.closed {
+		r.mu.Unlock()
+		_ = ln.Close()
+		return
+	}
 	r.srv = s
 	r.mu.Unlock()
 	_ = s.Serve(ln)
@@ -201,6 +211,7 @@ func (r *renamedSocketServer) start(path string) {
 
 func (r *renamedSocketServer) close() {
 	r.mu.Lock()
+	r.closed = true
 	s := r.srv
 	r.mu.Unlock()
 	if s != nil {
@@ -410,7 +421,7 @@ func TestMigrateConfirmsAfterDroppedResponse(t *testing.T) {
 		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
 	}, afterPatch: func() {
 		time.Sleep(100 * time.Millisecond)
-		later.start(expected)
+		later.start(expected, defaultHostnameLabel)
 	}}
 	srv.serve(t, sock)
 
@@ -444,7 +455,7 @@ func TestMigrateConfirmsRenamedSocket(t *testing.T) {
 		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
 	}, afterPatch: func() {
 		time.Sleep(100 * time.Millisecond)
-		later.start(expected)
+		later.start(expected, defaultHostnameLabel)
 	}}
 	srv.serve(t, sock)
 
@@ -480,6 +491,34 @@ func TestMigrateReportsUncertainWhenSocketNeverAppears(t *testing.T) {
 	}
 }
 
+// A socket at the expected path is not by itself evidence the rename landed:
+// a second workstation's forward can sit at a name this host's glob also
+// matches. The probe requires the peer behind it to report the same hostname
+// label, so a stranger there leaves the migration uncertain.
+func TestMigrateDoesNotConfirmADifferentPeer(t *testing.T) {
+	dir := sockDir(t)
+	sock := filepath.Join(dir, "dotvault.sock")
+	expected := filepath.Join(dir, "dotvault."+defaultHostnameLabel+".sock")
+
+	later := &renamedSocketServer{}
+	t.Cleanup(later.close)
+	srv := &fakePeer{version: "0.34.0", remotes: []map[string]any{
+		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
+	}, afterPatch: func() {
+		time.Sleep(50 * time.Millisecond)
+		later.start(expected, "laptop")
+	}}
+	srv.serve(t, sock)
+
+	m, got := newTestMigrator(t, sock, globPatterns(sock))
+	m.maybeMigrate(context.Background(), sock)
+
+	waitFor(t, func() bool { return len(got.snapshot()) == 1 })
+	if o := got.snapshot()[0]; o.confirmed {
+		t.Errorf("outcome = %+v, want uncertain: the socket is served by a different peer", o)
+	}
+}
+
 // The guard is against the exact path the peer's own hostname label produces.
 // A pattern that matches some other shape — `dotvault.?.sock` matches a
 // one-character label and nothing longer — must refuse, and a peer that
@@ -508,6 +547,37 @@ func TestMigrateGuardUsesThePeersRealLabel(t *testing.T) {
 			patterns:  func(dir string) []string { return []string{filepath.Join(dir, "dotvault.*.sock")} },
 			wantPatch: false,
 		},
+		{
+			// The label is joined into a filesystem path, so a hostile peer
+			// must not be able to steer the confirmation probe with one.
+			name:      "path traversal in the label",
+			label:     "../../etc",
+			patterns:  func(dir string) []string { return []string{filepath.Join(dir, "dotvault.*.sock")} },
+			wantPatch: false,
+		},
+		{
+			// The case the pattern guard alone would wave through: a bare
+			// glob metacharacter matches the borrower's own `dotvault.*.sock`
+			// pattern literally, so only the label validation stops it.
+			name:      "glob metacharacter in the label",
+			label:     "*",
+			patterns:  func(dir string) []string { return []string{filepath.Join(dir, "dotvault.*.sock")} },
+			wantPatch: false,
+		},
+		{
+			// LocalHostnameLabel lowercases, so an uppercase label did not
+			// come from a dotvault that agrees with this one about naming.
+			name:      "uppercase label",
+			label:     "Desktop",
+			patterns:  func(dir string) []string { return []string{filepath.Join(dir, "dotvault.*.sock")} },
+			wantPatch: false,
+		},
+		{
+			name:      "ordinary lowercase label",
+			label:     "desktop",
+			patterns:  func(dir string) []string { return []string{filepath.Join(dir, "dotvault.*.sock")} },
+			wantPatch: true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -530,6 +600,9 @@ func TestMigrateGuardUsesThePeersRealLabel(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			if len(srv.patched()) != 0 {
 				t.Errorf("patched despite the guard: %v", srv.patched())
+			}
+			if got := outcome.snapshot(); len(got) != 0 {
+				t.Errorf("outcomes = %v, want none: a refusal reaches no confirmation", got)
 			}
 		})
 	}

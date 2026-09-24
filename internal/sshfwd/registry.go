@@ -550,10 +550,11 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 //
 // The context is detached: the only caller is an HTTP handler, whose context
 // Go cancels the moment it returns — which is the whole point of deferring,
-// so inheriting that cancellation would defeat it. The Registry has no
-// lifetime context of its own to use instead, and Manager.Reconcile rejects
-// anything that arrives after Close, so a goroutine outliving shutdown fails
-// cleanly rather than resurrecting remotes.
+// so inheriting that cancellation would defeat it. Nothing cancels this: the
+// Registry has no lifetime context of its own to substitute, so the wait runs
+// to completion and Manager.Reconcile's rejection of anything arriving after
+// Close is the backstop — a goroutine outliving shutdown fails cleanly rather
+// than resurrecting remotes.
 //
 // It re-loads the file rather than closing over the slice this Patch
 // committed: a second mutation inside the window must win, not be quietly
@@ -561,11 +562,7 @@ func (g *Registry) Patch(ctx context.Context, host string, p Patch) (*Remote, er
 func (g *Registry) deferReconcile(ctx context.Context, delay time.Duration) {
 	ctx = context.WithoutCancel(ctx)
 	go func() {
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return
-		}
+		<-time.After(delay)
 
 		g.txMu.Lock()
 		defer g.txMu.Unlock()

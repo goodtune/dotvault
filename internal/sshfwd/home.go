@@ -46,6 +46,43 @@ func LocalHostnameLabel() (string, error) {
 	return out, nil
 }
 
+// maxHostnameLabel is the DNS limit on a single label, and so the ceiling on
+// anything LocalHostnameLabel can legitimately produce.
+const maxHostnameLabel = 63
+
+// ValidateHostnameLabel reports whether s is a label LocalHostnameLabel could
+// have produced: non-empty, at most 63 bytes, every byte in [a-z0-9-], and no
+// leading or trailing '-'.
+//
+// It exists for the consumer that does not produce its own label but is handed
+// one — the pre-1.0 forward migration reads `hostname_label` out of a peer's
+// unauthenticated status response and builds a socket path from it, so an
+// unchecked value would be path traversal by a hostile or merely broken peer.
+// The rule lives here, next to the producer, so the two definitions cannot
+// drift; nothing on this side of the boundary needs to call it.
+func ValidateHostnameLabel(s string) error {
+	if s == "" {
+		return fmt.Errorf("hostname label is empty")
+	}
+	if len(s) > maxHostnameLabel {
+		return fmt.Errorf("hostname label is %d bytes, over the %d-byte limit", len(s), maxHostnameLabel)
+	}
+	if s[0] == '-' || s[len(s)-1] == '-' {
+		return fmt.Errorf("hostname label starts or ends with '-'")
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+		default:
+			// Deliberately reports the position, not the byte: the caller
+			// logs this and the value came from off-host.
+			return fmt.Errorf("hostname label has a character outside [a-z0-9-] at byte %d", i)
+		}
+	}
+	return nil
+}
+
 // CommandRunner runs a single command on the remote and returns its stdout.
 // Abstracted so expansion is testable without an SSH server.
 type CommandRunner interface {

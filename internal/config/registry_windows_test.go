@@ -887,8 +887,48 @@ func TestReadRegistryVaultTokenSocketsLegacyREGSZ(t *testing.T) {
 	}
 	defer vk.Close()
 
+	// The legacy default expands to the pair, exactly as the YAML scalar does:
+	// read literally it would leave the host unable to find its forward once
+	// the workstation renames it. See config.ExpandLegacyScalar.
 	got := readRegistryVaultTokenSockets(vk)
-	want := []string{"~/.ssh/dotvault.sock"}
+	want := []string{LegacyPeerSocket, PerHostPeerSocketGlob}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want %v", got, want)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsLegacyREGSZOtherValue pins the other half of
+// the rule: a REG_SZ naming something that is not the pre-list default is the
+// admin's own choice and stays a one-element list.
+//
+// TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
+func TestReadRegistryVaultTokenSocketsLegacyREGSZOtherValue(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensocket-other\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringValue("TokenSocket", `C:\peer\api.sock`); err != nil {
+		t.Fatalf("set TokenSocket: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	got := readRegistryVaultTokenSockets(vk)
+	want := []string{`C:\peer\api.sock`}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("readRegistryVaultTokenSockets = %v, want %v", got, want)
 	}

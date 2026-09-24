@@ -884,7 +884,10 @@ func readRegistryVaultTokenSockets(vk registry.Key) []string {
 		return []string{}
 	}
 	if legacy, ok := readRegString(vk, "TokenSocket"); ok && legacy != "" {
-		return []string{legacy}
+		// ExpandLegacyScalar, not []string{legacy}: the pre-list default read
+		// literally would leave a host unable to find its forward once the
+		// workstation renames it to the per-hostname path. See its godoc.
+		return ExpandLegacyScalar(legacy)
 	}
 	return nil
 }

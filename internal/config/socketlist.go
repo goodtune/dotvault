@@ -33,7 +33,7 @@ func (s *SocketList) UnmarshalYAML(n *yaml.Node) error {
 			*s = SocketList{}
 			return nil
 		}
-		*s = SocketList{v}
+		*s = ExpandLegacyScalar(v)
 		return nil
 	case yaml.SequenceNode:
 		var v []string
@@ -87,13 +87,50 @@ func ValidateSocketPattern(p string) error {
 	return nil
 }
 
+// LegacyPeerSocket is the pre-list default peer socket path: the value a
+// scalar vault.token_socket almost always held, and the path an un-upgraded
+// workstation's managed forward still binds.
+//
+// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+const LegacyPeerSocket = "~/.ssh/dotvault.sock"
+
+// PerHostPeerSocketGlob matches the per-hostname socket every upgraded
+// workstation's managed forward binds (see sshfwd.DefaultRemoteSocket).
+const PerHostPeerSocketGlob = "~/.ssh/dotvault.*.sock"
+
 // DefaultPeerSocketPatterns is the vault.token_socket value applied when the
 // key is absent: the pre-list default path, so a workstation that has not
 // been upgraded keeps working, plus the per-hostname pattern every upgraded
-// workstation's managed forward binds (see sshfwd.DefaultRemoteSocket).
+// one binds.
 //
-// TODO(pre-1.0, #ISSUE): drop ~/.ssh/dotvault.sock from the defaults.
-var DefaultPeerSocketPatterns = []string{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"}
+// TODO(pre-1.0, #ISSUE): drop LegacyPeerSocket from the defaults.
+var DefaultPeerSocketPatterns = []string{LegacyPeerSocket, PerHostPeerSocketGlob}
+
+// ExpandLegacyScalar turns a single pre-list peer socket value into the list
+// it should be read as. A value of exactly LegacyPeerSocket becomes the pair
+// {LegacyPeerSocket, PerHostPeerSocketGlob}; anything else stays the one
+// pattern the operator named.
+//
+// The pair is what keeps a host that spells the pre-list default explicitly —
+// `token_socket: ~/.ssh/dotvault.sock`, the shape every pre-0.34 config guide
+// showed — able to find its forward after the workstation renames it to the
+// per-hostname path. Read literally, such a host would borrow once, trigger
+// the rename, and then match no socket at all, with nothing to recover it.
+// Taking the scalar as "the default, as it was then written" rather than as a
+// deliberate one-element list is the reading that preserves the operator's
+// actual intent.
+//
+// It returns the expanded pair rather than falling through to the absent-key
+// default so an exported config shows what is in force instead of the lossy
+// absent form.
+//
+// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+func ExpandLegacyScalar(v string) SocketList {
+	if v == LegacyPeerSocket {
+		return SocketList{LegacyPeerSocket, PerHostPeerSocketGlob}
+	}
+	return SocketList{v}
+}
 
 // peerSocketPatterns returns the configured peer patterns with the default
 // applied for an absent key. Defaulting happens here rather than at load so

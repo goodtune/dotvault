@@ -15,11 +15,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/sshfwd"
 )
@@ -32,22 +34,43 @@ const remoteSocketTemplateSince = "0.34.0"
 // legacyRemoteSocket is the pre-0.34 default, the only stored value the
 // migration touches. An absolute spelling of the same path is an operator's
 // deliberate choice, not the untouched default, so it is left alone.
-const legacyRemoteSocket = "~/.ssh/dotvault.sock"
+//
+// It is the workstation's ssh.yaml remote_socket, and config.LegacyPeerSocket
+// is this host's borrow pattern for the same forward — the same path seen from
+// the two ends, which is why the migrator can be pointed at the expansion of
+// either. Deliberately two constants: they are removed on different schedules.
+const legacyRemoteSocket = config.LegacyPeerSocket
 
 // migrateTimeout bounds the whole background exchange (status, list, csrf,
 // patch) so a hung peer cannot leave a goroutine parked for the daemon's
 // lifetime.
 const migrateTimeout = 15 * time.Second
 
+// migrateProbeLabel stands in for the workstation's future hostname label when
+// checking that this host has a borrow pattern covering the renamed socket.
+// The workstation's label is unknowable from here — {{HOSTNAME}} is expanded
+// at its end — and it is not the question anyway: what matters is whether the
+// borrower carries a glob over dotvault.<anything>.sock.
+const migrateProbeLabel = "x"
+
+// maxMigratedIdentities bounds the once-per-identity bookkeeping. A daemon
+// only ever sees one old-default socket path, re-created each time the forward
+// reconnects, so 64 is many reconnects' worth of history; past that the oldest
+// entry is dropped, which at worst costs one extra attempt against a socket
+// nothing has seen in a very long time.
+const maxMigratedIdentities = 64
+
 // peerMigrator PATCHes a workstation's managed-forward entry for this host
 // from the old shared default to the per-hostname template, over the very
 // socket that forward created. It is daemon-only and runs at most once per
 // socket identity per process.
 type peerMigrator struct {
-	oldDefault string // expanded $HOME/.ssh/dotvault.sock
+	oldDefault string   // expanded $HOME/.ssh/dotvault.sock
+	patterns   []string // this host's expanded borrow patterns
 
-	mu   sync.Mutex
-	done map[peerIdentity]bool
+	mu    sync.Mutex
+	done  map[peerIdentity]bool
+	order []peerIdentity // insertion order, for the bound above
 }
 
 // peerIdentity is the device/inode pair behind a socket node. Keying on it
@@ -56,8 +79,64 @@ type peerMigrator struct {
 // socket still sitting there is not retried.
 type peerIdentity struct{ dev, ino uint64 }
 
-func newPeerMigrator(oldDefault string) *peerMigrator {
-	return &peerMigrator{oldDefault: oldDefault, done: make(map[peerIdentity]bool)}
+// newPeerMigrator builds the migrator. patterns is this host's expanded borrow
+// pattern list (peer.Pool.Patterns), which the migration needs because the
+// rename it triggers moves the socket it is talking through: a host with no
+// pattern covering the new name would lose its only token source. See
+// canFindRenamedSocket.
+func newPeerMigrator(oldDefault string, patterns []string) *peerMigrator {
+	return &peerMigrator{
+		oldDefault: oldDefault,
+		patterns:   append([]string(nil), patterns...),
+		done:       make(map[peerIdentity]bool),
+	}
+}
+
+// canFindRenamedSocket reports whether any of this host's borrow patterns would
+// match the socket the workstation is about to rename its forward to.
+//
+// This is the guard against the migration severing its own borrow source. A
+// config that spells the pre-list default as a one-element list — which every
+// pre-0.34 guide showed as a scalar, and which an operator may equally have
+// written out as a list — matches only ~/.ssh/dotvault.sock. Migrate on that
+// host and the forward rebinds to a name nothing in the list matches, leaving
+// no token source and nothing to recover it: the borrow that would have
+// noticed can no longer happen. config.ExpandLegacyScalar handles the scalar
+// spelling; an explicit one-element list is the operator's own words, so it is
+// left alone and this refusal is what keeps it safe.
+//
+// The probe path uses a stand-in label (see migrateProbeLabel) because the
+// question is whether a glob covers the shape, not what the workstation will
+// actually be called.
+func (m *peerMigrator) canFindRenamedSocket() bool {
+	probe := filepath.Join(filepath.Dir(m.oldDefault), "dotvault."+migrateProbeLabel+".sock")
+	for _, pat := range m.patterns {
+		// A malformed pattern reports an error and no match; nothing to do
+		// about it here, and the pool has already logged it.
+		if ok, _ := filepath.Match(pat, probe); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// claim records id as handled and reports whether this caller is the one that
+// got to it first. Marking before the attempt rather than after is deliberate:
+// a failure is not retried until the socket is re-created, which is the only
+// event that makes a different answer likely.
+func (m *peerMigrator) claim(id peerIdentity) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.done[id] {
+		return false
+	}
+	m.done[id] = true
+	m.order = append(m.order, id)
+	if len(m.order) > maxMigratedIdentities {
+		delete(m.done, m.order[0])
+		m.order = m.order[1:]
+	}
+	return true
 }
 
 // migratingBorrower wraps a pool so every successful borrow through the old
@@ -92,13 +171,9 @@ func (m *peerMigrator) maybeMigrate(ctx context.Context, source string) {
 	if !ok {
 		return
 	}
-	m.mu.Lock()
-	if m.done[id] {
-		m.mu.Unlock()
+	if !m.claim(id) {
 		return
 	}
-	m.done[id] = true
-	m.mu.Unlock()
 
 	go func() {
 		// WithoutCancel: the borrow's ctx is frequently a short per-attempt
@@ -127,6 +202,15 @@ func (m *peerMigrator) migrate(ctx context.Context, socket string) error {
 	}
 	if !versionAtLeast(status.Version, remoteSocketTemplateSince) {
 		slog.Debug("peer too old for {{HOSTNAME}} forwards; leaving its default socket alone", "socket", socket, "peer_version", status.Version)
+		return nil
+	}
+
+	// Checked before the remotes list is fetched: it costs no network, and
+	// refusing early keeps the WARN about this host's own configuration
+	// separate from anything the peer reports.
+	if !m.canFindRenamedSocket() {
+		slog.Warn("not migrating the peer forward: vault.token_socket has no pattern matching the renamed socket, so this host would lose its only token source; add "+config.PerHostPeerSocketGlob+" to vault.token_socket",
+			"socket", socket, "patterns", m.patterns)
 		return nil
 	}
 
@@ -170,10 +254,13 @@ func (m *peerMigrator) patch(ctx context.Context, client *http.Client, host stri
 	resp, err := client.Do(req)
 	if err != nil {
 		// Applying the patch rebinds the forward, which tears down the
-		// connection carrying this response. A transport error after the
-		// request was written is the expected shape of success; the new
-		// socket appearing is the confirmation.
-		slog.Info("peer forward migration sent; connection dropped as the forward rebound", "host", host, "socket", sshfwd.DefaultRemoteSocket)
+		// connection carrying this response — so a transport error is the
+		// expected shape of success here, and treating it as a failure would
+		// mean warning on every migration that worked. It cannot be told apart
+		// from a genuine failure before the request was written (the peer going
+		// away mid-exchange), so say both: the new socket appearing is the
+		// confirmation, and if it does not, the next reconnect tries again.
+		slog.Info("peer forward migration may have been applied: the connection dropped, which is what rebinding the forward looks like, but is also what a peer going away looks like", "host", host, "socket", sshfwd.DefaultRemoteSocket, "error", err)
 		return nil
 	}
 	defer resp.Body.Close()

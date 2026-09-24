@@ -12,11 +12,61 @@ func TestSocketListUnmarshalScalar(t *testing.T) {
 	var v struct {
 		S SocketList `yaml:"token_socket"`
 	}
-	if err := yaml.Unmarshal([]byte("token_socket: ~/.ssh/dotvault.sock\n"), &v); err != nil {
+	if err := yaml.Unmarshal([]byte("token_socket: /run/peer/api.sock\n"), &v); err != nil {
 		t.Fatal(err)
 	}
-	if want := (SocketList{"~/.ssh/dotvault.sock"}); !reflect.DeepEqual(v.S, want) {
+	if want := (SocketList{"/run/peer/api.sock"}); !reflect.DeepEqual(v.S, want) {
 		t.Errorf("got %v, want %v", v.S, want)
+	}
+}
+
+// A scalar naming exactly the pre-list default is read as "the default, as it
+// was written then" — the pair — not as a deliberate one-element list. Without
+// this, such a host borrows once, triggers the forward rename, and then matches
+// no socket at all with no borrow left to recover through.
+//
+// TODO(pre-1.0, #ISSUE): drop with the scalar form.
+func TestSocketListUnmarshalLegacyScalarExpandsToPair(t *testing.T) {
+	var v struct {
+		S SocketList `yaml:"token_socket"`
+	}
+	if err := yaml.Unmarshal([]byte("token_socket: "+LegacyPeerSocket+"\n"), &v); err != nil {
+		t.Fatal(err)
+	}
+	want := SocketList{LegacyPeerSocket, PerHostPeerSocketGlob}
+	if !reflect.DeepEqual(v.S, want) {
+		t.Errorf("got %v, want %v", v.S, want)
+	}
+	// Non-nil, so an exported config shows the pair in force rather than the
+	// lossy absent form.
+	if v.S == nil {
+		t.Error("expanded list must be non-nil")
+	}
+}
+
+// An explicit sequence is the operator's own words and is left alone, even when
+// it happens to hold only the legacy path. The migrator's own guard is what
+// keeps that host safe (cmd/dotvault canFindRenamedSocket).
+func TestSocketListSequenceWithLegacyPathIsNotExpanded(t *testing.T) {
+	var v struct {
+		S SocketList `yaml:"token_socket"`
+	}
+	if err := yaml.Unmarshal([]byte("token_socket:\n  - "+LegacyPeerSocket+"\n"), &v); err != nil {
+		t.Fatal(err)
+	}
+	if want := (SocketList{LegacyPeerSocket}); !reflect.DeepEqual(v.S, want) {
+		t.Errorf("got %v, want %v", v.S, want)
+	}
+}
+
+func TestExpandLegacyScalar(t *testing.T) {
+	if got, want := ExpandLegacyScalar(LegacyPeerSocket), (SocketList{LegacyPeerSocket, PerHostPeerSocketGlob}); !reflect.DeepEqual(got, want) {
+		t.Errorf("legacy value: got %v, want %v", got, want)
+	}
+	for _, other := range []string{"/run/peer/api.sock", "~/.ssh/dotvault.other.sock", "~/.ssh/dotvault.*.sock"} {
+		if got, want := ExpandLegacyScalar(other), (SocketList{other}); !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: got %v, want %v", other, got, want)
+		}
 	}
 }
 

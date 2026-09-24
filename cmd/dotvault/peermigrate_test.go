@@ -81,6 +81,14 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 }
 
+// globPatterns is the borrow pattern list a correctly-configured host carries:
+// the old default plus the glob matching whatever the forward is renamed to.
+// Without the second entry the migrator refuses — see
+// TestMigrateRefusesWithoutAPatternForTheRenamedSocket.
+func globPatterns(sock string) []string {
+	return []string{sock, filepath.Join(filepath.Dir(sock), "dotvault.*.sock")}
+}
+
 func selfHost(t *testing.T) string {
 	h, err := os.Hostname()
 	if err != nil || h == "" {
@@ -127,7 +135,7 @@ func TestMigratePatchesOwnOldDefaultEntry(t *testing.T) {
 	}}
 	srv.serve(t, sock)
 
-	m := newPeerMigrator(sock)
+	m := newPeerMigrator(sock, globPatterns(sock))
 	m.maybeMigrate(context.Background(), sock)
 	waitFor(t, func() bool { return len(srv.patched()) == 1 })
 	got := srv.patched()[0]
@@ -151,7 +159,7 @@ func TestMigrateSkipsOldPeerVersion(t *testing.T) {
 		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
 	}}
 	srv.serve(t, sock)
-	m := newPeerMigrator(sock)
+	m := newPeerMigrator(sock, globPatterns(sock))
 	m.maybeMigrate(context.Background(), sock)
 	time.Sleep(200 * time.Millisecond)
 	if len(srv.patched()) != 0 {
@@ -167,7 +175,7 @@ func TestMigrateIgnoresOtherSockets(t *testing.T) {
 		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
 	}}
 	srv.serve(t, other)
-	m := newPeerMigrator(old)
+	m := newPeerMigrator(old, globPatterns(old))
 	m.maybeMigrate(context.Background(), other)
 	time.Sleep(200 * time.Millisecond)
 	if len(srv.patched()) != 0 {
@@ -181,7 +189,7 @@ func TestMigrateTreatsDroppedResponseAsApplied(t *testing.T) {
 		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
 	}}
 	srv.serve(t, sock)
-	m := newPeerMigrator(sock)
+	m := newPeerMigrator(sock, globPatterns(sock))
 	m.maybeMigrate(context.Background(), sock)
 	waitFor(t, func() bool { return len(srv.patched()) == 1 })
 	// A second nudge for the same identity must not retry: the drop is the
@@ -190,5 +198,75 @@ func TestMigrateTreatsDroppedResponseAsApplied(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if len(srv.patched()) != 1 {
 		t.Errorf("retried after a dropped response: %v", srv.patched())
+	}
+}
+
+// A host whose only borrow pattern is the old default literal would be left
+// with no token source the moment the workstation renamed its forward — and no
+// borrow left through which to notice. It must refuse.
+func TestMigrateRefusesWithoutAPatternForTheRenamedSocket(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
+	srv := &fakePeer{version: "0.34.0", remotes: []map[string]any{
+		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
+	}}
+	srv.serve(t, sock)
+
+	m := newPeerMigrator(sock, []string{sock})
+	m.maybeMigrate(context.Background(), sock)
+	time.Sleep(200 * time.Millisecond)
+	if len(srv.patched()) != 0 {
+		t.Errorf("migrated despite having no pattern for the renamed socket: %v", srv.patched())
+	}
+
+	// The same peer with a glob in the list does migrate, so the refusal above
+	// is the pattern check and not something else about this fixture.
+	m2 := newPeerMigrator(sock, globPatterns(sock))
+	m2.maybeMigrate(context.Background(), sock)
+	waitFor(t, func() bool { return len(srv.patched()) == 1 })
+}
+
+// canFindRenamedSocket is the whole guard, so pin its cases directly.
+func TestCanFindRenamedSocket(t *testing.T) {
+	const old = "/home/u/.ssh/dotvault.sock"
+	cases := []struct {
+		name     string
+		patterns []string
+		want     bool
+	}{
+		{"old default only", []string{old}, false},
+		{"no patterns", nil, false},
+		{"shipped default pair", []string{old, "/home/u/.ssh/dotvault.*.sock"}, true},
+		{"glob only", []string{"/home/u/.ssh/dotvault.*.sock"}, true},
+		{"literal per-host socket", []string{"/home/u/.ssh/dotvault." + migrateProbeLabel + ".sock"}, true},
+		{"glob in another directory", []string{"/run/dotvault/dotvault.*.sock"}, false},
+	}
+	for _, c := range cases {
+		if got := newPeerMigrator(old, c.patterns).canFindRenamedSocket(); got != c.want {
+			t.Errorf("%s: canFindRenamedSocket() = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The once-per-identity bookkeeping is bounded, so a daemon whose forward
+// reconnects for months does not accumulate identities for the life of the
+// process — and the identity it is currently using is never the one evicted.
+func TestMigratorClaimIsBounded(t *testing.T) {
+	m := newPeerMigrator("/nonexistent/dotvault.sock", nil)
+	const n = maxMigratedIdentities * 3
+	for i := 0; i < n; i++ {
+		if !m.claim(peerIdentity{dev: 1, ino: uint64(i)}) {
+			t.Fatalf("claim(%d) returned false for an unseen identity", i)
+		}
+	}
+	if len(m.done) != maxMigratedIdentities || len(m.order) != maxMigratedIdentities {
+		t.Errorf("done=%d order=%d, want %d each", len(m.done), len(m.order), maxMigratedIdentities)
+	}
+	// The most recent claim is still remembered (no repeat migration), while
+	// the oldest has aged out and would be attempted again.
+	if m.claim(peerIdentity{dev: 1, ino: n - 1}) {
+		t.Error("the most recent identity was forgotten")
+	}
+	if !m.claim(peerIdentity{dev: 1, ino: 0}) {
+		t.Error("the oldest identity should have aged out")
 	}
 }

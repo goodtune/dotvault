@@ -1031,7 +1031,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// byte-identical to the member path Borrow reports.
 	var migrator *peerMigrator
 	if oldDefault, err := paths.ExpandHome(legacyRemoteSocket); err == nil {
-		migrator = newPeerMigrator(oldDefault)
+		migrator = newPeerMigrator(oldDefault, peerPool.Patterns())
 	} else {
 		slog.Debug("cannot resolve the legacy peer socket path; forward migration disabled", "error", err)
 	}

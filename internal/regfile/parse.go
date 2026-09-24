@@ -673,7 +673,10 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 				return err
 			}
 			if legacy != "" {
-				cfg.Vault.TokenSockets = config.SocketList{legacy}
+				// The same reading the live registry loader and the YAML
+				// scalar branch apply: a bare pre-list default expands to
+				// the pair, so a migrated forward stays findable.
+				cfg.Vault.TokenSockets = config.ExpandLegacyScalar(legacy)
 			}
 			return nil
 		},

@@ -707,20 +707,34 @@ func TestParseRejectsMalformedHex(t *testing.T) {
 
 // TestParseLegacyTokenSocketREGSZ covers a policy pushed before the
 // TokenSockets REG_MULTI_SZ existed: a lone legacy TokenSocket REG_SZ value
-// must still parse, wrapped as a one-element SocketList.
+// must still parse. A value naming exactly the pre-list default expands to the
+// pair (config.ExpandLegacyScalar — read literally it would leave the host
+// unable to find its forward once the workstation renamed it); any other value
+// is the admin's own choice and stays one element.
 //
 // TODO(pre-1.0, #ISSUE): delete with the REG_SZ fallback.
 func TestParseLegacyTokenSocketREGSZ(t *testing.T) {
-	in := "Windows Registry Editor Version 5.00\r\n\r\n" +
-		"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
-		"\"Address\"=\"http://127.0.0.1:8200\"\r\n" +
-		"\"AuthMethod\"=\"token\"\r\n" +
-		"\"TokenSocket\"=\"~/.ssh/dotvault.sock\"\r\n"
-	cfg, err := Parse([]byte(in))
-	if err != nil {
-		t.Fatal(err)
+	parse := func(t *testing.T, value string) config.SocketList {
+		t.Helper()
+		in := "Windows Registry Editor Version 5.00\r\n\r\n" +
+			"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
+			"\"Address\"=\"http://127.0.0.1:8200\"\r\n" +
+			"\"AuthMethod\"=\"token\"\r\n" +
+			"\"TokenSocket\"=\"" + value + "\"\r\n"
+		cfg, err := Parse([]byte(in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Vault.TokenSockets
 	}
-	if want := (config.SocketList{"~/.ssh/dotvault.sock"}); !reflect.DeepEqual(cfg.Vault.TokenSockets, want) {
-		t.Errorf("got %v, want %v", cfg.Vault.TokenSockets, want)
+
+	got := parse(t, config.LegacyPeerSocket)
+	if want := (config.SocketList{config.LegacyPeerSocket, config.PerHostPeerSocketGlob}); !reflect.DeepEqual(got, want) {
+		t.Errorf("legacy default: got %v, want %v", got, want)
+	}
+
+	got = parse(t, "/run/peer/api.sock")
+	if want := (config.SocketList{"/run/peer/api.sock"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("other value: got %v, want %v", got, want)
 	}
 }

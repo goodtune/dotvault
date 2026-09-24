@@ -191,6 +191,12 @@ func TestValidateSocketPattern(t *testing.T) {
 		{"~/*/dotvault.sock", "only in the final path segment"},
 		{"/tmp/*/dotvault.sock", "only in the final path segment"},
 		{"/tmp/dotvault\x00.sock", "NUL"},
+		// .. segments are rejected wherever they appear, mirroring
+		// sshfwd.ValidateRemoteSocket at the other end of the same forward. A
+		// segment that merely contains ".." is an ordinary directory name.
+		{"~/.ssh/../x/dotvault.sock", ".. path segments"},
+		{"/tmp/../dotvault.*.sock", ".. path segments"},
+		{"/tmp/a..b/dotvault.sock", ""},
 	}
 	for _, c := range cases {
 		err := ValidateSocketPattern(c.in)

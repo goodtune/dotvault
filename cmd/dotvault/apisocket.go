@@ -98,15 +98,9 @@ func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
 
 // newBorrowChain builds the two-tier borrower the one-shot commands that may
 // borrow from this host's own daemon use — `status`, `sync`, `enrol`: the local
-// API socket first, then the peers.
-//
-// It is a chain rather than a single pool over cfg.TokenBorrowSockets(), even
-// though that list is already in the right order, because a pool sorts its
-// members by recency and the local socket is the *older* of the two in steady
-// state — bound once when the long-lived daemon started, against a forwarded
-// peer socket re-created on every SSH reconnect. Flattening the tiers would
-// therefore invert the documented local-first order rather than preserve it.
-// See peer.Chain.
+// API socket first, then the peers. peer.NewLocalFirstChain owns the tiering and
+// the reason it is a tier rather than an ordering hint; this resolves the two
+// socket sources and labels the tiers.
 //
 // The daemon (daemonBorrowSockets) and `dotvault login`
 // (freshLoginBorrowSockets) deliberately do NOT use this: both exclude the local
@@ -115,28 +109,28 @@ func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
 //
 // It returns the tier labels alongside the chain, in the same order
 // Chain.Status() reports them, so `dotvault status` can say which tier a
-// pattern belongs to. The two are built in one pass rather than derived
-// separately precisely so they cannot drift: a tier that is not appended
-// contributes no label either.
+// pattern belongs to. They are derived from the same two inputs the chain is
+// built from — a non-empty local socket, a non-empty pattern list — so the
+// label list and the tier list cannot disagree about which tiers exist.
 func newBorrowChain(cfg *config.Config) (*peer.Chain, []string) {
-	var (
-		tiers  []peer.Borrower
-		labels []string
-	)
-	if local, err := cfg.APISocketPath(); err != nil {
-		// Not fatal — the peers below are still borrowable — but silently
-		// dropping the tier would leave an operator with a misconfigured
-		// api.unix.path wondering why the local daemon is never consulted.
+	local, err := cfg.APISocketPath()
+	if err != nil {
+		// Not fatal — the peers are still borrowable — but silently dropping
+		// the tier would leave an operator with a misconfigured api.unix.path
+		// wondering why the local daemon is never consulted.
 		slog.Warn("could not resolve api.unix.path; local API socket excluded from borrow", "error", err)
-	} else if local != "" {
-		tiers = append(tiers, peer.NewPool([]string{local}))
+		local = ""
+	}
+	peers := cfg.PeerActionSockets()
+
+	var labels []string
+	if local != "" {
 		labels = append(labels, borrowTierLocalAPI)
 	}
-	if peers := newPeerPool(cfg.PeerActionSockets()); peers != nil {
-		tiers = append(tiers, peers)
+	if len(peers) > 0 {
 		labels = append(labels, borrowTierPeers)
 	}
-	return peer.NewChain(tiers...), labels
+	return peer.NewLocalFirstChain(local, peers), labels
 }
 
 // borrowTierLocalAPI and borrowTierPeers label the two tiers newBorrowChain

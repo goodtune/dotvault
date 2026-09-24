@@ -170,9 +170,9 @@ dotvault sync        One-shot sync cycle, then exit
 dotvault login       Force a fresh login via the configured auth method
 dotvault login-check Validate/renew cached token on interactive login (tty-aware)
 dotvault enrol       Interactive enrolment picker (`dotvault enrol <name>` to run one directly)
-dotvault browse      Open a URL in a browser, preferring the peer over vault.token_socket
-dotvault notify      Raise a desktop notification, preferring the peer over vault.token_socket
-dotvault clipboard   Put text on the clipboard, preferring the peer over vault.token_socket
+dotvault browse      Open a URL in a browser, preferring the peers in vault.token_socket
+dotvault notify      Raise a desktop notification, preferring the peers in vault.token_socket
+dotvault clipboard   Put text on the clipboard, preferring the peers in vault.token_socket
 dotvault ssh         Manage daemon-maintained SSH remote forwards (add/edit/list/remove)
 dotvault status      Display auth state, token TTL, per-rule sync state, filesystem mount state
 dotvault version     Print build version (--json for machine-readable resource metadata)

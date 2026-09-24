@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -144,6 +145,33 @@ func TestPoolBorrowSkipsUnauthenticatedPeerWithoutEvicting(t *testing.T) {
 		t.Fatalf("Borrow = (%q, %q)", tok, src)
 	}
 	for _, m := range p.Status().Members {
+		if m.Evicted {
+			t.Errorf("%s evicted after a 401; a live peer with no token must stay", m.Path)
+		}
+	}
+}
+
+// The whole pool answering 401 is the ordinary cold-start shape — every peer
+// serving but none authenticated yet — so it must report "no token" and leave
+// the pool intact. Evicting there would take the peers dark for a whole
+// EvictProbeInterval precisely when they are about to acquire a token.
+func TestPoolBorrowAllPeersUnauthenticated(t *testing.T) {
+	dir := sockDir(t)
+	a := filepath.Join(dir, "dotvault.a.sock")
+	b := filepath.Join(dir, "dotvault.b.sock")
+	tokenServer(t, a, "", 200)
+	tokenServer(t, b, "", 200)
+
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	tok, src := p.Borrow(context.Background())
+	if tok != "" || src != "" {
+		t.Errorf("Borrow = (%q, %q), want empty when no peer holds a token", tok, src)
+	}
+	members := p.Status().Members
+	if len(members) != 2 {
+		t.Fatalf("Status members = %+v, want both sockets", members)
+	}
+	for _, m := range members {
 		if m.Evicted {
 			t.Errorf("%s evicted after a 401; a live peer with no token must stay", m.Path)
 		}
@@ -317,17 +345,32 @@ func TestPoolNilReceiver(t *testing.T) {
 	}
 }
 
+// watchSupported reports whether Watch actually registers a watcher here.
+// Off Linux tokenwatch is inert and the pool relies on re-resolve instead, so
+// the event this test waits for is never produced. Test-only: production code
+// needs no such branch, because Watch degrades on its own.
+func watchSupported() bool { return runtime.GOOS == "linux" }
+
 func TestPoolWatchOnChangeFires(t *testing.T) {
 	if !watchSupported() {
 		t.Skip("no inotify on this platform")
 	}
 	dir := sockDir(t)
 	var fired atomic.Int32
-	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}, WithOnChange(func() { fired.Add(1) }))
+	// withWatchReady rather than a sleep: the socket must not be created until
+	// every watcher is registered, and a guessed interval is both slower than
+	// necessary and not a guarantee on a loaded machine.
+	ready := make(chan struct{})
+	p := NewPool([]string{filepath.Join(dir, "dotvault.*.sock")},
+		WithOnChange(func() { fired.Add(1) }), withWatchReady(ready))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = p.Watch(ctx) }()
-	time.Sleep(50 * time.Millisecond) // let the watch register
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watch did not report its watchers registered")
+	}
 	tokenServer(t, filepath.Join(dir, "dotvault.laptop.sock"), "t", 200)
 	deadline := time.Now().Add(2 * time.Second)
 	for fired.Load() == 0 && time.Now().Before(deadline) {

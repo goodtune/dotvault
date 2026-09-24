@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -87,6 +86,7 @@ type Pool struct {
 	fetchTimeout time.Duration
 	postTimeout  time.Duration
 	onChange     func()
+	watchReady   chan<- struct{} // closed by Watch once every watcher is registered (tests)
 
 	mu      sync.Mutex
 	members map[string]*member
@@ -109,7 +109,12 @@ func WithOnChange(fn func()) Option { return func(p *Pool) { p.onChange = fn } }
 func withFetchTimeout(d time.Duration) Option { return func(p *Pool) { p.fetchTimeout = d } }
 func withPostTimeout(d time.Duration) Option  { return func(p *Pool) { p.postTimeout = d } }
 
-func watchSupported() bool { return runtime.GOOS == "linux" }
+// withWatchReady registers a channel Watch closes once every directory watcher
+// is registered — the point from which a socket created in that directory
+// produces an event. A test waits on it instead of sleeping a guessed interval,
+// which is both slower than it needs to be and not actually a guarantee. Unset
+// in production, where the field is nil and the close is skipped.
+func withWatchReady(ch chan<- struct{}) Option { return func(p *Pool) { p.watchReady = ch } }
 
 // NewPool builds a pool over patterns (literal paths or final-segment globs,
 // ~-relative allowed). Patterns that cannot be expanded are dropped with a
@@ -375,7 +380,11 @@ func (p *Pool) Broadcast(ctx context.Context, apiPath string, form url.Values) e
 // A no-op on platforms without inotify (the on-demand re-resolve covers
 // them); an unwatchable directory degrades to that too.
 func (p *Pool) Watch(ctx context.Context) error {
-	if p == nil || len(p.patterns) == 0 {
+	if p == nil {
+		return nil
+	}
+	if len(p.patterns) == 0 {
+		p.signalWatchReady()
 		return nil
 	}
 	dirs := make(map[string][]string) // dir -> patterns
@@ -414,8 +423,21 @@ func (p *Pool) Watch(ctx context.Context) error {
 			}
 		}()
 	}
+	// Every watcher is registered, so an event for a socket created from here
+	// on will be delivered. Signalled before the wait, which blocks until ctx
+	// is done.
+	p.signalWatchReady()
 	wg.Wait()
 	return nil
+}
+
+// signalWatchReady closes the withWatchReady channel, if one was registered.
+// Watch is called once per pool, so a second call would panic on the closed
+// channel; nothing in production registers one.
+func (p *Pool) signalWatchReady() {
+	if p.watchReady != nil {
+		close(p.watchReady)
+	}
 }
 
 // noteSeen records a watch event for path: admit or refresh the member with

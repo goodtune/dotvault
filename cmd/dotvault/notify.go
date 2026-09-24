@@ -26,7 +26,7 @@ var sendLocalNotification = notify.Send
 func newNotifyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "notify <level> <title> [description]",
-		Short: "Raise a desktop notification, preferring the peers over vault.token_socket",
+		Short: "Raise a desktop notification, preferring the peers in vault.token_socket",
 		Long: fmt.Sprintf(`Raise a native desktop notification (a Windows toast, a macOS
 Notification Center panel, or a Linux D-Bus notification).
 

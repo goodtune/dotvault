@@ -88,9 +88,16 @@ func nodeKindName(k yaml.Kind) string {
 // ValidateSocketPattern checks one vault.token_socket entry. A pattern must be
 // absolute or ~/-relative (the api.unix.path rule — a relative path resolves
 // against the working directory and two processes would disagree about it),
-// and glob metacharacters are permitted only in the final path segment. That
-// restriction gives every pattern exactly one parent directory to watch and
-// keeps a pattern from walking the filesystem.
+// must contain no ".." segment, and glob metacharacters are permitted only in
+// the final path segment. The last restriction gives every pattern exactly one
+// parent directory to watch and keeps a pattern from walking the filesystem.
+//
+// The ".." rule mirrors sshfwd.ValidateRemoteSocket, which applies it to the
+// far end of the same forward: the two ends of one socket should not disagree
+// about what a legal path is. The pattern is also the name of a directory the
+// pool watches and globs, and a traversal there would mean watching somewhere
+// the operator did not name — `~/.ssh/../../etc/dotvault.*.sock` reads as
+// ~/.ssh-relative and is not.
 func ValidateSocketPattern(p string) error {
 	switch {
 	case p == "":
@@ -103,6 +110,15 @@ func ValidateSocketPattern(p string) error {
 		return errors.New("must be an absolute path (or ~/-relative); ~user/ is not supported")
 	case !filepath.IsAbs(p):
 		return errors.New("must be an absolute path (or ~/-relative)")
+	}
+	// Split on both separators for the same reason the directory check below
+	// uses LastIndexAny: a Windows pattern is backslash-separated, and a
+	// `..` segment there must be caught too. A segment that merely *contains*
+	// ".." (`a..b`) is an ordinary name and is left alone.
+	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return errors.New("must not contain .. path segments")
+		}
 	}
 	// LastIndexAny, not LastIndex on "/": a Windows pattern is separated by
 	// backslashes, and splitting on "/" alone would treat the whole of

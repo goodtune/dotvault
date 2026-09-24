@@ -101,6 +101,51 @@ func TestChainStatusReportsTiersInOrder(t *testing.T) {
 	}
 }
 
+// TestNewLocalFirstChain covers the shared constructor both call sites use
+// (cmd/dotvault newBorrowChain, client VaultConfig.borrower): the local socket
+// wins even when the peer's is fresher, and an empty local contributes no tier
+// at all rather than an empty leading one — which is what keeps Status()'s tiers
+// aligned with the labels a caller derives from the same two inputs.
+func TestNewLocalFirstChain(t *testing.T) {
+	dir := sockDir(t)
+	local := filepath.Join(dir, "api.sock")
+	remote := filepath.Join(dir, "peer.sock")
+	tokenServer(t, local, "hvs.local", 200)
+	tokenServer(t, remote, "hvs.remote", 200)
+	now := time.Now()
+	setMtime(t, local, now.Add(-time.Hour)) // long-lived daemon socket
+	setMtime(t, remote, now)                // forward that just reconnected
+
+	c := NewLocalFirstChain(local, []string{remote})
+	if tok, src := c.Borrow(context.Background()); tok != "hvs.local" || src != local {
+		t.Errorf("Borrow = (%q, %q), want the local socket's token", tok, src)
+	}
+	if st := c.Status(); len(st) != 2 {
+		t.Errorf("Status() = %d tiers, want 2", len(st))
+	}
+
+	// No local socket configured: one tier, the peers.
+	c = NewLocalFirstChain("", []string{remote})
+	if tok, src := c.Borrow(context.Background()); tok != "hvs.remote" || src != remote {
+		t.Errorf("Borrow = (%q, %q), want the peer's token", tok, src)
+	}
+	st := c.Status()
+	if len(st) != 1 {
+		t.Fatalf("Status() = %d tiers, want 1 (no local tier)", len(st))
+	}
+	if len(st[0].Patterns) != 1 || st[0].Patterns[0] != remote {
+		t.Errorf("tier 0 patterns = %v, want [%s]", st[0].Patterns, remote)
+	}
+
+	// Neither configured: a chain that borrows nothing, not a panic.
+	if tok, _ := NewLocalFirstChain("", nil).Borrow(context.Background()); tok != "" {
+		t.Errorf("an unconfigured chain borrowed %q", tok)
+	}
+	if st := NewLocalFirstChain("", nil).Status(); len(st) != 0 {
+		t.Errorf("an unconfigured chain reported %d tiers", len(st))
+	}
+}
+
 // TestChainNilReceiver: every method is nil-safe, so a call site with no chain
 // wired needs no branch — the same contract Pool holds.
 func TestChainNilReceiver(t *testing.T) {

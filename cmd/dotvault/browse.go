@@ -26,7 +26,7 @@ var openLocalBrowser = browser.OpenURL
 func newBrowseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "browse <url>",
-		Short: "Open a URL in a browser, preferring the peers over vault.token_socket",
+		Short: "Open a URL in a browser, preferring the peers in vault.token_socket",
 		Long: `Open a URL in a browser.
 
 vault.token_socket is a list of socket patterns (by default ~/.ssh/dotvault.sock

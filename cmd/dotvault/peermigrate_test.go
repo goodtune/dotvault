@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -16,8 +17,12 @@ import (
 
 // fakePeer is a workstation dotvault's API on a Unix socket: status (with a
 // version), the remotes list, csrf, and a PATCH recorder.
+// statusBody, when set, replaces the JSON status response verbatim — a peer
+// answering with something that is not JSON at all (a proxy's error page, a
+// future daemon serving HTML on that path).
 type fakePeer struct {
 	version     string
+	statusBody  string
 	remotes     []map[string]any
 	mu          sync.Mutex
 	patches     []struct{ host, body string }
@@ -32,6 +37,10 @@ func (f *fakePeer) serve(t *testing.T, path string) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		if f.statusBody != "" {
+			_, _ = w.Write([]byte(f.statusBody))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"version": f.version})
 	})
 	mux.HandleFunc("GET /api/v1/ssh/remotes", func(w http.ResponseWriter, r *http.Request) {
@@ -113,16 +122,68 @@ func TestVersionAtLeast(t *testing.T) {
 	}
 }
 
+// withLookupHost swaps the resolver seam for the duration of a test. No test
+// in this package resolves a real name: the answer would depend on the host's
+// search domains and every lookup — negative ones included — is a network
+// round trip.
+func withLookupHost(t *testing.T, fn func(context.Context, string) ([]string, error)) {
+	t.Helper()
+	prev := lookupHost
+	lookupHost = fn
+	t.Cleanup(func() { lookupHost = prev })
+}
+
+// firstLocalAddr returns one non-loopback address this machine's interfaces
+// carry, or "" when it has none (a fully isolated container).
+func firstLocalAddr() string {
+	for a := range localAddrs() {
+		return a
+	}
+	return ""
+}
+
 func TestHostIsSelf(t *testing.T) {
 	ctx := context.Background()
+
+	// The name branch answers before the resolver is reached, so a lookup here
+	// is a bug in itself — fail loudly rather than returning something.
+	withLookupHost(t, func(context.Context, string) ([]string, error) {
+		t.Error("hostname equality must not reach the resolver")
+		return nil, nil
+	})
 	if !hostIsSelf(ctx, selfHost(t)) {
 		t.Error("own hostname should match")
 	}
 	if hostIsSelf(ctx, "localhost") || hostIsSelf(ctx, "127.0.0.1") {
 		t.Error("loopback must never match")
 	}
+
+	withLookupHost(t, func(_ context.Context, host string) ([]string, error) {
+		return nil, fmt.Errorf("no such host: %s", host)
+	})
 	if hostIsSelf(ctx, "definitely-not-this-host.invalid") {
 		t.Error("unknown host must not match")
+	}
+
+	if local := firstLocalAddr(); local == "" {
+		t.Log("no non-loopback interface address; skipping the address-match case")
+	} else {
+		withLookupHost(t, func(context.Context, string) ([]string, error) {
+			return []string{local}, nil
+		})
+		if !hostIsSelf(ctx, "some-alias.example") {
+			t.Errorf("a host resolving to this machine's %s should match", local)
+		}
+	}
+
+	// Loopback is rejected in the address branch too, not just as a literal:
+	// every machine resolves it to itself, so admitting it would make every
+	// borrower claim every loopback entry.
+	withLookupHost(t, func(context.Context, string) ([]string, error) {
+		return []string{"127.0.0.1"}, nil
+	})
+	if hostIsSelf(ctx, "loopback-alias.example") {
+		t.Error("a host resolving only to loopback must not match")
 	}
 }
 
@@ -164,6 +225,42 @@ func TestMigrateSkipsOldPeerVersion(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if len(srv.patched()) != 0 {
 		t.Errorf("old peer must not be patched: %v", srv.patched())
+	}
+}
+
+// A peer whose status is not JSON at all — a proxy error page, an HTML
+// response — must not be patched, and must not be retried either: the identity
+// is claimed before the attempt, so a peer that cannot be understood is left
+// alone until its socket is re-created. Without that, an unparseable peer would
+// be re-attempted on every borrow.
+func TestMigrateSkipsPeerWithUnparseableStatus(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
+	srv := &fakePeer{statusBody: "<html>not a dotvault</html>", remotes: []map[string]any{
+		{"host": selfHost(t), "remote_socket": "~/.ssh/dotvault.sock"},
+	}}
+	srv.serve(t, sock)
+
+	m := newPeerMigrator(sock, globPatterns(sock))
+	m.maybeMigrate(context.Background(), sock)
+	time.Sleep(200 * time.Millisecond)
+	if len(srv.patched()) != 0 {
+		t.Errorf("patched a peer whose status could not be parsed: %v", srv.patched())
+	}
+
+	m.maybeMigrate(context.Background(), sock)
+	time.Sleep(200 * time.Millisecond)
+	if len(srv.patched()) != 0 {
+		t.Errorf("patched on a second attempt: %v", srv.patched())
+	}
+
+	// Directly: the identity is claimed, so the second maybeMigrate above did
+	// no work at all rather than repeating the failed exchange.
+	id, ok := socketIdentity(sock)
+	if !ok {
+		t.Skip("socket identity unavailable on this platform")
+	}
+	if m.claim(id) {
+		t.Error("the socket identity was not claimed, so every borrow would retry")
 	}
 }
 

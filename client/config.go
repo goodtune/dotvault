@@ -178,19 +178,11 @@ func (v VaultConfig) borrowSockets() []string {
 // watcher — a library consumer is a short-lived process, so on-demand
 // re-resolution is the whole mechanism.
 //
-// Two tiers rather than one pool over borrowSockets(), because local-first is a
-// stability rule and a pool can only sort by recency. See peer.Chain for why
-// those are not the same thing, and VaultConfig.APISocket for why this order.
+// peer.NewLocalFirstChain owns the tiering and why local-first has to be a tier
+// rather than a sort over borrowSockets(); see VaultConfig.APISocket for why
+// this order is the right one for a consumer.
 func (v VaultConfig) borrower() peer.Borrower {
-	var apiTier *peer.Pool
-	if v.APISocket != "" {
-		apiTier = peer.NewPool([]string{v.APISocket})
-	}
-	var peerTier *peer.Pool
-	if len(v.TokenSockets) > 0 {
-		peerTier = peer.NewPool(v.TokenSockets)
-	}
-	return peer.NewChain(apiTier, peerTier)
+	return peer.NewLocalFirstChain(v.APISocket, v.TokenSockets)
 }
 
 // peerPool is the pool the peer actions (Browse / Notify / Clipboard) fan out

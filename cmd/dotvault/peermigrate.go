@@ -341,6 +341,15 @@ func parseSemver(s string) ([3]int, bool) {
 	return out, true
 }
 
+// lookupHost is the name-resolution seam hostIsSelf goes through. It is a
+// package-level var so a test can answer without touching the network: the real
+// resolver's verdict on a given name depends on the host's search domains and
+// nameservers, and even a negative answer costs a round trip (up to the timeout
+// below). Production behaviour is net.DefaultResolver, unchanged.
+var lookupHost = func(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
 // hostIsSelf reports whether host names this machine: equal (case-folded)
 // to os.Hostname() or its first label, or resolving to a non-loopback
 // address one of this machine's interfaces carries. Loopback never matches —
@@ -370,7 +379,7 @@ func hostIsSelf(ctx context.Context, host string) bool {
 	}
 	lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupHost(lctx, host)
+	addrs, err := lookupHost(lctx, host)
 	if err != nil {
 		return false
 	}

@@ -27,7 +27,7 @@ var setLocalClipboard = clipboard.Set
 func newClipboardCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "clipboard [text]",
-		Short: "Put text on the clipboard, preferring the peers over vault.token_socket",
+		Short: "Put text on the clipboard, preferring the peers in vault.token_socket",
 		Long: `Put text on the system clipboard.
 
 The text is posted to the /api/v1/remote/clipboard endpoint of every live peer

@@ -52,6 +52,38 @@ func NewChain(borrowers ...Borrower) *Chain {
 	return c
 }
 
+// NewLocalFirstChain builds the standard two-tier borrow chain: this host's own
+// local API socket first, then the peer socket patterns, most-recently-seen
+// first within them. An empty local contributes no tier, so a caller with no
+// local socket configured needs no branch and gets a one-tier chain rather than
+// an empty leading one.
+//
+// Why a tier and not just an ordering hint: config.TokenBorrowSockets() already
+// returns the local socket ahead of the peers, so a single pool over that list
+// looks like it would do. It would not. A pool sorts its members by recency,
+// and in steady state the local socket is the *older* of the two — bound once
+// when the long-lived per-user daemon started, against a forwarded peer socket
+// re-created on every SSH reconnect. Flattening the tiers therefore inverts the
+// documented local-first order rather than preserving it, systematically
+// preferring the source that disappears with an SSH session over the one that
+// does not. No sort key inside a pool can fix that, because stability is not
+// something a stat can see — which is what makes this a tier boundary.
+//
+// Callers that want peers only (the daemon, which serves the local socket
+// itself, and `dotvault login`, which must not borrow back the token it is
+// replacing) build a single NewPool instead: their list is peers-only and there
+// is no second tier to order.
+func NewLocalFirstChain(local string, peerPatterns []string, opts ...Option) *Chain {
+	var tiers []Borrower
+	if local != "" {
+		tiers = append(tiers, NewPool([]string{local}, opts...))
+	}
+	if len(peerPatterns) > 0 {
+		tiers = append(tiers, NewPool(peerPatterns, opts...))
+	}
+	return NewChain(tiers...)
+}
+
 // Borrow implements Borrower: walk the tiers in order and return the first
 // token offered, along with the socket path it came from. Best-effort, like
 // Pool.Borrow — it never returns an error.

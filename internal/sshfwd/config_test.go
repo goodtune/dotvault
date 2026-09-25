@@ -198,3 +198,35 @@ func TestRemove(t *testing.T) {
 }
 
 func runtimeIsUnix() bool { return os.PathSeparator == '/' }
+
+func TestValidateRemoteSocketTemplateToken(t *testing.T) {
+	if err := ValidateRemoteSocket("~/.ssh/dotvault.{{HOSTNAME}}.sock"); err != nil {
+		t.Errorf("exact token rejected: %v", err)
+	}
+	for _, bad := range []string{
+		"~/.ssh/dotvault.{{HOST}}.sock",
+		"~/.ssh/dotvault.{{hostname}}.sock",
+		"~/.ssh/{{.sock",
+		"~/.ssh/dotvault.}}.sock",
+		// A single brace survives the exact-token strip, so it needs its own
+		// rejection: `{HOSTNAME}` is the likeliest spelling of the typo, and
+		// the socket it would bind still matches the borrower's dotvault.*.sock
+		// glob — so it would look like a working per-host forward while every
+		// workstation bound the same literal path.
+		"~/.ssh/dotvault.{HOSTNAME}.sock",
+		"~/.ssh/dotvault.{{HOSTNAME}.sock",
+		"~/.ssh/dotvault.{HOSTNAME}}.sock",
+		"~/.ssh/dotvault.{.sock",
+		"~/.ssh/dotvault.}.sock",
+	} {
+		if err := ValidateRemoteSocket(bad); err == nil {
+			t.Errorf("%q: expected rejection", bad)
+		}
+	}
+}
+
+func TestDefaultRemoteSocketIsPerHost(t *testing.T) {
+	if DefaultRemoteSocket != "~/.ssh/dotvault.{{HOSTNAME}}.sock" {
+		t.Errorf("DefaultRemoteSocket = %q", DefaultRemoteSocket)
+	}
+}

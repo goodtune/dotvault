@@ -12,8 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // newSSHCmd defines the `dotvault ssh` parent command: add/list/remove are
@@ -91,7 +91,7 @@ func daemonClient(cfg *config.Config) (*http.Client, string, error) {
 		return nil, "", fmt.Errorf("resolve api.unix.path: %w", err)
 	}
 	if sock != "" {
-		client, _, perr := auth.PeerSocketClient(sock)
+		client, _, perr := peer.Client(sock)
 		if perr != nil {
 			return nil, "", fmt.Errorf("cannot reach the dotvault daemon at its local API socket %s: %w", sock, perr)
 		}

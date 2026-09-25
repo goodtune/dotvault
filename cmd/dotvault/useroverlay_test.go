@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +28,16 @@ func TestMain(m *testing.M) {
 	}
 	userConfigPath = func() (string, error) {
 		return filepath.Join(dir, "config.yaml"), nil
+	}
+	// No test in this package may resolve a name: the answer depends on the
+	// developer's search domains and nameservers, and even a negative answer
+	// costs a round trip. Installing the refusal here rather than per-test
+	// keeps it race-free, since the migration reaches hostIsSelf from a
+	// background goroutine and a test swapping the var under it would be a
+	// write racing that read. TestHostIsSelf swaps it deliberately, and has no
+	// goroutine in flight when it does.
+	lookupHost = func(_ context.Context, host string) ([]string, error) {
+		return nil, fmt.Errorf("test resolver: refusing to look up %s", host)
 	}
 	code := m.Run()
 	os.RemoveAll(dir)

@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/notify"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // sendLocalNotification is the local fallback notifier. Indirected so tests
@@ -19,22 +19,22 @@ import (
 var sendLocalNotification = notify.Send
 
 // newNotifyCmd defines `dotvault notify <level> <title> [description]` — the
-// notification sibling of `dotvault browse`. It prefers posting to the peer
-// dotvault named by vault.token_socket (the same forwarded socket the token
-// borrow and remote browse use), and falls back to raising the notification
-// locally when no peer is reachable.
+// notification sibling of `dotvault browse`. It prefers posting to every live
+// peer dotvault matching vault.token_socket (the same forwarded sockets the
+// token borrow and remote browse use), and falls back to raising the
+// notification locally when no peer accepted it.
 func newNotifyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "notify <level> <title> [description]",
-		Short: "Raise a desktop notification, preferring the peer over vault.token_socket",
+		Short: "Raise a desktop notification, preferring the peers in vault.token_socket",
 		Long: fmt.Sprintf(`Raise a native desktop notification (a Windows toast, a macOS
 Notification Center panel, or a Linux D-Bus notification).
 
-When vault.token_socket names a reachable peer dotvault (typically an SSH
-RemoteForward from a workstation running the web UI), the notification is
-posted to the peer's /api/v1/remote/notify endpoint so it appears on the
-machine a human is actually looking at. When the peer is not configured or not
-reachable, the notification is raised on this host instead.
+The notification is posted to the /api/v1/remote/notify endpoint of every live
+peer socket matching vault.token_socket (by default ~/.ssh/dotvault.sock and
+~/.ssh/dotvault.*.sock), so it appears on each workstation forwarding here and a
+human sees it wherever they are actually looking. Only when no peer accepted it
+is the notification raised on this host instead.
 
 The level is one of: %s. It drives the notification's urgency (error and
 attention are delivered as audible alerts) and, where the platform supports a
@@ -76,19 +76,19 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	// Config is only needed to locate the peer socket. Local-only load, same
 	// rationale as `dotvault browse`: a load failure downgrades to a local
 	// notification rather than failing.
-	socket := ""
+	var pool *peer.Pool
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; notifying locally", "error", err)
 	} else {
-		socket = cfg.Vault.TokenSocket
+		pool = newPeerPool(cfg.PeerActionSockets())
 	}
 
-	if socket != "" {
-		err := postNotifyToSocket(cmd.Context(), socket, msg)
+	if pool != nil {
+		err := postNotifyToPeers(cmd.Context(), pool, msg)
 		if err == nil {
 			return nil
 		}
-		slog.Debug("peer notify unavailable; notifying locally", "socket", socket, "error", err)
+		slog.Debug("peer notify unavailable; notifying locally", "error", err)
 	}
 
 	if err := sendLocalNotification(msg); err != nil {
@@ -97,10 +97,10 @@ func runNotify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// postNotifyToSocket posts a notification to a peer dotvault's remote-notify
-// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
-// transport. The caller falls back to a local notification on any error.
-func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Message) error {
+// postNotifyToPeers posts a notification to every active peer dotvault's
+// remote-notify endpoint, via the pool's broadcast. Any peer accepting it is
+// success; the caller falls back to a local notification on any error.
+func postNotifyToPeers(ctx context.Context, pool *peer.Pool, msg notify.Message) error {
 	form := url.Values{
 		"level": {string(msg.Level)},
 		"title": {msg.Title},
@@ -109,5 +109,5 @@ func postNotifyToSocket(ctx context.Context, socketPath string, msg notify.Messa
 	if msg.ActionURL != "" {
 		form.Set("action_url", msg.ActionURL)
 	}
-	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/notify", form)
+	return pool.Broadcast(ctx, "/api/v1/remote/notify", form)
 }

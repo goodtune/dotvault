@@ -37,8 +37,8 @@
       <input id="ssh-host" name="host" class="enrol-prompt-input" placeholder="example.com" value="{{.FormHost}}">
       <label class="enrol-prompt-label" for="ssh-port">Port (default 22)</label>
       <input id="ssh-port" name="port" class="enrol-prompt-input" placeholder="22" inputmode="numeric" value="{{.FormPort}}">
-      <label class="enrol-prompt-label" for="ssh-socket">Remote socket (default ~/.ssh/dotvault.sock)</label>
-      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.sock" value="{{.FormSocket}}">
+      <label class="enrol-prompt-label" for="ssh-socket">Remote socket (default ~/.ssh/dotvault.{{"{{HOSTNAME}}"}}.sock)</label>
+      <input id="ssh-socket" name="remote_socket" class="enrol-prompt-input" placeholder="~/.ssh/dotvault.{{"{{HOSTNAME}}"}}.sock" value="{{.FormSocket}}">
       <div class="enrol-prompt-actions">
         <button type="submit" class="enrol-btn-primary">Add</button>
       </div>

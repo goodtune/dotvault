@@ -173,3 +173,104 @@ func TestExpandRemotePathRejectsDELInHome(t *testing.T) {
 		t.Fatal("accepted a $HOME with a DEL character; must reject")
 	}
 }
+
+func TestExpandRemotePathSubstitutesHostname(t *testing.T) {
+	old := hostnameFn
+	hostnameFn = func() (string, error) { return "Gary-MBP.local", nil }
+	t.Cleanup(func() { hostnameFn = old })
+
+	r := &fakeRunner{out: "/home/me\n"}
+	got, err := ExpandRemotePath(context.Background(), r, "~/.ssh/dotvault.{{HOSTNAME}}.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/home/me/.ssh/dotvault.gary-mbp.sock" {
+		t.Errorf("got %q", got)
+	}
+	// Absolute paths substitute too, without a home probe: the runner errors
+	// if it's ever called.
+	fr := &fakeRunner{err: errors.New("must not be called")}
+	got, err = ExpandRemotePath(context.Background(), fr, "/srv/dotvault.{{HOSTNAME}}.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/srv/dotvault.gary-mbp.sock" {
+		t.Errorf("got %q", got)
+	}
+	if fr.calls != 0 {
+		t.Errorf("probed %d times for an absolute path, want 0", fr.calls)
+	}
+}
+
+func TestExpandRemotePathHostnameSanitised(t *testing.T) {
+	old := hostnameFn
+	t.Cleanup(func() { hostnameFn = old })
+	cases := map[string]string{
+		"desktop":       "desktop",
+		"My Box_1.corp": "my-box-1",
+		"UPPER":         "upper",
+		"":              "", // error
+		"...":           "", // error: empty after sanitising
+	}
+	for in, want := range cases {
+		hostnameFn = func() (string, error) { return in, nil }
+		got, err := LocalHostnameLabel()
+		if want == "" {
+			if err == nil {
+				t.Errorf("%q: expected error, got %q", in, got)
+			}
+			continue
+		}
+		if err != nil || got != want {
+			t.Errorf("%q: got (%q, %v), want %q", in, got, err, want)
+		}
+	}
+}
+
+// ValidateHostnameLabel guards a value that arrives from off-host and becomes
+// a filesystem path, so its rejections matter more than its acceptances.
+func TestValidateHostnameLabel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool // true = accepted
+	}{
+		{"desktop", true},
+		{"my-box-1", true},
+		{"a", true},
+		{"0", true},
+		{strings.Repeat("a", maxHostnameLabel), true},
+		{"", false},
+		{strings.Repeat("a", maxHostnameLabel+1), false},
+		{"-desktop", false},
+		{"desktop-", false},
+		{"Desktop", false},
+		{"desk top", false},
+		{"desktop.corp", false},
+		{"../../etc", false},
+		{"..", false},
+		{"desk/top", false},
+		{"desk\x00top", false},
+		{"dotvault*", false},
+	}
+	for _, c := range cases {
+		err := ValidateHostnameLabel(c.in)
+		if (err == nil) != c.want {
+			t.Errorf("ValidateHostnameLabel(%q) = %v, want accepted = %v", c.in, err, c.want)
+		}
+	}
+
+	// Anything the producer emits must pass the validator, or the two have
+	// drifted and a legitimate peer would be refused.
+	old := hostnameFn
+	t.Cleanup(func() { hostnameFn = old })
+	for _, hostname := range []string{"desktop", "My Box_1.corp", "UPPER", "a.b.c", "-weird-"} {
+		hostnameFn = func() (string, error) { return hostname, nil }
+		label, err := LocalHostnameLabel()
+		if err != nil {
+			continue
+		}
+		if err := ValidateHostnameLabel(label); err != nil {
+			t.Errorf("LocalHostnameLabel() for %q produced %q, which ValidateHostnameLabel rejects: %v", hostname, label, err)
+		}
+	}
+}

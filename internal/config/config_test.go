@@ -225,11 +225,14 @@ rules:
 // TestValidateBorrowOnlyRequiresTokenSocket pins the load-bearing requirement
 // documented on VaultConfig.BorrowOnly: without a socket to borrow from, a
 // borrow-only host could never obtain a token at all, so this is refused at
-// config load rather than left to idle forever in the daemon.
+// config load rather than left to idle forever in the daemon. An absent
+// token_socket applies the default patterns and is fine; the only way to end
+// up with nothing to borrow from is the explicit empty list.
 func TestValidateBorrowOnlyRequiresTokenSocket(t *testing.T) {
 	yaml := `
 vault:
   address: "https://vault.example.com:8200"
+  token_socket: []
   borrow_only: true
 
 sync:
@@ -281,8 +284,10 @@ rules:
 	if !cfg.Vault.BorrowOnly {
 		t.Error("Vault.BorrowOnly = false, want true")
 	}
-	if cfg.Vault.TokenSocket != "~/.ssh/dotvault.sock" {
-		t.Errorf("Vault.TokenSocket = %q, want %q", cfg.Vault.TokenSocket, "~/.ssh/dotvault.sock")
+	// The legacy scalar expands to the default pair (ExpandLegacyScalar), so a
+	// borrow-only host still finds its forward once the workstation renames it.
+	if got := cfg.Vault.TokenSockets; len(got) != 2 || got[0] != LegacyPeerSocket || got[1] != PerHostPeerSocketGlob {
+		t.Errorf("Vault.TokenSockets = %v, want [%s %s]", got, LegacyPeerSocket, PerHostPeerSocketGlob)
 	}
 }
 

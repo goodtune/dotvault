@@ -23,7 +23,7 @@ func TestParseTextRoundTrip(t *testing.T) {
 			KVMount:             "kv",
 			UserPrefix:          "users/",
 			OIDCCallbackPort:    8251,
-			TokenSocket:         "~/.ssh/dotvault.sock",
+			TokenSockets:        config.SocketList{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"},
 			BorrowOnly:          true,
 			Policies:            []string{"dotvault", "kv-read"},
 			NoDefaultPolicy:     true,
@@ -704,6 +704,40 @@ func TestParseRejectsMalformedHex(t *testing.T) {
 		"\"TargetTemplate\"=hex(1):zz,zz\r\n"
 	if _, err := Parse([]byte(bad)); err == nil {
 		t.Errorf("expected error for malformed hex bytes")
+	}
+}
+
+// TestParseLegacyTokenSocketREGSZ covers a policy pushed before the
+// TokenSockets REG_MULTI_SZ existed: a lone legacy TokenSocket REG_SZ value
+// must still parse. A value naming exactly the pre-list default expands to the
+// pair (config.ExpandLegacyScalar — read literally it would leave the host
+// unable to find its forward once the workstation renamed it); any other value
+// is the admin's own choice and stays one element.
+//
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
+func TestParseLegacyTokenSocketREGSZ(t *testing.T) {
+	parse := func(t *testing.T, value string) config.SocketList {
+		t.Helper()
+		in := "Windows Registry Editor Version 5.00\r\n\r\n" +
+			"[HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\goodtune\\dotvault\\Vault]\r\n" +
+			"\"Address\"=\"http://127.0.0.1:8200\"\r\n" +
+			"\"AuthMethod\"=\"token\"\r\n" +
+			"\"TokenSocket\"=\"" + value + "\"\r\n"
+		cfg, err := Parse([]byte(in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Vault.TokenSockets
+	}
+
+	got := parse(t, config.LegacyPeerSocket)
+	if want := (config.SocketList{config.LegacyPeerSocket, config.PerHostPeerSocketGlob}); !reflect.DeepEqual(got, want) {
+		t.Errorf("legacy default: got %v, want %v", got, want)
+	}
+
+	got = parse(t, "/run/peer/api.sock")
+	if want := (config.SocketList{"/run/peer/api.sock"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("other value: got %v, want %v", got, want)
 	}
 }
 

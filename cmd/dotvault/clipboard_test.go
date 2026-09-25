@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/clipboard"
+	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // newUnixClipboardServer starts an httptest server bound to a Unix socket at
@@ -29,8 +31,8 @@ func newUnixClipboardServer(t *testing.T, sockPath string, handler http.HandlerF
 	t.Cleanup(srv.Close)
 }
 
-func TestPostClipboardToSocket_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+func TestPostClipboardToPeers_Success(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	var text, host string
 	newUnixClipboardServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -38,8 +40,8 @@ func TestPostClipboardToSocket_Success(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"clipboard set"}`))
 	})
 
-	if err := postClipboardToSocket(context.Background(), sock, "s3cr3t\nline2"); err != nil {
-		t.Fatalf("postClipboardToSocket: %v", err)
+	if err := postClipboardToPeers(context.Background(), peer.NewPool([]string{sock}), "s3cr3t\nline2"); err != nil {
+		t.Fatalf("postClipboardToPeers: %v", err)
 	}
 	if text != "s3cr3t\nline2" {
 		t.Errorf("peer got text %q, want it verbatim", text)
@@ -49,9 +51,9 @@ func TestPostClipboardToSocket_Success(t *testing.T) {
 	}
 }
 
-func TestPostClipboardToSocket_MissingSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
-	if err := postClipboardToSocket(context.Background(), sock, "t"); err == nil {
+func TestPostClipboardToPeers_MissingSocket(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "absent.sock")
+	if err := postClipboardToPeers(context.Background(), peer.NewPool([]string{sock}), "t"); err == nil {
 		t.Fatal("expected an error for a missing socket so the caller falls back locally")
 	}
 }
@@ -60,6 +62,10 @@ func TestPostClipboardToSocket_MissingSocket(t *testing.T) {
 // stdin, and the given --config override, returning the command error and the
 // text (if any) the local writer received.
 func runClipboardWith(t *testing.T, cfgPath, stdin string, args ...string) (error, *string) {
+	// Run as though no system-wide config were installed: --config is
+	// refused whenever one exists without bypass_system_config, which is
+	// the case on any machine running the product.
+	t.Cleanup(paths.SetSystemConfigPathForTest(filepath.Join(t.TempDir(), "absent.yaml")))
 	t.Helper()
 	prevCfg := flagConfig
 	flagConfig = cfgPath
@@ -82,7 +88,7 @@ func runClipboardWith(t *testing.T, cfgPath, stdin string, args ...string) (erro
 }
 
 func TestRunClipboard_PrefersPeerSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	var peerText string
 	newUnixClipboardServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -103,7 +109,7 @@ func TestRunClipboard_PrefersPeerSocket(t *testing.T) {
 }
 
 func TestRunClipboard_FallsBackWhenPeerUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, localText := runClipboardWith(t, writeBrowseConfig(t, sock), "", "local value")
 	if err != nil {
@@ -118,7 +124,7 @@ func TestRunClipboard_FallsBackWhenPeerErrors(t *testing.T) {
 	// The peer is reachable but returns a non-200 (e.g. its clipboard writer
 	// failed): runClipboard must fall back to the local clipboard rather than
 	// surfacing the peer error.
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	newUnixClipboardServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":"no display"}`))
@@ -146,7 +152,7 @@ func TestRunClipboard_FallsBackWhenConfigUnloadable(t *testing.T) {
 }
 
 func TestRunClipboard_ReadsStdinWhenNoArg(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, localText := runClipboardWith(t, writeBrowseConfig(t, sock), "from stdin\n")
 	if err != nil {
@@ -158,7 +164,7 @@ func TestRunClipboard_ReadsStdinWhenNoArg(t *testing.T) {
 }
 
 func TestRunClipboard_DashReadsStdin(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, localText := runClipboardWith(t, writeBrowseConfig(t, sock), "dash value", "-")
 	if err != nil {

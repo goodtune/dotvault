@@ -49,8 +49,9 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // ServeForward binds socket on the remote and relays every accepted connection
 // to target, returning when ctx is cancelled or the transport dies. host
 // labels the forward-failure metric recorded for a target dial that fails
-// mid-accept-loop (see serveListener) — it is otherwise unused here, so a
-// caller with no meaningful host identity may pass "".
+// mid-accept-loop (see serveListener) and names the `dotvault ssh edit`
+// override in the live-listener bind error below; it is otherwise unused
+// here, so a caller with no meaningful host identity may pass "".
 //
 // A bind failure alone does not prove the path is stale. sshd's default
 // StreamLocalBindUnlink=no makes bind() fail EADDRINUSE for *any* existing
@@ -85,7 +86,11 @@ func ServeForward(ctx context.Context, cl *ssh.Client, host, socket string, targ
 			// actively listening at this path right now. Unlinking here would
 			// silently hijack that session — exactly the outcome this probe
 			// exists to prevent.
-			return fail(fmt.Errorf("%w: %s: %w (a live listener already owns this path)", ErrBind, socket, bindErr))
+			// A live listener that is not ours is most often another
+			// workstation whose {{HOSTNAME}} label expands to the same
+			// name — two machines both called "laptop" — so name the
+			// fix rather than leave the operator to infer it.
+			return fail(fmt.Errorf("%w: %s: %w (a live listener already owns this path; if another workstation with the same hostname label forwards to this remote, give this one a distinct path with `dotvault ssh edit %s --socket`)", ErrBind, socket, bindErr, host))
 		}
 
 		if rmErr := removeRemoteFile(ctx, cl, socket); rmErr != nil {

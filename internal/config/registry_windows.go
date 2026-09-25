@@ -251,7 +251,7 @@ type registryLayer struct {
 	VaultPolicies            []string
 	VaultNoDefaultPolicy     *uint32
 	VaultDisableTokenRenewal *uint32
-	VaultTokenSocket         string
+	VaultTokenSockets        []string
 	VaultBorrowOnly          *uint32
 
 	// Vault\MTLS (cert auth), with BYO under Vault\MTLS\BYO.
@@ -395,7 +395,7 @@ func readRegistryLayerAt(root registry.Key, policyPath string) (registryLayer, b
 		layer.VaultPolicies = readRegMultiString(vk, "Policies")
 		layer.VaultNoDefaultPolicy = readRegDWORD(vk, "NoDefaultPolicy")
 		layer.VaultDisableTokenRenewal = readRegDWORD(vk, "DisableTokenRenewal")
-		layer.VaultTokenSocket, _ = readRegString(vk, "TokenSocket")
+		layer.VaultTokenSockets = readRegistryVaultTokenSockets(vk)
 		layer.VaultBorrowOnly = readRegDWORD(vk, "BorrowOnly")
 	}
 
@@ -642,8 +642,8 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	if layer.VaultDisableTokenRenewal != nil {
 		cfg.Vault.DisableTokenRenewal = *layer.VaultDisableTokenRenewal != 0
 	}
-	if layer.VaultTokenSocket != "" {
-		cfg.Vault.TokenSocket = layer.VaultTokenSocket
+	if layer.VaultTokenSockets != nil {
+		cfg.Vault.TokenSockets = SocketList(layer.VaultTokenSockets)
 	}
 	if layer.VaultBorrowOnly != nil {
 		cfg.Vault.BorrowOnly = *layer.VaultBorrowOnly != 0
@@ -962,6 +962,46 @@ func readRegMultiString(key registry.Key, name string) []string {
 		return nil
 	}
 	return val
+}
+
+// readRegistryVaultTokenSockets reads vault.token_socket from the open Vault
+// policy key: a TokenSockets REG_MULTI_SZ if present — including an
+// explicitly empty one, which means "disabled" and must not be confused
+// with an absent value — else a legacy TokenSocket REG_SZ read through
+// ExpandLegacyScalar (the default pair when it names the pre-list default,
+// otherwise the one pattern the operator wrote). Returns nil (not an empty,
+// non-nil slice) only when
+// neither value is present, so the caller's nil-means-absent convention
+// (config.SocketList) round-trips through the registry the same way it does
+// through YAML.
+//
+// Presence of TokenSockets has to be checked independently of its content:
+// GetStringsValue decodes a zero-byte REG_MULTI_SZ to a nil []string, the
+// same nil a missing value also produces, so readRegMultiString alone
+// cannot tell "explicitly empty" from "absent". GetValue(name, nil) can —
+// with no destination buffer the underlying RegQueryValueEx still succeeds
+// (it just reports the required size) whenever the value exists, and fails
+// with ErrNotExist only when it does not, regardless of the value's length
+// or type.
+//
+// TODO(pre-1.0, #172): drop the REG_SZ fallback.
+func readRegistryVaultTokenSockets(vk registry.Key) []string {
+	if _, _, err := vk.GetValue("TokenSockets", nil); err == nil {
+		if v := readRegMultiString(vk, "TokenSockets"); v != nil {
+			return v
+		}
+		// Present but empty (or an unexpected type readRegMultiString
+		// already warned about): "explicitly empty" wins over the legacy
+		// fallback below rather than reading it as absent.
+		return []string{}
+	}
+	if legacy, ok := readRegString(vk, "TokenSocket"); ok && legacy != "" {
+		// ExpandLegacyScalar, not []string{legacy}: the pre-list default read
+		// literally would leave a host unable to find its forward once the
+		// workstation renames it to the per-hostname path. See its godoc.
+		return ExpandLegacyScalar(legacy)
+	}
+	return nil
 }
 
 // readRegistryEnrolments reads enrolments from the Enrolments subkey under

@@ -20,7 +20,7 @@ import (
 )
 
 // socketClient builds an http.Client that reaches the server over its Unix
-// socket, mirroring what auth.PeerSocketClient does on the borrow side.
+// socket, mirroring what peer.Client does on the borrow side.
 func socketClient(path string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{

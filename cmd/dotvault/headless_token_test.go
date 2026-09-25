@@ -14,8 +14,13 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/vault"
 )
+
+// noPeerChange returns an empty peer-change indirection, for the tests that do
+// not exercise the pool's watcher. runDaemon owns the real one.
+func noPeerChange() *atomic.Pointer[func()] { return new(atomic.Pointer[func()]) }
 
 // mockVaultAccepting starts an httptest server standing in for Vault that
 // accepts only the given token on lookup-self (any other token gets 403).
@@ -68,7 +73,7 @@ func TestWaitForHeadlessToken_BorrowsFromSocket(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "peer.sock")
+	sock := filepath.Join(sockDir(t), "peer.sock")
 	serveUnixToken(t, sock, "peer-token")
 
 	// A token-file path that does not exist — the borrow is the only way in.
@@ -77,7 +82,7 @@ func TestWaitForHeadlessToken_BorrowsFromSocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}, auth.NewTokenDenylist()) {
+	if !waitForHeadlessToken(ctx, vc, tokenPath, peer.NewPool([]string{sock}), noPeerChange(), auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrowed token")
 	}
 	if got := vc.Token(); got != "peer-token" {
@@ -87,10 +92,13 @@ func TestWaitForHeadlessToken_BorrowsFromSocket(t *testing.T) {
 
 // TestWaitForHeadlessToken_SocketMaterialisesLater exercises the inotify path:
 // the socket does not exist when the wait begins, then an SSH RemoteForward
-// (modelled here by a goroutine) creates it. The directory watch must fire and
-// trigger an immediate borrow rather than waiting out the 10s poll. Linux-only
-// — on other platforms the tokenwatch is a no-op and the poll covers it (which
-// would make this test take up to 10s, so it is skipped there).
+// (modelled here by a goroutine) creates it. The pool's watch must fire and
+// trigger an immediate borrow rather than waiting out the 10s poll. The watcher
+// lives in runDaemon rather than in the idle, so the test reproduces that
+// wiring: the pool's OnChange hook dereferences the peerChanged indirection the
+// idle stores its wake into. Linux-only — on other platforms the watch is a
+// no-op and the poll covers it (which would make this test take up to 10s, so
+// it is skipped there).
 func TestWaitForHeadlessToken_SocketMaterialisesLater(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("inotify socket watch is Linux-only; other platforms rely on the 10s poll")
@@ -103,7 +111,7 @@ func TestWaitForHeadlessToken_SocketMaterialisesLater(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	dir := t.TempDir()
+	dir := sockDir(t)
 	sock := filepath.Join(dir, "peer.sock")
 	tokenPath := filepath.Join(t.TempDir(), ".dotvault-token")
 
@@ -138,7 +146,17 @@ func TestWaitForHeadlessToken_SocketMaterialisesLater(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	if !waitForHeadlessToken(ctx, vc, tokenPath, []string{sock}, auth.NewTokenDenylist()) {
+	// Mirror runDaemon: one pool, its OnChange going through the indirection
+	// the idle publishes its wake into, and one Watch goroutine.
+	peerChanged := noPeerChange()
+	pool := peer.NewPool([]string{sock}, peer.WithOnChange(func() {
+		if fn := peerChanged.Load(); fn != nil {
+			(*fn)()
+		}
+	}))
+	go func() { _ = pool.Watch(ctx) }()
+
+	if !waitForHeadlessToken(ctx, vc, tokenPath, pool, peerChanged, auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned false; expected a borrow once the socket materialised")
 	}
 	if got := vc.Token(); got != "late-token" {
@@ -163,7 +181,7 @@ func TestWaitForHeadlessToken_CancelWithoutToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	if waitForHeadlessToken(ctx, vc, tokenPath, nil, auth.NewTokenDenylist()) {
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, noPeerChange(), auth.NewTokenDenylist()) {
 		t.Fatal("waitForHeadlessToken returned true with no token source")
 	}
 }
@@ -238,7 +256,7 @@ func TestWaitForHeadlessTokenIgnoresFileWhenPathEmpty(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
-	if waitForHeadlessToken(ctx, vc, "", nil, nil) {
+	if waitForHeadlessToken(ctx, vc, "", nil, noPeerChange(), nil) {
 		t.Fatal("waitForHeadlessToken adopted a token despite an empty token path — a file dropped on a no-persist host would become the daemon's credential")
 	}
 	if got := vc.Token(); got != "" {
@@ -289,7 +307,7 @@ func TestWaitForHeadlessToken_RecordsRejectedToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	if waitForHeadlessToken(ctx, vc, tokenPath, nil, denyList) {
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, noPeerChange(), denyList) {
 		t.Fatal("waitForHeadlessToken returned true for a token Vault refuses")
 	}
 	// One pass, one question. This bound is a guard rather than the
@@ -330,7 +348,7 @@ func TestWaitForHeadlessToken_SkipsAlreadyDeniedToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
-	if waitForHeadlessToken(ctx, vc, tokenPath, nil, denyList) {
+	if waitForHeadlessToken(ctx, vc, tokenPath, nil, noPeerChange(), denyList) {
 		t.Fatal("waitForHeadlessToken returned true for a suppressed token")
 	}
 	if got := calls.Load(); got != 0 {

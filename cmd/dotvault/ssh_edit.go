@@ -31,15 +31,18 @@ counterpart of the web UI's per-remote edit form.
 
 Only the fields you pass change; everything else keeps its current value.
 --port 0 resets the port to the default (22), and --socket "" resets the
-remote socket path to the default (~/.ssh/dotvault.sock). Changes go through
-the same registry as "ssh add": the daemon persists ssh.yaml and reconciles
-the forward immediately, so --enable/--disable take effect without a
-restart.`,
+remote socket path to the default (~/.ssh/dotvault.{{HOSTNAME}}.sock). The
+default names the socket after this workstation so several workstations can
+forward to one remote. A remote running a dotvault older than 0.34 only
+looks for ~/.ssh/dotvault.sock — pass --socket ~/.ssh/dotvault.sock for it
+until it is upgraded. Changes go through the same registry as "ssh add": the
+daemon persists ssh.yaml and reconciles the forward immediately, so
+--enable/--disable take effect without a restart.`,
 		Args: cobra.ExactArgs(1),
 		RunE: runSSHEdit,
 	}
 	cmd.Flags().Int("port", 0, "SSH port (0 resets to the default, 22)")
-	cmd.Flags().String("socket", "", `remote Unix socket path to bind ("" resets to the default, ~/.ssh/dotvault.sock)`)
+	cmd.Flags().String("socket", "", `remote Unix socket path to bind ("" resets to the default, ~/.ssh/dotvault.{{HOSTNAME}}.sock)`)
 	cmd.Flags().Bool("enable", false, "enable the forward")
 	cmd.Flags().Bool("disable", false, "disable the forward without removing it")
 	return cmd

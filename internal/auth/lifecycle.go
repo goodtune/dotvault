@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/observability"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -139,13 +140,9 @@ type LifecycleManager struct {
 	// before this manager existed). See TokenDenylist.
 	denied *TokenDenylist
 
-	// tokenSockets is an ordered list of peer dotvault web-API Unix sockets.
-	// When non-empty, tryReload also consults each peer for a fresh token
-	// (after the file and env candidates) so a daemon whose token has gone
-	// invalid can recover by borrowing a peer's live token instead of
-	// forcing a re-auth. Empty disables the socket candidates. See
-	// FetchTokenFromSockets.
-	tokenSockets []string
+	// borrower, when non-nil, is consulted last by tryReload so the recovery
+	// path can borrow a peer's live token before declaring re-auth necessary.
+	borrower peer.Borrower
 
 	// OnReauth, when non-nil, is invoked exactly once each time the
 	// manager transitions to the needs-reauth state. Used by web mode to
@@ -369,12 +366,10 @@ func (lm *LifecycleManager) SetTokenFilePath(p string) {
 	lm.tokenFilePath = p
 }
 
-// SetTokenSockets wires the ordered peer dotvault web-API Unix sockets so the
-// recovery path can borrow a peer's live token (dotvault-to-dotvault sharing)
-// before declaring re-auth necessary. Empty disables it. See
-// FetchTokenFromSockets.
-func (lm *LifecycleManager) SetTokenSockets(paths []string) {
-	lm.tokenSockets = paths
+// SetBorrower wires the peer socket pool so the recovery path can borrow a
+// peer's live token before declaring re-auth necessary. Nil disables it.
+func (lm *LifecycleManager) SetBorrower(b peer.Borrower) {
+	lm.borrower = b
 }
 
 // SetOnReauth registers a callback fired when the manager transitions into
@@ -864,9 +859,9 @@ func (lm *LifecycleManager) resetRecoveryBackoff() {
 // env-first policy would keep selecting it and never see a fresh
 // value on disk. Reading the file first sidesteps that loop.
 func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
-	// A reload has a candidate source if either a token file or a peer socket
+	// A reload has a candidate source if either a token file or a borrower
 	// is configured. With neither there is nothing to pick up.
-	if lm.tokenFilePath == "" && len(lm.tokenSockets) == 0 {
+	if lm.tokenFilePath == "" && lm.borrower == nil {
 		return false
 	}
 	current := lm.client.Token()
@@ -897,11 +892,12 @@ func (lm *LifecycleManager) tryReload(ctx context.Context) bool {
 		addCandidate(fileToken)
 	}
 	addCandidate(ReadTokenEnv())
-	// The peer sockets are consulted last: a locally-written token (file/env,
-	// e.g. from a parallel `dotvault login`) takes precedence over a borrowed
-	// one. Best-effort — missing/stale sockets yield no candidate.
-	if len(lm.tokenSockets) > 0 {
-		sockToken, _ := FetchTokenFromSockets(ctx, lm.tokenSockets)
+	// The borrower is consulted last: a locally-written token (file/env, e.g.
+	// from a parallel `dotvault login`) takes precedence over a borrowed one.
+	// Best-effort — no borrower, or one with nothing to offer, yields no
+	// candidate.
+	if lm.borrower != nil {
+		sockToken, _ := lm.borrower.Borrow(ctx)
 		addCandidate(sockToken)
 	}
 	if len(candidates) == 0 {

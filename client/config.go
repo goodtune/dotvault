@@ -6,6 +6,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // Config is the connectivity-and-auth view of dotvault's system config. It is
@@ -133,17 +134,20 @@ type VaultConfig struct {
 	// token to exactly the capabilities the consumer needs.
 	NoDefaultPolicy bool
 
-	// TokenSocket is an optional path to a peer dotvault daemon's web-API
-	// Unix socket. When set, an interactive Login first tries to borrow a
-	// live token from the peer over the socket (the equivalent of
+	// TokenSockets lists peer dotvault socket patterns — literal paths or
+	// final-segment globs (`~/.ssh/dotvault.*.sock`) — mirroring
+	// vault.token_socket with its default applied. An interactive Login and
+	// AuthenticateCached borrow from the most recently seen live peer first
+	// (the equivalent of
 	// `curl --unix-socket <path> http://localhost/api/v1/token`) before
 	// running the configured auth flow — the dotvault-to-dotvault sharing
-	// seam. A missing or stale socket is ignored. A leading ~ is expanded.
-	TokenSocket string
+	// seam. Browse/Notify/Clipboard fan out to every live peer. Missing or
+	// stale sockets are skipped. A leading ~ is expanded.
+	TokenSockets []string
 
 	// BorrowOnly mirrors vault.borrow_only: the host this Config describes
 	// runs no fresh-auth flow of its own and authenticates exclusively by
-	// borrowing over TokenSocket/APISocket. AuthenticateCached is unaffected
+	// borrowing over TokenSockets/APISocket. AuthenticateCached is unaffected
 	// — it never runs a fresh-auth flow either way — but Login refuses
 	// outright with ErrLoginRequired, since "run the configured auth flow"
 	// has no meaning here.
@@ -153,15 +157,15 @@ type VaultConfig struct {
 	// socket (mirrors the api section: the resolved api.unix.path, or the
 	// per-user runtime default when api.enabled is set without a path).
 	//
-	// It is the same endpoint as TokenSocket and is tried ahead of it,
-	// because the two differ in lifetime rather than capability: the local
-	// socket is served by the long-lived per-user daemon, while TokenSocket
-	// is typically an SSH RemoteForward that vanishes when the session drops.
-	// A consumer started inside an SSH session therefore keeps borrowing
-	// successfully after that session ends.
+	// It is the same endpoint as TokenSockets and is tried ahead of them,
+	// because they differ in lifetime rather than capability: the local
+	// socket is served by the long-lived per-user daemon, while a
+	// TokenSockets entry is typically an SSH RemoteForward that vanishes when
+	// the session drops. A consumer started inside an SSH session therefore
+	// keeps borrowing successfully after that session ends.
 	//
 	// Borrow direction only. The peer actions (Browse / Notify / Clipboard)
-	// deliberately keep using TokenSocket: their whole purpose is to reach
+	// deliberately keep using TokenSockets: their whole purpose is to reach
 	// the workstation where a human is looking, and sending them to the local
 	// daemon would open a browser on the headless host nobody is sitting at.
 	APISocket string
@@ -174,10 +178,32 @@ func (v VaultConfig) borrowSockets() []string {
 	if v.APISocket != "" {
 		out = append(out, v.APISocket)
 	}
-	if v.TokenSocket != "" {
-		out = append(out, v.TokenSocket)
+	return append(out, v.TokenSockets...)
+}
+
+// borrower is what the token-borrow paths resolve through: the local API socket
+// tier first, then the peer tier, most-recently-seen first within it. No
+// watcher — a library consumer is a short-lived process, so on-demand
+// re-resolution is the whole mechanism.
+//
+// peer.NewLocalFirstChain owns the tiering and why local-first has to be a tier
+// rather than a sort over borrowSockets(); see VaultConfig.APISocket for why
+// this order is the right one for a consumer.
+func (v VaultConfig) borrower() peer.Borrower {
+	return peer.NewLocalFirstChain(v.APISocket, v.TokenSockets)
+}
+
+// peerPool is the pool the peer actions (Browse / Notify / Clipboard) fan out
+// over: TokenSockets only, deliberately excluding APISocket. Their purpose is
+// to reach the workstation where a human is looking, and routing them to the
+// local daemon would open a browser on the headless host nobody is sitting at.
+// Returns nil when nothing is configured, which peerAction reports as
+// ErrPeerUnavailable rather than silently succeeding at nothing.
+func (v VaultConfig) peerPool() *peer.Pool {
+	if len(v.TokenSockets) == 0 {
+		return nil
 	}
-	return out
+	return peer.NewPool(v.TokenSockets)
 }
 
 // DefaultConfigPath returns the platform-appropriate path to dotvault's
@@ -249,7 +275,7 @@ func fromInternal(cfg *config.Config) *Config {
 			AuthMount:        cfg.Vault.AuthMount,
 			AuthRole:         cfg.Vault.AuthRole,
 			OIDCCallbackPort: cfg.Vault.OIDCCallbackPort,
-			TokenSocket:      cfg.Vault.TokenSocket,
+			TokenSockets:     cfg.PeerActionSockets(),
 			BorrowOnly:       cfg.Vault.BorrowOnly,
 			APISocket:        apiSocket,
 			Policies:         cfg.Vault.Policies,

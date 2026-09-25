@@ -130,7 +130,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `ca_cert` | string | — | Path to CA certificate for TLS verification |
 | `tls_skip_verify` | bool | `false` | Skip TLS certificate verification (development only) |
 | `disable_token_renewal` | bool | `false` | Never call `RenewSelf`; TTL expiry still triggers re-auth |
-| `token_socket` | string | — | Optional path to a peer dotvault's web-API Unix socket to borrow a token from (see below) |
+| `token_socket` | string or list | `~/.ssh/dotvault.sock, ~/.ssh/dotvault.*.sock` | Peer dotvault socket patterns to borrow a token from and fan peer actions out to (see below); `[]` disables |
 | `borrow_only` | bool | `false` | Forbid this host from ever running its own fresh-auth flow; it only ever borrows a token via `token_socket` (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
@@ -197,17 +197,29 @@ When `token_socket` points at a Unix-domain socket served by another dotvault da
 curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/token
 ```
 
+`token_socket` is a **list of patterns** — literal paths or globs whose metacharacters sit in the final path segment (`~/.ssh/dotvault.*.sock`). A single string is still accepted. Every match is a member of a **pool**: token borrows try the most recently seen live socket first, while the peer actions (`browse`, `notify`, `clipboard`) are sent to **every** live socket and succeed if any accepts. A socket that cannot be reached within a few seconds is evicted from the pool — unless it appeared less than two seconds ago, since a forward's socket exists on `bind()` a moment before it `listen()`s and a refusal that fresh is a peer about to be fine — and readmitted when it is recreated (immediately on Linux via inotify; on the next attempt elsewhere) or after five minutes. When the key is absent the default is the pair above; set `token_socket: []` to disable peer sockets entirely.
+
+```yaml
+vault:
+  token_socket:
+    - ~/.ssh/dotvault.sock
+    - ~/.ssh/dotvault.*.sock
+```
+
+**Why per-workstation sockets.** A single shared path is a race the moment two workstations forward to the same remote: whichever connects last takes over the socket, and the other's forward is silently unbound. The observed case is a laptop and a desktop both managing a forward to the same headless host — the desktop is always up, the laptop wakes sporadically and steals the path, and when the laptop's lid closes the remote has nowhere to borrow from even though the desktop is right there. Naming each workstation's socket after itself (see [managed SSH forwards](../guide/ssh-forwards.md)) and letting the borrower hold a pool of every match removes the race instead of papering over it.
+
 The intended deployment: a workstation (e.g. Windows) runs dotvault with the [web UI](#web-section) enabled and authenticates interactively. You then SSH **from the workstation to** a second machine (e.g. a Linux dev box or server), and the SSH `RemoteForward` exposes the workstation daemon's loopback HTTP listener as a Unix socket **created on the remote (devbox) side**:
 
 ```
 # ~/.ssh/config on the workstation, where `ssh devbox` runs
 Host devbox
-    # Creates /home/me/.ssh/dotvault.sock ON devbox, forwarding to the
-    # workstation's web UI at 127.0.0.1:9000.
-    RemoteForward /home/me/.ssh/dotvault.sock 127.0.0.1:9000
+    # Creates /home/me/.ssh/dotvault.laptop.sock ON devbox, forwarding to
+    # the workstation's web UI at 127.0.0.1:9000.
+    # One socket per workstation — see the managed-forwards guide.
+    RemoteForward /home/me/.ssh/dotvault.laptop.sock 127.0.0.1:9000
 ```
 
-The remote dotvault then sets `token_socket: ~/.ssh/dotvault.sock` and borrows the workstation's token instead of needing its own browser or TTY to authenticate. If the `RemoteForward` above is itself managed by a [keyless sync rule](sync-rules.md#rules-without-a-vault-key), note the daemon syncs those rules *before* it authenticates — the file that creates the socket cannot be made to wait on the token that arrives over it. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
+The remote dotvault then sets `token_socket` (or leaves the default) and borrows the workstation's token instead of needing its own browser or TTY to authenticate. If the `RemoteForward` above is itself managed by a [keyless sync rule](sync-rules.md#rules-without-a-vault-key), note the daemon syncs those rules *before* it authenticates — the file that creates the socket cannot be made to wait on the token that arrives over it. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
 
 On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
 
@@ -328,7 +340,7 @@ Enabling `api` fixes that by putting a second, stable dotvault on the near side 
 
 ```
 workstation (interactive login)
-   │  SSH RemoteForward → ~/.ssh/dotvault.sock   ← comes and goes with the session
+   │  SSH RemoteForward → ~/.ssh/dotvault.<host>.sock   ← comes and goes with the session
    ▼
 devbox: dotvault daemon (vault.token_socket + api.enabled)
    │  $XDG_RUNTIME_DIR/dotvault/api.sock          ← always there while the daemon runs
@@ -339,19 +351,27 @@ devbox: your tmux job, scripts, Python bindings
 Configuration on the devbox is both settings together — borrow from the workstation, serve to everything local:
 
 ```yaml
-vault:
-  token_socket: ~/.ssh/dotvault.sock   # borrow from the workstation
 api:
-  enabled: true                        # serve the borrow endpoint locally
+  enabled: true   # serve the borrow endpoint locally
+```
+
+`token_socket` is deliberately absent here: the default pattern list already covers both the per-workstation sockets (`~/.ssh/dotvault.*.sock`) and the pre-0.34 shared path, so a devbox only needs the `api` half. Set it explicitly when the forwards live somewhere other than `~/.ssh`, and set it as a **list** when you do:
+
+```yaml
+vault:
+  token_socket:
+    - ~/.ssh/dotvault.*.sock   # one socket per forwarding workstation
+api:
+  enabled: true
 ```
 
 Clients on that host need no extra configuration: they read the same config and derive the same socket path.
 
 ### Borrow order
 
-When both are configured, a token borrow tries the **local API socket first**, then `vault.token_socket`. The local socket is preferred because it is the more stable of the two, which is the entire point. This ordering applies to the daemon, the CLI, the Go `client/` facade and the Python bindings alike. The daemon excludes its *own* socket from its list — it serves that one.
+When both are configured, a token borrow tries the **local API socket first**, then the `vault.token_socket` pool, most-recently-seen first. The local socket is preferred because it is the more stable of the two, which is the entire point. This ordering applies to the daemon, the CLI, the Go `client/` facade and the Python bindings alike. The daemon excludes its *own* socket from its list — it serves that one.
 
-The [peer actions](../cli.md#dotvault-browse) (`browse`, `notify`, `clipboard`) deliberately keep using `vault.token_socket` **only**. Their purpose is to reach the workstation where a human is looking; sending them to the local daemon would open a browser on the headless host nobody is sitting at.
+The [peer actions](../cli.md#dotvault-browse) (`browse`, `notify`, `clipboard`) deliberately keep using the `vault.token_socket` pool **only**, and are sent to every live peer in it. Their purpose is to reach the workstation where a human is looking; sending them to the local daemon would open a browser on the headless host nobody is sitting at.
 
 ### Separate from `web.enabled`
 

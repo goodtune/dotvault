@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/peer"
+	"github.com/goodtune/dotvault/internal/sshfwd"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -28,6 +30,36 @@ func TestHandleStatus(t *testing.T) {
 	json.NewDecoder(w.Body).Decode(&resp)
 	if _, ok := resp["authenticated"]; !ok {
 		t.Error("response missing 'authenticated' field")
+	}
+}
+
+// TestHandleStatusReportsHostnameLabel: the migration in cmd/dotvault reads
+// hostname_label to work out the exact path a forward will move to, and
+// refuses to migrate when it is absent — so it has to be served, and served
+// unauthenticated, since the borrower asks before any token is involved.
+func TestHandleStatusReportsHostnameLabel(t *testing.T) {
+	want, err := sshfwd.LocalHostnameLabel()
+	if err != nil {
+		t.Skipf("this host has no usable hostname label: %v", err)
+	}
+
+	s := testServer(t)
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp["hostname_label"]; got != want {
+		t.Errorf("hostname_label = %v, want %q", got, want)
+	}
+	if resp["authenticated"] != false {
+		t.Fatal("fixture is authenticated; this test must prove the label is served without a token")
 	}
 }
 
@@ -935,5 +967,32 @@ func TestHandleSecrets_SlowVaultReturnsWithinTimeout(t *testing.T) {
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestStatusCarriesPeerSockets(t *testing.T) {
+	s := testServer(t)
+	s.SetPeerStatus(func() peer.Status {
+		return peer.Status{
+			Patterns: []string{"~/.ssh/dotvault.*.sock"},
+			Members:  []peer.Member{{Path: "/home/u/.ssh/dotvault.laptop.sock", Evicted: true}},
+		}
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/status", nil)
+	w := httptest.NewRecorder()
+	s.handleStatus(w, req)
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	ps, ok := body["peer_sockets"].(map[string]any)
+	if !ok {
+		t.Fatalf("no peer_sockets block: %s", w.Body.String())
+	}
+	members := ps["members"].([]any)
+	if len(members) != 1 || members[0].(map[string]any)["evicted"] != true {
+		t.Errorf("members = %v", members)
 	}
 }

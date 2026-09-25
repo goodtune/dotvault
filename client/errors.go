@@ -73,10 +73,10 @@ var (
 	// transport/availability problem rather than an authorisation decision.
 	ErrUnreachable = errors.New("dotvault: vault unreachable")
 
-	// ErrPeerUnavailable indicates a peer-action call (Browse, Notify) could
-	// not be completed by the peer dotvault named by TokenSocket: the socket
-	// is not configured, the peer could not be reached (missing/stale socket,
-	// SSH forward down), or the peer answered that it could not perform the
+	// ErrPeerUnavailable indicates a peer-action call (Browse, Notify,
+	// Clipboard) could not be completed by any peer dotvault in TokenSockets:
+	// no socket is configured, no peer could be reached (missing/stale socket,
+	// SSH forward down), or every peer answered that it could not perform the
 	// action (e.g. a 502 because a browser opener failed, or a 503 because it
 	// was busy). It is the peer-side analogue of ErrUnreachable — a retryable
 	// availability problem, distinct from a request the peer rejected as

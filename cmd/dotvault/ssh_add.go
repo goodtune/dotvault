@@ -47,7 +47,11 @@ or non-interactive shell, pass --accept-host-key after verifying the printed
 fingerprint out of band.
 
 --port and --socket override the remote's SSH port (default 22) and the Unix
-socket path bound on the remote (default ~/.ssh/dotvault.sock) respectively.
+socket path bound on the remote (default ~/.ssh/dotvault.{{HOSTNAME}}.sock)
+respectively. The default names the socket after this workstation so several
+workstations can forward to one remote. A remote running a dotvault older
+than 0.34 only looks for ~/.ssh/dotvault.sock — pass --socket
+~/.ssh/dotvault.sock for it until it is upgraded.
 --force skips verification entirely and persists the entry as given — the
 documented escape for registering a host that is offline right now; it does
 not bypass the host-key confirmation gate on a later re-add, only the
@@ -57,7 +61,7 @@ verification dial itself.`,
 	}
 	cmd.Flags().Bool("force", false, "skip verification and persist the entry as given (for a host that is offline right now)")
 	cmd.Flags().Bool("accept-host-key", false, "accept an unpinned host's key without an interactive prompt (its fingerprint is still printed first)")
-	cmd.Flags().String("socket", "", "remote Unix socket path to bind (default ~/.ssh/dotvault.sock)")
+	cmd.Flags().String("socket", "", "remote Unix socket path to bind (default ~/.ssh/dotvault.{{HOSTNAME}}.sock)")
 	cmd.Flags().Int("port", 0, "SSH port (default 22)")
 	return cmd
 }

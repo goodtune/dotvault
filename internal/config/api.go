@@ -60,23 +60,24 @@ func (c *Config) APISocketPath() (string, error) {
 // started inside an SSH session keeps borrowing successfully after that
 // session ends — the whole point of the local socket.
 //
-// Paths are returned unexpanded; FetchTokenFromSocket expands a leading ~ at
+// Paths are returned unexpanded; peer.FetchToken expands a leading ~ at
 // fetch time.
 //
 // This is the borrow direction only. It is NOT the right order for the peer
 // actions (browse / notify / clipboard), which must reach the workstation
 // where a human is looking — posting those to the local daemon would open a
-// browser on the headless host nobody is sitting at. Those keep using
-// vault.token_socket directly.
+// browser on the headless host nobody is sitting at. Those go through
+// PeerActionSockets, which is this list without the local socket.
+//
+// Peer entries are patterns — literal paths or final-segment globs —
+// resolved by internal/peer.Pool; the default set applies when
+// vault.token_socket is absent.
 func (c *Config) TokenBorrowSockets() []string {
 	var out []string
 	if p := c.apiSocketCandidate(); p != "" {
 		out = append(out, p)
 	}
-	if c.Vault.TokenSocket != "" {
-		out = append(out, c.Vault.TokenSocket)
-	}
-	return out
+	return append(out, c.peerSocketPatterns()...)
 }
 
 // validateAPI checks the local API socket section. The only genuine footgun

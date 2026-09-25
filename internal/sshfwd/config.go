@@ -14,10 +14,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultRemoteSocket is the socket path used when a remote does not name one.
-// The leading ~ is expanded against the *remote* account's home at connect
-// time, not here — see home.go.
-const DefaultRemoteSocket = "~/.ssh/dotvault.sock"
+// DefaultRemoteSocket is the socket path used when a remote does not name
+// one. It is stored literally: the leading ~ is expanded against the
+// *remote* account's home and HostnameToken against this daemon's own
+// hostname, both at connect time — see home.go. Naming the socket after the
+// forwarding workstation is what lets two workstations forward to the same
+// remote without the last one to connect taking over a shared path.
+const DefaultRemoteSocket = "~/.ssh/dotvault." + HostnameToken + ".sock"
+
+// HostnameToken is the one template token a remote_socket may carry.
+const HostnameToken = "{{HOSTNAME}}"
 
 // DefaultPort is the SSH port used when a remote does not name one.
 const DefaultPort = 22
@@ -204,6 +210,16 @@ func Save(path string, f *File) error {
 // mishandling it would bind somewhere the user did not intend. Paths containing
 // .. segments are rejected to prevent escape to parent directories.
 func ValidateRemoteSocket(p string) error {
+	// Only the exact token is a template. Any other brace would bind a socket
+	// whose literal braces still match the borrower's dotvault.*.sock glob, so
+	// the typo would look like a working forward while every peer bound the
+	// same path — the exact collision the token exists to end. A single brace
+	// is rejected too, not just a doubled one: `{HOSTNAME}` is the likeliest
+	// spelling of the mistake and survives the token strip untouched.
+	stripped := strings.ReplaceAll(p, HostnameToken, "x")
+	if strings.ContainsAny(stripped, "{}") {
+		return fmt.Errorf("remote_socket may contain only the %s template token", HostnameToken)
+	}
 	switch {
 	case p == "":
 		return errors.New("remote_socket must not be empty")

@@ -85,10 +85,10 @@ func TestLogin_AllowedForNonCertificateMethods(t *testing.T) {
 func TestLogin_RefusedUnderBorrowOnly(t *testing.T) {
 	c, err := New(&Config{
 		Vault: VaultConfig{
-			Address:     "http://127.0.0.1:1",
-			AuthMethod:  "oidc",
-			TokenSocket: "~/.ssh/dotvault.sock",
-			BorrowOnly:  true,
+			Address:      "http://127.0.0.1:1",
+			AuthMethod:   "oidc",
+			TokenSockets: []string{"~/.ssh/dotvault.sock"},
+			BorrowOnly:   true,
 		},
 		TokenFile: filepath.Join(t.TempDir(), ".vault-token"),
 	})
@@ -130,11 +130,11 @@ func TestAuthenticateCached_SkipsCertCandidateUnderBorrowOnly(t *testing.T) {
 		t.Helper()
 		c, err := New(&Config{
 			Vault: VaultConfig{
-				Address:     "http://127.0.0.1:1",
-				AuthMethod:  "mtls",
-				TokenSocket: "~/.dotvault-borrow-only-test-absent.sock",
-				BorrowOnly:  borrowOnly,
-				MTLS:        MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
+				Address:      "http://127.0.0.1:1",
+				AuthMethod:   "mtls",
+				TokenSockets: []string{"~/.dotvault-borrow-only-test-absent.sock"},
+				BorrowOnly:   borrowOnly,
+				MTLS:         MTLSConfig{CertRole: "dotvault", StorageDir: t.TempDir()},
 			},
 			TokenFile: tokenFile,
 		})

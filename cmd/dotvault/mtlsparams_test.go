@@ -84,10 +84,10 @@ func TestEffectivePersistTokenAtRest(t *testing.T) {
 func TestMTLSParamsNilUnderBorrowOnly(t *testing.T) {
 	for _, method := range []string{"mtls", "mtls+tpm", "mtls+os"} {
 		cfg := &config.Config{Vault: config.VaultConfig{
-			Address:     "https://vault.example.com",
-			AuthMethod:  method,
-			TokenSocket: "~/.ssh/dotvault.sock",
-			BorrowOnly:  true,
+			Address:      "https://vault.example.com",
+			AuthMethod:   method,
+			TokenSockets: config.SocketList{"~/.ssh/dotvault.sock"},
+			BorrowOnly:   true,
 			MTLS: config.MTLSConfig{
 				CertRole: "dv", PKIRole: "dv-client",
 			},

@@ -261,18 +261,16 @@ func (c *Client) AuthenticateCached(ctx context.Context) error {
 		cachedRejected = true
 	}
 
-	// Candidate 3: borrow from a peer socket, local API socket first (see
-	// VaultConfig.APISocket for why that order). Best-effort — a
-	// missing/stale socket or an unauthenticated peer yields "" and falls
-	// through. Each distinct token is tried once: two sockets can front the
-	// same token (a local daemon that itself borrowed from the workstation),
-	// and re-validating an identical value would just be a wasted round trip.
-	sockets := c.cfg.Vault.borrowSockets()
-	for _, sock := range sockets {
-		borrowed, _ := auth.FetchTokenFromSocket(ctx, sock)
-		if borrowed == "" || seen[borrowed] {
-			continue
-		}
+	// Candidate 3: borrow from the peer pool — local API socket first (see
+	// VaultConfig.APISocket for why that order), then peers
+	// most-recently-seen first. Best-effort: a missing/stale socket or an
+	// unauthenticated peer yields "" and falls through. The pool returns one
+	// token, so there is nothing to de-duplicate here: two sockets can front
+	// the same token (a local daemon that itself borrowed from the
+	// workstation), and re-validating an identical value would be a wasted
+	// round trip.
+	sockets := c.cfg.Vault.borrowSockets() // patterns, for the diagnostics below
+	if borrowed, _ := c.cfg.Vault.borrower().Borrow(ctx); borrowed != "" && !seen[borrowed] {
 		seen[borrowed] = true
 		if ok, unreachable := tryCandidate(borrowed); ok {
 			return nil
@@ -399,7 +397,7 @@ func (c *Client) Login(ctx context.Context) error {
 	// returns auth.ErrBorrowOnly), but failing here is clearer for a facade
 	// consumer than surfacing that sentinel wrapped in ErrAuthFailed.
 	if c.cfg.Vault.BorrowOnly {
-		return fmt.Errorf("%w: this host is configured borrow-only: it authenticates exclusively by borrowing a token over TokenSocket/APISocket, never via a fresh-auth flow — use AuthenticateCached instead",
+		return fmt.Errorf("%w: this host is configured borrow-only: it authenticates exclusively by borrowing a token over TokenSockets/APISocket, never via a fresh-auth flow — use AuthenticateCached instead",
 			ErrLoginRequired)
 	}
 	if err := c.manager().Login(ctx); err != nil {
@@ -425,7 +423,7 @@ func (c *Client) manager() *auth.Manager {
 		AuthMount:        c.cfg.Vault.AuthMount,
 		AuthRole:         c.cfg.Vault.AuthRole,
 		OIDCCallbackPort: c.cfg.Vault.OIDCCallbackPort,
-		TokenSockets:     c.cfg.Vault.borrowSockets(),
+		Borrower:         c.cfg.Vault.borrower(),
 		Policy: auth.PolicyConstraint{
 			Policies:        c.cfg.Vault.Policies,
 			NoDefaultPolicy: c.cfg.Vault.NoDefaultPolicy,

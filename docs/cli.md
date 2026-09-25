@@ -143,13 +143,13 @@ With the section *disabled*, status normally prints no Docker block at all — w
 
 ### `dotvault browse`
 
-Open a URL in a browser, preferring a browser on the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+Open a URL in a browser, preferring a browser on a workstation at the other end of a [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
 
 ```sh
 dotvault browse <url>
 ```
 
-When `vault.token_socket` names a reachable peer dotvault (typically an SSH `RemoteForward` from a workstation running the web UI), the URL is form-posted to the peer's `POST /api/v1/remote/browse` endpoint and the browser opens **on the workstation** — the machine that actually has one. When the socket is not configured, missing, or the peer errors, the URL is opened in this host's default browser instead. Only `http` and `https` URLs without embedded `user:pass@` credentials are accepted; the same allowlist is enforced by the peer endpoint.
+`vault.token_socket` is a **list of socket patterns** — by default `~/.ssh/dotvault.sock` and `~/.ssh/dotvault.*.sock`, the paths a workstation's SSH `RemoteForward` binds — and the URL is form-posted to the `POST /api/v1/remote/browse` endpoint of **every live peer socket** in that pool. The command succeeds if any peer accepts, so with two workstations forwarded the page opens on both and the user finds it wherever they are sitting. Only when **no** peer accepted — nothing matched the patterns, nothing was reachable, or every peer errored — is the URL opened in this host's default browser instead. A peer that *rejects* the request (`4xx`, meaning the URL failed its validation) counts as not having accepted, though the identical check runs locally first so that answer is not normally reachable from this command. Only `http` and `https` URLs without embedded `user:pass@` credentials are accepted; the same allowlist is enforced by the peer endpoint.
 
 This makes it a natural `BROWSER` target on a headless box, so tools that launch OAuth flows (`gh auth login`, dotvault's own enrolment engines) land their login pages on the workstation's browser:
 
@@ -165,17 +165,17 @@ export BROWSER="dotvault browse"
     exec dotvault browse "$1"
     ```
 
-The raw endpoint is also curl-able over the forwarded socket:
+The raw endpoint is also curl-able over one peer's socket — each workstation binds its own `~/.ssh/dotvault.<host>.sock`, so name the one you want rather than the pool:
 
 ```sh
-curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/browse -d url=https://example.com
+curl --unix-socket ~/.ssh/dotvault.desktop.sock http://localhost/api/v1/remote/browse -d url=https://example.com
 ```
 
 The command is silent on success (exit `0`), matching `BROWSER` conventions. Config-load failures downgrade to the local browser with a warning rather than failing, so the command still works on a host with no dotvault config at all. On a truly display-less host the local fallback depends on what `xdg-open` resolves to — often a console browser — so on machines that should only ever delegate to the peer, treat a fallback as a sign the SSH `RemoteForward` is down.
 
 ### `dotvault notify`
 
-Raise a native desktop notification — a Windows toast, a macOS Notification Center panel, or a Linux D-Bus notification — preferring the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+Raise a native desktop notification — a Windows toast, a macOS Notification Center panel, or a Linux D-Bus notification — preferring a workstation at the other end of a [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
 
 ```sh
 dotvault notify <level> <title> [description]
@@ -186,7 +186,7 @@ dotvault notify <level> <title> [description]
 !!! note "macOS delivery"
     On macOS, notifications are delivered via `osascript` (or `terminal-notifier` if installed). An unsigned CLI binary driving `osascript display notification` is attributed to "Script Editor" and may be suppressed by Notification Center's per-app settings. The peer-preferring design largely sidesteps this — the workstation typically runs the daemon (web UI), which is the more reliable delivery path.
 
-When `vault.token_socket` names a reachable peer dotvault, the notification is form-posted to the peer's `POST /api/v1/remote/notify` endpoint and appears **on the workstation** — where a human is actually looking. When the socket is not configured, missing, or the peer errors, the notification is raised on this host instead. This is the natural way for a long-running job on a headless box to get the operator's attention:
+The notification is form-posted to the `POST /api/v1/remote/notify` endpoint of **every live peer socket** matching the `vault.token_socket` patterns (by default `~/.ssh/dotvault.sock` and `~/.ssh/dotvault.*.sock`), and succeeds if any peer accepts — so it appears on each workstation forwarding to this host, and the operator sees it wherever they are actually looking. Only when no peer accepted is the notification raised on this host instead; a peer that *rejects* the request (`4xx`, a bad level or an empty title) counts as not having accepted, though the identical check runs locally first. This is the natural way for a long-running job on a headless box to get the operator's attention:
 
 ```sh
 dotvault notify info "Sync complete" "all rules applied"
@@ -206,10 +206,10 @@ The click behaviour is platform-dependent, and the flag degrades gracefully:
 
 The URL must be `http`/`https` with a host and no embedded credentials — the same allowlist `dotvault browse` enforces — and is rejected locally (exit `1`) before anything is sent.
 
-The raw endpoint is curl-able over the forwarded socket too:
+The raw endpoint is curl-able over one peer's socket too (each workstation binds its own):
 
 ```sh
-curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/notify \
+curl --unix-socket ~/.ssh/dotvault.desktop.sock http://localhost/api/v1/remote/notify \
      -d level=error -d title='Backup failed' -d body='see the logs'
 ```
 
@@ -217,13 +217,16 @@ The title is required; the description is optional. An unknown level or an empty
 
 ### `dotvault clipboard`
 
-Put text on the system clipboard, preferring the machine at the other end of the [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
+Put text on the system clipboard, preferring a workstation at the other end of a [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
 
 ```sh
 dotvault clipboard [text]
 ```
 
-When `vault.token_socket` names a reachable peer dotvault, the text is form-posted to the peer's `POST /api/v1/remote/clipboard` endpoint and lands on the clipboard **of the workstation** — the machine the user is actually pasting on. When the socket is not configured, missing, or the peer errors, the text is placed on this host's clipboard instead (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux and the BSDs, the Win32 clipboard on Windows).
+The text is form-posted to the `POST /api/v1/remote/clipboard` endpoint of **every live peer socket** matching the `vault.token_socket` patterns (by default `~/.ssh/dotvault.sock` and `~/.ssh/dotvault.*.sock`), and the command succeeds if any peer accepts. Only when no peer accepted is the text placed on this host's clipboard instead (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux and the BSDs, the Win32 clipboard on Windows). A peer that *rejects* the request (`4xx`, text no clipboard can carry) counts as not having accepted, though the identical check runs locally first.
+
+!!! warning "With several workstations connected, the text lands on all of their clipboards"
+    The fan-out is deliberate — the user may be sitting at any one of the forwarding workstations — but it means the value is written to the clipboard of every one of them, not just the one in front of them. When more than one workstation is connected, stage a one-time value (a device code, a short-TTL token) rather than a long-lived secret.
 
 This is the third peer action alongside `browse` and `notify`, and together they close the loop for authenticating to a service from a headless host — open the login page in the workstation's browser, then stage the value the user needs to paste right where their Ctrl+V is:
 
@@ -237,10 +240,10 @@ With no positional argument (or with `-`), the text is read from **stdin**, and 
 
 The text is capped at 64 KiB and must be non-empty, valid UTF-8, with no NUL bytes; it is otherwise written verbatim (no sanitization — the typical payload is a credential that must arrive byte-for-byte intact). Invalid input fails locally (exit `1`) before anything is sent; the peer endpoint enforces the same rules and never logs the content, only its length.
 
-The raw endpoint is curl-able over the forwarded socket too:
+The raw endpoint is curl-able over one peer's socket too (each workstation binds its own):
 
 ```sh
-curl --unix-socket ~/.ssh/dotvault.sock http://localhost/api/v1/remote/clipboard -d text=s3cr3t
+curl --unix-socket ~/.ssh/dotvault.desktop.sock http://localhost/api/v1/remote/clipboard -d text=s3cr3t
 ```
 
 The command is silent on success (exit `0`). Config-load failures degrade to the local clipboard, like `browse` and `notify`.

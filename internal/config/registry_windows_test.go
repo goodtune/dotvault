@@ -71,8 +71,8 @@ func TestApplyRegistryLayerBorrowOnly(t *testing.T) {
 	cfg := &Config{}
 	on := uint32(1)
 	applyRegistryLayer(cfg, registryLayer{
-		VaultTokenSocket: "~/.ssh/dotvault.sock",
-		VaultBorrowOnly:  &on,
+		VaultTokenSockets: []string{"~/.ssh/dotvault.sock"},
+		VaultBorrowOnly:   &on,
 	})
 	if !cfg.Vault.BorrowOnly {
 		t.Error("BorrowOnly should be true when DWORD is 1")
@@ -901,6 +901,213 @@ func TestApplyRegistryLayerSignalEmptyHeaders(t *testing.T) {
 	}
 	if len(cfg.Observability.Logs.Headers) != 0 {
 		t.Errorf("Logs.Headers = %v, want empty", cfg.Observability.Logs.Headers)
+	}
+}
+
+// TestApplyRegistryLayerVaultTokenSockets mirrors
+// TestApplyRegistryLayerLeastPrivilegePolicies's nil-vs-explicit-empty
+// coverage for VaultPolicies: an absent (nil) layer value must not disturb a
+// base already carrying a preference, while an explicit empty REG_MULTI_SZ
+// (a non-nil empty slice) must still override it — "present" gates the
+// merge, not "non-empty".
+func TestApplyRegistryLayerVaultTokenSockets(t *testing.T) {
+	cfg := &Config{Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/keep.sock"}}}
+	applyRegistryLayer(cfg, registryLayer{})
+	if want := (SocketList{"~/.ssh/keep.sock"}); !reflect.DeepEqual(cfg.Vault.TokenSockets, want) {
+		t.Errorf("absent layer value: TokenSockets = %v, want %v (base untouched)", cfg.Vault.TokenSockets, want)
+	}
+
+	cfg2 := &Config{Vault: VaultConfig{TokenSockets: SocketList{"~/.ssh/stale.sock"}}}
+	applyRegistryLayer(cfg2, registryLayer{VaultTokenSockets: []string{}})
+	if len(cfg2.Vault.TokenSockets) != 0 {
+		t.Errorf("explicit empty layer value: TokenSockets = %v, want empty (explicit empty list must clear the base)", cfg2.Vault.TokenSockets)
+	}
+
+	cfg3 := &Config{}
+	applyRegistryLayer(cfg3, registryLayer{VaultTokenSockets: []string{"~/.ssh/a.sock", "~/.ssh/b.*.sock"}})
+	if want := (SocketList{"~/.ssh/a.sock", "~/.ssh/b.*.sock"}); !reflect.DeepEqual(cfg3.Vault.TokenSockets, want) {
+		t.Errorf("TokenSockets = %v, want %v", cfg3.Vault.TokenSockets, want)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsMultiSZ covers the current REG_MULTI_SZ
+// shape.
+func TestReadRegistryVaultTokenSocketsMultiSZ(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensockets\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringsValue("TokenSockets", []string{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"}); err != nil {
+		t.Fatalf("set TokenSockets: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	got := readRegistryVaultTokenSockets(vk)
+	want := []string{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want %v", got, want)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsLegacyREGSZ covers the pre-list REG_SZ
+// value on a host whose policy hasn't been re-pushed with the new
+// REG_MULTI_SZ shape yet.
+//
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
+func TestReadRegistryVaultTokenSocketsLegacyREGSZ(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-legacy\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-legacy`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensocket-legacy\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringValue("TokenSocket", "~/.ssh/dotvault.sock"); err != nil {
+		t.Fatalf("set TokenSocket: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-legacy\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	// The legacy default expands to the pair, exactly as the YAML scalar does:
+	// read literally it would leave the host unable to find its forward once
+	// the workstation renames it. See config.ExpandLegacyScalar.
+	got := readRegistryVaultTokenSockets(vk)
+	want := []string{LegacyPeerSocket, PerHostPeerSocketGlob}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want %v", got, want)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsLegacyREGSZOtherValue pins the other half of
+// the rule: a REG_SZ naming something that is not the pre-list default is the
+// admin's own choice and stays a one-element list.
+//
+// TODO(pre-1.0, #172): delete with the REG_SZ fallback.
+func TestReadRegistryVaultTokenSocketsLegacyREGSZOtherValue(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensocket-other\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringValue("TokenSocket", `C:\peer\api.sock`); err != nil {
+		t.Fatalf("set TokenSocket: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-other\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	got := readRegistryVaultTokenSockets(vk)
+	want := []string{`C:\peer\api.sock`}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want %v", got, want)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsAbsent covers neither value present.
+func TestReadRegistryVaultTokenSocketsAbsent(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-absent\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-absent`)
+	})
+
+	_, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensocket-absent\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensocket-absent\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	if got := readRegistryVaultTokenSockets(vk); got != nil {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want nil", got)
+	}
+}
+
+// TestReadRegistryVaultTokenSocketsExplicitEmptyWinsOverLegacy pins the
+// distinction an explicit empty REG_MULTI_SZ must preserve: it means peer
+// sockets are disabled, and that must hold even when a stale legacy
+// TokenSocket REG_SZ value is still sitting next to it (e.g. a policy push
+// that set the new value but never cleaned up the old one). Without the
+// presence check in readRegistryVaultTokenSockets, GetStringsValue decodes
+// the empty REG_MULTI_SZ to a nil slice indistinguishable from "absent",
+// and the legacy value would win — silently re-enabling default peer
+// sockets against the operator's explicit intent.
+func TestReadRegistryVaultTokenSocketsExplicitEmptyWinsOverLegacy(t *testing.T) {
+	t.Cleanup(func() {
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty\Vault`)
+		registry.DeleteKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty`)
+	})
+
+	k, _, err := registry.CreateKey(
+		registry.CURRENT_USER,
+		`SOFTWARE\dotvault-test-tokensockets-empty\Vault`,
+		registry.ALL_ACCESS,
+	)
+	if err != nil {
+		t.Fatalf("create Vault key: %v", err)
+	}
+	if err := k.SetStringsValue("TokenSockets", []string{}); err != nil {
+		t.Fatalf("set empty TokenSockets: %v", err)
+	}
+	if err := k.SetStringValue("TokenSocket", "~/.ssh/stale.sock"); err != nil {
+		t.Fatalf("set legacy TokenSocket: %v", err)
+	}
+	k.Close()
+
+	vk, err := registry.OpenKey(registry.CURRENT_USER, `SOFTWARE\dotvault-test-tokensockets-empty\Vault`, registry.READ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vk.Close()
+
+	got := readRegistryVaultTokenSockets(vk)
+	if got == nil || len(got) != 0 {
+		t.Errorf("readRegistryVaultTokenSockets = %v, want non-nil empty (explicit empty must win over the legacy fallback)", got)
 	}
 }
 

@@ -918,7 +918,6 @@ func TestEmptyStringEmittedExplicitly(t *testing.T) {
 		`"AuthMount"=""`,
 		`"AuthRole"=""`,
 		`"CACert"=""`,
-		`"TokenSocket"=""`,
 		`"OIDCCallbackPort"=dword:00000000`,
 	} {
 		if !strings.Contains(got, want) {
@@ -1298,5 +1297,94 @@ func TestSSHSectionEmitsDeletionStanza(t *testing.T) {
 	got := mustGenerate(t, cfg)
 	if !strings.Contains(got, `[-HKEY_LOCAL_MACHINE\SOFTWARE\Policies\goodtune\dotvault\SSH]`) {
 		t.Errorf("expected SSH deletion stanza even with no SSH config:\n%s", got)
+	}
+}
+
+// TestTokenSocketsRoundTripsAsMultiSZ pins vault.token_socket's list form
+// through render -> parse as a REG_MULTI_SZ, matching the Policies / OAuth
+// Scopes treatment, and confirms the legacy scalar REG_SZ value is no
+// longer emitted now that TokenSockets has replaced TokenSocket.
+func TestTokenSocketsRoundTripsAsMultiSZ(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
+	cfg.Vault.TokenSockets = config.SocketList{"~/.ssh/dotvault.sock", "~/.ssh/dotvault.*.sock"}
+
+	got := mustGenerate(t, cfg)
+	if !strings.Contains(got, `"TokenSockets"=hex(7):`) {
+		t.Errorf("expected a REG_MULTI_SZ TokenSockets value, got:\n%s", got)
+	}
+	if strings.Contains(got, `"TokenSocket"=`) {
+		t.Errorf("legacy TokenSocket REG_SZ must not be emitted:\n%s", got)
+	}
+
+	back, err := Parse([]byte(got))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !reflect.DeepEqual(back.Vault.TokenSockets, cfg.Vault.TokenSockets) {
+		t.Errorf("got %v, want %v", back.Vault.TokenSockets, cfg.Vault.TokenSockets)
+	}
+}
+
+// TestTokenSocketsEmptyVersusAbsent guards the explicit-empty-vs-absent
+// distinction that also carries policy meaning for TokenSockets (an
+// explicit empty list disables peer sockets outright): an explicit empty
+// list is emitted as an empty REG_MULTI_SZ so re-import clears a stale
+// value and round-trips back to a non-nil empty slice, while an absent
+// (nil) list emits nothing at all.
+func TestTokenSocketsEmptyVersusAbsent(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
+	cfg.Vault.TokenSockets = config.SocketList{}
+
+	got := mustGenerate(t, cfg)
+	back, err := Parse([]byte(got))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if back.Vault.TokenSockets == nil || len(back.Vault.TokenSockets) != 0 {
+		t.Errorf("explicit empty: got %#v, want non-nil empty", back.Vault.TokenSockets)
+	}
+
+	cfg.Vault.TokenSockets = nil
+	got = mustGenerate(t, cfg)
+	if strings.Contains(got, "TokenSockets") {
+		t.Errorf("absent list must not be emitted:\n%s", got)
+	}
+}
+
+// TestTokenSocketsAbsentSurvivesYAMLExport is the same absent-vs-empty
+// distinction on the YAML side, which is the surface an operator actually
+// meets: `reg-export` and GET /api/v1/config/download?format=yaml both marshal
+// the whole *config.Config through MarshalYAML. yaml.v3 renders a nil slice as
+// `[]`, which re-parses as the non-nil empty list meaning "peer sockets
+// explicitly disabled" — so without config.SocketList.MarshalYAML every host
+// that never set the key exported a config that switched borrowing off.
+func TestTokenSocketsAbsentSurvivesYAMLExport(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Sync = config.SyncConfig{RawInterval: "15m"}
+	cfg.Vault.TokenSockets = nil
+
+	yamlBytes, err := MarshalYAML(cfg)
+	if err != nil {
+		t.Fatalf("MarshalYAML: %v", err)
+	}
+	if strings.Contains(string(yamlBytes), "token_socket: []") {
+		t.Errorf("nil list must not export as an explicit empty list:\n%s", yamlBytes)
+	}
+
+	yamlPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, 0600); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	loaded, err := config.Load(yamlPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v\nyaml:\n%s", err, yamlBytes)
+	}
+	if loaded.Vault.TokenSockets != nil {
+		t.Errorf("absent token_socket reparsed as %#v, want nil (the defaults apply)", loaded.Vault.TokenSockets)
+	}
+	if got, want := loaded.PeerActionSockets(), config.DefaultPeerSocketPatterns; !reflect.DeepEqual(got, want) {
+		t.Errorf("peer sockets after export/import: got %v, want the defaults %v", got, want)
 	}
 }

@@ -459,22 +459,17 @@ type VaultConfig struct {
 	// with Policies to pin a token to exactly the capabilities dotvault needs.
 	NoDefaultPolicy     bool `yaml:"no_default_policy"`
 	DisableTokenRenewal bool `yaml:"disable_token_renewal"`
-	// TokenSocket is an optional path to a Unix-domain socket served by a
-	// peer dotvault daemon's web API. When set, dotvault tries to borrow a
-	// live Vault token from the peer via `GET http://localhost/api/v1/token`
-	// over this socket — the equivalent of
-	// `curl --unix-socket <path> http://localhost/api/v1/token` — before
-	// falling back to its own authentication. The borrow runs where dotvault
-	// would otherwise authenticate interactively: on a fresh login (Manager
-	// .Login, after Authenticate finds no usable cached token) and on the
-	// lifecycle recovery path after a cached token goes invalid; a healthy
-	// RenewSelf renewal does not borrow. This is the dotvault-to-dotvault
-	// token-sharing seam: a machine with no interactive login facility (no
-	// browser, no TTY) borrows the token from a peer that has one, reached
-	// over an SSH RemoteForward'd socket. A leading ~ is expanded to the
-	// user's home. A missing or stale socket is ignored — the normal auth
-	// flow proceeds — so the field is purely additive and needs no validation.
-	TokenSocket string `yaml:"token_socket"`
+	// TokenSockets lists peer dotvault web-API Unix socket patterns to borrow
+	// a live Vault token from — `GET http://localhost/api/v1/token` over the
+	// socket — before falling back to this host's own authentication, and to
+	// fan the peer actions (browse/notify/clipboard) out to. Each entry is a
+	// literal path or a glob whose metacharacters sit in the final segment
+	// (`~/.ssh/dotvault.*.sock`), so one workstation per socket can forward
+	// to this host without the last forward to connect stealing a shared
+	// path. Accepts a single string for compatibility. A nil (absent) value
+	// applies DefaultPeerSocketPatterns; an explicit empty list disables
+	// peer sockets. Borrowing is best-effort and never fatal.
+	TokenSockets SocketList `yaml:"token_socket"`
 	// BorrowOnly, when true, forces this host to authenticate to Vault
 	// exclusively by borrowing a live token over TokenSocket — it never runs
 	// AuthMethod's own fresh-auth flow (no OIDC browser, no LDAP prompt, no
@@ -1247,8 +1242,8 @@ func (c *Config) validate() error {
 	// path; without a socket to borrow from, this host could never obtain a
 	// token at all, so require one up front rather than trapping the
 	// operator in a daemon that idles forever with no way to succeed.
-	if c.Vault.BorrowOnly && c.Vault.TokenSocket == "" {
-		return fmt.Errorf("vault.borrow_only requires vault.token_socket (there is nothing to borrow a token from otherwise)")
+	if c.Vault.BorrowOnly && len(c.peerSocketPatterns()) == 0 {
+		return fmt.Errorf("vault.borrow_only requires at least one vault.token_socket pattern (an explicit empty list leaves nothing to borrow a token from)")
 	}
 
 	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {
@@ -1414,6 +1409,12 @@ func (c *Config) validate() error {
 	// above): a relative path is a mistake worth naming whether or not the
 	// section is currently enabled.
 	if err := c.validateAPI(); err != nil {
+		return err
+	}
+
+	// Peer socket patterns. Validated unconditionally, like the API socket:
+	// a relative pattern or a directory glob is a mistake worth naming.
+	if err := c.validateTokenSockets(); err != nil {
 		return err
 	}
 

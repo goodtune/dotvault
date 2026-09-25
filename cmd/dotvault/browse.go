@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 
-	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/web"
 )
 
@@ -19,21 +19,22 @@ import (
 var openLocalBrowser = browser.OpenURL
 
 // newBrowseCmd defines `dotvault browse <url>` — a $BROWSER-shaped wrapper
-// over the remote-browse endpoint. It prefers handing the URL to the peer
-// dotvault named by vault.token_socket (the same SSH-forwarded socket the
+// over the remote-browse endpoint. It prefers handing the URL to every live
+// peer dotvault matching vault.token_socket (the same SSH-forwarded sockets the
 // token borrow uses, so an already-wired headless host needs no new config),
-// and falls back to opening the URL locally when no peer is reachable.
+// and falls back to opening the URL locally when no peer accepted it.
 func newBrowseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "browse <url>",
-		Short: "Open a URL in a browser, preferring the peer over vault.token_socket",
+		Short: "Open a URL in a browser, preferring the peers in vault.token_socket",
 		Long: `Open a URL in a browser.
 
-When vault.token_socket names a reachable peer dotvault (typically an SSH
-RemoteForward from a workstation running the web UI), the URL is posted to
-the peer's /api/v1/remote/browse endpoint so the browser opens on the machine
-that actually has one. When the peer is not configured or not reachable, the
-URL is opened in this host's default browser instead.
+vault.token_socket is a list of socket patterns (by default ~/.ssh/dotvault.sock
+and ~/.ssh/dotvault.*.sock, the paths a workstation's SSH RemoteForward binds).
+The URL is posted to the /api/v1/remote/browse endpoint of every live peer
+socket, so the page opens on each workstation forwarding here and the user finds
+it wherever they are sitting. Only when no peer accepted it is the URL opened in
+this host's default browser instead.
 
 Suitable as a BROWSER environment variable target:
 
@@ -65,19 +66,19 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	// A load failure downgrades to the local browser rather than failing —
 	// `dotvault browse` should still open URLs on a host with a broken or
 	// absent config.
-	socket := ""
+	var pool *peer.Pool
 	if cfg, _, err := loadConfigLocalOnly(); err != nil {
 		slog.Warn("could not load config; opening locally", "error", err)
 	} else {
-		socket = cfg.Vault.TokenSocket
+		pool = newPeerPool(cfg.PeerActionSockets())
 	}
 
-	if socket != "" {
-		err := postBrowseToSocket(cmd.Context(), socket, target)
+	if pool != nil {
+		err := postBrowseToPeers(cmd.Context(), pool, target)
 		if err == nil {
 			return nil
 		}
-		slog.Debug("peer browse unavailable; opening locally", "socket", socket, "error", err)
+		slog.Debug("peer browse unavailable; opening locally", "error", err)
 	}
 
 	if err := openLocalBrowser(target); err != nil {
@@ -86,9 +87,9 @@ func runBrowse(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// postBrowseToSocket posts the URL to a peer dotvault's remote-browse
-// endpoint over its Unix-domain socket, via the shared auth.PostFormToPeer
-// transport. The caller falls back to the local browser on any error.
-func postBrowseToSocket(ctx context.Context, socketPath, target string) error {
-	return auth.PostFormToPeer(ctx, socketPath, "/api/v1/remote/browse", url.Values{"url": {target}})
+// postBrowseToPeers posts the URL to every active peer dotvault's remote-browse
+// endpoint, via the pool's broadcast. Any peer accepting it is success; the
+// caller falls back to the local browser on any error.
+func postBrowseToPeers(ctx context.Context, pool *peer.Pool, target string) error {
+	return pool.Broadcast(ctx, "/api/v1/remote/browse", url.Values{"url": {target}})
 }

@@ -17,7 +17,7 @@ import (
 func TestDaemonBorrowSocketsExcludesOwn(t *testing.T) {
 	cfg := &config.Config{
 		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
-		Vault: config.VaultConfig{TokenSocket: "/home/u/.ssh/dotvault.sock"},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
 	}
 
 	got := daemonBorrowSockets(cfg, "/run/dotvault/api.sock")
@@ -45,7 +45,8 @@ func TestDaemonBorrowSocketsMatchesTildePath(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		API: config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "~/dotvault/api.sock"}},
+		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "~/dotvault/api.sock"}},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{}}, // explicit "no peer sockets"; nil would apply the defaults
 	}
 	own := filepath.Join(home, "dotvault", "api.sock")
 
@@ -57,7 +58,7 @@ func TestDaemonBorrowSocketsMatchesTildePath(t *testing.T) {
 // TestDaemonBorrowSocketsWithoutOwnSocket: with the local socket disabled the
 // list is unchanged, so an existing deployment behaves exactly as before.
 func TestDaemonBorrowSocketsWithoutOwnSocket(t *testing.T) {
-	cfg := &config.Config{Vault: config.VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}}
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSockets: config.SocketList{"~/.ssh/dotvault.sock"}}}
 	got := daemonBorrowSockets(cfg, "")
 	want := []string{"~/.ssh/dotvault.sock"}
 	if !reflect.DeepEqual(got, want) {
@@ -100,7 +101,7 @@ func TestResolveAPISocketEnabled(t *testing.T) {
 func TestFreshLoginBorrowSocketsExcludesLocal(t *testing.T) {
 	cfg := &config.Config{
 		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
-		Vault: config.VaultConfig{TokenSocket: "/home/u/.ssh/dotvault.sock"},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
 	}
 	got := freshLoginBorrowSockets(cfg)
 	want := []string{"/home/u/.ssh/dotvault.sock"}
@@ -112,10 +113,86 @@ func TestFreshLoginBorrowSocketsExcludesLocal(t *testing.T) {
 // TestFreshLoginBorrowSocketsKeepsPeerOnly confirms the ordinary headless
 // deployment (no local socket) is untouched by that exclusion.
 func TestFreshLoginBorrowSocketsKeepsPeerOnly(t *testing.T) {
-	cfg := &config.Config{Vault: config.VaultConfig{TokenSocket: "~/.ssh/dotvault.sock"}}
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSockets: config.SocketList{"~/.ssh/dotvault.sock"}}}
 	got := freshLoginBorrowSockets(cfg)
 	want := []string{"~/.ssh/dotvault.sock"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("freshLoginBorrowSockets = %v, want %v", got, want)
+	}
+}
+
+// TestNewPeerPoolNilWhenNoPatterns pins the property every call site leans on:
+// with nothing configured there is no pool, and a nil *peer.Pool is
+// nil-receiver safe throughout — so `Borrower: newPeerPool(...)` stays correct
+// for an operator who has configured no peers at all, with no branch at the
+// wiring site.
+func TestNewPeerPoolNilWhenNoPatterns(t *testing.T) {
+	if got := newPeerPool(nil); got != nil {
+		t.Errorf("newPeerPool(nil) = %v, want nil", got)
+	}
+	if got := newPeerPool([]string{}); got != nil {
+		t.Errorf("newPeerPool(empty) = %v, want nil", got)
+	}
+	pool := newPeerPool([]string{"/run/dotvault/api.sock"})
+	if pool == nil {
+		t.Fatal("newPeerPool returned nil for a non-empty pattern list")
+	}
+	if got := pool.Patterns(); !reflect.DeepEqual(got, []string{"/run/dotvault/api.sock"}) {
+		t.Errorf("Patterns() = %v, want the configured pattern", got)
+	}
+}
+
+// TestNewBorrowChainTiers pins the local-first borrow order for the one-shot
+// commands that may borrow from this host's own daemon. The tiers, not a sort
+// key, are what carry it: the local socket is bound once when the long-lived
+// daemon starts while a forwarded peer socket is re-created on every SSH
+// reconnect, so a single pool over both would order the peer first by recency.
+func TestNewBorrowChainTiers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no local API socket on windows; apiSocketCandidate gates it")
+	}
+	cfg := &config.Config{
+		API:   config.APIConfig{Enabled: true, Unix: config.APIUnixConfig{Path: "/run/dotvault/api.sock"}},
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.*.sock"}},
+	}
+	chain, labels := newBorrowChain(cfg)
+	tiers := chain.Status()
+	if len(tiers) != 2 {
+		t.Fatalf("Status() = %d tiers, want 2 (local API socket, then peers)", len(tiers))
+	}
+	if got := tiers[0].Patterns; !reflect.DeepEqual(got, []string{"/run/dotvault/api.sock"}) {
+		t.Errorf("tier 0 = %v, want the local API socket first", got)
+	}
+	if got := tiers[1].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.*.sock"}) {
+		t.Errorf("tier 1 = %v, want the peer pattern", got)
+	}
+	// The labels are what `dotvault status` prints against each pattern, so
+	// they must stay positionally aligned with the tiers and name them
+	// distinctly — one shared label read as though the local socket were just
+	// another peer pattern.
+	if want := []string{borrowTierLocalAPI, borrowTierPeers}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("labels = %v, want %v", labels, want)
+	}
+}
+
+// TestNewBorrowChainWithoutLocalSocket: with the local socket disabled the
+// chain is the peer tier alone — not an empty tier reported as "none present",
+// which would have an operator looking for a socket that can never exist.
+func TestNewBorrowChainWithoutLocalSocket(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{TokenSockets: config.SocketList{"/home/u/.ssh/dotvault.sock"}},
+	}
+	chain, labels := newBorrowChain(cfg)
+	tiers := chain.Status()
+	if len(tiers) != 1 {
+		t.Fatalf("Status() = %d tiers, want 1 (peers only)", len(tiers))
+	}
+	if got := tiers[0].Patterns; !reflect.DeepEqual(got, []string{"/home/u/.ssh/dotvault.sock"}) {
+		t.Errorf("tier 0 = %v, want the peer socket", got)
+	}
+	// A dropped tier must drop its label too, or every subsequent pattern
+	// would be printed under the wrong tier's name.
+	if want := []string{borrowTierPeers}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("labels = %v, want %v", labels, want)
 	}
 }

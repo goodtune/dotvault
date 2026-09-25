@@ -7,6 +7,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
 // resolveAPISocket returns the path the daemon should bind for the local API
@@ -104,4 +105,69 @@ func freshLoginBorrowSockets(cfg *config.Config) []string {
 		local = ""
 	}
 	return borrowSocketsExcluding(cfg, local)
+}
+
+// newPeerPool builds a transient pool — resolve on demand, no watcher — for
+// one-shot commands and the daemon's startup. It returns nil for an empty
+// pattern list, which every consumer handles: *peer.Pool is nil-receiver safe,
+// so a caller with nothing configured needs no branch.
+func newPeerPool(patterns []string, opts ...peer.Option) *peer.Pool {
+	if len(patterns) == 0 {
+		return nil
+	}
+	return peer.NewPool(patterns, opts...)
+}
+
+// newBorrowChain builds the two-tier borrower the one-shot commands that may
+// borrow from this host's own daemon use — `status`, `sync`, `enrol`: the local
+// API socket first, then the peers. peer.NewLocalFirstChain owns the tiering and
+// the reason it is a tier rather than an ordering hint; this resolves the two
+// socket sources and labels the tiers.
+//
+// The daemon (daemonBorrowSockets) and `dotvault login`
+// (freshLoginBorrowSockets) deliberately do NOT use this: both exclude the local
+// socket outright, so their lists are peers-only and a single pool is already
+// the whole story.
+//
+// It returns the tier labels alongside the chain, in the same order
+// Chain.Status() reports them, so `dotvault status` can say which tier a
+// pattern belongs to. They are derived from the same two inputs the chain is
+// built from — a non-empty local socket, a non-empty pattern list — so the
+// label list and the tier list cannot disagree about which tiers exist.
+func newBorrowChain(cfg *config.Config) (*peer.Chain, []string) {
+	local, err := cfg.APISocketPath()
+	if err != nil {
+		// Not fatal — the peers are still borrowable — but silently dropping
+		// the tier would leave an operator with a misconfigured api.unix.path
+		// wondering why the local daemon is never consulted.
+		slog.Warn("could not resolve api.unix.path; local API socket excluded from borrow", "error", err)
+		local = ""
+	}
+	peers := cfg.PeerActionSockets()
+
+	var labels []string
+	if local != "" {
+		labels = append(labels, borrowTierLocalAPI)
+	}
+	if len(peers) > 0 {
+		labels = append(labels, borrowTierPeers)
+	}
+	return peer.NewLocalFirstChain(local, peers), labels
+}
+
+// borrowTierLocalAPI and borrowTierPeers label the two tiers newBorrowChain
+// builds. They are distinct because the tiers answer different questions: the
+// first is this host's own daemon, the second the workstations forwarding to
+// it, and one shared label made a `dotvault status` listing read as though the
+// local socket were just another peer pattern.
+const (
+	borrowTierLocalAPI = "local API socket"
+	borrowTierPeers    = "peer socket pattern"
+)
+
+// authBorrowChain is newBorrowChain for the callers that want the borrower
+// alone — the auth.Manager wiring, which has no status listing to label.
+func authBorrowChain(cfg *config.Config) *peer.Chain {
+	chain, _ := newBorrowChain(cfg)
+	return chain
 }

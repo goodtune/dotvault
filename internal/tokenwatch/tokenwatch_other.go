@@ -9,15 +9,13 @@ import "context"
 // New/Run/Close unconditionally; there is nothing to register, so New
 // never fails and Run simply blocks until ctx is cancelled. onChange is
 // never invoked.
-type Watcher struct {
-	onChange func()
-}
+type Watcher struct{}
 
 // New returns a no-op Watcher. It never fails — there is no inotify
-// machinery to set up — and accepts path for signature parity with the
-// Linux build.
+// machinery to set up — and accepts path and onChange for signature
+// parity with the Linux build.
 func New(path string, onChange func()) (*Watcher, error) {
-	return &Watcher{onChange: onChange}, nil
+	return &Watcher{}, nil
 }
 
 // Run blocks until ctx is cancelled and returns ctx.Err(). onChange is

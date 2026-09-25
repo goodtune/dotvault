@@ -7,10 +7,30 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goodtune/dotvault/internal/paths"
+	"github.com/goodtune/dotvault/internal/peer"
 )
+
+// sockDir returns a temporary directory with a short path, shared by every
+// test in this package that binds a Unix socket. t.TempDir() names the
+// directory after the test, and on macOS that plus the socket name exceeds the
+// 103-byte sun_path limit, so the bind would fail before the behaviour under
+// test ever ran.
+func sockDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/tmp", "dv")
+	if err != nil {
+		// Windows has no /tmp; the short path only matters where a socket is
+		// bound, so fall back rather than failing a test that may not bind one.
+		return t.TempDir()
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}
 
 // newUnixBrowseServer starts an httptest server bound to a Unix socket at
 // sockPath, serving POST /api/v1/remote/browse with the given handler. If the
@@ -31,8 +51,8 @@ func newUnixBrowseServer(t *testing.T, sockPath string, handler http.HandlerFunc
 	t.Cleanup(srv.Close)
 }
 
-func TestPostBrowseToSocket_Success(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+func TestPostBrowseToPeers_Success(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	var gotURL, gotHost string
 	newUnixBrowseServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -44,8 +64,9 @@ func TestPostBrowseToSocket_Success(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"browser opened"}`))
 	})
 
-	if err := postBrowseToSocket(context.Background(), sock, "https://example.com/x"); err != nil {
-		t.Fatalf("postBrowseToSocket: %v", err)
+	pool := peer.NewPool([]string{sock})
+	if err := postBrowseToPeers(context.Background(), pool, "https://example.com/x"); err != nil {
+		t.Fatalf("postBrowseToPeers: %v", err)
 	}
 	if gotURL != "https://example.com/x" {
 		t.Errorf("peer received url = %q, want %q", gotURL, "https://example.com/x")
@@ -57,40 +78,66 @@ func TestPostBrowseToSocket_Success(t *testing.T) {
 	}
 }
 
-func TestPostBrowseToSocket_MissingSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
-	if err := postBrowseToSocket(context.Background(), sock, "https://example.com"); err == nil {
+// TestBrowseFansOutToEveryPeer is the point of the pool on the peer-action
+// side: in a workstation-per-socket topology the URL must land on every
+// workstation, not just whichever socket the pattern happened to glob first.
+func TestBrowseFansOutToEveryPeer(t *testing.T) {
+	dir := sockDir(t)
+	var hits atomic.Int32
+	for _, name := range []string{"dotvault.a.sock", "dotvault.b.sock"} {
+		newUnixBrowseServer(t, filepath.Join(dir, name), func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			_, _ = w.Write([]byte(`{"status":"browser opened"}`))
+		})
+	}
+	pool := peer.NewPool([]string{filepath.Join(dir, "dotvault.*.sock")})
+	if err := postBrowseToPeers(context.Background(), pool, "https://example.com/"); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 2 {
+		t.Errorf("hits = %d, want 2", hits.Load())
+	}
+}
+
+func TestPostBrowseToPeers_MissingSocket(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "absent.sock")
+	pool := peer.NewPool([]string{sock})
+	if err := postBrowseToPeers(context.Background(), pool, "https://example.com"); err == nil {
 		t.Fatal("expected an error for a missing socket so the caller falls back locally")
 	}
 }
 
-func TestPostBrowseToSocket_StaleSocket(t *testing.T) {
+func TestPostBrowseToPeers_StaleSocket(t *testing.T) {
 	// A regular file with no listener stands in for a socket left behind by a
-	// dead SSH session: the dial fails and the caller falls back locally.
-	sock := filepath.Join(t.TempDir(), "stale.sock")
+	// dead SSH session. The pool admits only nodes that really are sockets, so
+	// this resolves to no members at all — an error either way, and the caller
+	// falls back locally.
+	sock := filepath.Join(sockDir(t), "stale.sock")
 	if err := os.WriteFile(sock, []byte("not a socket"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := postBrowseToSocket(context.Background(), sock, "https://example.com"); err == nil {
+	pool := peer.NewPool([]string{sock})
+	if err := postBrowseToPeers(context.Background(), pool, "https://example.com"); err == nil {
 		t.Fatal("expected an error for a stale socket")
 	}
 }
 
-func TestPostBrowseToSocket_PeerError(t *testing.T) {
+func TestPostBrowseToPeers_PeerError(t *testing.T) {
 	// A non-200 from the peer (e.g. its browser launch failed) must surface
 	// as an error carrying the peer's message.
-	sock := filepath.Join(t.TempDir(), "dotvault.sock")
+	sock := filepath.Join(sockDir(t), "dotvault.sock")
 	newUnixBrowseServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":"failed to open browser: no display"}`))
 	})
 
-	err := postBrowseToSocket(context.Background(), sock, "https://example.com")
+	pool := peer.NewPool([]string{sock})
+	err := postBrowseToPeers(context.Background(), pool, "https://example.com")
 	if err == nil {
 		t.Fatal("expected an error for a non-200 peer response")
 	}
-	if got := err.Error(); got != "peer returned 502: failed to open browser: no display" {
+	if got := err.Error(); !strings.Contains(got, "peer returned 502: failed to open browser: no display") {
 		t.Errorf("error = %q, want the peer's message included", got)
 	}
 }
@@ -145,7 +192,7 @@ func runBrowseWith(t *testing.T, cfgPath, target string) (error, string) {
 }
 
 func TestRunBrowse_PrefersPeerSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(sockDir(t), "p.sock")
 	var peerGot string
 	newUnixBrowseServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -166,7 +213,7 @@ func TestRunBrowse_PrefersPeerSocket(t *testing.T) {
 }
 
 func TestRunBrowse_FallsBackWhenPeerUnreachable(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "absent.sock")
+	sock := filepath.Join(sockDir(t), "absent.sock")
 
 	err, openedLocally := runBrowseWith(t, writeBrowseConfig(t, sock), "https://example.com/b")
 	if err != nil {
@@ -199,11 +246,10 @@ func TestRunBrowse_RejectsInvalidURLBeforeAnything(t *testing.T) {
 	}
 }
 
-func TestPostBrowseToSocket_ExpandsHome(t *testing.T) {
-	home := t.TempDir()
+func TestPostBrowseToPeers_ExpandsHome(t *testing.T) {
+	home := sockDir(t)
 	t.Setenv("HOME", home)        // Linux/macOS
 	t.Setenv("USERPROFILE", home) // Windows
-	// Keep the socket path short: Unix socket paths have a ~104-byte limit.
 	sock := filepath.Join(home, "b.sock")
 	served := false
 	newUnixBrowseServer(t, sock, func(w http.ResponseWriter, r *http.Request) {
@@ -211,8 +257,9 @@ func TestPostBrowseToSocket_ExpandsHome(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"browser opened"}`))
 	})
 
-	if err := postBrowseToSocket(context.Background(), "~/b.sock", "https://example.com"); err != nil {
-		t.Fatalf("postBrowseToSocket: %v", err)
+	pool := peer.NewPool([]string{"~/b.sock"})
+	if err := postBrowseToPeers(context.Background(), pool, "https://example.com"); err != nil {
+		t.Fatalf("postBrowseToPeers: %v", err)
 	}
 	if !served {
 		t.Error("peer handler was never reached through the ~-expanded path")

@@ -6,14 +6,14 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/peer"
 )
 
-// Browse asks the peer dotvault named by the configured TokenSocket to open
+// Browse asks every live peer dotvault in the configured TokenSockets to open
 // rawURL in a browser on the peer's host — the programmatic equivalent of
 // `dotvault browse <url>` and of
 //
-//	curl --unix-socket <TokenSocket> http://localhost/api/v1/remote/browse -d url=<rawURL>
+//	curl --unix-socket <peer socket> http://localhost/api/v1/remote/browse -d url=<rawURL>
 //
 // It is for the headless-consumer topology: a program on a machine with no
 // browser hands a URL back over the same SSH-forwarded socket it borrows its
@@ -32,7 +32,7 @@ func (c *Client) Browse(ctx context.Context, rawURL string) error {
 	return c.peerAction(ctx, "browse", "/api/v1/remote/browse", url.Values{"url": {rawURL}})
 }
 
-// Notify asks the peer dotvault named by the configured TokenSocket to raise a
+// Notify asks every live peer dotvault in the configured TokenSockets to raise a
 // native desktop notification on the peer's host — the programmatic equivalent
 // of `dotvault notify <level> <title> [body]`. It is the notification sibling
 // of Browse over the same socket: a long-running job on a headless box surfaces
@@ -60,7 +60,7 @@ func (c *Client) Notify(ctx context.Context, level, title, body, actionURL strin
 	return c.peerAction(ctx, "notify", "/api/v1/remote/notify", form)
 }
 
-// Clipboard asks the peer dotvault named by the configured TokenSocket to put
+// Clipboard asks every live peer dotvault in the configured TokenSockets to put
 // text on the clipboard of the peer's host — the programmatic equivalent of
 // `dotvault clipboard` and the third peer action over the same socket. Where
 // Browse opens a login page on the workstation and Notify tells the user
@@ -80,12 +80,14 @@ func (c *Client) Clipboard(ctx context.Context, text string) error {
 	return c.peerAction(ctx, "clipboard", "/api/v1/remote/clipboard", url.Values{"text": {text}})
 }
 
-// peerAction posts a peer-action form to apiPath over the configured
-// TokenSocket and maps the shared transport's typed errors onto the facade's
-// taxonomy:
+// peerAction posts a peer-action form to apiPath on every live peer in
+// TokenSockets — the fan-out is the point in a workstation-per-socket topology,
+// where the user may be sitting at any of them — and maps the shared
+// transport's typed errors onto the facade's taxonomy:
 //
-//   - no socket configured, or the peer could not be contacted at all
-//     (ErrPeerUnreachable) → ErrPeerUnavailable (retryable availability);
+//   - no socket configured, or no peer could be contacted at all
+//     (ErrPeerUnreachable, which peer.ErrNoPeers also wraps) →
+//     ErrPeerUnavailable (retryable availability);
 //   - the peer answered 5xx (it reached the action but could not complete it —
 //     a 502 opener failure, a 503 "busy, try again") → ErrPeerUnavailable;
 //   - any other non-200 (a 4xx: the peer rejected the request as invalid —
@@ -96,16 +98,20 @@ func (c *Client) Clipboard(ctx context.Context, text string) error {
 // Keying availability on the 5xx class (rather than singling out 400) keeps a
 // future 4xx the endpoint might grow — a 403, 405, 415 — correctly classified
 // as a permanent request error rather than a retryable one.
+//
+// With several peers the broadcast's own precedence rules apply: a 4xx from any
+// peer surfaces even if another accepted, because bad input is bad everywhere
+// and the caller must hear it; otherwise any 200 is success.
 func (c *Client) peerAction(ctx context.Context, action, apiPath string, form url.Values) error {
-	socket := c.cfg.Vault.TokenSocket
-	if socket == "" {
+	pool := c.cfg.Vault.peerPool()
+	if pool == nil {
 		return fmt.Errorf("%w: no peer socket configured (set vault.token_socket)", ErrPeerUnavailable)
 	}
-	err := auth.PostFormToPeer(ctx, socket, apiPath, form)
+	err := pool.Broadcast(ctx, apiPath, form)
 	if err == nil {
 		return nil
 	}
-	var se *auth.PeerStatusError
+	var se *peer.StatusError
 	if errors.As(err, &se) && se.Status < 500 {
 		return fmt.Errorf("dotvault: peer rejected %s request: %s", action, se.Message)
 	}

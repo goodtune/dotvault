@@ -3,11 +3,9 @@
 package tokenwatch
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -44,8 +42,8 @@ const pollTimeoutMs = 100
 // delivers events that occur after InotifyAddWatch returns).
 type Watcher struct {
 	fd       int
-	name     string
-	onChange func()
+	match    func(name string) bool
+	onChange func(name string)
 }
 
 // New registers an inotify watch on the parent directory of path and
@@ -61,24 +59,12 @@ type Watcher struct {
 // replace the inode; a file-level watch would survive only until the
 // first rotation. Watching the directory and filtering events by name
 // keeps the subscription alive across arbitrarily many replacements.
+//
+// New is built on the more general NewMatch, narrowed to a single
+// literal name.
 func New(path string, onChange func()) (*Watcher, error) {
-	dir := filepath.Dir(path)
 	name := filepath.Base(path)
-
-	// Non-blocking fd so the read loop interleaves ctx-cancellation
-	// checks (via Poll with a bounded timeout) instead of blocking
-	// forever in Read.
-	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := unix.InotifyAddWatch(fd, dir, watchMask); err != nil {
-		unix.Close(fd)
-		return nil, err
-	}
-
-	return &Watcher{fd: fd, name: name, onChange: onChange}, nil
+	return NewMatch(filepath.Dir(path), func(n string) bool { return n == name }, func(string) { onChange() })
 }
 
 // Run blocks reading the inotify fd registered by New, calling onChange
@@ -117,8 +103,8 @@ func (w *Watcher) Run(ctx context.Context) error {
 			return err
 		}
 
-		if nameMatched(buf[:nread], w.name) {
-			w.onChange()
+		for _, name := range matchedNames(buf[:nread], w.match) {
+			w.onChange(name)
 		}
 	}
 }
@@ -139,32 +125,4 @@ func Watch(ctx context.Context, path string, onChange func()) error {
 	}
 	defer w.Close()
 	return w.Run(ctx)
-}
-
-// nameMatched reports whether any inotify event in buf names the watched
-// file. A directory watch delivers events for every entry, so the name
-// filter is what scopes the callback to the token file. Coalescing a
-// burst of matching events into a single onChange is fine — Reload is
-// idempotent.
-func nameMatched(buf []byte, name string) bool {
-	offset := 0
-	for offset+unix.SizeofInotifyEvent <= len(buf) {
-		raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-		nameLen := int(raw.Len)
-		start := offset + unix.SizeofInotifyEvent
-		end := start + nameLen
-		if nameLen > 0 && end <= len(buf) {
-			// The name field is NUL-padded to the event alignment;
-			// trim at the first NUL before comparing.
-			evName := buf[start:end]
-			if i := bytes.IndexByte(evName, 0); i >= 0 {
-				evName = evName[:i]
-			}
-			if string(evName) == name {
-				return true
-			}
-		}
-		offset = end
-	}
-	return false
 }

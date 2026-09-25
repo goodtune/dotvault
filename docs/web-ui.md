@@ -59,6 +59,38 @@ Shows at a glance:
 
 Browse and inspect secrets synced by dotvault. Secrets are hidden by default and require explicit reveal (`?reveal=true`). Nested Vault paths — such as a grouped enrolment written under `databricks/prod` — render in the sidebar as expandable folders that lazy-load their contents on first open, mirroring the grouped layout on the enrolment screen.
 
+### Editing secrets
+
+The secret browser is read-only until an administrator names one or more editable subtrees in [`web.editable_paths`](configuration/config-reference.md#editable-key-spaces). With that set, editing happens **on the secret's own page** — there is no separate editor view. A pencil beside a field turns that row into inputs, next to the eye and clipboard buttons already there; save or cancel puts it back. Opening a row, and cancelling it, leave the rest of the page exactly as it was. **Saving reloads the page**, though, so finish one row before opening another — a save discards whatever was typed into any other open row.
+
+Opening a row **reveals that field's value** — there is no editing a value you cannot see — so the pencil is a deliberate gesture like the eye beside it, one row at a time, and the daemon logs it the same way (the path, never the field name or the value). Every other cell on the page stays masked.
+
+Editing needs JavaScript. The pencil, **Add field** and **New secret** are script-driven, like the eye and clipboard buttons already on those rows — with scripting off they still appear but do nothing when clicked, and what works is the read-only view plus **Delete**. If you need to write without a browser, the [JSON API](#api-endpoints) and the [filesystem mount](guide/filesystem.md) both do it losslessly.
+
+The editable subtrees are listed in the Secrets sidebar **whether or not they exist yet**. A subtree holds nothing until the first secret is written into it, and a folder you cannot see is one you cannot create in. (If your Vault policy grants write on those paths without granting `list` on the folder above them, that is fine: a listing failure inside a configured subtree is treated as "empty" rather than reported. Everywhere else it is still an error.)
+
+#### Creating a secret
+
+**New secret** on a folder asks for a name relative to that folder and takes you to it — `personal` plus `aws` lands on `/ui/secrets/personal/aws`. Naming a secret does not create it: that URL simply holds nothing yet, which is what makes the page there a create form. Add the first field and the secret comes into being. The URL is the whole state, so there is nothing to keep in step between "new" and "existing".
+
+The name is a single segment, because your key space is one folder deep — the same shape an enrolment key has, flat or grouped exactly once. A nested name like `aws/dev` is refused rather than taking you to a page that could never save.
+
+#### Versions, and not clobbering each other
+
+Every save carries the **version** the row was rendered from, and Vault refuses the write if the secret has moved on since. So if something else changes a secret while you have it open — the daemon's own enrolment refresh, another browser tab, the filesystem mount, the API — your save is refused with an explanation rather than silently overwriting whatever landed in between. The page comes back showing what is in Vault now — which means **the text you had typed is gone**, so copy anything you cannot retype out of the box before saving a row you have had open for a while. Creating works the same way: the first field is written on the condition that nothing exists at that path, so two simultaneous creates cannot both appear to succeed.
+
+Within one row you can change the value, rename the field (the old name goes, the value moves), or remove the field. Removing the last field is refused, since Vault does not store a fieldless secret and deleting the whole secret is its own gesture. Adding a field — or renaming one onto a name the secret already has — is refused rather than quietly replacing what is there: the field that would lose is the one you were not looking at.
+
+#### What survives a round trip, and what cannot
+
+- **A value you do not edit is written back byte for byte**, including its type: a field holding the number `1000000` stays a number, and one holding CRLF line endings keeps them. Editing a structured value turns it into a string; editing a multi-line one stores it with `\n` endings, because every browser submits a text area as CRLF whatever the value held and the server cannot tell which it was.
+- **Multi-line values are safe.** A PEM private key or certificate keeps its line breaks, including a value that begins with one — the value box is a resizable text area rather than a single-line input.
+- **Names cannot contain line breaks or leading/trailing whitespace.** A single-line input discards those, so saving would rename the field rather than edit it. Rather than corrupt it, the page withholds the pencil on such a secret and says why, naming the JSON API and the [filesystem mount](guide/filesystem.md) — both of which edit it losslessly, the mount when `fuse.read_write` is on. Delete still works, since it renders no name back.
+
+Secrets an enrolment owns stay read-only even inside an editable subtree, and the page says so rather than silently dropping the controls: dotvault rewrites those at the engine's next run, so an edit there would be lost without warning. That protection comes from the configuration rather than from what Vault currently holds, so a **configured enrolment that has not run yet is protected too** — you cannot create a secret at the path an enrolment will later claim, only to have it overwritten the first time the engine runs. Nothing outside the configured subtrees is editable, including the root of your key space.
+
+**Delete removes every version.** It is the same operation as `rm` on the [filesystem mount](guide/filesystem.md) — a KVv2 metadata delete, with no undelete. The form asks you to type the secret's name back before it will run.
+
 ### Manual sync
 
 Trigger an immediate sync cycle from the dashboard without waiting for the next poll interval.
@@ -112,11 +144,23 @@ The web UI communicates with the dotvault daemon via a REST API:
 | `GET` | `/api/v1/rules` | Configured sync rules |
 | `GET` | `/api/v1/token` | Current Vault token (authenticated sessions only) |
 | `GET` | `/api/v1/secrets/{path}` | List or reveal a secret |
+| `POST` | `/api/v1/secrets/{path}` | Create a secret; 409 if one already exists (CSRF-protected) |
+| `PUT` | `/api/v1/secrets/{path}` | Replace a secret; 404 if absent (CSRF-protected) |
+| `DELETE` | `/api/v1/secrets/{path}` | Delete a secret and every version of it (CSRF-protected) |
 | `POST` | `/api/v1/sync` | Trigger immediate sync (CSRF-protected) |
 | `POST` | `/api/v1/remote/browse` | Open a form-posted `url` in this host's default browser (not CSRF-protected) |
 | `POST` | `/api/v1/remote/notify` | Raise a form-posted desktop notification on this host (not CSRF-protected) |
 | `POST` | `/api/v1/remote/clipboard` | Put form-posted `text` on this host's clipboard (not CSRF-protected) |
 | `GET` | `/api/v1/csrf` | Obtain a one-time CSRF token |
+
+The three secret mutations write inside [`web.editable_paths`](configuration/config-reference.md#editable-key-spaces) and answer `403` everywhere else, so they are registered whether or not anything is configured — what grants the capability is the policy, not the route table. They are the non-browser way to do what the [secret editor](#editing-secrets) does, and the answer when a field name carries a line break or surrounding whitespace the form cannot round-trip. The body is `{"fields": {...}}`, the same object `GET …?reveal=true` returns, so a caller can read, edit and send it straight back; unlike the browser's per-row save it **replaces the whole document**, exactly as a write through the filesystem mount does. They are ordinary CSRF-protected mutations, so each needs a token from `GET /api/v1/csrf` echoed back in `X-CSRF-Token`:
+
+```sh
+TOKEN=$(curl -s http://127.0.0.1:9000/api/v1/csrf | jq -r .token)
+curl -X PUT http://127.0.0.1:9000/api/v1/secrets/personal/token \
+  -H "X-CSRF-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fields": {"value": "new"}}'
+```
 
 `POST /api/v1/remote/browse` is the outbound counterpart of `GET /api/v1/token`: over the same SSH-forwarded Unix socket that lets a headless peer borrow the workstation's token, it lets the peer hand a URL back so browser-driven flows open where a browser actually exists — see [`dotvault browse`](cli.md#dotvault-browse). It accepts a form POST (`url=https://...`, body only — the query string is ignored) and only `http`/`https` URLs with a host and no embedded `user:pass@` credentials; `file://` and custom protocol schemes are rejected before anything reaches the OS URL opener, and only one browser open runs at a time (concurrent requests get a 503). It is deliberately exempt from the CSRF handshake: its consumer is a bare `curl`/`dotvault browse` POST with no practical way to run the issue-then-spend token dance, and it reads no state and returns nothing sensitive. Cross-site browser traffic is rejected by an `Origin` check instead — browsers always attach an `Origin` header to cross-origin POSTs, and only the daemon's own origin (a loopback hostname on the daemon's own listener port — a page served by any *other* loopback server does not qualify) is accepted; curl and the CLI send no `Origin` and pass.
 

@@ -54,6 +54,8 @@ web:
     Welcome to dotvault. Click **Login** to authenticate via SSO.
   secret_view_text: |
     These secrets are synchronised from Vault to your local machine.
+  editable_paths:
+    - personal
 
 api:
   enabled: true
@@ -129,6 +131,7 @@ The behaviour is identical on every platform. On Windows GPO the equivalent regi
 | `tls_skip_verify` | bool | `false` | Skip TLS certificate verification (development only) |
 | `disable_token_renewal` | bool | `false` | Never call `RenewSelf`; TTL expiry still triggers re-auth |
 | `token_socket` | string or list | `~/.ssh/dotvault.sock, ~/.ssh/dotvault.*.sock` | Peer dotvault socket patterns to borrow a token from and fan peer actions out to (see below); `[]` disables |
+| `borrow_only` | bool | `false` | Forbid this host from ever running its own fresh-auth flow; it only ever borrows a token via `token_socket` (see below) |
 
 Secret paths are constructed as: `{kv_mount}/data/{user_prefix}{username}/{vault_key}`
 
@@ -216,7 +219,7 @@ Host devbox
     RemoteForward /home/me/.ssh/dotvault.laptop.sock 127.0.0.1:9000
 ```
 
-The remote dotvault then sets `token_socket` (or leaves the default) and borrows the workstation's token instead of needing its own browser or TTY to authenticate. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
+The remote dotvault then sets `token_socket` (or leaves the default) and borrows the workstation's token instead of needing its own browser or TTY to authenticate. If the `RemoteForward` above is itself managed by a [keyless sync rule](sync-rules.md#rules-without-a-vault-key), note the daemon syncs those rules *before* it authenticates — the file that creates the socket cannot be made to wait on the token that arrives over it. Because the socket *listener* lives on the borrowing host, this side should be Linux or macOS, where `AF_UNIX` is fully supported; the workstation only needs the loopback TCP web UI.
 
 On Linux the daemon also **watches the socket** (inotify) and re-borrows as soon as it materialises or is replaced — so an SSH `RemoteForward` that connects after the daemon started, or drops and reconnects, is picked up within moments rather than only on the next periodic check.
 
@@ -236,6 +239,26 @@ The socket carries traffic the other way too. [`dotvault browse <url>`](../cli.m
 !!! warning "The socket grants the token to anyone who can connect"
     Any local process or user that can `connect()` to the forwarded socket can read the Vault token from it — and, via `POST /api/v1/remote/browse`, `POST /api/v1/remote/notify`, and `POST /api/v1/remote/clipboard`, open arbitrary web pages (including phishing pages) in the workstation's browser, raise arbitrary desktop notifications on it, and replace the workstation's clipboard contents (a paste-hijacking primitive — e.g. swapping a copied wallet address or command). dotvault does **not** create the socket and cannot enforce its permissions — that is the SSH `RemoteForward`'s responsibility (it creates the socket owned by, and typically readable only by, the SSH user). Only enable `token_socket` on hosts whose other local users you trust, and rely on the remote host's filesystem permissions on the socket path.
 
+### `borrow_only` — forbid a fresh-auth flow entirely
+
+`borrow_only: true` takes the borrow above and makes it the *only* way this host can ever obtain a Vault token. `auth_method` (and the `mtls` block, if present) is simply not consulted: no OIDC browser, no LDAP prompt, no certificate bootstrap, and the web login view shows a waiting card instead of any credential form. Validated to require a non-empty `token_socket`, since without one this host could never authenticate at all.
+
+The use case is a fleet where one machine — an operator's desktop — is the sole holder of a Vault identity, and every other host it reaches must receive that identity only by borrowing it, never by minting one of its own:
+
+```yaml
+# Remote/headless host's config — shares vault.address, kv_mount, etc. with
+# the desktop's config; auth_method can even be left as whatever the desktop
+# uses, since it is ignored here.
+vault:
+  address: "https://vault.example.com:8200"
+  token_socket: "~/.ssh/dotvault.sock"   # forwarded from the desktop
+  borrow_only: true
+```
+
+Reuse of an already-cached token (the token file or `DOTVAULT_TOKEN`) still applies first, exactly as in every other mode. What happens once that reuse comes up empty then differs by caller. The daemon (`dotvault run`) **idles and keeps retrying the borrow**, watching both the token file (for a manually-dropped override) and the socket, rather than failing startup — the same shape a headless host with no interactive facility already uses while waiting for `dotvault login` to run elsewhere. `dotvault sync`/`--once` and `login-check`'s fallback have a job to do that only needs *a* token, borrowed included, so they make one borrow attempt and fail immediately only once that comes up empty. `dotvault login` and the Go `client/` library's `Login` are different: their entire purpose — force a fresh login, ignoring the cache — has no meaning under this mode regardless of whether a borrow would happen to succeed right now, so both refuse unconditionally *without even attempting one* (`AuthenticateCached`, which never runs a fresh-auth flow to begin with, is unaffected and keeps borrowing normally; the Python bindings expose only `AuthenticateCached`, not `Login`).
+
+On Windows GPO the equivalent registry value is a `BorrowOnly` REG_DWORD under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Vault`.
+
 For example, with defaults and username `jane`, the rule `vault_key: "gh"` reads from `kv/data/users/jane/gh`.
 
 ## Sync section
@@ -254,9 +277,41 @@ On Enterprise Vault, dotvault also subscribes to the Events API via WebSocket fo
 | `listen` | string | — | Listen address (must be loopback, e.g. `127.0.0.1:9000`) |
 | `login_text` | string | — | Markdown text displayed on the login page |
 | `secret_view_text` | string | — | Markdown text displayed on the secret view page |
+| `editable_paths` | list of strings | — | Folders of your own key space the web UI may create, edit and delete secrets in — one folder name per entry. Empty (the default) keeps the UI read-only |
 
 !!! danger "Loopback only"
     The `listen` address **must** resolve to a loopback address (`127.0.0.1`, `[::1]`, or `localhost`). dotvault will refuse to start if a non-loopback address is configured. This is a hard security invariant.
+
+### Editable key spaces
+
+By default the web UI only reads. `editable_paths` opts a named part of your key space into full CRUD — see [Editing secrets](../web-ui.md#editing-secrets) for what that looks like in the browser.
+
+Each entry is a single **folder** name relative to `kv/{user_prefix}{username}/` — your key space is one folder deep, so an entry names a folder and the secrets directly inside it become editable:
+
+```yaml
+web:
+  enabled: true
+  listen: "127.0.0.1:9000"
+  editable_paths:
+    - personal
+    - scratch
+```
+
+With `user_prefix: users/` and a user of `gary`, that makes the secrets in `users/gary/personal/` and `users/gary/scratch/` editable — `personal/token`, `scratch/todo` and so on.
+
+Four things are **never** editable, whatever this is set to:
+
+- **Anything more than one folder deep.** Your key space is one folder deep and this setting is a view onto that layout, not a second one: an [enrolment key](#enrolments-section) is flat (`gh`) or grouped exactly once (`databricks/prod`), so an entry here names a single folder and an editable secret sits directly inside it. `personal/token` is editable; `personal/aws/dev` is not, and it says so rather than reporting the path as outside the subtree. An entry that is itself nested (`scratch/notes`) names a *secret*, not a folder, and is rejected at config load — accepting it would grant editing over a subtree that cannot exist.
+- **The root of your key space.** `personal/token` is editable; a secret sitting at exactly `users/gary/personal` is not, and neither is `users/gary/gh`. A root names a folder, and the secret that happens to share its name is a direct child of the key-space root like any other. Admitting the root would put every enrolment credential and every sync rule's source one gesture away from being replaced, which is the blast radius this setting exists to bound — so an entry naming it (`""`, `"/"`) is rejected at config load rather than quietly ignored.
+- **Anything an enrolment writes.** If `personal/gh` is a configured enrolment key — a [grouped enrolment](#enrolments-section) whose group happens to be an editable subtree; a flat key like `gh` sits at the key-space root and is already excluded by the root rule below — it stays read-only even though `personal` is editable: the credential there belongs to the enrolment engine, which will overwrite an edit at its next run or refresh. The rule reads the *configuration*, not Vault, so it holds before the enrolment has ever run — the path cannot be created by hand and then silently overwritten the first time the engine claims it. The UI says so on the page rather than just omitting the controls. This is evaluated live, so an enrolment added by a [remote config](remote-config.md) refresh takes a path out of reach without a restart.
+- **Any other user's secrets.** The path is always resolved beneath your own prefix, and `..` segments are rejected rather than collapsed.
+
+`editable_paths` is validated whether or not `web.enabled` is set, so a bad entry is reported when you stage the config rather than on the restart that turns the UI on. Entries are canonicalised (`/personal/` becomes `personal`), and a duplicate is an error.
+
+Each configured subtree is listed in the web UI's Secrets sidebar whether or not it exists in Vault yet — a subtree holds nothing until the first secret is written into it, and it has to be reachable for that first write to happen. A `list` denial or a 404 on a configured subtree is therefore treated as "empty" rather than reported, so a Vault policy that grants write on those paths without granting `list` on the folder above them still works. Listing failures outside the configured subtrees are still errors.
+
+!!! note "This is a UI capability, not a Vault permission"
+    dotvault refuses a write outside these subtrees; Vault does not know about them. The token still carries whatever the auth role granted it, so this bounds what the *browser* can do, not what the daemon could. Narrow the token itself with [`vault.policies`](#vault-section) if that is what you need.
 
 ## API section
 
@@ -387,11 +442,41 @@ The mount root is your own KV prefix (`{kv_mount}/{user_prefix}{username}/`), bo
     A secret and a folder sharing a KV name coexist fine — `users/you/databricks` is `databricks.json` and `users/you/databricks/prod` is `databricks/prod.json`. What does collide is a KV folder whose name already ends in `.json`, which competes with the secret of the same stem. The directory wins so the secrets underneath stay reachable, the daemon warns naming the path, and the shadowed secret has no path in the mount. The mount refuses to create such a directory, so it can only come from a KV tree already laid out that way.
 
 !!! note "Unix only"
-    `fuse.enabled` has no effect on Windows: the daemon logs a warning and mounts nothing, so a config shared across a mixed-platform fleet is safe. There is no Windows equivalent planned — WinFsp is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries. Linux needs `/dev/fuse` and the `fusermount3` helper (`fuse3` package); macOS needs [macFUSE](https://macfuse.github.io/).
+    `fuse.enabled` has no effect on Windows: the daemon logs a warning and mounts nothing, so a config shared across a mixed-platform fleet is safe. There is no Windows equivalent planned — WinFsp is a DLL reached through cgo, and dotvault ships `CGO_ENABLED=0` static binaries. Linux needs `/dev/fuse` and the `fusermount3` helper (`fuse3` package), and a systemd unit that does not set `NoNewPrivileges=` or any other seccomp-based sandbox directive, which disarm the helper — see [Hardening and the FUSE mount](../admin/deployment.md#hardening-and-the-fuse-mount); macOS needs [macFUSE](https://macfuse.github.io/).
 
 Reading a file in the mount calls Vault, so `grep -r` across the mount — or an editor indexing your home directory — reads every secret you have and puts each one in Vault's audit log. Reach for a specific path.
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
+
+## Docker volumes section
+
+The `docker` section serves your secrets to containers as a Docker volume plugin (rootless Docker and Podman both consume the same protocol). A volume is a directory of plain files — `gh.json` per secret, rendered exactly as the [filesystem](#filesystem-section) renders it — that the daemon materialises when a container first mounts it, keeps current from Vault events (Enterprise) or on a refresh window (Community), and deletes when the last container lets go. See the [Docker volumes guide](../guide/docker-volumes.md) for registration, the per-volume `secrets`/`layout`/`mode`/`ttl` options, and the refresh policy.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve the plugin |
+| `socket` | string | `$XDG_RUNTIME_DIR/dotvault/docker.sock` | Unix socket the engine connects to (`0600` in a `0700` directory); must be absolute (or `~`-relative). The engine is told about it by a one-line spec file, which the Linux packages create per user for rootless Docker — see the guide. Change this and you must write that file yourself, since the packaged drop-in names the default |
+| `volume_dir` | string | `$XDG_RUNTIME_DIR/dotvault/volumes` | Directory volumes are materialised under, one subdirectory each. Created at mode `0700` |
+| `cache_ttl` | duration | `1m` | Default refresh window for a volume without its own `ttl` option. Governs Community, and Enterprise while the event subscription is down; must be positive and at most 10 minutes, since the window is also how long a rotated secret keeps being served to a container |
+
+```yaml
+docker:
+  enabled: true
+  socket: ""        # default: $XDG_RUNTIME_DIR/dotvault/docker.sock
+  volume_dir: ""    # default: $XDG_RUNTIME_DIR/dotvault/volumes
+  cache_ttl: "1m"
+```
+
+The socket is deliberately not under an engine's own plugin directory: a rootless `dockerd` scans `/run/docker/plugins` inside its own mount namespace, which nothing outside it can populate, and a rootful one's is root-owned. Both engines accept a `.spec` file naming any socket, and `dotvault status` prints its path and contents. The **daemon** never writes that file — it does not edit another tool's configuration. The Linux **packages** do, for the rootless Docker case only, via a systemd user-tmpfiles drop-in that creates `~/.local/lib/docker/plugins/dotvault.spec` at login; it never overwrites a file that already exists, and it is opted out of with `ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf`. Note it names the *default* socket path, so a customised `socket` needs a hand-written spec. See [Registering the plugin](../guide/docker-volumes.md#registering-the-plugin).
+
+!!! note "Linux only"
+    `docker.enabled` has no effect on macOS or Windows: the daemon logs a warning and serves nothing. Docker Desktop and Podman machine run the engine in a virtual machine, where a host-side socket is unreachable, so there is nothing a build for those platforms could usefully bind. A config shared across a mixed-platform fleet is safe.
+
+Volume definitions (names and options, never secret data) persist in `{cache_dir}/docker-volumes.json`, so a daemon restart under a running container resumes refreshing the directory that container still holds. The section is static — a change needs a restart — and is refused in a remote-config document, like every other section that opens a listener.
+
+On Linux, the packaged `dotvault-docker.socket` unit (optional, not enabled by default) lets systemd bind this socket and hold the fd across daemon restarts, so an engine call landing mid-restart queues instead of failing. `docker.enabled` remains the master switch, and under activation the unit's `ListenStream=` path wins over `socket` — the `.spec` file must name that path. The unit's default `ListenStream=` and the default `socket` are the same path, so the packaged spec drop-in above is correct in both modes. See [Socket activation](../admin/deployment.md#socket-activation-optional) and [plugin registration](../admin/deployment.md#docker-volume-plugin-registration-automatic-per-user).
+
+On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Socket` (REG_SZ), `VolumeDir` (REG_SZ) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\Docker`, and the section round-trips through `reg-import`/`reg-export` like every other, for the same mixed-fleet reason as `fuse`.
 
 ## Observability section
 
@@ -476,7 +561,13 @@ dotvault validates the configuration on startup and exits with an error if:
 - A `target.format` is not one of: `yaml`, `json`, `ini`, `toml`, `text`, `netrc`, `ssh_config`
 - A rule sets `target.delete_nulls: true` on a format other than `json` or `yaml` — the others have no null literal a template could render, and silently ignoring the flag would leave you believing a retired credential had been deleted (see [Removing a field](sync-rules.md#removing-a-field))
 - `web.listen` resolves to a non-loopback address (when web is enabled)
+- A `web.editable_paths` entry names the root of your key space (`""`, `"/"`) rather than a folder in it — silently ignoring it would leave you believing you had granted editing that you had not
+- A `web.editable_paths` entry is more than one segment deep (`scratch/notes`) — your key space is one folder deep, so that names a secret rather than a folder; write `scratch`
+- A `web.editable_paths` entry is not a valid relative KV path (an empty segment, `.`, `..`, or an embedded NUL)
+- Two `web.editable_paths` entries name the same folder once canonicalised (`personal` and `/personal/`)
 - An enrolment entry has an empty `engine` field
 - `api.unix.path` is set to a relative path (it would resolve against each process's working directory, so the daemon and a client started elsewhere would disagree about where the socket is)
 - `fuse.mountpoint` is set to a relative path (same reason as `api.unix.path`: the daemon and anyone reading the config would disagree about where the secrets appeared)
 - `fuse.cache_ttl` does not parse as a duration, or is negative
+- `docker.socket` or `docker.volume_dir` is set to a relative path (same reason as `api.unix.path`)
+- `docker.cache_ttl` does not parse as a duration, is zero or negative, or exceeds 10 minutes

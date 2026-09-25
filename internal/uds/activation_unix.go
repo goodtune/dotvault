@@ -122,12 +122,4 @@ func ownedByCurrentUser(fi os.FileInfo) bool {
 // refuse anyone — clients would still connect into a backlog nobody
 // accepts and hang there. Draining is the honest refusal available to us:
 // each client connects, is closed at once, and fails fast with EOF.
-func drainListener(ln net.Listener) {
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		c.Close()
-	}
-}
+func drainListener(ln net.Listener) { DrainListener(ln) }

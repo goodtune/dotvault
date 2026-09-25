@@ -266,6 +266,12 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("GET /ui/fragments/secrets/mask", s.handleUISecretMask)
 	s.mux.HandleFunc("GET /ui/fragments/secrets/copy-btn", s.handleUISecretCopyBtn)
 	s.mux.HandleFunc("GET /ui/fragments/enrol-card", s.handleUIEnrolCardFragment)
+	// Secret editing (web.editable_paths) is in-place on the detail page:
+	// these turn one row editable and back. The fragment prefix is outside
+	// /ui/secrets/, whose page route is a {path...} wildcard a literal
+	// sibling would shadow.
+	s.mux.HandleFunc("GET /ui/fragments/secrets/edit-row", s.handleUISecretEditRow)
+	s.mux.HandleFunc("GET /ui/fragments/secrets/row", s.handleUISecretRow)
 
 	// Mutations (same-origin POSTs; see requireUIWrite).
 	s.mux.HandleFunc("POST /ui/actions/sync", s.handleUIActionSync)
@@ -275,6 +281,9 @@ func (s *Server) registerSSRUIRoutes() {
 	s.mux.HandleFunc("POST /ui/enrol/skip", s.handleUIEnrolSkip)
 	s.mux.HandleFunc("POST /ui/enrol/reset", s.handleUIEnrolReset)
 	s.mux.HandleFunc("POST /ui/enrol/secret", s.handleUIEnrolSecret)
+	s.mux.HandleFunc("POST /ui/secrets-edit/field", s.handleUISecretFieldSave)
+	s.mux.HandleFunc("POST /ui/secrets-edit/goto", s.handleUISecretGoto)
+	s.mux.HandleFunc("POST /ui/secrets-edit/delete", s.handleUISecretDelete)
 	s.mux.HandleFunc("POST /ui/remotes/add", s.handleUIRemoteAdd)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/save", s.handleUIRemoteSave)
 	s.mux.HandleFunc("POST /ui/remotes/{host}/delete", s.handleUIRemoteDelete)
@@ -333,6 +342,20 @@ func (s *Server) uiRenderPage(w http.ResponseWriter, page string, data any) {
 	s.uiRender(w, page, "layout", data)
 }
 
+// uiRenderPageStatus is uiRenderPage with a non-200 status — a form
+// re-rendered after a refusal, say.
+//
+// It exists because a caller cannot simply WriteHeader first: net/http
+// snapshots the header map at WriteHeader, so the Content-Type and
+// Cache-Control: no-store that uiRender sets would be silently discarded.
+// That is not cosmetic — the secret editor's re-render is the one page whose
+// body carries plaintext secret material, so losing no-store there would put
+// it in a shared cache. The status therefore has to travel *into* the
+// renderer rather than being applied around it.
+func (s *Server) uiRenderPageStatus(w http.ResponseWriter, page string, data any, status int) {
+	s.uiRenderWithStatus(w, page, "layout", data, status)
+}
+
 // uiRenderStandalone executes a page inside the chrome-less shell used by the
 // login view and the first-run wizard — the surfaces that exist before there
 // is a dashboard to frame them.
@@ -344,6 +367,14 @@ func (s *Server) uiRenderStandalone(w http.ResponseWriter, page string, data any
 // errors after the first byte cannot become a clean 500, so the page is
 // rendered to a buffer first.
 func (s *Server) uiRender(w http.ResponseWriter, page, shell string, data any) {
+	s.uiRenderWithStatus(w, page, shell, data, http.StatusOK)
+}
+
+// uiRenderWithStatus is uiRender's implementation. The status is written
+// after the headers and only once the template has executed cleanly, so a
+// render failure can still become an honest 500 (see uiRenderPageStatus for
+// why the status cannot be applied by the caller instead).
+func (s *Server) uiRenderWithStatus(w http.ResponseWriter, page, shell string, data any, status int) {
 	tmpl, ok := uiPages[page]
 	if !ok {
 		writeError(w, "unknown page", http.StatusInternalServerError)
@@ -357,6 +388,9 @@ func (s *Server) uiRender(w http.ResponseWriter, page, shell string, data any) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
 	fmt.Fprint(w, b.String())
 }
 
@@ -373,7 +407,62 @@ func uiFragment(name string, data any) (string, error) {
 // uiPatchElements sends rendered elements as a datastar patch-elements SSE
 // response. A write failure just means the client went away mid-patch, so it
 // is logged at debug and not surfaced.
+// noStoreSSEWriter forces Cache-Control: no-store onto an SSE response.
+//
+// It exists because datastar's NewSSE sets "no-cache" and flushes the headers
+// itself, so a plain Set before or after it is either overwritten or too
+// late. Some of these fragments carry a revealed secret — the eye's cell and
+// the pencil's edit row — and "no-cache" permits a shared cache to *store*
+// the response and merely revalidate it. The pages that carry the same values
+// say no-store; a value should not become more storable for arriving as a
+// fragment.
+//
+// Buffering the header map and applying it at first write is what lets the
+// last word be ours. Flush is implemented rather than inherited because
+// http.ResponseController tries the outermost writer first, and datastar
+// flushes through one — without it the implicit WriteHeader would happen on
+// the wrapped writer and skip this.
+type noStoreSSEWriter struct {
+	http.ResponseWriter
+	hdr     http.Header
+	written bool
+}
+
+func newNoStoreSSEWriter(w http.ResponseWriter) *noStoreSSEWriter {
+	return &noStoreSSEWriter{ResponseWriter: w, hdr: w.Header().Clone()}
+}
+
+func (w *noStoreSSEWriter) Header() http.Header { return w.hdr }
+
+func (w *noStoreSSEWriter) WriteHeader(code int) {
+	if w.written {
+		return
+	}
+	w.written = true
+	dst := w.ResponseWriter.Header()
+	for k, v := range w.hdr {
+		dst[k] = v
+	}
+	dst.Set("Cache-Control", "no-store, max-age=0")
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *noStoreSSEWriter) Write(b []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *noStoreSSEWriter) Flush() {
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *noStoreSSEWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func uiPatchElements(w http.ResponseWriter, r *http.Request, elements string) {
+	w = newNoStoreSSEWriter(w)
 	sse := datastar.NewSSE(w, r)
 	if err := sse.PatchElements(elements); err != nil {
 		slog.Debug("patch elements failed", "error", err)
@@ -487,12 +576,24 @@ func (s *Server) buildUINav(ctx context.Context, active, selected string) []uiNa
 // path to the selected secret (one folder level, matching the enrolment key
 // grammar).
 func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected string) {
+	roots := s.editPolicy().Roots()
 	keys, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix())
 	if err != nil {
 		sec.Note, sec.NoteIsError = "failed to list secrets", true
 		slog.Warn("ui: list secrets for nav failed", "error", err)
-		return
+		// Not a return: the configured editable subtrees are known from
+		// configuration, not from Vault, so they stay reachable even when
+		// the root listing is denied. That is the case this has to survive
+		// — a policy granting write inside a subtree need not grant LIST on
+		// the user prefix above it, and without this the one path the user
+		// is invited to create in would be unreachable. The note stays, so
+		// the failure is reported rather than papered over.
+		keys = nil
+		if len(roots) == 0 {
+			return
+		}
 	}
+	keys = mergeEditableRoots(keys, roots)
 	if len(keys) == 0 {
 		sec.Note = "No secrets found"
 		return
@@ -512,7 +613,7 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 			if name == expandFolder {
 				item.Expanded = true
 				item.Href = "/ui/secrets/"
-				children, err := s.vault.ListKVv2(ctx, s.kvMount, s.userKVPrefix()+entry)
+				children, err := s.listSecretKeys(ctx, name)
 				switch {
 				case err != nil:
 					item.Note, item.NoteIsError = "failed to list", true
@@ -548,6 +649,68 @@ func (s *Server) fillSecretsNav(ctx context.Context, sec *uiNavSection, selected
 			Selected: entry == selected,
 		})
 	}
+}
+
+// mergeEditableRoots folds the configured editable subtrees into a LIST
+// result so they appear in the sidebar before anything has been written into
+// them. A configured root holds nothing until the first secret is created, and
+// a folder you cannot see is a folder you cannot create in — the entry *is*
+// the way in.
+//
+// A root is a single path segment (kvpath.CleanEditableRoot), so it sits at
+// the same level as every other folder the listing returns and the nav's
+// one-level expansion covers it without any special case.
+func mergeEditableRoots(keys []string, roots []string) []string {
+	if len(roots) == 0 {
+		return keys
+	}
+	have := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		have[strings.TrimSuffix(k, "/")] = struct{}{}
+	}
+	out := append([]string(nil), keys...)
+	for _, root := range roots {
+		if _, dup := have[root]; dup {
+			continue
+		}
+		have[root] = struct{}{}
+		out = append(out, root+"/")
+	}
+	sort.Strings(out)
+	return out
+}
+
+// listSecretKeys lists the children of a folder under this user's prefix,
+// reporting an empty folder inside an editable subtree as empty rather than as
+// a failure.
+//
+// A Vault policy that grants write on a path need not grant LIST on the folder
+// above it, and a KVv2 LIST of a prefix holding nothing is a 404 besides. Both
+// are the normal state of a configured editable root nobody has written to
+// yet, and surfacing either as an error would put a red note on the one folder
+// the user is being invited to create in. The tolerance is deliberately scoped
+// to paths the edit policy admits — a listing failure anywhere else is still a
+// real failure and still reported.
+func (s *Server) listSecretKeys(ctx context.Context, rel string) ([]string, error) {
+	p := s.userKVPrefix()
+	if rel != "" {
+		p += rel + "/"
+	}
+	keys, err := s.vault.ListKVv2(ctx, s.kvMount, p)
+	if err == nil {
+		return keys, nil
+	}
+	if s.editPolicy().AllowsWithin(rel) {
+		// WARN, not DEBUG. ListKVv2 already maps a 404 to (nil, nil), so an
+		// empty prefix never reaches here at all — what does is a real
+		// failure, in practice a policy granting write on this subtree
+		// without `list` on it. Tolerating that keeps the folder usable;
+		// hiding it below the default log level would make a genuine ACL
+		// problem invisible.
+		slog.Warn("ui: list of editable path failed; treating as empty", "path", rel, "error", err)
+		return nil, nil
+	}
+	return nil, err
 }
 
 // uiEnrolDot maps an enrolment status to its quick-glance dot.

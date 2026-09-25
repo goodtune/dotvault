@@ -118,10 +118,9 @@ func drainFiles(name string, files []*os.File) {
 // accepts and hang indefinitely. The warning is the operability half: the
 // mismatch is a configuration disagreement only the operator can resolve.
 //
-// keep lists the names enabled surfaces claim, now or later — the daemon
-// calls this once at startup, and the SSH agent does not take its listener
-// until after the first successful Vault auth, so "claimed" cannot be
-// inferred from the snapshot alone.
+// keep lists the names enabled surfaces claim, now or later — the daemon calls
+// this once at startup, before the web server and the SSH agent have taken
+// their listeners, so "claimed" cannot be inferred from the snapshot alone.
 func DrainUnclaimedActivation(keep ...string) {
 	snapshotActivation()
 	kept := make(map[string]bool, len(keep))

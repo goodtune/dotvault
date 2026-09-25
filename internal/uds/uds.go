@@ -11,7 +11,10 @@
 // package is the single implementation.
 package uds
 
-import "errors"
+import (
+	"errors"
+	"net"
+)
 
 // ErrAlreadyListening is returned by Listen when a live process is already
 // accepting connections on the requested path. Callers wrap it with a message
@@ -22,3 +25,21 @@ var ErrAlreadyListening = errors.New("another process is already listening on th
 // ErrUnsupported is returned by Listen on platforms where dotvault does not
 // serve Unix domain sockets (Windows, which uses named pipes instead).
 var ErrUnsupported = errors.New("unix domain sockets are not supported on this platform")
+
+// DrainListener accepts and immediately closes every connection on ln until
+// the listener dies. It is the honest refusal available for a socket whose
+// listening fd something else retains — systemd, under socket activation —
+// where merely closing our own dup refuses nobody: clients would still
+// connect into a backlog nobody accepts and hang there. Drained, each one
+// fails fast with EOF. Exported for a surface that claimed an activated fd
+// and then could not start (the Docker volume plugin's Run), which must not
+// leave the fd kept-but-unserved; the unclaimed-fd housekeeping uses it too.
+func DrainListener(ln net.Listener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c.Close()
+	}
+}

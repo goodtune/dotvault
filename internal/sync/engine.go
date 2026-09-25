@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -113,11 +114,8 @@ func (e *Engine) currentInterval() time.Duration {
 // RunOnce executes a single sync cycle across all rules.
 func (e *Engine) RunOnce(ctx context.Context) error {
 	start := time.Now()
-	lastErr := e.runOnceLocked(ctx)
-	outcome := "ok"
-	if lastErr != nil {
-		outcome = "error"
-	}
+	failed, lastErr := e.runOnceLocked(ctx)
+	outcome := syncOutcome(lastErr, failed)
 	// Record outside the mutex: metric ops are independent of the
 	// engine's critical section, and dragging them inside would
 	// inflate the lock-hold window if the OTel exporter (or a
@@ -127,18 +125,167 @@ func (e *Engine) RunOnce(ctx context.Context) error {
 	return lastErr
 }
 
-func (e *Engine) runOnceLocked(ctx context.Context) error {
+// errCycleInterrupted marks a cycle that stopped because its context was
+// cancelled rather than because it finished. It is dotvault's own sentinel
+// rather than context.Canceled directly, because the classification below must
+// not be reachable by an error that merely *contains* a context error: the
+// Vault API client applies its own HTTP timeout, so a genuinely failing rule
+// can return a read error satisfying errors.Is(err, context.DeadlineExceeded),
+// and labelling that cycle "cancelled" would drop a real failure out of the
+// failure rate — the same conflation this sentinel exists to prevent, inverted.
+var errCycleInterrupted = errors.New("sync cycle interrupted")
+
+// syncOutcome labels a finished cycle for dotvault.sync.ticks and
+// dotvault.sync.duration. It takes the failure count as well as the error
+// because the two facts are independent: a cycle can both fail a rule and then
+// be cancelled, and only the count says which happened.
+//
+// A failed rule wins over an interruption. That ordering is the point: the
+// failure is the actionable fact and belongs in the rate an operator alerts
+// on, whereas an interruption is usually just this daemon shutting down.
+//
+// A cancelled cycle then gets its own value rather than folding into either
+// neighbour. Counted "ok" it would inflate the success rate with cycles that
+// never ran their whole rule set — the same conflation RunKeyless stays off
+// this counter to avoid, arriving by a different route. Counted "error" it
+// would put every daemon shutdown into the failure rate.
+//
+// Kept a pure function of its inputs so the classification is unit-testable
+// without standing up a metric exporter.
+func syncOutcome(err error, failed int) string {
+	switch {
+	case failed > 0:
+		return "error"
+	case errors.Is(err, errCycleInterrupted):
+		return "cancelled"
+	case err != nil:
+		return "error"
+	default:
+		return "ok"
+	}
+}
+
+// runOnceLocked runs every rule and reports the failure count alongside the
+// last error. The count is returned rather than derived from the error because
+// syncOutcome needs to tell a failed rule from an interruption, and an error
+// value alone cannot carry that.
+func (e *Engine) runOnceLocked(ctx context.Context) (failed int, lastErr error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	var lastErr error
+	_, failed, lastErr = e.runRulesLocked(ctx, nil)
+	return failed, lastErr
+}
+
+// runRulesLocked syncs every rule the include predicate accepts, in
+// configuration order, and reports how many were processed without error, how
+// many failed, and the last error seen. A nil predicate means every rule.
+// Callers must already hold e.mu.
+//
+// Per-rule isolation is the invariant it carries for every caller: a rule that
+// fails is logged and the loop continues, so one bad rule never costs the
+// others their sync.
+//
+// The include predicate is consulted before the cancellation check, so a
+// caller can observe which rules the loop reached. That ordering is part of
+// the contract rather than an accident of layout — a test drives the
+// cancellation through it.
+//
+// It stops early if ctx is cancelled between rules, and reports that stop as
+// an error wrapping errCycleInterrupted rather than returning nil. syncRule
+// itself is synchronous file I/O that observes no deadline, so this is the
+// only granularity available — but it is the one that matters: on shutdown the
+// daemon stops working through a long rule set instead of writing files it has
+// been told to stop writing, and returns to its caller within one rule.
+func (e *Engine) runRulesLocked(ctx context.Context, include func(config.Rule) bool) (ok, failed int, lastErr error) {
 	for _, rule := range e.cfg.Rules {
+		if include != nil && !include(rule) {
+			continue
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			// Report the interruption rather than breaking silently: a cycle
+			// that stopped early did not run its whole rule set, and a caller
+			// handed nil here cannot tell that from a complete one — RunOnce
+			// would record it as a successful full cycle on
+			// dotvault.sync.ticks, the "one rate meaning two things" this
+			// package works to avoid, reached from the other side.
+			//
+			// A rule error already seen wins, because it is the more
+			// actionable of the two and is what a caller printing this should
+			// show; syncOutcome reads the failure count rather than the error
+			// chain, so the cycle is still labelled "error" either way.
+			if lastErr == nil {
+				lastErr = fmt.Errorf("%w after %d rules: %w", errCycleInterrupted, ok+failed, cerr)
+			}
+			break
+		}
 		if err := e.syncRule(ctx, rule); err != nil {
 			slog.Error("sync rule failed", "rule", rule.Name, "error", err)
+			failed++
 			lastErr = err
+			continue
+		}
+		ok++
+	}
+	return ok, failed, lastErr
+}
+
+// RunKeyless syncs only the keyless rules — those naming no vault_key — and is
+// safe to call before the daemon holds a Vault token: syncRule skips the secret
+// read entirely for such a rule, so the whole pass renders from {{ username }}
+// and literals and touches Vault not at all. It reports how many rules were
+// processed without error and how many failed, so a caller can say what
+// happened without re-logging errors this already logged per rule. Both counts
+// under-report if ctx is cancelled mid-pass, which the pass logs itself rather
+// than returning — see the interruption branch below.
+//
+// It exists because those rules would otherwise be held hostage by
+// authentication they do not need. A daemon that idles waiting for a token —
+// headless with nothing to borrow yet, borrow-only with the forward not up, or
+// web mode with nobody at the browser — can idle indefinitely, and until now
+// the managed ssh_config that a user's `ssh` needs to reach the very host that
+// would hand it a token was not written until after the token arrived. The
+// files these rules manage are the ones most likely to be needed *to* complete
+// the login.
+//
+// Deliberately not recorded as a sync tick: dotvault.sync.ticks counts full
+// cycles across every rule, and mixing in a partial pre-auth pass would make
+// that rate mean two different things. The rules run again in the first full
+// cycle after authentication, where the state store's skip gate makes them a
+// no-op unless something really changed.
+func (e *Engine) RunKeyless(ctx context.Context) (ok, failed int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	keyless := func(rule config.Rule) bool { return rule.Keyless() }
+	var n int
+	for _, rule := range e.cfg.Rules {
+		if keyless(rule) {
+			n++
 		}
 	}
-	return lastErr
+	if n == 0 {
+		return 0, 0
+	}
+	// Logged here rather than left to the caller so the line lands before the
+	// work does: syncRule is synchronous file I/O, and if a rule stalls on an
+	// unresponsive home directory this is the only evidence of what it stalled
+	// on. Counting first costs one extra pass over a rule list that is already
+	// in memory.
+	slog.Info("syncing keyless rules (no vault token required)", "rules", n)
+	ok, failed, err := e.runRulesLocked(ctx, keyless)
+	if errors.Is(err, errCycleInterrupted) {
+		// Say so rather than returning counts a caller would read as a
+		// finished pass. The counts alone cannot carry it — an interrupted
+		// pass under-reports both, so failed == 0 looks like a clean sweep and
+		// the daemon's "some rules could not be synced" warning, which keys on
+		// failed, stays silent. That is the same conflation RunOnce's
+		// "cancelled" outcome exists to prevent, arriving on this path.
+		// Reported here rather than returned because the only caller is
+		// shutting down when it happens and has nothing left to decide.
+		slog.Info("keyless sync pass stopped before every rule ran", "synced", ok, "failed", failed, "of", n, "reason", err)
+	}
+	return ok, failed
 }
 
 // RunLoopOption tunes RunLoop's behaviour without exposing the
@@ -170,7 +317,11 @@ func (e *Engine) RunLoop(ctx context.Context, opts ...RunLoopOption) error {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	if err := e.RunOnce(ctx); err != nil {
+	// Gated on ctx too: a cancelled initial sync now returns an error (see
+	// runRulesLocked), and "continuing into the loop" is false on the one path
+	// that is about to return instead. Per-rule failures are already logged
+	// individually, so nothing is lost by staying quiet here on shutdown.
+	if err := e.RunOnce(ctx); err != nil && ctx.Err() == nil {
 		slog.Warn("initial sync had errors (continuing into the loop)", "error", err)
 	}
 	// Don't fire the readiness hook if ctx has been cancelled
@@ -226,6 +377,12 @@ func (e *Engine) runLoopAfterInitial(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Deliberately nil, not ctx.Err(): this value becomes the daemon's
+			// exit status (cmd/dotvault's loopErrCh), and a normal SIGTERM stop
+			// reported as an error makes systemd record a clean shutdown as a
+			// failure — the same reasoning waitForHeadlessToken states for its
+			// own return. Cancellation is error-bearing *inside* a cycle now
+			// (see runRulesLocked), so resist "propagating" it here to match.
 			return nil
 
 		case <-ticker.C:
@@ -363,7 +520,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// in either case, because it is a template function, not a context field.
 	secretData := map[string]any{}
 	secretVersion := 0
-	if rule.VaultKey != "" {
+	if !rule.Keyless() {
 		secretPath := e.cfg.Vault.UserPrefix + e.username + "/" + rule.VaultKey
 		secret, err := e.vault.ReadKVv2(ctx, e.cfg.Vault.KVMount, secretPath)
 		if err != nil {
@@ -392,7 +549,7 @@ func (e *Engine) syncRule(ctx context.Context, rule config.Rule) error {
 	// which cannot match the non-empty computed hash, forcing the first sync).
 	currentState := e.state.Get(rule.Name)
 	ruleHash := ruleRenderHash(rule)
-	versionUnchanged := rule.VaultKey == "" || (secretVersion == currentState.VaultVersion && currentState.VaultVersion > 0)
+	versionUnchanged := rule.Keyless() || (secretVersion == currentState.VaultVersion && currentState.VaultVersion > 0)
 	if versionUnchanged && currentState.RuleHash == ruleHash {
 		currentChecksum, _ := FileChecksum(targetPath)
 		if currentChecksum == currentState.FileChecksum {

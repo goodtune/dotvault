@@ -10,12 +10,21 @@ import (
 
 // agentConfigFixture is a representative AgentConfig exercising both source
 // kinds, an empty transport path (Unix) alongside a set one (Windows pipe), a
-// templated principal list, and the ttl / ephemeral_key fields.
+// templated principal list, the ttl / ephemeral_key fields, and the relay's
+// own settings — an explicit tri-state plus a templated socket and a pipe, so
+// the round-trip covers the fields that replaced the retired `source: agent`
+// entry.
 func agentConfigFixture() config.AgentConfig {
+	relay := true
 	return config.AgentConfig{
 		Enabled: true,
 		Unix:    config.AgentUnixConfig{Path: ""},
 		Windows: config.AgentWindowsConfig{Pipe: `\\.\pipe\dotvault-agent`},
+		Relay: config.AgentRelayConfig{
+			Enabled: &relay,
+			Socket:  "/run/user/{{.uid}}/ssh-agent.socket",
+			Pipe:    `\\.\pipe\openssh-ssh-agent`,
+		},
 		Keys: []config.AgentKeySource{
 			{Source: "kv", PathPrefix: "ssh/"},
 			{
@@ -27,6 +36,41 @@ func agentConfigFixture() config.AgentConfig {
 				EphemeralKey: true,
 			},
 		},
+	}
+}
+
+// TestAgentRelayTriStateRoundTrip pins the property the *bool exists for: an
+// unset relay must come back unset, not pinned to whatever the exporter
+// observed. Emitting it unconditionally would turn "no preference" into an
+// explicit choice on every export/import cycle — the same trap WindowsPutty
+// already avoids.
+func TestAgentRelayTriStateRoundTrip(t *testing.T) {
+	on, off := true, false
+	for name, in := range map[string]*bool{"unset": nil, "true": &on, "false": &off} {
+		t.Run(name, func(t *testing.T) {
+			src := validBaseConfig()
+			src.Sync = config.SyncConfig{RawInterval: "15m"}
+			src.Agent = agentConfigFixture()
+			src.Agent.Relay.Enabled = in
+
+			text, err := GenerateText(src)
+			if err != nil {
+				t.Fatalf("GenerateText: %v", err)
+			}
+			out, err := Parse([]byte(text))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			got := out.Agent.Relay.Enabled
+			switch {
+			case in == nil && got != nil:
+				t.Errorf("relay.enabled unset became %v; an absent preference must stay absent", *got)
+			case in != nil && got == nil:
+				t.Errorf("relay.enabled %v was dropped", *in)
+			case in != nil && got != nil && *in != *got:
+				t.Errorf("relay.enabled = %v, want %v", *got, *in)
+			}
+		})
 	}
 }
 
@@ -200,4 +244,38 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[pos:])
+}
+
+// TestAgentRelayKeyIsPreDeleted pins the idempotency half of the tri-state.
+// Emitting `Enabled` only when the operator expressed a preference is what
+// keeps an unset relay from coming back pinned — but on its own it leaves the
+// opposite hole: an operator who had `relay.enabled: false` and removed it
+// would re-import a document that never mentions the value, so the old
+// `Enabled=0` would survive in the registry and the relay would stay off while
+// the config no longer asks for it. The pre-deletion is what closes that, so
+// it is asserted rather than left to the reader of the emitter.
+func TestAgentRelayKeyIsPreDeleted(t *testing.T) {
+	off := false
+	for name, enabled := range map[string]*bool{"unset": nil, "explicit false": &off} {
+		t.Run(name, func(t *testing.T) {
+			src := validBaseConfig()
+			src.Sync = config.SyncConfig{RawInterval: "15m"}
+			src.Agent = agentConfigFixture()
+			src.Agent.Relay.Enabled = enabled
+
+			text, err := GenerateText(src)
+			if err != nil {
+				t.Fatalf("GenerateText: %v", err)
+			}
+			del := "[-" + rootKey + `\Agent\Relay]`
+			if !strings.Contains(text, del) {
+				t.Errorf("no %q stanza; a dropped relay.enabled preference would survive re-import", del)
+			}
+			// The deletion must precede the re-creation, or it would wipe the
+			// values just written.
+			if strings.Index(text, del) > strings.Index(text, "["+rootKey+`\Agent\Relay]`) {
+				t.Error("the deletion stanza follows the key it is meant to clear")
+			}
+		})
+	}
 }

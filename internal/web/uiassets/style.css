@@ -777,3 +777,42 @@ body {
   margin: 8px 0;
   word-break: break-all;
 }
+
+/* Secret editing (web.editable_paths) happens in place: a pencil swaps one
+   row of the field table for this form, so the page never leaves the secret. */
+.field-row-editing > td { background: #fafbfc; }
+
+.field-edit-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.field-edit-row { display: flex; gap: 8px; align-items: flex-start; }
+.field-edit-actions { display: flex; gap: 8px; align-items: center; }
+
+.secret-field-name, .secret-field-value {
+  font-family: 'SF Mono', Monaco, monospace;
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  color: #222;
+  min-width: 0;
+}
+.secret-field-name { flex: 0 0 30%; }
+/* A textarea rather than an input, so a PEM private key survives the round
+   trip (see the secret-row-edit fragment). */
+.secret-field-value { flex: 1; resize: vertical; line-height: 1.5; overflow: auto; }
+.secret-field-name:focus, .secret-field-value:focus { outline: none; border-color: #3a86ff; }
+
+.field-remove { margin-left: auto; }
+
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  opacity: 0.6;
+}
+.icon-btn:hover { opacity: 1; }
+
+.secret-delete-card { margin-top: 24px; max-width: 480px; }
+.secret-delete-form { display: flex; flex-direction: column; gap: 6px; }

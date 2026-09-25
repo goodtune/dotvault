@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -123,6 +124,25 @@ func DefaultAgentSocket() string {
 		return filepath.Join(rt, "dotvault", "agent.sock")
 	}
 	return filepath.Join(CacheDir(), "agent.sock")
+}
+
+// UID returns the current user's numeric UID as a string (the account SID on
+// Windows), for substitution into agent-endpoint templates. On Unix it uses the
+// os.Getuid() syscall rather than os/user.Current(): the latter's pure-Go
+// (CGO-disabled — dotvault's build) implementation reads /etc/passwd and errors
+// when the running UID has no entry there, which is common in containers /
+// distroless images; that would blank a {{.uid}} template and yield a bad path
+// like "/run/user//ssh-agent.socket". The syscall always succeeds. Only Windows
+// (where os.Getuid returns -1) falls back to os/user for the SID.
+func UID() (string, error) {
+	if runtime.GOOS != "windows" {
+		return strconv.Itoa(os.Getuid()), nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("get current user: %w", err)
+	}
+	return u.Uid, nil
 }
 
 // DefaultAPISocket returns the per-user Unix domain socket path for the local
@@ -282,4 +302,59 @@ func mustHomeDir() string {
 		panic("cannot determine home directory: resolved to an empty path")
 	}
 	return home
+}
+
+// DefaultDockerSocket returns the per-user Unix domain socket path the Docker
+// volume plugin listens on when docker.socket is unset. It follows
+// DefaultAPISocket exactly — $XDG_RUNTIME_DIR/dotvault/docker.sock, falling
+// back to the cache dir when XDG_RUNTIME_DIR is empty.
+//
+// Deliberately NOT under the engine's own plugin directory. A rootless
+// dockerd scans /run/docker/plugins inside its own mount namespace (a private
+// copy-up of /run), which no process outside RootlessKit can populate, and a
+// rootful dockerd's /run/docker/plugins is root-owned, which a per-user daemon
+// cannot write. Both engines accept a .spec file naming an arbitrary socket
+// instead, so dotvault binds inside its own owner-only runtime directory and
+// the operator registers it with a one-line spec — see docs/guide/docker-volumes.md.
+func DefaultDockerSocket() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "docker.sock")
+	}
+	return filepath.Join(CacheDir(), "docker.sock")
+}
+
+// DefaultDockerSpecPath returns the plugin registration file a rootless Docker
+// engine reads to learn where DefaultDockerSocket is:
+// ~/.local/lib/docker/plugins/dotvault.spec, holding the single line
+// "unix://<socket>".
+//
+// ~/.local/lib rather than the ~/.config/docker/plugins the Docker
+// documentation names: moby's rootlessConfigPluginsPath has an inverted error
+// check in every release through v28, so the config-home location resolves to
+// /etc/docker/plugins in practice while the lib-home one works.
+//
+// The daemon never writes this file — see DefaultDockerSocket for why
+// registration is not its step. The Linux packages do, through the
+// user-tmpfiles drop-in in packaging/linux, whose `f` line must stay in step
+// with this path; cmd/dotvault/packaging_test.go pins the two together. The
+// drop-in hardcodes ~/.local/lib because tmpfiles has no specifier for
+// $XDG_LIB_HOME, which rootlessLibPluginsPath does honour — a user who sets it
+// writes the spec by hand, and so is not served by this default either.
+func DefaultDockerSpecPath() string {
+	return filepath.Join(mustHomeDir(), ".local", "lib", "docker", "plugins", "dotvault.spec")
+}
+
+// DefaultDockerVolumeDir returns the directory under which the Docker volume
+// plugin materialises each volume when docker.volume_dir is unset:
+// $XDG_RUNTIME_DIR/dotvault/volumes, falling back to the cache dir.
+//
+// The runtime dir is preferred for the same reason Docker keeps its own
+// secrets on a tmpfs: it is owner-only, typically memory-backed, and cleared
+// when the user's last session ends, so a rendered secret never outlives the
+// login that produced it.
+func DefaultDockerVolumeDir() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return filepath.Join(rt, "dotvault", "volumes")
+	}
+	return filepath.Join(CacheDir(), "volumes")
 }

@@ -133,9 +133,18 @@ func (s *vaultCASource) Identities(ctx context.Context) ([]Identity, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The comment names both the source (s.name, the stable log/status
+	// identifier) and the local OS user this daemon runs as — the same
+	// value renderPrincipals expands {{.vault_username}} to — so
+	// `ssh-add -l` output distinguishes whose certificate each listed
+	// identity is when comparing identities across more than one user's
+	// agent (e.g. a forwarded connection, or a shared host running
+	// multiple per-user daemons). s.name itself is left untouched: it is
+	// also what Backend and the status/log lines key on, and must stay
+	// stable regardless of who happens to be signed in.
 	return []Identity{{
 		PubKey:  cert,
-		Comment: s.name,
+		Comment: fmt.Sprintf("%s - by dotvault for %s", s.name, s.username),
 		Expiry:  certExpiry(cert),
 	}}, nil
 }

@@ -18,6 +18,12 @@ sync:
 web:
   enabled: true
   listen: "127.0.0.1:9000"
+  # Editable key spaces. Named subtrees of kv/users/<you>/ the web UI may
+  # create, edit and delete secrets in; everything else — the root of the key
+  # space included, so every enrolment credential — stays read-only. Set here
+  # so a dev run exercises the CRUD surface.
+  editable_paths:
+    - personal
 
 # Observability is opt-in. Uncomment and point at a local OTel
 # collector to exercise the exporters end-to-end. Each signal is
@@ -84,11 +90,45 @@ fuse:
   # default is 30s.
   cache_ttl: "5s"
 
-# SSH agent surface. Serves a read-only agent.ExtendedAgent over a Unix
-# domain socket (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the
-# live Vault token. Point SSH_AUTH_SOCK at the socket to use it.
+# Docker volume plugin. Serves the Docker volume plugin protocol on a per-user
+# Unix socket so a rootless Docker or Podman container can mount your secrets
+# (`docker volume create -d dotvault -o secrets=gh myvol`). Linux only; the
+# engine has to be told about the socket once via a spec file — `dotvault
+# status` prints the command.
+#
+# Pointed at dev-only paths for the same reason as the API socket and the
+# mountpoint above: a dev run must not fight an installed daemon for the
+# shared runtime-directory defaults.
+docker:
+  enabled: true
+  socket: "~/.cache/dotvault/docker-dev.sock"
+  volume_dir: "~/.cache/dotvault/volumes-dev"
+  # Short so the Community-edition refresh is observable during development;
+  # the shipped default is 1m. Against the Enterprise dev image, volumes
+  # refresh on events instead and this only governs the disconnected case.
+  cache_ttl: "10s"
+
+# SSH agent surface. Serves an agent.ExtendedAgent over a Unix domain socket
+# (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the live Vault
+# token. Point SSH_AUTH_SOCK at the socket to use it. dotvault's own
+# identities are read-only; because the SSH agent relay is on by default (below)
+# the mutating operations are proxied to the agents it shadows instead, so
+# `ssh-add` through this socket still works.
 agent:
   enabled: true
+  # The SSH agent relay: sit in front of the agents you already run
+  # (ssh-agent, gpg-agent, a keyring daemon, the Windows OpenSSH agent,
+  # Pageant). Their keys are served alongside the Vault-backed ones and
+  # `ssh-add` against dotvault lands in the agent underneath. dotvault
+  # forwards the protocol and stores nothing.
+  #
+  # On by default and always tried last, after every keys[] entry below, so
+  # dotvault's own identities are offered first. Set relay.enabled: false to
+  # turn it off — that is the only way to not have it. relay.socket (Unix) /
+  # relay.pipe (Windows) pin it to one endpoint instead of auto-detecting;
+  # both accept {{.username}}/{{.uid}}.
+  relay:
+    enabled: true
   unix:
     path: ""              # default: per-user runtime socket
   windows:

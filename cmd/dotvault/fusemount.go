@@ -45,10 +45,14 @@ func resolveFUSEMountpoint(cfg *config.Config) string {
 // failure is logged once and recorded in the service's status; see
 // vaultfs.Service.Run for why it is not retried.
 //
-// Called after the first successful Vault auth, like the SSH agent listener:
-// the mount answers reads by calling Vault, so mounting before there is a
-// token would publish a directory that returns errors to anything that looked
-// at it — including, on a desktop, whatever indexes the user's home directory.
+// Called after the first successful Vault auth. The mount answers reads by
+// calling Vault, so mounting before there is a token would publish a directory
+// that returns errors to anything that looked at it — including, on a desktop,
+// whatever indexes the user's home directory. The SSH agent listener no longer
+// waits this way, and the difference is the failure mode, not the principle: a
+// pre-auth agent answers "no identities" in microseconds, which a client
+// simply moves past, where a pre-auth mount answers an error per read with no
+// equivalent of "nothing here".
 func startFUSE(ctx context.Context, cfg *config.Config, vc *vault.Client, username string) *vaultfs.Service {
 	mountpoint := resolveFUSEMountpoint(cfg)
 	if mountpoint == "" {

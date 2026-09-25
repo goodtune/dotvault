@@ -98,7 +98,11 @@ func TestLifecycleManager_DeniedTokenStopsLookupSpam(t *testing.T) {
 	lm := NewLifecycleManager(vc, 20*time.Millisecond, false)
 	lm.SetTokenFilePath(tokenFile)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 15s, not 5s: this test's own budgets stack — up to 2s waiting for the
+	// re-auth signal, 3s for the lookup count to settle, then 2s for the
+	// replacement below. A 5s lifecycle context could expire mid-test and take
+	// the manager goroutine down before Reload() was ever serviced.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	errCh := lm.Start(ctx)
 
@@ -132,14 +136,15 @@ func TestLifecycleManager_DeniedTokenStopsLookupSpam(t *testing.T) {
 	}
 	lm.Reload()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for vc.Token() != "fresh-token" && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := vc.Token(); got != "fresh-token" {
-		t.Fatalf("client token = %q after a fresh token was written, want %q", got, "fresh-token")
-	}
-	if lm.NeedsReauth() {
+	// Both conditions, because the token is installed *before* the replacement
+	// completes: tryReload sets the unvalidated candidate on the client, and the
+	// Start loop clears the re-auth flag only after withTokenInFlux returns, so
+	// NeedsReauth stays true across the whole span. Waiting on the token alone
+	// releases inside it and reads a state the manager is contracted to be in.
+	if !waitFor(func() bool { return vc.Token() == "fresh-token" && !lm.NeedsReauth() }, 2*time.Second) {
+		if got := vc.Token(); got != "fresh-token" {
+			t.Fatalf("client token = %q after a fresh token was written, want %q", got, "fresh-token")
+		}
 		t.Error("NeedsReauth() = true after adopting a valid token")
 	}
 }

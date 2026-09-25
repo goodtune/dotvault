@@ -631,8 +631,14 @@ func TestUIEnrolCard_SpentAndPromptStates(t *testing.T) {
 // quotes, backslashes, and other JS-string metacharacters in a field or path
 // name can never appear raw inside a data-on:* / data-init attribute value.
 func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
-	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3)
-	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL} {
+	// Rendering a fragment needs the template set, which nothing else in this
+	// test builds — without it an isolated `go test -run` panics on a nil
+	// template rather than reporting anything useful.
+	if err := uiInitTemplates(); err != nil {
+		t.Fatal(err)
+	}
+	f := uiSecretFieldRefs(`we"ird'pa\th`, `fi'eld"na\me`, 3, 7)
+	for _, u := range []string{f.RevealURL, f.MaskURL, f.CopyURL, f.CopyBtnURL, f.EditURL, f.CancelURL} {
 		if strings.ContainsAny(u, `'"\`+"`") {
 			t.Errorf("fragment URL %q carries raw JS-string metacharacters", u)
 		}
@@ -650,6 +656,21 @@ func TestUIFragmentURLsAreQueryEncoded(t *testing.T) {
 	}
 	if !strings.Contains(frag, "fi%27eld%22na%5Cme") {
 		t.Errorf("expected percent-encoded field name in fragment: %s", frag)
+	}
+
+	// The pencil is the editor's own datastar attribute, and it interpolates
+	// the same hostile path and field name.
+	pencil, err := uiFragment("pencil-btn", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{`we"ird`, `fi'eld`, `na\me`} {
+		if strings.Contains(pencil, raw) {
+			t.Errorf("pencil carries unencoded value %q: %s", raw, pencil)
+		}
+	}
+	if !strings.Contains(pencil, "fi%27eld%22na%5Cme") {
+		t.Errorf("expected percent-encoded field name in the pencil: %s", pencil)
 	}
 }
 

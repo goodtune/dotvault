@@ -19,6 +19,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
@@ -205,6 +206,12 @@ type Server struct {
 	// peerStatus reports the peer socket pool for /api/v1/status's
 	// "peer_sockets" block. Nil when the daemon borrows from no peer.
 	peerStatus func() peer.Status
+
+	// dockerStatus reports the Docker volume plugin's state for
+	// /api/v1/status's "docker" block. Nil when the plugin is not served.
+	// Guarded by fuseMu alongside fuseStatus — both are post-construction
+	// wirings of the same shape; read through dockerStatusSnapshot.
+	dockerStatus func() dockervol.Status
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
@@ -480,6 +487,14 @@ func (s *Server) registerAPIRoutes() {
 	s.mux.HandleFunc("GET /api/v1/config/download", s.handleConfigDownload)
 	s.mux.HandleFunc("GET /api/v1/token", s.handleToken)
 	s.mux.HandleFunc("GET /api/v1/secrets/", s.handleSecrets)
+	// Secret CRUD for the subtrees web.editable_paths names. Ordinary CSRF
+	// protection, like the SSH routes below and for the same reason. With no
+	// editable subtrees configured every one of these refuses with 403, so
+	// registering them unconditionally widens nothing: the policy, not the
+	// route table, is what grants the capability.
+	s.mux.HandleFunc("POST /api/v1/secrets/", s.requireCSRF(s.handleSecretWrite))
+	s.mux.HandleFunc("PUT /api/v1/secrets/", s.requireCSRF(s.handleSecretWrite))
+	s.mux.HandleFunc("DELETE /api/v1/secrets/", s.requireCSRF(s.handleSecretDelete))
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
 	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
 	// rationale (bare-curl consumer over a forwarded socket; nothing
@@ -751,6 +766,22 @@ func (s *Server) SetFUSEStatus(status func() vaultfs.Status) {
 	s.fuseMu.Lock()
 	defer s.fuseMu.Unlock()
 	s.fuseStatus = status
+}
+
+// SetDockerStatus wires the volume plugin's status query in after
+// construction, for the same reason SetFUSEStatus exists.
+func (s *Server) SetDockerStatus(status func() dockervol.Status) {
+	s.fuseMu.Lock()
+	defer s.fuseMu.Unlock()
+	s.dockerStatus = status
+}
+
+// dockerStatusSnapshot returns the currently wired plugin status query, or
+// nil if none is configured.
+func (s *Server) dockerStatusSnapshot() func() dockervol.Status {
+	s.fuseMu.RLock()
+	defer s.fuseMu.RUnlock()
+	return s.dockerStatus
 }
 
 // fuseStatusSnapshot returns the currently wired filesystem status query, or

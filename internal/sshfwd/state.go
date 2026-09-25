@@ -35,6 +35,7 @@ const (
 	ClassRefused     ErrorClass = "connection-refused"
 	ClassHandshake   ErrorClass = "handshake"
 	ClassAuth        ErrorClass = "authentication"
+	ClassIdentity    ErrorClass = "identity"
 	ClassHostKey     ErrorClass = "host-key"
 	ClassBind        ErrorClass = "remote-socket-bind"
 	ClassSocketDir   ErrorClass = "remote-socket-dir"
@@ -78,6 +79,14 @@ func Classify(err error) ErrorClass {
 		return ClassRefused
 	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
 		return ClassUnreachable
+	case errors.Is(err, ErrIdentity):
+		// Checked ahead of ErrAuth so a credential source that could not be
+		// consulted is never reported as a credential the remote refused. The
+		// two want opposite responses: an unauthorised principal needs a human
+		// and so takes the AuthFailureFloor, where an identity source that
+		// erred is very often recovering already and should be retried on the
+		// ordinary backoff.
+		return ClassIdentity
 	case errors.Is(err, ErrAuth):
 		return ClassAuth
 	case errors.Is(err, ErrSocketDir):

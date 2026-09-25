@@ -132,22 +132,40 @@ sudo systemctl --global enable dotvault.service
 
 #### Socket activation (optional)
 
-The packages also ship two **socket units**, installed but not enabled: `dotvault-api.socket` (the [local API socket](../configuration/config-reference.md#api-section)) and `dotvault-agent.socket` (the [SSH agent](../guide/ssh-agent.md) socket). Without them the daemon binds its sockets itself, and each socket disappears whenever the daemon does — `systemctl --user restart dotvault.service` is a brief outage for anything borrowing a token or requesting a signature at that moment. With a socket unit enabled, **systemd binds the socket and holds the listening fd across daemon restarts**, so clients queue in the backlog and are served when the daemon returns; the socket also exists from `sockets.target` at session start, before the daemon has authenticated.
+The packages also ship three **socket units**, installed but not enabled: `dotvault-api.socket` (the [local API socket](../configuration/config-reference.md#api-section)), `dotvault-agent.socket` (the [SSH agent](../guide/ssh-agent.md) socket) and `dotvault-docker.socket` (the [Docker volume plugin](../guide/docker-volumes.md) socket). Without them the daemon binds its sockets itself, and each socket disappears whenever the daemon does — `systemctl --user restart dotvault.service` is a brief outage for anything borrowing a token, requesting a signature, or starting a container at that moment. With a socket unit enabled, **systemd binds the socket and holds the listening fd across daemon restarts**, so clients queue in the backlog and are served when the daemon returns; the socket also exists from `sockets.target` at session start, before the daemon has authenticated.
 
 ```sh
 systemctl --user enable --now dotvault-api.socket
 systemctl --user enable --now dotvault-agent.socket   # optional, independent
+systemctl --user enable --now dotvault-docker.socket  # optional, independent
 ```
 
 Things to know:
 
-- **The config is still the master switch.** `api.enabled` / `agent.enabled` decide whether the surface exists; the socket unit only decides who binds it. If systemd passes a socket the daemon is not configured to serve, the daemon *drains* it — connections are accepted and closed immediately, so clients fail fast with EOF — and logs a warning naming the mismatch. (Merely closing the daemon's copy would refuse nobody: systemd retains its own listening fd, so clients would hang in a backlog no one accepts.) Enabling the socket unit is not a substitute for enabling the feature.
+- **The config is still the master switch.** `api.enabled` / `agent.enabled` / `docker.enabled` decide whether the surface exists; the socket unit only decides who binds it. If systemd passes a socket the daemon is not configured to serve, the daemon *drains* it — connections are accepted and closed immediately, so clients fail fast with EOF — and logs a warning naming the mismatch. (Merely closing the daemon's copy would refuse nobody: systemd retains its own listening fd, so clients would hang in a backlog no one accepts.) Enabling the socket unit is not a substitute for enabling the feature.
 - **This is fd-passing, not start-on-demand.** The service stays `WantedBy=default.target` and runs regardless of connections — it is syncing files and keeping a token alive. Enable both the `.socket` and the `.service`; enabling only one is a half-configured state.
+- **A queued connection is bounded by startup, not by authentication.** All three surfaces begin serving before the daemon has a Vault token: the API socket answers an honest `401`, the SSH agent answers "no identities" (and refuses a signature), and the volume plugin refuses a `Mount` that would need Vault with a message naming the cause, until one arrives. That distinction matters because the backlog has no timeout of its own — a daemon that can never obtain a token (no local token, no peer to borrow from) would otherwise leave every client blocked forever on a connection systemd had already accepted.
 - **Owner-only is verified, not assumed.** The units set `SocketMode=0600`, and the daemon independently checks the inherited socket's filesystem mode and **refuses** anything wider — `SocketMode` defaults to `0666`, so a hand-edited unit that drops the line fails loudly instead of silently exposing the token endpoint to every uid on the box.
-- **The socket unit's path wins.** Under activation the socket lives wherever `ListenStream=` says; if that differs from `api.unix.path` / `agent.unix.path`, the daemon logs the divergence and reports the activated path in `dotvault status`.
+- **The socket unit's path wins.** Under activation the socket lives wherever `ListenStream=` says; if that differs from `api.unix.path` / `agent.unix.path` / `docker.socket`, the daemon logs the divergence and reports the activated path in `dotvault status`. For the volume plugin the adopted path reaches `/api/v1/status` and the log, but `dotvault status` dials the *configured* `docker.socket` and prints its registration hint from it — so keep `docker.socket` and the unit's `ListenStream=` the same (they agree by default), and remember the `.spec` file that registers the plugin with the engine must name the unit's path.
+- **The volume plugin gains the least from it.** A container already holding a volume never notices a daemon restart — the materialised directory lives under `RuntimeDirectory=dotvault`, `RuntimeDirectoryPreserve=yes` keeps it across the restart, and the daemon resumes refreshing it. The socket unit only smooths the engine's own calls: a `docker run` or `docker volume create` landing mid-restart queues instead of the engine reporting the plugin unreachable.
 - **Owner-only covers the directory too.** Alongside the socket-node mode, the daemon verifies the parent directory is owner-only and owned by the same user (`DirectoryMode=0700` in the units) — a socket in a directory someone else can write to can be swapped for an impostor, which no node check catches.
 - Requires systemd ≥ 227 (`FileDescriptorName=` support). On older systemd the fds arrive unnamed, and the daemon drains them with a warning rather than serving them.
 - Not applicable on macOS (launchd has its own, incompatible mechanism) or Alpine/OpenRC; on those the daemon's self-bind path runs unchanged.
+
+#### Docker volume plugin registration (automatic, per user)
+
+The Linux packages also ship a **systemd user-tmpfiles drop-in** at `/usr/share/user-tmpfiles.d/dotvault-docker.conf`. When a user's manager runs `systemd-tmpfiles --user --create` at login, it creates `~/.local/lib/docker/plugins/dotvault.spec` containing `unix://$XDG_RUNTIME_DIR/dotvault/docker.sock`, which is what registers the [Docker volume plugin](../guide/docker-volumes.md) with that user's rootless Docker engine. Without it every user has to write that file by hand, and the path and contents are both per-user — the home directory and the uid — so a package cannot simply install the file.
+
+Note that this is `/usr/share/user-tmpfiles.d`, not `/usr/lib/tmpfiles.d`: the system tmpfiles directories are under `/usr/lib`, the *user* ones under `/usr/share`. Nothing else about the packaging changes — there is no `%post` scriptlet, and the drop-in is inert on Alpine, which runs OpenRC.
+
+Things to know:
+
+- **It runs from `systemd-tmpfiles-setup.service` in the user manager**, which — unlike the system unit of the same name — is not symlinked at install time and relies on the distro applying systemd's shipped preset (`90-systemd-user.preset` does `enable systemd-tmpfiles-setup.service`). Where a distro does not, it simply never runs and nothing says so. `systemctl --user is-enabled systemd-tmpfiles-setup.service` is the check; `systemd-tmpfiles --user --create` applies it without a re-login.
+- **An existing spec file is left entirely alone.** The drop-in uses tmpfiles' `f` type and `:`-prefixed modes, and both apply only when the item is created: the contents of an existing spec are never rewritten, and its permissions are never reset (a bare mode field is re-enforced on every run, so a spec a user had tightened to `0600` would come back `0644` at each login). A user who wrote their own spec for a customised `docker.socket` keeps it exactly as they left it.
+- **The path is correct under socket activation too.** `dotvault-docker.socket`'s `ListenStream=%t/dotvault/docker.sock` and the daemon's own default socket are the same path, so the registered spec is right whichever binds it. It is wrong only when an operator has customised one of them, which is the case the previous point covers.
+- **The spec is created regardless of `docker.enabled`.** For a user who has not enabled the plugin, `docker volume create -d dotvault` then fails with a connection error instead of `plugin not found`. There is no exposure — the socket is `0600` in a `0700` directory, and an unconfigured daemon binds nothing — only a less obvious error message.
+- **Opting out** uses tmpfiles' vendor-override convention: a same-named symlink to `/dev/null` in a directory of higher precedence. A user does `ln -s /dev/null ~/.config/user-tmpfiles.d/dotvault-docker.conf`; to opt a whole machine out, put the same symlink at `/usr/local/share/user-tmpfiles.d/dotvault-docker.conf`. The user search path, highest precedence first, is `~/.config/user-tmpfiles.d`, `$XDG_RUNTIME_DIR/user-tmpfiles.d`, `~/.local/share/user-tmpfiles.d`, `/usr/local/share/user-tmpfiles.d`, `/usr/share/user-tmpfiles.d` — note it does not include `/etc/user-tmpfiles.d`, which serves the system instance only. The installed basename is fixed for exactly this reason.
+- Podman and rootful Docker are unaffected: Podman is registered in `containers.conf` and rootful Docker in `/etc/docker/plugins`, neither of which dotvault writes. See the [Docker volumes guide](../guide/docker-volumes.md#registering-the-plugin).
 
 !!! tip "Enable lingering if the daemon must outlive a login session"
     A `--user` service normally stops when the user's last session ends, and `$XDG_RUNTIME_DIR` (where the SSH agent and [local API socket](../configuration/config-reference.md#api-section) live) is torn down with it. For a machine people reach over SSH — where a `tmux` job or the local API socket is expected to survive a disconnect — enable lingering so the user manager keeps running:
@@ -188,6 +206,20 @@ The unit hard-codes a couple of system paths that the package owns: `ExecStart=/
     `TimeoutStartSec=infinity` disables the pre-ready timeout entirely if your environment can't bound the first sync.
 
     Note also that anything declaring `After=dotvault.service` now blocks until the first sync completes — a behavioural change from the previous manually-created unit which had no `Type=notify` gate.
+
+#### Hardening and the FUSE mount
+
+Do not add systemd sandboxing to this unit, and check any `systemctl --user edit` drop-in for it. The packaged unit sets no `NoNewPrivileges=`, `RestrictNamespaces=`, `RestrictSUIDSGID=` or `LockPersonality=`, and that is deliberate: `NoNewPrivileges=` makes `execve` ignore the setuid bit and file capabilities for the daemon and every process below it, which disarms the FUSE mount helper and breaks [`fuse.enabled`](../guide/filesystem.md) outright. The daemon asks the kernel to mount directly first, but that needs `CAP_SYS_ADMIN`, which a user manager cannot grant, so the helper is the only path it has.
+
+The constraint covers the whole seccomp-based class, not those four names — `RestrictRealtime=`, `MemoryDenyWriteExecute=`, `SystemCallFilter=`, `ProtectClock=`, `ProtectKernelTunables=`, `PrivateDevices=` and friends all make systemd imply `NoNewPrivileges=yes` in a unit that cannot install the filter otherwise, which is every user-manager service. A drop-in adding any one of them re-breaks the mount, and does so with nothing in the log naming the cause.
+
+Little is given up by leaving them out. A per-user service already runs with the user's own authority — it can read `~/.ssh` and write `~/.bashrc` or `~/.config/systemd/user/` — so a compromised daemon that wants an unconfined process arranges to be run again outside the unit rather than escaping the sandbox. These directives were defence in depth against an exploit that cannot persist, not a boundary. `UMask=0077` is not seccomp-based, has no effect on the mount, and is kept.
+
+If you do not use `fuse.enabled`, the directives are harmless — but the packaged unit is shared, so re-add them only in a drop-in on hosts where you know the filesystem is off.
+
+<!-- TRANSITIONAL: added after v0.35.0 for the systemd sandbox-directive removal. Remove this admonition around v0.38.0 (≈3 minor releases) once upgrading installs are unlikely. -->
+!!! note "Upgrading from v0.35.0 or earlier"
+    Units shipped up to v0.35.0 carried those four directives, and `fuse.enabled` could not have worked under them. A package upgrade replaces the packaged unit, but it will **not** touch a copy you made at `~/.config/systemd/user/dotvault.service` or a drop-in you wrote — both shadow the packaged file. If the filesystem does not mount after upgrading, check those two places first, then `systemctl --user daemon-reload`.
 
 ### launchd (macOS)
 
@@ -299,12 +331,15 @@ Disabling the `logs` signal leaves the global LoggerProvider on the OTel no-op i
 
 The standard `OTEL_*` environment variables (generic `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS`, and the signal-specific `_METRICS_*` / `_LOGS_*` variants) are honoured by the SDK whenever the corresponding config field is empty, so endpoint and header configuration can live entirely outside the config file. Put credential-bearing values (`OTEL_EXPORTER_OTLP_HEADERS`) in the per-user `EnvironmentFile` (`~/.config/dotvault/env`, mode 0600) rather than a world-readable location — this is the recommended way to share a token across both signals without it appearing in any config artefact, and it is where the shared-field deprecation steers that use case.
 
+!!! warning "Upgraders: `dotvault.sync.ticks` gained a third `outcome` value"
+    A sync cycle interrupted part-way through — the ordinary shape of a daemon shutting down — used to be recorded as `outcome="ok"`, because the cycle reported no error. It now reports `outcome="cancelled"`. Two kinds of existing query change meaning: one written as `outcome="error"` is unaffected in what it counts but no longer sees the *whole* of "not a clean cycle", and one written as `outcome != "ok"` now counts every daemon restart as an anomaly. Prefer `outcome="error"` for alerting, which is the failure rate and excludes shutdowns by construction. Nothing else about the instrument changed, and no other metric is affected.
+
 The exporter emits a bounded set of instruments:
 
 | Metric                          | Type      | Attributes                                           |
 | ------------------------------- | --------- | ---------------------------------------------------- |
-| `dotvault.sync.ticks`           | counter   | `outcome={ok,error}`                                 |
-| `dotvault.sync.duration`        | histogram | `outcome`                                            |
+| `dotvault.sync.ticks`           | counter   | `outcome={ok,cancelled,error}` — `cancelled` is a cycle the daemon stopped part-way through (a shutdown, almost always), counted apart from both neighbours so it neither inflates the success rate with cycles that never ran every rule nor puts routine shutdowns in the failure rate. A cycle that failed a rule *and* was then cancelled counts as `error`: the failure is the actionable half |
+| `dotvault.sync.duration`        | histogram | `outcome={ok,cancelled,error}` — same vocabulary as the counter above |
 | `dotvault.vault.calls`          | counter   | `op={read,write,lookup_self,renew_self}`, `status`   |
 | `dotvault.token.renewals`       | counter   | `outcome={renewed,reauth_required,failed}`           |
 | `dotvault.token.ttl_remaining`  | histogram | (no attrs)                                           |
@@ -342,6 +377,7 @@ Both return JSON and are loopback-only, suitable for the OTel `httpcheckreceiver
 - **Atomic writes** — all file writes use temp file + rename to prevent partial writes.
 - **Web UI** — loopback only, CSRF-protected, strict Content Security Policy.
 - **Windows** — DACL-based permission checks via the Windows Security API.
+- **systemd sandboxing** — the packaged user unit deliberately carries none, because the seccomp-based directives disarm the FUSE mount helper; see [Hardening and the FUSE mount](#hardening-and-the-fuse-mount) for what that does and does not cost.
 
 ## Config reload
 

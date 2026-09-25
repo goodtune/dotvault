@@ -89,9 +89,16 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 	}
 
 	// Same exclusion as Manager.Authenticate: a file present under mtls+os is
-	// stale, and using it here would route around certLogin's removal.
-	token := resolveTokenForMethod(paths.VaultTokenPath(), auth.PersistTokenAtRest(cfg.Vault.AuthMethod))
-	if token == "" && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
+	// stale, and using it here would route around certLogin's removal. Under
+	// borrow_only that exclusion does not apply (see
+	// effectivePersistTokenAtRest) — auth_method is ignored entirely, so a
+	// leftover token file is an ordinary manual-override candidate.
+	token := resolveTokenForMethod(paths.VaultTokenPath(), effectivePersistTokenAtRest(cfg))
+	// Under borrow_only, auth_method (mtls+os included) is ignored — see
+	// config.VaultConfig.BorrowOnly and mtlsParams — so this host must never
+	// derive a token from its own certificate store; falling through to the
+	// plain "not authenticated" branch below is the correct outcome.
+	if token == "" && !cfg.Vault.BorrowOnly && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
 		// mtls+os keeps no token at rest, so an absent file is the normal state
 		// rather than "not authenticated". Deriving one from the certificate is
 		// the right answer here: it needs no human, so it does not violate this
@@ -122,7 +129,11 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 		token = vc.Token()
 	}
 	if token == "" {
-		fmt.Fprintln(os.Stderr, "dotvault: not authenticated; run `dotvault login` first")
+		if cfg.Vault.BorrowOnly {
+			fmt.Fprintln(os.Stderr, "dotvault: not authenticated; this host is borrow-only and has no token to enrol with (run the daemon so it can borrow one from its peer socket)")
+		} else {
+			fmt.Fprintln(os.Stderr, "dotvault: not authenticated; run `dotvault login` first")
+		}
 		os.Exit(1)
 	}
 	vc.SetToken(token)

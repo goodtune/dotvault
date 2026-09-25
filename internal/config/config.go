@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/handlers"
+	"github.com/goodtune/dotvault/internal/kvpath"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/perms"
 	"gopkg.in/yaml.v3"
@@ -116,6 +117,7 @@ type Config struct {
 	Agent         AgentConfig          `yaml:"agent,omitempty"`
 	API           APIConfig            `yaml:"api,omitempty"`
 	FUSE          FUSEConfig           `yaml:"fuse,omitempty"`
+	Docker        DockerConfig         `yaml:"docker,omitempty"`
 	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
@@ -468,8 +470,36 @@ type VaultConfig struct {
 	// applies DefaultPeerSocketPatterns; an explicit empty list disables
 	// peer sockets. Borrowing is best-effort and never fatal.
 	TokenSockets SocketList `yaml:"token_socket"`
+	// BorrowOnly, when true, forces this host to authenticate to Vault
+	// exclusively by borrowing a live token over TokenSocket — it never runs
+	// AuthMethod's own fresh-auth flow (no OIDC browser, no LDAP prompt, no
+	// certificate bootstrap, no web login form). The use case is a remote or
+	// headless host that must never carry its own Vault identity: the
+	// operator's desktop authenticates interactively and is the sole holder
+	// of a credential, and every other host reached from it (over the same
+	// SSH RemoteForward'd socket vault.token_socket already documents)
+	// receives that identity only by borrowing it, never by minting its own.
+	//
+	// AuthMethod (and vault.mtls, if set) is simply ignored in this mode —
+	// deliberately, so the same base config can be shared between the
+	// desktop and its remote hosts with only this flag differing, rather
+	// than requiring the remote hosts to carry a method they must never
+	// actually use. Reuse of an existing cached token (the token file or
+	// DOTVAULT_TOKEN) still applies first, exactly as in every other mode;
+	// this only gates what happens once that comes up empty. Validated to
+	// require a non-empty TokenSocket, since without one there would be
+	// nothing to borrow from and the host could never authenticate at all.
+	//
+	// The daemon idles — watching the token file and the socket, retrying
+	// the borrow — rather than failing when no token is available yet; a
+	// one-shot command (`dotvault login`, `dotvault sync`) instead returns
+	// an error naming the mode, since there is no fresh-auth flow for it to
+	// wait on. `dotvault login`'s "ignore the cache and force a fresh login"
+	// contract has no meaning under this mode and is refused outright.
+	BorrowOnly bool `yaml:"borrow_only"`
 	// MTLS configures the cert auth methods. It is consulted only when
 	// AuthMethod drives the cert-auth flow ("mtls", "mtls+tpm", "mtls+os").
+	// Ignored entirely when BorrowOnly is set.
 	MTLS MTLSConfig `yaml:"mtls"`
 }
 
@@ -570,23 +600,119 @@ type WebConfig struct {
 	Listen         string `yaml:"listen"`
 	LoginText      string `yaml:"login_text"`
 	SecretViewText string `yaml:"secret_view_text"`
+
+	// EditablePaths names the subtrees of the user's own key space the web
+	// UI may create, replace and delete secrets in. Empty (the default)
+	// means the UI stays read-only, exactly as it was before this existed.
+	//
+	// Each entry is a single folder relative to kv/{user_prefix}{username}/:
+	// "personal" makes personal/token editable and leaves a secret at exactly
+	// "personal" alone. The key space is one folder deep — the same shape
+	// validateEnrolmentKey enforces — so an entry names one segment and an
+	// editable secret is one segment below it; "personal/aws/dev" is not a
+	// path this grants, and "scratch/notes" is not an entry it accepts.
+	// The key-space root is never editable however this is set —
+	// admitting it would put every enrolment target and every sync rule's
+	// source one gesture away from being replaced, which is the blast radius
+	// the section exists to bound. The rule is kvpath.EditPolicy, shared with
+	// the handlers so a screen cannot offer an edit the request would refuse.
+	//
+	// It is deliberately NOT user-overridable via the per-user overlay: the
+	// overlay's test is whether a user turning the section on could reach
+	// anything their own Vault token could not, and while the answer here is
+	// no, "no" is not the only question — this grants *write* reach over
+	// credentials other tooling consumes, where the overlay's one precedent
+	// (fuse) grants a read-only view. See the per-user overlay notes in
+	// CLAUDE.md before reconsidering.
+	// No `omitempty`, matching vault.policies and ssh.certificate_authorities:
+	// internal/regfile's MarshalYAML contract is that an empty optional field
+	// is emitted explicitly so a re-import can clear a previously-set value,
+	// and this is a list whose *empty* state is a deliberate answer — it is
+	// how a policy revokes editing a base config granted.
+	EditablePaths []string `yaml:"editable_paths"`
 }
 
 // AgentConfig configures the SSH agent surface. Disabled by default; when
 // enabled the daemon serves an agent.ExtendedAgent over a Unix domain socket
 // (Linux/macOS) or a named pipe (Windows), backed by the live Vault token.
 //
-// The inner fields deliberately omit `omitempty` for the same round-trip
-// reason as ObservabilityConfig: an exported config must re-emit cleared
-// optional values so a re-import can blank a previously-set path or pipe. The
-// top-level Agent field keeps `omitempty` so operators who don't use the agent
-// see no empty block in downloads.
+// The inner string fields deliberately omit `omitempty` for the same
+// round-trip reason as ObservabilityConfig: an exported config must re-emit
+// cleared optional values so a re-import can blank a previously-set path or
+// pipe. The *bool tri-states are the exception and do carry it — for them nil
+// and false are different answers, so an unset one must not be emitted at all.
+// Note this is now about the field inside its block, not the block: `relay`
+// and `windows` are structs and are always written, so what a missing
+// `omitempty` would produce is `relay.enabled: null` or `windows.putty: null`
+// — a preference nobody expressed, handed back by an export as though they
+// had. The top-level Agent field keeps `omitempty` so operators who don't use
+// the agent see no empty block in downloads.
 type AgentConfig struct {
 	Enabled bool               `yaml:"enabled"`
 	Unix    AgentUnixConfig    `yaml:"unix"`
 	Windows AgentWindowsConfig `yaml:"windows"`
-	Keys    []AgentKeySource   `yaml:"keys"`
+
+	// Relay configures the upstream-agent relay: the SSH agents this user
+	// already runs, which dotvault proxies to so their keys are served
+	// alongside its own Vault-backed ones and `ssh-add` lands in the agent
+	// underneath. It is **on by default** and is not a key source — the relay
+	// is always appended last, after every configured keys[] entry, so
+	// dotvault's own identities are offered first and the shadowed agents fill
+	// in behind them. A block rather than three sibling scalars because that
+	// is what it is: one subsystem with a switch and its settings, the same
+	// shape as Unix and Windows above.
+	Relay AgentRelayConfig `yaml:"relay"`
+
+	Keys []AgentKeySource `yaml:"keys"`
 }
+
+// AgentRelayConfig holds the upstream-agent relay's switch and its endpoint
+// override.
+type AgentRelayConfig struct {
+	// Enabled controls whether the relay runs. It is implicit rather than
+	// opt-in because "point every SSH client at dotvault once and leave it
+	// there" only holds if the keys the user already had keep working without
+	// them having to ask. An arrangement that silently drops half of someone's
+	// keys unless they found a config stanza is not one they can adopt
+	// wholesale, so the single supported way to not have it is to say so:
+	// relay.enabled: false.
+	//
+	// A *bool because the merge and registry layers must tell "unmentioned"
+	// from "explicitly false" — a plain bool would make every operator who
+	// never wrote the field look like they were turning the relay off. Read it
+	// through AgentConfig.RelayEnabled, never directly.
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// Socket (Unix) and Pipe (Windows) pin the relay to one named endpoint
+	// instead of auto-detecting. Empty — the recommended setting — re-scans
+	// the platform's well-known agent locations on every listing, so an agent
+	// started, restarted, or forwarded mid-session is picked up with no config
+	// change and no daemon restart.
+	//
+	// The override exists for the case detection cannot serve: an agent at a
+	// path dotvault does not know about. Both accept {{.username}} and
+	// {{.uid}}. Only the field matching the running platform is consulted, so
+	// one config can carry both for a mixed fleet.
+	//
+	// Naming an endpoint also skips the peer-ownership check auto-detection
+	// applies, deliberately: the operator chose this endpoint and may well mean
+	// an agent running as another account. On Unix that is a real trade — the
+	// pin buys a fixed path and gives up the kernel's answer about who is on
+	// the other end — so it is logged when it happens.
+	//
+	// It is NOT a security control, and on Windows specifically it is not the
+	// answer to a multi-user host. A pinned pipe name authenticates nothing:
+	// the namespace is first-creator-wins, so whoever created
+	// \\.\pipe\openssh-ssh-agent first owns it for the boot whether or not
+	// the config names it. Pinning narrows which endpoint is dialled, not who
+	// answers. Where that matters, the control is relay.enabled: false.
+	Socket string `yaml:"socket"`
+	Pipe   string `yaml:"pipe"`
+}
+
+// RelayEnabled reports whether the upstream-agent relay should run. Absent
+// means on: see AgentRelayConfig.Enabled for why the default is to relay.
+func (a AgentConfig) RelayEnabled() bool { return a.Relay.Enabled == nil || *a.Relay.Enabled }
 
 // APIConfig configures the local API socket: the daemon's web API served over
 // a per-user Unix domain socket in addition to (or instead of) the loopback
@@ -703,11 +829,16 @@ func (w AgentWindowsConfig) PuttyEnabled() bool {
 	return w.Putty == nil || *w.Putty
 }
 
-// AgentKeySource is one ordered origin of signing identities: either raw keys
-// discovered under a KV path prefix, or short-lived certificates minted by a
-// Vault SSH CA.
+// AgentKeySource is one ordered origin of Vault-backed signing identities:
+// raw keys discovered under a KV path prefix, or short-lived certificates
+// minted by a Vault SSH CA. Those two are the whole list — the upstream-agent
+// relay is not a key source and is configured by AgentRelayConfig instead.
 type AgentKeySource struct {
 	// Source selects the engine: "kv" or "vault-ca".
+	//
+	// The upstream-agent relay was once spelled here as source: "agent". It is
+	// no longer a key source at all — it is implicit, always last, and
+	// controlled by agent.relay.enabled. See AgentRelayConfig.
 	Source string `yaml:"source"`
 
 	// PathPrefix (kv) is resolved under kv/data/{user_prefix}{you}/; every
@@ -732,6 +863,16 @@ type Rule struct {
 	VaultKey    string       `yaml:"vault_key"`
 	OAuth       *OAuthConfig `yaml:"oauth"`
 	Target      Target       `yaml:"target"`
+}
+
+// Keyless reports whether the rule names no vault_key. Such a rule manages a
+// file with no Vault-backed content — it renders from {{ username }} and
+// literals with an empty data context — so it never reads a secret, and the
+// daemon can therefore sync it before it holds a Vault token at all. Every
+// consumer asks through this predicate rather than re-spelling the comparison,
+// so the definition of "keyless" lives with the type that owns it.
+func (r Rule) Keyless() bool {
+	return r.VaultKey == ""
 }
 
 // OAuthConfig holds optional OAuth2 settings for a rule.
@@ -954,8 +1095,15 @@ func IsMTLSMethod(method string) bool {
 }
 
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
-// unless auth_method drives the cert-auth flow (see IsMTLSMethod).
+// unless auth_method drives the cert-auth flow (see IsMTLSMethod), and is
+// skipped entirely under vault.borrow_only — that mode never runs any
+// fresh-auth flow, cert-issuing or otherwise, so the block's requirements
+// (cert_role, pki_role, ...) would only obstruct a config that shares its
+// AuthMethod with a non-borrow-only deployment of the same base config.
 func (c *Config) validateMTLS() error {
+	if c.Vault.BorrowOnly {
+		return nil
+	}
 	method := c.Vault.AuthMethod
 	if !IsMTLSMethod(method) {
 		return nil
@@ -1090,6 +1238,14 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	// vault.borrow_only forces every fresh-auth attempt onto the borrow
+	// path; without a socket to borrow from, this host could never obtain a
+	// token at all, so require one up front rather than trapping the
+	// operator in a daemon that idles forever with no way to succeed.
+	if c.Vault.BorrowOnly && len(c.peerSocketPatterns()) == 0 {
+		return fmt.Errorf("vault.borrow_only requires at least one vault.token_socket pattern (an explicit empty list leaves nothing to borrow a token from)")
+	}
+
 	if c.Vault.OIDCCallbackPort < 0 || c.Vault.OIDCCallbackPort > 65535 {
 		return fmt.Errorf("vault.oidc_callback_port %d: must be between 0 and 65535", c.Vault.OIDCCallbackPort)
 	}
@@ -1113,6 +1269,13 @@ func (c *Config) validate() error {
 		if err := paths.ValidateLoopback(c.Web.Listen); err != nil {
 			return fmt.Errorf("web.listen: %w", err)
 		}
+	}
+	// Checked whether or not the section is enabled, matching the
+	// api.unix.path / fuse.mountpoint convention: an operator staging a
+	// config before flipping `enabled` should learn about a bad path now,
+	// not on the restart that turns the surface on.
+	if err := validateEditablePaths(c.Web.EditablePaths); err != nil {
+		return err
 	}
 
 	// Observability validation. The block is optional — only validate
@@ -1200,8 +1363,14 @@ func (c *Config) validate() error {
 	// user opted in. Transport paths are left empty-able: the agent applies
 	// per-user defaults at construction (Unix runtime socket / DefaultAgentPipe).
 	if c.Agent.Enabled {
-		if len(c.Agent.Keys) == 0 {
-			return fmt.Errorf("agent.keys: at least one key source is required when the agent is enabled")
+		// keys[] may be empty: the relay is implicit and on by default, so
+		// "serve whatever agents I already run, and nothing of my own" is a
+		// complete configuration. It is only empty *and* relay-off that leaves
+		// the agent with nothing to serve, which is a mistake worth naming
+		// rather than starting a listener that can only ever answer "no
+		// identities".
+		if len(c.Agent.Keys) == 0 && !c.Agent.RelayEnabled() {
+			return fmt.Errorf("agent: with agent.relay.enabled false, at least one agent.keys[] source is required (otherwise the agent has nothing to serve)")
 		}
 		for i, k := range c.Agent.Keys {
 			switch k.Source {
@@ -1223,6 +1392,11 @@ func (c *Config) validate() error {
 						return fmt.Errorf("agent.keys[%d].ttl %q: must be positive", i, k.TTL)
 					}
 				}
+			case "agent":
+				// Named explicitly so an existing config gets told what
+				// happened rather than "invalid source": the relay stopped
+				// being a key source and became implicit.
+				return fmt.Errorf("agent.keys[%d]: source %q is no longer a key source — the upstream-agent relay is implicit and always last; remove this entry, and use agent.relay.enabled: false to turn it off or agent.relay.socket/agent.relay.pipe to pin an endpoint", i, k.Source)
 			case "":
 				return fmt.Errorf("agent.keys[%d]: source is required (kv or vault-ca)", i)
 			default:
@@ -1247,6 +1421,12 @@ func (c *Config) validate() error {
 	// Filesystem (FUSE) section. Validated unconditionally for the same
 	// reason as the API socket above.
 	if err := c.validateFUSE(); err != nil {
+		return err
+	}
+
+	// Docker volume plugin section. Validated unconditionally for the same
+	// reason as the two above.
+	if err := c.validateDocker(); err != nil {
 		return err
 	}
 
@@ -1304,7 +1484,7 @@ func validateRule(i int, r Rule, seen map[string]bool) error {
 	// content (e.g. an ssh_config built purely from {{ username }} and
 	// literals). Such a keyless rule renders with an empty data context, so it
 	// must carry a template — there is no secret data to fall back on.
-	if r.VaultKey == "" && r.Target.Template == "" {
+	if r.Keyless() && r.Target.Template == "" {
 		return fmt.Errorf("rules[%d] (%s): a rule without vault_key must supply target.template (no secret data to write otherwise)", i, r.Name)
 	}
 	if r.Target.Path == "" {
@@ -1383,6 +1563,51 @@ func validateEnrolmentKey(key string) error {
 		if seg == "." || seg == ".." {
 			return fmt.Errorf("key segment must not be %q (got %q)", seg, key)
 		}
+	}
+	return nil
+}
+
+// validateEditablePaths checks web.editable_paths and rewrites each entry in
+// canonical form, so everything downstream — the policy, the UI, the config
+// download — sees one spelling of a given subtree rather than whichever of
+// "personal", "personal/" or "/personal/" the operator happened to type.
+//
+// The path grammar is kvpath.CleanEditableRoot, which wraps the kvpath.Clean
+// the filesystem mount and the Docker volume plugin apply, rather than a
+// second implementation here. It adds the two rules this section needs:
+//
+//   - An entry may not name the key-space root. "" and "/" would make every
+//     secret editable, which is precisely what the section exists to prevent,
+//     and silently ignoring such an entry would leave an operator believing
+//     they had granted something.
+//   - An entry is a single path segment, and carries no backslash. The user's
+//     key space is one folder deep — an enrolment key is flat ("gh") or
+//     grouped exactly once ("databricks/prod", see validateEnrolmentKey) — so
+//     "scratch/notes" names a secret, not a folder, and accepting it as a root
+//     would grant editing over a subtree that cannot exist. validateEnrolmentKey
+//     refuses a backslash for the same reason this does: it is not a separator
+//     in a Vault path, so it would silently become part of a folder's name.
+func validateEditablePaths(entries []string) error {
+	seen := make(map[string]int, len(entries))
+	for i, raw := range entries {
+		clean, err := kvpath.CleanEditableRoot(raw)
+		if err != nil {
+			switch {
+			case errors.Is(err, kvpath.ErrNotEditable):
+				return fmt.Errorf("web.editable_paths[%d] %q: names the key space root; give a folder in it, such as \"personal\"", i, raw)
+			case errors.Is(err, kvpath.ErrRootDepth):
+				return fmt.Errorf("web.editable_paths[%d] %q: %w; the key space is one folder deep, so an entry names a single folder such as \"personal\"", i, raw, err)
+			case errors.Is(err, kvpath.ErrRootSeparator):
+				return fmt.Errorf("web.editable_paths[%d] %q: %w; Vault paths are slash-separated, so a backslash would be part of the folder's name rather than a separator", i, raw, err)
+			default:
+				return fmt.Errorf("web.editable_paths[%d] %q: %w (a path segment may not be empty, \".\", \"..\", or contain NUL)", i, raw, err)
+			}
+		}
+		if first, dup := seen[clean]; dup {
+			return fmt.Errorf("web.editable_paths[%d] %q: duplicates entry %d", i, raw, first)
+		}
+		seen[clean] = i
+		entries[i] = clean
 	}
 	return nil
 }

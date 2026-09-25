@@ -1,7 +1,33 @@
 {{define "content"}}
-<div class="secret-heading"><h2>{{.Folder}}</h2></div>
-<div class="secret-meta">Folder</div>
-{{if .Entries}}<ul class="ui-folder-list">
-  {{range .Entries}}<li><a href="{{.Href}}"><span class="key-icon">{{.Icon}}</span>{{.Name}}</a></li>{{end}}
-</ul>{{else}}<div class="panel-empty">This folder is empty</div>{{end}}
+<div data-signals="{showNew: false}">
+  <div class="secret-heading">
+    <h2>{{.Folder}}</h2>
+    {{if .CanCreate}}<button class="enrol-btn-primary" data-on:click="$showNew = !$showNew">New secret</button>{{end}}
+  </div>
+  <div class="secret-meta">Folder</div>
+  {{if .CanCreate}}
+  {{/* The name dialog does not create anything: it turns a name into a URL.
+       The secret at that URL does not exist yet, and that is what makes the
+       page it lands on a create form — there is no separate "new" route to
+       keep in step with the real one. */}}
+  <div class="enrol-card" data-show="$showNew" style="display: none">
+    <form class="ssh-add-form" method="post" action="/ui/secrets-edit/goto">
+      <input type="hidden" name="folder" value="{{.Folder}}">
+      {{/* The key space is one folder deep, so the name is a single segment.
+           Saying so here is what keeps a nested name from costing the user
+           their typing to a bare 403 from the handler. */}}
+      <label class="enrol-prompt-label" for="new-secret-name">Name, directly inside <code>{{.Folder}}/</code> &mdash; no <code>/</code></label>
+      <input id="new-secret-name" name="name" class="enrol-prompt-input" placeholder="my-secret"
+             autocomplete="off" spellcheck="false" required>
+      <div class="enrol-prompt-actions">
+        <button type="submit" class="enrol-btn-primary">Create</button>
+        <button type="button" class="enrol-btn-secondary" data-on:click="$showNew = false">Cancel</button>
+      </div>
+    </form>
+  </div>
+  {{end}}
+  {{if .Entries}}<ul class="ui-folder-list">
+    {{range .Entries}}<li><a href="{{.Href}}"><span class="key-icon">{{.Icon}}</span>{{.Name}}</a></li>{{end}}
+  </ul>{{else}}<div class="panel-empty">This folder is empty</div>{{end}}
+</div>
 {{end}}

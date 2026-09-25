@@ -35,6 +35,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/kvpath"
 )
 
 // ErrUnsupported is returned by Mount on platforms with no FUSE implementation
@@ -53,8 +55,10 @@ var ErrReadOnly = errors.New("vaultfs: filesystem is read-only")
 var ErrInvalidDocument = errors.New("vaultfs: not a JSON object with at least one field")
 
 // ErrInvalidName is returned for a path component a KV path cannot carry: an
-// empty name, "." or "..", or one containing a slash or NUL.
-var ErrInvalidName = errors.New("vaultfs: invalid name")
+// empty name, "." or "..", or one containing a slash or NUL. It is an alias
+// of the leaf package's sentinel rather than a second one, so an errors.Is
+// check written against either spelling matches a rejection from either.
+var ErrInvalidName = kvpath.ErrInvalidName
 
 // Secret is one KVv2 secret as the filesystem needs it: the data section plus
 // the version metadata that becomes the file's mtime.

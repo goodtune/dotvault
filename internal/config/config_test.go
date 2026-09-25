@@ -222,6 +222,75 @@ rules:
 	}
 }
 
+// TestValidateBorrowOnlyRequiresTokenSocket pins the load-bearing requirement
+// documented on VaultConfig.BorrowOnly: without a socket to borrow from, a
+// borrow-only host could never obtain a token at all, so this is refused at
+// config load rather than left to idle forever in the daemon. An absent
+// token_socket applies the default patterns and is fine; the only way to end
+// up with nothing to borrow from is the explicit empty list.
+func TestValidateBorrowOnlyRequiresTokenSocket(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  token_socket: []
+  borrow_only: true
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: text
+`
+	path := writeTemp(t, yaml)
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want an error naming the missing vault.token_socket")
+	} else if !strings.Contains(err.Error(), "token_socket") {
+		t.Errorf("Load() error = %v, want it to mention vault.token_socket", err)
+	}
+}
+
+// TestLoadBorrowOnlyIgnoresAuthMethod pins the other half of the contract: a
+// borrow-only config carries token_socket and may leave auth_method (and its
+// mtls block) as whatever a shared base config already has — including a
+// cert method that would otherwise require cert_role/pki_role — because
+// neither is ever consulted under this mode.
+func TestLoadBorrowOnlyIgnoresAuthMethod(t *testing.T) {
+	yaml := `
+vault:
+  address: "https://vault.example.com:8200"
+  auth_method: "mtls"
+  token_socket: "~/.ssh/dotvault.sock"
+  borrow_only: true
+
+sync:
+  interval: "5m"
+
+rules:
+  - name: gh
+    vault_key: "gh"
+    target:
+      path: "~/.config/gh/hosts.yml"
+      format: text
+`
+	path := writeTemp(t, yaml)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v (vault.mtls.cert_role should not be required under borrow_only)", err)
+	}
+	if !cfg.Vault.BorrowOnly {
+		t.Error("Vault.BorrowOnly = false, want true")
+	}
+	// The legacy scalar expands to the default pair (ExpandLegacyScalar), so a
+	// borrow-only host still finds its forward once the workstation renames it.
+	if got := cfg.Vault.TokenSockets; len(got) != 2 || got[0] != LegacyPeerSocket || got[1] != PerHostPeerSocketGlob {
+		t.Errorf("Vault.TokenSockets = %v, want [%s %s]", got, LegacyPeerSocket, PerHostPeerSocketGlob)
+	}
+}
+
 func TestLoadCustomUserPrefix(t *testing.T) {
 	yaml := `
 vault:

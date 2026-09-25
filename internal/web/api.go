@@ -20,6 +20,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{
 		"authenticated": authenticated,
 		"auth_method":   s.authMethod,
+		"borrow_only":   s.vaultCfg.BorrowOnly,
 		"time":          time.Now().Format(time.RFC3339),
 		"version":       s.version,
 		// Bootstrap state, served unauthenticated alongside auth_method
@@ -135,6 +136,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// to go.
 	if peerStatus := s.peerStatusSnapshot(); peerStatus != nil {
 		status["peer_sockets"] = peerStatus()
+	}
+
+	// Docker volume plugin state (socket, refresh policy, per-volume
+	// counts and last error). Unauthenticated like the blocks above: it
+	// names volumes and the KV paths they select — visible in any listing
+	// — never a secret's contents.
+	if dockerStatus := s.dockerStatusSnapshot(); dockerStatus != nil {
+		status["docker"] = dockerStatus()
 	}
 
 	writeJSON(w, status)

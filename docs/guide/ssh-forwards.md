@@ -15,6 +15,9 @@ Two, and both are hard requirements — a remote whose preconditions aren't met 
 - **A local API surface.** The forward's target is dotvault's own web API, so something has to be listening: `api.enabled` (the per-user API socket) or `web.enabled` (the loopback web listener). When both are configured the **API socket is preferred** — it is `0600` inside a `0700` directory, whereas the TCP listener `web.enabled` controls is reachable by every uid on the box.
 - **`agent.enabled`**, with at least one usable key source. The SSH identity used to authenticate to each remote is drawn from the same [agent backend](ssh-agent.md) that serves `ssh-add -l` — there is no separate credential to configure.
 
+!!! note "Managed forwards offer your relayed keys too"
+    Because the identity is the whole agent backend, and the [SSH agent relay](ssh-agent.md#the-ssh-agent-relay) is on by default, a managed forward offers the keys held by the agents you already run alongside dotvault's Vault-backed ones. The relay is always tried last, so a Vault-backed key is offered first and normally wins — but on a busy agent the extra identities can exhaust the remote `sshd`'s `MaxAuthTries` before the right one is reached, which surfaces as `authentication-error` and its long retry floor. If a remote authenticates by hand but not through a managed forward, that is the first thing to check; `agent.relay.enabled: false` is the lever, and it applies to the agent surface and managed forwards together — there is no way to relay for one and not the other.
+
 !!! warning "Windows: `web.enabled` is required"
     The per-user API socket (`api.enabled`) is Unix-only today. On Windows, `dotvault ssh` and the managed-forward subsystem need `web.enabled` — there is no local named-pipe equivalent of the API socket yet.
 
@@ -141,6 +144,8 @@ That probe cannot distinguish "nothing is listening" from "something is listenin
 ## Runtime state
 
 Each remote's live connection is one of: `connecting`, `connected`, `reconnecting`, `offline`, `authentication-error`, `host-key-error`, or `disabled` (the state when a precondition above isn't met, or the entry has `enabled: false`). `authentication-error` and `host-key-error` still retry automatically — a Vault-CA certificate can be reissued, a host key can be re-pinned by re-running `ssh add` — but from a much longer backoff floor than a plain network blip, since those conditions typically need a human to clear them.
+
+A remote whose credentials could not be *resolved* at all — the SSH agent's sources all erred, most often a `vault-ca` mint attempted while the daemon was replacing its own Vault token — reports `offline` with a last error beginning `ssh identity resolution failed`, rather than `authentication-error`. It is a deliberate distinction: the remote refusing a credential you presented usually needs a human, where a credential source that erred is frequently recovering already, so this case retries on the ordinary backoff instead of the long floor above. (Internally it carries its own `identity` failure class, which is what the `dotvault.ssh.connect_failure_total` metric is labelled with — worth knowing if you alert on that label.)
 
 `dotvault ssh list` and `GET /api/v1/status`'s `ssh` block both report this live state; `dotvault status` itself does not currently render it (use `ssh list` for that).
 

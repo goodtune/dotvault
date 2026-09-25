@@ -680,6 +680,7 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 			}
 			return nil
 		},
+		func() error { return applyBool(&cfg.Vault.BorrowOnly, vaultKey, "BorrowOnly") },
 		func() error {
 			v, ok, err := getMultiString(vaultKey, "Policies")
 			if err != nil {
@@ -740,6 +741,16 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		func() error { return apply(&cfg.Web.Listen, webKey, "Listen") },
 		func() error { return apply(&cfg.Web.LoginText, webKey, "LoginText") },
 		func() error { return apply(&cfg.Web.SecretViewText, webKey, "SecretViewText") },
+		func() error {
+			v, ok, err := getMultiString(webKey, "EditablePaths")
+			if err != nil {
+				return err
+			}
+			if ok {
+				cfg.Web.EditablePaths = v
+			}
+			return nil
+		},
 	} {
 		if err := fn(); err != nil {
 			return err
@@ -885,6 +896,21 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 
+	// Docker (the volume plugin).
+	dockerKey := rootKey + `\Docker`
+	if err := applyBool(&cfg.Docker.Enabled, dockerKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.Socket, dockerKey, "Socket"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.VolumeDir, dockerKey, "VolumeDir"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Docker.RawCacheTTL, dockerKey, "CacheTTL"); err != nil {
+		return err
+	}
+
 	// SSH (admin-owned host-CA trust material).
 	sshKey := rootKey + `\SSH`
 	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {
@@ -908,6 +934,17 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 	if err := applyBoolPtr(&cfg.Agent.Windows.Putty, agentKey, "WindowsPutty"); err != nil {
+		return err
+	}
+	// The relay block has its own subkey, matching the YAML nesting.
+	relayKey := agentKey + `\Relay`
+	if err := applyBoolPtr(&cfg.Agent.Relay.Enabled, relayKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Relay.Socket, relayKey, "Socket"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.Agent.Relay.Pipe, relayKey, "Pipe"); err != nil {
 		return err
 	}
 	// Agent key sources. Each is a subkey under Agent\Keys named after its

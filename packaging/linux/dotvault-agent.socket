@@ -9,10 +9,11 @@ Documentation=https://github.com/goodtune/dotvault
 #
 #   systemctl --user enable --now dotvault-agent.socket
 #
-# agent.enabled must still be set in the dotvault config. Note the daemon
-# starts serving the agent only after its first successful Vault
-# authentication — connections arriving earlier queue in the backlog, which
-# is the point.
+# agent.enabled must still be set in the dotvault config. The daemon starts
+# serving the agent early in startup, before it authenticates, so the queue
+# only ever holds connections for as long as startup itself takes; until a
+# Vault token arrives the agent answers "no identities" rather than leaving
+# clients blocked on a connection nobody reads.
 
 [Socket]
 # Must match FileDescriptorName exactly: the daemon claims inherited fds by

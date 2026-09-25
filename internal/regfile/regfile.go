@@ -51,6 +51,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeAgent(cfg.Agent)
 	e.writeAPI(cfg.API)
 	e.writeFUSE(cfg.FUSE)
+	e.writeDocker(cfg.Docker)
 	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -119,6 +120,7 @@ func (e *emitter) writeVault(v config.VaultConfig) {
 	if v.TokenSockets != nil {
 		e.writeMultiString("TokenSockets", v.TokenSockets)
 	}
+	e.writeBool("BorrowOnly", v.BorrowOnly)
 	// Emit Policies whenever non-nil so an explicit empty list round-trips as an
 	// empty REG_MULTI_SZ rather than being silently dropped, matching the OAuth
 	// Scopes / agent Principals treatment.
@@ -188,6 +190,14 @@ func (e *emitter) writeWeb(w config.WebConfig) {
 	// non-ASCII byte, so they round-trip the same way rule templates do.
 	e.writeString("LoginText", w.LoginText)
 	e.writeString("SecretViewText", w.SecretViewText)
+	// Emit whenever non-nil so an explicit empty list round-trips as an empty
+	// REG_MULTI_SZ rather than being dropped, matching the Vault Policies /
+	// OAuth Scopes / agent Principals treatment. Here that matters twice
+	// over: an empty list is how a policy revokes editing a base config
+	// granted, and a dropped value would silently restore it.
+	if w.EditablePaths != nil {
+		e.writeMultiString("EditablePaths", w.EditablePaths)
+	}
 	e.WriteString("\r\n")
 }
 
@@ -317,12 +327,19 @@ func (e *emitter) writeRemoteConfig(r config.RemoteConfig) {
 }
 
 // writeAgent emits the Agent section: the scalar Enabled / Unix / Windows
-// transport settings, plus an ordered Keys subtree. The keys list is
-// dynamically sized, so — like Rules and Enrolments — the Keys subtree is
-// deleted before re-creation so a key removed from YAML doesn't linger in the
-// registry on re-import. List order is preserved by naming each key subkey
-// after its zero-based index (`Keys\0`, `Keys\1`, …); the parser sorts those
-// names numerically to rebuild the slice.
+// transport settings, the Relay block, and an ordered Keys subtree.
+//
+// Two subtrees are deleted before re-creation, for the same reason reached by
+// different routes. Keys is dynamically sized, so — like Rules and Enrolments
+// — a key removed from YAML would otherwise linger in the registry on
+// re-import; list order is preserved by naming each key subkey after its
+// zero-based index (`Keys\0`, `Keys\1`, …), which the parser sorts
+// numerically to rebuild the slice. Relay is fixed-shape but holds a
+// tri-state: `Enabled` is written only when the operator expressed a
+// preference, so without the pre-deletion, dropping `relay.enabled: false`
+// from YAML would re-import a document that leaves the old `Enabled=0` in
+// place — the registry keeping the relay off while the config no longer says
+// so, which is exactly the divergence a lossless round trip must not produce.
 func (e *emitter) writeAgent(a config.AgentConfig) {
 	e.writeKey(rootKey + `\Agent`)
 	e.writeBool("Enabled", a.Enabled)
@@ -334,6 +351,22 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 	if a.Windows.Putty != nil {
 		e.writeBool("WindowsPutty", *a.Windows.Putty)
 	}
+	e.WriteString("\r\n")
+
+	// The relay block gets its own subkey, matching the YAML nesting.
+	// Pre-deleted so a dropped `relay.enabled` preference clears rather than
+	// surviving as a stale DWORD; see the doc comment above.
+	e.writeKeyDeletion(rootKey + `\Agent\Relay`)
+	e.writeKey(rootKey + `\Agent\Relay`)
+	// Enabled is tri-state (default true) for the same reason as WindowsPutty:
+	// emitting it unconditionally would pin an unset field to whatever the
+	// export happened to observe, so an operator who never expressed a
+	// preference would come back from a round-trip having expressed one.
+	if a.Relay.Enabled != nil {
+		e.writeBool("Enabled", *a.Relay.Enabled)
+	}
+	e.writeString("Socket", a.Relay.Socket)
+	e.writeString("Pipe", a.Relay.Pipe)
 	e.WriteString("\r\n")
 
 	// Always pre-delete the Keys subtree so removals round-trip. This is a
@@ -350,9 +383,12 @@ func (e *emitter) writeAgent(a config.AgentConfig) {
 }
 
 // writeAPI emits the API section (the local API socket). Flat scalars under
-// one key, matching the Agent section's transport treatment: the YAML nests
-// the path under `unix:` so a future `windows:` block has somewhere to go,
-// but the registry has no reason to mirror that nesting for a single value.
+// one key: the YAML nests the path under `unix:` so a future `windows:` block
+// has somewhere to go, but a lone value is not worth a subkey. The Agent
+// section's transports are flat for the same reason, while its Relay block
+// does get one — the dividing line is whether the YAML block groups several
+// related settings an administrator thinks of as one thing, not whether the
+// YAML happens to nest.
 func (e *emitter) writeAPI(a config.APIConfig) {
 	e.writeKey(rootKey + `\API`)
 	e.writeBool("Enabled", a.Enabled)
@@ -377,6 +413,18 @@ func (e *emitter) writeFUSE(f config.FUSEConfig) {
 	// unset rather than being frozen at whatever the default happened to be
 	// when the config was loaded.
 	e.writeString("CacheTTL", f.RawCacheTTL)
+	e.WriteString("\r\n")
+}
+
+// writeDocker emits the volume plugin section — flat scalars under one key,
+// like FUSE, and emitted on every platform for the same mixed-fleet reason.
+func (e *emitter) writeDocker(d config.DockerConfig) {
+	e.writeKey(rootKey + `\Docker`)
+	e.writeBool("Enabled", d.Enabled)
+	e.writeString("Socket", d.Socket)
+	e.writeString("VolumeDir", d.VolumeDir)
+	// The raw string, not the parsed duration — see writeFUSE.
+	e.writeString("CacheTTL", d.RawCacheTTL)
 	e.WriteString("\r\n")
 }
 

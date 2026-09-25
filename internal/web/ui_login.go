@@ -18,6 +18,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -95,7 +96,22 @@ func (s *Server) signalAuthDone() {
 // credential. Under certificate auth a browser login is *only* ever a
 // bootstrap, so a second login arriving after the bootstrap was consumed is
 // dropped rather than adopted (operationalAdoptionAllowed).
+//
+// Also refuses under borrow-only, as the chokepoint every adopting caller
+// funnels through — not a substitute for the guards each entry point
+// (handleAuthStart, handleAuthCallback, handleLoginLDAP) already carries,
+// which additionally stop those handlers from ever starting a flow or
+// completing a real Vault authentication in the first place (letting one
+// through only to discard the result here would still mint a live,
+// unrevoked Vault token nobody adopts), but a second, independent line: a
+// review found handleLoginLDAPProgress reaches this function with no guard
+// of its own, relying entirely on handleLoginLDAP never having created the
+// session it polls. Guarding here means every current and future caller
+// inherits the guarantee instead of having to remember it individually.
 func (s *Server) consumeLoginToken(ctx context.Context, raw string) (bootstrapped bool, err error) {
+	if s.vaultCfg.BorrowOnly {
+		return false, fmt.Errorf("borrow-only mode: this host authenticates only by borrowing a token from its peer socket")
+	}
 	if s.deliverBootstrapToken(raw) {
 		return true, nil
 	}
@@ -185,8 +201,21 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 // renderLogin draws the login card for the configured auth method, or — while
-// a certificate bootstrap is waiting — for the bootstrap credential method.
+// a certificate bootstrap is waiting — for the bootstrap credential method, or
+// — under borrow-only mode — a waiting card of its own: this host runs no
+// fresh-auth flow at all, so none of the credential cards below are ever
+// reachable, and showing one would invite a login attempt the daemon has no
+// way to honour.
 func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg string) {
+	if s.vaultCfg.BorrowOnly {
+		s.uiRenderStandalone(w, "login", uiLoginData{
+			uiStandaloneData: uiStandaloneData{Title: "Sign in", Error: errMsg, Refresh: loginPollSeconds},
+			Method:           "borrow",
+			CustomText:       template.HTML(s.loginTextHTML),
+		})
+		return
+	}
+
 	data := uiLoginData{
 		uiStandaloneData: uiStandaloneData{Title: "Sign in", Error: errMsg},
 		Method:           s.authMethod,
@@ -213,6 +242,10 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 // handleLoginLDAP starts an LDAP login and hands off to the progress page.
 func (s *Server) handleLoginLDAP(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	if s.vaultCfg.BorrowOnly {
+		writeError(w, "credential login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
 		return
 	}
 	if s.login == nil {
@@ -348,6 +381,12 @@ func (s *Server) handleLoginLDAPTOTP(w http.ResponseWriter, r *http.Request) {
 // handleLoginToken adopts a pasted Vault token after validating it.
 func (s *Server) handleLoginToken(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSameOrigin(w, r) {
+		return
+	}
+	// Mirrors the borrow-only guard in handleLoginLDAP: no card ever posts
+	// here under borrow-only mode, but this closes the direct-POST path.
+	if s.vaultCfg.BorrowOnly {
+		writeError(w, "token login is not available in borrow-only mode: this host authenticates only by borrowing a token from its peer socket", http.StatusForbidden)
 		return
 	}
 	// Under certificate auth the operational token comes from the cert login

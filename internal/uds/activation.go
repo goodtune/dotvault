@@ -17,8 +17,9 @@ import (
 // (activation_unix.go), and the retained-master claim model below.
 //
 // The daemon consumes this through ActivatedListener("api") /
-// ActivatedListener("agent"), matching the FileDescriptorName= set in the
-// packaged dotvault-api.socket / dotvault-agent.socket units. Activation is
+// ActivatedListener("agent") / ActivatedListener("docker"), matching the
+// FileDescriptorName= set in the packaged dotvault-api.socket /
+// dotvault-agent.socket / dotvault-docker.socket units. Activation is
 // strictly optional: with no LISTEN_FDS in the environment every call reports
 // "no activation" and the self-bind path in Listen runs exactly as before.
 // systemd holding the listening fd is what makes a daemon restart transparent

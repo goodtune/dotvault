@@ -736,7 +736,7 @@ func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 	// bootstrap token is transient and never operational, so it must not emit
 	// the "set vault.policies" transition notice that Login attaches to a real
 	// oidc/ldap login. The rest of Login is a no-op for a bootstrap anyway —
-	// boot has no TokenSocket (no peer borrow) and bootstrap_method is plain
+	// boot has no peer Borrower (no peer borrow) and bootstrap_method is plain
 	// oidc/ldap (never +tpm, so no TPM preflight), both validated at config
 	// load — so the only behavioural difference of bypassing Login is skipping
 	// the notice.

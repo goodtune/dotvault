@@ -4,13 +4,13 @@ go 1.26.0
 
 require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2
-	github.com/Microsoft/go-winio v0.6.2
+	github.com/Microsoft/go-winio v0.6.3
 	github.com/cli/oauth v1.2.2
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/gen2brain/beeep v0.11.2
 	github.com/google/certtostore v1.0.7
 	github.com/google/go-tpm v0.9.8
-	github.com/google/go-tpm-tools v0.4.9
+	github.com/google/go-tpm-tools v0.4.10
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
@@ -18,18 +18,18 @@ require (
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/spf13/cobra v1.10.2
 	github.com/starfederation/datastar-go v1.2.2
-	go.opentelemetry.io/otel v1.46.0
-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.22.0
-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.22.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.46.0
-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.46.0
-	go.opentelemetry.io/otel/log v0.22.0
-	go.opentelemetry.io/otel/metric v1.46.0
-	go.opentelemetry.io/otel/sdk v1.46.0
-	go.opentelemetry.io/otel/sdk/log v0.22.0
-	go.opentelemetry.io/otel/sdk/metric v1.46.0
+	go.opentelemetry.io/otel v1.47.0
+	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.23.0
+	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.23.0
+	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.47.0
+	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.47.0
+	go.opentelemetry.io/otel/log v1.47.0
+	go.opentelemetry.io/otel/metric v1.47.0
+	go.opentelemetry.io/otel/sdk v1.47.0
+	go.opentelemetry.io/otel/sdk/log v1.47.0
+	go.opentelemetry.io/otel/sdk/metric v1.47.0
 	golang.org/x/crypto v0.57.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.46.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/ini.v1 v1.67.3
@@ -39,7 +39,7 @@ require (
 
 require (
 	github.com/CAFxX/httpcompression v0.0.9 // indirect
-	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260522213940-e5c6d01a3007 // indirect
+	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260915221818-a6c0685fb9fc // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
@@ -55,8 +55,7 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/deck v1.1.0 // indirect
-	github.com/google/go-configfs-tsm v0.3.3-0.20240919001351-b4b5b84fdcbc // indirect
-	github.com/google/go-eventlog v0.0.3-0.20260416001248-6807b85eecf0 // indirect
+	github.com/google/go-configfs-tsm v0.3.3 // indirect
 	github.com/google/go-sev-guest v0.14.0 // indirect
 	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
 	github.com/google/logger v1.1.1 // indirect
@@ -85,15 +84,15 @@ require (
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel/trace v1.46.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
-	google.golang.org/grpc v1.83.1 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260928230214-8a89bd6388cc // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260928230214-8a89bd6388cc // indirect
+	google.golang.org/grpc v1.83.2 // indirect
 )
 
 tool github.com/josephspurrier/goversioninfo/cmd/goversioninfo

@@ -13,10 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/paths"
-	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -79,76 +77,13 @@ func runEnrol(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve username: %w", err)
 	}
 
-	vc, err := vault.NewClient(vault.Config{
-		Address:       cfg.Vault.Address,
-		CACert:        cfg.Vault.CACert,
-		TLSSkipVerify: cfg.Vault.TLSSkipVerify,
-	})
+	vc, err := cachedVaultClient(ctx, cfg, username)
 	if err != nil {
-		return fmt.Errorf("create vault client: %w", err)
-	}
-
-	// Same exclusion as Manager.Authenticate: a file present under mtls+os is
-	// stale, and using it here would route around certLogin's removal. Under
-	// borrow_only that exclusion does not apply (see
-	// effectivePersistTokenAtRest) — auth_method is ignored entirely, so a
-	// leftover token file is an ordinary manual-override candidate.
-	token := resolveTokenForMethod(paths.VaultTokenPath(), effectivePersistTokenAtRest(cfg))
-	// Under borrow_only, auth_method (mtls+os included) is ignored — see
-	// config.VaultConfig.BorrowOnly and mtlsParams — so this host must never
-	// derive a token from its own certificate store; falling through to the
-	// plain "not authenticated" branch below is the correct outcome.
-	if token == "" && !cfg.Vault.BorrowOnly && !auth.PersistTokenAtRest(cfg.Vault.AuthMethod) {
-		// mtls+os keeps no token at rest, so an absent file is the normal state
-		// rather than "not authenticated". Deriving one from the certificate is
-		// the right answer here: it needs no human, so it does not violate this
-		// command's rule against initiating a fresh *interactive* login, and
-		// refusing instead would tell the user to run `dotvault login` for a
-		// method where that is neither necessary nor meaningful.
-		mgr := &auth.Manager{
-			VaultClient: vc,
-			// Wired so certLogin can REMOVE a stale file, not so it can write
-			// one: this branch runs only when PersistTokenAtRest is false, so
-			// the write arm is unreachable here. Leaving it empty made
-			// RemoveTokenFile a no-op (an empty path means "do not persist"),
-			// so `dotvault enrol` on a host with a leftover plaintext token
-			// completed a successful mtls+os cert login and left that token
-			// sitting on disk — declining to *use* it, but not removing it.
-			TokenFilePath: paths.VaultTokenPath(),
-			AuthMethod:    cfg.Vault.AuthMethod,
-			AuthMount:     cfg.Vault.AuthMount,
-			AuthRole:      cfg.Vault.AuthRole,
-			Policy:        vaultPolicyConstraint(cfg),
-			Username:      username,
-			MTLS:          mtlsParams(cfg, username),
-		}
-		if err := mgr.CertLoginFromStore(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "dotvault: certificate login failed (%v); this host may need enrolling\n", err)
+		if errors.Is(err, errCachedAuth) {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		token = vc.Token()
-	}
-	if token == "" {
-		if cfg.Vault.BorrowOnly {
-			fmt.Fprintln(os.Stderr, "dotvault: not authenticated; this host is borrow-only and has no token to enrol with (run the daemon so it can borrow one from its peer socket)")
-		} else {
-			fmt.Fprintln(os.Stderr, "dotvault: not authenticated; run `dotvault login` first")
-		}
-		os.Exit(1)
-	}
-	vc.SetToken(token)
-	if _, err := vc.LookupSelf(ctx); err != nil {
-		// Distinguish "token genuinely rejected" (403, login helps)
-		// from "Vault unreachable / TLS / transient" (login won't
-		// help and pointing the user at it would mask the real
-		// operational problem). Mirrors runLoginCheck's behaviour
-		// for the same call.
-		if vault.IsForbidden(err) {
-			fmt.Fprintf(os.Stderr, "dotvault: cached vault token is invalid (%v); run `dotvault login` first\n", err)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "dotvault: vault unreachable (%v)\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	enrolIO := enrol.IO{

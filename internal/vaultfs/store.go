@@ -117,3 +117,19 @@ func (s *vaultStore) Write(ctx context.Context, relPath string, data map[string]
 func (s *vaultStore) Delete(ctx context.Context, relPath string) error {
 	return s.client.DeleteKVv2(ctx, s.mount, s.path(relPath))
 }
+
+// casClient is the client capability WriteCAS needs. Kept out of KVClient so
+// the filesystem's narrowed view of Vault does not grow an operation it never
+// uses; *vault.Client satisfies it.
+type casClient interface {
+	WriteKVv2CAS(ctx context.Context, mount, path string, data map[string]any, cas int) error
+}
+
+// WriteCAS implements CASWriter when the underlying client supports it.
+func (s *vaultStore) WriteCAS(ctx context.Context, relPath string, data map[string]any, cas int) error {
+	c, ok := s.client.(casClient)
+	if !ok {
+		return fmt.Errorf("vaultfs: client does not support check-and-set writes")
+	}
+	return c.WriteKVv2CAS(ctx, s.mount, s.path(relPath), data, cas)
+}

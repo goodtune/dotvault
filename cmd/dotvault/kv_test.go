@@ -16,18 +16,19 @@ import (
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
 // memKV is an in-memory kvBackend keyed by relative path.
 type memKV struct {
-	secrets map[string]*vault.Secret
+	secrets map[string]*vaultfs.Secret
 	// casRaces makes the next n WriteCAS calls lose, simulating a concurrent
 	// writer bumping the version between the read and the write.
 	casRaces int
 	writes   int
 }
 
-func newMemKV() *memKV { return &memKV{secrets: map[string]*vault.Secret{}} }
+func newMemKV() *memKV { return &memKV{secrets: map[string]*vaultfs.Secret{}} }
 
 func (m *memKV) put(rel string, data map[string]any) {
 	v := 1
@@ -38,7 +39,7 @@ func (m *memKV) put(rel string, data map[string]any) {
 	for k, val := range data {
 		cp[k] = val
 	}
-	m.secrets[rel] = &vault.Secret{Data: cp, Version: v}
+	m.secrets[rel] = &vaultfs.Secret{Data: cp, Version: v}
 }
 
 func (m *memKV) List(_ context.Context, rel string) ([]string, error) {
@@ -66,7 +67,7 @@ func (m *memKV) List(_ context.Context, rel string) ([]string, error) {
 	return out, nil
 }
 
-func (m *memKV) Read(_ context.Context, rel string) (*vault.Secret, error) {
+func (m *memKV) Read(_ context.Context, rel string) (*vaultfs.Secret, error) {
 	return m.secrets[rel], nil
 }
 
@@ -200,6 +201,9 @@ func TestKVGet(t *testing.T) {
 		{"ssh", "absent", "table"},
 		{"", "", "table"},
 		{"ssh", "", "yaml"},
+		{"ssh", "pub", "json"},
+		{"ssh/", "", "table"},
+		{`dir\ssh`, "", "table"},
 	} {
 		if err := kvGet(ctx, s, &out, tc.path, tc.field, tc.format, false); err == nil {
 			t.Errorf("get %+v: want error", tc)
@@ -220,8 +224,8 @@ func TestKVPutReplacesAndGuardsEnrolments(t *testing.T) {
 	if got := m.secrets["personal/api"].Data; len(got) != 1 || got["token"] != "b" {
 		t.Errorf("put should replace the whole secret, got %v", got)
 	}
-	if strings.Contains(log.String(), "b") && !strings.Contains(log.String(), "api") {
-		t.Errorf("unexpected log %q", log.String())
+	if !strings.Contains(log.String(), "1 field to personal/api") {
+		t.Errorf("unexpected confirmation %q", log.String())
 	}
 
 	if err := kvPut(ctx, s, &log, "gh", map[string]any{"oauth_token": "x"}, false, false); err == nil {
@@ -279,9 +283,13 @@ func TestKVPatch(t *testing.T) {
 		m.put("x", map[string]any{"a": "1"})
 		m.casRaces = kvCASAttempts
 		s := kvTestSession(m)
+		m.casRaces = kvCASAttempts + 1
 		err := kvPatch(ctx, s, &log, "x", map[string]any{"a": "2"}, nil, false, false)
 		if !errors.Is(err, vault.ErrCASMismatch) {
 			t.Errorf("err = %v, want ErrCASMismatch", err)
+		}
+		if m.casRaces != 1 {
+			t.Errorf("made %d CAS attempts, want %d", kvCASAttempts+1-m.casRaces, kvCASAttempts)
 		}
 	})
 
@@ -300,6 +308,7 @@ func TestKVPatch(t *testing.T) {
 			{"remove last field", "x", nil, []string{"a"}},
 			{"set and remove", "x", map[string]any{"a": "2"}, []string{"a"}},
 			{"enrolment path", "gh", map[string]any{"a": "1"}, nil},
+			{"duplicate remove", "x", map[string]any{"b": "1"}, []string{"a", "a"}},
 		}
 		for _, tc := range cases {
 			if err := kvPatch(ctx, s, &log, tc.path, tc.set, tc.remove, false, false); err == nil {
@@ -347,11 +356,12 @@ func TestParseKVData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := parseKVData([]string{"a=1", "b=x=y", "c=@" + keyFile, "d=-", "e="}, strings.NewReader("from stdin\n"))
+	got, err := parseKVData([]string{"a=1", "b=x=y", "c=@" + keyFile, "d=-", "e="}, strings.NewReader("from stdin\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]any{"a": "1", "b": "x=y", "c": "PEM\n", "d": "from stdin\n", "e": ""}
+	// @file is verbatim; stdin loses exactly one trailing newline.
+	want := map[string]any{"a": "1", "b": "x=y", "c": "PEM\n", "d": "from stdin", "e": ""}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("%s = %q, want %q", k, got[k], v)
@@ -424,7 +434,7 @@ func TestKVCommandWiring(t *testing.T) {
 	}
 }
 
-// TestVaultKVPaths pins how the adapter composes Vault paths: everything sits
+// TestVaultKVPaths pins how the store the kv commands drive composes Vault paths: everything sits
 // under the mount and the user's root, on the data/ or metadata/ endpoint
 // each operation needs.
 func TestVaultKVPaths(t *testing.T) {
@@ -454,7 +464,14 @@ func TestVaultKVPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	vc.SetToken("t")
-	k := &vaultKV{vc: vc, mount: "kv", root: "users/alice/"}
+	store, err := vaultfs.NewStore(vc, "kv", "users/", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, ok := store.(kvBackend)
+	if !ok {
+		t.Fatal("vault store does not satisfy kvBackend (no WriteCAS)")
+	}
 	ctx := context.Background()
 
 	if _, err := k.List(ctx, ""); err != nil {
@@ -487,5 +504,110 @@ func TestVaultKVPaths(t *testing.T) {
 	}
 	if strings.Join(seen, "\n") != strings.Join(want, "\n") {
 		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(seen, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestKVClipboard(t *testing.T) {
+	m := newMemKV()
+	m.put("single", map[string]any{"token": "tok-1\n"})
+	m.put("multi", map[string]any{"a": "1", "b": "2"})
+	m.put("bad", map[string]any{"v": "nul\x00byte"})
+	s := kvTestSession(m)
+	ctx := context.Background()
+
+	var got []string
+	orig := kvDeliverClipboard
+	kvDeliverClipboard = func(_ context.Context, cfg *config.Config, text string) error {
+		if cfg != s.cfg {
+			t.Error("delivery should use the session's config (it carries the peer sockets)")
+		}
+		got = append(got, text)
+		return nil
+	}
+	t.Cleanup(func() { kvDeliverClipboard = orig })
+
+	// A single-field secret needs no --field; one trailing newline is
+	// dropped, as `kv get --field … | dotvault clipboard` would.
+	if err := kvClipboard(ctx, s, "single", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := kvClipboard(ctx, s, "multi", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "|") != "tok-1|2" {
+		t.Errorf("delivered %q", got)
+	}
+
+	got = nil
+	err := kvClipboard(ctx, s, "multi", "")
+	if err == nil || !strings.Contains(err.Error(), "a, b") {
+		t.Errorf("ambiguous field: err = %v", err)
+	}
+	for _, tc := range []struct{ path, field string }{{"missing", ""}, {"multi", "zz"}, {"bad", ""}, {"", ""}} {
+		if err := kvClipboard(ctx, s, tc.path, tc.field); err == nil {
+			t.Errorf("%+v: want error", tc)
+		}
+	}
+	if len(got) != 0 {
+		t.Errorf("refused copies still delivered %q", got)
+	}
+}
+
+// TestDeliverClipboardFallsBackLocally pins the shared delivery path: with
+// no live peer, the text lands on the local clipboard.
+func TestDeliverClipboardFallsBackLocally(t *testing.T) {
+	var local string
+	orig := setLocalClipboard
+	setLocalClipboard = func(text string) error { local = text; return nil }
+	t.Cleanup(func() { setLocalClipboard = orig })
+
+	cfg := &config.Config{Vault: config.VaultConfig{TokenSockets: []string{filepath.Join(t.TempDir(), "absent.sock")}}}
+	if err := deliverClipboard(context.Background(), cfg, "v"); err != nil {
+		t.Fatal(err)
+	}
+	if local != "v" {
+		t.Errorf("local clipboard = %q", local)
+	}
+	local = ""
+	if err := deliverClipboard(context.Background(), nil, "w"); err != nil || local != "w" {
+		t.Errorf("nil config: local = %q, err = %v", local, err)
+	}
+}
+
+func TestKVTableOutputEscapesControls(t *testing.T) {
+	m := newMemKV()
+	m.put("x", map[string]any{"v": "a\x1b]52;c;ZXZpbA==\x07b"})
+	s := kvTestSession(m)
+	var out bytes.Buffer
+	m.put("pem", map[string]any{"k": "line1\nline2"})
+	if err := kvGet(context.Background(), s, &out, "x", "", "table", false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(out.String(), 0x1b) || !strings.Contains(out.String(), `\x1b`) {
+		t.Errorf("table output not escaped: %q", out.String())
+	}
+	out.Reset()
+	if err := kvGet(context.Background(), s, &out, "pem", "", "table", false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out.String(), "\n") != 3 || !strings.Contains(out.String(), `line1\nline2`) {
+		t.Errorf("multi-line value should stay on its row: %q", out.String())
+	}
+	out.Reset()
+	if err := kvGet(context.Background(), s, &out, "x", "v", "table", true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.ContainsRune(out.String(), 0x1b) {
+		t.Error("--field output must stay byte for byte")
+	}
+}
+
+func TestEditPolicyManagedMatchesGuard(t *testing.T) {
+	s := kvTestSession(newMemKV())
+	if err := guardManaged(s.cfg, "gh", false); err == nil {
+		t.Error("enrolment path not guarded")
+	}
+	if err := guardManaged(s.cfg, "gh/sub", false); err != nil {
+		t.Errorf("path below an enrolment is not itself managed: %v", err)
 	}
 }

@@ -128,6 +128,20 @@ func NewEditPolicy(roots []string, managed []string) EditPolicy {
 	return p
 }
 
+// Managed reports whether rel is a path dotvault itself writes — an
+// enrolment's target — independently of whether it is editable. It is the
+// question a writer outside the web UI (`dotvault kv`) asks before replacing
+// a secret an engine would overwrite, so the CLI and the UI share one
+// definition of "managed".
+func (p EditPolicy) Managed(rel string) bool {
+	clean, err := Clean(rel)
+	if err != nil {
+		return false
+	}
+	_, ok := p.managed[clean]
+	return ok
+}
+
 // Enabled reports whether any subtree is editable at all. A false answer is
 // what the UI keys its read-only presentation off, so the "no editing
 // configured" case renders exactly as it did before this feature existed.

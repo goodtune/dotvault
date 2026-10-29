@@ -141,6 +141,39 @@ With the [`docker` section](configuration/config-reference.md#docker-volumes-sec
 
 With the section *disabled*, status normally prints no Docker block at all — with one exception: if the packaged tmpfiles drop-in has registered a `.spec` file anyway (it runs at login and knows nothing about your config), status says so, because that is the state in which an engine reports a connection error rather than `plugin not found`.
 
+### `dotvault kv`
+
+Read and write the secrets in your own key space — a deliberately narrow counterpart of `vault kv`. There are no switches for the address, mount, or path prefix: those come from dotvault's configuration, and every path is relative to `{kv_mount}/{user_prefix}{username}/`, the same tree the sync engine reads, the web UI's secret browser shows, and the [filesystem mount](guide/filesystem.md) serves. `dotvault kv get gh` reads `kv/users/<you>/gh`; no argument can name a path outside your own subtree.
+
+```sh
+dotvault kv list [folder] [--format table|json]
+dotvault kv get <path> [--field <name>] [--format table|json]
+dotvault kv clipboard <path> [--field <name>]
+dotvault kv put <path> <key=value>... | -  [--force]
+dotvault kv patch <path> [key=value]... [--remove <name>]... [--force]
+dotvault kv delete <path> [--force]
+```
+
+- `list` (alias `ls`) prints the entries directly inside a folder (the root when omitted); folders carry a trailing `/`.
+- `get` prints a secret's fields as a table, with control characters (line breaks included) escaped so a multi-line value stays on its row and a stored value cannot drive your terminal. `--field` prints one value alone, byte for byte — a trailing newline is added only when stdout is a terminal, so `dotvault kv get --field private_key ssh > key` writes the key exactly. `--format json` prints the data as a JSON object, the same bytes the filesystem mount serves.
+- `clipboard` (aliases `clip`, `copy`) puts one field on the clipboard without printing it — shorthand for `dotvault kv get --field <name> <path> | dotvault clipboard`, delivered exactly as [`dotvault clipboard`](#dotvault-clipboard) delivers (every live peer workstation first, this host's clipboard otherwise), with one trailing newline dropped. `--field` may be omitted when the secret has a single field.
+- `put` writes a secret, creating it if absent. As with `vault kv put`, the fields given **replace** the secret's whole contents.
+- `patch` changes some fields of an existing secret and keeps the rest; `--remove` deletes a field. The write is a check-and-set against the version it read, so a concurrent change by another writer is never silently overwritten — the patch is re-applied to the newer version instead.
+- `delete` (alias `rm`) removes the secret and every version of it, as the web UI does.
+
+Values are `key=value`; `key=@file` reads a file verbatim (use it for a key or certificate whose final newline matters), and `key=-` reads stdin with one trailing newline dropped — the artefact of `echo` and of PowerShell's pipeline. A lone `-` instead of pairs reads a whole JSON object from stdin, so `get --format json` output can be edited and written back; it is also the way to store a value that itself begins with `@` or is exactly `-`. Prefer a file or stdin for anything sensitive — a value on the command line is visible in the process listing and your shell history:
+
+```sh
+echo "$TOKEN" | dotvault kv patch personal/api token=-
+dotvault kv put ssh/deploy private_key=@id_ed25519 public_key=@id_ed25519.pub
+```
+
+Paths use `/` between folders on every platform; a backslash is refused, as is a trailing `/` on a secret path.
+
+`put`, `patch`, and `delete` refuse a path configured as an [enrolment](configuration/config-reference.md) unless `--force` is given: the enrolment engine owns that secret and would overwrite the change at its next refresh. (Deleting an enrolment's secret with `--force` is how to start that enrolment over.) The global `--dry-run` reports what a write would do without performing it.
+
+These commands need a valid cached token — `DOTVAULT_TOKEN`, the token file, or one borrowed from this host's daemon or a peer socket — and never start an interactive login; run `dotvault login` first if needed. Under `mtls+os` a token is derived from the host's certificate. The `web.editable_paths` setting does not apply here: it governs the web UI, whereas this command acts with your own token, exactly as `vault kv` would.
+
 ### `dotvault browse`
 
 Open a URL in a browser, preferring a browser on a workstation at the other end of a [`vault.token_socket`](configuration/config-reference.md#token_socket-dotvault-to-dotvault-token-sharing) peer socket.
@@ -320,4 +353,4 @@ dotvault run 2>/var/log/dotvault.log
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Error (config validation, auth failure, etc.) |
+| 1 | Error (config validation, auth failure, a `dotvault kv` path or field that does not exist, etc.) |

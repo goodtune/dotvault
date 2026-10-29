@@ -88,3 +88,12 @@ type Store interface {
 	// Delete removes the secret at relPath and all of its versions.
 	Delete(ctx context.Context, relPath string) error
 }
+
+// CASWriter is the optional check-and-set write a Store may offer: write data
+// only if the secret is still at version cas (0 meaning "only if absent"),
+// failing with vault.ErrCASMismatch otherwise. The mount does not need it —
+// its writes are the user's own shell — but a read-modify-write caller does,
+// or a concurrent writer's change is lost with nothing to show for it.
+type CASWriter interface {
+	WriteCAS(ctx context.Context, relPath string, data map[string]any, cas int) error
+}

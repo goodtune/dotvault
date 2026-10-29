@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/goodtune/dotvault/internal/clipboard"
+	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/peer"
 )
 
@@ -74,25 +75,35 @@ func runClipboard(cmd *cobra.Command, args []string) error {
 	// Config is only needed to locate the peer socket. Local-only load, same
 	// rationale as `dotvault browse`: a load failure downgrades to the local
 	// clipboard rather than failing.
-	var pool *peer.Pool
-	if cfg, _, err := loadConfigLocalOnly(); err != nil {
+	cfg, _, err := loadConfigLocalOnly()
+	if err != nil {
 		slog.Warn("could not load config; using the local clipboard", "error", err)
-	} else {
-		pool = newPeerPool(cfg.PeerActionSockets())
+		cfg = nil
 	}
+	return deliverClipboard(cmd.Context(), cfg, text)
+}
 
-	if pool != nil {
-		err := postClipboardToPeers(cmd.Context(), pool, text)
-		if err == nil {
-			return nil
+// deliverClipboard puts already-validated text on the clipboard: broadcast to
+// every live peer in cfg's vault.token_socket pool, and only when none accepts
+// it, this host's own clipboard. A nil cfg skips straight to the local
+// clipboard. Shared by `dotvault clipboard` and `dotvault kv clipboard`, so
+// the two cannot disagree about where a value lands.
+func deliverClipboard(ctx context.Context, cfg *config.Config, text string) error {
+	if cfg != nil {
+		if pool := newPeerPool(cfg.PeerActionSockets()); pool != nil {
+			err := postClipboardToPeers(ctx, pool, text)
+			if err == nil {
+				return nil
+			}
+			// Scrub the text from the logged error: a peer's non-200 body is
+			// echoed into peer.StatusError.Message, so a hostile or buggy peer
+			// could otherwise reflect the secret into this host's logs. The
+			// broadcast joins every peer's failure, so one error may carry
+			// several such bodies — all the more reason to scrub rather than
+			// trust.
+			slog.Debug("peer clipboard unavailable; using the local clipboard",
+				"error", strings.ReplaceAll(err.Error(), text, "<text>"))
 		}
-		// Scrub the text from the logged error: a peer's non-200 body is
-		// echoed into peer.StatusError.Message, so a hostile or buggy peer
-		// could otherwise reflect the secret into this host's logs. The
-		// broadcast joins every peer's failure, so one error may carry several
-		// such bodies — all the more reason to scrub rather than trust.
-		slog.Debug("peer clipboard unavailable; using the local clipboard",
-			"error", strings.ReplaceAll(err.Error(), text, "<text>"))
 	}
 
 	if err := setLocalClipboard(text); err != nil {

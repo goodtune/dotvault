@@ -93,6 +93,32 @@ The engine writes these fields to the Vault KV secret:
 |-------|-------------|
 | `oauth_token` | The GitHub OAuth access token |
 | `user` | The authenticated GitHub username |
+| `refresh_token` | Only for an expiring token (see below): the token dotvault rotates with |
+| `issued_at` / `expires_at` | Only for an expiring token: RFC3339 timestamps of the current access token's lifetime |
+| `refresh_token_expires_at` | Only for an expiring token, when GitHub reports it: when the refresh token itself lapses |
+
+## Expiring tokens and automatic refresh
+
+Whether a GitHub token expires is decided by the OAuth client, not by dotvault. A classic OAuth app — including the GitHub CLI's, which is the default `client_id` — issues a token that never expires, and the secret holds just `oauth_token` and `user`, exactly as before. A **GitHub App** with user-to-server token expiration enabled (or an OAuth app opted in to expiring tokens) instead returns an access token valid for eight hours together with a refresh token valid for six months.
+
+When the device flow returns a refresh token and an expiry, dotvault stores `refresh_token`, `issued_at` and `expires_at` alongside the token, and the daemon's refresh manager rotates it the same way it rotates JFrog and Databricks credentials:
+
+1. Every check interval (five minutes), the secret is read and skipped unless the access token is past half its lifetime.
+2. dotvault posts `grant_type=refresh_token` to `{host}/login/oauth/access_token` with the configured `client_id`. No client secret is sent or needed — device-flow tokens are refreshable by client ID alone.
+3. GitHub returns a new access token **and a new refresh token**; the old refresh token stops working immediately. The whole secret is replaced, and the sync engine re-renders `hosts.yml` (or whatever the rule writes) with the new `oauth_token`.
+4. If GitHub rejects the refresh token (`bad_refresh_token` — it expired, was revoked, or the `client_id` setting changed since enrolment), the secret is deleted from Vault so the enrolment flow prompts for a fresh login. Any other failure is treated as transient: the existing secret is kept and the refresh retried with backoff.
+
+To use it, register a GitHub App with **Expire user authorization tokens** and **Enable Device Flow** turned on, and point the enrolment at it:
+
+```yaml
+enrolments:
+  gh:
+    engine: github
+    settings:
+      client_id: "Iv23li..."   # the GitHub App's client ID
+```
+
+A GitHub App's user token carries the permissions granted to the App rather than OAuth scopes, so the `scopes` setting has no effect for one. Because dotvault owns the rotation, a sync rule should render only `oauth_token` — never the refresh token — so that `gh` or `git` never tries to refresh on its own and race the daemon. A secret enrolled before this feature, or by a client that issues non-expiring tokens, carries no `expires_at` and is never touched by the refresh manager.
 
 ## GitHub Enterprise Server
 

@@ -1,7 +1,18 @@
 package enrol
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
+
+	"github.com/cli/oauth/api"
+
+	"github.com/goodtune/dotvault/internal/config"
 )
 
 func TestGitHubEngine_Name(t *testing.T) {
@@ -46,5 +57,213 @@ func TestGitHubSettingsOverride(t *testing.T) {
 	customClientID := "custom-client-id"
 	if customClientID == githubDefaultClientID {
 		t.Error("test client ID matches default — override test would be vacuous")
+	}
+}
+
+func TestGitHubCredential(t *testing.T) {
+	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+
+	t.Run("non-expiring token keeps the legacy shape", func(t *testing.T) {
+		got := githubCredential(&api.AccessToken{Token: "gho_x"}, now)
+		if len(got) != 1 || got["oauth_token"] != "gho_x" {
+			t.Errorf("got %v", got)
+		}
+	})
+
+	t.Run("expiry without a refresh token is not rotatable", func(t *testing.T) {
+		got := githubCredential(&api.AccessToken{Token: "ghu_x", ExpiresIn: 8 * time.Hour}, now)
+		if _, ok := got["expires_at"]; ok {
+			t.Errorf("expires_at written without a refresh token: %v", got)
+		}
+	})
+
+	t.Run("expiring token gains the refresh fields", func(t *testing.T) {
+		got := githubCredential(&api.AccessToken{
+			Token:                 "ghu_x",
+			RefreshToken:          "ghr_y",
+			ExpiresIn:             8 * time.Hour,
+			RefreshTokenExpiresIn: 184 * 24 * time.Hour,
+		}, now)
+		want := map[string]string{
+			"oauth_token":              "ghu_x",
+			"refresh_token":            "ghr_y",
+			"issued_at":                "2026-11-01T10:00:00Z",
+			"expires_at":               "2026-11-01T18:00:00Z",
+			"refresh_token_expires_at": "2027-05-04T10:00:00Z",
+		}
+		if len(got) != len(want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s = %q, want %q", k, got[k], v)
+			}
+		}
+	})
+}
+
+// fakeGitHubTokenEndpoint serves /login/oauth/access_token the way github.com
+// does (form-encoded), recording the refresh grants it sees.
+func fakeGitHubTokenEndpoint(t *testing.T, respond func(w http.ResponseWriter, form url.Values)) (*httptest.Server, *int) {
+	t.Helper()
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/login/oauth/access_token" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		calls++
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+		respond(w, r.PostForm)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+func TestGitHubRefresh(t *testing.T) {
+	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	existing := map[string]string{
+		"oauth_token":   "ghu_old",
+		"refresh_token": "ghr_old",
+		"issued_at":     "2026-11-01T02:00:00Z",
+		"expires_at":    "2026-11-01T10:00:00Z",
+		"user":          "octocat",
+	}
+	ctx := context.Background()
+
+	t.Run("rotates both tokens and keeps the user", func(t *testing.T) {
+		srv, calls := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, form url.Values) {
+			if form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "ghr_old" || form.Get("client_id") != "Iv1.custom" {
+				t.Errorf("unexpected grant %v", form)
+			}
+			if form.Get("client_secret") != "" {
+				t.Error("no client secret should be sent for a device-flow token")
+			}
+			fmt.Fprint(w, "access_token=ghu_new&refresh_token=ghr_new&expires_in=28800&refresh_token_expires_in=15897600&token_type=bearer")
+		})
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		got, err := e.Refresh(ctx, map[string]any{"host": srv.URL, "client_id": "Iv1.custom"}, existing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *calls != 1 {
+			t.Errorf("token endpoint calls = %d", *calls)
+		}
+		if got["oauth_token"] != "ghu_new" || got["refresh_token"] != "ghr_new" || got["user"] != "octocat" {
+			t.Errorf("got %v", got)
+		}
+		if got["issued_at"] != "2026-11-01T10:00:00Z" || got["expires_at"] != "2026-11-01T18:00:00Z" {
+			t.Errorf("timestamps: %v", got)
+		}
+	})
+
+	t.Run("a rejected refresh token means re-enrol", func(t *testing.T) {
+		srv, _ := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, _ url.Values) {
+			fmt.Fprint(w, "error=bad_refresh_token&error_description=The+refresh+token+passed+is+incorrect+or+expired.")
+		})
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		_, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, existing)
+		if !errors.Is(err, ErrRevoked) {
+			t.Errorf("err = %v, want ErrRevoked", err)
+		}
+	})
+
+	t.Run("a server fault is transient", func(t *testing.T) {
+		srv, _ := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, _ url.Values) {
+			w.WriteHeader(http.StatusBadGateway)
+		})
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		_, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, existing)
+		if err == nil || errors.Is(err, ErrRevoked) {
+			t.Errorf("err = %v, want a transient error", err)
+		}
+	})
+
+	t.Run("an expired refresh token skips the round trip", func(t *testing.T) {
+		srv, calls := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, _ url.Values) {
+			fmt.Fprint(w, "access_token=ghu_new")
+		})
+		stale := map[string]string{}
+		for k, v := range existing {
+			stale[k] = v
+		}
+		stale["refresh_token_expires_at"] = "2026-10-01T00:00:00Z"
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		_, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, stale)
+		if !errors.Is(err, ErrRevoked) || *calls != 0 {
+			t.Errorf("err = %v, calls = %d", err, *calls)
+		}
+	})
+
+	t.Run("no refresh token is an error, not a revocation", func(t *testing.T) {
+		e := &GitHubEngine{now: func() time.Time { return now }}
+		_, err := e.Refresh(ctx, nil, map[string]string{"oauth_token": "x", "expires_at": "2026-11-01T10:00:00Z"})
+		if err == nil || errors.Is(err, ErrRevoked) {
+			t.Errorf("err = %v", err)
+		}
+	})
+
+	t.Run("cancellation returns promptly", func(t *testing.T) {
+		block := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-block }))
+		t.Cleanup(func() { close(block); srv.Close() })
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		if _, err := e.Refresh(cctx, map[string]any{"host": srv.URL}, existing); !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v", err)
+		}
+	})
+}
+
+// TestRefreshManagerRotatesGitHub drives the real engine through the
+// RefreshManager: an expiring GitHub token past half-life is rotated in
+// Vault, and a classic non-expiring one is never sent to the token endpoint.
+func TestRefreshManagerRotatesGitHub(t *testing.T) {
+	issued := time.Date(2026, 11, 1, 2, 0, 0, 0, time.UTC)
+	now := issued.Add(5 * time.Hour) // past the 4h half-life of an 8h token
+
+	srv, calls := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, form url.Values) {
+		if form.Get("refresh_token") != "ghr_old" {
+			t.Errorf("refresh grant presented %q", form.Get("refresh_token"))
+		}
+		fmt.Fprint(w, "access_token=ghu_new&refresh_token=ghr_new&expires_in=28800")
+	})
+	RegisterEngine("github-test", &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }})
+	t.Cleanup(func() { UnregisterEngine("github-test") })
+
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	fv.seed("users/alice/gh", map[string]string{
+		"oauth_token":   "ghu_old",
+		"refresh_token": "ghr_old",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(8 * time.Hour).Format(time.RFC3339),
+		"user":          "alice",
+	})
+	fv.seed("users/alice/classic", map[string]string{"oauth_token": "gho_forever", "user": "alice"})
+
+	settings := map[string]any{"host": srv.URL}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"gh":      {Engine: "github-test", Settings: settings},
+		"classic": {Engine: "github-test", Settings: settings},
+	}, time.Hour, WithClock(&fixedClock{now: now}))
+	m.tick(context.Background())
+
+	if *calls != 1 {
+		t.Errorf("token endpoint calls = %d, want 1 (the classic token must not be refreshed)", *calls)
+	}
+	got := fv.secret("users/alice/gh")
+	if got["oauth_token"] != "ghu_new" || got["refresh_token"] != "ghr_new" || got["user"] != "alice" {
+		t.Errorf("rotated secret = %v", got)
+	}
+	if got["expires_at"] != now.Add(8*time.Hour).Format(time.RFC3339) {
+		t.Errorf("expires_at = %q", got["expires_at"])
+	}
+	if c := fv.secret("users/alice/classic"); c["oauth_token"] != "gho_forever" {
+		t.Errorf("classic secret changed: %v", c)
 	}
 }

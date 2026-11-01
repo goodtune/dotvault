@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -21,6 +23,10 @@ const (
 	// githubDefaultClientID is the GitHub CLI's public OAuth app client ID.
 	githubDefaultClientID = "178c6fc778ccc68e1d6a"
 	githubDefaultHost     = "https://github.com"
+	// githubDefaultTokenLifetime is GitHub's documented lifetime for an
+	// expiring user access token, used only when a refresh response omits
+	// expires_in for a credential already known to expire.
+	githubDefaultTokenLifetime = 8 * time.Hour
 )
 
 var githubDefaultScopes = []string{"repo", "read:org", "gist"}
@@ -29,13 +35,15 @@ var githubDefaultScopes = []string{"repo", "read:org", "gist"}
 //
 // Whether the credential expires is GitHub's decision, not dotvault's: a
 // classic OAuth app (the GitHub CLI's default client ID among them) issues a
-// token that never expires, while a GitHub App with user-token expiration —
-// or an OAuth app opted in to it — returns an 8-hour access token alongside a
-// refresh token. The engine records whatever came back. When the response
+// token that never expires, while a GitHub App with user-token expiration
+// returns an 8-hour access token alongside a refresh token. The engine records whatever came back. When the response
 // carried a refresh token and an expiry, the secret gains refresh_token,
 // issued_at and expires_at and the RefreshManager rotates it past half-life,
 // exactly as it does for JFrog and Databricks; when it did not, the secret is
-// what it always was, and the RefreshManager skips it (no expires_at).
+// what it always was, and the RefreshManager skips it (no expires_at). Note
+// the converse trap: switching client_id on an existing classic enrolment
+// changes nothing until the user re-runs `dotvault enrol`, since Fields()
+// already reports the old secret complete.
 type GitHubEngine struct {
 	// httpClient overrides the proxy-aware client built from settings.
 	// Tests only.
@@ -66,10 +74,12 @@ func (e *GitHubEngine) client(settings map[string]any) (*http.Client, error) {
 }
 
 // githubClientID returns the configured OAuth client ID, or the GitHub CLI's.
-// Refresh must present the same client ID the token was issued to, which is
-// why it is read from the same settings rather than stored in the secret: a
-// changed client_id makes the refresh token unusable, and the refusal that
-// follows (ErrRevoked → re-enrol) is the correct outcome.
+// Refresh must present the same client ID the token was issued to; it is read
+// from the same settings rather than stored in the secret, so a changed
+// client_id is noticed at the next refresh. Whether GitHub answers that with a
+// code cli/oauth maps to ErrRefreshTokenInvalid (wipe + re-enrol) or with
+// another error (transient, retried) is GitHub's call; re-running
+// `dotvault enrol` is the reliable way to switch clients.
 func githubClientID(settings map[string]any) string {
 	if v, ok := settings["client_id"].(string); ok && v != "" {
 		return v
@@ -186,7 +196,10 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 // refresh fields are written only for an expiring token that came with a
 // refresh token: an expiry without one cannot be rotated (writing expires_at
 // would only have the RefreshManager fail on it every half-life), and a
-// refresh token without an expiry has nothing to rotate ahead of.
+// refresh token without an expiry has nothing to rotate ahead of. Refresh
+// guarantees the expiry half for a credential already known to expire; the
+// refresh-token half it gets from oauth.Refresh, which carries the presented
+// token forward when the server does not rotate it.
 func githubCredential(tok *api.AccessToken, now time.Time) map[string]string {
 	out := map[string]string{"oauth_token": tok.Token}
 	if tok.RefreshToken == "" || tok.ExpiresIn <= 0 {
@@ -202,26 +215,26 @@ func githubCredential(tok *api.AccessToken, now time.Time) map[string]string {
 	return out
 }
 
-// Refresh exchanges the stored refresh token for a new token pair (GitHub
+// Refresh exchanges the stored refresh token for a new token pair. GitHub
 // rotates the refresh token on every use, so the old one is dead the moment
-// this succeeds — the same contract as JFrog). It is only ever called for a
+// this succeeds — the same contract as JFrog. It is only ever called for a
 // secret carrying expires_at, i.e. one githubCredential wrote from an
-// expiring token. No client secret is sent: tokens from the device flow are
-// refreshable by client ID alone.
+// expiring token. No client secret is sent: cli/oauth documents device-flow
+// tokens as refreshable by client ID alone.
 func (e *GitHubEngine) Refresh(ctx context.Context, settings map[string]any, existing map[string]string) (map[string]string, error) {
 	refresh := existing["refresh_token"]
 	if refresh == "" {
 		return nil, fmt.Errorf("github refresh requires a refresh_token in the existing secret")
 	}
-	// A refresh token past its own lifetime (six months on github.com) is
-	// refused by GitHub; skip the round trip and go straight to re-enrolment.
-	if v := existing["refresh_token_expires_at"]; v != "" {
-		if exp, err := time.Parse(time.RFC3339, v); err == nil && !e.clock().Before(exp) {
-			return nil, fmt.Errorf("github refresh token expired at %s: %w", v, ErrRevoked)
-		}
-	}
+	// refresh_token_expires_at is deliberately not pre-checked: an
+	// ErrRevoked wipes the secret, and that decision belongs to GitHub, not
+	// to a host clock that may be skewed.
 
-	host, err := oauth.NewGitHubHost(githubHostURL(settings))
+	hostURL := githubHostURL(settings)
+	if err := requireSecureTokenEndpoint(hostURL); err != nil {
+		return nil, err
+	}
+	host, err := oauth.NewGitHubHost(hostURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse github host: %w", err)
 	}
@@ -230,36 +243,35 @@ func (e *GitHubEngine) Refresh(ctx context.Context, settings map[string]any, exi
 		return nil, fmt.Errorf("configure http client: %w", err)
 	}
 
-	// oauth.Refresh takes no context; run it aside so a daemon shutdown is not
-	// held up by a slow token endpoint (the client's own timeout bounds the
-	// abandoned call).
-	type result struct {
-		token *api.AccessToken
-		err   error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		tok, err := oauth.Refresh(oauth.RefreshOptions{
-			Host:         host,
-			ClientID:     githubClientID(settings),
-			RefreshToken: refresh,
-			HTTPClient:   client,
-		})
-		ch <- result{tok, err}
-	}()
-
-	var tok *api.AccessToken
-	select {
-	case r := <-ch:
-		if r.err != nil {
-			if errors.Is(r.err, oauth.ErrRefreshTokenInvalid) {
-				return nil, fmt.Errorf("github refresh rejected: %w", ErrRevoked)
-			}
-			return nil, fmt.Errorf("github refresh: %w", r.err)
+	// oauth.Refresh takes no context, so the request is bound to ctx through
+	// the client it is handed. Cancelling the request itself, rather than
+	// abandoning it in a goroutine, matters here: GitHub rotates the refresh
+	// token on use, so an abandoned call that still succeeded would consume
+	// the stored token, and the next tick's bad_refresh_token would wipe the
+	// secret — credential loss caused by an ordinary daemon shutdown.
+	tok, err := oauth.Refresh(oauth.RefreshOptions{
+		Host:         host,
+		ClientID:     githubClientID(settings),
+		RefreshToken: refresh,
+		HTTPClient:   ctxPoster{ctx: ctx, client: client},
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		tok = r.token
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if errors.Is(err, oauth.ErrRefreshTokenInvalid) {
+			return nil, fmt.Errorf("github refresh rejected: %w", ErrRevoked)
+		}
+		return nil, fmt.Errorf("github refresh: %w", err)
+	}
+
+	// The secret already proved this credential expires, so a response that
+	// omits expires_in must not be read as "never expires": githubCredential
+	// would drop the refresh fields, the RefreshManager would then skip the
+	// secret as legacy, and the token would die hours later with nothing
+	// prompting a re-enrol. Assume the previous lifetime instead.
+	if tok.ExpiresIn <= 0 {
+		tok.ExpiresIn = previousLifetime(existing)
 	}
 
 	out := githubCredential(tok, e.clock())
@@ -269,6 +281,52 @@ func (e *GitHubEngine) Refresh(ctx context.Context, settings map[string]any, exi
 		out["user"] = user
 	}
 	return out, nil
+}
+
+// ctxPoster adapts an *http.Client to the PostForm-only interface cli/oauth
+// accepts, binding every request to ctx.
+type ctxPoster struct {
+	ctx    context.Context
+	client *http.Client
+}
+
+func (p ctxPoster) PostForm(u string, data url.Values) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(p.ctx, http.MethodPost, u, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return p.client.Do(req)
+}
+
+// requireSecureTokenEndpoint refuses to send a refresh token in cleartext.
+// The device flow tolerates an http:// host (GHES behind a TLS-terminating
+// proxy on loopback, say), but a refresh is different twice over: the token
+// it carries is long-lived, and an on-path forger of the error response
+// could make dotvault delete the secret. Loopback stays allowed.
+func requireSecureTokenEndpoint(hostURL string) error {
+	u, err := url.Parse(hostURL)
+	if err != nil {
+		return fmt.Errorf("parse github host: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if ip := net.ParseIP(u.Hostname()); (ip != nil && ip.IsLoopback()) || u.Hostname() == "localhost" {
+		return nil
+	}
+	return fmt.Errorf("github refresh refuses a non-https host %q", u.Host)
+}
+
+// previousLifetime is the access-token lifetime the existing secret records,
+// falling back to GitHub's documented eight hours when it cannot be read.
+func previousLifetime(existing map[string]string) time.Duration {
+	issued, err1 := time.Parse(time.RFC3339, existing["issued_at"])
+	expires, err2 := time.Parse(time.RFC3339, existing["expires_at"])
+	if err1 == nil && err2 == nil && expires.After(issued) {
+		return expires.Sub(issued)
+	}
+	return githubDefaultTokenLifetime
 }
 
 func fetchGitHubUser(ctx context.Context, client *http.Client, hostURL, token string) (string, error) {

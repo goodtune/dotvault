@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -155,8 +156,32 @@ func TestGitHubRefresh(t *testing.T) {
 		if got["oauth_token"] != "ghu_new" || got["refresh_token"] != "ghr_new" || got["user"] != "octocat" {
 			t.Errorf("got %v", got)
 		}
-		if got["issued_at"] != "2026-11-01T10:00:00Z" || got["expires_at"] != "2026-11-01T18:00:00Z" {
+		if got["issued_at"] != "2026-11-01T10:00:00Z" || got["expires_at"] != "2026-11-01T18:00:00Z" || got["refresh_token_expires_at"] != "2027-05-04T10:00:00Z" {
 			t.Errorf("timestamps: %v", got)
+		}
+	})
+
+	t.Run("a response without expires_in keeps the credential rotatable", func(t *testing.T) {
+		srv, _ := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, _ url.Values) {
+			fmt.Fprint(w, "access_token=ghu_new")
+		})
+		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
+		got, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, existing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The previous 8h lifetime is assumed, and oauth.Refresh carries the
+		// unrotated refresh token forward, so the next half-life still fires.
+		if got["refresh_token"] != "ghr_old" || got["expires_at"] != "2026-11-01T18:00:00Z" {
+			t.Errorf("credential downgraded: %v", got)
+		}
+	})
+
+	t.Run("a cleartext non-loopback host is refused", func(t *testing.T) {
+		e := &GitHubEngine{now: func() time.Time { return now }}
+		_, err := e.Refresh(ctx, map[string]any{"host": "http://ghe.example.com"}, existing)
+		if err == nil || errors.Is(err, ErrRevoked) {
+			t.Errorf("err = %v", err)
 		}
 	})
 
@@ -182,18 +207,19 @@ func TestGitHubRefresh(t *testing.T) {
 		}
 	})
 
-	t.Run("an expired refresh token skips the round trip", func(t *testing.T) {
+	t.Run("a stored refresh-token expiry does not short-circuit GitHub", func(t *testing.T) {
 		srv, calls := fakeGitHubTokenEndpoint(t, func(w http.ResponseWriter, _ url.Values) {
-			fmt.Fprint(w, "access_token=ghu_new")
+			fmt.Fprint(w, "access_token=ghu_new&refresh_token=ghr_new&expires_in=28800")
 		})
-		stale := map[string]string{}
+		skewed := map[string]string{}
 		for k, v := range existing {
-			stale[k] = v
+			skewed[k] = v
 		}
-		stale["refresh_token_expires_at"] = "2026-10-01T00:00:00Z"
+		// A local clock that thinks the refresh token lapsed must not be
+		// what wipes the secret; GitHub accepting it is the answer.
+		skewed["refresh_token_expires_at"] = "2026-10-01T00:00:00Z"
 		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
-		_, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, stale)
-		if !errors.Is(err, ErrRevoked) || *calls != 0 {
+		if _, err := e.Refresh(ctx, map[string]any{"host": srv.URL}, skewed); err != nil || *calls != 1 {
 			t.Errorf("err = %v, calls = %d", err, *calls)
 		}
 	})
@@ -206,15 +232,27 @@ func TestGitHubRefresh(t *testing.T) {
 		}
 	})
 
-	t.Run("cancellation returns promptly", func(t *testing.T) {
-		block := make(chan struct{})
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-block }))
-		t.Cleanup(func() { close(block); srv.Close() })
+	t.Run("cancellation aborts the in-flight request", func(t *testing.T) {
+		arrived := make(chan struct{})
+		aborted := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The server only watches for a hang-up once the body is read.
+			_, _ = io.ReadAll(r.Body)
+			close(arrived)
+			<-r.Context().Done() // the client hung up
+			close(aborted)
+		}))
+		t.Cleanup(srv.Close)
 		e := &GitHubEngine{httpClient: srv.Client(), now: func() time.Time { return now }}
 		cctx, cancel := context.WithCancel(ctx)
-		cancel()
+		go func() { <-arrived; cancel() }()
 		if _, err := e.Refresh(cctx, map[string]any{"host": srv.URL}, existing); !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v", err)
+		}
+		select {
+		case <-aborted:
+		case <-time.After(5 * time.Second):
+			t.Error("the request was abandoned rather than cancelled")
 		}
 	})
 }

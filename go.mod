@@ -5,13 +5,13 @@ go 1.26.0
 require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/cli/oauth v1.2.2
+	github.com/cli/oauth v1.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
-	github.com/gen2brain/beeep v0.11.2
+	github.com/gen2brain/beeep v0.11.3
 	github.com/google/certtostore v1.0.7
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.11
-	github.com/hanwen/go-fuse/v2 v2.12.0
+	github.com/hanwen/go-fuse/v2 v2.12.1
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/jdx/go-netrc v1.0.0
 	github.com/mattn/go-ieproxy v0.0.12
@@ -46,8 +46,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cli/browser v1.0.0 // indirect
-	github.com/cli/safeexec v1.0.0 // indirect
+	github.com/cli/browser v1.3.0 // indirect
 	github.com/esiqveland/notify v0.13.3 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect

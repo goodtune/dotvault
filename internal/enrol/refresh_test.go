@@ -915,8 +915,8 @@ func TestRefreshManager_UpdateConfigPrunesRevoked(t *testing.T) {
 		"jfrog": {Engine: "jfrog-fake"},
 		"other": {Engine: "jfrog-fake"},
 	}, time.Hour)
-	m.setRevoked("jfrog", revokedMark{version: 1})
-	m.setRevoked("other", revokedMark{version: 2})
+	m.setRevoked("jfrog", config.Enrolment{Engine: "jfrog-fake"}, revokedMark{version: 1})
+	m.setRevoked("other", config.Enrolment{Engine: "jfrog-fake"}, revokedMark{version: 2})
 
 	m.UpdateConfig(map[string]config.Enrolment{"other": {Engine: "jfrog-fake"}})
 
@@ -924,6 +924,48 @@ func TestRefreshManager_UpdateConfigPrunesRevoked(t *testing.T) {
 		t.Error("revocation mark survived its enrolment's removal")
 	}
 	if _, ok := m.revocation("other"); !ok {
-		t.Error("revocation mark of a still-configured enrolment was dropped")
+		t.Error("revocation mark of an unchanged enrolment was dropped")
+	}
+}
+
+// A rejection can be the configuration's fault: correcting the enrolment in
+// place must clear the pending wipe and the backoff, or the fix would be
+// greeted by the deletion of a credential it could have refreshed.
+func TestRefreshManager_UpdateConfigClearsChangedEnrolment(t *testing.T) {
+	before := config.Enrolment{Engine: "jfrog-fake", Settings: map[string]any{"client_id": "wrong"}}
+	after := config.Enrolment{Engine: "jfrog-fake", Settings: map[string]any{"client_id": "right"}}
+	m := NewRefreshManager(nil, "kv", "users/alice/", map[string]config.Enrolment{"gh": before}, time.Hour)
+	m.setRevoked("gh", before, revokedMark{version: 3})
+	m.bumpBackoff("gh")
+
+	m.UpdateConfig(map[string]config.Enrolment{"gh": after})
+
+	if _, ok := m.revocation("gh"); ok {
+		t.Error("revocation mark survived an in-place config change")
+	}
+	if m.inBackoff("gh", time.Now()) {
+		t.Error("backoff survived an in-place config change")
+	}
+}
+
+// A rejection observed by a refresh that was already in flight when the
+// config changed must not arm a wipe against the new configuration.
+func TestRefreshManager_StaleAttemptDoesNotArm(t *testing.T) {
+	used := config.Enrolment{Engine: "jfrog-fake", Settings: map[string]any{"client_id": "wrong"}}
+	m := NewRefreshManager(nil, "kv", "users/alice/", map[string]config.Enrolment{"gh": used}, time.Hour)
+
+	// The reload lands between the attempt starting and its rejection.
+	m.UpdateConfig(map[string]config.Enrolment{"gh": {Engine: "jfrog-fake", Settings: map[string]any{"client_id": "right"}}})
+	m.setRevoked("gh", used, revokedMark{version: 3})
+	if _, ok := m.revocation("gh"); ok {
+		t.Error("stale attempt armed a wipe against the changed enrolment")
+	}
+
+	// Removed and re-added identically is the same enrolment again, so an
+	// attempt that ran under it still counts.
+	m.UpdateConfig(map[string]config.Enrolment{"gh": used})
+	m.setRevoked("gh", used, revokedMark{version: 3})
+	if _, ok := m.revocation("gh"); !ok {
+		t.Error("attempt under the current enrolment did not arm")
 	}
 }

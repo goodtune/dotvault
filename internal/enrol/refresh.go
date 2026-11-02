@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
@@ -124,20 +125,31 @@ func NewRefreshManager(
 func (m *RefreshManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	old := m.enrolments
 	m.enrolments = enrolments
-	// Drop backoff and revocation state for any enrolment that was removed:
-	// a mark that outlived its enrolment would be judged against whatever a
-	// later enrolment under the same key writes.
+	// Drop backoff and revocation state for any enrolment that was removed or
+	// changed. A removed key's mark would be judged against whatever a later
+	// enrolment under that key writes. A changed one matters as much: a
+	// rejection can be the configuration's fault rather than the
+	// credential's (a wrong client_id, say), and a mark surviving the fix
+	// would wipe a credential the corrected enrolment could have refreshed.
 	for key := range m.backoffs {
-		if _, ok := enrolments[key]; !ok {
+		if !sameEnrolment(old, enrolments, key) {
 			delete(m.backoffs, key)
 		}
 	}
 	for key := range m.revoked {
-		if _, ok := enrolments[key]; !ok {
+		if !sameEnrolment(old, enrolments, key) {
 			delete(m.revoked, key)
 		}
 	}
+}
+
+// sameEnrolment reports whether key is configured identically in both maps.
+func sameEnrolment(old, cur map[string]config.Enrolment, key string) bool {
+	o, okOld := old[key]
+	c, okCur := cur[key]
+	return okOld && okCur && reflect.DeepEqual(o, c)
 }
 
 // Start launches the refresh goroutine. It stops when ctx is cancelled.
@@ -295,7 +307,7 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 			// delete, so arm the wipe and let the next tick decide on evidence.
 			// The token is not presented again in the meantime.
 			slog.Warn("refresh: upstream rejected the credential, wiping on the next check unless the secret changes", "key", key, "error", err)
-			m.setRevoked(key, revokedMark{version: secret.Version, created: secret.CreatedTime})
+			m.setRevoked(key, enrolment, revokedMark{version: secret.Version, created: secret.CreatedTime})
 			return
 		}
 		slog.Warn("refresh: transient failure, will retry", "key", key, "error", err)
@@ -347,9 +359,17 @@ func (m *RefreshManager) revocation(key string) (revokedMark, bool) {
 	return r, ok
 }
 
-func (m *RefreshManager) setRevoked(key string, mark revokedMark) {
+// setRevoked arms the wipe, but only if key is still configured as the
+// enrolment the rejected attempt ran under. A config reload landing while
+// the refresh was in flight has already cleared state for a changed or
+// removed key (see UpdateConfig); arming afterwards would bring back a
+// rejection the reload had invalidated.
+func (m *RefreshManager) setRevoked(key string, used config.Enrolment, mark revokedMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if cur, ok := m.enrolments[key]; !ok || !reflect.DeepEqual(cur, used) {
+		return
+	}
 	m.revoked[key] = mark
 }
 

@@ -120,8 +120,9 @@ func NewRefreshManager(
 	return m
 }
 
-// UpdateConfig replaces the enrolment map atomically. Called when the
-// daemon's background config-reload loop detects changes.
+// UpdateConfig replaces the enrolment map atomically, dropping backoff and
+// pending-wipe state for every enrolment it removes or changes. Called when
+// the daemon's background config-reload loop detects changes.
 func (m *RefreshManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -149,7 +150,15 @@ func (m *RefreshManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 func sameEnrolment(old, cur map[string]config.Enrolment, key string) bool {
 	o, okOld := old[key]
 	c, okCur := cur[key]
-	return okOld && okCur && reflect.DeepEqual(o, c)
+	return okOld && okCur && refreshEquivalent(o, c)
+}
+
+// refreshEquivalent reports whether two enrolments would refresh the same
+// way: the engine and the settings handed to Refresh. Fields that play no
+// part in a refresh (HelpText) are ignored, so editing them neither cancels
+// a pending wipe nor lets a rejected token be presented again.
+func refreshEquivalent(a, b config.Enrolment) bool {
+	return a.Engine == b.Engine && reflect.DeepEqual(a.Settings, b.Settings)
 }
 
 // Start launches the refresh goroutine. It stops when ctx is cancelled.
@@ -243,7 +252,7 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 
 	if mark, ok := m.revocation(key); ok {
 		if mark.matches(secret) {
-			m.wipeRevoked(ctx, key, path)
+			m.wipeRevoked(ctx, key, path, enrolment)
 			return
 		}
 		// The secret moved on after the rejection, so whoever spent that
@@ -306,7 +315,7 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 			// Wiping now would delete that, and Vault offers no conditional
 			// delete, so arm the wipe and let the next tick decide on evidence.
 			// The token is not presented again in the meantime.
-			slog.Warn("refresh: upstream rejected the credential, wiping on the next check unless the secret changes", "key", key, "error", err)
+			slog.Warn("refresh: upstream rejected the credential, wiping on the next check unless the secret or its enrolment config changes", "key", key, "error", err)
 			m.setRevoked(key, enrolment, revokedMark{version: secret.Version, created: secret.CreatedTime})
 			return
 		}
@@ -339,7 +348,16 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 // wipeRevoked deletes a secret whose refresh token the provider rejected and
 // which no other writer has replaced since. A failed delete stays armed and
 // backs off, so it is retried without presenting the token again.
-func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string) {
+//
+// The mark and the enrolment are re-checked just before the delete: a reload
+// landing after tick took its snapshot has cleared the mark of a changed
+// enrolment, and deleting anyway would undo exactly that. What remains is the
+// delete's own round trip, since holding m.mu across a Vault call would stall
+// UpdateConfig behind it.
+func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string, used config.Enrolment) {
+	if !m.stillArmed(key, used) {
+		return
+	}
 	slog.Warn("refresh: upstream credential revoked, wiping vault secret so user can re-enrol", "key", key)
 	if err := m.client.DeleteKVv2(ctx, m.kvMount, path); err != nil {
 		slog.Error("refresh: failed to delete revoked secret, will retry", "key", key, "error", err)
@@ -359,6 +377,18 @@ func (m *RefreshManager) revocation(key string) (revokedMark, bool) {
 	return r, ok
 }
 
+// stillArmed reports whether key still carries a mark and is still
+// configured as the enrolment the caller is acting under.
+func (m *RefreshManager) stillArmed(key string, used config.Enrolment) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.revoked[key]; !ok {
+		return false
+	}
+	cur, ok := m.enrolments[key]
+	return ok && refreshEquivalent(cur, used)
+}
+
 // setRevoked arms the wipe, but only if key is still configured as the
 // enrolment the rejected attempt ran under. A config reload landing while
 // the refresh was in flight has already cleared state for a changed or
@@ -367,7 +397,7 @@ func (m *RefreshManager) revocation(key string) (revokedMark, bool) {
 func (m *RefreshManager) setRevoked(key string, used config.Enrolment, mark revokedMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.enrolments[key]; !ok || !reflect.DeepEqual(cur, used) {
+	if cur, ok := m.enrolments[key]; !ok || !refreshEquivalent(cur, used) {
 		return
 	}
 	m.revoked[key] = mark

@@ -961,11 +961,46 @@ func TestRefreshManager_StaleAttemptDoesNotArm(t *testing.T) {
 		t.Error("stale attempt armed a wipe against the changed enrolment")
 	}
 
-	// Removed and re-added identically is the same enrolment again, so an
-	// attempt that ran under it still counts.
+	// Changed back to what the attempt ran under is the same enrolment
+	// again, so the attempt still counts.
 	m.UpdateConfig(map[string]config.Enrolment{"gh": used})
 	m.setRevoked("gh", used, revokedMark{version: 3})
 	if _, ok := m.revocation("gh"); !ok {
 		t.Error("attempt under the current enrolment did not arm")
+	}
+}
+
+// Fields that play no part in a refresh must not cancel a pending wipe:
+// clearing it would let the rejected token be presented again.
+func TestRefreshManager_HelpTextEditKeepsMark(t *testing.T) {
+	before := config.Enrolment{Engine: "jfrog-fake", Settings: map[string]any{"client_id": "x"}}
+	after := before
+	after.HelpText = "new help"
+	m := NewRefreshManager(nil, "kv", "users/alice/", map[string]config.Enrolment{"gh": before}, time.Hour)
+	m.setRevoked("gh", before, revokedMark{version: 3})
+
+	m.UpdateConfig(map[string]config.Enrolment{"gh": after})
+
+	if _, ok := m.revocation("gh"); !ok {
+		t.Error("a HelpText edit cleared the revocation mark")
+	}
+}
+
+// A reload that lands after tick read the mark but before the delete must
+// stop the wipe: the corrected enrolment may still refresh the credential.
+func TestRefreshManager_WipeSkippedAfterReload(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	fv.seed("users/alice/gh", map[string]string{"access_token": "a"})
+
+	used := config.Enrolment{Engine: "jfrog-fake", Settings: map[string]any{"client_id": "wrong"}}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{"gh": used}, time.Hour)
+	m.setRevoked("gh", used, revokedMark{version: 1})
+
+	m.UpdateConfig(map[string]config.Enrolment{"gh": {Engine: "jfrog-fake", Settings: map[string]any{"client_id": "right"}}})
+	m.wipeRevoked(context.Background(), "gh", "users/alice/gh", used)
+
+	if got := fv.deleted(); len(got) != 0 {
+		t.Errorf("deleted = %v after the enrolment changed, want none", got)
 	}
 }

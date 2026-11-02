@@ -49,7 +49,20 @@ type RefreshManager struct {
 	// revoked holds, per enrolment, the KVv2 version whose refresh token the
 	// provider rejected. The wipe runs a tick later, and only if that version
 	// is still current; see refreshOne.
-	revoked map[string]int
+	revoked map[string]revokedMark
+}
+
+// revokedMark identifies the rejected KVv2 version by number and creation
+// time together. The number alone is not an identity: deleting a secret's
+// metadata and enrolling again restarts its versions at 1, so a fresh
+// credential could otherwise match the mark and be wiped on its first tick.
+type revokedMark struct {
+	version int
+	created time.Time
+}
+
+func (r revokedMark) matches(s *vault.Secret) bool {
+	return r.version == s.Version && r.created.Equal(s.CreatedTime)
 }
 
 type backoffState struct {
@@ -96,7 +109,7 @@ func NewRefreshManager(
 		clock:         realClock{},
 		enrolments:    enrolments,
 		backoffs:      make(map[string]backoffState),
-		revoked:       make(map[string]int),
+		revoked:       make(map[string]revokedMark),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -110,10 +123,17 @@ func (m *RefreshManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.enrolments = enrolments
-	// Drop backoff state for any enrolment that was removed.
+	// Drop backoff and revocation state for any enrolment that was removed:
+	// a mark that outlived its enrolment would be judged against whatever a
+	// later enrolment under the same key writes.
 	for key := range m.backoffs {
 		if _, ok := enrolments[key]; !ok {
 			delete(m.backoffs, key)
+		}
+	}
+	for key := range m.revoked {
+		if _, ok := enrolments[key]; !ok {
+			delete(m.revoked, key)
 		}
 	}
 }
@@ -207,8 +227,8 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 		return
 	}
 
-	if version, ok := m.revokedVersion(key); ok {
-		if version == secret.Version {
+	if mark, ok := m.revokedMark(key); ok {
+		if mark.matches(secret) {
 			m.wipeRevoked(ctx, key, path)
 			return
 		}
@@ -273,7 +293,7 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 			// delete, so arm the wipe and let the next tick decide on evidence.
 			// The token is not presented again in the meantime.
 			slog.Warn("refresh: upstream rejected the credential, wiping on the next check unless the secret changes", "key", key, "error", err)
-			m.setRevoked(key, secret.Version)
+			m.setRevoked(key, revokedMark{version: secret.Version, created: secret.CreatedTime})
 			return
 		}
 		slog.Warn("refresh: transient failure, will retry", "key", key, "error", err)
@@ -318,17 +338,17 @@ func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string) {
 	m.clearRevoked(key)
 }
 
-func (m *RefreshManager) revokedVersion(key string) (int, bool) {
+func (m *RefreshManager) revokedMark(key string) (revokedMark, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	v, ok := m.revoked[key]
-	return v, ok
+	r, ok := m.revoked[key]
+	return r, ok
 }
 
-func (m *RefreshManager) setRevoked(key string, version int) {
+func (m *RefreshManager) setRevoked(key string, mark revokedMark) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.revoked[key] = version
+	m.revoked[key] = mark
 }
 
 func (m *RefreshManager) clearRevoked(key string) {

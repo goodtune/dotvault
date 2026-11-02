@@ -75,6 +75,11 @@ type fakeVault struct {
 	mount   string                       // e.g. "kv"
 	secrets map[string]map[string]string // path -> data
 	version map[string]int               // path -> current KVv2 version
+	// created is each path's current-version creation time, which Vault
+	// reports alongside the version number. A tick counter rather than the
+	// wall clock, so every write gets a distinct, deterministic time.
+	created map[string]time.Time
+	ticks   int
 	writes  []fakeVaultWrite
 	deletes []string
 	// When non-zero, DELETE on the metadata endpoint returns this status
@@ -89,7 +94,7 @@ type fakeVaultWrite struct {
 }
 
 func newFakeVault(mount string) *fakeVault {
-	return &fakeVault{mount: mount, secrets: map[string]map[string]string{}, version: map[string]int{}}
+	return &fakeVault{mount: mount, secrets: map[string]map[string]string{}, version: map[string]int{}, created: map[string]time.Time{}}
 }
 
 // serve returns an httptest.Server speaking a KVv2 subset for this fake.
@@ -119,6 +124,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			fv.mu.Lock()
 			data, ok := fv.secrets[path]
 			version := fv.version[path]
+			created := fv.created[path]
 			fv.mu.Unlock()
 			if !ok {
 				// Mimic Vault's 404 body so the SDK parses it as a
@@ -131,7 +137,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			body, _ := json.Marshal(map[string]any{
 				"data": map[string]any{
 					"data":     stringMapToAny(data),
-					"metadata": map[string]any{"version": version},
+					"metadata": map[string]any{"version": version, "created_time": created.Format(time.RFC3339Nano)},
 				},
 			})
 			w.Header().Set("Content-Type", "application/json")
@@ -164,6 +170,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			}
 			fv.secrets[path] = data
 			fv.version[path]++
+			fv.stampLocked(path)
 			fv.writes = append(fv.writes, fakeVaultWrite{Path: path, Data: copyMap(data)})
 			fmt.Fprintf(w, `{"data":{"version":%d}}`, fv.version[path])
 		default:
@@ -185,6 +192,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		fv.mu.Lock()
 		delete(fv.secrets, path)
 		delete(fv.version, path)
+		delete(fv.created, path)
 		fv.deletes = append(fv.deletes, path)
 		fv.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
@@ -206,6 +214,24 @@ func (fv *fakeVault) seed(path string, data map[string]string) {
 	defer fv.mu.Unlock()
 	fv.secrets[path] = copyMap(data)
 	fv.version[path]++
+	fv.stampLocked(path)
+}
+
+// stampLocked records a fresh creation time for path's new version. Callers
+// hold fv.mu.
+func (fv *fakeVault) stampLocked(path string) {
+	fv.ticks++
+	fv.created[path] = time.Date(2026, 1, 1, 0, 0, fv.ticks, 0, time.UTC)
+}
+
+// purge deletes path's metadata the way an operator would, outside the
+// refresh manager, so the next write restarts its versions at 1.
+func (fv *fakeVault) purge(path string) {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	delete(fv.secrets, path)
+	delete(fv.version, path)
+	delete(fv.created, path)
 }
 
 func (fv *fakeVault) secret(path string) map[string]string {
@@ -835,4 +861,69 @@ func TestRefreshManager_NonRefresherEngineIgnored(t *testing.T) {
 	)
 	// Should not panic or error; simply a no-op.
 	m.tick(context.Background())
+}
+
+// A secret purged and enrolled again restarts at version 1, so a revocation
+// mark recorded against the old version 1 must not wipe the new credential:
+// the mark identifies a version by its creation time too, not its number.
+func TestRefreshManager_ErrRevokedSparesReenrolmentAtSameVersion(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	fv.seed("users/alice/jfrog", map[string]string{
+		"access_token":  "old",
+		"refresh_token": "r-old",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	})
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) { return nil, ErrRevoked }
+	registerFake(t, "jfrog-fake", fake)
+
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour, WithClock(clk))
+	m.tick(context.Background()) // rejection arms the wipe against version 1
+
+	// Between the ticks the user purges the secret and enrols afresh; the
+	// new credential is version 1 again, and well before its half-life.
+	fv.purge("users/alice/jfrog")
+	fv.seed("users/alice/jfrog", map[string]string{
+		"access_token":  "new",
+		"refresh_token": "r-new",
+		"issued_at":     clk.Now().Format(time.RFC3339),
+		"expires_at":    clk.Now().Add(6 * time.Hour).Format(time.RFC3339),
+	})
+
+	m.tick(context.Background())
+
+	if got := fv.secret("users/alice/jfrog"); got["access_token"] != "new" {
+		t.Fatalf("re-enrolled secret wiped by a stale mark: %v", got)
+	}
+	if d := fv.deleted(); len(d) != 0 {
+		t.Errorf("deleted = %v, want none", d)
+	}
+}
+
+// Removing an enrolment drops its revocation mark, so re-adding it later is
+// judged on the new credential alone.
+func TestRefreshManager_UpdateConfigPrunesRevoked(t *testing.T) {
+	m := NewRefreshManager(nil, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+		"other": {Engine: "jfrog-fake"},
+	}, time.Hour)
+	m.setRevoked("jfrog", revokedMark{version: 1})
+	m.setRevoked("other", revokedMark{version: 2})
+
+	m.UpdateConfig(map[string]config.Enrolment{"other": {Engine: "jfrog-fake"}})
+
+	if _, ok := m.revokedMark("jfrog"); ok {
+		t.Error("revocation mark survived its enrolment's removal")
+	}
+	if _, ok := m.revokedMark("other"); !ok {
+		t.Error("revocation mark of a still-configured enrolment was dropped")
+	}
 }

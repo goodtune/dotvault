@@ -201,6 +201,14 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 			io.Log.Warn("could not fetch github username", "error", err)
 			user = ""
 		}
+		// A GitHub App can issue an expiring token without token_lifetime
+		// asking for one, so the host check above is not enough on its own:
+		// whatever the setting, a refresh token is never persisted for a
+		// host Refresh would refuse, where it could never rotate and the
+		// credential would die at expiry with nothing prompting a re-enrol.
+		if err := checkExpiringHost(r.token, hostURL); err != nil {
+			return nil, err
+		}
 		out := githubCredential(r.token, e.clock())
 		out["user"] = user
 		return out, nil
@@ -314,6 +322,18 @@ func (p ctxPoster) PostForm(u string, data url.Values) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return p.client.Do(req)
+}
+
+// checkExpiringHost refuses an expiring token issued over a host Refresh
+// would refuse, whatever token_lifetime asked for.
+func checkExpiringHost(tok *api.AccessToken, hostURL string) error {
+	if tok.RefreshToken == "" || tok.ExpiresIn <= 0 {
+		return nil
+	}
+	if err := requireSecureTokenEndpoint(hostURL); err != nil {
+		return fmt.Errorf("github issued an expiring token: %w", err)
+	}
+	return nil
 }
 
 // requireSecureTokenEndpoint refuses to send a refresh token in cleartext.

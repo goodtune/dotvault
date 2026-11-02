@@ -458,3 +458,25 @@ func TestRefreshManagerRotatesGitHub(t *testing.T) {
 		t.Errorf("classic secret changed: %v", c)
 	}
 }
+
+// A GitHub App can return an expiring token unasked, so the host check must
+// key off the response, not the token_lifetime setting.
+func TestCheckExpiringHost(t *testing.T) {
+	expiring := &api.AccessToken{Token: "ghu_x", RefreshToken: "ghr_y", ExpiresIn: 8 * time.Hour}
+	classic := &api.AccessToken{Token: "gho_x"}
+	for _, tc := range []struct {
+		name    string
+		tok     *api.AccessToken
+		host    string
+		wantErr bool
+	}{
+		{"expiring over cleartext", expiring, "http://ghe.example.com", true},
+		{"expiring over https", expiring, "https://ghe.example.com", false},
+		{"expiring over loopback", expiring, "http://127.0.0.1:8080", false},
+		{"classic over cleartext", classic, "http://ghe.example.com", false},
+	} {
+		if err := checkExpiringHost(tc.tok, tc.host); (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+	}
+}

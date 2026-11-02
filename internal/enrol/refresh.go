@@ -56,6 +56,8 @@ type RefreshManager struct {
 // time together. The number alone is not an identity: deleting a secret's
 // metadata and enrolling again restarts its versions at 1, so a fresh
 // credential could otherwise match the mark and be wiped on its first tick.
+// A read without version metadata leaves CreatedTime zero on both sides, so
+// the match falls back to the version number alone, as it was before.
 type revokedMark struct {
 	version int
 	created time.Time
@@ -227,7 +229,7 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 		return
 	}
 
-	if mark, ok := m.revokedMark(key); ok {
+	if mark, ok := m.revocation(key); ok {
 		if mark.matches(secret) {
 			m.wipeRevoked(ctx, key, path)
 			return
@@ -338,7 +340,7 @@ func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string) {
 	m.clearRevoked(key)
 }
 
-func (m *RefreshManager) revokedMark(key string) (revokedMark, bool) {
+func (m *RefreshManager) revocation(key string) (revokedMark, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.revoked[key]

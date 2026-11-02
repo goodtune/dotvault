@@ -920,10 +920,10 @@ func TestRefreshManager_UpdateConfigPrunesRevoked(t *testing.T) {
 
 	m.UpdateConfig(map[string]config.Enrolment{"other": {Engine: "jfrog-fake"}})
 
-	if _, ok := m.revokedMark("jfrog"); ok {
+	if _, ok := m.revocation("jfrog"); ok {
 		t.Error("revocation mark survived its enrolment's removal")
 	}
-	if _, ok := m.revokedMark("other"); !ok {
+	if _, ok := m.revocation("other"); !ok {
 		t.Error("revocation mark of a still-configured enrolment was dropped")
 	}
 }

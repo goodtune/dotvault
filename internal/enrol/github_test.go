@@ -474,6 +474,10 @@ func TestCheckExpiringHost(t *testing.T) {
 		{"expiring over https", expiring, "https://ghe.example.com", false},
 		{"expiring over loopback", expiring, "http://127.0.0.1:8080", false},
 		{"classic over cleartext", classic, "http://ghe.example.com", false},
+		// The boundary githubCredential also draws: no expiry means nothing
+		// to rotate, so the refresh fields would not be written anyway.
+		{"refresh token without expiry over cleartext", &api.AccessToken{Token: "x", RefreshToken: "r"}, "http://ghe.example.com", false},
+		{"expiry without refresh token over cleartext", &api.AccessToken{Token: "x", ExpiresIn: time.Hour}, "http://ghe.example.com", false},
 	} {
 		if err := checkExpiringHost(tc.tok, tc.host); (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)

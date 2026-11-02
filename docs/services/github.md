@@ -113,7 +113,7 @@ enrolments:
 
 This works with the default `client_id`; no app registration is needed. dotvault adds the `offline_access` scope to the device flow, which is what `gh auth login --expiring` does, and GitHub returns an access token valid for eight hours together with a refresh token valid for about six months. Your OAuth scopes are unchanged, so the token reaches the same repositories as before.
 
-`token_lifetime: expiring` is a request, not a guarantee. GitHub decides what to issue, and hosts without support — GitHub Enterprise Server, today — return an ordinary token, which dotvault stores and uses as usual. Only github.com and GHE.com (`*.ghe.com`) hosts are known to support it. An `expiring` enrolment against a plain `http://` host (loopback excepted) is refused, because the refresh token would cross in the clear and could never be used. dotvault requests expiry through the `offline_access` scope, so listing that scope in `scopes` has the same effect whatever `token_lifetime` says.
+`token_lifetime: expiring` is a request, not a guarantee. GitHub decides what to issue, and hosts without support — GitHub Enterprise Server, today — return an ordinary token, which dotvault stores and uses as usual. Only github.com and GHE.com (`*.ghe.com`) hosts are known to support it. An `expiring` enrolment against a plain `http://` host (loopback excepted) is refused before the device flow starts, because the refresh token would cross in the clear and could never be used. The same applies to any expiring token GitHub issues over such a host whatever `token_lifetime` says, such as one from a GitHub App with token expiration turned on; that refusal comes after you finish the device flow, since only the response shows the token expires, and nothing is stored. Point `host` at an `https://` URL to enrol. dotvault requests expiry through the `offline_access` scope, so listing that scope in `scopes` has the same effect whatever `token_lifetime` says.
 
 Changing the setting does not replace an existing enrolment, because a secret already holding an `oauth_token` counts as complete. Run the enrolment again to obtain the expiring token:
 
@@ -134,7 +134,7 @@ Refresh requires an `https://` host (loopback excepted): the refresh token is lo
 
 ### Using a GitHub App
 
-You do not need a GitHub App for expiring tokens, but if you already use one, register it with **Expire user authorization tokens** and **Enable Device Flow** turned on and point the enrolment at it:
+You do not need a GitHub App for expiring tokens, but if you already use one, register it with **Expire user authorization tokens** and **Enable Device Flow** turned on and point the enrolment at it. Such an App issues expiring tokens without `token_lifetime`, so its `host` must be an `https://` URL (loopback excepted), or the enrolment is refused once the device flow completes:
 
 ```yaml
 enrolments:

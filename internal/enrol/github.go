@@ -196,18 +196,20 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		if r.err != nil {
 			return nil, fmt.Errorf("device flow: %w", r.err)
 		}
+		// A GitHub App can issue an expiring token without token_lifetime
+		// asking for one, so the token_lifetime check before the device flow
+		// is not enough on its own: whatever the setting, a refresh token is
+		// never persisted for a host Refresh would refuse, where it could
+		// never rotate and the credential would die at expiry with nothing
+		// prompting a re-enrol. Checked before the /user lookup so a token
+		// about to be discarded is not sent over cleartext once more.
+		if err := checkExpiringHost(r.token, hostURL); err != nil {
+			return nil, err
+		}
 		user, err := fetchGitHubUser(ctx, httpClient, hostURL, r.token.Token)
 		if err != nil {
 			io.Log.Warn("could not fetch github username", "error", err)
 			user = ""
-		}
-		// A GitHub App can issue an expiring token without token_lifetime
-		// asking for one, so the host check above is not enough on its own:
-		// whatever the setting, a refresh token is never persisted for a
-		// host Refresh would refuse, where it could never rotate and the
-		// credential would die at expiry with nothing prompting a re-enrol.
-		if err := checkExpiringHost(r.token, hostURL); err != nil {
-			return nil, err
 		}
 		out := githubCredential(r.token, e.clock())
 		out["user"] = user
@@ -331,7 +333,7 @@ func checkExpiringHost(tok *api.AccessToken, hostURL string) error {
 		return nil
 	}
 	if err := requireSecureTokenEndpoint(hostURL); err != nil {
-		return fmt.Errorf("github issued an expiring token: %w", err)
+		return fmt.Errorf("github issued an expiring token, which dotvault only stores for an https host so it can be refreshed (set host to an https:// URL): %w", err)
 	}
 	return nil
 }

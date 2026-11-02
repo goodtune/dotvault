@@ -129,8 +129,9 @@ func fakeGitHubTokenEndpoint(t *testing.T, respond func(w http.ResponseWriter, f
 // fakeGitHubDeviceFlow serves the device-code and token endpoints the way
 // github.com does: the token endpoint answers with a refresh token only when
 // the code request carried offline_access, so the fake rewards exactly what the
-// real server does. It reports the scope the engine actually sent.
-func fakeGitHubDeviceFlow(t *testing.T) (*httptest.Server, *string) {
+// real server does. honourOffline false models a host without support, which
+// ignores the request. It reports the scope the engine actually sent.
+func fakeGitHubDeviceFlow(t *testing.T, honourOffline bool) (*httptest.Server, *string) {
 	t.Helper()
 	var scope string
 	mux := http.NewServeMux()
@@ -150,7 +151,7 @@ func fakeGitHubDeviceFlow(t *testing.T) (*httptest.Server, *string) {
 	})
 	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
 		v := url.Values{"access_token": {"gho_new"}, "token_type": {"bearer"}}
-		if strings.Contains(scope, "offline_access") {
+		if honourOffline && strings.Contains(scope, "offline_access") {
 			v.Set("refresh_token", "ghr_new")
 			v.Set("expires_in", "28800")
 			v.Set("refresh_token_expires_in", "15811200")
@@ -172,6 +173,7 @@ func TestGitHubRunTokenLifetime(t *testing.T) {
 	tests := []struct {
 		name        string
 		settings    map[string]any
+		unsupported bool // the host ignores offline_access
 		wantScope   string
 		wantRefresh bool
 	}{
@@ -199,10 +201,25 @@ func TestGitHubRunTokenLifetime(t *testing.T) {
 			wantScope:   "repo workflow offline_access",
 			wantRefresh: true,
 		},
+		{
+			name: "expiring does not repeat an explicit offline_access",
+			settings: map[string]any{
+				"token_lifetime": "expiring",
+				"scopes":         []any{"repo", "offline_access"},
+			},
+			wantScope:   "repo offline_access",
+			wantRefresh: true,
+		},
+		{
+			name:        "a host that ignores the request yields an ordinary token",
+			settings:    map[string]any{"token_lifetime": "expiring"},
+			unsupported: true,
+			wantScope:   "repo read:org gist offline_access",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, scope := fakeGitHubDeviceFlow(t)
+			srv, scope := fakeGitHubDeviceFlow(t, !tt.unsupported)
 			settings := map[string]any{"host": srv.URL}
 			for k, v := range tt.settings {
 				settings[k] = v
@@ -232,7 +249,7 @@ func TestGitHubRunTokenLifetime(t *testing.T) {
 	}
 
 	t.Run("an invalid value fails before contacting GitHub", func(t *testing.T) {
-		srv, scope := fakeGitHubDeviceFlow(t)
+		srv, scope := fakeGitHubDeviceFlow(t, true)
 		e := &GitHubEngine{httpClient: srv.Client()}
 		_, err := e.Run(context.Background(), map[string]any{
 			"host":           srv.URL,
@@ -245,6 +262,19 @@ func TestGitHubRunTokenLifetime(t *testing.T) {
 			t.Errorf("device code was requested with scope %q", *scope)
 		}
 	})
+}
+
+// Refresh refuses a cleartext host, so enrolling an expiring token over one
+// would deliver a refresh token in the clear and then strand it.
+func TestGitHubRunExpiringRefusesCleartextHost(t *testing.T) {
+	e := &GitHubEngine{httpClient: http.DefaultClient}
+	_, err := e.Run(context.Background(), map[string]any{
+		"host":           "http://github.example.com",
+		"token_lifetime": "expiring",
+	}, IO{Out: io.Discard, In: strings.NewReader("")})
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("err = %v, want a refusal naming https", err)
+	}
 }
 
 func TestGitHubRefresh(t *testing.T) {

@@ -1529,6 +1529,9 @@ func validateEnrolment(key string, e Enrolment) error {
 			return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
 		}
 	}
+	// Deliberately engine-specific, unlike token_ttl above: this setting means
+	// nothing to any other engine. Every GitHubTokenLifetime error starts with
+	// the setting's name, which is what the prefix here relies on.
 	if e.Engine == "github" {
 		if _, err := GitHubTokenLifetime(e.Settings); err != nil {
 			return fmt.Errorf("enrolments[%q].settings.%w", key, err)

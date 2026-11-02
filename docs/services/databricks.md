@@ -82,7 +82,7 @@ After enrolment, the daemon's `RefreshManager` checks every 5 minutes whether th
 3. dotvault stamps a fresh `issued_at=now`, `expires_at=now + expires_in`, and writes the new pair to Vault atomically.
 4. The sync engine picks up the updated secret and rewrites `~/.databrickscfg`.
 
-A `401` or `403` from the token endpoint is treated as permanent revocation: the secret is deleted from Vault and the user is prompted to re-enrol on the next wizard pass. Other errors are transient; the existing secret is kept and the refresh is retried with exponential backoff.
+A `401` or `403` from the token endpoint is treated as permanent revocation: unless the secret has changed by the next check, it is deleted from Vault and the user is prompted to re-enrol on the next wizard pass. Other errors are transient; the existing secret is kept and the refresh is retried with exponential backoff.
 
 ## Credentials stored in Vault
 

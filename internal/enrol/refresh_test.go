@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -73,6 +74,7 @@ type fakeVault struct {
 	mu      sync.Mutex
 	mount   string                       // e.g. "kv"
 	secrets map[string]map[string]string // path -> data
+	version map[string]int               // path -> current KVv2 version
 	writes  []fakeVaultWrite
 	deletes []string
 	// When non-zero, DELETE on the metadata endpoint returns this status
@@ -87,7 +89,7 @@ type fakeVaultWrite struct {
 }
 
 func newFakeVault(mount string) *fakeVault {
-	return &fakeVault{mount: mount, secrets: map[string]map[string]string{}}
+	return &fakeVault{mount: mount, secrets: map[string]map[string]string{}, version: map[string]int{}}
 }
 
 // serve returns an httptest.Server speaking a KVv2 subset for this fake.
@@ -116,6 +118,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			fv.mu.Lock()
 			data, ok := fv.secrets[path]
+			version := fv.version[path]
 			fv.mu.Unlock()
 			if !ok {
 				// Mimic Vault's 404 body so the SDK parses it as a
@@ -128,7 +131,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 			body, _ := json.Marshal(map[string]any{
 				"data": map[string]any{
 					"data":     stringMapToAny(data),
-					"metadata": map[string]any{"version": 1},
+					"metadata": map[string]any{"version": version},
 				},
 			})
 			w.Header().Set("Content-Type", "application/json")
@@ -136,7 +139,10 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost, http.MethodPut:
 			body, _ := io.ReadAll(r.Body)
 			var req struct {
-				Data map[string]any `json:"data"`
+				Data    map[string]any `json:"data"`
+				Options struct {
+					CAS *int `json:"cas"`
+				} `json:"options"`
 			}
 			if err := json.Unmarshal(body, &req); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -149,10 +155,17 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			fv.mu.Lock()
+			defer fv.mu.Unlock()
+			if req.Options.CAS != nil && *req.Options.CAS != fv.version[path] {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"errors":["check-and-set parameter did not match the current version"]}`))
+				return
+			}
 			fv.secrets[path] = data
+			fv.version[path]++
 			fv.writes = append(fv.writes, fakeVaultWrite{Path: path, Data: copyMap(data)})
-			fv.mu.Unlock()
-			_, _ = w.Write([]byte(`{"data":{"version":1}}`))
+			fmt.Fprintf(w, `{"data":{"version":%d}}`, fv.version[path])
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -171,6 +184,7 @@ func (fv *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		fv.mu.Lock()
 		delete(fv.secrets, path)
+		delete(fv.version, path)
 		fv.deletes = append(fv.deletes, path)
 		fv.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
@@ -191,6 +205,7 @@ func (fv *fakeVault) seed(path string, data map[string]string) {
 	fv.mu.Lock()
 	defer fv.mu.Unlock()
 	fv.secrets[path] = copyMap(data)
+	fv.version[path]++
 }
 
 func (fv *fakeVault) secret(path string) map[string]string {
@@ -386,12 +401,115 @@ func TestRefreshManager_ErrRevokedWipesSecret(t *testing.T) {
 	)
 	m.tick(context.Background())
 
+	// The first rejection only arms the wipe: the token may have been spent
+	// by a daemon on another host that has not written its result yet.
+	if got := fv.secret("users/alice/jfrog"); got == nil {
+		t.Fatal("secret wiped on the first rejection")
+	}
+
+	m.tick(context.Background())
+
+	if n := len(fake.Calls()); n != 1 {
+		t.Errorf("Refresh calls = %d, want 1: a rejected token must not be replayed", n)
+	}
 	if got := fv.secret("users/alice/jfrog"); got != nil {
 		t.Errorf("secret still present after ErrRevoked: %v", got)
 	}
 	deleted := fv.deleted()
 	if len(deleted) != 1 || deleted[0] != "users/alice/jfrog" {
 		t.Errorf("deleted = %v, want [users/alice/jfrog]", deleted)
+	}
+}
+
+// A second daemon sharing the same secret must not delete what the first one
+// rotated. Both read the same version and present the same single-use token;
+// the loser is told the token is bad.
+func TestRefreshManager_ErrRevokedSparesSecretRotatedElsewhere(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	expires := issued.Add(6 * time.Hour)
+	seed := func(token string) map[string]string {
+		return map[string]string{
+			"access_token":  token,
+			"refresh_token": "r-" + token,
+			"issued_at":     issued.Format(time.RFC3339),
+			"expires_at":    expires.Format(time.RFC3339),
+		}
+	}
+	fv.seed("users/alice/jfrog", seed("old"))
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) { return nil, ErrRevoked }
+	registerFake(t, "jfrog-fake", fake)
+
+	clk := &fixedClock{now: issued.Add(4 * time.Hour)}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour, WithClock(clk))
+	m.tick(context.Background())
+
+	// The winner's write lands between this daemon's two ticks, and its
+	// fresh issued_at keeps the secret before half-life.
+	rotated := seed("new")
+	rotated["issued_at"] = clk.Now().Format(time.RFC3339)
+	rotated["expires_at"] = clk.Now().Add(6 * time.Hour).Format(time.RFC3339)
+	fv.seed("users/alice/jfrog", rotated)
+
+	m.tick(context.Background())
+
+	if got := fv.secret("users/alice/jfrog"); got["access_token"] != "new" {
+		t.Fatalf("rotated secret lost: %v", got)
+	}
+	if d := fv.deleted(); len(d) != 0 {
+		t.Errorf("deleted = %v, want none", d)
+	}
+	if n := len(fake.Calls()); n != 1 {
+		t.Errorf("Refresh calls = %d, want 1", n)
+	}
+}
+
+// A rotation must not overwrite a secret that moved while the refresh was in
+// flight: a re-enrolment or another writer holds the newer credential.
+func TestRefreshManager_RotationLosesToNewerWrite(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	expires := issued.Add(6 * time.Hour)
+	data := map[string]string{
+		"access_token":  "old",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    expires.Format(time.RFC3339),
+	}
+	fv.seed("users/alice/jfrog", data)
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) {
+		fresh := copyMap(data)
+		fresh["access_token"] = "re-enrolled"
+		fv.seed("users/alice/jfrog", fresh)
+		lost := copyMap(data)
+		lost["access_token"] = "rotated"
+		return lost, nil
+	}
+	registerFake(t, "jfrog-fake", fake)
+
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour, WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}))
+	m.tick(context.Background())
+
+	if got := fv.secret("users/alice/jfrog"); got["access_token"] != "re-enrolled" {
+		t.Errorf("access_token = %q, want the newer write kept", got["access_token"])
+	}
+	m.mu.Lock()
+	b := m.backoffs["jfrog"]
+	m.mu.Unlock()
+	if b.delay != 0 {
+		t.Errorf("backoff = %v, want none: losing to a newer write is not a failure", b)
 	}
 }
 
@@ -463,8 +581,8 @@ func TestRefreshManager_MalformedSecretBumpsBackoff(t *testing.T) {
 
 func TestRefreshManager_ErrRevokedDeleteFailureBumpsBackoff(t *testing.T) {
 	// If the Vault cleanup for a revoked credential fails, the manager
-	// must NOT clear backoff — otherwise the next tick re-calls Refresh
-	// against a known-revoked token every cycle.
+	// must back off and retry the delete, never re-calling Refresh against
+	// a known-revoked token.
 	fv := newFakeVault("kv")
 	vc := fv.serve(t)
 	fv.deleteStatus = http.StatusInternalServerError
@@ -489,6 +607,8 @@ func TestRefreshManager_ErrRevokedDeleteFailureBumpsBackoff(t *testing.T) {
 		WithClock(clk),
 	)
 	m.tick(context.Background())
+	clk.Advance(10 * time.Second)
+	m.tick(context.Background()) // the armed wipe runs, and its delete fails
 
 	// Secret must still be present (delete failed).
 	if got := fv.secret("users/alice/jfrog"); got == nil {
@@ -501,11 +621,20 @@ func TestRefreshManager_ErrRevokedDeleteFailureBumpsBackoff(t *testing.T) {
 	if b.delay == 0 {
 		t.Errorf("backoff delay should be set after failed delete, got %v", b)
 	}
-	callsBefore := len(fake.Calls())
 	m.tick(context.Background())
-	if len(fake.Calls()) != callsBefore {
-		t.Errorf("Refresh called %d additional times within backoff window, want 0",
-			len(fake.Calls())-callsBefore)
+
+	// Past the backoff the delete is retried, still without Refresh.
+	fv.mu.Lock()
+	fv.deleteStatus = 0
+	fv.mu.Unlock()
+	clk.Advance(time.Minute)
+	m.tick(context.Background())
+
+	if got := fv.secret("users/alice/jfrog"); got != nil {
+		t.Errorf("secret still present after the retried delete: %v", got)
+	}
+	if n := len(fake.Calls()); n != 1 {
+		t.Errorf("Refresh calls = %d, want 1", n)
 	}
 }
 

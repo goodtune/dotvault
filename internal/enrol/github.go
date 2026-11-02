@@ -111,6 +111,13 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 	if err != nil {
 		return nil, err
 	}
+	if expiring {
+		// Refresh would refuse this host, so an expiring token enrolled here
+		// could never rotate, and its refresh token would cross in the clear.
+		if err := requireSecureTokenEndpoint(hostURL); err != nil {
+			return nil, fmt.Errorf("token_lifetime expiring: %w", err)
+		}
+	}
 
 	scopes := githubDefaultScopes
 	if raw, ok := settings["scopes"]; ok {

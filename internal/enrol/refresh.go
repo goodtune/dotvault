@@ -46,6 +46,10 @@ type RefreshManager struct {
 	// `nextAttempt` is the clock time before which tick() skips this
 	// enrolment — this is what actually makes the backoff observable.
 	backoffs map[string]backoffState
+	// revoked holds, per enrolment, the KVv2 version whose refresh token the
+	// provider rejected. The wipe runs a tick later, and only if that version
+	// is still current; see refreshOne.
+	revoked map[string]int
 }
 
 type backoffState struct {
@@ -92,6 +96,7 @@ func NewRefreshManager(
 		clock:         realClock{},
 		enrolments:    enrolments,
 		backoffs:      make(map[string]backoffState),
+		revoked:       make(map[string]int),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -198,7 +203,18 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 		// Clear any stale backoff from a previous attempt (e.g. the secret
 		// was deleted externally while we were in a backoff window).
 		m.resetBackoff(key)
+		m.clearRevoked(key)
 		return
+	}
+
+	if version, ok := m.revokedVersion(key); ok {
+		if version == secret.Version {
+			m.wipeRevoked(ctx, key, path)
+			return
+		}
+		// The secret moved on after the rejection, so whoever spent that
+		// token wrote its replacement. Judge the new version on its merits.
+		m.clearRevoked(key)
 	}
 
 	existing := stringifyStringMap(secret.Data)
@@ -250,19 +266,14 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	rotated, err := engine.Refresh(ctx, enrolment.Settings, existing)
 	if err != nil {
 		if errors.Is(err, ErrRevoked) {
-			slog.Warn("refresh: upstream credential revoked, wiping vault secret so user can re-enrol", "key", key, "error", err)
-			if delErr := m.client.DeleteKVv2(ctx, m.kvMount, path); delErr != nil {
-				// Treat Vault cleanup failure as transient: keep backoff
-				// so we retry the delete on a later tick instead of
-				// re-calling Refresh against a known-revoked credential
-				// every cycle.
-				slog.Error("refresh: failed to delete revoked secret, will retry", "key", key, "error", delErr)
-				m.bumpBackoff(key)
-				return
-			}
-			// No backoff once the revoked secret has been wiped — the
-			// state is terminal until the user re-enrols.
-			m.resetBackoff(key)
+			// A rotating refresh token is single-use, so a rejection does not
+			// prove the credential is dead: a daemon on another host sharing
+			// this secret may have spent it and be about to write the result.
+			// Wiping now would delete that, and Vault offers no conditional
+			// delete, so arm the wipe and let the next tick decide on evidence.
+			// The token is not presented again in the meantime.
+			slog.Warn("refresh: upstream rejected the credential, wiping on the next check unless the secret changes", "key", key, "error", err)
+			m.setRevoked(key, secret.Version)
 			return
 		}
 		slog.Warn("refresh: transient failure, will retry", "key", key, "error", err)
@@ -274,7 +285,14 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 	for k, v := range rotated {
 		data[k] = v
 	}
-	if err := m.client.WriteKVv2(ctx, m.kvMount, path, data); err != nil {
+	// Check-and-set against the version the refresh token came from: anything
+	// written since (a re-enrolment, say) is newer than this rotation.
+	if err := m.client.WriteKVv2CAS(ctx, m.kvMount, path, data, secret.Version); err != nil {
+		if errors.Is(err, vault.ErrCASMismatch) {
+			slog.Info("refresh: secret changed during rotation, keeping the newer version", "key", key)
+			m.resetBackoff(key)
+			return
+		}
 		slog.Warn("refresh: failed to write rotated secret", "key", key, "error", err)
 		m.bumpBackoff(key)
 		return
@@ -282,6 +300,41 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 
 	slog.Info("refresh: rotation complete", "key", key, "new_expires_at", rotated["expires_at"])
 	m.resetBackoff(key)
+}
+
+// wipeRevoked deletes a secret whose refresh token the provider rejected and
+// which no other writer has replaced since. A failed delete stays armed and
+// backs off, so it is retried without presenting the token again.
+func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string) {
+	slog.Warn("refresh: upstream credential revoked, wiping vault secret so user can re-enrol", "key", key)
+	if err := m.client.DeleteKVv2(ctx, m.kvMount, path); err != nil {
+		slog.Error("refresh: failed to delete revoked secret, will retry", "key", key, "error", err)
+		m.bumpBackoff(key)
+		return
+	}
+	// No backoff once the revoked secret has been wiped — the state is
+	// terminal until the user re-enrols.
+	m.resetBackoff(key)
+	m.clearRevoked(key)
+}
+
+func (m *RefreshManager) revokedVersion(key string) (int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.revoked[key]
+	return v, ok
+}
+
+func (m *RefreshManager) setRevoked(key string, version int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revoked[key] = version
+}
+
+func (m *RefreshManager) clearRevoked(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.revoked, key)
 }
 
 // bumpBackoff records a failure for this enrolment and sets the next

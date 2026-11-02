@@ -49,7 +49,7 @@ enrolments:
 | `client_id` | `178c6fc778ccc68e1d6a` (GitHub CLI's app) | OAuth application client ID |
 | `host` | `github.com` | GitHub host (for GitHub Enterprise Server) |
 | `scopes` | `repo`, `read:org`, `gist` | OAuth scopes to request |
-| `token_lifetime` | `non-expiring` | `expiring` asks GitHub for a short-lived token that dotvault rotates automatically (see [Expiring tokens](#expiring-tokens-and-automatic-refresh)). A quoted string, not a boolean, so that it round-trips through the Windows registry; any other value is a config error. |
+| `token_lifetime` | `non-expiring` | `expiring` asks GitHub for a short-lived token that dotvault rotates automatically (see [Expiring tokens](#expiring-tokens-and-automatic-refresh)). A string, not a boolean, so that it round-trips through the Windows registry; any other value is a config error. |
 | `https_proxy` | host's system proxy machinery | Override HTTPS proxy for all outbound calls from this enrolment. `http_proxy` is accepted as an alias. |
 
 ## Behind a corporate proxy
@@ -113,7 +113,7 @@ enrolments:
 
 This works with the default `client_id`; no app registration is needed. dotvault adds the `offline_access` scope to the device flow, which is what `gh auth login --expiring` does, and GitHub returns an access token valid for eight hours together with a refresh token valid for about six months. Your OAuth scopes are unchanged, so the token reaches the same repositories as before.
 
-`token_lifetime: expiring` is a request, not a guarantee. GitHub decides what to issue, and hosts without support — GitHub Enterprise Server, today — return an ordinary token, which dotvault stores and uses as usual. Only github.com and GHE.com (`*.ghe.com`) hosts are known to support it.
+`token_lifetime: expiring` is a request, not a guarantee. GitHub decides what to issue, and hosts without support — GitHub Enterprise Server, today — return an ordinary token, which dotvault stores and uses as usual. Only github.com and GHE.com (`*.ghe.com`) hosts are known to support it. An `expiring` enrolment against a plain `http://` host (loopback excepted) is refused, because the refresh token would cross in the clear and could never be used. dotvault requests expiry through the `offline_access` scope, so listing that scope in `scopes` has the same effect whatever `token_lifetime` says.
 
 Changing the setting does not replace an existing enrolment, because a secret already holding an `oauth_token` counts as complete. Run the enrolment again to obtain the expiring token:
 
@@ -128,7 +128,7 @@ When the device flow returns a refresh token and an expiry, dotvault stores `ref
 1. Every check interval (five minutes), the secret is read and skipped unless the access token is past half its lifetime — about four hours for an eight-hour token.
 2. dotvault posts `grant_type=refresh_token` to `{host}/login/oauth/access_token` with the configured `client_id`. No client secret is sent: the [`cli/oauth`](https://github.com/cli/oauth) library this uses documents device-flow tokens as refreshable without one, so dotvault never needs a GitHub App's secret in its config.
 3. GitHub returns a new access token **and a new refresh token**; the old refresh token stops working immediately. The whole secret is replaced, and the sync engine re-renders `hosts.yml` (or whatever the rule writes) with the new `oauth_token`. A refresh that is interrupted — the daemon shutting down mid-request — is cancelled rather than left to complete in the background, so it cannot silently consume the stored refresh token.
-4. If GitHub rejects the refresh token as invalid or expired (`bad_refresh_token`), the secret is deleted from Vault so the enrolment flow prompts for a fresh login. Any other failure is treated as transient: the existing secret is kept, a warning is logged, and the refresh is retried with backoff.
+4. If GitHub rejects the refresh token as invalid or expired (`bad_refresh_token`), dotvault waits for the next check and then, if the secret has not changed, deletes it from Vault so the enrolment flow prompts for a fresh login. The wait matters when more than one daemon enrols the same secret, as on hosts sharing one Vault identity: a refresh token works once, so the daemon that loses the race is told its token is bad, and it must not delete what the winner is writing. Any other failure is treated as transient: the existing secret is kept, a warning is logged, and the refresh is retried with backoff.
 
 Refresh requires an `https://` host (loopback excepted): the refresh token is long-lived, and the response decides whether the secret is wiped, so neither is sent or trusted over cleartext.
 
@@ -146,11 +146,13 @@ enrolments:
 
 Such an app returns an expiring token whether or not `token_lifetime` is set. As with `token_lifetime`, changing `client_id` does not replace an existing enrolment: run `dotvault enrol gh` again, or delete the secret and let the daemon's enrolment check prompt for it. A GitHub App's user token carries the permissions granted to the App rather than OAuth scopes, so the `scopes` setting has no effect for one, and it reaches only the repositories the App is installed on.
 
-A sync rule should render only `oauth_token`: dotvault owns the rotation, so keep the refresh token out of files.
+### Keep the refresh token out of files
+
+A sync rule should render only `oauth_token`: dotvault owns the rotation, so keep the refresh token out of files. The same applies to the other ways of reading the secret. The [filesystem mount](../guide/filesystem.md) shows every field of `gh.json`, and a [Docker volume](../guide/docker-volumes.md) that selects `gh` (or the whole key space, its default) publishes them to containers. No client secret is needed to use a refresh token, so anything that can read it can mint access tokens, and spending it takes the credential away from dotvault. Leave `gh` out of a volume's `secrets=` list once it holds a refresh token.
 
 ## GitHub Enterprise Server
 
-For GitHub Enterprise Server, set the `host` in settings:
+For GitHub Enterprise Server, set the `host` in settings. Enterprise Server does not issue expiring tokens today, so `token_lifetime: expiring` has no effect there and you get an ordinary token.
 
 ```yaml
 enrolments:

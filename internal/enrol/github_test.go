@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,6 +124,127 @@ func fakeGitHubTokenEndpoint(t *testing.T, respond func(w http.ResponseWriter, f
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &calls
+}
+
+// fakeGitHubDeviceFlow serves the device-code and token endpoints the way
+// github.com does: the token endpoint answers with a refresh token only when
+// the code request carried offline_access, so the fake rewards exactly what the
+// real server does. It reports the scope the engine actually sent.
+func fakeGitHubDeviceFlow(t *testing.T) (*httptest.Server, *string) {
+	t.Helper()
+	var scope string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		scope = r.PostForm.Get("scope")
+		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+		fmt.Fprint(w, url.Values{
+			"device_code":      {"dc"},
+			"user_code":        {"ABCD-1234"},
+			"verification_uri": {"https://example.test/device"},
+			"expires_in":       {"60"},
+			"interval":         {"1"},
+		}.Encode())
+	})
+	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
+		v := url.Values{"access_token": {"gho_new"}, "token_type": {"bearer"}}
+		if strings.Contains(scope, "offline_access") {
+			v.Set("refresh_token", "ghr_new")
+			v.Set("expires_in", "28800")
+			v.Set("refresh_token_expires_in", "15811200")
+		}
+		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+		fmt.Fprint(w, v.Encode())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &scope
+}
+
+func TestGitHubRunTokenLifetime(t *testing.T) {
+	// A test run must not replace the developer's clipboard.
+	orig := copyToClipboard
+	copyToClipboard = func(string) {}
+	t.Cleanup(func() { copyToClipboard = orig })
+
+	tests := []struct {
+		name        string
+		settings    map[string]any
+		wantScope   string
+		wantRefresh bool
+	}{
+		{
+			name:      "unset requests no refresh token",
+			wantScope: "repo read:org gist",
+		},
+		{
+			name:      "non-expiring requests no refresh token",
+			settings:  map[string]any{"token_lifetime": "non-expiring"},
+			wantScope: "repo read:org gist",
+		},
+		{
+			name:        "expiring requests offline_access with the default scopes",
+			settings:    map[string]any{"token_lifetime": "expiring"},
+			wantScope:   "repo read:org gist offline_access",
+			wantRefresh: true,
+		},
+		{
+			name: "expiring keeps a custom scope list",
+			settings: map[string]any{
+				"token_lifetime": "expiring",
+				"scopes":         []any{"repo", "workflow"},
+			},
+			wantScope:   "repo workflow offline_access",
+			wantRefresh: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, scope := fakeGitHubDeviceFlow(t)
+			settings := map[string]any{"host": srv.URL}
+			for k, v := range tt.settings {
+				settings[k] = v
+			}
+			e := &GitHubEngine{httpClient: srv.Client()}
+			got, err := e.Run(context.Background(), settings, IO{
+				Out: io.Discard,
+				In:  strings.NewReader("\n"),
+				Log: slog.New(slog.DiscardHandler),
+			})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if *scope != tt.wantScope {
+				t.Errorf("scope sent = %q, want %q", *scope, tt.wantScope)
+			}
+			if got["oauth_token"] != "gho_new" {
+				t.Errorf("oauth_token = %q", got["oauth_token"])
+			}
+			if _, ok := got["refresh_token"]; ok != tt.wantRefresh {
+				t.Errorf("refresh_token present = %v, want %v", ok, tt.wantRefresh)
+			}
+			if _, ok := got["expires_at"]; ok != tt.wantRefresh {
+				t.Errorf("expires_at present = %v, want %v", ok, tt.wantRefresh)
+			}
+		})
+	}
+
+	t.Run("an invalid value fails before contacting GitHub", func(t *testing.T) {
+		srv, scope := fakeGitHubDeviceFlow(t)
+		e := &GitHubEngine{httpClient: srv.Client()}
+		_, err := e.Run(context.Background(), map[string]any{
+			"host":           srv.URL,
+			"token_lifetime": "forever",
+		}, IO{Out: io.Discard, In: strings.NewReader("")})
+		if err == nil || !strings.Contains(err.Error(), "token_lifetime") {
+			t.Fatalf("err = %v, want a token_lifetime error", err)
+		}
+		if *scope != "" {
+			t.Errorf("device code was requested with scope %q", *scope)
+		}
+	})
 }
 
 func TestGitHubRefresh(t *testing.T) {

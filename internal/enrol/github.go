@@ -16,6 +16,7 @@ import (
 	"github.com/cli/oauth"
 	"github.com/cli/oauth/api"
 
+	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/httpproxy"
 )
 
@@ -33,17 +34,20 @@ var githubDefaultScopes = []string{"repo", "read:org", "gist"}
 
 // GitHubEngine performs a GitHub OAuth device flow.
 //
-// Whether the credential expires is GitHub's decision, not dotvault's: a
-// classic OAuth app (the GitHub CLI's default client ID among them) issues a
-// token that never expires, while a GitHub App with user-token expiration
-// returns an 8-hour access token alongside a refresh token. The engine records whatever came back. When the response
+// Whether the credential expires is GitHub's decision, but the client can ask.
+// token_lifetime: expiring sets oauth.Flow.RequestRefreshToken, which adds the
+// offline_access scope to the device flow, as `gh auth login --expiring` does;
+// that works with the default client ID. A GitHub App with user-token
+// expiration returns an expiring token unasked. The request is a preference:
+// a host without support (GitHub Enterprise Server, today) answers with an
+// ordinary token, so the engine records whatever came back. When the response
 // carried a refresh token and an expiry, the secret gains refresh_token,
 // issued_at and expires_at and the RefreshManager rotates it past half-life,
 // exactly as it does for JFrog and Databricks; when it did not, the secret is
 // what it always was, and the RefreshManager skips it (no expires_at). Note
-// the converse trap: switching client_id on an existing classic enrolment
-// changes nothing until the user re-runs `dotvault enrol`, since Fields()
-// already reports the old secret complete.
+// the trap: changing token_lifetime or client_id on an existing non-expiring
+// enrolment changes nothing until the user re-runs `dotvault enrol`, since
+// Fields() already reports the old secret complete.
 type GitHubEngine struct {
 	// httpClient overrides the proxy-aware client built from settings.
 	// Tests only.
@@ -56,7 +60,7 @@ func (e *GitHubEngine) Name() string { return "GitHub" }
 
 // Fields is deliberately the non-expiring shape only. refresh_token,
 // issued_at and expires_at exist only when GitHub issued an expiring token,
-// so listing them would mark every classic-OAuth-app enrolment incomplete.
+// so listing them would mark every non-expiring enrolment incomplete.
 func (e *GitHubEngine) Fields() []string { return []string{"oauth_token"} }
 
 func (e *GitHubEngine) clock() time.Time {
@@ -103,6 +107,11 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 
 	hostURL := githubHostURL(settings)
 
+	expiring, err := config.GitHubTokenLifetime(settings)
+	if err != nil {
+		return nil, err
+	}
+
 	scopes := githubDefaultScopes
 	if raw, ok := settings["scopes"]; ok {
 		sl, ok := raw.([]any)
@@ -136,12 +145,13 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 	}
 
 	flow := &oauth.Flow{
-		Host:       host,
-		ClientID:   clientID,
-		Scopes:     scopes,
-		HTTPClient: httpClient,
-		Stdout:     io.Out,
-		Stdin:      in,
+		Host:                host,
+		ClientID:            clientID,
+		Scopes:              scopes,
+		RequestRefreshToken: expiring,
+		HTTPClient:          httpClient,
+		Stdout:              io.Out,
+		Stdin:               in,
 		DisplayCode: func(userCode, verificationURI string) error {
 			copyToClipboard(userCode)
 			fmt.Fprintf(io.Out, "! First, copy your one-time code: %s\n", userCode)

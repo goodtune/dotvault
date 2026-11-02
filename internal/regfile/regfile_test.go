@@ -1388,3 +1388,27 @@ func TestTokenSocketsAbsentSurvivesYAMLExport(t *testing.T) {
 		t.Errorf("peer sockets after export/import: got %v, want the defaults %v", got, want)
 	}
 }
+
+// token_lifetime is a string, not a boolean, precisely so it survives this
+// conversion: writeSetting refuses a bool, which would fail reg-import for
+// any config that used it.
+func TestGitHubTokenLifetimeRoundTrip(t *testing.T) {
+	cfg := &config.Config{
+		Vault: config.VaultConfig{Address: "https://vault.example.com:8200"},
+		Rules: []config.Rule{{
+			Name:     "gh",
+			VaultKey: "gh",
+			Target:   config.Target{Path: "~/gh.yml", Format: "yaml"},
+		}},
+		Enrolments: map[string]config.Enrolment{
+			"gh": {Engine: "github", Settings: map[string]any{"token_lifetime": "expiring"}},
+		},
+	}
+	got, err := Parse([]byte(mustGenerate(t, cfg)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if v := got.Enrolments["gh"].Settings["token_lifetime"]; v != "expiring" {
+		t.Errorf("token_lifetime = %v, want expiring", v)
+	}
+}

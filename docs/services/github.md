@@ -38,6 +38,7 @@ enrolments:
         - read:org
         - gist
         - workflow
+      token_lifetime: expiring                  # default: non-expiring
       https_proxy: http://squid.example.com:3128   # default: system proxy machinery
 ```
 
@@ -48,6 +49,7 @@ enrolments:
 | `client_id` | `178c6fc778ccc68e1d6a` (GitHub CLI's app) | OAuth application client ID |
 | `host` | `github.com` | GitHub host (for GitHub Enterprise Server) |
 | `scopes` | `repo`, `read:org`, `gist` | OAuth scopes to request |
+| `token_lifetime` | `non-expiring` | `expiring` asks GitHub for a short-lived token that dotvault rotates automatically (see [Expiring tokens](#expiring-tokens-and-automatic-refresh)). A quoted string, not a boolean, so that it round-trips through the Windows registry; any other value is a config error. |
 | `https_proxy` | host's system proxy machinery | Override HTTPS proxy for all outbound calls from this enrolment. `http_proxy` is accepted as an alias. |
 
 ## Behind a corporate proxy
@@ -99,7 +101,27 @@ The engine writes these fields to the Vault KV secret:
 
 ## Expiring tokens and automatic refresh
 
-Whether a GitHub token expires is decided by the OAuth client, not by dotvault. A classic OAuth app — including the GitHub CLI's, which is the default `client_id` — issues a token that never expires, and the secret holds just `oauth_token` and `user`, exactly as before. A **GitHub App** with user-to-server token expiration enabled instead returns an access token valid for eight hours together with a refresh token valid for about six months.
+By default dotvault asks for an ordinary token that never expires, and the secret holds just `oauth_token` and `user`. To get a short-lived token instead, set `token_lifetime`:
+
+```yaml
+enrolments:
+  gh:
+    engine: github
+    settings:
+      token_lifetime: expiring
+```
+
+This works with the default `client_id`; no app registration is needed. dotvault adds the `offline_access` scope to the device flow, which is what `gh auth login --expiring` does, and GitHub returns an access token valid for eight hours together with a refresh token valid for about six months. Your OAuth scopes are unchanged, so the token reaches the same repositories as before.
+
+`token_lifetime: expiring` is a request, not a guarantee. GitHub decides what to issue, and hosts without support — GitHub Enterprise Server, today — return an ordinary token, which dotvault stores and uses as usual. Only github.com and GHE.com (`*.ghe.com`) hosts are known to support it.
+
+Changing the setting does not replace an existing enrolment, because a secret already holding an `oauth_token` counts as complete. Run the enrolment again to obtain the expiring token:
+
+```sh
+dotvault enrol gh
+```
+
+Keep the daemon running once you switch. The access token lasts eight hours and only the daemon rotates it, so a host with no daemon running for longer than that is left with an expired token until a daemon next refreshes it.
 
 When the device flow returns a refresh token and an expiry, dotvault stores `refresh_token`, `issued_at` and `expires_at` alongside the token, and the daemon's refresh manager rotates it the same way it rotates JFrog and Databricks credentials:
 
@@ -110,9 +132,9 @@ When the device flow returns a refresh token and an expiry, dotvault stores `ref
 
 Refresh requires an `https://` host (loopback excepted): the refresh token is long-lived, and the response decides whether the secret is wiped, so neither is sent or trusted over cleartext.
 
-### Switching to a GitHub App
+### Using a GitHub App
 
-Register a GitHub App with **Expire user authorization tokens** and **Enable Device Flow** turned on, and point the enrolment at it:
+You do not need a GitHub App for expiring tokens, but if you already use one, register it with **Expire user authorization tokens** and **Enable Device Flow** turned on and point the enrolment at it:
 
 ```yaml
 enrolments:
@@ -122,13 +144,9 @@ enrolments:
       client_id: "Iv23li..."   # the GitHub App's client ID
 ```
 
-Changing `client_id` does not by itself replace an existing enrolment: a secret already holding an `oauth_token` counts as complete, and one from a classic OAuth app carries no `expires_at`, so the refresh manager leaves it alone. Run the enrolment again to obtain the expiring token:
+Such an app returns an expiring token whether or not `token_lifetime` is set. As with `token_lifetime`, changing `client_id` does not replace an existing enrolment: run `dotvault enrol gh` again, or delete the secret and let the daemon's enrolment check prompt for it. A GitHub App's user token carries the permissions granted to the App rather than OAuth scopes, so the `scopes` setting has no effect for one, and it reaches only the repositories the App is installed on.
 
-```sh
-dotvault enrol gh
-```
-
-(or delete the secret and let the daemon's enrolment check prompt for it). A GitHub App's user token carries the permissions granted to the App rather than OAuth scopes, so the `scopes` setting has no effect for one. A sync rule should render only `oauth_token`: dotvault owns the rotation, so keep the refresh token out of files.
+A sync rule should render only `oauth_token`: dotvault owns the rotation, so keep the refresh token out of files.
 
 ## GitHub Enterprise Server
 

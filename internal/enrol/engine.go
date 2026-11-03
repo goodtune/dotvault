@@ -2,7 +2,9 @@ package enrol
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -217,4 +219,19 @@ func UnregisterEngine(name string) {
 	enginesMu.Lock()
 	defer enginesMu.Unlock()
 	delete(engines, name)
+}
+
+// stringifyField renders an existing KVv2 value as the string the engine
+// contract carries: strings verbatim, anything else as JSON so it is kept
+// rather than dropped. Shared by the copy and slack engines' merges. (The
+// client facade's stringifyField uses %v instead; the two are unrelated.)
+func stringifyField(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(b)
 }

@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/goodtune/dotvault/internal/vault"
 )
 
 func slackSettings(ws ...string) map[string]any {
@@ -82,11 +87,49 @@ func TestSlackRunNeedsACookie(t *testing.T) {
 	if _, err := e.Run(context.Background(), slackSettings("acme"), pasteIO("just some text")); err == nil || !strings.Contains(err.Error(), "no d cookie") {
 		t.Fatalf("err = %v", err)
 	}
-	if _, err := e.Run(context.Background(), slackSettings("acme"), IO{}); err == nil {
-		t.Fatal("no PromptSecret: want an error")
+	if _, err := e.Run(context.Background(), slackSettings("acme"), IO{}); err == nil || !strings.Contains(err.Error(), "PromptSecret") {
+		t.Fatalf("no PromptSecret: err = %v", err)
+	}
+	failing := IO{PromptSecret: func(string) (string, error) { return "", errors.New("cancelled") }}
+	if out, err := e.Run(context.Background(), slackSettings("acme"), failing); err == nil || out != nil {
+		t.Fatalf("prompt error: out = %v, err = %v", out, err)
+	}
+	// No Out at all is fine: nothing to print to.
+	quiet := IO{PromptSecret: func(string) (string, error) { return "xoxd-good", nil }}
+	if out, err := e.Run(context.Background(), slackSettings("acme"), quiet); err != nil || decodeCred(t, out["acme"]).Cookie != "xoxd-good" {
+		t.Fatalf("nil Out: out = %v, err = %v", out, err)
 	}
 	if _, err := e.Run(context.Background(), map[string]any{}, pasteIO("xoxd-good")); err == nil {
 		t.Fatal("no workspaces: want an error")
+	}
+}
+
+func TestSlackRunFailsWhenTheSecretCannotBeRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	vc, err := vault.NewClient(vault.Config{Address: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vc.SetToken("t")
+	eio := pasteIO("xoxd-good")
+	eio.Vault, eio.KVMount, eio.TargetPath = vc, "kv", "users/u/slack/slk"
+	// Writing without the existing fields would drop them, so nothing is written.
+	if out, err := (&SlackEngine{}).Run(context.Background(), slackSettings("acme"), eio); err == nil || out != nil {
+		t.Fatalf("out = %v, err = %v", out, err)
+	}
+}
+
+func TestStringifyField(t *testing.T) {
+	for in, want := range map[any]string{"plain": "plain", true: "true", 3.5: "3.5"} {
+		if got := stringifyField(in); got != want {
+			t.Errorf("stringifyField(%v) = %q, want %q", in, got, want)
+		}
+	}
+	if got := stringifyField(map[string]any{"a": 1}); got != `{"a":1}` {
+		t.Errorf("object = %q, want JSON", got)
 	}
 }
 
@@ -107,6 +150,7 @@ func TestParseSlackCookie(t *testing.T) {
 		"decoded":     "xoxd-abc/def",
 		"bare + semi": "xoxd-abc%2Fdef;",
 		"bare CRLF":   "\r\nxoxd-abc%2Fdef\r\n",
+		"ps + space":  `New-Object System.Net.Cookie("d", "xoxd-abc%2Fdef", "/", ".slack.com")`,
 		// Chrome's Copy as cURL (cmd) escapes % as ^%.
 		"cmd escaped %": `curl ^"https://x.slack.com/api/a^" -H ^"cookie: d=xoxd-abc^%^2Fdef; x=2^"`,
 		// A web form input drops the newlines of a multi-line paste.

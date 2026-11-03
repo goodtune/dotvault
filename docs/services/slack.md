@@ -26,7 +26,9 @@ Point slk at the secret with its `[vault]` section: `secret = "slack/slk"`.
 
 dotvault keeps only the `d` cookie from what you paste and stores it for every listed workspace, since one cookie covers every workspace that browser is signed in to. It does not check the cookie with Slack; a wrong or signed-out cookie shows up when slk starts, as a warning naming the workspace. To replace the session, run `dotvault enrol slack/slk` again.
 
-Adding a workspace to `workspaces` brings the enrolment back as pending. Fields already in the secret that are not listed are kept; remove one with `dotvault kv patch`.
+Adding a workspace to `workspaces` brings the enrolment back as pending. Fields already in the secret that this enrolment does not write (unlisted workspaces, anything another tool wrote) are kept; remove one with `dotvault kv patch`.
+
+slk refuses a field whose `domain` is not its own name, and sends the cookie only to `<domain>.slack.com` after checking `domain` is a Slack subdomain.
 
 ## Vault schema
 

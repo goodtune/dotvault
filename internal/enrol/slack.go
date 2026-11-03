@@ -106,7 +106,8 @@ func (e *SlackEngine) Run(ctx context.Context, settings map[string]any, eio IO) 
 		out[domain] = string(b)
 	}
 	if eio.Out != nil {
-		fmt.Fprintf(eio.Out, "✓ Session stored for %s\n", strings.Join(workspaces, ", "))
+		// Stored, not verified: slk warns at startup if Slack refuses it.
+		fmt.Fprintf(eio.Out, "✓ Session stored for %s (slk checks it when it starts)\n", strings.Join(workspaces, ", "))
 	}
 	return out, nil
 }
@@ -115,7 +116,7 @@ var (
 	// d=xoxd-… in a Cookie header, a -b argument or a $session cookie line.
 	slackDCookieRE = regexp.MustCompile(`(?:^|[^A-Za-z0-9_-])d=(xoxd-[^;\s"'\\]+)`)
 	// PowerShell's Copy as PowerShell: New-Object System.Net.Cookie("d", "xoxd-…", …).
-	slackPSCookieRE = regexp.MustCompile(`Cookie\(\s*"d"\s*,\s*"(xoxd-[^"]+)"`)
+	slackPSCookieRE = regexp.MustCompile(`Cookie\(\s*"d"\s*,\s*"(xoxd-[^"\s;]+)"`)
 	// A bare xoxd-… value on its own line.
 	slackBareCookieRE = regexp.MustCompile(`(?m)^[ \t]*(xoxd-[^;\s"'\\]+);?[ \t]*\r?$`)
 )
@@ -144,18 +145,4 @@ func parseSlackCookie(paste string) string {
 		cookie = url.QueryEscape(cookie)
 	}
 	return cookie
-}
-
-// stringifyField renders an existing KVv2 value as the string the engine
-// contract carries: strings verbatim, anything else as JSON so it is kept
-// rather than dropped. Shared by the copy and slack engines' merges.
-func stringifyField(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprint(v)
-	}
-	return string(b)
 }

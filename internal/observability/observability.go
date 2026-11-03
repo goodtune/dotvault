@@ -1073,7 +1073,7 @@ func RecordPeerPool(ctx context.Context, event string) {
 
 // RecordEnrolAttempt records an enrolment attempt by engine and outcome.
 // Engine values pass through classifyEngine in internal/enrol, so the
-// label is one of {"copy","databricks","github","jfrog","ssh","unknown"}. Outcomes
+// label is one of {"copy","databricks","ghp","github","jfrog","slack","ssh","unknown"}. Outcomes
 // emitted today: "completed", "error".
 func RecordEnrolAttempt(ctx context.Context, engine, outcome string) {
 	instrMu.RLock()

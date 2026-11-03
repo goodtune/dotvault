@@ -4,73 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"net/http"
-	"net/http/httptest"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 )
-
-// fakeSlack serves a workspace page and auth.test for any domain (the first
-// path segment), signed in only for the cookie good. Domain "limited" answers
-// its first page load with a 429.
-type fakeSlack struct {
-	srv     *httptest.Server
-	good    string
-	pages   atomic.Int32
-	limited atomic.Bool
-}
-
-func newFakeSlack(t *testing.T, good string) *fakeSlack {
-	t.Helper()
-	f := &fakeSlack{good: good}
-	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		domain, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
-		cookie := ""
-		if c, err := r.Cookie("d"); err == nil {
-			cookie = c.Value
-		}
-		switch rest {
-		case "":
-			f.pages.Add(1)
-			if domain == "alwayslimited" || domain == "limited" && !f.limited.Swap(true) {
-				w.Header().Set("Retry-After", "0")
-				w.WriteHeader(http.StatusTooManyRequests)
-				return
-			}
-			if cookie != f.good || domain == "signedout" {
-				_, _ = w.Write([]byte(`<html>Sign in to Slack</html>`))
-				return
-			}
-			_, _ = w.Write([]byte(`<script>var boot = {"api_token":"xoxc-` + domain + `-` + strconv.Itoa(int(f.pages.Load())) + `","x":1}</script>`))
-		case "api/auth.test":
-			_ = r.ParseForm()
-			if cookie != f.good || !strings.HasPrefix(r.Form.Get("token"), "xoxc-"+domain) {
-				_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_auth"}`))
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"ok": true, "team": strings.ToUpper(domain), "team_id": "T-" + domain, "user_id": "U1",
-			})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(f.srv.Close)
-	return f
-}
-
-func (f *fakeSlack) engine(now time.Time) *SlackEngine {
-	return &SlackEngine{
-		pageURL:    func(d string) string { return f.srv.URL + "/" + d + "/" },
-		apiURL:     func(d, m string) string { return f.srv.URL + "/" + d + "/api/" + m },
-		httpClient: f.srv.Client(),
-		now:        func() time.Time { return now },
-	}
-}
 
 func slackSettings(ws ...string) map[string]any {
 	list := make([]any, len(ws))
@@ -96,24 +32,23 @@ func decodeCred(t *testing.T, s string) SlackCredential {
 	return c
 }
 
-var slackNow = time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
-
-func TestSlackRunMintsEveryWorkspace(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
+func TestSlackRunStoresTheCookieForEveryWorkspace(t *testing.T) {
 	curl := `curl 'https://acme.slack.com/api/client.counts' -H 'cookie: b=x; d=xoxd-good; d-s=1' --data-raw 'token=xoxc-old'`
-	out, err := f.engine(slackNow).Run(context.Background(), slackSettings("acme", "beta"), pasteIO(curl))
+	out, err := (&SlackEngine{}).Run(context.Background(), slackSettings("acme", "beta"), pasteIO(curl))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range []string{"acme", "beta"} {
-		c := decodeCred(t, out[d])
-		if c.Domain != d || c.TeamID != "T-"+d || c.TeamName != strings.ToUpper(d) || c.UserID != "U1" ||
-			c.Cookie != "xoxd-good" || !strings.HasPrefix(c.AccessToken, "xoxc-"+d) {
-			t.Errorf("%s credential = %+v", d, c)
-		}
+	if len(out) != 2 {
+		t.Fatalf("out = %v, want exactly the two workspace fields", out)
 	}
-	if out["issued_at"] != "2026-11-03T12:00:00Z" || out["expires_at"] != "2026-11-04T12:00:00Z" {
-		t.Errorf("timestamps = %q / %q", out["issued_at"], out["expires_at"])
+	for _, d := range []string{"acme", "beta"} {
+		if c := decodeCred(t, out[d]); c != (SlackCredential{Domain: d, Cookie: "xoxd-good"}) {
+			t.Errorf("%s = %+v", d, c)
+		}
+		// The contract with slk: no access token, which slk mints itself.
+		if strings.Contains(out[d], "access_token") || strings.Contains(out[d], "xoxc-") {
+			t.Errorf("%s carries a token: %q", d, out[d])
+		}
 	}
 	// The field set the manager checks for completeness is the workspaces.
 	if got := (&SlackEngine{}).FieldsFromSettings(slackSettings("acme", "beta")); strings.Join(got, ",") != "acme,beta" {
@@ -121,168 +56,44 @@ func TestSlackRunMintsEveryWorkspace(t *testing.T) {
 	}
 }
 
-func TestSlackRunRefusesWithoutWritingWhenAWorkspaceFails(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	// acme mints, then signedout refuses: the run returns nothing at all,
-	// not acme alone, which would count as complete without signedout.
-	out, err := f.engine(slackNow).Run(context.Background(), slackSettings("acme", "signedout"), pasteIO("xoxd-good"))
-	if err == nil || !strings.Contains(err.Error(), "signedout.slack.com did not accept that session") {
-		t.Fatalf("err = %v", err)
-	}
-	if out != nil {
-		t.Errorf("out = %v, want nothing", out)
-	}
-}
-
 func TestSlackRunMergesTheExistingSecret(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
 	fv := newFakeVault("kv")
 	fv.secrets["users/u/slack/slk"] = map[string]string{
-		"gone": `{"domain":"gone","cookie":"xoxd-old","team_id":"T9","access_token":"xoxc-old"}`,
+		"gone": `{"domain":"gone","cookie":"xoxd-old"}`,
 		"note": "written by hand",
+		"acme": `{"domain":"acme","cookie":"xoxd-stale"}`,
 	}
 	eio := pasteIO("xoxd-good")
 	eio.Vault, eio.KVMount, eio.TargetPath = fv.serve(t), "kv", "users/u/slack/slk"
-	out, err := f.engine(slackNow).Run(context.Background(), slackSettings("acme"), eio)
+	out, err := (&SlackEngine{}).Run(context.Background(), slackSettings("acme"), eio)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decodeCred(t, out["acme"]).TeamID != "T-acme" {
-		t.Errorf("acme not minted: %v", out)
+	if decodeCred(t, out["acme"]).Cookie != "xoxd-good" {
+		t.Errorf("acme not replaced with the new session: %v", out)
 	}
-	if out["note"] != "written by hand" || !strings.Contains(out["gone"], "xoxc-old") {
-		t.Errorf("fields this run does not produce must be kept: %v", out)
+	if out["note"] != "written by hand" || !strings.Contains(out["gone"], "xoxd-old") {
+		t.Errorf("fields this run does not write must be kept: %v", out)
 	}
 }
 
 func TestSlackRunNeedsACookie(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	_, err := f.engine(slackNow).Run(context.Background(), slackSettings("acme"), pasteIO("just some text"))
-	if err == nil || !strings.Contains(err.Error(), "no d cookie") {
+	e := &SlackEngine{}
+	if _, err := e.Run(context.Background(), slackSettings("acme"), pasteIO("just some text")); err == nil || !strings.Contains(err.Error(), "no d cookie") {
 		t.Fatalf("err = %v", err)
 	}
-	if _, err := f.engine(slackNow).Run(context.Background(), slackSettings("acme"), IO{}); err == nil {
+	if _, err := e.Run(context.Background(), slackSettings("acme"), IO{}); err == nil {
 		t.Fatal("no PromptSecret: want an error")
 	}
-	if _, err := f.engine(slackNow).Run(context.Background(), map[string]any{}, pasteIO("xoxd-good")); err == nil {
+	if _, err := e.Run(context.Background(), map[string]any{}, pasteIO("xoxd-good")); err == nil {
 		t.Fatal("no workspaces: want an error")
 	}
 }
 
-func TestSlackRetriesRateLimit(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	out, err := f.engine(slackNow).Run(context.Background(), slackSettings("limited"), pasteIO("xoxd-good"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decodeCred(t, out["limited"]).TeamID != "T-limited" {
-		t.Errorf("out = %v", out)
-	}
-	if n := f.pages.Load(); n != 2 {
-		t.Errorf("page loads = %d, want 2 (one 429, one retry)", n)
-	}
-}
-
-func TestSlackRefreshReMintsAndKeepsOtherFields(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	old, _ := json.Marshal(SlackCredential{Domain: "acme", TeamID: "T-acme", AccessToken: "xoxc-stale", Cookie: "xoxd-good"})
-	existing := map[string]string{
-		"acme":       string(old),
-		"issued_at":  "2026-11-01T00:00:00Z",
-		"expires_at": "2026-11-02T00:00:00Z",
-		"note":       "written by hand",
-	}
-	settings := slackSettings("acme")
-	settings["refresh_interval"] = "6h"
-	out, err := f.engine(slackNow).Refresh(context.Background(), settings, existing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c := decodeCred(t, out["acme"]); c.AccessToken == "xoxc-stale" || !strings.HasPrefix(c.AccessToken, "xoxc-acme") {
-		t.Errorf("token not re-minted: %+v", c)
-	}
-	if out["note"] != "written by hand" {
-		t.Errorf("other field lost: %v", out)
-	}
-	if out["expires_at"] != "2026-11-03T18:00:00Z" {
-		t.Errorf("expires_at = %q, want refresh_interval after now", out["expires_at"])
-	}
-	if existing["acme"] != string(old) {
-		t.Error("Refresh must not write its input")
-	}
-}
-
-func TestSlackRefreshOnlyTheConfiguredWorkspaces(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	live, _ := json.Marshal(SlackCredential{Domain: "acme", Cookie: "xoxd-good"})
-	dead := `{"domain":"gone","cookie":"xoxd-expired","access_token":"xoxc-old"}`
-	out, err := f.engine(slackNow).Refresh(context.Background(), slackSettings("acme"),
-		map[string]string{"acme": string(live), "gone": dead})
-	if err != nil {
-		t.Fatalf("a dead cookie on a workspace no longer listed must not revoke the secret: %v", err)
-	}
-	if out["gone"] != dead {
-		t.Errorf("unlisted field changed: %q", out["gone"])
-	}
-	if !strings.HasPrefix(decodeCred(t, out["acme"]).AccessToken, "xoxc-acme") {
-		t.Errorf("acme not re-minted: %v", out)
-	}
-}
-
-func TestSlackRefreshRefusesAForeignDomain(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	for _, domain := range []string{"other", "evil.example/?"} {
-		cred, _ := json.Marshal(SlackCredential{Domain: domain, Cookie: "xoxd-good"})
-		before := f.pages.Load()
-		_, err := f.engine(slackNow).Refresh(context.Background(), slackSettings("acme"), map[string]string{"acme": string(cred)})
-		if err == nil || errors.Is(err, ErrRevoked) {
-			t.Errorf("domain %q: err = %v, want a refusal", domain, err)
-		}
-		if f.pages.Load() != before {
-			t.Errorf("domain %q: the cookie was sent somewhere", domain)
-		}
-	}
-}
-
-func TestSlackRefreshWithNothingEnrolledIsAnError(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	_, err := f.engine(slackNow).Refresh(context.Background(), slackSettings("acme"),
-		map[string]string{"issued_at": "2026-11-01T00:00:00Z", "expires_at": "2026-11-02T00:00:00Z"})
-	if err == nil {
-		t.Fatal("want an error, not a fresh stamp on a secret with no workspace")
-	}
-}
-
-func TestSlackRateLimitGivesUp(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	_, err := f.engine(slackNow).Run(context.Background(), slackSettings("alwayslimited"), pasteIO("xoxd-good"))
-	if err == nil || !strings.Contains(err.Error(), "429") {
-		t.Fatalf("err = %v", err)
-	}
-	if n := f.pages.Load(); n != slackMaxAttempts {
-		t.Errorf("page loads = %d, want %d", n, slackMaxAttempts)
-	}
-}
-
-func TestSlackRefreshDeadCookieIsRevoked(t *testing.T) {
-	f := newFakeSlack(t, "xoxd-good")
-	dead, _ := json.Marshal(SlackCredential{Domain: "acme", AccessToken: "xoxc-x", Cookie: "xoxd-expired"})
-	_, err := f.engine(slackNow).Refresh(context.Background(), slackSettings("acme"), map[string]string{"acme": string(dead)})
-	if !errors.Is(err, ErrRevoked) {
-		t.Fatalf("err = %v, want ErrRevoked", err)
-	}
-}
-
-func TestSlackRefreshTransientIsNotRevoked(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-	}))
-	defer srv.Close()
-	e := &SlackEngine{pageURL: func(string) string { return srv.URL }, httpClient: srv.Client()}
-	cred, _ := json.Marshal(SlackCredential{Domain: "acme", Cookie: "xoxd-good"})
-	_, err := e.Refresh(context.Background(), slackSettings("acme"), map[string]string{"acme": string(cred)})
-	if err == nil || errors.Is(err, ErrRevoked) {
-		t.Fatalf("err = %v, want a transient (non-revoked) error", err)
+func TestSlackEngineIsNotARefresher(t *testing.T) {
+	// There is no token to rotate: slk mints its own from the cookie.
+	if _, ok := any(&SlackEngine{}).(Refresher); ok {
+		t.Error("the slack engine must not refresh anything")
 	}
 }
 

@@ -1,27 +1,12 @@
 package config
 
-import (
-	"fmt"
-	"time"
-)
-
-// SlackReservedFields are the field names the slack engine writes beside its
-// workspace fields, so no workspace may be named after one.
-var SlackReservedFields = []string{"issued_at", "expires_at"}
-
-// DefaultSlackRefreshInterval is how long a slack enrolment's minted tokens
-// are treated as valid; the RefreshManager re-mints past half of it.
-const DefaultSlackRefreshInterval = 24 * time.Hour
-
-// minSlackRefreshInterval keeps a misconfigured enrolment from re-minting
-// every workspace (one page load each) every few minutes.
-const minSlackRefreshInterval = time.Hour
+import "fmt"
 
 // SlackWorkspaces returns a slack enrolment's workspaces setting: the Slack
 // subdomains (acme for acme.slack.com) it enrols, each also the name of its
 // field in the secret. It is the one definition of the setting, shared by
 // config load and the engine. At least one is required; a name must be a
-// valid subdomain, unique, and not one of SlackReservedFields.
+// valid subdomain and unique.
 func SlackWorkspaces(settings map[string]any) ([]string, error) {
 	raw, ok := settings["workspaces"]
 	if !ok {
@@ -44,11 +29,6 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 		if err := ValidSlackSubdomain(s); err != nil {
 			return nil, fmt.Errorf("workspaces entry %q: %w", s, err)
 		}
-		for _, r := range SlackReservedFields {
-			if s == r {
-				return nil, fmt.Errorf("workspaces entry %q is reserved for the engine's own bookkeeping", s)
-			}
-		}
 		if seen[s] {
 			return nil, fmt.Errorf("workspaces entry %q is listed twice", s)
 		}
@@ -60,8 +40,8 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 
 // ValidSlackSubdomain applies Slack's workspace URL rule: lowercase letters,
 // digits and hyphens, 1–63 bytes, no leading or trailing hyphen. Being a
-// single DNS label is also what makes it safe to put in a URL host: the slack
-// engine re-checks it on every domain it is about to send a cookie to.
+// single DNS label is also what makes it safe for slk to put in a URL host
+// in front of .slack.com.
 func ValidSlackSubdomain(s string) error {
 	if s == "" || len(s) > 63 {
 		return fmt.Errorf("must be 1-63 characters")
@@ -76,25 +56,4 @@ func ValidSlackSubdomain(s string) error {
 		}
 	}
 	return nil
-}
-
-// SlackRefreshInterval returns a slack enrolment's refresh_interval setting:
-// how long minted tokens are treated as valid (default 24h, minimum 1h).
-func SlackRefreshInterval(settings map[string]any) (time.Duration, error) {
-	raw, ok := settings["refresh_interval"]
-	if !ok {
-		return DefaultSlackRefreshInterval, nil
-	}
-	s, ok := raw.(string)
-	if !ok {
-		return 0, fmt.Errorf("refresh_interval must be a duration string, got %T", raw)
-	}
-	d, err := ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("refresh_interval %q: %w", s, err)
-	}
-	if d < minSlackRefreshInterval {
-		return 0, fmt.Errorf("refresh_interval %q is below the 1h minimum", s)
-	}
-	return d, nil
 }

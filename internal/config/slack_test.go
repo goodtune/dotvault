@@ -3,7 +3,6 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestSlackWorkspaces(t *testing.T) {
@@ -19,25 +18,10 @@ func TestSlackWorkspaces(t *testing.T) {
 		"upper":     {"workspaces": []any{"Acme"}},
 		"dotted":    {"workspaces": []any{"acme.slack.com"}},
 		"leading -": {"workspaces": []any{"-acme"}},
-		"reserved":  {"workspaces": []any{"expires_at"}},
 		"duplicate": {"workspaces": []any{"acme", "acme"}},
 	} {
 		if _, err := SlackWorkspaces(settings); err == nil || !strings.HasPrefix(err.Error(), "workspaces") {
 			t.Errorf("%s: err = %v, want one naming the setting", name, err)
-		}
-	}
-}
-
-func TestSlackRefreshInterval(t *testing.T) {
-	if d, err := SlackRefreshInterval(map[string]any{}); err != nil || d != DefaultSlackRefreshInterval {
-		t.Errorf("default = %v, %v", d, err)
-	}
-	if d, err := SlackRefreshInterval(map[string]any{"refresh_interval": "2d"}); err != nil || d != 48*time.Hour {
-		t.Errorf("2d = %v, %v", d, err)
-	}
-	for _, v := range []any{"30m", "soon", 5} {
-		if _, err := SlackRefreshInterval(map[string]any{"refresh_interval": v}); err == nil {
-			t.Errorf("%v: want an error", v)
 		}
 	}
 }

@@ -281,10 +281,10 @@ enrolments:
       resulting token so it can keep your local config in sync.
     settings:
       url: "https://ghp.example.com"
-  # Slack browser session for slk (github.com/goodtune/slk). There is no local
-  # Slack to test against: list subdomains you are signed in to in your
-  # browser, then paste a request copied as cURL when asked. One field per
-  # workspace lands in users/<you>/slack/slk.
+  # Slack browser session for slk (github.com/goodtune/slk). Stores only the
+  # pasted session's d cookie, one field per workspace, in
+  # users/<you>/slack/slk; it never contacts Slack, so any xoxd- value works
+  # for exercising the flow.
   slack/slk:
     engine: slack
     settings:

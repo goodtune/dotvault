@@ -1543,9 +1543,6 @@ func validateEnrolment(key string, e Enrolment) error {
 		if _, err := SlackWorkspaces(e.Settings); err != nil {
 			return fmt.Errorf("enrolments[%q].settings.%w", key, err)
 		}
-		if _, err := SlackRefreshInterval(e.Settings); err != nil {
-			return fmt.Errorf("enrolments[%q].settings.%w", key, err)
-		}
 	}
 	return nil
 }

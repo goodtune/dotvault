@@ -19,10 +19,10 @@ enrolments:
   slack/slk:
     engine: slack
     settings:
-      workspaces: [acme, acme-eng]   # Slack subdomains: acme.slack.com
+      workspaces: [acme, acme-eng]   # Slack domains: acme.slack.com (acme.enterprise for Grid)
 ```
 
-Each workspace is a field named by its subdomain whose value is a JSON object (an engine writes string fields, so the object is a string):
+Each workspace is a field named by its domain whose value is a JSON object (an engine writes string fields, so the object is a string):
 
 ```json
 {"domain": "acme", "cookie": "xoxd-…"}
@@ -63,4 +63,4 @@ Python bindings are not extended in this change.
 ## Not in scope
 
 - Reading the Slack desktop app's storage (LevelDB plus per-OS cookie decryption). The paste flow works everywhere the web UI or a terminal does; a desktop reader can be added later as another way to fill the same secret shape.
-- Enrolling several Slack accounts for one workspace: one secret holds one session per subdomain.
+- Enrolling several Slack accounts for one workspace: one secret holds one session per workspace domain.

@@ -6,22 +6,22 @@ import (
 )
 
 // SlackWorkspaces returns a slack enrolment's workspaces setting: the Slack
-// subdomains (acme for acme.slack.com, acme.enterprise for an Enterprise
+// domains (acme for acme.slack.com, acme.enterprise for an Enterprise
 // Grid organisation) it enrols, each also the name of its
 // field in the secret. It is the one definition of the setting, shared by
 // config load and the engine. At least one is required; a name must be a
-// valid subdomain and unique.
+// valid Slack domain (ValidSlackDomain) and unique.
 func SlackWorkspaces(settings map[string]any) ([]string, error) {
 	raw, ok := settings["workspaces"]
 	if !ok {
-		return nil, fmt.Errorf("workspaces is required: the Slack subdomains to enrol, e.g. [acme] for acme.slack.com")
+		return nil, fmt.Errorf("workspaces is required: the Slack domains to enrol, e.g. [acme] for acme.slack.com or [acme.enterprise] for Enterprise Grid")
 	}
 	list, ok := raw.([]any)
 	if !ok {
-		return nil, fmt.Errorf("workspaces must be a list of Slack subdomains, got %T", raw)
+		return nil, fmt.Errorf("workspaces must be a list of Slack domains, got %T", raw)
 	}
 	if len(list) == 0 {
-		return nil, fmt.Errorf("workspaces must name at least one Slack subdomain")
+		return nil, fmt.Errorf("workspaces must name at least one Slack domain")
 	}
 	seen := make(map[string]bool, len(list))
 	out := make([]string, 0, len(list))
@@ -30,7 +30,7 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("workspaces entries must be strings, got %T", v)
 		}
-		if err := ValidSlackSubdomain(s); err != nil {
+		if err := ValidSlackDomain(s); err != nil {
 			return nil, fmt.Errorf("workspaces entry %q: %w", s, err)
 		}
 		if seen[s] {
@@ -42,25 +42,21 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 	return out, nil
 }
 
-// ValidSlackSubdomain applies Slack's workspace URL rule to what goes in
-// front of .slack.com: one label (lowercase letters, digits and hyphens, 1–63
-// bytes, no leading or trailing hyphen), optionally followed by ".enterprise"
-// for an Enterprise Grid organisation (acme.enterprise for
-// acme.enterprise.slack.com). Allowing exactly that is also what makes it
-// safe for slk to put in a URL host in front of .slack.com.
-func ValidSlackSubdomain(s string) error {
+// ValidSlackDomain applies Slack's workspace URL rule to what goes in front
+// of .slack.com: one label (lowercase letters, digits and hyphens, 1–63 bytes,
+// no leading or trailing hyphen), optionally followed by ".enterprise" for an
+// Enterprise Grid organisation (acme.enterprise for acme.enterprise.slack.com).
+// Allowing exactly that is also what makes it safe for slk to put in a URL
+// host in front of .slack.com. slk applies the same rule as validSlackDomain.
+func ValidSlackDomain(s string) error {
 	label := strings.TrimSuffix(s, ".enterprise")
-	if label == "" || len(label) > 63 {
-		return fmt.Errorf("must be 1-63 characters, optionally followed by .enterprise for Enterprise Grid")
-	}
-	if label[0] == '-' || label[len(label)-1] == '-' {
-		return fmt.Errorf("must not start or end with '-'")
-	}
-	for i := 0; i < len(label); i++ {
+	ok := label != "" && len(label) <= 63 && label[0] != '-' && label[len(label)-1] != '-'
+	for i := 0; ok && i < len(label); i++ {
 		c := label[i]
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
-			return fmt.Errorf("must contain only a-z, 0-9 and '-' (the part before .slack.com), plus .enterprise for Enterprise Grid")
-		}
+		ok = c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-'
+	}
+	if !ok {
+		return fmt.Errorf("not a Slack domain: use the part before .slack.com, in lowercase (acme, or acme.enterprise for Enterprise Grid)")
 	}
 	return nil
 }

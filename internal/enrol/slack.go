@@ -21,7 +21,7 @@ var (
 // (docs/superpowers/specs/2026-11-03-slack-enrolment-design.md). It carries
 // the session's d cookie and nothing else: the user pastes the session once,
 // and the engine writes one field per configured workspace (named by its
-// subdomain) holding a SlackCredential as JSON. It never contacts Slack. slk
+// domain: acme, or acme.enterprise for Enterprise Grid) holding a SlackCredential as JSON. It never contacts Slack. slk
 // mints the xoxc access token from the cookie itself, in memory, every time it
 // starts, so there is no token here to mint, store or refresh.
 //
@@ -32,7 +32,7 @@ type SlackEngine struct{}
 
 // SlackCredential is one workspace's field in a slack enrolment's secret.
 type SlackCredential struct {
-	Domain string `json:"domain"` // the subdomain: acme for acme.slack.com
+	Domain string `json:"domain"` // acme for acme.slack.com, acme.enterprise for Enterprise Grid
 	Cookie string `json:"cookie"` // the d cookie, URL-encoded
 }
 

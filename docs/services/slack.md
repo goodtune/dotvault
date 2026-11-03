@@ -9,7 +9,7 @@ enrolments:
   slack/slk:
     engine: slack
     settings:
-      workspaces: [acme, acme-eng]   # the part before .slack.com
+      workspaces: [acme, acme-eng]   # the part before .slack.com (acme.enterprise for Grid)
 ```
 
 | Setting | Required | Description |
@@ -28,7 +28,7 @@ dotvault keeps only the `d` cookie from what you paste and stores it for every l
 
 Adding a workspace to `workspaces` brings the enrolment back as pending. Fields already in the secret that this enrolment does not write (unlisted workspaces, anything another tool wrote) are kept; remove one with `dotvault kv patch`.
 
-slk refuses a field whose `domain` is not its own name, and sends the cookie only to `<domain>.slack.com` after checking `domain` is a Slack subdomain.
+slk refuses a field whose `domain` is not its own name, and sends the cookie only to `<domain>.slack.com` after checking `domain` is a Slack domain.
 
 ## Vault schema
 
@@ -38,6 +38,12 @@ slk refuses a field whose `domain` is not its own name, and sends the cookie onl
 {"domain": "acme", "cookie": "xoxd-…"}
 ```
 
-The fields can also be written by hand in the same shape (for example with `dotvault kv put`); slk reads them identically.
+The fields can also be written by hand in the same shape, and slk reads them identically. The field name must equal its `domain`, and the value is the JSON object as a string. Patch one field at a time, so the other workspaces stay, with the value on stdin so the cookie is not on the command line (`--force` because the path belongs to an enrolment):
+
+```sh
+echo '{"domain":"acme.enterprise","cookie":"xoxd-…"}' | dotvault kv patch --force slack/slk acme.enterprise=-
+```
+
+Don't use `dotvault kv put`: it replaces the whole secret.
 
 There is nothing to refresh: the cookie is long-lived and slk mints a fresh access token from it at every start. When Slack stops accepting the cookie (you signed out of that browser, or it expired), enrol again.

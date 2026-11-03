@@ -281,6 +281,14 @@ enrolments:
       resulting token so it can keep your local config in sync.
     settings:
       url: "https://ghp.example.com"
+  # Slack browser session for slk (github.com/goodtune/slk). There is no local
+  # Slack to test against: list subdomains you are signed in to in your
+  # browser, then paste a request copied as cURL when asked. One field per
+  # workspace lands in users/<you>/slack/slk.
+  slack/slk:
+    engine: slack
+    settings:
+      workspaces: [example]
   # Mirrors kv/apps/sample/keys/{user} (seeded by vault-init) into the
   # user's enrolment path under a different field name. Re-evaluated on
   # every poll cycle by the WatchManager and, on Enterprise Vault, on

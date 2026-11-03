@@ -192,6 +192,7 @@ var (
 		"ghp":        &GHPEngine{},
 		"github":     &GitHubEngine{},
 		"jfrog":      &JFrogEngine{},
+		"slack":      &SlackEngine{},
 		"ssh":        &SSHEngine{},
 	}
 )

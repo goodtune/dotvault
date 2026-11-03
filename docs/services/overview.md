@@ -63,6 +63,7 @@ Enrolment configuration changes are detected on each polling tick without requir
 | `jfrog` | JFrog Platform / Artifactory | Browser-based web login + token rotation |
 | `databricks` | Databricks workspace / account | OAuth U2M (authorization code + PKCE) + token rotation |
 | `ghp` | Self-hosted ghp server (GitHub proxy) | CLI device-authorization flow |
+| `slack` | Slack browser session (for slk) | Paste the browser session once; stores the cookie only |
 | `ssh` | SSH key generation | Ed25519 key pair |
 | `copy` | Mirror an existing Vault KVv2 secret | Non-interactive; template-driven copy with periodic re-evaluation |
 
@@ -72,6 +73,7 @@ See the individual engine pages for details:
 - [JFrog Platform](jfrog.md)
 - [Databricks](databricks.md)
 - [ghp](ghp.md)
+- [Slack](slack.md)
 - [SSH Keys](ssh.md)
 - [Copy](copy.md)
 
@@ -85,7 +87,7 @@ Engines implement a simple interface:
 
 Engines that need extra behaviour layer it on through optional interfaces the manager probes for at run time:
 
-- **`SettingsFielder`** — for engines whose written-field set is determined by per-enrolment settings rather than being static (used by `copy`, where the JSON template decides the keys)
+- **`SettingsFielder`** — for engines whose written-field set is determined by per-enrolment settings rather than being static (used by `copy`, where the JSON template decides the keys, and `slack`, where the keys are the configured workspaces)
 - **`Refresher`** — for engines whose credentials expire and can be rotated without user interaction (used by `jfrog`, `databricks`, and `github` when GitHub issued an expiring token); driven by the daemon's `RefreshManager`
 - **`Watcher`** — for engines whose output is derived from upstream Vault data and must track source changes (used by `copy`); driven by the daemon's `WatchManager`, which polls on every sync interval and reacts to `kv-v2/data-write` events on Vault Enterprise
 - **`Unattended`** — for engines that acquire their credential with no user involvement at all: no browser to visit, no code to copy, no prompt to answer (used by `copy`). Declaring it keeps the engine out of the web UI's first-run wizard — both out of the decision to show it, in both directions, and off the page itself (it is managed from the enrolments tree instead) — it cannot raise the wizard, since there would be nothing for the user to do in it, and its completing does not count as the user having been through setup, since it completes without them. It changes nothing else: the enrolment is still ordinary pending work everywhere else, run by the CLI enrolment pass and offered by `dotvault enrol`. An engine that does not implement it is treated as interactive

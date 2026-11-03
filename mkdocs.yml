@@ -71,6 +71,7 @@ nav:
       - JFrog Platform: services/jfrog.md
       - Databricks: services/databricks.md
       - ghp: services/ghp.md
+      - Slack: services/slack.md
       - SSH Keys: services/ssh.md
       - Copy: services/copy.md
   - Filesystem: guide/filesystem.md

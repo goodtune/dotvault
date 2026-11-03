@@ -1537,6 +1537,13 @@ func validateEnrolment(key string, e Enrolment) error {
 			return fmt.Errorf("enrolments[%q].settings.%w", key, err)
 		}
 	}
+	// Same shape as the github check above: every SlackWorkspaces error starts
+	// with the setting's name.
+	if e.Engine == "slack" {
+		if _, err := SlackWorkspaces(e.Settings); err != nil {
+			return fmt.Errorf("enrolments[%q].settings.%w", key, err)
+		}
+	}
 	return nil
 }
 

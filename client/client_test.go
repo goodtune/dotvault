@@ -671,3 +671,30 @@ func TestAuthenticateCached_FallsBackToPeerSocket(t *testing.T) {
 		t.Errorf("Token = %q, want remote-token", c.Token())
 	}
 }
+
+func TestReadUserSecretFields(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	id, err := c.IdentityName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fv.secrets["kv/users/"+id+"/slack/slk"] = map[string]any{"acme": `{"domain":"acme"}`, "count": 3}
+
+	got, found, err := c.ReadUserSecretFields(context.Background(), "slack/slk")
+	if err != nil || !found {
+		t.Fatalf("got (%v, %v, %v)", got, found, err)
+	}
+	if len(got) != 2 || got["acme"] != `{"domain":"acme"}` || got["count"] != "3" {
+		t.Errorf("fields = %v", got)
+	}
+
+	got, found, err = c.ReadUserSecretFields(context.Background(), "absent")
+	if err != nil || found || got != nil {
+		t.Errorf("absent secret: got (%v, %v, %v), want (nil, false, nil)", got, found, err)
+	}
+}

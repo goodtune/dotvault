@@ -1,0 +1,62 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+)
+
+// SlackWorkspaces returns a slack enrolment's workspaces setting: the Slack
+// domains (acme for acme.slack.com, acme.enterprise for an Enterprise
+// Grid organisation) it enrols, each also the name of its
+// field in the secret. It is the one definition of the setting, shared by
+// config load and the engine. At least one is required; a name must be a
+// valid Slack domain (ValidSlackDomain) and unique.
+func SlackWorkspaces(settings map[string]any) ([]string, error) {
+	raw, ok := settings["workspaces"]
+	if !ok {
+		return nil, fmt.Errorf("workspaces is required: the Slack domains to enrol, e.g. [acme] for acme.slack.com or [acme.enterprise] for Enterprise Grid")
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("workspaces must be a list of Slack domains, got %T", raw)
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("workspaces must name at least one Slack domain")
+	}
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("workspaces entries must be strings, got %T", v)
+		}
+		if err := ValidSlackDomain(s); err != nil {
+			return nil, fmt.Errorf("workspaces entry %q: %w", s, err)
+		}
+		if seen[s] {
+			return nil, fmt.Errorf("workspaces entry %q is listed twice", s)
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// ValidSlackDomain applies Slack's workspace URL rule to what goes in front
+// of .slack.com: one label (lowercase letters, digits and hyphens, 1–63 bytes,
+// no leading or trailing hyphen), optionally followed by ".enterprise" for an
+// Enterprise Grid organisation (acme.enterprise for acme.enterprise.slack.com).
+// Allowing exactly that is also what makes it safe for slk to put in a URL
+// host in front of .slack.com. slk applies the same rule as validSlackDomain.
+func ValidSlackDomain(s string) error {
+	label := strings.TrimSuffix(s, ".enterprise")
+	ok := label != "" && len(label) <= 63 && label[0] != '-' && label[len(label)-1] != '-'
+	for i := 0; ok && i < len(label); i++ {
+		c := label[i]
+		ok = c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-'
+	}
+	if !ok {
+		return fmt.Errorf("not a Slack domain: use the part before .slack.com, in lowercase (acme, or acme.enterprise for Enterprise Grid)")
+	}
+	return nil
+}

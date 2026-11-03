@@ -61,6 +61,16 @@ func TestSlackRunStoresTheCookieForEveryWorkspace(t *testing.T) {
 	}
 }
 
+func TestSlackRunEnterpriseGrid(t *testing.T) {
+	out, err := (&SlackEngine{}).Run(context.Background(), slackSettings("company.enterprise"), pasteIO("xoxd-g"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := decodeCred(t, out["company.enterprise"]); c != (SlackCredential{Domain: "company.enterprise", Cookie: "xoxd-g"}) {
+		t.Errorf("credential = %+v", c)
+	}
+}
+
 func TestSlackRunMergesTheExistingSecret(t *testing.T) {
 	fv := newFakeVault("kv")
 	fv.secrets["users/u/slack/slk"] = map[string]string{

@@ -14,7 +14,7 @@ enrolments:
 
 | Setting | Required | Description |
 |---------|----------|-------------|
-| `workspaces` | yes | Slack subdomains to enrol: `acme` for `acme.slack.com`. Each becomes a field of the secret |
+| `workspaces` | yes | Slack domains to enrol: `acme` for `acme.slack.com`, or `acme.enterprise` for an Enterprise Grid organisation at `acme.enterprise.slack.com`. Each becomes a field of the secret |
 
 Point slk at the secret with its `[vault]` section: `secret = "slack/slk"`.
 
@@ -37,5 +37,7 @@ slk refuses a field whose `domain` is not its own name, and sends the cookie onl
 ```json
 {"domain": "acme", "cookie": "xoxd-…"}
 ```
+
+The fields can also be written by hand in the same shape (for example with `dotvault kv put`); slk reads them identically.
 
 There is nothing to refresh: the cookie is long-lived and slk mints a fresh access token from it at every start. When Slack stops accepting the cookie (you signed out of that browser, or it expired), enrol again.

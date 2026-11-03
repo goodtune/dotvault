@@ -28,7 +28,7 @@ Each workspace is a field named by its subdomain whose value is a JSON object (a
 {"domain": "acme", "cookie": "xoxd-…"}
 ```
 
-A workspace name must be a valid Slack subdomain (`[a-z0-9-]`, 1–63 bytes, no leading or trailing `-`), checked at config load.
+A workspace name must be a valid Slack domain, checked at config load: one label (`[a-z0-9-]`, 1–63 bytes, no leading or trailing `-`), optionally followed by `.enterprise` for an Enterprise Grid organisation (`acme.enterprise` for `acme.enterprise.slack.com`).
 
 The field names and the JSON shape are the whole contract with slk. Neither module imports the other's code: slk imports `client/`, so this engine importing slk would make the two modules depend on each other. The one piece of Slack logic the engine needs (reading a pasted session) is small and implemented here.
 

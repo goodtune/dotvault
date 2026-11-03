@@ -6,8 +6,8 @@ import (
 )
 
 func TestSlackWorkspaces(t *testing.T) {
-	good, err := SlackWorkspaces(map[string]any{"workspaces": []any{"acme", "acme-eng", "a1"}})
-	if err != nil || strings.Join(good, ",") != "acme,acme-eng,a1" {
+	good, err := SlackWorkspaces(map[string]any{"workspaces": []any{"acme", "acme-eng", "a1", "company.enterprise"}})
+	if err != nil || strings.Join(good, ",") != "acme,acme-eng,a1,company.enterprise" {
 		t.Fatalf("got %v, %v", good, err)
 	}
 	for name, settings := range map[string]map[string]any{
@@ -17,6 +17,9 @@ func TestSlackWorkspaces(t *testing.T) {
 		"non-str":   {"workspaces": []any{1}},
 		"upper":     {"workspaces": []any{"Acme"}},
 		"dotted":    {"workspaces": []any{"acme.slack.com"}},
+		"grid host": {"workspaces": []any{"acme.enterprise.slack.com"}},
+		"bare grid": {"workspaces": []any{".enterprise"}},
+		"two dots":  {"workspaces": []any{"a.b.enterprise"}},
 		"leading -": {"workspaces": []any{"-acme"}},
 		"duplicate": {"workspaces": []any{"acme", "acme"}},
 	} {

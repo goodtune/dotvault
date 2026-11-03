@@ -1247,3 +1247,52 @@ func writeTemp(t *testing.T, content string) string {
 	}
 	return path
 }
+
+func TestGitHubTokenLifetime(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings map[string]any
+		want     bool
+		wantErr  bool
+	}{
+		{name: "nil settings", settings: nil, want: false},
+		{name: "unset", settings: map[string]any{"host": "github.com"}, want: false},
+		{name: "empty", settings: map[string]any{"token_lifetime": ""}, want: false},
+		{name: "non-expiring", settings: map[string]any{"token_lifetime": "non-expiring"}, want: false},
+		{name: "expiring", settings: map[string]any{"token_lifetime": "expiring"}, want: true},
+		{name: "typo", settings: map[string]any{"token_lifetime": "expring"}, wantErr: true},
+		{name: "wrong case", settings: map[string]any{"token_lifetime": "Expiring"}, wantErr: true},
+		// A YAML boolean is refused rather than coerced: the registry has no
+		// way to carry one, so accepting it would break reg-import.
+		{name: "boolean", settings: map[string]any{"token_lifetime": true}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GitHubTokenLifetime(tt.settings)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateEnrolmentTokenLifetime(t *testing.T) {
+	bad := Enrolment{Engine: "github", Settings: map[string]any{"token_lifetime": "forever"}}
+	err := validateEnrolment("gh", bad)
+	if err == nil || !strings.Contains(err.Error(), `enrolments["gh"].settings.token_lifetime`) {
+		t.Fatalf("err = %v, want one naming the setting", err)
+	}
+	good := Enrolment{Engine: "github", Settings: map[string]any{"token_lifetime": "expiring"}}
+	if err := validateEnrolment("gh", good); err != nil {
+		t.Fatalf("valid value refused: %v", err)
+	}
+	// The setting belongs to the github engine; another engine's map is
+	// not judged by it.
+	other := Enrolment{Engine: "ghp", Settings: map[string]any{"token_lifetime": "forever"}}
+	if err := validateEnrolment("ghp", other); err != nil {
+		t.Fatalf("other engine refused: %v", err)
+	}
+}

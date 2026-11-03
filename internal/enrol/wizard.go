@@ -64,6 +64,6 @@ func runWizard(ctx context.Context, pending []pendingEnrolment, io IO) map[strin
 // Best-effort: if no clipboard mechanism is available, it silently continues
 // (the device code stays visible in the terminal either way). The writers live
 // in internal/clipboard, shared with the remote-clipboard peer action.
-func copyToClipboard(text string) {
+var copyToClipboard = func(text string) {
 	_ = clipboard.Set(text)
 }

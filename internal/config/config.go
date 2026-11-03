@@ -1529,7 +1529,41 @@ func validateEnrolment(key string, e Enrolment) error {
 			return fmt.Errorf("enrolments[%q].settings.token_ttl %q is below the 10m minimum", key, s)
 		}
 	}
+	// Deliberately engine-specific, unlike token_ttl above: this setting means
+	// nothing to any other engine. Every GitHubTokenLifetime error starts with
+	// the setting's name, which is what the prefix here relies on.
+	if e.Engine == "github" {
+		if _, err := GitHubTokenLifetime(e.Settings); err != nil {
+			return fmt.Errorf("enrolments[%q].settings.%w", key, err)
+		}
+	}
 	return nil
+}
+
+// GitHubTokenLifetime reports whether a github enrolment asks for an expiring
+// token. It is the one definition of the token_lifetime setting, shared by
+// config load and the engine.
+//
+// The value is a string rather than a boolean because the registry cannot carry
+// a boolean enrolment setting (regfile's writeSetting refuses one), and a
+// misspelt value is an error because reading it as the default would leave an
+// operator believing their token rotates when it does not.
+func GitHubTokenLifetime(settings map[string]any) (expiring bool, err error) {
+	raw, ok := settings["token_lifetime"]
+	if !ok {
+		return false, nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return false, fmt.Errorf(`token_lifetime must be the string "expiring" or "non-expiring", got %T`, raw)
+	}
+	switch s {
+	case "expiring":
+		return true, nil
+	case "", "non-expiring":
+		return false, nil
+	}
+	return false, fmt.Errorf(`token_lifetime %q must be "expiring" or "non-expiring"`, s)
 }
 
 // validateEnrolmentKey enforces the shape of an enrolment key. A key is either

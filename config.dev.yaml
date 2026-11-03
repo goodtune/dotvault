@@ -243,6 +243,7 @@ enrolments:
     # is HTTPS_PROXY / HTTP_PROXY / NO_PROXY from the daemon environment.
     # settings:
     #   https_proxy: http://squid.example.com:3128
+    #   token_lifetime: expiring   # rotate a short-lived token (github.com, *.ghe.com)
   ssh:
     engine: ssh
     settings:

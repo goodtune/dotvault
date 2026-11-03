@@ -51,7 +51,8 @@ func EngineFields(e Engine, settings map[string]any) []string {
 }
 
 // Refresher is implemented by engines whose credentials expire and can be
-// rotated without user interaction. Today only JFrog implements it.
+// rotated without user interaction: JFrog, Databricks, and GitHub (when
+// GitHub issued an expiring token).
 type Refresher interface {
 	Engine
 

@@ -40,15 +40,17 @@ A workspace that fails to mint (not signed in to it in that browser, a 429 that 
 
 Fields: `FieldsFromSettings` returns the configured workspace names, so the manager treats the enrolment as incomplete until every listed workspace is present, and a newly listed workspace prompts for the session again.
 
-Output for the web enrolment card: the prompt is a passphrase-style secret input, which the card already renders; the engine opens no browser. Its instructions (`help_text` default) say where to find the cookie: dev tools → Network → any request to `/api/` → Copy as cURL.
+Output for the web enrolment card: the prompt is a passphrase-style secret input, which the card already renders; the engine opens no browser. The prompt's own label says where to find the session (dev tools → Network → a request to `/api/` → Copy as cURL or PowerShell); an admin can add `help_text` as for any enrolment.
 
 ## Refresh (`Refresher`)
 
-The `xoxc` token's lifetime is not documented and not observable before it fails; the `d` cookie is long-lived. So the engine re-mints every workspace's token from its stored cookie past half-life (default every 12 hours), rewriting the whole secret with fresh `access_token`s and new timestamps.
+The `xoxc` token's lifetime is not documented and not observable before it fails; the `d` cookie is long-lived. So the engine re-mints the configured workspaces from their stored cookies past half-life (default every 12 hours), rewriting the secret with fresh `access_token`s and new timestamps.
 
-- A mint that lands on Slack's sign-in page instead of a page carrying `api_token`, or an `auth.test` answering `invalid_auth` / `not_authed`, means the cookie is dead: `ErrRevoked`, so the RefreshManager wipes the secret and the enrolment comes back as pending. That is per secret, not per workspace: the cookie is shared, so a dead cookie is dead for all of them.
-- Anything else (network, 5xx, 429) is transient: the secret is kept and retried with backoff.
-- A workspace whose cookie is not the same as the others (enrolled separately by hand) is refreshed with its own cookie; a revocation of any one cookie still reports revoked, because the alternative is a secret the manager counts as complete with a dead workspace in it.
+- Only listed workspaces are refreshed. A field for a workspace no longer listed is carried over untouched: a dead cookie there must not revoke, and so wipe, a secret whose listed workspaces are fine.
+- A listed field is minted only when its stored `domain` equals the field's name, and every domain is re-validated as a subdomain just before a cookie is sent to it, so an edited secret cannot redirect the cookie to another host. `auth.test` follows no redirects (a 307/308 would replay the token in its body).
+- A mint that lands on Slack's sign-in page, or an `auth.test` answering `invalid_auth`, `not_authed`, `account_inactive` or `token_revoked`, means the cookie is dead: `ErrRevoked`, so the RefreshManager wipes the secret and the enrolment comes back as pending. That is per secret, not per workspace: the cookie is shared.
+- Within an attempt only a 429 is retried (three tries, `Retry-After` capped at 10s). Anything else fails the attempt as transient; the RefreshManager keeps the secret and retries with its backoff.
+- Minting nothing (no listed workspace in the secret) is an error, not a fresh stamp.
 
 `refresh_interval` (duration, default `24h`, floor `1h`) is validated at config load, as `token_ttl` is for JFrog.
 

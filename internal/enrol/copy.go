@@ -175,18 +175,10 @@ func (e *CopyEngine) Run(ctx context.Context, settings map[string]any, io IO) (m
 		}
 		if existing != nil {
 			for k, v := range existing.Data {
-				s, ok := v.(string)
-				if !ok {
-					// KVv2 stores arbitrary JSON; coerce non-strings
-					// rather than dropping them so we don't accidentally
-					// strip data the user wrote with another tool.
-					b, mErr := json.Marshal(v)
-					if mErr != nil {
-						return nil, fmt.Errorf("copy: encode existing key %q: %w", k, mErr)
-					}
-					s = string(b)
-				}
-				merged[k] = s
+				// KVv2 stores arbitrary JSON; coerce non-strings
+				// rather than dropping them so we don't accidentally
+				// strip data the user wrote with another tool.
+				merged[k] = stringifyField(v)
 			}
 		}
 	}

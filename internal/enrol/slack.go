@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -74,7 +73,7 @@ func (e *SlackEngine) FieldsFromSettings(settings map[string]any) []string {
 
 // slackPastePrompt is the PromptSecret label. The web card renders it as a
 // secret input, so it must stand on its own.
-const slackPastePrompt = "Paste your Slack browser session (DevTools → Network → a request to /api/ → Copy as cURL), or just the d cookie (xoxd-…):"
+const slackPastePrompt = "Paste your Slack browser session (DevTools → Network → a request to /api/ → Copy as cURL, or Copy as PowerShell), or just the d cookie (xoxd-…):"
 
 // Run asks for the browser session once and mints every configured workspace
 // from its d cookie. A workspace that fails fails the run and nothing is
@@ -146,11 +145,22 @@ func (e *SlackEngine) Run(ctx context.Context, settings map[string]any, eio IO) 
 	return out, nil
 }
 
-// Refresh re-mints every workspace credential in the secret from its own
-// cookie. A dead cookie for any of them is ErrRevoked for the whole secret:
+// Refresh re-mints the configured workspaces from their own cookies. Only
+// those: a field for a workspace no longer listed (Run keeps it) is carried
+// over untouched, because a dead cookie there would otherwise revoke, and so
+// wipe, a secret whose listed workspaces are fine. A listed field is minted
+// only when its stored domain is the field's own name, so a hand-edited
+// domain cannot send the cookie anywhere but that workspace.
+//
+// A dead cookie for a listed workspace is ErrRevoked for the whole secret:
 // the alternative is a secret the manager counts as complete with a workspace
-// in it that can no longer sign in.
+// in it that can no longer sign in. Minting nothing is an error rather than a
+// fresh stamp, so a secret with no usable workspace never looks current.
 func (e *SlackEngine) Refresh(ctx context.Context, settings map[string]any, existing map[string]string) (map[string]string, error) {
+	workspaces, err := config.SlackWorkspaces(settings)
+	if err != nil {
+		return nil, fmt.Errorf("slack: settings.%w", err)
+	}
 	interval, err := config.SlackRefreshInterval(settings)
 	if err != nil {
 		return nil, fmt.Errorf("slack: settings.%w", err)
@@ -160,18 +170,23 @@ func (e *SlackEngine) Refresh(ctx context.Context, settings map[string]any, exis
 		return nil, err
 	}
 	out := make(map[string]string, len(existing))
-	names := make([]string, 0, len(existing))
 	for k, v := range existing {
 		out[k] = v
-		names = append(names, k)
 	}
-	sort.Strings(names) // deterministic order for logs and tests
-	for _, name := range names {
-		var cred SlackCredential
-		if json.Unmarshal([]byte(existing[name]), &cred) != nil || cred.Domain == "" || cred.Cookie == "" {
-			continue // not a workspace field (issued_at, or another tool's)
+	minted := 0
+	for _, name := range workspaces {
+		raw, ok := existing[name]
+		if !ok {
+			continue // listed but not enrolled yet: the manager re-runs Run
 		}
-		fresh, err := e.mint(ctx, client, cred.Domain, cred.Cookie)
+		var cred SlackCredential
+		if err := json.Unmarshal([]byte(raw), &cred); err != nil || cred.Cookie == "" {
+			return nil, fmt.Errorf("slack: %s: field is not a credential; enrol again", name)
+		}
+		if cred.Domain != name {
+			return nil, fmt.Errorf("slack: %s: stored domain %q is not the field's own; enrol again", name, cred.Domain)
+		}
+		fresh, err := e.mint(ctx, client, name, cred.Cookie)
 		if err != nil {
 			return nil, fmt.Errorf("slack: %s: %w", name, err)
 		}
@@ -180,6 +195,10 @@ func (e *SlackEngine) Refresh(ctx context.Context, settings map[string]any, exis
 			return nil, err
 		}
 		out[name] = string(b)
+		minted++
+	}
+	if minted == 0 {
+		return nil, errors.New("slack: no configured workspace is enrolled in this secret; enrol again")
 	}
 	e.stamp(out, interval)
 	return out, nil
@@ -214,6 +233,11 @@ var errSlackSignedOut = fmt.Errorf("the d cookie is no longer signed in to Slack
 // an xoxc api_token for a signed-in session, and auth.test with it names the
 // team and user and proves the session works.
 func (e *SlackEngine) mint(ctx context.Context, client *http.Client, domain, cookie string) (SlackCredential, error) {
+	// The domain becomes the host the cookie is sent to, so it is checked
+	// here, where every caller passes through, not only at config load.
+	if err := config.ValidSlackSubdomain(domain); err != nil {
+		return SlackCredential{}, fmt.Errorf("workspace %q: %w", domain, err)
+	}
 	token, err := e.pageToken(ctx, client, domain, cookie)
 	if err != nil {
 		return SlackCredential{}, err
@@ -284,7 +308,11 @@ func (e *SlackEngine) authTest(ctx context.Context, client *http.Client, domain,
 		apiURL = e.apiURL(domain, "auth.test")
 	}
 	form := url.Values{"token": {token}}.Encode()
-	resp, err := slackDo(ctx, client, func() (*http.Request, error) {
+	// A 307/308 would replay the body, token included, to wherever it
+	// points; auth.test has no reason to redirect, so none is followed.
+	noRedirect := *client
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := slackDo(ctx, &noRedirect, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form))
 		if err != nil {
 			return nil, err
@@ -390,8 +418,8 @@ func parseSlackCookie(paste string) string {
 }
 
 // stringifyField renders an existing KVv2 value as the string the engine
-// contract carries, as the copy engine does: strings verbatim, anything else
-// as JSON so it is kept rather than dropped.
+// contract carries: strings verbatim, anything else as JSON so it is kept
+// rather than dropped. Shared by the copy and slack engines' merges.
 func stringifyField(v any) string {
 	if s, ok := v.(string); ok {
 		return s

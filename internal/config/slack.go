@@ -41,7 +41,7 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("workspaces entries must be strings, got %T", v)
 		}
-		if err := validSlackSubdomain(s); err != nil {
+		if err := ValidSlackSubdomain(s); err != nil {
 			return nil, fmt.Errorf("workspaces entry %q: %w", s, err)
 		}
 		for _, r := range SlackReservedFields {
@@ -58,10 +58,11 @@ func SlackWorkspaces(settings map[string]any) ([]string, error) {
 	return out, nil
 }
 
-// validSlackSubdomain applies Slack's workspace URL rule: lowercase letters,
+// ValidSlackSubdomain applies Slack's workspace URL rule: lowercase letters,
 // digits and hyphens, 1–63 bytes, no leading or trailing hyphen. Being a
-// single DNS label is also what makes it safe to put in a URL host.
-func validSlackSubdomain(s string) error {
+// single DNS label is also what makes it safe to put in a URL host: the slack
+// engine re-checks it on every domain it is about to send a cookie to.
+func ValidSlackSubdomain(s string) error {
 	if s == "" || len(s) > 63 {
 		return fmt.Errorf("must be 1-63 characters")
 	}

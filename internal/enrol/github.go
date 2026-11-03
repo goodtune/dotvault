@@ -203,7 +203,7 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 		// never rotate and the credential would die at expiry with nothing
 		// prompting a re-enrol. Checked before the /user lookup so a token
 		// about to be discarded is not sent over cleartext once more.
-		if err := checkExpiringHost(r.token, hostURL); err != nil {
+		if err := checkExpiringToken(r.token, hostURL); err != nil {
 			return nil, err
 		}
 		user, err := fetchGitHubUser(ctx, httpClient, hostURL, r.token.Token)
@@ -222,7 +222,8 @@ func (e *GitHubEngine) Run(ctx context.Context, settings map[string]any, io IO) 
 // githubCredential renders a token response as the Vault secret. The
 // refresh fields are written only for an expiring token that came with a
 // refresh token: an expiry without one cannot be rotated (writing expires_at
-// would only have the RefreshManager fail on it every half-life), and a
+// would only have the RefreshManager fail on it every half-life; Run refuses
+// that response before it gets here, see checkExpiringToken), and a
 // refresh token without an expiry has nothing to rotate ahead of. Refresh
 // guarantees the expiry half for a credential already known to expire; the
 // refresh-token half it gets from oauth.Refresh, which carries the presented
@@ -326,11 +327,20 @@ func (p ctxPoster) PostForm(u string, data url.Values) (*http.Response, error) {
 	return p.client.Do(req)
 }
 
-// checkExpiringHost refuses an expiring token issued over a host Refresh
-// would refuse, whatever token_lifetime asked for.
-func checkExpiringHost(tok *api.AccessToken, hostURL string) error {
-	if tok.RefreshToken == "" || tok.ExpiresIn <= 0 {
+// checkExpiringToken refuses an expiring token dotvault could never keep
+// current, whatever token_lifetime asked for: one that came without a refresh
+// token, and one issued over a host Refresh would refuse. Stored, either would
+// stop working at its expiry with nothing prompting a re-enrol: the first
+// lands in the legacy shape the refresh manager skips and the enrolment check
+// counts as complete, the second strands its refresh token. Refusing at
+// enrolment turns a credential that silently dies hours later into an error
+// the user sees now.
+func checkExpiringToken(tok *api.AccessToken, hostURL string) error {
+	if tok.ExpiresIn <= 0 {
 		return nil
+	}
+	if tok.RefreshToken == "" {
+		return errors.New("github issued an expiring token without a refresh token, so dotvault could not keep it current; this host or app does not support refreshable tokens (remove token_lifetime: expiring, or use an app whose tokens do not expire)")
 	}
 	if err := requireSecureTokenEndpoint(hostURL); err != nil {
 		return fmt.Errorf("github issued an expiring token, which dotvault only stores for an https host so it can be refreshed (set host to an https:// URL): %w", err)

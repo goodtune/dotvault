@@ -277,6 +277,50 @@ func TestGitHubRunExpiringRefusesCleartextHost(t *testing.T) {
 	}
 }
 
+// A token that expires but cannot be refreshed is refused at enrolment rather
+// than stored in the legacy shape, where it would die unnoticed at expiry.
+func TestGitHubRunRefusesExpiryWithoutRefreshToken(t *testing.T) {
+	orig := copyToClipboard
+	copyToClipboard = func(string) {}
+	t.Cleanup(func() { copyToClipboard = orig })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+		fmt.Fprint(w, url.Values{
+			"device_code":      {"dc"},
+			"user_code":        {"ABCD-1234"},
+			"verification_uri": {"https://example.test/device"},
+			"expires_in":       {"60"},
+			"interval":         {"1"},
+		}.Encode())
+	})
+	userCalls := 0
+	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+		fmt.Fprint(w, "access_token=ghu_new&token_type=bearer&expires_in=28800")
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { userCalls++ })
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	e := &GitHubEngine{httpClient: srv.Client()}
+	got, err := e.Run(context.Background(), map[string]any{"host": srv.URL}, IO{
+		Out: io.Discard,
+		In:  strings.NewReader("\n"),
+		Log: slog.New(slog.DiscardHandler),
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh token") {
+		t.Fatalf("err = %v, want a refusal naming the missing refresh token", err)
+	}
+	if got != nil {
+		t.Errorf("credential returned despite refusal: %v", got)
+	}
+	if userCalls != 0 {
+		t.Errorf("user lookup made %d calls for a token about to be discarded", userCalls)
+	}
+}
+
 func TestGitHubRefresh(t *testing.T) {
 	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
 	existing := map[string]string{
@@ -461,7 +505,7 @@ func TestRefreshManagerRotatesGitHub(t *testing.T) {
 
 // A GitHub App can return an expiring token unasked, so the host check must
 // key off the response, not the token_lifetime setting.
-func TestCheckExpiringHost(t *testing.T) {
+func TestCheckExpiringToken(t *testing.T) {
 	expiring := &api.AccessToken{Token: "ghu_x", RefreshToken: "ghr_y", ExpiresIn: 8 * time.Hour}
 	classic := &api.AccessToken{Token: "gho_x"}
 	for _, tc := range []struct {
@@ -474,12 +518,15 @@ func TestCheckExpiringHost(t *testing.T) {
 		{"expiring over https", expiring, "https://ghe.example.com", false},
 		{"expiring over loopback", expiring, "http://127.0.0.1:8080", false},
 		{"classic over cleartext", classic, "http://ghe.example.com", false},
-		// The boundary githubCredential also draws: no expiry means nothing
-		// to rotate, so the refresh fields would not be written anyway.
+		// No expiry means nothing to rotate, so a stray refresh token is
+		// harmless: githubCredential does not write it.
 		{"refresh token without expiry over cleartext", &api.AccessToken{Token: "x", RefreshToken: "r"}, "http://ghe.example.com", false},
-		{"expiry without refresh token over cleartext", &api.AccessToken{Token: "x", ExpiresIn: time.Hour}, "http://ghe.example.com", false},
+		// An expiry with no refresh token can never be renewed, so it would
+		// die silently in Vault; refused on any host.
+		{"expiry without refresh token over https", &api.AccessToken{Token: "x", ExpiresIn: time.Hour}, "https://ghe.example.com", true},
+		{"expiry without refresh token over cleartext", &api.AccessToken{Token: "x", ExpiresIn: time.Hour}, "http://ghe.example.com", true},
 	} {
-		if err := checkExpiringHost(tc.tok, tc.host); (err != nil) != tc.wantErr {
+		if err := checkExpiringToken(tc.tok, tc.host); (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
 	}

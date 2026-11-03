@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,12 +296,12 @@ func TestGitHubRunRefusesExpiryWithoutRefreshToken(t *testing.T) {
 			"interval":         {"1"},
 		}.Encode())
 	})
-	userCalls := 0
+	var userCalls atomic.Int32
 	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
 		fmt.Fprint(w, "access_token=ghu_new&token_type=bearer&expires_in=28800")
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { userCalls++ })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { userCalls.Add(1) })
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -316,8 +317,8 @@ func TestGitHubRunRefusesExpiryWithoutRefreshToken(t *testing.T) {
 	if got != nil {
 		t.Errorf("credential returned despite refusal: %v", got)
 	}
-	if userCalls != 0 {
-		t.Errorf("user lookup made %d calls for a token about to be discarded", userCalls)
+	if n := userCalls.Load(); n != 0 {
+		t.Errorf("user lookup made %d calls for a token about to be discarded", n)
 	}
 }
 
@@ -503,8 +504,9 @@ func TestRefreshManagerRotatesGitHub(t *testing.T) {
 	}
 }
 
-// A GitHub App can return an expiring token unasked, so the host check must
-// key off the response, not the token_lifetime setting.
+// A GitHub App can return an expiring token unasked, so the check keys off
+// the response, not the token_lifetime setting: an expiring token is refused
+// over a cleartext host, and refused anywhere without a refresh token.
 func TestCheckExpiringToken(t *testing.T) {
 	expiring := &api.AccessToken{Token: "ghu_x", RefreshToken: "ghr_y", ExpiresIn: 8 * time.Hour}
 	classic := &api.AccessToken{Token: "gho_x"}

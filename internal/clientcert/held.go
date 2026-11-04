@@ -25,6 +25,7 @@ type held struct {
 	dir, method, username string
 	reissueBefore         time.Duration
 
+	// mu serialises Current, which does file I/O under it.
 	mu sync.Mutex
 	// cur is the most recent pair exported, kept even after a failure so
 	// Last can report it. loaded says cur still corresponds to the envelope
@@ -33,6 +34,15 @@ type held struct {
 	loaded  bool
 	statKey envelopeStat
 	lastErr error
+
+	// last mirrors cur and lastErr under its own lock, so Last (and with it
+	// /api/v1/status) never waits behind a Current blocked on a hung cache
+	// directory.
+	last struct {
+		sync.Mutex
+		pair *Pair
+		err  error
+	}
 }
 
 // envelopeStat is what identifies one version of the envelope file. The full
@@ -76,24 +86,34 @@ func (h *held) Current(ctx context.Context) (*Pair, error) {
 	if err != nil {
 		h.loaded = false
 		h.lastErr = err
+		h.publish()
 		return nil, err
 	}
 	p, err := h.pairFrom(hc)
 	if err != nil {
 		h.loaded = false
 		h.lastErr = err
+		h.publish()
 		return nil, err
 	}
 	h.cur, h.statKey, h.loaded, h.lastErr = p, key, true, nil
+	h.publish()
 	return p, nil
+}
+
+// publish copies cur and lastErr to what Last reads. Called with h.mu held.
+func (h *held) publish() {
+	h.last.Lock()
+	h.last.pair, h.last.err = h.cur, h.lastErr
+	h.last.Unlock()
 }
 
 // Last returns the most recent pair served and the most recent error, without
 // touching the filesystem.
 func (h *held) Last() (*Pair, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.cur, h.lastErr
+	h.last.Lock()
+	defer h.last.Unlock()
+	return h.last.pair, h.last.err
 }
 
 func (h *held) pairFrom(hc *auth.HeldCertificate) (*Pair, error) {

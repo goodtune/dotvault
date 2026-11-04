@@ -344,3 +344,20 @@ func TestHeldErrorsCarryNoKeyMaterial(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestHeldLastDoesNotWaitOnCurrent(t *testing.T) {
+	h := NewHeld(t.TempDir(), "mtls", "gary", 0).(*held)
+	// A Current stuck in file I/O on a hung cache directory holds h.mu.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = h.Last()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Last blocked behind Current")
+	}
+}

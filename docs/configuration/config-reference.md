@@ -68,6 +68,11 @@ fuse:
   read_write: false
   cache_ttl: "30s"
 
+client_cert:
+  enabled: true
+  pki_role: "dotvault-tools"   # a dedicated role; see the Client certificate section
+  ttl: "5m"
+
 rules:
   - name: gh
     vault_key: "gh"
@@ -183,6 +188,12 @@ vault:
     Under `mtls`, `mtls+tpm`, or `mtls+os` the daemon also rotates its own certificate and retires the one it replaces, both headless and both using this same downscoped token. That needs `pki/sign/<role>` (mint the replacement) and `pki/revoke` (retire the superseded certificate) on top of the three above. Without `pki/sign` the certificate runs to expiry and the host needs a fresh human bootstrap; without `pki/revoke` rotation still works but each superseded certificate stays valid at the CA until its own TTL ends.
 
     `pki/revoke` is not scopeable to a host's own certificates — read the trade-off in [What your Vault admin must set up](../authentication/mtls.md#what-your-vault-admin-must-set-up) before granting it, and note that [`revoke_superseded: false`](../authentication/mtls.md#opting-out-revoke_superseded-false) is the supported way to decline it without collecting a warning on every rotation. The dev stack's `dotvault` policy grants both and is a working reference for the whole cert-auth lifecycle.
+
+!!! note "Client certificates need `pki/sign/<role>` too"
+    When [`client_cert`](#client-certificate-section) is enabled and the host signs short-lived certificates (every host except one using plain `mtls`, and always under `borrow_only`), the policy must also grant `pki/sign/<client_cert.pki_role>` — for example `pki/sign/dotvault-tools`. A policy without it makes the certificate fail with a permission error naming the role. The dev stack's `dotvault` policy grants it.
+
+!!! note "Downscoped tokens carry the parent's metadata"
+    A child token minted by `auth/token/create` has no `meta` of its own, so a downscoped token would lose the `username` the login recorded. dotvault therefore reads the login token's `meta` with one extra `lookup-self` per login and passes it to the child it mints. That is what lets `{{.token_username}}` — the default [client certificate](#client-certificate-section) common name — resolve on a downscoped token, and on one borrowed from a peer (borrowed tokens are downscoped workstation tokens). The read is best effort: if it fails, the child is minted without metadata and a DEBUG line says so, because refusing a least-privilege downscope over a convenience would trade a security property for it. A workstation must run a build that carries this before its borrowers can use `{{.token_username}}`.
 
 This is a **per-deployment** concern — dotvault ships no default policy list, because the right policy name(s) depend entirely on your Vault policy layout. The downscoped child token is renewable and managed by the normal token lifecycle; when it expires dotvault re-authenticates and re-narrows.
 
@@ -448,6 +459,83 @@ Reading a file in the mount calls Vault, so `grep -r` across the mount — or an
 
 On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ), `ReadWrite` (REG_DWORD) and `CacheTTL` (REG_SZ) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\FUSE`, and the section round-trips through `reg-import`/`reg-export` like every other — an admin managing a mixed fleet from one policy sets it for the Linux and macOS machines that policy covers.
 
+## Client certificate section
+
+The `client_cert` section makes a mutual-TLS client certificate available to **other tools**, so `curl`, a database driver or an internal API client can identify you to a service the way dotvault identifies you to Vault. The certificate and its key appear as `client.crt`, `client.key` and `client.pem` at the root of the [filesystem](#filesystem-section) mount, in [Docker volumes](#docker-volumes-section) that ask for them, and through the public Go package (`client/`) and the Python bindings (`python/`). The service on the far end is up to you; this section only supplies the client side.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Serve a client certificate |
+| `pki_mount` | string | `vault.mtls.pki_mount`, else `pki` | PKI secrets engine mount that signs the certificate |
+| `pki_role` | string | `vault.mtls.pki_role` | PKI role to sign against. Required when the host signs and no `vault.mtls.pki_role` is there to inherit |
+| `common_name` | string | `{{.token_username}}` | Template for the subject common name (see below) |
+| `ttl` | duration | `5m` | Lifetime requested for a signed certificate. At least `1m`; no ceiling here, since the PKI role's `max_ttl` is the cap |
+| `key_type` | string | `ec` | `ec` (P-256) or `rsa`, for services that insist on RSA |
+| `key_bits` | int | `0` | RSA modulus (`2048`, `3072`, `4096`, `8192`; `0` means `2048`). Rejected with `key_type: ec` |
+
+```yaml
+client_cert:
+  enabled: true
+  pki_mount: "pki"
+  pki_role: "dotvault-tools"
+  common_name: "{{.token_username}}"
+  ttl: "5m"
+```
+
+### Where the certificate comes from
+
+There are two sources, and the **configured** `auth_method` picks between them. It is never inferred from the key that happens to be in memory.
+
+- **Held.** With `vault.auth_method: mtls` exactly (the software key backend) and a certificate already enrolled on the host, dotvault serves that certificate and key as they are. The pair follows the login certificate's own rotation (`reissue_before`): after a rotation the new pair is served. No token and no `pki_role` are needed. The `pki_*`, `common_name`, `ttl` and `key_*` fields apply only if the held certificate is missing, expired or unreadable and a role is available, in which case dotvault falls back to the short-lived source; with no role it reports an error naming the cause.
+- **Short-lived.** Everywhere else — `oidc`, `ldap`, `token`, `mtls+tpm`, `mtls+os`, a borrowed token, and **always under `vault.borrow_only`** — dotvault generates a key in memory, has `<pki_mount>/sign/<pki_role>` sign it with the current Vault token, and replaces it before it expires. The key lives only in the daemon's memory (the one place it reaches a filesystem is a Docker volume directory on the runtime tmpfs, deleted at the last unmount) and is never written to disk by dotvault.
+
+`mtls+tpm` and `mtls+os` deliberately use the short-lived source: their login key is sealed in the TPM or kept in the OS certificate store precisely so that it cannot be taken out, and this feature never extracts it.
+
+Under `borrow_only` the section is never "held": a borrow-only host runs no certificate login, so there is no credential on it to serve. It signs a short-lived certificate with the borrowed token, which is the motivating case: a remote host reached over SSH that holds a token but no certificate.
+
+`pki_mount` and `pki_role` fall back to `vault.mtls.pki_mount` and `vault.mtls.pki_role` — **including under `borrow_only`**, which otherwise ignores the `vault.mtls` block, so one base config can serve the workstation and its remotes.
+
+### Rotation
+
+A short-lived certificate is signed lazily on first use, and replaced when less than half of its *issued* lifetime remains (`NotAfter − NotBefore`, not the requested `ttl`, because the PKI role's `max_ttl` may shorten the request). Concurrent readers share one signing call. A held certificate is re-read from disk whenever the login credential is replaced.
+
+Failed signs back off: after a failure no new sign is attempted for 10 seconds, doubling per consecutive failure up to 5 minutes, and a success or a different token resets it. Any two sign attempts, whatever their outcome, are at least 10 seconds apart. While a sign is paced, a read returns the still-valid cached certificate, or an error when there is none (`EAGAIN` from the filesystem, `ErrSignPaced` from the library). This is what stops a policy that denies `pki/sign` from turning every `ls -l` of the mount, or every poll of `client.pem`, into a denied request at Vault.
+
+### Common name
+
+`common_name` is a template with exactly two variables:
+
+- `{{.token_username}}` — the **Vault identity** of the token being used to sign: `meta.username` from `lookup-self`, else `meta.common_name`. LDAP and userpass logins set `meta.username`; an OIDC role sets it with `claim_mappings`; a certificate login sets `meta.common_name`. It is looked up once per token. If the token carries neither, signing fails with an error that names the cause and suggests `{{.os_user}}`. It **never** falls back silently to the OS account, because the service would then see a different person.
+- `{{.os_user}}` — the OS account dotvault runs as, with any `DOMAIN\` prefix stripped.
+
+The default is the Vault identity rather than the OS account because on a borrowing remote the OS account (`ubuntu`, `ec2-user`) is usually not the person, and the far-end service identifies you by this name.
+
+`{{.user}}` and `{{.vault_username}}` are **refused at config load**, with a message naming the two explicit variables. Those names mean the OS account elsewhere in dotvault (the Copy engine's `{{.user}}` and the SSH agent's `{{.vault_username}}` both expand to it), and a certificate subject is the one place where guessing wrong grants somebody else's identity.
+
+!!! warning "OIDC needs a `claim_mappings` entry"
+    A Vault OIDC role records no username by default, so `{{.token_username}}` fails on a plain OIDC login. Map a claim to `username` on the role, for example `claim_mappings="email=username"`, or set `common_name: "{{.os_user}}"`. The dev stack's OIDC role does the former.
+
+!!! note "A held certificate keeps its own name"
+    The held path serves whatever common name `vault.mtls.common_name` produced when the certificate was issued; this section's `common_name` does not apply to it.
+
+### Security properties and decisions
+
+!!! warning "The held certificate is a Vault login credential"
+    Under plain `mtls`, `client.key` is the key dotvault logs in to Vault with. Anything that can read it — a local process, or a container holding a volume — can log in to Vault as you until the certificate expires. This is accepted on the grounds that the device and its processes are trusted and the mount and volumes are reachable only by your own uid, but it is a real widening of what the file system exposes, and you should know it before enabling the section.
+
+!!! warning "An inherited role means each short-lived certificate is a Vault login"
+    When `client_cert.pki_role` is inherited from `vault.mtls.pki_role`, the certificates it signs are issued by the same CA the `cert` auth method trusts, so each one also works as a Vault cert-auth login for its few minutes of life. If you want the two kept apart, set a **separate `client_cert.pki_role`** whose CA the `cert` auth method does not trust (its own intermediate, or a different mount), and give that role `no_store=true`, a modest `max_ttl`, and `client_flag=true`, `server_flag=false`. The dev stack's `dotvault-tools` role is a starting point (note the dev stack trusts one CA for everything, so there it is not separate).
+
+Short-lived certificates are not revoked: they expire in minutes, which is why the recommended role uses `no_store` (Vault then does not even record them). A *held* certificate is different: when the login certificate rotates, `vault.mtls.revoke_superseded` (default on) revokes the one it replaced, so a long-lived process that loaded the old pair once loses it at rotation. Rotation happens `reissue_before` (default 7 days) ahead of expiry; have such a process re-read the files per connection rather than caching the pair.
+
+Key material and PEM never appear in logs or errors. The log lines carry the serial, `NotAfter`, source and common name only.
+
+### Reading it
+
+`GET /api/v1/status` carries a `client_cert` block (unauthenticated, like the sibling blocks): `state` (`idle`, `serving` or `error`), `source` (`held` or `ephemeral`), `common_name`, `serial`, `not_after` and `last_error`. It never carries the PEM or the key. `dotvault status` prints a **config-derived** section — which source applies, the PKI mount and role, the TTL, and for a held certificate what is on disk — and never signs and never contacts Vault; what the running daemon is actually serving is on the API.
+
+The section is static (a change needs a restart), is refused in a remote-config document, and is **not** user-overridable through the [per-user config file](#per-user-preferences): a certificate is a credential a process can present to a service, a wider grant than the read-only view of your own secrets that `fuse` allows there. It is validated whether or not it is enabled. On Windows GPO the equivalents are `Enabled` (REG_DWORD), `PKIMount`, `PKIRole`, `CommonName`, `TTL`, `KeyType` (REG_SZ) and `KeyBits` (REG_DWORD) under `HKLM\SOFTWARE\Policies\goodtune\dotvault\ClientCert`, and it round-trips through `reg-import`/`reg-export` like every other section.
+
 ## Docker volumes section
 
 The `docker` section serves your secrets to containers as a Docker volume plugin (rootless Docker and Podman both consume the same protocol). A volume is a directory of plain files — `gh.json` per secret, rendered exactly as the [filesystem](#filesystem-section) renders it — that the daemon materialises when a container first mounts it, keeps current from Vault events (Enterprise) or on a refresh window (Community), and deletes when the last container lets go. See the [Docker volumes guide](../guide/docker-volumes.md) for registration, the per-volume `secrets`/`layout`/`mode`/`ttl` options, and the refresh policy.
@@ -571,3 +659,7 @@ dotvault validates the configuration on startup and exits with an error if:
 - `fuse.cache_ttl` does not parse as a duration, or is negative
 - `docker.socket` or `docker.volume_dir` is set to a relative path (same reason as `api.unix.path`)
 - `docker.cache_ttl` does not parse as a duration, is zero or negative, or exceeds 10 minutes
+- `client_cert.ttl` does not parse as a duration, or is under one minute
+- `client_cert.common_name` does not parse as a template, or references a variable other than `{{.token_username}}` and `{{.os_user}}` (`{{.user}}` and `{{.vault_username}}` are refused by name)
+- `client_cert.key_type` is not `ec` or `rsa`, or `client_cert.key_bits` is not a valid RSA size or is set with `ec`
+- `client_cert.enabled` is true, the host signs rather than holds, and neither `client_cert.pki_role` nor `vault.mtls.pki_role` names a role

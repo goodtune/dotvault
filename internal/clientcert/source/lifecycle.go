@@ -44,21 +44,31 @@ func (e *ephemeral) reportRejection(err error) {
 	e.reporter.Report(err)
 }
 
-// awaitReplacement returns the token flight f should sign with. When no
-// replacement is in flight that is the token Current read. When one is, it
-// waits for it to clear — bounded by reauthWait, which never exceeds the
-// sign's own timeout — and re-reads the client's token, since the value read
-// before the wait is the one being replaced. A replacement that does not
-// clear in time is ErrReauthInProgress: transient, and not a Vault verdict.
+// awaitReplacement returns the token flight f should sign with. Without a
+// gate (the client facade, which resolves its own token) that is the token
+// Current read. With one, it first waits out a replacement in flight —
+// bounded by reauthWait, which never exceeds the sign's own timeout — and
+// then, whether or not it waited, re-reads the client's token: the value
+// Current read may be a candidate the lifecycle manager was still judging,
+// and a rejected candidate is replaced before the gate reads clear. A
+// replacement that does not clear in time is ErrReauthInProgress: transient,
+// and not a Vault verdict.
+//
+// The re-read happens before any Vault call, so the lookup and the sign are
+// still made under one token, and the flight is re-filed under it (tokenHash,
+// lastToken) so pacing and backoff follow the token actually presented.
 func (e *ephemeral) awaitReplacement(ctx context.Context, f *flight) (string, error) {
 	g := e.gate.Get()
-	if g == nil || !g.NeedsReauth() {
+	if g == nil {
 		return f.token, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, e.reauthWait)
-	defer cancel()
-	if err := tokengate.Wait(ctx, g); err != nil {
-		return "", fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, err)
+	if g.NeedsReauth() {
+		wctx, cancel := context.WithTimeout(ctx, e.reauthWait)
+		err := tokengate.Wait(wctx, g)
+		cancel()
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, err)
+		}
 	}
 	token := e.s.Token()
 	if token == "" {

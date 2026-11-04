@@ -84,6 +84,10 @@ type fakeSigner struct {
 	gate chan struct{}
 	// lookupErr, when set, is what LookupSelfWithToken returns.
 	lookupErr error
+	// afterToken, when set, runs once after the next Token read: a test
+	// uses it to replace the client's token between Current reading it and
+	// the sign starting.
+	afterToken func()
 }
 
 func newFakeSigner(t *testing.T, clock *testClock) *fakeSigner {
@@ -122,8 +126,13 @@ func newFakeSigner(t *testing.T, clock *testClock) *fakeSigner {
 
 func (f *fakeSigner) Token() string {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.token
+	tok, hook := f.token, f.afterToken
+	f.afterToken = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return tok
 }
 
 func (f *fakeSigner) setToken(tok string) {

@@ -92,6 +92,58 @@ func TestEphemeralWaitsOutTokenReplacement(t *testing.T) {
 	if len(f.signTokens) != 1 || f.signTokens[0] != "s.replacement" {
 		t.Fatalf("signed with %q, want the replacement token", f.signTokens)
 	}
+	// The common name is looked up with the same token the sign presents.
+	if len(f.lookupTokens) != 1 || f.lookupTokens[0] != "s.replacement" {
+		t.Fatalf("looked up the common name with %q, want the replacement token", f.lookupTokens)
+	}
+}
+
+// Current can read a candidate token the lifecycle manager is still judging
+// and find the gate already clear by the time the sign starts. The sign must
+// present what the client holds once the gate is clear, not the candidate:
+// a rejected candidate is replaced before the gate opens.
+func TestEphemeralRereadsTheTokenOnceTheGateIsClear(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setToken("s.candidate")
+	src := newSource(t, f, defaultOptions(clock))
+	wire(t, src, &stubGate{}, nil)
+	f.mu.Lock()
+	f.afterToken = func() { f.setToken("s.settled") }
+	f.mu.Unlock()
+
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.signTokens) != 1 || f.signTokens[0] != "s.settled" {
+		t.Fatalf("signed with %q, want the token held once the gate was clear", f.signTokens)
+	}
+	if len(f.lookupTokens) != 1 || f.lookupTokens[0] != "s.settled" {
+		t.Fatalf("looked up with %q, want the token held once the gate was clear", f.lookupTokens)
+	}
+}
+
+// Without a gate (the client facade) there is no lifecycle to defer to, and
+// the sign keeps the token Current read.
+func TestEphemeralWithoutGateKeepsTheTokenCurrentRead(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setToken("s.read")
+	src := newSource(t, f, defaultOptions(clock))
+	f.mu.Lock()
+	f.afterToken = func() { f.setToken("s.later") }
+	f.mu.Unlock()
+
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.signTokens) != 1 || f.signTokens[0] != "s.read" {
+		t.Fatalf("signed with %q, want the token Current read", f.signTokens)
+	}
 }
 
 // A replacement that never clears is bounded, and its failure is transient:

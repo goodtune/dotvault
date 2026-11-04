@@ -320,8 +320,10 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 		e.warned, e.warnedAs = false, ""
 		e.resetBackoffLocked()
 	} else {
-		// Filed under the token the sign actually used, which is the one
-		// Current hashed: the sign never re-reads the client's token.
+		// Filed under the token the sign actually used: the one Current
+		// hashed, or the one awaitReplacement re-read and re-filed the
+		// flight under once the gate was clear. Nothing re-reads the token
+		// after that, so the lookup and the sign present the same one.
 		e.failures++
 		e.retryAt = e.now().Add(backoffFor(e.failures))
 		e.lastErr = err
@@ -368,8 +370,8 @@ func (e *ephemeral) warnLocked(err error) {
 }
 
 // sign generates a key, has Vault sign it with token, and assembles the clientcert.Pair.
-// token is the value Current read, never re-read here: the common name lookup
-// and the sign must present the same token, or a swap mid-sign could render
+// token is the value the flight settled on (see awaitReplacement), never
+// re-read here: the common name lookup and the sign must present the same token, or a swap mid-sign could render
 // one token's username into a certificate another token signs.
 func (e *ephemeral) sign(ctx context.Context, token string) (*clientcert.Pair, error) {
 	cn, err := e.commonName(ctx, token)

@@ -326,10 +326,12 @@ func mapClientCertErr(ctx context.Context, err error) error {
 		return nil
 	case errors.Is(err, clientcert.ErrNoToken):
 		return fmt.Errorf("%w: no token to sign a client certificate with: %w", ErrLoginRequired, err)
-	case errors.Is(err, clientcert.ErrSignPaced), errors.Is(err, clientcert.ErrNoUsername):
-		// Kept reachable but not categorised: pacing is transient and says
-		// nothing about Vault, and a missing username is a deployment fault
-		// no existing sentinel names.
+	case errors.Is(err, clientcert.ErrSignPaced), errors.Is(err, clientcert.ErrNoUsername),
+		errors.Is(err, clientcert.ErrSignInProgress):
+		// Kept reachable but not categorised: pacing and a sign that outlived
+		// the caller's context are transient and say nothing about Vault
+		// (ErrSignPaced and ErrSignInProgress are exported aliases), and a
+		// missing username is a deployment fault no existing sentinel names.
 		return fmt.Errorf("dotvault: client certificate: %w", err)
 	case errors.Is(err, auth.ErrNoCertCredential), errors.Is(err, auth.ErrHeldNotExportable):
 		// Held certificate unusable and no role to sign one instead.

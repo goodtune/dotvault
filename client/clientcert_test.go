@@ -51,6 +51,8 @@ type certVault struct {
 	signs atomic.Int32
 	// signStatus, when non-zero, makes pki/sign answer that status.
 	signStatus atomic.Int32
+	// signDelay, when non-zero, holds each pki/sign response that long.
+	signDelay atomic.Int64
 	// lastPath is the most recent signing path.
 	lastPath atomic.Value
 	// valid is the one token Vault accepts ("good" unless a test changes it).
@@ -124,6 +126,9 @@ func newCertVault(t *testing.T) *certVault {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
 			return
+		}
+		if d := time.Duration(cv.signDelay.Load()); d > 0 {
+			time.Sleep(d)
 		}
 		if st := int(cv.signStatus.Load()); st != 0 {
 			w.WriteHeader(st)
@@ -236,6 +241,34 @@ func TestClientCertificateEphemeral(t *testing.T) {
 	}
 	if n := cv.signs.Load(); n != 1 {
 		t.Errorf("signs = %d, want 1", n)
+	}
+}
+
+// A call whose deadline ends while a sign is still in flight gets an error
+// errors.Is can recognise, uncategorised, and the sign is not abandoned: the
+// next call is answered with its result rather than signing again.
+func TestClientCertificateDeadlineMidSignIsSignInProgress(t *testing.T) {
+	cv := newCertVault(t)
+	cv.signDelay.Store(int64(300 * time.Millisecond))
+	t.Setenv("DOTVAULT_TOKEN", "good")
+	c := newClient(t, cv.ephemeralConfig(t))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := c.ClientCertificate(ctx)
+	if !errors.Is(err, ErrSignInProgress) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want ErrSignInProgress wrapping the deadline", err)
+	}
+	for _, cat := range []error{ErrDenied, ErrUnreachable, ErrLoginRequired, ErrNotConfigured, ErrAuthFailed} {
+		if errors.Is(err, cat) {
+			t.Fatalf("err = %v is categorised as %v; a sign outliving the deadline is not a verdict", err, cat)
+		}
+	}
+	if _, err := c.ClientCertificate(context.Background()); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if n := cv.signs.Load(); n != 1 {
+		t.Fatalf("signs = %d, want the one sign the first call started", n)
 	}
 }
 
@@ -707,6 +740,10 @@ func TestMapClientCertErr(t *testing.T) {
 	}
 	if got := mapClientCertErr(ctx, errors.New("clientcert: generate key: boom")); errors.Is(got, ErrUnreachable) {
 		t.Errorf("a local failure must not read as unreachable: %v", got)
+	}
+	inflight := fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.DeadlineExceeded)
+	if got := mapClientCertErr(ctx, inflight); !errors.Is(got, ErrSignInProgress) || !errors.Is(got, context.DeadlineExceeded) || errors.Is(got, ErrUnreachable) {
+		t.Errorf("sign in progress -> %v, want ErrSignInProgress, uncategorised", got)
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()

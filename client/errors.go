@@ -108,6 +108,17 @@ var (
 	// failure is on record. It is the same value the daemon's sources use,
 	// so errors.Is matches whichever is compared.
 	ErrSignPaced = clientcert.ErrSignPaced
+
+	// ErrSignInProgress indicates ClientCertificate (or a TLSConfig
+	// handshake, whose own bound is 30 seconds) ran out of context while a
+	// certificate sign it was waiting on was still in flight. The sign is not
+	// abandoned: it carries on under its own timeout, and a later call is
+	// answered with its result instead of signing again, so the right
+	// response is to retry. The error also wraps the context's own error
+	// (context.DeadlineExceeded or context.Canceled). Like ErrSignPaced it is
+	// not one of the outcome categories above, since it says nothing about
+	// Vault, and it is the same value the daemon's sources use.
+	ErrSignInProgress = clientcert.ErrSignInProgress
 )
 
 // classify maps a raw Vault API error onto one of the sentinel categories.

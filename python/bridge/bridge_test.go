@@ -32,6 +32,10 @@ func TestCategoryOf(t *testing.T) {
 		{"auth failed", fmt.Errorf("wrap: %w", client.ErrAuthFailed), catAuthFailed},
 		{"peer unavailable", fmt.Errorf("wrap: %w", client.ErrPeerUnavailable), catPeerUnavailable},
 		{"not configured", fmt.Errorf("wrap: %w", client.ErrNotConfigured), catNotConfigured},
+		// Transient and not a Vault verdict: the base DotvaultError in
+		// Python, like ErrSignPaced.
+		{"sign in progress", fmt.Errorf("wrap: %w", client.ErrSignInProgress), catOther},
+		{"sign paced", fmt.Errorf("wrap: %w", client.ErrSignPaced), catOther},
 		{"unknown", errors.New("something else"), catOther},
 		{"unknown handle", errUnknownHandle, catOther},
 	}

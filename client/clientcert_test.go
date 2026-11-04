@@ -517,6 +517,59 @@ func TestTLSConfigRecoversFromRejectedToken(t *testing.T) {
 	}
 }
 
+func TestClientCertificateFailedReplacementIsNotRetriedPerCall(t *testing.T) {
+	cv := newCertVault(t)
+	cv.valid.Store("t1")
+	cfg := cv.ephemeralConfig(t)
+	if err := os.WriteFile(cfg.TokenFile, []byte("t1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock()
+	c := newClient(t, cfg)
+	c.now = clock.Now
+	ctx := context.Background()
+	if err := c.AuthenticateCached(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// t1 dies and nothing replaces it: the token file still holds t1.
+	cv.valid.Store("t2")
+	if _, err := c.ClientCertificate(ctx); !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("first call: err = %v, want ErrLoginRequired", err)
+	}
+	if c.Token() != "" {
+		t.Fatalf("token = %q, want the dead token dropped", c.Token())
+	}
+	after := cv.lookups.Load()
+
+	// Every later call finds no token. Re-running AuthenticateCached each
+	// time would re-read the dead token file and send a denied lookup-self
+	// per call (and, under mtls+tpm, a TPM key derivation): the storm the
+	// token denylist exists to stop.
+	for range 20 {
+		if _, err := c.ClientCertificate(ctx); !errors.Is(err, ErrLoginRequired) {
+			t.Fatalf("err = %v, want the remembered ErrLoginRequired", err)
+		}
+		clock.Advance(100 * time.Millisecond)
+	}
+	if n := cv.lookups.Load() - after; n != 0 {
+		t.Fatalf("lookup-self calls across 20 rapid calls = %d, want 0 inside the interval", n)
+	}
+
+	// After the interval one attempt is made, and it succeeds once a usable
+	// token has appeared; success clears the remembered failure.
+	clock.Advance(certReplaceInterval)
+	if err := os.WriteFile(cfg.TokenFile, []byte("t2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ClientCertificate(ctx); err != nil {
+		t.Fatalf("after the interval: %v", err)
+	}
+	if n := cv.lookups.Load() - after; n != 1 {
+		t.Errorf("lookup-self calls after the interval = %d, want 1", n)
+	}
+}
+
 func TestClientCertificatePolicyDenialKeepsTokenAndIsPaced(t *testing.T) {
 	cv := newCertVault(t)
 	t.Setenv("DOTVAULT_TOKEN", "good")

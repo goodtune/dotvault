@@ -75,6 +75,10 @@ type Client struct {
 	// certReplacedAt is when the certificate path last tried to replace a
 	// token Vault rejected (guarded by authMu); see replaceRejectedToken.
 	certReplacedAt time.Time
+	// certAuthErr and certAuthAt remember the certificate path's last failed
+	// AuthenticateCached (guarded by authMu); see certAuthenticate.
+	certAuthErr error
+	certAuthAt  time.Time
 	// now is the clock the certificate path reads; nil means time.Now.
 	// Tests set it to move the certificate's lifetime without sleeping.
 	now func() time.Time

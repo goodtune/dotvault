@@ -219,7 +219,31 @@ func (c *Client) authenticateForCert(ctx context.Context) error {
 	if c.vc.Token() != "" {
 		return nil
 	}
-	return c.AuthenticateCached(ctx)
+	return c.certAuthenticate(ctx)
+}
+
+// certAuthenticate runs AuthenticateCached for the certificate path, at most
+// once per certReplaceInterval while it keeps failing: inside the interval
+// the last failure is returned unchanged. Without that, every call and every
+// handshake on a Client with no usable token would re-read a dead token
+// file, send a denied lookup-self, dial the peer sockets and, under mtls+tpm,
+// derive a TPM key — the denied-request storm auth.TokenDenylist exists to
+// stop on the daemon side. A failure caused by the caller's own context
+// ending says nothing about the token sources and is not remembered. A
+// success clears the memory. Called with authMu held.
+func (c *Client) certAuthenticate(ctx context.Context) error {
+	now := c.clock()
+	if c.certAuthErr != nil && now.Sub(c.certAuthAt) < certReplaceInterval {
+		return c.certAuthErr
+	}
+	err := c.AuthenticateCached(ctx)
+	switch {
+	case err == nil:
+		c.certAuthErr, c.certAuthAt = nil, time.Time{}
+	case ctx.Err() == nil:
+		c.certAuthErr, c.certAuthAt = err, now
+	}
+	return err
 }
 
 // lastReporter is implemented by every clientcert source: the most recent pair
@@ -253,9 +277,9 @@ func (c *Client) signRejection(src clientcert.Source, pair *clientcert.Pair, err
 	return nil
 }
 
-// replaceRejectedToken re-resolves the Client's token after Vault rejected
-// rejected while signing. It reports whether the Client now holds a different
-// token. A 403 from pki/sign is also what a policy without that path answers,
+// replaceRejectedToken re-resolves the Client's token after Vault refused the
+// token named by rejected while signing. It reports whether the Client now
+// holds a different token. A 403 from pki/sign is also what a policy without that path answers,
 // so the token is first checked with lookup-self and kept when Vault still
 // accepts it; only a token Vault refuses there is dropped and replaced through
 // AuthenticateCached, whose error is returned when nothing replaces it.
@@ -280,7 +304,10 @@ func (c *Client) replaceRejectedToken(ctx context.Context, rejected string) (boo
 		}
 	}
 	c.vc.SetToken("")
-	if err := c.AuthenticateCached(ctx); err != nil {
+	// Through certAuthenticate, so a failure here is what the next calls
+	// (which now find no token) are answered with, instead of each running
+	// AuthenticateCached again.
+	if err := c.certAuthenticate(ctx); err != nil {
 		return false, err
 	}
 	return c.vc.Token() != rejected, nil

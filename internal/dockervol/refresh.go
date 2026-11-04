@@ -181,7 +181,25 @@ const (
 	// issued lifetime, so volumes signed together do not all re-render (and
 	// re-sign) in the same instant.
 	certJitterDivisor = 20
+	// certWindowDivisor additionally bounds the jitter to 1/10 of the
+	// window between RefreshAt and NotAfter. For a short-lived certificate
+	// RefreshAt is the half-life, so the two bounds agree; for a held one
+	// RefreshAt is NotAfter minus reissue_before, a window that can be a
+	// small fraction of a long lifetime, and 5% of a year would land the
+	// re-render weeks after the daemon rotated and revoked the copy the
+	// volume holds — or past NotAfter outright.
+	certWindowDivisor = 10
 )
+
+// certJitterBound is the most nextCertRefresh may add past RefreshAt.
+func certJitterBound(pair *clientcert.Pair) time.Duration {
+	lifetime := pair.NotAfter.Sub(pair.NotBefore)
+	window := pair.NotAfter.Sub(pair.RefreshAt)
+	if lifetime <= 0 || window <= 0 {
+		return 0
+	}
+	return min(lifetime/certJitterDivisor, window/certWindowDivisor)
+}
 
 // certSchedule is the per-loop state nextCertRefresh carries between arms.
 type certSchedule struct {
@@ -195,7 +213,8 @@ type certSchedule struct {
 // never armed for a volume that does not carry the certificate.
 //
 //   - Success: the pair's RefreshAt, plus jitter of at most 5% of the
-//     issued lifetime, and never less than certTimerMin.
+//     issued lifetime and at most a tenth of the RefreshAt-to-NotAfter
+//     window (see certWindowDivisor), and never less than certTimerMin.
 //   - Success with a pair already past its RefreshAt: the source has
 //     nothing newer to give yet — a held certificate the daemon has not
 //     rotated, or an ephemeral one whose re-sign is paced and which is
@@ -243,9 +262,7 @@ func (d *Driver) nextCertRefresh(spec Spec, pair *clientcert.Pair, err error, s 
 		return delay, true
 	}
 	s.overdue = 0
-	if lifetime := pair.NotAfter.Sub(pair.NotBefore); lifetime > 0 {
-		until += d.jitter(lifetime / certJitterDivisor)
-	}
+	until += d.jitter(certJitterBound(pair))
 	return max(until, certTimerMin), true
 }
 

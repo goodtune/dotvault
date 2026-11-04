@@ -1205,7 +1205,10 @@ func TestNextCertRefresh(t *testing.T) {
 		arm  bool
 	}{
 		{"no certificate", Spec{TTL: time.Minute}, nil, nil, 0, false},
-		{"due later, jitter 5% of lifetime", with, pair(time.Hour, 100*time.Minute), nil, time.Hour + 5*time.Minute, true},
+		// Half-life shaped (the short-lived source): both jitter bounds agree on 5%.
+		{"due later, jitter 5% of lifetime", with, pair(time.Hour, 122*time.Minute), nil, time.Hour + 6*time.Minute + 6*time.Second, true},
+		// RefreshAt well past half-life: the window bound (a tenth of 39m) wins.
+		{"due later, jitter bounded by the window", with, pair(time.Hour, 100*time.Minute), nil, time.Hour + 3*time.Minute + 54*time.Second, true},
 		{"due almost now, 1s floor", with, pair(100*time.Millisecond, 0), nil, time.Second, true},
 		{"paced", with, nil, wrapped, certRetry, true},
 		{"source has no token", with, nil, clientcert.ErrNoToken, certRetry, true},
@@ -1217,6 +1220,38 @@ func TestNextCertRefresh(t *testing.T) {
 		got, arm := d.nextCertRefresh(tc.spec, tc.pair, tc.err, &s)
 		if got != tc.want || arm != tc.arm {
 			t.Errorf("%s: = %v,%v want %v,%v", tc.name, got, arm, tc.want, tc.arm)
+		}
+	}
+
+	// A held-shaped pair: a 30-day certificate the daemon re-issues 7 days
+	// before expiry. 5% of the lifetime is 36h, by which time the daemon has
+	// rotated and (revoke_superseded) revoked the volume's copy; the jitter
+	// is bounded by a tenth of the 7-day window instead.
+	heldPair := func(lifetime time.Duration) *clientcert.Pair {
+		nb := now.Add(-24 * time.Hour)
+		na := nb.Add(lifetime)
+		return &clientcert.Pair{NotBefore: nb, NotAfter: na, RefreshAt: na.Add(-7 * 24 * time.Hour), Source: clientcert.SourceHeld}
+	}
+	for _, lifetime := range []time.Duration{30 * 24 * time.Hour, 365 * 24 * time.Hour} {
+		hp := heldPair(lifetime)
+		var hs certSchedule
+		got, _ := d.nextCertRefresh(with, hp, nil, &hs)
+		want := hp.RefreshAt.Sub(now) + 7*24*time.Hour/10
+		if got != want {
+			t.Errorf("held %v: delay = %v, want RefreshAt + %v (= %v)", lifetime, got, 7*24*time.Hour/10, want)
+		}
+		if !now.Add(got).Before(hp.NotAfter) {
+			t.Errorf("held %v: timer fires at or past NotAfter", lifetime)
+		}
+		// Once due, while the daemon has not rotated yet (rotation lands
+		// up to one hourly ReissueIfDue tick later), the volume re-checks
+		// at most every ttl rather than waiting out another long delay.
+		overdue := heldPair(lifetime)
+		overdue.RefreshAt = now.Add(-time.Minute)
+		for range 8 {
+			if dl, _ := d.nextCertRefresh(with, overdue, nil, &hs); dl > with.TTL {
+				t.Fatalf("held %v overdue: re-check after %v, want at most the ttl %v", lifetime, dl, with.TTL)
+			}
 		}
 	}
 

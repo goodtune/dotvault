@@ -25,9 +25,41 @@ type HeldCertificate struct {
 	NotAfter time.Time
 	// Serial is the leaf's serial as recorded in the envelope.
 	Serial string
-	// ModTime is the mtime of credential.json, so a caller can notice that a
-	// rotation replaced the credential.
+	// Version identifies the credential.json this was read from, taken
+	// before the content was read, so a caller comparing it with a later
+	// StatCredential notices a rotation that replaced the credential.
+	Version CredentialVersion
+}
+
+// CredentialVersion identifies one write of credential.json: its
+// full-resolution mtime and its size, so a rewrite within the same second is
+// still told apart unless it also keeps the size and lands on the identical
+// mtime. Comparable with ==.
+type CredentialVersion struct {
 	ModTime time.Time
+	Size    int64
+}
+
+// StatCredential reports the version of the credential envelope under
+// storageDir without reading it, for a caller that keeps an exported
+// HeldCertificate and wants to know cheaply whether it is still current. It
+// stats the same file ExportHeldCertificate reads; an empty storageDir is
+// refused for the same reason it is there.
+func StatCredential(storageDir string) (CredentialVersion, error) {
+	if storageDir == "" {
+		return CredentialVersion{}, fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
+	}
+	fi, err := os.Stat(credentialPath(storageDir))
+	if err != nil {
+		return CredentialVersion{}, err
+	}
+	return versionOf(fi), nil
+}
+
+func versionOf(fi os.FileInfo) CredentialVersion {
+	// Normalise to wall-clock UTC so == compares the instant, not the
+	// location or a monotonic reading.
+	return CredentialVersion{ModTime: fi.ModTime().UTC().Round(0), Size: fi.Size()}
 }
 
 // ErrHeldNotExportable is returned when the held certificate's key is
@@ -58,9 +90,9 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		return nil, fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
 	}
 	// Stat before reading. A rotation landing between the two then pairs the
-	// old mtime with the new content, which only makes the caller reload once
-	// more; the other order would pair a new mtime with old content and hide
-	// the rotation from it until the next one.
+	// old version with the new content, which only makes the caller reload
+	// once more; the other order would pair a new version with old content and
+	// hide the rotation from it until the next one.
 	fi, err := os.Stat(credentialPath(storageDir))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -116,6 +148,6 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		KeyPEM:   pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
 		NotAfter: cred.NotAfter,
 		Serial:   cred.Serial,
-		ModTime:  fi.ModTime(),
+		Version:  versionOf(fi),
 	}, nil
 }

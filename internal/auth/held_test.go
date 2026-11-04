@@ -83,8 +83,8 @@ func TestExportHeldCertificate(t *testing.T) {
 	if held.Serial != "aa:bb" {
 		t.Fatalf("Serial = %q", held.Serial)
 	}
-	if held.ModTime.IsZero() {
-		t.Fatal("ModTime not set")
+	if held.Version.ModTime.IsZero() || held.Version.Size == 0 {
+		t.Fatalf("Version not set: %+v", held.Version)
 	}
 }
 
@@ -199,8 +199,8 @@ func TestExportHeldStatsBeforeRead(t *testing.T) {
 	if held.Serial != "cc:dd" {
 		t.Fatalf("Serial = %q, want the rotated content", held.Serial)
 	}
-	if !held.ModTime.Equal(old) {
-		t.Fatalf("ModTime = %v, want the pre-read mtime %v", held.ModTime, old)
+	if !held.Version.ModTime.Equal(old) {
+		t.Fatalf("Version.ModTime = %v, want the pre-read mtime %v", held.Version.ModTime, old)
 	}
 }
 
@@ -225,5 +225,36 @@ func TestExportHeldKeyCertMismatch(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), otherPEM[40:80]) {
 		t.Fatal("error carries key material")
+	}
+}
+
+// StatCredential is the cheap check a caller compares with an export's
+// Version: on an unchanged envelope the two agree, and a rewrite changes it.
+func TestStatCredentialMatchesExportVersion(t *testing.T) {
+	dir := t.TempDir()
+	seedHeld(t, dir, "mtls", "file", "alice", time.Now().Add(time.Hour), pkcs8Handle(t))
+	held, err := ExportHeldCertificate(dir, "mtls", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := StatCredential(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != held.Version {
+		t.Fatalf("StatCredential = %+v, export Version = %+v", v, held.Version)
+	}
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(credentialPath(dir), later, later); err != nil {
+		t.Fatal(err)
+	}
+	if v2, err := StatCredential(dir); err != nil || v2 == v {
+		t.Fatalf("after rewrite: %+v, %v; want a different version", v2, err)
+	}
+}
+
+func TestStatCredentialRefusesEmptyDir(t *testing.T) {
+	if _, err := StatCredential(""); !errors.Is(err, ErrNoCertCredential) {
+		t.Fatalf("err = %v, want ErrNoCertCredential", err)
 	}
 }

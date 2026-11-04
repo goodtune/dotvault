@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -14,10 +12,12 @@ import (
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
-// credentialFile is the name of the envelope auth writes under the mtls
-// storage directory. It is repeated here (rather than exported from auth)
-// only so the held source can stat it cheaply on every Current.
-const credentialFile = "credential.json"
+// statCredential and exportHeld are auth's, as variables so a test can stand
+// in for the envelope and land a rotation exactly where it wants one.
+var (
+	statCredential = auth.StatCredential
+	exportHeld     = auth.ExportHeldCertificate
+)
 
 // held serves the certificate this host already logs in to Vault with, under
 // plain mtls. It owns no key and signs nothing: the daemon rotates the
@@ -30,10 +30,10 @@ type held struct {
 	mu sync.Mutex
 	// cur is the most recent pair exported, kept even after a failure so
 	// Last can report it. loaded says cur still corresponds to the envelope
-	// as it was when statKey was taken.
+	// at version, the stat auth took before reading it.
 	cur     *clientcert.Pair
 	loaded  bool
-	statKey envelopeStat
+	version auth.CredentialVersion
 	lastErr error
 
 	// last mirrors cur and lastErr under its own lock, so Last (and with it
@@ -44,15 +44,6 @@ type held struct {
 		pair *clientcert.Pair
 		err  error
 	}
-}
-
-// envelopeStat is what identifies one version of the envelope file. The full
-// nanosecond mtime and the size are both compared, so a rewrite within the
-// same second is still seen unless it also keeps the size and lands on the
-// identical mtime.
-type envelopeStat struct {
-	modTime time.Time
-	size    int64
 }
 
 // NewHeld returns a clientcert.Source serving the held mtls certificate stored under
@@ -73,17 +64,16 @@ func (h *held) Current(ctx context.Context) (*clientcert.Pair, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Stat before exporting: a rotation after this point changes the file
-	// away from the key we record, so the next call reloads.
-	var key envelopeStat
-	if fi, err := os.Stat(filepath.Join(h.dir, credentialFile)); err == nil {
-		key = envelopeStat{modTime: fi.ModTime(), size: fi.Size()}
-		if h.loaded && key == h.statKey && time.Now().Before(h.cur.NotAfter) {
-			return h.cur, nil
-		}
+	// The cheap check only decides whether to export. The version recorded
+	// beside the content is the one the export itself reports, which auth
+	// takes before it reads the file: a rotation landing between the two then
+	// pairs the older version with the newer content and costs one more
+	// reload, never the reverse, which would hide the rotation.
+	if v, err := statCredential(h.dir); err == nil && h.loaded && v == h.version && time.Now().Before(h.cur.NotAfter) {
+		return h.cur, nil
 	}
 
-	hc, err := auth.ExportHeldCertificate(h.dir, h.method, h.username)
+	hc, err := exportHeld(h.dir, h.method, h.username)
 	if err != nil {
 		h.loaded = false
 		h.lastErr = err
@@ -97,7 +87,7 @@ func (h *held) Current(ctx context.Context) (*clientcert.Pair, error) {
 		h.publish()
 		return nil, err
 	}
-	h.cur, h.statKey, h.loaded, h.lastErr = p, key, true, nil
+	h.cur, h.version, h.loaded, h.lastErr = p, hc.Version, true, nil
 	h.publish()
 	return p, nil
 }

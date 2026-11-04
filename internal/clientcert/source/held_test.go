@@ -362,3 +362,71 @@ func TestHeldLastDoesNotWaitOnCurrent(t *testing.T) {
 		t.Fatal("Last blocked behind Current")
 	}
 }
+
+// The version that gates reloading must be the one auth took before it read
+// the content, never a stat of the source's own: a rotation landing between
+// the two would otherwise pair the newer version with the older content and
+// hide the rotation until the next one. Here the rotation has already landed
+// when the source looks, but the export it gets back was read from the file
+// before that (auth's pre-read stat says so): the next call must reload.
+func TestHeldGatesOnTheExportsPreReadVersion(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := writeEnvelope(t, mkdir(t, dir, "old"), envelopeSpec{serial: 0x01})
+	newPath := writeEnvelope(t, mkdir(t, dir, "new"), envelopeSpec{serial: 0x02})
+	oldHC, err := auth.ExportHeldCertificate(filepath.Dir(oldPath), "mtls", "gary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHC, err := auth.ExportHeldCertificate(filepath.Dir(newPath), "mtls", "gary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := auth.CredentialVersion{ModTime: time.Unix(1000, 0).UTC(), Size: 1}
+	v2 := auth.CredentialVersion{ModTime: time.Unix(2000, 0).UTC(), Size: 2}
+	oldHC.Version, newHC.Version = v1, v2
+
+	exports := []*auth.HeldCertificate{oldHC, newHC}
+	calls := 0
+	swapHeldSeams(t,
+		func(string) (auth.CredentialVersion, error) { return v2, nil },
+		func(string, string, string) (*auth.HeldCertificate, error) {
+			if calls >= len(exports) {
+				t.Fatal("exported again with an unchanged envelope")
+			}
+			hc := exports[calls]
+			calls++
+			return hc, nil
+		})
+
+	src := NewHeld(dir, "mtls", "gary", time.Hour)
+	p1, err := src.Current(context.Background())
+	if err != nil || p1.Serial != "01" {
+		t.Fatalf("first: %v, %v", p1, err)
+	}
+	p2, err := src.Current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.Serial != "02" {
+		t.Fatalf("second Current served serial %s: the newer stat was paired with the older content", p2.Serial)
+	}
+	if p3, err := src.Current(context.Background()); err != nil || p3 != p2 {
+		t.Fatalf("third: %v, %v; want the cached second pair", p3, err)
+	}
+}
+
+func mkdir(t *testing.T, parent, name string) string {
+	t.Helper()
+	d := filepath.Join(parent, name)
+	if err := os.Mkdir(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func swapHeldSeams(t *testing.T, stat func(string) (auth.CredentialVersion, error), export func(string, string, string) (*auth.HeldCertificate, error)) {
+	t.Helper()
+	origStat, origExport := statCredential, exportHeld
+	statCredential, exportHeld = stat, export
+	t.Cleanup(func() { statCredential, exportHeld = origStat, origExport })
+}

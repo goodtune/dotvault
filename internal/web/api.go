@@ -146,6 +146,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status["docker"] = dockerStatus()
 	}
 
+	// Client certificate being served (source, subject, serial, expiry, last
+	// error). Unauthenticated like the blocks above, so it carries the facts
+	// the certificate's public part would show and nothing else: never the
+	// PEM, the key or a fingerprint of either.
+	if certStatus := s.clientCertStatusSnapshot(); certStatus != nil {
+		status["client_cert"] = certStatus()
+	}
+
 	writeJSON(w, status)
 }
 

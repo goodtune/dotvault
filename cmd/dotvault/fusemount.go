@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"runtime"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/vaultfs"
@@ -53,7 +54,7 @@ func resolveFUSEMountpoint(cfg *config.Config) string {
 // pre-auth agent answers "no identities" in microseconds, which a client
 // simply moves past, where a pre-auth mount answers an error per read with no
 // equivalent of "nothing here".
-func startFUSE(ctx context.Context, cfg *config.Config, vc *vault.Client, username string) *vaultfs.Service {
+func startFUSE(ctx context.Context, cfg *config.Config, vc *vault.Client, username string, certSrc clientcert.Source) *vaultfs.Service {
 	mountpoint := resolveFUSEMountpoint(cfg)
 	if mountpoint == "" {
 		return nil
@@ -68,6 +69,7 @@ func startFUSE(ctx context.Context, cfg *config.Config, vc *vault.Client, userna
 		Mountpoint: mountpoint,
 		ReadWrite:  cfg.FUSE.ReadWrite,
 		CacheTTL:   cfg.FUSE.CacheTTL,
+		ClientCert: certSrc,
 	})
 	if err != nil {
 		slog.Warn("filesystem not mounted", "mountpoint", mountpoint, "error", err)

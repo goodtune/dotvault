@@ -17,6 +17,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/clipboard"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/dockervol"
@@ -212,6 +213,11 @@ type Server struct {
 	// Guarded by fuseMu alongside fuseStatus — both are post-construction
 	// wirings of the same shape; read through dockerStatusSnapshot.
 	dockerStatus func() dockervol.Status
+
+	// clientCertStatus reports the served client certificate for
+	// /api/v1/status's "client_cert" block. Nil when client_cert is not
+	// enabled. Guarded by fuseMu, like the other post-construction wirings.
+	clientCertStatus func() clientcert.Status
 
 	// reauthGate, when set, reports whether the daemon's own token has gone
 	// invalid and is awaiting re-authentication. /api/v1/token consults it so
@@ -774,6 +780,23 @@ func (s *Server) SetDockerStatus(status func() dockervol.Status) {
 	s.fuseMu.Lock()
 	defer s.fuseMu.Unlock()
 	s.dockerStatus = status
+}
+
+// SetClientCertStatus wires the client certificate source's status query in
+// after construction, for the same reason SetFUSEStatus exists. The query must
+// never sign: it is called on every status poll.
+func (s *Server) SetClientCertStatus(status func() clientcert.Status) {
+	s.fuseMu.Lock()
+	defer s.fuseMu.Unlock()
+	s.clientCertStatus = status
+}
+
+// clientCertStatusSnapshot returns the currently wired client certificate
+// status query, or nil if none is configured.
+func (s *Server) clientCertStatusSnapshot() func() clientcert.Status {
+	s.fuseMu.RLock()
+	defer s.fuseMu.RUnlock()
+	return s.clientCertStatus
 }
 
 // dockerStatusSnapshot returns the currently wired plugin status query, or

@@ -52,6 +52,7 @@ func GenerateText(cfg *config.Config) (string, error) {
 	e.writeAPI(cfg.API)
 	e.writeFUSE(cfg.FUSE)
 	e.writeDocker(cfg.Docker)
+	e.writeClientCert(cfg.ClientCert)
 	e.writeSSH(cfg.SSH)
 	e.writeRules(cfg.Rules)
 	e.writeEnrolments(cfg.Enrolments)
@@ -425,6 +426,29 @@ func (e *emitter) writeDocker(d config.DockerConfig) {
 	e.writeString("VolumeDir", d.VolumeDir)
 	// The raw string, not the parsed duration — see writeFUSE.
 	e.writeString("CacheTTL", d.RawCacheTTL)
+	e.WriteString("\r\n")
+}
+
+// writeClientCert emits the client certificate section — flat scalars under
+// one key, emitted on every platform for the same mixed-fleet reason as FUSE
+// and Docker. The key is deleted first and recreated so the one value that is
+// omitted when unset, KeyBits, is cleared on re-import rather than left in
+// force from an earlier policy; the strings are always emitted, even empty,
+// for the same clearing reason.
+func (e *emitter) writeClientCert(c config.ClientCertConfig) {
+	key := rootKey + `\ClientCert`
+	e.writeKeyDeletion(key)
+	e.writeKey(key)
+	e.writeBool("Enabled", c.Enabled)
+	e.writeString("PKIMount", c.PKIMount)
+	e.writeString("PKIRole", c.PKIRole)
+	e.writeString("CommonName", c.CommonName)
+	// The raw string, not the parsed duration — see writeFUSE.
+	e.writeString("TTL", c.RawTTL)
+	e.writeString("KeyType", c.KeyType)
+	if c.KeyBits != 0 {
+		e.writeDWORD("KeyBits", uint32(c.KeyBits))
+	}
 	e.WriteString("\r\n")
 }
 

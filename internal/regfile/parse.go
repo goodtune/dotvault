@@ -911,6 +911,30 @@ func applyValues(cfg *config.Config, values map[valueKey]regValue, rules map[str
 		return err
 	}
 
+	// ClientCert (client certificates served to other tools).
+	clientCertKey := rootKey + `\ClientCert`
+	if err := applyBool(&cfg.ClientCert.Enabled, clientCertKey, "Enabled"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.ClientCert.PKIMount, clientCertKey, "PKIMount"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.ClientCert.PKIRole, clientCertKey, "PKIRole"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.ClientCert.CommonName, clientCertKey, "CommonName"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.ClientCert.RawTTL, clientCertKey, "TTL"); err != nil {
+		return err
+	}
+	if err := apply(&cfg.ClientCert.KeyType, clientCertKey, "KeyType"); err != nil {
+		return err
+	}
+	if err := applyInt(&cfg.ClientCert.KeyBits, clientCertKey, "KeyBits"); err != nil {
+		return err
+	}
+
 	// SSH (admin-owned host-CA trust material).
 	sshKey := rootKey + `\SSH`
 	if err := applyBool(&cfg.SSH.InsecureIgnoreHostKey, sshKey, "InsecureIgnoreHostKey"); err != nil {

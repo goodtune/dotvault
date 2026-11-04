@@ -11,6 +11,7 @@ import (
 	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/clientcert/source"
 	"github.com/goodtune/dotvault/internal/config"
+	"github.com/goodtune/dotvault/internal/tokengate"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -66,8 +67,8 @@ func newClientCertSource(cfg *config.Config, signer source.Signer, username stri
 // replaced, and the report of a token rejection the sign saw first.
 // *auth.LifecycleManager satisfies it.
 type clientCertLifecycle interface {
-	source.ReauthGate
-	source.RejectionReporter
+	tokengate.Gate
+	tokengate.Reporter
 }
 
 // wireClientCertLifecycle hands the lifecycle manager to the certificate

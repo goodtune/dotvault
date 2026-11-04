@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"text/template"
 	"text/template/parse"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/securestore"
+	"github.com/goodtune/dotvault/internal/tokengate"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -99,10 +99,11 @@ type ephemeral struct {
 	lastErr     error             // error of the most recent failed sign
 	failedToken [sha256.Size]byte // SHA-256 of the token the last failure used
 
-	// gate and reporter are the token-lifecycle seams (see lifecycle.go):
-	// a gateHolder and a reporterHolder, stored after construction because
-	// the lifecycle manager is built after the source.
-	gate, reporter atomic.Value
+	// gate and reporter are the token-lifecycle seams (see lifecycle.go),
+	// set after construction because the lifecycle manager is built after
+	// the source.
+	gate     tokengate.GateSlot
+	reporter tokengate.ReporterSlot
 	// reauthWait bounds the wait on gate before a sign; signTimeout unless a
 	// test shortens it.
 	reauthWait time.Duration

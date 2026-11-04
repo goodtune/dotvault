@@ -11,6 +11,7 @@ import (
 	vaultapi "github.com/hashicorp/vault/api"
 
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/tokengate"
 )
 
 // stubGate is a ReauthGate a test opens and closes.
@@ -36,7 +37,7 @@ func (r *recordingReporter) reported() []error {
 	return append([]error(nil), r.errs...)
 }
 
-func wire(t *testing.T, src clientcert.Source, g ReauthGate, r RejectionReporter) {
+func wire(t *testing.T, src clientcert.Source, g tokengate.Gate, r tokengate.Reporter) {
 	t.Helper()
 	w, ok := src.(LifecycleWirer)
 	if !ok {

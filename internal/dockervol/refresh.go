@@ -201,7 +201,9 @@ type certSchedule struct {
 //     rotated, or an ephemeral one whose re-sign is paced and which is
 //     still valid. Re-rendering at the 1s floor would re-read every
 //     selected secret from Vault each second, so this backs off from
-//     d.certRetry, doubling to the ticker's cadence.
+//     d.certRetry, doubling to the ticker's cadence, but never past
+//     NotAfter (plus certTimerMin), so an expired pair is always replaced
+//     as soon as the source can sign again.
 //   - Failure the source expects to clear shortly (ErrSignPaced, or no
 //     token, whether the source or the driver noticed): d.certRetry.
 //   - Any other failure, or no pair reported: the ordinary ticker cadence.
@@ -228,7 +230,17 @@ func (d *Driver) nextCertRefresh(spec Spec, pair *clientcert.Pair, err error, s 
 		if delay < ceiling {
 			s.overdue++
 		}
-		return min(delay, ceiling), true
+		delay = min(delay, ceiling)
+		// Never back off past the certificate's expiry. A source that
+		// cannot sign right now (a transient Vault failure) still answers
+		// with its cached pair while that pair is valid, so a backoff
+		// step that overran NotAfter would leave the container holding
+		// an expired client.crt long after Vault recovered. Firing just
+		// after NotAfter guarantees the source must try again.
+		if exp := pair.NotAfter.Sub(d.now()); exp > 0 {
+			delay = min(delay, exp+certTimerMin)
+		}
+		return delay, true
 	}
 	s.overdue = 0
 	if lifetime := pair.NotAfter.Sub(pair.NotBefore); lifetime > 0 {

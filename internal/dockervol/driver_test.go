@@ -1041,10 +1041,12 @@ func TestVolumeClientCertRefreshesWhileEventsDrive(t *testing.T) {
 	if !fileHas(crt, "FIRST") {
 		t.Fatal("mount did not write the first certificate")
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	// Due in 200ms and floored at certTimerMin (1s); the 5s deadline is
+	// headroom for a loaded CI runner, not the expected latency.
+	deadline := time.Now().Add(5 * time.Second)
 	for !fileHas(crt, "SECOND") {
 		if time.Now().After(deadline) {
-			t.Fatal("certificate not re-rendered within 2s of falling due")
+			t.Fatal("certificate not re-rendered within 5s of falling due")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1115,6 +1117,9 @@ func TestVolumeClientCertRetriesShortlyWhenPaced(t *testing.T) {
 func TestVolumeClientCertTimerStopsOnUnmount(t *testing.T) {
 	d, _ := newTestDriver(t, newMemStore(), nil)
 	d.jitter = noJitter
+	// The pair is always overdue, so a loop that kept running would fire
+	// every certRetry; at 50ms that is many calls inside the window.
+	d.certRetry = 50 * time.Millisecond
 	src := &seqCertSource{next: func(int) (*clientcert.Pair, error) {
 		return certPair("ANY", time.Hour, 0), nil
 	}}
@@ -1232,6 +1237,17 @@ func TestNextCertRefresh(t *testing.T) {
 			break
 		}
 	}
+	// The backoff never overruns the certificate's expiry: with the
+	// backoff at 40s and NotAfter 15s away, the timer fires just after
+	// NotAfter so the source has to sign again.
+	var e certSchedule
+	near := &clientcert.Pair{NotBefore: now.Add(-time.Hour), NotAfter: now.Add(15 * time.Second), RefreshAt: now.Add(-time.Minute)}
+	d.nextCertRefresh(with, near, nil, &e)
+	d.nextCertRefresh(with, near, nil, &e)
+	if dl, _ := d.nextCertRefresh(with, near, nil, &e); dl != 15*time.Second+certTimerMin {
+		t.Errorf("overdue delay near NotAfter = %v, want %v", dl, 15*time.Second+certTimerMin)
+	}
+
 	// A pair with a future RefreshAt resets the backoff.
 	d.nextCertRefresh(with, pair(time.Hour, time.Hour), nil, &s)
 	if dl, _ := d.nextCertRefresh(with, pair(-time.Second, time.Hour), nil, &s); dl != certRetry {

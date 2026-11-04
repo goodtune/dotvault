@@ -463,6 +463,8 @@ On Windows GPO, the equivalents are `Enabled` (REG_DWORD), `Mountpoint` (REG_SZ)
 
 The `client_cert` section makes a mutual-TLS client certificate available to **other tools**, so `curl`, a database driver or an internal API client can identify you to a service the way dotvault identifies you to Vault. The certificate and its key appear as `client.crt`, `client.key` and `client.pem` at the root of the [filesystem](#filesystem-section) mount, in [Docker volumes](#docker-volumes-section) that ask for them, and through the public Go package (`client/`) and the Python bindings (`python/`). The service on the far end is up to you; this section only supplies the client side.
 
+On Windows only the Go package and the Python bindings serve the certificate: the filesystem mount and the Docker volume plugin are not available there, so the section has no files to put it in.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Serve a client certificate |

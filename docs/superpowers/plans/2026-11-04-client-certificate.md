@@ -1,5 +1,7 @@
 # Client Certificates for Tools Implementation Plan
 
+> **Historical.** This is the plan the feature was built from. Several details changed in review, so the shipped behaviour is described by CLAUDE.md ("Client certificates for tools") and the user docs, not here.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Serve a client certificate (`client.crt`, `client.key`, `client.pem`) that tools can use for mTLS. It comes through the FUSE mount, Docker volumes, the `client/` Go package and the Python bindings. The certificate is either the held `mtls` credential or a 5-minute certificate signed in memory.

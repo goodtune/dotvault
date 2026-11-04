@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -310,13 +311,19 @@ func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret
 // the Vault default for the parent (no explicit ttl is requested). A DisplayName
 // of "dotvault" is set so the downscoped tokens are recognisable in Vault's
 // audit log.
-func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefaultPolicy bool) (string, error) {
+//
+// meta, when non-empty, is set as the child's token metadata. Vault does not
+// inherit a parent's meta onto a child, and the child is the token dotvault
+// actually works with, so a caller that wants identity (meta.username) to
+// survive the downscope passes the parent's meta here.
+func (c *Client) CreateChildToken(ctx context.Context, policies []string, noDefaultPolicy bool, meta map[string]string) (string, error) {
 	renewable := true
 	req := &vaultapi.TokenCreateRequest{
 		Policies:        policies,
 		NoDefaultPolicy: noDefaultPolicy,
 		Renewable:       &renewable,
 		DisplayName:     "dotvault",
+		Metadata:        meta,
 	}
 	secret, err := c.raw.Auth().Token().CreateWithContext(ctx, req)
 	if err != nil {
@@ -350,6 +357,29 @@ func (c *Client) NewSibling(token string) (*Client, error) {
 	})
 }
 
+// TokenMeta extracts the token metadata (data.meta) from a lookup-self style
+// response as strings. Non-string values are skipped, and it is nil-safe: a nil
+// secret, absent data or absent/empty meta all yield nil.
+func TokenMeta(secret *vaultapi.Secret) map[string]string {
+	if secret == nil || secret.Data == nil {
+		return nil
+	}
+	raw, ok := secret.Data["meta"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var meta map[string]string
+	for k, v := range raw {
+		if sv, ok := v.(string); ok {
+			if meta == nil {
+				meta = make(map[string]string, len(raw))
+			}
+			meta[k] = sv
+		}
+	}
+	return meta
+}
+
 // CreateChildTokenFor mints a child of parentToken without disturbing the
 // receiver's own token. It builds an isolated sibling client (NewSibling: same
 // address/TLS/client-cert, parentToken as the auth token) and creates the child
@@ -361,12 +391,24 @@ func (c *Client) NewSibling(token string) (*Client, error) {
 // observe — or persist — that broad token. The sibling carries the client
 // certificate too, so on an mTLS deployment that requires a client cert on
 // every Vault request the auth/token/create call still succeeds.
+//
+// The child carries the parent's token metadata (see CreateChildToken), read
+// with a lookup-self on the same sibling. That read is best effort: a failure
+// or an absent meta mints the child without meta and logs once at DEBUG, since
+// refusing a least-privilege downscope over a metadata read would trade a
+// security property for a convenience. Only the mint itself fails closed.
 func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, policies []string, noDefaultPolicy bool) (string, error) {
 	sibling, err := c.NewSibling(parentToken)
 	if err != nil {
 		return "", fmt.Errorf("build downscope client: %w", err)
 	}
-	return sibling.CreateChildToken(ctx, policies, noDefaultPolicy)
+	var meta map[string]string
+	if parent, lerr := sibling.LookupSelf(ctx); lerr != nil {
+		slog.Debug("could not read parent token metadata; minting downscoped token without it", "error", lerr)
+	} else if meta = TokenMeta(parent); meta == nil {
+		slog.Debug("parent token has no metadata; minting downscoped token without it")
+	}
+	return sibling.CreateChildToken(ctx, policies, noDefaultPolicy, meta)
 }
 
 // ServerHealth returns the Vault server health status.

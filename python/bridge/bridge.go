@@ -14,7 +14,8 @@
 //
 // Scope is the read-only + cached-auth subset of the facade plus the
 // peer-action surface: AuthenticateCached (never prompts), IdentityName, Token,
-// ReadKVField, ReadUserSecret, and the socket-forwarded Browse/Notify/Clipboard.
+// ReadKVField, ReadUserSecret, ClientCertificate, and the socket-forwarded
+// Browse/Notify/Clipboard.
 // Interactive Login/Authenticate (browser/terminal) are out — driving an OIDC
 // browser pop or an LDAP password prompt across an FFI boundary from inside a
 // Python process is awkward and is not what a library caller wants; such
@@ -129,6 +130,7 @@ const (
 	catAuthFailed      = 4
 	catOther           = 5
 	catPeerUnavailable = 6
+	catNotConfigured   = 7
 )
 
 // Handle table. A *client.Client is never exposed to C directly; it is parked
@@ -222,6 +224,8 @@ func categoryOf(err error) int {
 		return catAuthFailed
 	case errors.Is(err, client.ErrPeerUnavailable):
 		return catPeerUnavailable
+	case errors.Is(err, client.ErrNotConfigured):
+		return catNotConfigured
 	default:
 		return catOther
 	}
@@ -431,6 +435,40 @@ func dotvault_remote_clipboard(h C.longlong, text *C.char, timeoutMillis C.longl
 		setErr(errOut, err)
 		return category(err)
 	}
+	return catOK
+}
+
+// dotvault_client_certificate returns the mutual-TLS client certificate the
+// client's config describes as two owned PEM strings: *certOut is the leaf
+// followed by its CA chain, *keyOut is the PKCS#8 private key. On success both
+// are non-nil and the caller frees each with dotvault_free; on any error both
+// are left untouched (nil) and only *errOut is set. Nothing here logs, and
+// errors carry no key material (the facade guarantees that).
+//
+// It never prompts. The facade may authenticate from the cached sources
+// (token, peer socket, enrolled certificate) to sign, so syncEnv runs first.
+//
+//export dotvault_client_certificate
+func dotvault_client_certificate(h C.longlong, timeoutMillis C.longlong, certOut, keyOut, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	syncEnv()
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	cc, err := c.ClientCertificate(ctx)
+	if err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	if certOut == nil || keyOut == nil {
+		setErr(errOut, errors.New("dotvault: client_certificate: nil output pointer"))
+		return catOther
+	}
+	*certOut = C.CString(string(cc.CertPEM))
+	*keyOut = C.CString(string(cc.KeyPEM))
 	return catOK
 }
 

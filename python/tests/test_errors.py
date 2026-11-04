@@ -14,6 +14,7 @@ def test_category_codes_match_bridge_contract():
     assert _errors.CAT_AUTH_FAILED == 4
     assert _errors.CAT_OTHER == 5
     assert _errors.CAT_PEER_UNAVAILABLE == 6
+    assert _errors.CAT_NOT_CONFIGURED == 7
 
 
 def test_error_for_maps_each_category():
@@ -22,6 +23,7 @@ def test_error_for_maps_each_category():
     assert isinstance(_errors.error_for(_errors.CAT_UNREACHABLE, "x"), dotvault.Unreachable)
     assert isinstance(_errors.error_for(_errors.CAT_AUTH_FAILED, "x"), dotvault.AuthFailed)
     assert isinstance(_errors.error_for(_errors.CAT_PEER_UNAVAILABLE, "x"), dotvault.PeerUnavailable)
+    assert isinstance(_errors.error_for(_errors.CAT_NOT_CONFIGURED, "x"), dotvault.NotConfigured)
 
 
 def test_error_for_unknown_category_is_base_error():
@@ -42,5 +44,6 @@ def test_subclasses_are_dotvault_errors():
         dotvault.Unreachable,
         dotvault.AuthFailed,
         dotvault.PeerUnavailable,
+        dotvault.NotConfigured,
     ):
         assert issubclass(cls, dotvault.DotvaultError)

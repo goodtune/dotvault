@@ -76,6 +76,12 @@ _declare(
     [c_longlong, c_char_p, c_longlong, POINTER(c_void_p)],
 )
 
+_declare(
+    "dotvault_client_certificate",
+    c_int,
+    [c_longlong, c_longlong, POINTER(c_void_p), POINTER(c_void_p), POINTER(c_void_p)],
+)
+
 lib = _lib
 
 

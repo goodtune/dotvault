@@ -1,0 +1,399 @@
+package clientcert
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"text/template"
+	"text/template/parse"
+	"time"
+
+	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/securestore"
+	"github.com/goodtune/dotvault/internal/vault"
+)
+
+// signTimeout bounds one signing round trip (LookupSelf plus SignCSR). The
+// sign runs detached from whichever caller started it, because other callers
+// may be waiting on the same result; this is what stops it running forever
+// against a hung Vault.
+const signTimeout = 30 * time.Second
+
+// EphemeralOptions configures NewEphemeral. The caller resolves defaults and
+// inheritance (config.ClientCertPKIMount and friends); this package only
+// checks that what arrives is usable.
+type EphemeralOptions struct {
+	PKIMount, PKIRole, CommonName string
+	TTL                           time.Duration
+	KeyType                       string
+	KeyBits                       int
+	OSUser                        string
+	Now                           func() time.Time // nil = time.Now
+}
+
+// ephemeral is the Source that signs short-lived certificates on demand.
+type ephemeral struct {
+	s                  Signer
+	o                  EphemeralOptions
+	cn                 *template.Template
+	needsTokenUsername bool
+	now                func() time.Time
+
+	mu       sync.Mutex
+	cur      *Pair
+	inflight *flight
+	warned   bool // a WARN has been logged for the current failure streak
+	user     usernameCache
+}
+
+// flight is one in-progress sign shared by every caller that arrives while it
+// runs. pair and err are written before done is closed.
+type flight struct {
+	done chan struct{}
+	pair *Pair
+	err  error
+}
+
+// usernameCache remembers token_username for one token, keyed on the SHA-256
+// of the token value so the token itself is never retained here.
+type usernameCache struct {
+	tokenHash [sha256.Size]byte
+	name      string
+	valid     bool
+}
+
+// NewEphemeral returns a Source that signs certificates via
+// <PKIMount>/sign/<PKIRole> with s's current token. The common-name template
+// is parsed once here; whether it needs a LookupSelf (it references
+// token_username) is decided once here too.
+func NewEphemeral(s Signer, o EphemeralOptions) (Source, error) {
+	if s == nil {
+		return nil, errors.New("clientcert: nil signer")
+	}
+	if o.PKIMount == "" {
+		return nil, errors.New("clientcert: PKI mount is required")
+	}
+	if o.PKIRole == "" {
+		return nil, errors.New("clientcert: PKI role is required")
+	}
+	if o.CommonName == "" {
+		return nil, errors.New("clientcert: common name template is required")
+	}
+	if o.TTL <= 0 {
+		return nil, fmt.Errorf("clientcert: ttl must be positive, got %s", o.TTL)
+	}
+	switch securestore.KeyType(o.KeyType) {
+	case "", securestore.KeyEC, securestore.KeyRSA:
+	default:
+		return nil, fmt.Errorf("clientcert: unknown key type %q", o.KeyType)
+	}
+	t, err := template.New("client_cert.common_name").Option("missingkey=error").Parse(o.CommonName)
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: common name template: %w", err)
+	}
+	now := o.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &ephemeral{
+		s:                  s,
+		o:                  o,
+		cn:                 t,
+		needsTokenUsername: templateReads(t, "token_username"),
+		now:                now,
+	}, nil
+}
+
+// Current returns the cached certificate while it is inside the first half of
+// its issued lifetime, and otherwise signs a new one. Concurrent callers share
+// a single sign. When signing is impossible (no token) or fails, a cached
+// certificate that has not reached NotAfter is still served.
+func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
+	e.mu.Lock()
+	now := e.now()
+	if e.cur != nil && now.Before(e.cur.RefreshAt) {
+		p := e.cur
+		e.mu.Unlock()
+		return p, nil
+	}
+	f := e.inflight
+	if f == nil {
+		if e.s.Token() == "" {
+			// Not a sign failure, so no WARN: the daemon is between tokens
+			// and the caller's error says so.
+			p := e.validLocked(now)
+			e.mu.Unlock()
+			if p != nil {
+				return p, nil
+			}
+			return nil, ErrNoToken
+		}
+		f = &flight{done: make(chan struct{})}
+		e.inflight = f
+		go e.run(ctx, f)
+	}
+	e.mu.Unlock()
+
+	select {
+	case <-f.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if f.err == nil {
+		return f.pair, nil
+	}
+	e.mu.Lock()
+	p := e.validLocked(e.now())
+	e.mu.Unlock()
+	if p != nil {
+		return p, nil
+	}
+	return nil, f.err
+}
+
+// validLocked returns the cached pair if it has not yet expired.
+func (e *ephemeral) validLocked(now time.Time) *Pair {
+	if e.cur != nil && now.Before(e.cur.NotAfter) {
+		return e.cur
+	}
+	return nil
+}
+
+// run performs one sign for flight f. It is detached from the starting
+// caller's cancellation (that caller may give up while others still wait) but
+// keeps its values, and is bounded by signTimeout.
+func (e *ephemeral) run(parent context.Context, f *flight) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), signTimeout)
+	defer cancel()
+	pair, err := e.sign(ctx)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err == nil {
+		e.cur = pair
+		e.warned = false
+	} else if !errors.Is(err, ErrNoToken) && e.validLocked(e.now()) != nil && !e.warned {
+		e.warned = true
+		slog.Warn("client certificate refresh failed; serving the current certificate until it expires",
+			"source", SourceEphemeral,
+			"serial", e.cur.Serial,
+			"not_after", e.cur.NotAfter,
+			"common_name", e.cur.CommonName,
+			"mount", e.o.PKIMount,
+			"role", e.o.PKIRole,
+			"error", err)
+	}
+	e.inflight = nil
+	f.pair, f.err = pair, err
+	close(f.done)
+}
+
+// sign generates a key, has Vault sign it, and assembles the Pair.
+func (e *ephemeral) sign(ctx context.Context) (*Pair, error) {
+	token := e.s.Token()
+	if token == "" {
+		return nil, ErrNoToken
+	}
+	cn, err := e.commonName(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := securestore.NewSoftwareKey(securestore.KeyType(e.o.KeyType), e.o.KeyBits)
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: generate key: %w", err)
+	}
+	csr, err := auth.BuildCSR(key, cn)
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: %w", err)
+	}
+	issued, err := e.s.SignCSR(ctx, e.o.PKIMount, e.o.PKIRole, csr, cn, e.o.TTL.String())
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: sign via %s/sign/%s: %w", strings.Trim(e.o.PKIMount, "/"), e.o.PKIRole, err)
+	}
+
+	der := leafDER([]byte(issued.CertPEM))
+	if der == nil {
+		return nil, errors.New("clientcert: Vault returned no certificate")
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: parse issued certificate: %w", err)
+	}
+	if !publicKeysEqual(leaf.PublicKey, key.Public()) {
+		return nil, errors.New("clientcert: issued certificate does not match the generated key")
+	}
+	if !leaf.NotAfter.After(e.now()) {
+		return nil, fmt.Errorf("clientcert: issued certificate already expired at %s (check the PKI role's ttl and the clock)", leaf.NotAfter.Format(time.RFC3339))
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("clientcert: encode key: %w", err)
+	}
+
+	p := &Pair{
+		CertPEM:    []byte(issued.CertPEM),
+		KeyPEM:     pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+		NotBefore:  leaf.NotBefore,
+		NotAfter:   leaf.NotAfter,
+		RefreshAt:  leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore) / 2),
+		Serial:     vault.FormatSerial(leaf.SerialNumber),
+		CommonName: leaf.Subject.CommonName,
+		Source:     SourceEphemeral,
+	}
+	slog.Info("client certificate issued",
+		"source", SourceEphemeral,
+		"serial", p.Serial,
+		"not_after", p.NotAfter,
+		"common_name", p.CommonName,
+		"mount", e.o.PKIMount,
+		"role", e.o.PKIRole)
+	return p, nil
+}
+
+// commonName renders the CN template for token.
+func (e *ephemeral) commonName(ctx context.Context, token string) (string, error) {
+	data := map[string]string{"os_user": e.o.OSUser}
+	if e.needsTokenUsername {
+		name, err := e.tokenUsername(ctx, token)
+		if err != nil {
+			return "", err
+		}
+		data["token_username"] = name
+	}
+	var buf bytes.Buffer
+	if err := e.cn.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("clientcert: render common name: %w", err)
+	}
+	cn := buf.String()
+	if strings.TrimSpace(cn) == "" {
+		return "", errors.New("clientcert: common name template rendered empty")
+	}
+	return cn, nil
+}
+
+// tokenUsername returns meta.username, else meta.common_name, for token,
+// looking it up at most once per distinct token value.
+func (e *ephemeral) tokenUsername(ctx context.Context, token string) (string, error) {
+	h := sha256.Sum256([]byte(token))
+	e.mu.Lock()
+	if e.user.valid && e.user.tokenHash == h {
+		name := e.user.name
+		e.mu.Unlock()
+		return name, nil
+	}
+	e.mu.Unlock()
+
+	secret, err := e.s.LookupSelf(ctx)
+	if err != nil {
+		return "", fmt.Errorf("clientcert: look up token username: %w", err)
+	}
+	meta := vault.TokenMeta(secret)
+	name := meta["username"]
+	if name == "" {
+		name = meta["common_name"]
+	}
+	if name == "" {
+		return "", ErrNoUsername
+	}
+	// LookupSelf reads the client's token at call time. Only cache the answer
+	// against token if that is still the token, so a swap mid-lookup cannot
+	// file one token's username under another's hash.
+	if e.s.Token() == token {
+		e.mu.Lock()
+		e.user = usernameCache{tokenHash: h, name: name, valid: true}
+		e.mu.Unlock()
+	}
+	return name, nil
+}
+
+// publicKeysEqual compares two public keys via their Equal method.
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	ea, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+	return ok && ea.Equal(b)
+}
+
+// templateReads reports whether t can read the named top-level field. It
+// walks the parse tree, so a reference inside {{if}}, {{with}}, {{range}} or a
+// pipeline counts, as does $.name. Passing the whole context ({{.}} or {{$}}
+// at the top level) counts too, conservatively, since the callee may read
+// anything from it.
+func templateReads(t *template.Template, name string) bool {
+	for _, tt := range t.Templates() {
+		if tt.Tree != nil && nodeReads(tt.Tree.Root, name, true) {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeReads walks n. atRoot is false inside a {{with}} or {{range}} body,
+// where dot no longer names the root context.
+func nodeReads(n parse.Node, name string, atRoot bool) bool {
+	switch n := n.(type) {
+	case nil:
+		return false
+	case *parse.ListNode:
+		if n == nil {
+			return false
+		}
+		for _, c := range n.Nodes {
+			if nodeReads(c, name, atRoot) {
+				return true
+			}
+		}
+	case *parse.ActionNode:
+		return nodeReads(n.Pipe, name, atRoot)
+	case *parse.PipeNode:
+		if n == nil {
+			return false
+		}
+		for _, c := range n.Cmds {
+			if nodeReads(c, name, atRoot) {
+				return true
+			}
+		}
+	case *parse.CommandNode:
+		for _, a := range n.Args {
+			if nodeReads(a, name, atRoot) {
+				return true
+			}
+		}
+	case *parse.FieldNode:
+		return atRoot && len(n.Ident) > 0 && n.Ident[0] == name
+	case *parse.DotNode:
+		return atRoot
+	case *parse.VariableNode:
+		if len(n.Ident) == 1 && n.Ident[0] == "$" {
+			return true
+		}
+		return len(n.Ident) > 1 && n.Ident[0] == "$" && n.Ident[1] == name
+	case *parse.ChainNode:
+		return nodeReads(n.Node, name, atRoot)
+	case *parse.IfNode:
+		return branchReads(&n.BranchNode, name, atRoot, atRoot)
+	case *parse.RangeNode:
+		return branchReads(&n.BranchNode, name, atRoot, false)
+	case *parse.WithNode:
+		return branchReads(&n.BranchNode, name, atRoot, false)
+	case *parse.TemplateNode:
+		return nodeReads(n.Pipe, name, atRoot)
+	}
+	return false
+}
+
+// branchReads walks an if/with/range: the pipeline in the enclosing scope, the
+// body in bodyAtRoot's scope, and the else branch in the enclosing scope.
+func branchReads(b *parse.BranchNode, name string, atRoot, bodyAtRoot bool) bool {
+	return nodeReads(b.Pipe, name, atRoot) ||
+		nodeReads(b.List, name, bodyAtRoot) ||
+		nodeReads(b.ElseList, name, atRoot)
+}

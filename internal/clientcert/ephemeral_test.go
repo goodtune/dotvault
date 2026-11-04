@@ -816,8 +816,8 @@ func TestEphemeralMinIntervalWhenRoleCapsBelowHalfLife(t *testing.T) {
 				t.Fatalf("at +%v: want the cached pair, err = %v", now.Sub(first.NotBefore), err)
 			}
 		default:
-			if !errors.Is(err, errSignThrottled) {
-				t.Fatalf("at +%v: err = %v, want errSignThrottled", now.Sub(first.NotBefore), err)
+			if !errors.Is(err, ErrSignPaced) {
+				t.Fatalf("at +%v: err = %v, want ErrSignPaced", now.Sub(first.NotBefore), err)
 			}
 		}
 	}
@@ -843,5 +843,43 @@ func TestBackoffFor(t *testing.T) {
 	}
 	if got := backoffFor(1000); got != signBackoffMax {
 		t.Errorf("backoffFor(1000) = %v, want cap", got)
+	}
+}
+
+func TestEphemeralNewTokenWithinMinIntervalIsPacedNotMisdiagnosed(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	clock.Advance(5 * time.Second)
+	f.setToken("s.fresh-token")
+	f.setSignErr(nil)
+
+	_, err := src.Current(ctx)
+	if !errors.Is(err, ErrSignPaced) {
+		t.Fatalf("err = %v, want ErrSignPaced", err)
+	}
+	var re *vaultapi.ResponseError
+	if errors.As(err, &re) {
+		t.Fatalf("the new token was blamed for the old token's failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "max_ttl") {
+		t.Fatalf("paced error names an invented cause: %v", err)
+	}
+	if got := f.signs.Load(); got != 1 {
+		t.Fatalf("signs = %d, want 1 (still paced)", got)
+	}
+
+	clock.Advance(5 * time.Second) // minSignInterval since the failed attempt
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("after the interval: %v", err)
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs = %d, want 2", got)
 	}
 }

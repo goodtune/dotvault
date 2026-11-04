@@ -55,12 +55,6 @@ const (
 	minSignInterval = 10 * time.Second
 )
 
-// errSignThrottled is returned when the cached certificate has expired and
-// minSignInterval has not yet passed since the last (successful) sign, which
-// happens only when the PKI role issues certificates shorter-lived than the
-// interval.
-var errSignThrottled = errors.New("clientcert: the last certificate expired before the next sign is allowed; the PKI role's max_ttl is shorter than the minimum sign interval")
-
 // EphemeralOptions configures NewEphemeral. The caller resolves defaults and
 // inheritance (config.ClientCertPKIMount and friends); this package only
 // checks that what arrives is usable.
@@ -192,7 +186,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 				return p, nil
 			}
 			if err == nil {
-				err = errSignThrottled
+				err = ErrSignPaced
 			}
 			return nil, err
 		}

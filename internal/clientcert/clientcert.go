@@ -104,6 +104,18 @@ type Source interface {
 // instead.
 var ErrNoToken = errors.New("clientcert: no Vault token to sign a certificate with")
 
+// ErrSignPaced is returned when no valid certificate is cached, a new one
+// would have to be signed, and sign pacing does not allow an attempt yet
+// (minSignInterval since the last attempt), while there is no failure on
+// record to report instead. It is reached in more than one way — a PKI role
+// whose max_ttl is shorter than the interval, a new token arriving shortly
+// after the previous token's failed sign (the reset deliberately forgets that
+// failure rather than blame the new token for it), or a token that vanished
+// mid-sign and came back — so it names no cause. It is transient: a later
+// call signs. Consumers can tell pacing apart from a real failure with
+// errors.Is.
+var ErrSignPaced = errors.New("clientcert: next certificate sign is paced; retry shortly")
+
 // ErrNoUsername is returned when the common-name template needs
 // {{.token_username}} and the token's metadata records neither a username nor
 // a common name. It never falls back to anything silently: a certificate

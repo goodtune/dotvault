@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -48,7 +49,11 @@ func (e *ephemeral) reportRejection(err error) {
 // gate (the client facade, which resolves its own token) that is the token
 // Current read. With one, it first waits out a replacement in flight —
 // bounded by reauthWait, which never exceeds the sign's own timeout — and
-// then, whether or not it waited, re-reads the client's token: the value
+// only a replacement: a re-auth the lifecycle manager has signalled needs a
+// login or a borrow, not time, so it fails at once with ErrNoToken, the
+// answer a daemon with no token gives (the same split as the SSH agent's
+// waitForToken and waitForReauth). Then, whether or not it waited, it
+// re-reads the client's token: the value
 // Current read may be a candidate the lifecycle manager was still judging,
 // and a rejected candidate is replaced before the gate reads clear. A
 // replacement that does not clear in time is ErrReauthInProgress: transient,
@@ -64,9 +69,12 @@ func (e *ephemeral) awaitReplacement(ctx context.Context, f *flight) (string, er
 	}
 	if g.NeedsReauth() {
 		wctx, cancel := context.WithTimeout(ctx, e.reauthWait)
-		err := tokengate.Wait(wctx, g)
+		err := tokengate.WaitForReplacement(wctx, g)
 		cancel()
-		if err != nil {
+		switch {
+		case errors.Is(err, tokengate.ErrSignalled):
+			return "", fmt.Errorf("%w: %w", clientcert.ErrNoToken, err)
+		case err != nil:
 			return "", fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, err)
 		}
 	}

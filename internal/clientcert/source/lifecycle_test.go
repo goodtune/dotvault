@@ -14,10 +14,13 @@ import (
 	"github.com/goodtune/dotvault/internal/tokengate"
 )
 
-// stubGate is a ReauthGate a test opens and closes.
-type stubGate struct{ engaged atomic.Bool }
+// stubGate is a tokengate.Gate (and Signaller) a test opens and closes.
+// engaged is NeedsReauth; signalled is ReauthSignalled, the lifecycle
+// manager having given up and needing a token from outside.
+type stubGate struct{ engaged, signalled atomic.Bool }
 
-func (g *stubGate) NeedsReauth() bool { return g.engaged.Load() }
+func (g *stubGate) NeedsReauth() bool     { return g.engaged.Load() || g.signalled.Load() }
+func (g *stubGate) ReauthSignalled() bool { return g.signalled.Load() }
 
 // recordingReporter is a RejectionReporter that keeps what it was told.
 type recordingReporter struct {
@@ -279,5 +282,53 @@ func TestFallbackAcceptsLifecycleSeams(t *testing.T) {
 	}
 	if got := rep.reported(); len(got) != 1 {
 		t.Fatalf("reported %d times through the fallback, want once", len(got))
+	}
+}
+
+// A signalled re-auth needs a login or a borrow, not a replacement that will
+// finish on its own: the sign fails at once with ErrNoToken rather than
+// waiting out reauthWait for ErrReauthInProgress.
+func TestEphemeralSignalledReauthFailsFast(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	g := &stubGate{}
+	g.signalled.Store(true)
+	wire(t, src, g, nil)
+
+	start := time.Now()
+	_, err := src.Current(context.Background())
+	if !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want ErrNoToken", err)
+	}
+	if errors.Is(err, clientcert.ErrReauthInProgress) {
+		t.Fatalf("err = %v, a signalled re-auth is not a replacement in progress", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("took %s, want an immediate answer", took)
+	}
+	if n := f.signs.Load() + f.lookups.Load(); n != 0 {
+		t.Fatalf("Vault called %d times", n)
+	}
+}
+
+// A replacement that gives up while the sign waits for it ends the wait at
+// once, with the same answer.
+func TestEphemeralReplacementThatGivesUpEndsTheWait(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+	time.AfterFunc(200*time.Millisecond, func() { g.engaged.Store(false); g.signalled.Store(true) })
+
+	start := time.Now()
+	_, err := src.Current(context.Background())
+	if !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want ErrNoToken", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("took %s, want the wait to end when the replacement gave up", took)
 	}
 }

@@ -315,11 +315,25 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if err == nil {
+	switch {
+	case err == nil:
 		e.cur = pair
 		e.warned, e.warnedAs = false, ""
 		e.resetBackoffLocked()
-	} else {
+	case errors.Is(err, clientcert.ErrReauthInProgress):
+		// The token was still being replaced when the wait ran out. Nothing
+		// was sent to Vault, so this is no verdict on the token or the role:
+		// it neither starts nor extends the failure backoff and logs at
+		// DEBUG. The minSignInterval floor, measured from lastAttempt, still
+		// paces the next attempt with the same token. Recorded as lastErr so
+		// a paced read and the status block both report it.
+		e.lastErr = err
+		slog.Debug("client certificate sign deferred: the Vault token is still being replaced",
+			"source", clientcert.SourceEphemeral,
+			"mount", e.o.PKIMount,
+			"role", e.o.PKIRole,
+			"error", err)
+	default:
 		// Filed under the token the sign actually used: the one Current
 		// hashed, or the one awaitReplacement re-read and re-filed the
 		// flight under once the gate was clear. Nothing re-reads the token

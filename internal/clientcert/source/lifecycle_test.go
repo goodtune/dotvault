@@ -1,8 +1,10 @@
 package source
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -330,5 +332,114 @@ func TestEphemeralReplacementThatGivesUpEndsTheWait(t *testing.T) {
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Fatalf("took %s, want the wait to end when the replacement gave up", took)
+	}
+}
+
+// A replacement that ends with the client holding no token is ErrNoToken:
+// no WARN (the daemon is between tokens, and the caller's error says so), but
+// it counts as a failure so the same dead state is not re-asked on every read,
+// and a new token resets it at once.
+func TestEphemeralGateClearsWithNoToken(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	e := src.(*ephemeral)
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+
+	time.AfterFunc(200*time.Millisecond, func() { f.setToken(""); g.engaged.Store(false) })
+	if _, err := src.Current(context.Background()); !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want ErrNoToken", err)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("WARN logged for a replacement that left no token:\n%s", buf.String())
+	}
+	e.mu.Lock()
+	failures := e.failures
+	e.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("failures = %d, want 1", failures)
+	}
+	if _, err := e.Last(); !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("Last error = %v, want ErrNoToken", err)
+	}
+
+	f.setToken("s.new")
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatalf("Current with a new token: %v (want the failure reset at once)", err)
+	}
+	if _, err := e.Last(); err != nil {
+		t.Fatalf("Last error after success = %v", err)
+	}
+}
+
+// A replacement that does not clear in time is not Vault's verdict on
+// anything: no WARN, and no failure counted, so the backoff does not double
+// across repeated timeouts. The minSignInterval floor still applies to the
+// same token.
+func TestEphemeralGateTimeoutIsNotAVerdict(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	e := src.(*ephemeral)
+	e.reauthWait = 150 * time.Millisecond
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+
+	for i := range 2 {
+		if _, err := src.Current(context.Background()); !errors.Is(err, clientcert.ErrReauthInProgress) {
+			t.Fatalf("attempt %d: err = %v, want ErrReauthInProgress", i, err)
+		}
+		clock.Advance(minSignInterval)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("WARN logged for a gate timeout:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "level=DEBUG") {
+		t.Fatalf("gate timeout not logged at DEBUG:\n%s", buf.String())
+	}
+	e.mu.Lock()
+	failures := e.failures
+	e.mu.Unlock()
+	if failures != 0 {
+		t.Fatalf("failures = %d, want 0: a gate timeout must not feed the backoff", failures)
+	}
+
+	// The floor still holds for the same token.
+	g.engaged.Store(false)
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatalf("Current once the floor had passed: %v (a doubled backoff would still be refusing)", err)
+	}
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Within minSignInterval of a gate timeout, the same token is still paced.
+func TestEphemeralGateTimeoutKeepsTheFloor(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	e := src.(*ephemeral)
+	e.reauthWait = 100 * time.Millisecond
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+
+	if _, err := src.Current(context.Background()); !errors.Is(err, clientcert.ErrReauthInProgress) {
+		t.Fatalf("err = %v", err)
+	}
+	g.engaged.Store(false)
+	_, err := src.Current(context.Background())
+	if err == nil || f.signs.Load() != 0 {
+		t.Fatalf("err = %v, signs = %d: want the same token paced inside minSignInterval", err, f.signs.Load())
 	}
 }

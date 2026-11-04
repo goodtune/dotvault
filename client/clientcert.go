@@ -68,16 +68,17 @@ type ClientCertificate struct {
 // max TTL without any action from the caller. That happens when the call that
 // notices is due to replace the certificate anyway: while the current
 // certificate is still valid it keeps being served and the replacement token
-// signs the next one; when nothing valid is left the call fails transiently
-// (signing is paced, at most one attempt per ten seconds) and a later one
-// succeeds.
+// signs the next one; when nothing valid is left the replacement token signs
+// within the same call. A new token is not held to the interval the signing
+// source keeps between attempts with one token, and replacing a rejected
+// token is itself limited to once per ten seconds.
 //
 // Errors are categorised for errors.Is: ErrNotConfigured (section disabled, or
 // no PKI role and no usable held certificate), ErrLoginRequired, ErrDenied (a
 // 401/403 from Vault, typically a policy without pki/sign), ErrUnreachable
-// (transport failure or a 5xx). A signing attempt made too soon after the last
-// one, with no failure on record, wraps ErrSignPaced; it is transient and a
-// later call succeeds. While a failed signing is backing off, the call returns
+// (transport failure or a 5xx). A signing attempt made with the same token too
+// soon after the last one, with no failure on record, wraps ErrSignPaced; it
+// is transient and a later call succeeds. While a failed signing is backing off, the call returns
 // that signing's error again rather than ErrSignPaced.
 func (c *Client) ClientCertificate(ctx context.Context) (*ClientCertificate, error) {
 	src, err := c.clientCertSource()

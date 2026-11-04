@@ -57,6 +57,16 @@ type certVault struct {
 	valid atomic.Value
 	// lookups counts lookup-self requests.
 	lookups atomic.Int32
+	// clock, when set, dates the certificates the CA issues; otherwise the
+	// wall clock does.
+	clock atomic.Pointer[fakeClock]
+}
+
+func (cv *certVault) now() time.Time {
+	if c := cv.clock.Load(); c != nil {
+		return c.Now()
+	}
+	return time.Now()
 }
 
 func (cv *certVault) accepts(r *http.Request) bool {
@@ -142,8 +152,8 @@ func newCertVault(t *testing.T) *certVault {
 		leaf := &x509.Certificate{
 			SerialNumber: big.NewInt(0x2a),
 			Subject:      pkix.Name{CommonName: body.CommonName},
-			NotBefore:    time.Now().Add(-time.Minute),
-			NotAfter:     time.Now().Add(10 * time.Minute),
+			NotBefore:    cv.now().Add(-time.Minute),
+			NotAfter:     cv.now().Add(10 * time.Minute),
 			KeyUsage:     x509.KeyUsageDigitalSignature,
 			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		}
@@ -468,9 +478,9 @@ func TestClientCertificateReplacesRejectedTokenBeforeExpiry(t *testing.T) {
 		t.Fatalf("token = %q, want the replacement t2", c.Token())
 	}
 
-	// Once signing is no longer paced, the replacement token signs the next
-	// certificate, well before the first one expires.
-	clock.Advance(11 * time.Second)
+	// The next call signs with the replacement token, well before the first
+	// certificate expires; a new token is not held to the interval between
+	// attempts.
 	next, err := c.ClientCertificate(ctx)
 	if err != nil {
 		t.Fatalf("after the replacement: %v", err)
@@ -501,19 +511,58 @@ func TestTLSConfigRecoversFromRejectedToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Nothing signed yet and the adopted token is already dead.
+	// Nothing signed yet and the adopted token is already dead. The handshake
+	// that finds it replaces the token and signs with the replacement in the
+	// same call: the signing source does not hold a new token to the interval
+	// it keeps between attempts with one token.
 	cv.rotateToken(t, cfg, "t2")
-	if _, err := tc.GetClientCertificate(&tls.CertificateRequestInfo{}); err == nil {
-		t.Fatal("the handshake that finds the dead token should fail: signing is paced")
-	} else if errors.Is(err, ErrDenied) {
-		t.Fatalf("a replaced token was reported as a policy denial: %v", err)
+	if _, err := tc.GetClientCertificate(&tls.CertificateRequestInfo{}); err != nil {
+		t.Fatalf("handshake that finds the dead token: %v", err)
 	}
 	if c.Token() != "t2" {
 		t.Fatalf("token = %q, want t2", c.Token())
 	}
-	clock.Advance(11 * time.Second)
-	if _, err := tc.GetClientCertificate(&tls.CertificateRequestInfo{}); err != nil {
-		t.Fatalf("handshake after the replacement: %v", err)
+	if n := cv.signs.Load(); n != 2 {
+		t.Errorf("signs = %d, want 2 (refused with t1, signed with t2)", n)
+	}
+}
+
+func TestClientCertificateRecoversFromRejectionInOneCallWhenNothingIsValid(t *testing.T) {
+	cv := newCertVault(t)
+	cv.valid.Store("t1")
+	cfg := cv.ephemeralConfig(t)
+	if err := os.WriteFile(cfg.TokenFile, []byte("t1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock()
+	cv.clock.Store(clock)
+	c := newClient(t, cfg)
+	c.now = clock.Now
+	ctx := context.Background()
+
+	first, err := c.ClientCertificate(ctx)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	// Mid-life of the Client: the daemon re-logged in (t1 is dead, t2 is in
+	// the token file) and the cached certificate has expired, so there is
+	// nothing valid to serve while the token is replaced.
+	cv.rotateToken(t, cfg, "t2")
+	clock.Advance(12 * time.Minute) // the fake CA issues ~11 minutes
+
+	cc, err := c.ClientCertificate(ctx)
+	if err != nil {
+		t.Fatalf("the call that finds the dead token should recover in place: %v", err)
+	}
+	if bytes.Equal(cc.CertPEM, first.CertPEM) {
+		t.Error("the expired certificate was served")
+	}
+	if c.Token() != "t2" {
+		t.Fatalf("token = %q, want t2", c.Token())
+	}
+	if n := cv.signs.Load(); n != 3 {
+		t.Errorf("signs = %d, want 3 (first, refused with t1, signed with t2)", n)
 	}
 }
 

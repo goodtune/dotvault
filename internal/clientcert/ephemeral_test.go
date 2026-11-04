@@ -905,7 +905,7 @@ func TestBackoffFor(t *testing.T) {
 	}
 }
 
-func TestEphemeralNewTokenWithinMinIntervalIsPacedNotMisdiagnosed(t *testing.T) {
+func TestEphemeralNewTokenIsNotHeldToMinInterval(t *testing.T) {
 	clock := newTestClock()
 	f := newFakeSigner(t, clock)
 	f.setSignErr(forbidden())
@@ -919,24 +919,50 @@ func TestEphemeralNewTokenWithinMinIntervalIsPacedNotMisdiagnosed(t *testing.T) 
 	f.setToken("s.fresh-token")
 	f.setSignErr(nil)
 
-	_, err := src.Current(ctx)
-	if !errors.Is(err, ErrSignPaced) {
-		t.Fatalf("err = %v, want ErrSignPaced", err)
+	// A token the last attempt was not made with signs at once: the floor
+	// paces repeated attempts with one token, and a replacement token (the
+	// client facade swapping out one Vault rejected) must not be answered
+	// with ErrSignPaced for the old token's attempt.
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("new token inside minSignInterval: %v", err)
 	}
-	var re *vaultapi.ResponseError
-	if errors.As(err, &re) {
-		t.Fatalf("the new token was blamed for the old token's failure: %v", err)
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs = %d, want 2 (the new token signed immediately)", got)
 	}
-	if strings.Contains(err.Error(), "max_ttl") {
-		t.Fatalf("paced error names an invented cause: %v", err)
+}
+
+func TestEphemeralSameTokenWithinMinIntervalIsPaced(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.maxTTL = 4 * time.Second // RefreshAt is 2s after issue
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if got := f.signs.Load(); got != 1 {
-		t.Fatalf("signs = %d, want 1 (still paced)", got)
+	f.setToken("s.fresh-token")
+	clock.Advance(3 * time.Second) // past RefreshAt
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("new token: %v", err)
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs = %d, want 2", got)
 	}
 
-	clock.Advance(5 * time.Second) // minSignInterval since the failed attempt
-	if _, err := src.Current(ctx); err != nil {
-		t.Fatalf("after the interval: %v", err)
+	// The exemption is for a token the last attempt did not use, once: the
+	// same new token is held to the floor like any other.
+	clock.Advance(3 * time.Second) // past the new pair's RefreshAt, before NotAfter
+	p, err := src.Current(ctx)
+	if err != nil || p == nil {
+		t.Fatalf("same token inside the interval: want the still-valid pair, got %v", err)
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs = %d, want 2 (same token inside minSignInterval is paced)", got)
+	}
+	clock.Advance(2 * time.Second) // past NotAfter, still inside the interval
+	if _, err := src.Current(ctx); !errors.Is(err, ErrSignPaced) {
+		t.Fatalf("err = %v, want ErrSignPaced", err)
 	}
 	if got := f.signs.Load(); got != 2 {
 		t.Fatalf("signs = %d, want 2", got)

@@ -97,9 +97,10 @@ var (
 
 	// ErrSignPaced indicates ClientCertificate (or a TLSConfig handshake)
 	// found no valid certificate cached and the next signing attempt is not
-	// due yet: signs are at least ten seconds apart, so a call arriving
-	// sooner — after a new token was adopted, say — is answered without
-	// contacting Vault. It is transient: a later call succeeds or reports
+	// due yet: signs with the same token are at least ten seconds apart, so a
+	// call arriving sooner — against a PKI role whose max_ttl is shorter than
+	// that, say — is answered without contacting Vault. A newly adopted token
+	// is not paced this way. It is transient: a later call succeeds or reports
 	// what signing actually returned. It is deliberately not one of the
 	// categories above, since it says nothing about Vault. During a failure
 	// backoff the error of the last failed signing is returned instead (a

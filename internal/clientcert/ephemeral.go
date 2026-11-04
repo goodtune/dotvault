@@ -42,11 +42,18 @@ const signTimeout = 30 * time.Second
 //     that failed, since the failure may have been that token's fault.
 //     During the window Current answers from memory: the cached pair while
 //     it is still valid, otherwise the last sign error.
-//   - minSignInterval: the floor between sign attempts of any outcome. It
-//     covers the case where signing succeeds but the PKI role's max_ttl caps
-//     the lifetime so short that RefreshAt is already past (or nearly) when
-//     the certificate arrives; without a floor that role would be re-signed
-//     on every call.
+//   - minSignInterval: the floor between sign attempts of any outcome made
+//     with the same token. It covers the case where signing succeeds but the
+//     PKI role's max_ttl caps the lifetime so short that RefreshAt is already
+//     past (or nearly) when the certificate arrives; without a floor that
+//     role would be re-signed on every call. A token different from the one
+//     the last attempt used is exempt, as it is from the backoff: the
+//     attempt it would be paced against said nothing about it, and the case
+//     that matters — the client facade replacing a token Vault rejected —
+//     would otherwise answer the replacement with ErrSignPaced until the
+//     interval ran out. The sign rate is then bounded by how often the token
+//     really changes, which its producers limit (the facade replaces a
+//     rejected token at most once per ten seconds).
 //
 // They are constants; tests move time with EphemeralOptions.Now.
 const (
@@ -84,6 +91,7 @@ type ephemeral struct {
 
 	// Sign pacing; see signBackoffBase.
 	lastAttempt time.Time         // start of the most recent sign attempt
+	lastToken   [sha256.Size]byte // SHA-256 of the token that attempt used
 	failures    int               // consecutive failed signs
 	retryAt     time.Time         // no sign before this while failures > 0
 	lastErr     error             // error of the most recent failed sign
@@ -183,7 +191,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 		if e.failures > 0 && h != e.failedToken {
 			e.resetBackoffLocked()
 		}
-		if earliest := e.nextSignLocked(); now.Before(earliest) {
+		if earliest := e.nextSignLocked(h); now.Before(earliest) {
 			p, err := e.validLocked(now), e.lastErr
 			e.mu.Unlock()
 			if p != nil {
@@ -194,7 +202,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 			}
 			return nil, err
 		}
-		e.lastAttempt = now
+		e.lastAttempt, e.lastToken = now, h
 		f = &flight{token: token, tokenHash: h, done: make(chan struct{})}
 		e.inflight = f
 		go e.run(ctx, f)
@@ -234,11 +242,13 @@ func (e *ephemeral) validLocked(now time.Time) *Pair {
 	return nil
 }
 
-// nextSignLocked is the earliest time a new sign may start: minSignInterval
-// after the last attempt, or the end of the failure backoff if later.
-func (e *ephemeral) nextSignLocked() time.Time {
+// nextSignLocked is the earliest time a sign with the token hashing to h may
+// start: minSignInterval after the last attempt when that attempt used the
+// same token, or the end of the failure backoff if later. Current resets the
+// backoff before asking when h differs from the token that failed.
+func (e *ephemeral) nextSignLocked(h [sha256.Size]byte) time.Time {
 	var earliest time.Time
-	if !e.lastAttempt.IsZero() {
+	if !e.lastAttempt.IsZero() && h == e.lastToken {
 		earliest = e.lastAttempt.Add(minSignInterval)
 	}
 	if e.failures > 0 && e.retryAt.After(earliest) {
@@ -248,7 +258,8 @@ func (e *ephemeral) nextSignLocked() time.Time {
 }
 
 // resetBackoffLocked ends a failure streak's backoff. minSignInterval still
-// applies, since it is measured from lastAttempt.
+// applies to the token the last attempt used, since it is measured from
+// lastAttempt.
 func (e *ephemeral) resetBackoffLocked() {
 	e.failures = 0
 	e.retryAt = time.Time{}

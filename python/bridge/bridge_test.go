@@ -7,9 +7,13 @@ package main
 // the cgo-free seams in bridge.go (lookupID/dropID, cSetenv/cUnsetenv).
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goodtune/dotvault/client"
@@ -90,5 +94,30 @@ func TestSyncEnvReadsLiveCEnvironment(t *testing.T) {
 	syncEnv()
 	if got, ok := os.LookupEnv("DOTVAULT_TOKEN"); ok {
 		t.Fatalf("after unset+syncEnv, os env still set to %q", got)
+	}
+}
+
+func TestClientCertificateNilOutputNeverSigns(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DOTVAULT_TOKEN", "s.token")
+	t.Setenv("VAULT_MAX_RETRIES", "0")
+	c, err := client.New(&client.Config{
+		Vault:      client.VaultConfig{Address: srv.URL, AuthMethod: "token"},
+		TokenFile:  t.TempDir() + "/token",
+		ClientCert: client.ClientCertConfig{Enabled: true, PKIRole: "tools", CommonName: "{{.os_user}}"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientCertificate(context.Background(), c, false); !errors.Is(err, errNilOutput) {
+		t.Fatalf("err = %v, want errNilOutput", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("Vault saw %d requests for a call that could not receive the result", n)
 	}
 }

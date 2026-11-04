@@ -458,18 +458,28 @@ func dotvault_client_certificate(h C.longlong, timeoutMillis C.longlong, certOut
 	syncEnv()
 	ctx, cancel := callContext(timeoutMillis)
 	defer cancel()
-	cc, err := c.ClientCertificate(ctx)
+	cc, err := clientCertificate(ctx, c, certOut != nil && keyOut != nil)
 	if err != nil {
 		setErr(errOut, err)
 		return category(err)
 	}
-	if certOut == nil || keyOut == nil {
-		setErr(errOut, errors.New("dotvault: client_certificate: nil output pointer"))
-		return catOther
-	}
 	*certOut = C.CString(string(cc.CertPEM))
 	*keyOut = C.CString(string(cc.KeyPEM))
 	return catOK
+}
+
+// errNilOutput is a caller passing nowhere to put the PEM.
+var errNilOutput = errors.New("dotvault: client_certificate: nil output pointer")
+
+// clientCertificate is dotvault_client_certificate's cgo-free body. The output
+// pointers are checked before ClientCertificate is called, so a caller that
+// could not receive the result never triggers a signing at Vault (and never
+// has a private key generated for nothing).
+func clientCertificate(ctx context.Context, c *client.Client, outputsOK bool) (*client.ClientCertificate, error) {
+	if !outputsOK {
+		return nil, errNilOutput
+	}
+	return c.ClientCertificate(ctx)
 }
 
 func main() {}

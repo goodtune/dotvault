@@ -11,6 +11,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/clientcert/source"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -83,7 +84,7 @@ func signClientCert(t *testing.T, token string) *clientcert.Pair {
 	if err != nil {
 		t.Fatalf("vault client: %v", err)
 	}
-	src, err := clientcert.NewEphemeral(vc, clientcert.EphemeralOptions{
+	src, err := source.NewEphemeral(vc, source.EphemeralOptions{
 		PKIMount:   testPKIMount,
 		PKIRole:    clientCertTestRole,
 		CommonName: "{{.token_username}}",

@@ -106,7 +106,7 @@ Decided with the owner after the builder check: the default common name is the *
 
 These are the builder's calls; the ones below marked *(my call)* are what I'd do, recorded so they can be checked.
 
-- **Package layout.** *(my call)* A new `internal/clientcert` package owning a source interface (`Current(ctx) (*Pair, error)` plus a change notification) with two implementations, held and ephemeral, consumed by `vaultfs`, `dockervol`, and `client/`.
+- **Package layout.** *(my call)* A new `internal/clientcert` package owning a source interface (`Current(ctx) (*Pair, error)` plus a change notification) with two implementations, held and ephemeral, consumed by `vaultfs`, `dockervol`, and `client/`. As built it is two packages: `internal/clientcert` is a leaf holding the interface, `Pair`, the error sentinels and the status projection, and `internal/clientcert/source` holds the two implementations and the selection, so the consumers do not depend on `internal/auth` or `internal/config`.
 - **Rotation timing for ephemeral certificates.** *(my call)* Sign lazily on first use; replace when less than half the certificate's actual lifetime remains (computed from the issued NotAfter, since the PKI role's `max_ttl` may shorten the request). Concurrent readers share one signing call (single-flight).
 - **Key type.** *(my call)* EC P-256 by default, with optional `key_type`/`key_bits` mirroring `vault.mtls`'s rules (some services insist on RSA).
 - **TTL bounds.** *(my call)* Positive duration, floor 1 minute so half-life rotation isn't continuous; no ceiling beyond the PKI role's own `max_ttl`.

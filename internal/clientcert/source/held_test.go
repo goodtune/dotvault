@@ -1,4 +1,4 @@
-package clientcert
+package source
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 )
 
 // envelopeSpec describes a credential.json to write.
@@ -115,8 +116,8 @@ func TestHeldServesEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Source != SourceHeld {
-		t.Errorf("Source = %q", p.Source)
+	if p.Source != clientcert.SourceHeld {
+		t.Errorf("clientcert.Source = %q", p.Source)
 	}
 	if p.CommonName != "gary" {
 		t.Errorf("CommonName = %q", p.CommonName)
@@ -312,7 +313,7 @@ func TestHeldLast(t *testing.T) {
 	dir := t.TempDir()
 	path := writeEnvelope(t, dir, envelopeSpec{})
 	src := NewHeld(dir, "mtls", "gary", time.Hour)
-	r := src.(lastReporter)
+	r := src.(clientcert.LastReporter)
 	if p, err := r.Last(); p != nil || err != nil {
 		t.Fatalf("before any call: %v, %v", p, err)
 	}

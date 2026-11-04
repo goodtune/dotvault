@@ -1,12 +1,16 @@
-// Package clientcert serves a mutual-TLS client certificate to tools: the
-// FUSE mount, Docker volumes and the client library all read one through the
-// Source interface and receive a Pair.
+// Package clientcert is the vocabulary for serving a mutual-TLS client
+// certificate to tools: the FUSE mount, Docker volumes and the client library
+// all read one through the Source interface and receive a Pair.
 //
-// There are two sources. The held source (added separately) re-serves the
-// certificate this host already logs in to Vault with, under plain mtls. The
-// ephemeral source, everywhere else, generates a key in memory, has Vault's
-// PKI engine sign it with the daemon's current token, and replaces it before
-// it expires. Neither persists anything.
+// It is a leaf on purpose. It holds the types, the error sentinels and the
+// status projection, and imports nothing from dotvault, so a consumer (vaultfs,
+// dockervol, web) can depend on it without pulling in internal/auth or
+// internal/config. The two implementations and the selection between them live
+// in internal/clientcert/source: the held source re-serves the certificate
+// this host already logs in to Vault with, under plain mtls; the ephemeral
+// source, everywhere else, generates a key in memory, has Vault's PKI engine
+// sign it with the daemon's current token, and replaces it before it expires.
+// Neither persists anything.
 //
 // Key material and PEM never appear in errors or log lines. Only the serial,
 // NotAfter, common name, mount and role are logged.
@@ -20,10 +24,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"time"
-
-	vaultapi "github.com/hashicorp/vault/api"
-
-	"github.com/goodtune/dotvault/internal/vault"
 )
 
 // Source names, as reported in Pair.Source and status output.
@@ -68,7 +68,7 @@ func (p *Pair) TLSCertificate() (tls.Certificate, error) {
 // Fingerprint is the hex SHA-256 of the leaf certificate's DER, for status
 // output and tests. Empty when CertPEM holds no certificate.
 func (p *Pair) Fingerprint() string {
-	der := leafDER(p.CertPEM)
+	der := LeafDER(p.CertPEM)
 	if der == nil {
 		return ""
 	}
@@ -76,8 +76,8 @@ func (p *Pair) Fingerprint() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// leafDER returns the DER of the first CERTIFICATE block in pemBytes, or nil.
-func leafDER(pemBytes []byte) []byte {
+// LeafDER returns the DER of the first CERTIFICATE block in pemBytes, or nil.
+func LeafDER(pemBytes []byte) []byte {
 	rest := pemBytes
 	for {
 		var block *pem.Block
@@ -119,16 +119,3 @@ var ErrSignPaced = errors.New("clientcert: next certificate sign is paced; retry
 // a common name. It never falls back to anything silently: a certificate
 // subject is an identity, and guessing grants somebody else's.
 var ErrNoUsername = errors.New("clientcert: the Vault token carries no username (meta.username or meta.common_name); set client_cert.common_name to {{.os_user}} or configure the auth method to record one")
-
-// Signer is the slice of the Vault client the ephemeral source needs. Token
-// reads the client's current token; the two calls take a token explicitly, so
-// one sign is made entirely under the token it started with even if another
-// goroutine (a re-login, a borrow, the client facade replacing a rejected
-// token) installs a different one on the shared client meanwhile.
-type Signer interface {
-	Token() string
-	LookupSelfWithToken(ctx context.Context, token string) (*vaultapi.Secret, error)
-	SignCSRWithToken(ctx context.Context, token, mount, role, csrPEM, commonName, ttl string) (*vault.IssuedCert, error)
-}
-
-var _ Signer = (*vault.Client)(nil)

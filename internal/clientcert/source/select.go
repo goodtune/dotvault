@@ -1,4 +1,13 @@
-package clientcert
+// Package source implements clientcert.Source: the held source, which
+// re-serves this host's mtls login certificate (plain mtls only), the
+// ephemeral source, which signs short-lived certificates in memory, and New /
+// NewFromParams, the one place the configuration chooses between them.
+//
+// It is split from internal/clientcert because it needs internal/auth (the
+// envelope export and CSR builder) and internal/config (the projection), and
+// the consumers that serve a certificate should not. Build a Source here, in
+// cmd/dotvault or client/, and hand the consumers the interface.
+package source
 
 import (
 	"context"
@@ -7,15 +16,9 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 )
-
-// lastReporter is implemented by every Source this package returns, for the
-// status block. Last returns the most recent pair served and the most recent
-// error without any I/O and without signing.
-type lastReporter interface {
-	Last() (*Pair, error)
-}
 
 // Params is everything source selection needs, flattened out of the config so
 // the client/ facade, which has its own config projection, can build one and
@@ -56,7 +59,7 @@ func ParamsFromConfig(cfg *config.Config, osUser, mtlsStorageDir string) Params 
 	}
 }
 
-// NewFromParams is the one place a Source is chosen. It returns nil, nil when
+// NewFromParams is the one place a clientcert.Source is chosen. It returns nil, nil when
 // the feature is disabled.
 //
 // Held (plain mtls) serves the credential this host already holds. When that
@@ -65,7 +68,7 @@ func ParamsFromConfig(cfg *config.Config, osUser, mtlsStorageDir string) Params 
 // ephemeral source; without a role the held error is what the caller sees.
 // Every other configuration uses the ephemeral source alone. s may be nil
 // only for a held configuration with no role.
-func NewFromParams(p Params, s Signer) (Source, error) {
+func NewFromParams(p Params, s Signer) (clientcert.Source, error) {
 	if !p.Enabled {
 		return nil, nil
 	}
@@ -87,20 +90,20 @@ func NewFromParams(p Params, s Signer) (Source, error) {
 }
 
 // New is NewFromParams over a loaded config.
-func New(cfg *config.Config, s Signer, osUser, mtlsStorageDir string) (Source, error) {
+func New(cfg *config.Config, s Signer, osUser, mtlsStorageDir string) (clientcert.Source, error) {
 	return NewFromParams(ParamsFromConfig(cfg, osUser, mtlsStorageDir), s)
 }
 
 // fallback tries the held source and, only when the host has no usable held
 // credential, the ephemeral one.
 type fallback struct {
-	held, eph Source
+	held, eph clientcert.Source
 
 	mu   sync.Mutex
-	used Source // the source whose answer Current last returned
+	used clientcert.Source // the source whose answer Current last returned
 }
 
-func (f *fallback) Current(ctx context.Context) (*Pair, error) {
+func (f *fallback) Current(ctx context.Context) (*clientcert.Pair, error) {
 	p, err := f.held.Current(ctx)
 	src := f.held
 	if err != nil && errors.Is(err, auth.ErrNoCertCredential) {
@@ -115,18 +118,18 @@ func (f *fallback) Current(ctx context.Context) (*Pair, error) {
 
 // Last reports whichever source answered most recently, or the held source
 // before any call.
-func (f *fallback) Last() (*Pair, error) {
+func (f *fallback) Last() (*clientcert.Pair, error) {
 	f.mu.Lock()
 	src := f.used
 	f.mu.Unlock()
 	if src == nil {
 		src = f.held
 	}
-	return src.(lastReporter).Last()
+	return src.(clientcert.LastReporter).Last()
 }
 
 var (
-	_ lastReporter = (*held)(nil)
-	_ lastReporter = (*ephemeral)(nil)
-	_ lastReporter = (*fallback)(nil)
+	_ clientcert.LastReporter = (*held)(nil)
+	_ clientcert.LastReporter = (*ephemeral)(nil)
+	_ clientcert.LastReporter = (*fallback)(nil)
 )

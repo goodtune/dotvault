@@ -13,13 +13,14 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/clientcert/source"
 	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // handshakeTimeout bounds one certificate lookup made from a TLS handshake,
 // where crypto/tls offers no context. It matches the sign timeout inside
-// internal/clientcert, so a handshake that has to wait on a sign outlasts
-// nothing but that sign.
+// internal/clientcert/source, so a handshake that has to wait on a sign
+// outlasts nothing but that sign.
 const handshakeTimeout = 30 * time.Second
 
 // certReplaceInterval is the shortest gap between two attempts to replace a
@@ -180,13 +181,13 @@ func (c *Client) clientCertSource() (clientcert.Source, error) {
 			c.certErr = fmt.Errorf("dotvault: resolve OS user for the client certificate: %w", err)
 			return
 		}
-		src, err := clientcert.NewFromParams(clientcert.Params{
+		src, err := source.NewFromParams(source.Params{
 			Enabled:       true,
 			Held:          c.cfg.clientCertHeld(),
 			Method:        c.cfg.Vault.AuthMethod,
 			StorageDir:    c.cfg.Vault.MTLS.StorageDir,
 			ReissueBefore: c.cfg.Vault.ReissueBefore,
-			Ephemeral: clientcert.EphemeralOptions{
+			Ephemeral: source.EphemeralOptions{
 				PKIMount:   cc.PKIMount,
 				PKIRole:    cc.PKIRole,
 				CommonName: cc.CommonName,
@@ -247,12 +248,6 @@ func (c *Client) certAuthenticate(ctx context.Context) error {
 	return err
 }
 
-// lastReporter is implemented by every clientcert source: the most recent pair
-// served and the most recent error, read without signing.
-type lastReporter interface {
-	Last() (*clientcert.Pair, error)
-}
-
 // signRejection returns the token rejection behind a Current answer, or nil.
 // A failed refresh does not always surface as err: while the cached
 // certificate is still valid the source keeps serving it, so a token that died
@@ -268,7 +263,7 @@ func (c *Client) signRejection(src clientcert.Source, pair *clientcert.Pair, err
 	if pair == nil || pair.Source != clientcert.SourceEphemeral || c.clock().Before(pair.RefreshAt) {
 		return nil
 	}
-	lr, ok := src.(lastReporter)
+	lr, ok := src.(clientcert.LastReporter)
 	if !ok {
 		return nil
 	}

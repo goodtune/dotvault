@@ -1,4 +1,4 @@
-package clientcert
+package source
 
 import (
 	"bytes"
@@ -22,6 +22,7 @@ import (
 
 	vaultapi "github.com/hashicorp/vault/api"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -231,7 +232,7 @@ func defaultOptions(clock *testClock) EphemeralOptions {
 	}
 }
 
-func newSource(t *testing.T, f *fakeSigner, o EphemeralOptions) Source {
+func newSource(t *testing.T, f *fakeSigner, o EphemeralOptions) clientcert.Source {
 	t.Helper()
 	src, err := NewEphemeral(f, o)
 	if err != nil {
@@ -259,7 +260,7 @@ func TestEphemeralSignsOnFirstUse(t *testing.T) {
 		t.Fatalf("ttl sent = %q, want 5m0s", f.lastTTL)
 	}
 	if p.Source != "ephemeral" {
-		t.Fatalf("Source = %q, want ephemeral", p.Source)
+		t.Fatalf("clientcert.Source = %q, want ephemeral", p.Source)
 	}
 	if p.Serial == "" {
 		t.Fatal("Serial empty")
@@ -288,17 +289,6 @@ func TestEphemeralSignsOnFirstUse(t *testing.T) {
 	}
 	if len(p.Fingerprint()) != 64 {
 		t.Fatalf("Fingerprint = %q, want 64 hex chars", p.Fingerprint())
-	}
-}
-
-func TestPairCombinedAddsSeparatorNewline(t *testing.T) {
-	p := &Pair{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY\n")}
-	if got := string(p.Combined()); got != "CERT\nKEY\n" {
-		t.Fatalf("Combined = %q", got)
-	}
-	p = &Pair{CertPEM: []byte("CERT\n"), KeyPEM: []byte("KEY\n")}
-	if got := string(p.Combined()); got != "CERT\nKEY\n" {
-		t.Fatalf("Combined = %q", got)
 	}
 }
 
@@ -391,7 +381,7 @@ func TestEphemeralSingleFlight(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	pairs := make([]*Pair, callers)
+	pairs := make([]*clientcert.Pair, callers)
 	errs := make([]error, callers)
 	for i := range callers {
 		wg.Add(1)
@@ -466,8 +456,8 @@ func TestEphemeralServesCachedPairWithoutToken(t *testing.T) {
 	}
 
 	clock.Advance(3 * time.Minute) // past NotAfter
-	if _, err := src.Current(ctx); !errors.Is(err, ErrNoToken) {
-		t.Fatalf("err = %v, want ErrNoToken", err)
+	if _, err := src.Current(ctx); !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want clientcert.ErrNoToken", err)
 	}
 }
 
@@ -476,8 +466,8 @@ func TestEphemeralNoTokenNoCache(t *testing.T) {
 	f := newFakeSigner(t, clock)
 	f.setToken("")
 	src := newSource(t, f, defaultOptions(clock))
-	if _, err := src.Current(context.Background()); !errors.Is(err, ErrNoToken) {
-		t.Fatalf("err = %v, want ErrNoToken", err)
+	if _, err := src.Current(context.Background()); !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want clientcert.ErrNoToken", err)
 	}
 	if f.signs.Load() != 0 {
 		t.Fatalf("signs = %d, want 0", f.signs.Load())
@@ -604,8 +594,8 @@ func TestEphemeralNoUsernameErrors(t *testing.T) {
 	f.meta = nil
 	src := newSource(t, f, defaultOptions(clock))
 	_, err := src.Current(context.Background())
-	if !errors.Is(err, ErrNoUsername) {
-		t.Fatalf("err = %v, want ErrNoUsername", err)
+	if !errors.Is(err, clientcert.ErrNoUsername) {
+		t.Fatalf("err = %v, want clientcert.ErrNoUsername", err)
 	}
 	if f.signs.Load() != 0 {
 		t.Fatalf("signed with no username: signs = %d", f.signs.Load())
@@ -865,8 +855,8 @@ func TestEphemeralBackoffNoTokenTakesPrecedence(t *testing.T) {
 		t.Fatal("expected the 403")
 	}
 	f.setToken("")
-	if _, err := src.Current(ctx); !errors.Is(err, ErrNoToken) {
-		t.Fatalf("err = %v, want ErrNoToken during backoff without a token", err)
+	if _, err := src.Current(ctx); !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want clientcert.ErrNoToken during backoff without a token", err)
 	}
 }
 
@@ -923,8 +913,8 @@ func TestEphemeralMinIntervalWhenRoleCapsBelowHalfLife(t *testing.T) {
 				t.Fatalf("at +%v: want the cached pair, err = %v", now.Sub(first.NotBefore), err)
 			}
 		default:
-			if !errors.Is(err, ErrSignPaced) {
-				t.Fatalf("at +%v: err = %v, want ErrSignPaced", now.Sub(first.NotBefore), err)
+			if !errors.Is(err, clientcert.ErrSignPaced) {
+				t.Fatalf("at +%v: err = %v, want clientcert.ErrSignPaced", now.Sub(first.NotBefore), err)
 			}
 		}
 	}
@@ -970,7 +960,7 @@ func TestEphemeralNewTokenIsNotHeldToMinInterval(t *testing.T) {
 	// A token the last attempt was not made with signs at once: the floor
 	// paces repeated attempts with one token, and a replacement token (the
 	// client facade swapping out one Vault rejected) must not be answered
-	// with ErrSignPaced for the old token's attempt.
+	// with clientcert.ErrSignPaced for the old token's attempt.
 	if _, err := src.Current(ctx); err != nil {
 		t.Fatalf("new token inside minSignInterval: %v", err)
 	}
@@ -1009,8 +999,8 @@ func TestEphemeralSameTokenWithinMinIntervalIsPaced(t *testing.T) {
 		t.Fatalf("signs = %d, want 2 (same token inside minSignInterval is paced)", got)
 	}
 	clock.Advance(2 * time.Second) // past NotAfter, still inside the interval
-	if _, err := src.Current(ctx); !errors.Is(err, ErrSignPaced) {
-		t.Fatalf("err = %v, want ErrSignPaced", err)
+	if _, err := src.Current(ctx); !errors.Is(err, clientcert.ErrSignPaced) {
+		t.Fatalf("err = %v, want clientcert.ErrSignPaced", err)
 	}
 	if got := f.signs.Load(); got != 2 {
 		t.Fatalf("signs = %d, want 2", got)

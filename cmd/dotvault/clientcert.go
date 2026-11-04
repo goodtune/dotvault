@@ -9,6 +9,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/clientcert/source"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -26,7 +27,7 @@ import (
 func buildClientCertSource(cfg *config.Config, vc *vault.Client, username string) clientcert.Source {
 	// A nil *vault.Client must become a nil interface, not a non-nil
 	// Signer wrapping a nil pointer.
-	var signer clientcert.Signer
+	var signer source.Signer
 	if vc != nil {
 		signer = vc
 	}
@@ -51,8 +52,8 @@ func warnInheritedClientCertRole(cfg *config.Config) {
 		"pki_role", cfg.Vault.MTLS.PKIRole)
 }
 
-func newClientCertSource(cfg *config.Config, signer clientcert.Signer, username string) clientcert.Source {
-	src, err := clientcert.New(cfg, signer, username, mtlsStorageDir(cfg))
+func newClientCertSource(cfg *config.Config, signer source.Signer, username string) clientcert.Source {
+	src, err := source.New(cfg, signer, username, mtlsStorageDir(cfg))
 	if err != nil {
 		slog.Warn("client certificate not served", "error", err)
 		return nil

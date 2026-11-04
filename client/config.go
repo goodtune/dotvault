@@ -354,7 +354,7 @@ func fromInternal(cfg *config.Config) *Config {
 }
 
 // clientCertTTL applies the default lifetime to a non-positive TTL, as
-// clientcert.ParamsFromConfig does on the daemon side.
+// source.ParamsFromConfig (internal/clientcert/source) does on the daemon side.
 func clientCertTTL(d time.Duration) time.Duration {
 	if d <= 0 {
 		return config.DefaultClientCertTTL

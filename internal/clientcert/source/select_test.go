@@ -1,4 +1,4 @@
-package clientcert
+package source
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 )
 
@@ -75,13 +76,13 @@ func TestNewHeldPrefersHeldWhenPresent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Source != SourceHeld || p.Serial != "77" {
+	if p.Source != clientcert.SourceHeld || p.Serial != "77" {
 		t.Fatalf("got source %q serial %q", p.Source, p.Serial)
 	}
 	if signer.signs.Load() != 0 {
 		t.Fatal("signed an ephemeral certificate while a held one was usable")
 	}
-	if lp, _ := src.(lastReporter).Last(); lp != p {
+	if lp, _ := src.(clientcert.LastReporter).Last(); lp != p {
 		t.Error("Last does not report the held pair")
 	}
 }
@@ -98,10 +99,10 @@ func TestHeldFallsBackToEphemeral(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Source != SourceEphemeral {
-		t.Fatalf("Source = %q, want ephemeral", p.Source)
+	if p.Source != clientcert.SourceEphemeral {
+		t.Fatalf("clientcert.Source = %q, want ephemeral", p.Source)
 	}
-	if lp, _ := src.(lastReporter).Last(); lp != p {
+	if lp, _ := src.(clientcert.LastReporter).Last(); lp != p {
 		t.Error("Last does not report the ephemeral pair that served last")
 	}
 }
@@ -113,7 +114,7 @@ func TestHeldFallbackReturnsToHeldOnceEnrolled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p, err := src.Current(context.Background()); err != nil || p.Source != SourceEphemeral {
+	if p, err := src.Current(context.Background()); err != nil || p.Source != clientcert.SourceEphemeral {
 		t.Fatalf("first: %v, %v", p, err)
 	}
 	writeEnvelope(t, dir, envelopeSpec{})
@@ -121,8 +122,8 @@ func TestHeldFallbackReturnsToHeldOnceEnrolled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Source != SourceHeld {
-		t.Fatalf("Source = %q, want held after enrolment", p.Source)
+	if p.Source != clientcert.SourceHeld {
+		t.Fatalf("clientcert.Source = %q, want held after enrolment", p.Source)
 	}
 }
 

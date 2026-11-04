@@ -1,4 +1,4 @@
-package clientcert
+package source
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/securestore"
 	"github.com/goodtune/dotvault/internal/vault"
 )
@@ -50,7 +51,7 @@ const signTimeout = 30 * time.Second
 //     the last attempt used is exempt, as it is from the backoff: the
 //     attempt it would be paced against said nothing about it, and the case
 //     that matters — the client facade replacing a token Vault rejected —
-//     would otherwise answer the replacement with ErrSignPaced until the
+//     would otherwise answer the replacement with clientcert.ErrSignPaced until the
 //     interval ran out. The sign rate is then bounded by how often the token
 //     really changes, which its producers limit (the facade replaces a
 //     rejected token at most once per ten seconds).
@@ -74,7 +75,7 @@ type EphemeralOptions struct {
 	Now                           func() time.Time // nil = time.Now
 }
 
-// ephemeral is the Source that signs short-lived certificates on demand.
+// ephemeral is the clientcert.Source that signs short-lived certificates on demand.
 type ephemeral struct {
 	s                  Signer
 	o                  EphemeralOptions
@@ -83,7 +84,7 @@ type ephemeral struct {
 	now                func() time.Time
 
 	mu       sync.Mutex
-	cur      *Pair
+	cur      *clientcert.Pair
 	inflight *flight
 	warned   bool   // a WARN has been logged for the current failure streak
 	warnedAs string // the error text that WARN carried
@@ -110,7 +111,7 @@ type flight struct {
 	token     string
 	tokenHash [sha256.Size]byte
 	done      chan struct{}
-	pair      *Pair
+	pair      *clientcert.Pair
 	err       error
 }
 
@@ -122,11 +123,11 @@ type usernameCache struct {
 	valid     bool
 }
 
-// NewEphemeral returns a Source that signs certificates via
+// NewEphemeral returns a clientcert.Source that signs certificates via
 // <PKIMount>/sign/<PKIRole> with s's current token. The common-name template
 // is parsed once here; whether it needs a LookupSelf (it references
 // token_username) is decided once here too.
-func NewEphemeral(s Signer, o EphemeralOptions) (Source, error) {
+func NewEphemeral(s Signer, o EphemeralOptions) (clientcert.Source, error) {
 	if s == nil {
 		return nil, errors.New("clientcert: nil signer")
 	}
@@ -170,7 +171,7 @@ func NewEphemeral(s Signer, o EphemeralOptions) (Source, error) {
 // certificate that has not reached NotAfter is still served. Signs are paced
 // (see signBackoffBase): inside a backoff window or minSignInterval, Current
 // answers from memory without contacting Vault.
-func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
+func (e *ephemeral) Current(ctx context.Context) (*clientcert.Pair, error) {
 	e.mu.Lock()
 	now := e.now()
 	if e.cur != nil && now.Before(e.cur.RefreshAt) {
@@ -189,7 +190,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 			if p != nil {
 				return p, nil
 			}
-			return nil, ErrNoToken
+			return nil, clientcert.ErrNoToken
 		}
 		h := sha256.Sum256([]byte(token))
 		if e.failures > 0 && h != e.failedToken {
@@ -202,7 +203,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 				return p, nil
 			}
 			if err == nil {
-				err = ErrSignPaced
+				err = clientcert.ErrSignPaced
 			}
 			return nil, err
 		}
@@ -235,14 +236,14 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 
 // Last returns the most recent pair signed and the most recent sign error,
 // without signing or contacting Vault.
-func (e *ephemeral) Last() (*Pair, error) {
+func (e *ephemeral) Last() (*clientcert.Pair, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.cur, e.lastErr
 }
 
 // validLocked returns the cached pair if it has not yet expired.
-func (e *ephemeral) validLocked(now time.Time) *Pair {
+func (e *ephemeral) validLocked(now time.Time) *clientcert.Pair {
 	if e.cur != nil && now.Before(e.cur.NotAfter) {
 		return e.cur
 	}
@@ -324,7 +325,7 @@ func (e *ephemeral) warnLocked(err error) {
 	e.warned, e.warnedAs = true, msg
 	if p := e.validLocked(e.now()); p != nil {
 		slog.Warn("client certificate refresh failed; serving the current certificate until it expires",
-			"source", SourceEphemeral,
+			"source", clientcert.SourceEphemeral,
 			"serial", p.Serial,
 			"not_after", p.NotAfter,
 			"common_name", p.CommonName,
@@ -334,17 +335,17 @@ func (e *ephemeral) warnLocked(err error) {
 		return
 	}
 	slog.Warn("client certificate signing failed; no certificate to serve until it succeeds",
-		"source", SourceEphemeral,
+		"source", clientcert.SourceEphemeral,
 		"mount", e.o.PKIMount,
 		"role", e.o.PKIRole,
 		"error", err)
 }
 
-// sign generates a key, has Vault sign it with token, and assembles the Pair.
+// sign generates a key, has Vault sign it with token, and assembles the clientcert.Pair.
 // token is the value Current read, never re-read here: the common name lookup
 // and the sign must present the same token, or a swap mid-sign could render
 // one token's username into a certificate another token signs.
-func (e *ephemeral) sign(ctx context.Context, token string) (*Pair, error) {
+func (e *ephemeral) sign(ctx context.Context, token string) (*clientcert.Pair, error) {
 	cn, err := e.commonName(ctx, token)
 	if err != nil {
 		return nil, err
@@ -363,7 +364,7 @@ func (e *ephemeral) sign(ctx context.Context, token string) (*Pair, error) {
 		return nil, fmt.Errorf("clientcert: sign via %s/sign/%s: %w", strings.Trim(e.o.PKIMount, "/"), e.o.PKIRole, err)
 	}
 
-	der := leafDER([]byte(issued.CertPEM))
+	der := clientcert.LeafDER([]byte(issued.CertPEM))
 	if der == nil {
 		return nil, errors.New("clientcert: Vault returned no certificate")
 	}
@@ -382,7 +383,7 @@ func (e *ephemeral) sign(ctx context.Context, token string) (*Pair, error) {
 		return nil, fmt.Errorf("clientcert: encode key: %w", err)
 	}
 
-	p := &Pair{
+	p := &clientcert.Pair{
 		CertPEM:    []byte(issued.CertPEM),
 		KeyPEM:     pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
 		NotBefore:  leaf.NotBefore,
@@ -390,10 +391,10 @@ func (e *ephemeral) sign(ctx context.Context, token string) (*Pair, error) {
 		RefreshAt:  leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore) / 2),
 		Serial:     vault.FormatSerial(leaf.SerialNumber),
 		CommonName: leaf.Subject.CommonName,
-		Source:     SourceEphemeral,
+		Source:     clientcert.SourceEphemeral,
 	}
 	slog.Info("client certificate issued",
-		"source", SourceEphemeral,
+		"source", clientcert.SourceEphemeral,
 		"serial", p.Serial,
 		"not_after", p.NotAfter,
 		"common_name", p.CommonName,
@@ -445,7 +446,7 @@ func (e *ephemeral) tokenUsername(ctx context.Context, token string) (string, er
 		name = meta["common_name"]
 	}
 	if name == "" {
-		return "", ErrNoUsername
+		return "", clientcert.ErrNoUsername
 	}
 	// The lookup presented token itself, so the answer is token's whatever
 	// the client holds now.

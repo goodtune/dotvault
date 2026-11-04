@@ -19,6 +19,13 @@ const (
 	StateExpired = "expired"
 )
 
+// LastReporter is implemented by every Source the source package returns, for
+// the status block. Last returns the most recent pair served and the most
+// recent error without any I/O and without signing.
+type LastReporter interface {
+	Last() (*Pair, error)
+}
+
 // Status is the public face of a Source for /api/v1/status. It is served
 // unauthenticated, so it carries the facts a certificate's own public part
 // would show (subject, serial, expiry) and never the PEM, the key or any
@@ -41,7 +48,7 @@ func StatusOf(s Source) Status {
 }
 
 func statusAt(s Source, now time.Time) Status {
-	r, ok := s.(lastReporter)
+	r, ok := s.(LastReporter)
 	if !ok {
 		return Status{}
 	}

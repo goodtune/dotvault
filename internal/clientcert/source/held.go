@@ -1,4 +1,4 @@
-package clientcert
+package source
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 )
 
@@ -30,7 +31,7 @@ type held struct {
 	// cur is the most recent pair exported, kept even after a failure so
 	// Last can report it. loaded says cur still corresponds to the envelope
 	// as it was when statKey was taken.
-	cur     *Pair
+	cur     *clientcert.Pair
 	loaded  bool
 	statKey envelopeStat
 	lastErr error
@@ -40,7 +41,7 @@ type held struct {
 	// directory.
 	last struct {
 		sync.Mutex
-		pair *Pair
+		pair *clientcert.Pair
 		err  error
 	}
 }
@@ -54,13 +55,13 @@ type envelopeStat struct {
 	size    int64
 }
 
-// NewHeld returns a Source serving the held mtls certificate stored under
+// NewHeld returns a clientcert.Source serving the held mtls certificate stored under
 // storageDir. username must be the current OS user and must not be empty: an
 // empty username disables the envelope's identity check, which is what stops
 // one account serving another's certificate. reissueBefore is
 // vault.mtls.reissue_before and sets RefreshAt; zero (or a value that would
 // put RefreshAt before NotBefore) falls back to the certificate's half-life.
-func NewHeld(storageDir, method, username string, reissueBefore time.Duration) Source {
+func NewHeld(storageDir, method, username string, reissueBefore time.Duration) clientcert.Source {
 	return &held{dir: storageDir, method: method, username: username, reissueBefore: reissueBefore}
 }
 
@@ -68,7 +69,7 @@ func NewHeld(storageDir, method, username string, reissueBefore time.Duration) S
 // when the cached certificate has expired. Errors from auth.ExportHeldCertificate
 // pass through unchanged, so callers can test them with errors.Is against
 // auth.ErrNoCertCredential and auth.ErrHeldNotExportable.
-func (h *held) Current(ctx context.Context) (*Pair, error) {
+func (h *held) Current(ctx context.Context) (*clientcert.Pair, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -110,14 +111,14 @@ func (h *held) publish() {
 
 // Last returns the most recent pair served and the most recent error, without
 // touching the filesystem.
-func (h *held) Last() (*Pair, error) {
+func (h *held) Last() (*clientcert.Pair, error) {
 	h.last.Lock()
 	defer h.last.Unlock()
 	return h.last.pair, h.last.err
 }
 
-func (h *held) pairFrom(hc *auth.HeldCertificate) (*Pair, error) {
-	der := leafDER(hc.CertPEM)
+func (h *held) pairFrom(hc *auth.HeldCertificate) (*clientcert.Pair, error) {
+	der := clientcert.LeafDER(hc.CertPEM)
 	if der == nil {
 		return nil, fmt.Errorf("clientcert: held credential: %w: no certificate in the envelope", auth.ErrNoCertCredential)
 	}
@@ -129,7 +130,7 @@ func (h *held) pairFrom(hc *auth.HeldCertificate) (*Pair, error) {
 	if h.reissueBefore <= 0 || !refresh.After(leaf.NotBefore) {
 		refresh = leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore) / 2)
 	}
-	return &Pair{
+	return &clientcert.Pair{
 		CertPEM:    hc.CertPEM,
 		KeyPEM:     hc.KeyPEM,
 		NotBefore:  leaf.NotBefore,
@@ -137,6 +138,6 @@ func (h *held) pairFrom(hc *auth.HeldCertificate) (*Pair, error) {
 		RefreshAt:  refresh,
 		Serial:     vault.FormatSerial(leaf.SerialNumber),
 		CommonName: leaf.Subject.CommonName,
-		Source:     SourceHeld,
+		Source:     clientcert.SourceHeld,
 	}, nil
 }

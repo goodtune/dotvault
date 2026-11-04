@@ -78,6 +78,9 @@ type ClientCertConfig struct {
 
 	// CommonName is a text/template for the certificate subject CN, over
 	// {{.token_username}} and {{.os_user}}. Defaults to {{.token_username}}.
+	// {{.os_user}} is the OS account the process runs as, as it is for the
+	// daemon; WithIdentity does not change it (nor whose held certificate is
+	// served), since that option names a KV path segment, not a person.
 	CommonName string
 
 	// TTL is the lifetime requested for an issued certificate. Zero means

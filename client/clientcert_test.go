@@ -26,7 +26,19 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/paths"
 )
+
+// osUser is the account the test runs as: what {{.os_user}} renders and whose
+// held envelope is served, whatever WithIdentity says.
+func osUser(t *testing.T) string {
+	t.Helper()
+	u, err := paths.Username()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
 
 // certVault is a fake Vault that answers token lookup and signs CSRs at
 // <mount>/sign/<role> with an in-test CA.
@@ -204,8 +216,8 @@ func TestClientCertificateEphemeral(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if leaf.Subject.CommonName != "gary" {
-		t.Errorf("CN = %q, want gary", leaf.Subject.CommonName)
+	if want := osUser(t); leaf.Subject.CommonName != want {
+		t.Errorf("CN = %q, want the OS user %q", leaf.Subject.CommonName, want)
 	}
 
 	// A second call is served from the cache: no new sign.
@@ -299,7 +311,7 @@ func TestClientCertificateUnreachableIs5xx(t *testing.T) {
 func TestClientCertificateHeld(t *testing.T) {
 	cv := newCertVault(t) // no token anywhere: a held certificate needs none
 	dir := t.TempDir()
-	writeHeldEnvelope(t, dir, "gary")
+	writeHeldEnvelope(t, dir, osUser(t))
 
 	cfg := cv.ephemeralConfig(t)
 	cfg.Vault.AuthMethod = "mtls"
@@ -315,11 +327,47 @@ func TestClientCertificateHeld(t *testing.T) {
 		t.Errorf("pki/sign called %d times, want 0 for a held certificate", n)
 	}
 	leaf, _ := x509.ParseCertificate(cc.Certificate.Certificate[0])
-	if leaf.Subject.CommonName != "gary" {
-		t.Errorf("CN = %q, want gary", leaf.Subject.CommonName)
+	if want := osUser(t); leaf.Subject.CommonName != want {
+		t.Errorf("CN = %q, want %q", leaf.Subject.CommonName, want)
 	}
 	if c.Token() != "" {
 		t.Error("a held certificate must not require or acquire a token")
+	}
+}
+
+func TestClientCertificateHeldIgnoresWithIdentity(t *testing.T) {
+	cv := newCertVault(t)
+	dir := t.TempDir()
+	writeHeldEnvelope(t, dir, osUser(t))
+	cfg := cv.ephemeralConfig(t)
+	cfg.Vault.AuthMethod = "mtls"
+	cfg.Vault.MTLS = MTLSConfig{StorageDir: dir}
+	cfg.ClientCert.PKIRole = ""
+	// WithIdentity re-points the KV path segment; it must not make the host
+	// refuse its own held certificate.
+	c, err := New(cfg, WithIdentity("someone-else-entirely"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ClientCertificate(context.Background()); err != nil {
+		t.Fatalf("ClientCertificate under WithIdentity: %v", err)
+	}
+}
+
+func TestClientCertificateOSUserIgnoresWithIdentity(t *testing.T) {
+	cv := newCertVault(t)
+	t.Setenv("DOTVAULT_TOKEN", "good")
+	c, err := New(cv.ephemeralConfig(t), WithIdentity("someone-else-entirely"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc, err := c.ClientCertificate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(cc.Certificate.Certificate[0])
+	if want := osUser(t); leaf.Subject.CommonName != want {
+		t.Errorf("{{.os_user}} rendered %q, want the OS user %q", leaf.Subject.CommonName, want)
 	}
 }
 
@@ -525,7 +573,7 @@ func TestClientCertificateHandSetHeldUnderTPMStillSigns(t *testing.T) {
 	// A storage dir holding an envelope for this user: if Held leaked through,
 	// the held source would serve it and no sign would happen.
 	dir := t.TempDir()
-	writeHeldEnvelope(t, dir, "gary")
+	writeHeldEnvelope(t, dir, osUser(t))
 	cfg.Vault.MTLS = MTLSConfig{StorageDir: dir}
 	cfg.ClientCert.Held = true
 
@@ -620,8 +668,8 @@ func TestTLSConfigPresentsCurrentCert(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "gary" {
-		t.Errorf("server saw CN %q, want gary", body)
+	if want := osUser(t); string(body) != want {
+		t.Errorf("server saw CN %q, want %q", body, want)
 	}
 }
 

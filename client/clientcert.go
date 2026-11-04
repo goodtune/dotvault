@@ -13,6 +13,7 @@ import (
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
+	"github.com/goodtune/dotvault/internal/paths"
 )
 
 // handshakeTimeout bounds one certificate lookup made from a TLS handshake,
@@ -168,9 +169,13 @@ func (c *Client) clientCertSource() (clientcert.Source, error) {
 			c.certErr = fmt.Errorf("%w: the client_cert section is not enabled", ErrNotConfigured)
 			return
 		}
-		user, err := c.IdentityName()
+		// The OS account, not IdentityName: WithIdentity names the KV path
+		// segment, while the held envelope's identity check and
+		// {{.os_user}} are about who this process runs as — the same value
+		// the daemon and the facade's own certificate login use.
+		user, err := paths.Username()
 		if err != nil {
-			c.certErr = err
+			c.certErr = fmt.Errorf("dotvault: resolve OS user for the client certificate: %w", err)
 			return
 		}
 		src, err := clientcert.NewFromParams(clientcert.Params{

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/vaultfs"
 )
@@ -39,7 +41,10 @@ var (
 // startLoopLocked starts a volume's refresh loop. Caller holds d.mu. With
 // initial set the loop renders immediately — the resume-after-restart case,
 // where the directory holds whatever the previous daemon last wrote.
-func (d *Driver) startLoopLocked(v *volume, initial bool) {
+// Otherwise seed is the certificate pair the caller's own render wrote (nil
+// for a volume without one), from which the loop schedules the certificate's
+// next refresh.
+func (d *Driver) startLoopLocked(v *volume, initial bool, seed *clientcert.Pair) {
 	ctx, cancel := context.WithCancel(d.lifetime())
 	v.cancel = cancel
 	v.done = make(chan struct{})
@@ -49,7 +54,7 @@ func (d *Driver) startLoopLocked(v *volume, initial bool) {
 	// them, both under d.mu, and the goroutine may not have run yet when
 	// that happens — an Unmount landing right behind a Mount would
 	// otherwise find v.done already nil and close(nil).
-	go d.runVolume(ctx, v, v.nudge, v.done, initial)
+	go d.runVolume(ctx, v, v.nudge, v.done, initial, seed)
 }
 
 // stopLoopLocked stops a volume's loop and returns the channel that closes
@@ -73,10 +78,30 @@ func (d *Driver) stopLoopLocked(v *volume) chan struct{} {
 // — Community edition, or an Enterprise subscription that has dropped —
 // so on Enterprise with a live subscription a volume is rendered once and
 // then only when Vault says something changed.
-func (d *Driver) runVolume(ctx context.Context, v *volume, nudge <-chan struct{}, done chan struct{}, initial bool) {
+//
+// A volume carrying the client certificate also has a timer, re-armed after
+// every refresh from what that refresh produced (nextCertRefresh). It fires
+// regardless of eventsDriving: a certificate ages without Vault saying
+// anything, so no event will ever arrive to replace it.
+func (d *Driver) runVolume(ctx context.Context, v *volume, nudge <-chan struct{}, done chan struct{}, initial bool, seed *clientcert.Pair) {
 	defer close(done)
+	certTimer := time.NewTimer(time.Hour)
+	certTimer.Stop()
+	defer certTimer.Stop()
+	var certC <-chan time.Time // nil, so never selected, while unarmed
+	var sched certSchedule
+	rearm := func(pair *clientcert.Pair, err error) {
+		delay, ok := d.nextCertRefresh(v.Spec, pair, err, &sched)
+		if !ok {
+			return
+		}
+		certTimer.Reset(delay)
+		certC = certTimer.C
+	}
 	if initial {
-		d.refresh(ctx, v)
+		rearm(d.refresh(ctx, v))
+	} else {
+		rearm(seed, nil)
 	}
 	ticker := time.NewTicker(v.Spec.TTL)
 	defer ticker.Stop()
@@ -96,36 +121,128 @@ func (d *Driver) runVolume(ctx context.Context, v *volume, nudge <-chan struct{}
 			case <-nudge:
 			default:
 			}
-			d.refresh(ctx, v)
+			rearm(d.refresh(ctx, v))
 		case <-ticker.C:
 			if d.eventsDriving() {
 				continue
 			}
-			d.refresh(ctx, v)
+			rearm(d.refresh(ctx, v))
+		case <-certC:
+			slog.Debug("docker volume client certificate due; re-rendering", "volume", v.Name)
+			rearm(d.refresh(ctx, v))
 		}
 	}
 }
 
-func (d *Driver) refresh(ctx context.Context, v *volume) {
-	if !d.hasToken() {
+// refresh re-renders v under its opMu and records the outcome, returning the
+// certificate pair the render wrote (nil when the volume carries none) and
+// the error, so the loop can schedule the certificate's next refresh.
+func (d *Driver) refresh(ctx context.Context, v *volume) (*clientcert.Pair, error) {
+	if v.Spec.ClientCert != ClientCertOnly && !d.hasToken() {
 		// A resumed volume can be running before the daemon has
 		// authenticated. Asking Vault without a token would only turn one
 		// known condition into a per-tick 400; record it and try again on
-		// the next tick or nudge.
+		// the next tick or nudge. A client_cert=only volume reads no
+		// secrets, so it is not held back here: a held certificate needs
+		// no token at all, and a source that does need one reports
+		// clientcert.ErrNoToken itself.
 		d.recordRefresh(v, 0, ErrNoToken)
-		return
+		return nil, ErrNoToken
 	}
 	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
 	defer cancel()
 	v.opMu.Lock()
-	n, _, err := materialise(ctx, d.store, d.opts.ClientCert, d.volumePath(v.Name), v.Spec)
+	n, pair, err := materialise(ctx, d.store, d.opts.ClientCert, d.volumePath(v.Name), v.Spec)
 	v.opMu.Unlock()
 	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
 		// Shutdown or unmount mid-render: not a failure worth recording
 		// against a volume that is about to be wiped or resumed.
-		return
+		return nil, err
 	}
 	d.recordRefresh(v, n, err)
+	return pair, err
+}
+
+// Certificate schedule. A volume carrying the client certificate is
+// re-rendered when the certificate falls due, because nothing else would:
+// Vault sends no event when a certificate ages, and on Enterprise the ticker
+// is suppressed while a subscription is live.
+const (
+	// defaultCertRetry is the re-arm after the source answers that it
+	// cannot serve a certificate yet (sign pacing, no token). Both clear in
+	// seconds and the files are about to expire, so waiting out the ttl
+	// would be wrong. It is also the first step of the overdue backoff (see
+	// nextCertRefresh). Driver.certRetry carries it so a test can shorten
+	// it for one driver without racing another test's loops.
+	defaultCertRetry = 10 * time.Second
+	// certTimerMin is the shortest the certificate timer is armed for.
+	certTimerMin = time.Second
+	// certJitterDivisor bounds the jitter to 1/20 (5%) of the certificate's
+	// issued lifetime, so volumes signed together do not all re-render (and
+	// re-sign) in the same instant.
+	certJitterDivisor = 20
+)
+
+// certSchedule is the per-loop state nextCertRefresh carries between arms.
+type certSchedule struct {
+	// overdue counts consecutive successful refreshes whose pair was
+	// already past its RefreshAt.
+	overdue int
+}
+
+// nextCertRefresh decides when the certificate timer next fires after a
+// refresh that produced pair and err, and whether it is armed at all. It is
+// never armed for a volume that does not carry the certificate.
+//
+//   - Success: the pair's RefreshAt, plus jitter of at most 5% of the
+//     issued lifetime, and never less than certTimerMin.
+//   - Success with a pair already past its RefreshAt: the source has
+//     nothing newer to give yet — a held certificate the daemon has not
+//     rotated, or an ephemeral one whose re-sign is paced and which is
+//     still valid. Re-rendering at the 1s floor would re-read every
+//     selected secret from Vault each second, so this backs off from
+//     d.certRetry, doubling to the ticker's cadence.
+//   - Failure the source expects to clear shortly (ErrSignPaced, or no
+//     token, whether the source or the driver noticed): d.certRetry.
+//   - Any other failure, or no pair reported: the ordinary ticker cadence.
+func (d *Driver) nextCertRefresh(spec Spec, pair *clientcert.Pair, err error, s *certSchedule) (time.Duration, bool) {
+	if spec.ClientCert == ClientCertOff {
+		return 0, false
+	}
+	switch {
+	case err != nil && (errors.Is(err, clientcert.ErrSignPaced) || errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, ErrNoToken)):
+		return d.certRetry, true
+	case err != nil, pair == nil:
+		return spec.TTL, true
+	}
+	until := pair.RefreshAt.Sub(d.now())
+	if until <= 0 {
+		ceiling := max(spec.TTL, d.certRetry)
+		delay := d.certRetry
+		for range s.overdue {
+			if delay >= ceiling {
+				break
+			}
+			delay *= 2
+		}
+		if delay < ceiling {
+			s.overdue++
+		}
+		return min(delay, ceiling), true
+	}
+	s.overdue = 0
+	if lifetime := pair.NotAfter.Sub(pair.NotBefore); lifetime > 0 {
+		until += d.jitter(lifetime / certJitterDivisor)
+	}
+	return max(until, certTimerMin), true
+}
+
+// defaultJitter returns a uniformly random duration in [0, bound].
+func defaultJitter(bound time.Duration) time.Duration {
+	if bound <= 0 {
+		return 0
+	}
+	return rand.N(bound + 1)
 }
 
 // eventsDriving reports whether a live subscription is keeping volumes fresh.
@@ -360,7 +477,7 @@ func (d *Driver) resume() {
 	for _, v := range d.volumes {
 		if len(v.Mounts) > 0 {
 			slog.Info("resuming docker volume still mounted by the engine", "volume", v.Name, "mounts", len(v.Mounts))
-			d.startLoopLocked(v, true)
+			d.startLoopLocked(v, true, nil)
 		}
 	}
 	entries, err := os.ReadDir(d.opts.VolumeDir)

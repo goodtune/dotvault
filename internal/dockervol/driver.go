@@ -67,6 +67,10 @@ type Driver struct {
 	store  vaultfs.Store
 	events EventSource
 	now    func() time.Time
+	// jitter and certRetry pace the client certificate timer (see
+	// nextCertRefresh); fields so a test can fix them per driver.
+	jitter    func(bound time.Duration) time.Duration
+	certRetry time.Duration
 
 	// ctx is the lifetime context Run was given; volume loops derive from
 	// it. Background until Run starts, which is also when volumes can first
@@ -152,12 +156,14 @@ func New(opts Options, store vaultfs.Store, events EventSource) (*Driver, error)
 		return nil, fmt.Errorf("dockervol: default ttl must be positive")
 	}
 	d := &Driver{
-		opts:    opts,
-		store:   store,
-		events:  events,
-		now:     time.Now,
-		ctx:     context.Background(),
-		volumes: map[string]*volume{},
+		opts:      opts,
+		store:     store,
+		events:    events,
+		now:       time.Now,
+		jitter:    defaultJitter,
+		certRetry: defaultCertRetry,
+		ctx:       context.Background(),
+		volumes:   map[string]*volume{},
 	}
 	if err := d.load(); err != nil {
 		return nil, err
@@ -270,6 +276,7 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 
 	dir := d.volumePath(name)
 	populated := false
+	var pair *clientcert.Pair
 	if !active {
 		defer func() {
 			d.mu.Lock()
@@ -290,13 +297,17 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 	if !active {
 		// Only the first mount needs Vault: a container joining a volume
 		// that is already materialised gets the files that exist, whatever
-		// the daemon's token is doing at that moment.
-		if !d.hasToken() {
+		// the daemon's token is doing at that moment. A client_cert=only
+		// volume reads no secrets, so it needs no token of the daemon's
+		// own; its source reports clientcert.ErrNoToken if it needs one.
+		if v.Spec.ClientCert != ClientCertOnly && !d.hasToken() {
 			return "", ErrNoToken
 		}
 		ctx, cancel := context.WithTimeout(ctx, mountTimeout)
 		defer cancel()
-		n, _, err := materialise(ctx, d.store, d.opts.ClientCert, dir, v.Spec)
+		var n int
+		var err error
+		n, pair, err = materialise(ctx, d.store, d.opts.ClientCert, dir, v.Spec)
 		d.recordRefresh(v, n, err)
 		if err != nil {
 			return "", fmt.Errorf("populate volume %q: %w", name, err)
@@ -322,7 +333,7 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 		// last Unmount that raced this call and may already have wiped the
 		// directory — in which case the new loop must render immediately.
 		// So must one whose render raced a Vault event.
-		d.startLoopLocked(v, !populated || v.pendingEvent)
+		d.startLoopLocked(v, !populated || v.pendingEvent, pair)
 	}
 	v.pendingEvent = false
 	slog.Info("docker volume mounted", "volume", name, "mounts", len(v.Mounts), "secrets", v.secrets)

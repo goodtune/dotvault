@@ -70,7 +70,9 @@ var ErrNotFound = errors.New("no such volume")
 
 // ErrNoToken is returned by Mount while the daemon holds no Vault token: the
 // volume cannot be populated, and an empty directory would be a worse answer
-// than a refusal the container runtime reports.
+// than a refusal the container runtime reports. A client_cert=only volume
+// reads no secrets and is exempt; its certificate source reports its own
+// clientcert.ErrNoToken when it needs a token to sign.
 var ErrNoToken = errors.New("dotvault has not authenticated with vault yet, so the volume cannot be populated")
 
 // ErrUnsupported is returned by Run on platforms where the plugin is not

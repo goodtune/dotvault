@@ -241,6 +241,13 @@ func TestHandleAuthCallback_Downscopes(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{
 				"auth": map[string]any{"client_token": "broad-token", "policies": []string{"default", "admin"}},
 			})
+		case "/v1/auth/token/lookup-self":
+			if got := r.Header.Get("X-Vault-Token"); got != "broad-token" {
+				t.Errorf("parent metadata read with token %q, want broad-token", got)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"meta": map[string]any{"username": "gary"}},
+			})
 		case "/v1/auth/token/create":
 			if got := r.Header.Get("X-Vault-Token"); got != "broad-token" {
 				t.Errorf("child created off token %q, want broad-token", got)
@@ -274,6 +281,9 @@ func TestHandleAuthCallback_Downscopes(t *testing.T) {
 	if ndp, _ := createBody["no_default_policy"].(bool); !ndp {
 		t.Errorf("child create no_default_policy = %v, want true", createBody["no_default_policy"])
 	}
+	if meta, _ := createBody["meta"].(map[string]any); meta["username"] != "gary" {
+		t.Errorf("child create meta = %v, want the parent's username carried over", createBody["meta"])
+	}
 }
 
 // TestHandleAuthCallback_DownscopeFailureDoesNotLeakBroadToken is the web-layer
@@ -288,6 +298,11 @@ func TestHandleAuthCallback_DownscopeFailureDoesNotLeakBroadToken(t *testing.T) 
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
 				"auth": map[string]any{"client_token": "broad-token", "policies": []string{"admin"}},
+			})
+		case "/v1/auth/token/lookup-self":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"meta": map[string]any{"username": "gary"}},
 			})
 		case "/v1/auth/token/create":
 			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)

@@ -63,8 +63,8 @@ type ClientCertConfig struct {
 
 	// Held reports that the certificate served is the one this host already
 	// logs in to Vault with (plain "mtls" and not borrow-only), so no token or
-	// PKI role is needed to serve it. LoadConfig sets it from the config's own
-	// rule; New derives it the same way for a hand-built Config.
+	// PKI role is needed to serve it. It is derived, not chosen: New overwrites
+	// whatever is set here using the daemon's own rule.
 	Held bool
 
 	// PKIMount is the PKI secrets engine mount used to sign. Defaults to
@@ -408,8 +408,9 @@ func (c *Config) withDefaults() Config {
 		}
 	}
 	// Client-certificate defaults mirror config.ClientCertPKIMount and friends.
-	// Held is derived exactly as config.ClientCertHeld does, so a hand-built
-	// Config cannot disagree with a loaded one about which source serves.
+	// Held is always recomputed through config.ClientCertHeldFor, the rule
+	// the daemon itself uses, so a hand-built Config cannot disagree with a
+	// loaded one and a stale or hand-set Held is overwritten.
 	cc := &out.ClientCert
 	if cc.PKIMount == "" {
 		cc.PKIMount = config.DefaultPKIMount
@@ -418,9 +419,7 @@ func (c *Config) withDefaults() Config {
 		cc.CommonName = config.DefaultClientCertCommonName
 	}
 	cc.TTL = clientCertTTL(cc.TTL)
-	if cc.Enabled && out.Vault.AuthMethod == "mtls" && !out.Vault.BorrowOnly {
-		cc.Held = true
-	}
+	cc.Held = config.ClientCertHeldFor(cc.Enabled, out.Vault.AuthMethod, out.Vault.BorrowOnly)
 	return out
 }
 

@@ -361,6 +361,41 @@ func TestClientCertificateHeldIsDerivedForHandBuiltConfig(t *testing.T) {
 	if cfg.withDefaults().ClientCert.Held {
 		t.Error("borrow_only must not be held")
 	}
+	// A hand-set Held is overwritten, not trusted.
+	for _, method := range []string{"oidc", "mtls+tpm", "mtls+os", "token"} {
+		c := &Config{
+			Vault:      VaultConfig{Address: "http://127.0.0.1:1", AuthMethod: method},
+			ClientCert: ClientCertConfig{Enabled: true, Held: true},
+		}
+		if c.withDefaults().ClientCert.Held {
+			t.Errorf("method %q: hand-set Held survived", method)
+		}
+	}
+}
+
+func TestClientCertificateHandSetHeldUnderTPMStillSigns(t *testing.T) {
+	cv := newCertVault(t)
+	t.Setenv("DOTVAULT_TOKEN", "good")
+	cfg := cv.ephemeralConfig(t)
+	cfg.Vault.AuthMethod = "mtls+tpm"
+	// A storage dir holding an envelope for this user: if Held leaked through,
+	// the held source would serve it and no sign would happen.
+	dir := t.TempDir()
+	writeHeldEnvelope(t, dir, "gary")
+	cfg.Vault.MTLS = MTLSConfig{StorageDir: dir}
+	cfg.ClientCert.Held = true
+
+	cc, err := newClient(t, cfg).ClientCertificate(context.Background())
+	if err != nil {
+		t.Fatalf("ClientCertificate: %v", err)
+	}
+	if n := cv.signs.Load(); n != 1 {
+		t.Errorf("signs = %d, want 1: the ephemeral source must serve under mtls+tpm", n)
+	}
+	leaf, _ := x509.ParseCertificate(cc.Certificate.Certificate[0])
+	if err := leaf.CheckSignatureFrom(cv.caCert); err != nil {
+		t.Errorf("certificate was not issued by the fake CA: %v", err)
+	}
 }
 
 func TestMapClientCertErr(t *testing.T) {

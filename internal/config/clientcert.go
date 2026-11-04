@@ -131,7 +131,14 @@ func (c *Config) ClientCertCommonName() string {
 // shared base config says. It issues ephemerally like any other host and so
 // needs a PKI role of its own.
 func (c *Config) ClientCertHeld() bool {
-	return c.ClientCert.Enabled && c.Vault.AuthMethod == "mtls" && !c.Vault.BorrowOnly
+	return ClientCertHeldFor(c.ClientCert.Enabled, c.Vault.AuthMethod, c.Vault.BorrowOnly)
+}
+
+// ClientCertHeldFor is the held rule over its three inputs, for callers that
+// carry them without a *Config (the client/ facade's projection). It is the
+// one definition: ClientCertHeld calls it, so the two cannot drift.
+func ClientCertHeldFor(enabled bool, method string, borrowOnly bool) bool {
+	return enabled && method == "mtls" && !borrowOnly
 }
 
 // validateClientCert checks the client_cert section and fills in TTL and

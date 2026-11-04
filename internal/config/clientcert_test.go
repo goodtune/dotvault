@@ -269,3 +269,23 @@ func TestClientCertNotUserOverridable(t *testing.T) {
 		t.Fatalf("ParseUserConfig() = %v, want an error naming client_cert", err)
 	}
 }
+
+func TestClientCertHeldFor(t *testing.T) {
+	for _, tc := range []struct {
+		enabled    bool
+		method     string
+		borrowOnly bool
+		want       bool
+	}{
+		{true, "mtls", false, true},
+		{false, "mtls", false, false},
+		{true, "mtls", true, false},
+		{true, "mtls+tpm", false, false},
+		{true, "mtls+os", false, false},
+		{true, "oidc", false, false},
+	} {
+		if got := ClientCertHeldFor(tc.enabled, tc.method, tc.borrowOnly); got != tc.want {
+			t.Errorf("ClientCertHeldFor(%v, %q, %v) = %v, want %v", tc.enabled, tc.method, tc.borrowOnly, got, tc.want)
+		}
+	}
+}

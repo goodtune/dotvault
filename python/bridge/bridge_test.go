@@ -121,3 +121,20 @@ func TestClientCertificateNilOutputNeverSigns(t *testing.T) {
 		t.Fatalf("Vault saw %d requests for a call that could not receive the result", n)
 	}
 }
+
+// TestWipeZeroesOutString proves the string dotvault_free releases is zeroed
+// first. Out strings carry tokens, secret values and a private key, and freed
+// malloc memory is not cleared, so without the wipe they would linger in the
+// host process's heap until reused.
+func TestWipeZeroesOutString(t *testing.T) {
+	const secret = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n"
+	got := wipedCString(secret)
+	if len(got) != len(secret) {
+		t.Fatalf("read back %d bytes, want %d", len(got), len(secret))
+	}
+	for i, b := range got {
+		if b != 0 {
+			t.Fatalf("byte %d = %#x after wipe, want 0", i, b)
+		}
+	}
+}

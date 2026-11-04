@@ -67,6 +67,16 @@ static int dvTestUnsetenv(const char* k) {
 	return unsetenv(k);
 #endif
 }
+
+// dvWipe zeroes the NUL-terminated string at p in place. The writes go
+// through a volatile pointer so the compiler cannot drop them as dead stores
+// ahead of the free that follows.
+static void dvWipe(char* p) {
+	volatile char* v = p;
+	while (*v) {
+		*v++ = 0;
+	}
+}
 */
 import "C"
 
@@ -248,11 +258,28 @@ func dotvault_default_config_path() *C.char {
 	return C.CString(client.DefaultConfigPath())
 }
 
+// dotvault_free releases an out string. It zeroes the bytes first: out
+// strings carry tokens, secret values and private keys, and freed malloc
+// memory is not cleared, so they would otherwise linger in the host
+// process's heap until the allocator reuses the block. (The Python side's
+// own copy is an immutable str it cannot clear; this covers the half the
+// bridge owns.)
+//
 //export dotvault_free
 func dotvault_free(p *C.char) {
 	if p != nil {
+		C.dvWipe(p)
 		C.free(unsafe.Pointer(p))
 	}
+}
+
+// wipedCString allocates s as an out string would be, wipes it as
+// dotvault_free does, and returns the bytes left behind, for cgo-free tests.
+func wipedCString(s string) []byte {
+	p := C.CString(s)
+	defer C.free(unsafe.Pointer(p))
+	C.dvWipe(p)
+	return C.GoBytes(unsafe.Pointer(p), C.int(len(s)))
 }
 
 // dotvault_client_new loads dotvault's system config from configPath (empty =>

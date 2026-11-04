@@ -422,6 +422,7 @@ type staticSections struct {
 	API           config.APIConfig
 	FUSE          config.FUSEConfig
 	Docker        config.DockerConfig
+	ClientCert    config.ClientCertConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
 	Bypass        bool
@@ -435,6 +436,7 @@ func staticSectionsOf(c *config.Config) staticSections {
 		API:           c.API,
 		FUSE:          c.FUSE,
 		Docker:        c.Docker,
+		ClientCert:    c.ClientCert,
 		Observability: c.Observability,
 		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
@@ -544,6 +546,9 @@ func changedStaticSections(a, b staticSections) []string {
 	}
 	if !reflect.DeepEqual(a.Docker, b.Docker) {
 		out = append(out, "docker")
+	}
+	if !reflect.DeepEqual(a.ClientCert, b.ClientCert) {
+		out = append(out, "client_cert")
 	}
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")

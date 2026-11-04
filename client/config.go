@@ -61,19 +61,13 @@ type ClientCertConfig struct {
 	// false.
 	Enabled bool
 
-	// Held reports that the certificate served is the one this host already
-	// logs in to Vault with (plain "mtls" and not borrow-only), so no token or
-	// PKI role is needed to serve it. It is derived, not chosen: New overwrites
-	// whatever is set here using the daemon's own rule.
-	Held bool
-
 	// PKIMount is the PKI secrets engine mount used to sign. Defaults to
 	// "pki".
 	PKIMount string
 
 	// PKIRole is the PKI role signed against. Required unless a held
-	// certificate can serve instead; with Held it is the fallback used when
-	// the host holds no usable certificate.
+	// certificate can serve instead; under plain "mtls" it is the fallback
+	// used when the host holds no usable certificate.
 	PKIRole string
 
 	// CommonName is a text/template for the certificate subject CN, over
@@ -146,7 +140,7 @@ type VaultConfig struct {
 	MTLS MTLSConfig
 
 	// ReissueBefore mirrors vault.mtls.reissue_before. It is consulted only
-	// to schedule when a held client certificate (ClientCert.Held) is read
+	// to schedule when a held client certificate (plain "mtls") is read
 	// again, never to rotate one. Zero falls back to the certificate's
 	// half-life.
 	ReissueBefore time.Duration
@@ -349,7 +343,6 @@ func fromInternal(cfg *config.Config) *Config {
 		},
 		ClientCert: ClientCertConfig{
 			Enabled:    cfg.ClientCert.Enabled,
-			Held:       cfg.ClientCertHeld(),
 			PKIMount:   cfg.ClientCertPKIMount(),
 			PKIRole:    cfg.ClientCertPKIRole(),
 			CommonName: cfg.ClientCertCommonName(),
@@ -411,9 +404,9 @@ func (c *Config) withDefaults() Config {
 		}
 	}
 	// Client-certificate defaults mirror config.ClientCertPKIMount and friends.
-	// Held is always recomputed through config.ClientCertHeldFor, the rule
-	// the daemon itself uses, so a hand-built Config cannot disagree with a
-	// loaded one and a stale or hand-set Held is overwritten.
+	// Whether the certificate is held is not a field at all: it is derived on
+	// use (clientCertHeld) through the daemon's own rule, so a hand-built
+	// Config cannot disagree with a loaded one.
 	cc := &out.ClientCert
 	if cc.PKIMount == "" {
 		cc.PKIMount = config.DefaultPKIMount
@@ -422,8 +415,14 @@ func (c *Config) withDefaults() Config {
 		cc.CommonName = config.DefaultClientCertCommonName
 	}
 	cc.TTL = clientCertTTL(cc.TTL)
-	cc.Held = config.ClientCertHeldFor(cc.Enabled, out.Vault.AuthMethod, out.Vault.BorrowOnly)
 	return out
+}
+
+// clientCertHeld reports whether the client certificate is the one this host
+// already logs in to Vault with (plain "mtls", not borrow-only), via
+// config.ClientCertHeldFor, the rule the daemon itself applies.
+func (cfg Config) clientCertHeld() bool {
+	return config.ClientCertHeldFor(cfg.ClientCert.Enabled, cfg.Vault.AuthMethod, cfg.Vault.BorrowOnly)
 }
 
 // defaultMTLSStorageDir is {cache_dir}/mtls, matching the daemon, or "" when the

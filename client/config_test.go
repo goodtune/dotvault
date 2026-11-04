@@ -172,7 +172,6 @@ rules:
 	}
 	want := ClientCertConfig{
 		Enabled:    true,
-		Held:       false, // oidc, not plain mtls
 		PKIMount:   "corp-pki",
 		PKIRole:    "workstation",
 		CommonName: "{{.os_user}}",
@@ -210,7 +209,7 @@ rules:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if !cfg.ClientCert.Held {
+	if !cfg.clientCertHeld() {
 		t.Error("plain mtls with client_cert enabled must project Held")
 	}
 	if cfg.ClientCert.PKIRole != "workstation" || cfg.ClientCert.TTL != 5*time.Minute {

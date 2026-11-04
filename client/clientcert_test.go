@@ -546,36 +546,34 @@ func TestClientCertificateHeldIsDerivedForHandBuiltConfig(t *testing.T) {
 		Vault:      VaultConfig{Address: "http://127.0.0.1:1", AuthMethod: "mtls"},
 		ClientCert: ClientCertConfig{Enabled: true},
 	}
-	if got := cfg.withDefaults().ClientCert; !got.Held || got.PKIMount != "pki" || got.CommonName != "{{.token_username}}" || got.TTL != 5*time.Minute {
-		t.Errorf("defaults = %+v", got)
+	if got := cfg.withDefaults(); !got.clientCertHeld() || got.ClientCert.PKIMount != "pki" || got.ClientCert.CommonName != "{{.token_username}}" || got.ClientCert.TTL != 5*time.Minute {
+		t.Errorf("defaults = %+v, held = %v", got.ClientCert, got.clientCertHeld())
 	}
 	cfg.Vault.BorrowOnly = true
-	if cfg.withDefaults().ClientCert.Held {
+	if cfg.withDefaults().clientCertHeld() {
 		t.Error("borrow_only must not be held")
 	}
-	// A hand-set Held is overwritten, not trusted.
 	for _, method := range []string{"oidc", "mtls+tpm", "mtls+os", "token"} {
 		c := &Config{
 			Vault:      VaultConfig{Address: "http://127.0.0.1:1", AuthMethod: method},
-			ClientCert: ClientCertConfig{Enabled: true, Held: true},
+			ClientCert: ClientCertConfig{Enabled: true},
 		}
-		if c.withDefaults().ClientCert.Held {
-			t.Errorf("method %q: hand-set Held survived", method)
+		if c.withDefaults().clientCertHeld() {
+			t.Errorf("method %q is held", method)
 		}
 	}
 }
 
-func TestClientCertificateHandSetHeldUnderTPMStillSigns(t *testing.T) {
+func TestClientCertificateUnderTPMSignsDespiteEnvelope(t *testing.T) {
 	cv := newCertVault(t)
 	t.Setenv("DOTVAULT_TOKEN", "good")
 	cfg := cv.ephemeralConfig(t)
 	cfg.Vault.AuthMethod = "mtls+tpm"
-	// A storage dir holding an envelope for this user: if Held leaked through,
-	// the held source would serve it and no sign would happen.
+	// A storage dir holding an envelope for this user: were mtls+tpm treated
+	// as held, the held source would serve it and no sign would happen.
 	dir := t.TempDir()
 	writeHeldEnvelope(t, dir, osUser(t))
 	cfg.Vault.MTLS = MTLSConfig{StorageDir: dir}
-	cfg.ClientCert.Held = true
 
 	cc, err := newClient(t, cfg).ClientCertificate(context.Background())
 	if err != nil {

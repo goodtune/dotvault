@@ -181,7 +181,7 @@ func (c *Client) clientCertSource() (clientcert.Source, error) {
 		}
 		src, err := clientcert.NewFromParams(clientcert.Params{
 			Enabled:       true,
-			Held:          cc.Held,
+			Held:          c.cfg.clientCertHeld(),
 			Method:        c.cfg.Vault.AuthMethod,
 			StorageDir:    c.cfg.Vault.MTLS.StorageDir,
 			ReissueBefore: c.cfg.Vault.ReissueBefore,

@@ -332,3 +332,35 @@ func TestClientCertHeldFor(t *testing.T) {
 		}
 	}
 }
+
+func TestClientCertRoleInherited(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		enabled    bool
+		method     string
+		borrowOnly bool
+		ownRole    string
+		mtlsRole   string
+		want       bool
+	}{
+		{"signs with the login role", true, "mtls+tpm", false, "", "user-client", true},
+		{"borrow_only signs with the shared login role", true, "mtls", true, "", "user-client", true},
+		{"non-cert method with an mtls block", true, "oidc", false, "", "user-client", true},
+		{"own role keeps them apart", true, "mtls+tpm", false, "tools", "user-client", false},
+		{"no login role to inherit", true, "oidc", false, "tools", "", false},
+		{"held does not sign", true, "mtls", false, "", "user-client", false},
+		{"disabled", false, "mtls+tpm", false, "", "user-client", false},
+	} {
+		c := &Config{
+			Vault: VaultConfig{
+				AuthMethod: tc.method,
+				BorrowOnly: tc.borrowOnly,
+				MTLS:       MTLSConfig{PKIRole: tc.mtlsRole},
+			},
+			ClientCert: ClientCertConfig{Enabled: tc.enabled, PKIRole: tc.ownRole},
+		}
+		if got := c.ClientCertRoleInherited(); got != tc.want {
+			t.Errorf("%s: ClientCertRoleInherited() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

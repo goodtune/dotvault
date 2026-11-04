@@ -111,6 +111,24 @@ func (c *Config) ClientCertPKIRole() string {
 	return c.Vault.MTLS.PKIRole
 }
 
+// ClientCertRoleInherited reports whether this host signs client
+// certificates under the role it inherited from vault.mtls.pki_role: the
+// section is enabled, the host signs (not held), client_cert.pki_role is empty
+// and vault.mtls.pki_role is set.
+//
+// Inheritance is deliberate — it lets one base config serve a workstation and
+// its borrow_only remotes — but it has a consequence the daemon warns about at
+// startup: that role is the one the login certificates are signed under, so
+// the CA the cert auth method trusts signs these too, and each such
+// certificate can log in to Vault. The token that login yields takes the cert
+// auth role's TTL and is renewable, so it outlives the certificate's few
+// minutes. A dedicated client_cert.pki_role on a CA the cert auth method does
+// not trust keeps the two apart.
+func (c *Config) ClientCertRoleInherited() bool {
+	return c.ClientCert.Enabled && !c.ClientCertHeld() &&
+		c.ClientCert.PKIRole == "" && c.Vault.MTLS.PKIRole != ""
+}
+
 // ClientCertCommonName resolves the subject CN template.
 func (c *Config) ClientCertCommonName() string {
 	if c.ClientCert.CommonName != "" {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -136,5 +137,36 @@ func TestPrintClientCertStatusHeldStates(t *testing.T) {
 				t.Errorf("output missing %q or the fallback note:\n%s", tc.want, out)
 			}
 		})
+	}
+}
+
+func TestWarnInheritedClientCertRole(t *testing.T) {
+	capture := func(cfg *config.Config) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+		defer slog.SetDefault(prev)
+		warnInheritedClientCertRole(cfg)
+		return buf.String()
+	}
+
+	inherited := &config.Config{
+		Vault: config.VaultConfig{
+			AuthMethod: "mtls+tpm",
+			MTLS:       config.MTLSConfig{PKIRole: "user-client"},
+		},
+		ClientCert: config.ClientCertConfig{Enabled: true},
+	}
+	out := capture(inherited)
+	for _, want := range []string{"level=WARN", "client_cert.pki_role", "vault.mtls.pki_role", "user-client", "log in to Vault"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning %q does not mention %q", out, want)
+		}
+	}
+
+	own := *inherited
+	own.ClientCert.PKIRole = "tools"
+	if out := capture(&own); out != "" {
+		t.Errorf("a dedicated role still warned: %q", out)
 	}
 }

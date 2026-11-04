@@ -30,7 +30,25 @@ func buildClientCertSource(cfg *config.Config, vc *vault.Client, username string
 	if vc != nil {
 		signer = vc
 	}
+	warnInheritedClientCertRole(cfg)
 	return newClientCertSource(cfg, signer, username)
+}
+
+// warnInheritedClientCertRole logs, once per daemon start, when this host
+// signs client certificates under the role inherited from vault.mtls.pki_role
+// (config.ClientCertRoleInherited). Inheritance is supported — one base config
+// can serve a workstation and its borrow_only remotes — but every certificate
+// signed under the login role is also a Vault login, and the token it yields
+// outlives the certificate.
+func warnInheritedClientCertRole(cfg *config.Config) {
+	if !cfg.ClientCertRoleInherited() {
+		return
+	}
+	slog.Warn("client_cert.pki_role is unset, so client certificates are signed under vault.mtls.pki_role, the role this host's login certificates use; "+
+		"each one can log in to Vault, and the token that login yields takes the cert auth role's TTL and is renewable, outliving the certificate. "+
+		"Set client_cert.pki_role to a dedicated role on a CA the cert auth method does not trust to keep them apart",
+		"pki_mount", cfg.ClientCertPKIMount(),
+		"pki_role", cfg.Vault.MTLS.PKIRole)
 }
 
 func newClientCertSource(cfg *config.Config, signer clientcert.Signer, username string) clientcert.Source {

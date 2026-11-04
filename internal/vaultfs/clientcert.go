@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/clientcert"
 )
@@ -87,4 +90,56 @@ func (t *Tree) clientCertDocument(ctx context.Context, path string) (*Document, 
 		b = pair.Combined()
 	}
 	return &Document{Bytes: b, ModTime: pair.NotBefore, Version: 0}, nil
+}
+
+// certFailureLogInterval is how often the same client certificate failure is
+// logged again. Every stat, lookup and open of a certificate file reaches the
+// source, so a persistent failure (a policy without pki/sign) would otherwise
+// log once per read; the line still has to carry the cause, since an errno
+// cannot.
+const certFailureLogInterval = 10 * time.Minute
+
+// maxCertFailureKeys bounds certFailureLog's memory. The error text includes
+// the file name, so one cause occupies up to three keys.
+const maxCertFailureKeys = 32
+
+// certFailureLog rate-limits the WARN for a client certificate failure: each
+// distinct error is logged at once, then at most every certFailureLogInterval.
+type certFailureLog struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+	now  func() time.Time
+}
+
+var certFailures = &certFailureLog{now: time.Now}
+
+// shouldLog reports whether msg is due to be logged, and records it if so.
+func (l *certFailureLog) shouldLog(msg string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if at, ok := l.last[msg]; ok && now.Sub(at) < certFailureLogInterval {
+		return false
+	}
+	if l.last == nil || len(l.last) >= maxCertFailureKeys {
+		l.last = make(map[string]time.Time)
+	}
+	l.last[msg] = now
+	return true
+}
+
+// logCertFailure logs a client certificate failure that is about to become an
+// errno, with the error (which names the PKI role and Vault's answer, and by
+// the source's contract never carries key or certificate material). A source
+// that is waiting for a token or pacing its next sign is logged at DEBUG on
+// every call, since that clears on its own and is reported as EAGAIN.
+func logCertFailure(op, path string, err error) {
+	if errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, clientcert.ErrSignPaced) {
+		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
+		return
+	}
+	if errors.Is(err, context.Canceled) || !certFailures.shouldLog(err.Error()) {
+		return
+	}
+	slog.Warn("vaultfs: client certificate unavailable", "op", op, "path", displayPath(path), "error", err)
 }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -658,5 +660,48 @@ func TestTreeClientCertSourceError(t *testing.T) {
 	src.set(nil, nil)
 	if _, err := tree.Document(ctx, ClientCertFile); err == nil {
 		t.Error("Document with a nil pair returned no error")
+	}
+}
+
+func TestCertFailureLogRateLimited(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	l := &certFailureLog{now: func() time.Time { return now }}
+	if !l.shouldLog("denied") {
+		t.Fatal("the first occurrence must be logged")
+	}
+	for range 100 {
+		if l.shouldLog("denied") {
+			t.Fatal("a repeat inside the interval was logged")
+		}
+	}
+	if !l.shouldLog("sealed") {
+		t.Fatal("a different error must be logged at once")
+	}
+	now = now.Add(certFailureLogInterval)
+	if !l.shouldLog("denied") {
+		t.Fatal("a persistent failure must be logged again after the interval")
+	}
+}
+
+func TestLogCertFailureNamesTheCause(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	saved := certFailures
+	certFailures = &certFailureLog{now: time.Now}
+	t.Cleanup(func() { certFailures = saved })
+
+	cause := errors.New("clientcert: sign via pki/sign/tools: Code: 403. permission denied")
+	err := fmt.Errorf("client certificate for %q: %w", ClientPEMFile, cause)
+	for range 50 {
+		logCertFailure("getattr", ClientPEMFile, err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "level=WARN"); n != 1 {
+		t.Fatalf("WARN lines = %d for 50 identical failures, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "pki/sign/tools") || !strings.Contains(out, "403") {
+		t.Fatalf("the log line does not name the role and Vault's answer:\n%s", out)
 	}
 }

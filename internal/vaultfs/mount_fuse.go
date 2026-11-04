@@ -960,11 +960,16 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 // waiting for a token, or pacing its next sign, is transient and says so with
 // EAGAIN; anything else is EIO. An interrupted call stays EINTR, since that
 // is the caller going away rather than the source failing. Logging goes
-// through logErrno, and no certificate error carries PEM.
+// through logCertFailure, which names the cause (logErrno's per-errno lines
+// would log a denial on every read and without the error), and no
+// certificate error carries PEM.
 func certErrno(op, path string, err error) syscall.Errno {
-	errno := logErrno(op, path, err)
-	if errno == syscall.EAGAIN || errno == syscall.EINTR {
-		return errno
+	logCertFailure(op, path, err)
+	switch {
+	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced):
+		return syscall.EAGAIN
+	case errors.Is(err, context.Canceled):
+		return syscall.EINTR
 	}
 	return syscall.EIO
 }

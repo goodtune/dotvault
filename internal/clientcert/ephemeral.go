@@ -78,7 +78,8 @@ type ephemeral struct {
 	mu       sync.Mutex
 	cur      *Pair
 	inflight *flight
-	warned   bool // a WARN has been logged for the current failure streak
+	warned   bool   // a WARN has been logged for the current failure streak
+	warnedAs string // the error text that WARN carried
 	user     usernameCache
 
 	// Sign pacing; see signBackoffBase.
@@ -273,7 +274,7 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 	switch {
 	case err == nil:
 		e.cur = pair
-		e.warned = false
+		e.warned, e.warnedAs = false, ""
 		e.resetBackoffLocked()
 	case !errors.Is(err, ErrNoToken):
 		// ErrNoToken here means the token vanished between Current's check
@@ -284,20 +285,42 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 		e.lastErr = err
 		e.failedToken = f.tokenHash
 	}
-	if err != nil && !errors.Is(err, ErrNoToken) && e.validLocked(e.now()) != nil && !e.warned {
-		e.warned = true
-		slog.Warn("client certificate refresh failed; serving the current certificate until it expires",
-			"source", SourceEphemeral,
-			"serial", e.cur.Serial,
-			"not_after", e.cur.NotAfter,
-			"common_name", e.cur.CommonName,
-			"mount", e.o.PKIMount,
-			"role", e.o.PKIRole,
-			"error", err)
+	if err != nil && !errors.Is(err, ErrNoToken) {
+		e.warnLocked(err)
 	}
 	e.inflight = nil
 	f.pair, f.err = pair, err
 	close(f.done)
+}
+
+// warnLocked logs a sign failure at WARN, naming the mount and role, on the
+// first failure of a streak and again only when the error changes. It logs
+// whether or not a cached pair is left to serve: a denial on the very first
+// sign is the case an operator most needs named, and every reader that
+// follows (each stat of a mounted client.pem, each handshake) would otherwise
+// see only an errno or an error it may not log.
+func (e *ephemeral) warnLocked(err error) {
+	msg := err.Error()
+	if e.warned && msg == e.warnedAs {
+		return
+	}
+	e.warned, e.warnedAs = true, msg
+	if p := e.validLocked(e.now()); p != nil {
+		slog.Warn("client certificate refresh failed; serving the current certificate until it expires",
+			"source", SourceEphemeral,
+			"serial", p.Serial,
+			"not_after", p.NotAfter,
+			"common_name", p.CommonName,
+			"mount", e.o.PKIMount,
+			"role", e.o.PKIRole,
+			"error", err)
+		return
+	}
+	slog.Warn("client certificate signing failed; no certificate to serve until it succeeds",
+		"source", SourceEphemeral,
+		"mount", e.o.PKIMount,
+		"role", e.o.PKIRole,
+		"error", err)
 }
 
 // sign generates a key, has Vault sign it, and assembles the Pair.

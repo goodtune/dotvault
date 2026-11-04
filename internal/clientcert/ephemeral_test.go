@@ -500,6 +500,48 @@ func TestEphemeralKeepsCachedPairOnSignFailure(t *testing.T) {
 	}
 }
 
+func TestEphemeralWarnsOnFirstFailureWithoutCachedPair(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	restore := captureLogs(&buf)
+	defer restore()
+
+	// A denial on the very first sign: nothing cached to serve.
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	out := buf.String()
+	if n := strings.Count(out, "level=WARN"); n != 1 {
+		t.Fatalf("WARN lines = %d, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "role="+defaultOptions(clock).PKIRole) || !strings.Contains(out, "403") {
+		t.Fatalf("WARN does not name the role and the cause:\n%s", out)
+	}
+
+	// The same denial again, after the backoff: no new WARN.
+	clock.Advance(signBackoffBase + time.Second)
+	_, _ = src.Current(ctx)
+	if f.signs.Load() != 2 {
+		t.Fatalf("signs = %d, want 2", f.signs.Load())
+	}
+	if n := strings.Count(buf.String(), "level=WARN"); n != 1 {
+		t.Fatalf("WARN lines = %d after a repeat, want 1:\n%s", n, buf.String())
+	}
+
+	// A different error is news.
+	f.setSignErr(errors.New("vault is sealed"))
+	clock.Advance(backoffFor(2) + time.Second)
+	_, _ = src.Current(ctx)
+	if n := strings.Count(buf.String(), "level=WARN"); n != 2 {
+		t.Fatalf("WARN lines = %d after a different error, want 2:\n%s", n, buf.String())
+	}
+}
+
 func TestEphemeralCommonNameFallsBackToMetaCommonName(t *testing.T) {
 	clock := newTestClock()
 	f := newFakeSigner(t, clock)

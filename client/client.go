@@ -46,8 +46,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
 	"github.com/goodtune/dotvault/internal/vault"
@@ -60,6 +62,15 @@ type Client struct {
 	cfg      Config
 	vc       *vault.Client
 	identity string // overrides the OS-user identity when non-empty (see WithIdentity)
+
+	// Client-certificate state (see clientcert.go). The source is built on
+	// first use; authMu serialises the cached-authentication step a
+	// certificate request may need, because AuthenticateCached is not safe for
+	// concurrent calls and concurrent TLS handshakes can ask at once.
+	certOnce sync.Once
+	certSrc  clientcert.Source
+	certErr  error
+	authMu   sync.Mutex
 }
 
 // Option configures a Client at construction time. Options are the

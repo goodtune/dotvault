@@ -78,7 +78,42 @@ Under `mtls+os` specifically, the **token file is not a candidate at all**: that
 
 The minted token is held **in memory only** and is never written to the token file. That file belongs to the daemon, and a library inside somebody else's process must not race it — the same ownership rule the peer-socket borrow follows.
 
-**`Login` refuses under certificate auth**, returning `ErrLoginRequired`. A fresh login under a cert method would, on a host with no usable credential, run the bootstrap: an OIDC browser flow or an LDAP terminal prompt, then mint a certificate and write it to this host. None of that belongs in a library call. Enrolment stays with the dotvault daemon or CLI, which own the host; the facade consumes what they provisioned. Concretely, the facade can **use** a certificate but can never mint, rotate, or bootstrap one — `VaultConfig.MTLS` carries only the cert mount, role, and storage directory, with no PKI mount/role, bootstrap method, or BYO paths.
+**`Login` refuses under certificate auth**, returning `ErrLoginRequired`. A fresh login under a cert method would, on a host with no usable credential, run the bootstrap: an OIDC browser flow or an LDAP terminal prompt, then mint a certificate and write it to this host. None of that belongs in a library call. Enrolment stays with the dotvault daemon or CLI, which own the host; the facade consumes what they provisioned. Concretely, the facade can **use** a certificate but can never mint, rotate, or bootstrap the one it logs in to Vault with — `VaultConfig.MTLS` carries only the cert mount, role, and storage directory, with no PKI mount/role, bootstrap method, or BYO paths.
+
+## Client certificates for other services
+
+`ClientCertificate` and `TLSConfig` hand you the mutual-TLS client certificate the operator's `client_cert` section describes, so a Go program can call a service that wants a client certificate without handling PKI itself. This is the Go equivalent of `curl --cert client.pem https://service.example.com/`, with the same certificate the daemon serves through the filesystem mount and Docker volumes.
+
+```go
+cfg, err := client.LoadConfig(client.DefaultConfigPath())
+if err != nil {
+    return err
+}
+cli, err := client.New(cfg)
+if err != nil {
+    return err
+}
+
+// Presented on every handshake; rotation needs no action from you.
+tlsCfg, err := cli.TLSConfig(nil) // or a *tls.Config of your own to extend
+if err != nil {
+    return err // errors.Is(err, client.ErrNotConfigured) when client_cert is off
+}
+httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+resp, err := httpClient.Get("https://service.example.com/")
+
+// Or take the certificate itself, for a tool that wants files or PEM bytes:
+cc, err := cli.ClientCertificate(ctx)
+// cc.CertPEM, cc.KeyPEM, cc.CombinedPEM, cc.NotAfter, cc.Certificate (tls.Certificate)
+```
+
+Where the certificate comes from depends on the operator's config. Under plain `mtls` it is the certificate this host already logs in to Vault with, read from disk; it needs no token and no PKI role. Under every other method it is a fresh key generated in memory and signed by Vault's PKI engine (`<pki_mount>/sign/<pki_role>`) with the Client's token, replaced when half its lifetime has passed, and never written to disk. `LoadConfig` resolves all of this; a hand-built `Config` sets `Config.ClientCert` itself (`Enabled`, `PKIRole`, and optionally `PKIMount`, `CommonName`, `TTL`, `KeyType`, `KeyBits`).
+
+Like `AuthenticateCached`, these calls **never prompt**. When signing needs a token and the Client holds none, `ClientCertificate` tries `AuthenticateCached` once and then signs; if that finds no token the error wraps `ErrLoginRequired`. A Vault 403 from the signing call wraps `ErrDenied` (typically a policy missing `pki/sign/<role>`), and a transport failure or 5xx wraps `ErrUnreachable`. A signing attempt made too soon after the previous one returns an uncategorised error (it wraps none of this package's sentinels); it is transient and a later call succeeds.
+
+`TLSConfig` clones the `*tls.Config` you pass (nil is allowed) and sets `GetClientCertificate`. crypto/tls offers that callback no context, so the lookup runs under a bounded 30 second one, and **a handshake can block while a certificate is being signed**. That happens at most once per certificate lifetime; concurrent handshakes share one signing and later ones are answered from memory. A failure in the callback fails the handshake with the same error `ClientCertificate` would return.
+
+`CertPEM`, `KeyPEM` and `CombinedPEM` carry a private key. Do not log them or put them in error messages; nothing in this package does.
 
 ## Peer actions: Browse, Notify, and Clipboard
 
@@ -113,6 +148,7 @@ Sentinels are `errors.Is`-able and map to a small, stable set of outcomes:
 | `ErrUnreachable` | DNS/connection/TLS/timeout/5xx | `unreachable` |
 | `ErrAuthFailed` | interactive login ran but didn't yield a token | `denied` (your choice) |
 | `ErrPeerUnavailable` | `Browse`/`Notify`/`Clipboard`: no socket, peer down, or action failed | `peer_unavailable` |
+| `ErrNotConfigured` | `ClientCertificate`/`TLSConfig`: `client_cert` disabled, or no PKI role and no usable held certificate | `not_configured` |
 | `(value, false, nil)` from a read | secret/field absent | `missing_field` |
 
 `ErrAuthFailed` is a distinct sentinel from `ErrDenied` so you *can* tell "wrong/declined credentials" from "token lacks the policy". Folding both into a `denied` metric label is reasonable but is your decision, not the library's.

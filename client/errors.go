@@ -83,6 +83,15 @@ var (
 	// invalid, which surfaces as a plain (uncategorised) error carrying the
 	// peer's message.
 	ErrPeerUnavailable = errors.New("dotvault: peer action unavailable")
+
+	// ErrNotConfigured indicates ClientCertificate or TLSConfig was asked for a
+	// client certificate this Config cannot produce: the client_cert section is
+	// disabled, or it is enabled but there is neither a PKI role to sign with
+	// nor a usable held certificate to serve. It is a configuration state, not
+	// a transient failure: retrying will not change it. Where there is an
+	// underlying cause (no certificate enrolled on this host, say) it is
+	// wrapped too, so errors.Is finds it.
+	ErrNotConfigured = errors.New("dotvault: client certificate not configured")
 )
 
 // classify maps a raw Vault API error onto one of the sentinel categories.

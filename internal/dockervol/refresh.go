@@ -183,16 +183,23 @@ const (
 	certJitterDivisor = 20
 	// certWindowDivisor additionally bounds the jitter to 1/10 of the
 	// window between RefreshAt and NotAfter. For a short-lived certificate
-	// RefreshAt is the half-life, so the two bounds agree; for a held one
-	// RefreshAt is NotAfter minus reissue_before, a window that can be a
-	// small fraction of a long lifetime, and 5% of a year would land the
-	// re-render weeks after the daemon rotated and revoked the copy the
-	// volume holds — or past NotAfter outright.
+	// RefreshAt is the half-life, so the two bounds agree; the second one
+	// only guards a source whose RefreshAt sits late in the lifetime.
 	certWindowDivisor = 10
 )
 
 // certJitterBound is the most nextCertRefresh may add past RefreshAt.
+//
+// A held pair gets none. Jitter exists to spread re-signs, and nothing is
+// signed for a held certificate: the daemon rotates it (and, with
+// revoke_superseded, revokes the copy this volume holds) within about an
+// hour of RefreshAt, so any delay past RefreshAt is only time spent serving
+// a certificate that is about to stop working. The overdue backoff then
+// re-checks at most every volume ttl until the rotation lands.
 func certJitterBound(pair *clientcert.Pair) time.Duration {
+	if pair.Source == clientcert.SourceHeld {
+		return 0
+	}
 	lifetime := pair.NotAfter.Sub(pair.NotBefore)
 	window := pair.NotAfter.Sub(pair.RefreshAt)
 	if lifetime <= 0 || window <= 0 {
@@ -212,9 +219,10 @@ type certSchedule struct {
 // refresh that produced pair and err, and whether it is armed at all. It is
 // never armed for a volume that does not carry the certificate.
 //
-//   - Success: the pair's RefreshAt, plus jitter of at most 5% of the
-//     issued lifetime and at most a tenth of the RefreshAt-to-NotAfter
-//     window (see certWindowDivisor), and never less than certTimerMin.
+//   - Success: the pair's RefreshAt, plus — for a short-lived pair only —
+//     jitter of at most 5% of the issued lifetime and at most a tenth of
+//     the RefreshAt-to-NotAfter window (see certJitterBound), and never
+//     less than certTimerMin. A held pair fires at RefreshAt exactly.
 //   - Success with a pair already past its RefreshAt: the source has
 //     nothing newer to give yet — a held certificate the daemon has not
 //     rotated, or an ephemeral one whose re-sign is paced and which is

@@ -1224,9 +1224,10 @@ func TestNextCertRefresh(t *testing.T) {
 	}
 
 	// A held-shaped pair: a 30-day certificate the daemon re-issues 7 days
-	// before expiry. 5% of the lifetime is 36h, by which time the daemon has
-	// rotated and (revoke_superseded) revoked the volume's copy; the jitter
-	// is bounded by a tenth of the 7-day window instead.
+	// before expiry. The daemon rotates (and, with revoke_superseded,
+	// revokes the volume's copy) within about an hour of RefreshAt, and
+	// nothing is signed for a held pair, so jitter would only delay picking
+	// the rotation up: the timer fires at RefreshAt exactly.
 	heldPair := func(lifetime time.Duration) *clientcert.Pair {
 		nb := now.Add(-24 * time.Hour)
 		na := nb.Add(lifetime)
@@ -1236,9 +1237,8 @@ func TestNextCertRefresh(t *testing.T) {
 		hp := heldPair(lifetime)
 		var hs certSchedule
 		got, _ := d.nextCertRefresh(with, hp, nil, &hs)
-		want := hp.RefreshAt.Sub(now) + 7*24*time.Hour/10
-		if got != want {
-			t.Errorf("held %v: delay = %v, want RefreshAt + %v (= %v)", lifetime, got, 7*24*time.Hour/10, want)
+		if want := hp.RefreshAt.Sub(now); got != want {
+			t.Errorf("held %v: delay = %v, want RefreshAt with no jitter (= %v)", lifetime, got, want)
 		}
 		if !now.Add(got).Before(hp.NotAfter) {
 			t.Errorf("held %v: timer fires at or past NotAfter", lifetime)

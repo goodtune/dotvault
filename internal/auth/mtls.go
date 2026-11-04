@@ -761,7 +761,7 @@ func (m *Manager) runBootstrap(ctx context.Context) (*vault.Client, error) {
 // hardware key, so it is only attempted when no PKI role offers sign — left as
 // the sign path for v1.
 func (m *Manager) signOrIssue(ctx context.Context, vc *vault.Client, signer crypto.Signer, commonName string) (*vault.IssuedCert, error) {
-	csrPEM, err := buildCSR(signer, commonName)
+	csrPEM, err := BuildCSR(signer, commonName)
 	if err != nil {
 		return nil, err
 	}
@@ -887,8 +887,9 @@ func (m *Manager) renderCommonName() (string, error) {
 	return rendered, nil
 }
 
-// buildCSR creates a PEM-encoded CSR over the given signer.
-func buildCSR(signer crypto.Signer, commonName string) (string, error) {
+// BuildCSR creates a PEM-encoded CSR over the given signer. It is exported so
+// the short-lived client-certificate source builds its requests the same way.
+func BuildCSR(signer crypto.Signer, commonName string) (string, error) {
 	tmplCSR := &x509.CertificateRequest{Subject: pkix.Name{CommonName: commonName}}
 	der, err := x509.CreateCertificateRequest(rand.Reader, tmplCSR, signer)
 	if err != nil {

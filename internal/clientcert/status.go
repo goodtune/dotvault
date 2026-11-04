@@ -13,6 +13,10 @@ const (
 	// StateError means the most recent attempt failed. A previously served
 	// certificate may still be reported alongside it.
 	StateError = "error"
+	// StateExpired means the last certificate served has passed its NotAfter
+	// and nothing has failed since: nobody has asked for a replacement, so
+	// none was made. The next read replaces it.
+	StateExpired = "expired"
 )
 
 // Status is the public face of a Source for /api/v1/status. It is served
@@ -33,6 +37,10 @@ type Status struct {
 // safe to call from a status handler at any rate. A nil Source, or one that
 // does not report, yields the zero Status.
 func StatusOf(s Source) Status {
+	return statusAt(s, time.Now())
+}
+
+func statusAt(s Source, now time.Time) Status {
 	r, ok := s.(lastReporter)
 	if !ok {
 		return Status{}
@@ -45,6 +53,11 @@ func StatusOf(s Source) Status {
 		st.CommonName = p.CommonName
 		st.Serial = p.Serial
 		st.NotAfter = p.NotAfter
+		if !now.Before(p.NotAfter) {
+			// Reporting "serving" beside a past not_after would claim a
+			// certificate is being presented that no service would accept.
+			st.State = StateExpired
+		}
 	}
 	if err != nil {
 		st.State = StateError

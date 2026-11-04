@@ -53,3 +53,16 @@ func TestStatusOfError(t *testing.T) {
 		t.Errorf("StatusOf = %+v", got)
 	}
 }
+
+func TestStatusOfExpiredWhenNothingReplacedIt(t *testing.T) {
+	na := time.Now().Add(-time.Minute)
+	got := StatusOf(&reporterSource{pair: &Pair{Serial: "aa", NotAfter: na, Source: SourceEphemeral}})
+	if got.State != StateExpired || !got.NotAfter.Equal(na) || got.LastError != "" {
+		t.Errorf("StatusOf = %+v, want expired with the old not_after and no error", got)
+	}
+	// An error still wins: it is the more useful thing to report.
+	got = StatusOf(&reporterSource{pair: &Pair{NotAfter: na}, err: errors.New("denied")})
+	if got.State != StateError {
+		t.Errorf("StatusOf with an error = %+v, want error", got)
+	}
+}

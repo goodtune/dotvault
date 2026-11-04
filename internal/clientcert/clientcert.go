@@ -133,3 +133,25 @@ var ErrSignInProgress = errors.New("clientcert: still waiting on a certificate s
 // finish within the wait. It is transient (the FUSE mount answers EAGAIN) and
 // is not a Vault verdict: nothing was sent to Vault.
 var ErrReauthInProgress = errors.New("clientcert: the Vault token is being replaced; retry shortly")
+
+// Transient reports whether err, from Source.Current, is one that clears on
+// its own, so a consumer should retry shortly rather than treat it as a
+// failed sign: no token yet (ErrNoToken), the next sign paced (ErrSignPaced),
+// the token being replaced (ErrReauthInProgress), or the caller's own
+// deadline running out while a sign was still in flight (ErrSignInProgress
+// wrapping context.DeadlineExceeded). An explicit cancel is the caller going
+// away rather than the source failing, so ErrSignInProgress wrapping
+// context.Canceled is not transient. It is the one definition the FUSE mount
+// (EAGAIN versus EIO/EINTR) and the Docker volume plugin (the short
+// certificate retry versus the ordinary ticker) both apply.
+func Transient(err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, ErrNoToken), errors.Is(err, ErrSignPaced), errors.Is(err, ErrReauthInProgress):
+		return true
+	case errors.Is(err, ErrSignInProgress):
+		return !errors.Is(err, context.Canceled)
+	}
+	return false
+}

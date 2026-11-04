@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -967,7 +968,7 @@ func logErrno(op, path string, err error) syscall.Errno {
 		return syscall.EINVAL
 	case errors.Is(err, ErrInvalidName):
 		return syscall.EINVAL
-	case certTransient(err):
+	case clientcert.Transient(err):
 		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
 		return syscall.EAGAIN
 	case errors.Is(err, context.Canceled):

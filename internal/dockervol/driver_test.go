@@ -1215,6 +1215,9 @@ func TestNextCertRefresh(t *testing.T) {
 		{"daemon has no token", with, nil, ErrNoToken, certRetry, true},
 		{"token being replaced", with, nil, fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, context.DeadlineExceeded), certRetry, true},
 		{"mount timed out waiting on a sign", with, nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.DeadlineExceeded), certRetry, true},
+		// Cancelled is shutdown, not something the short retry fixes: the
+		// same rule the FUSE mount applies when it answers EINTR.
+		{"render cancelled while a sign was in flight", with, nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.Canceled), with.TTL, true},
 		{"other failure", with, nil, errors.New("pki: permission denied"), with.TTL, true},
 		{"no pair reported", with, nil, nil, with.TTL, true},
 	} {

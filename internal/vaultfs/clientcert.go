@@ -132,10 +132,10 @@ func (l *certFailureLog) shouldLog(msg string) bool {
 // logCertFailure logs a client certificate failure that is about to become an
 // errno, with the error (which names the PKI role and Vault's answer, and by
 // the source's contract never carries key or certificate material). A
-// transient answer (certTransient) is logged at DEBUG on every call, since it
-// clears on its own and is reported as EAGAIN.
+// transient answer (clientcert.Transient) is logged at DEBUG on every call,
+// since it clears on its own and is reported as EAGAIN.
 func logCertFailure(op, path string, err error) {
-	if certTransient(err) {
+	if clientcert.Transient(err) {
 		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
 		return
 	}
@@ -145,42 +145,23 @@ func logCertFailure(op, path string, err error) {
 	slog.Warn("vaultfs: client certificate unavailable", "op", op, "path", displayPath(path), "error", err)
 }
 
-// certErrno maps a client certificate failure onto an errno. A source that is
-// waiting for a token, pacing its next sign or waiting out a token
-// replacement is transient and says so with EAGAIN, and so is an operation
-// whose own deadline (opTimeout) ran out while a sign was still in flight: the
-// sign continues detached, so a retry gets its result (see certTransient). Anything else is EIO, including a sign that itself timed out against
-// Vault. An interrupted call stays EINTR, since that is the caller going away
-// rather than the source failing. Logging goes
-// through logCertFailure, which names the cause (logErrno's per-errno lines
-// would log a denial on every read and without the error), and no
-// certificate error carries PEM.
+// certErrno maps a client certificate failure onto an errno. A transient
+// answer (clientcert.Transient: no token yet, a paced sign, a token
+// replacement still in progress, or this operation's own opTimeout running
+// out while a sign was in flight, which continues detached so a retry gets its
+// result) is EAGAIN. An interrupted call is EINTR, since that is the caller
+// going away rather than the source failing. Anything else is EIO, including a
+// sign that itself timed out against Vault. Logging goes through
+// logCertFailure, which names the cause (logErrno's per-errno lines would log
+// a denial on every read and without the error), and no certificate error
+// carries PEM.
 func certErrno(op, path string, err error) syscall.Errno {
 	logCertFailure(op, path, err)
 	switch {
-	case certTransient(err):
+	case clientcert.Transient(err):
 		return syscall.EAGAIN
 	case errors.Is(err, context.Canceled):
 		return syscall.EINTR
 	}
 	return syscall.EIO
-}
-
-// certTransient reports whether a client certificate error clears on its own,
-// so a reader should be told EAGAIN: no token yet (ErrNoToken), the next sign
-// paced (ErrSignPaced), the token being replaced (ErrReauthInProgress), or the
-// operation's own deadline running out while a sign was still in flight
-// (ErrSignInProgress wrapping DeadlineExceeded). An explicit cancel is the
-// caller going away and is not transient, so ErrSignInProgress wrapping
-// Canceled stays EINTR. The one definition certErrno, logCertFailure and
-// logErrno share.
-func certTransient(err error) bool {
-	switch {
-	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced),
-		errors.Is(err, clientcert.ErrReauthInProgress):
-		return true
-	case errors.Is(err, clientcert.ErrSignInProgress):
-		return !errors.Is(err, context.Canceled)
-	}
-	return false
 }

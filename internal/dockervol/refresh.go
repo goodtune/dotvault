@@ -231,18 +231,17 @@ type certSchedule struct {
 //     d.certRetry, doubling to the ticker's cadence, but never past
 //     NotAfter (plus certTimerMin), so an expired pair is always replaced
 //     as soon as the source can sign again.
-//   - Failure the source expects to clear shortly (ErrSignPaced, no token
-//     whether the source or the driver noticed, a token replacement still
-//     in progress, or this render's deadline running out while a sign was
-//     in flight): d.certRetry.
+//   - Failure that clears shortly (clientcert.Transient — the definition
+//     the FUSE mount shares — or the driver's own ErrNoToken): d.certRetry.
+//     A render cancelled mid-sign is shutdown, not transient, and takes the
+//     ticker like any other failure.
 //   - Any other failure, or no pair reported: the ordinary ticker cadence.
 func (d *Driver) nextCertRefresh(spec Spec, pair *clientcert.Pair, err error, s *certSchedule) (time.Duration, bool) {
 	if spec.ClientCert == ClientCertOff {
 		return 0, false
 	}
 	switch {
-	case err != nil && (errors.Is(err, clientcert.ErrSignPaced) || errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, ErrNoToken) ||
-		errors.Is(err, clientcert.ErrReauthInProgress) || errors.Is(err, clientcert.ErrSignInProgress)):
+	case clientcert.Transient(err) || errors.Is(err, ErrNoToken):
 		return d.certRetry, true
 	case err != nil, pair == nil:
 		return spec.TTL, true

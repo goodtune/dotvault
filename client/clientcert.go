@@ -76,8 +76,9 @@ type ClientCertificate struct {
 // no PKI role and no usable held certificate), ErrLoginRequired, ErrDenied (a
 // 401/403 from Vault, typically a policy without pki/sign), ErrUnreachable
 // (transport failure or a 5xx). A signing attempt made too soon after the last
-// one fails with an error that wraps neither; it is transient and a later call
-// succeeds.
+// one, with no failure on record, wraps ErrSignPaced; it is transient and a
+// later call succeeds. While a failed signing is backing off, the call returns
+// that signing's error again rather than ErrSignPaced.
 func (c *Client) ClientCertificate(ctx context.Context) (*ClientCertificate, error) {
 	src, err := c.clientCertSource()
 	if err != nil {

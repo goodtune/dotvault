@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	vaultapi "github.com/hashicorp/vault/api"
+
+	"github.com/goodtune/dotvault/internal/clientcert"
 )
 
 // Sentinel errors expose a small, stable set of failure categories so callers
@@ -92,6 +94,19 @@ var (
 	// underlying cause (no certificate enrolled on this host, say) it is
 	// wrapped too, so errors.Is finds it.
 	ErrNotConfigured = errors.New("dotvault: client certificate not configured")
+
+	// ErrSignPaced indicates ClientCertificate (or a TLSConfig handshake)
+	// found no valid certificate cached and the next signing attempt is not
+	// due yet: signs are at least ten seconds apart, so a call arriving
+	// sooner — after a new token was adopted, say — is answered without
+	// contacting Vault. It is transient: a later call succeeds or reports
+	// what signing actually returned. It is deliberately not one of the
+	// categories above, since it says nothing about Vault. During a failure
+	// backoff the error of the last failed signing is returned instead (a
+	// denial keeps reading as ErrDenied), so this is only seen when no
+	// failure is on record. It is the same value the daemon's sources use,
+	// so errors.Is matches whichever is compared.
+	ErrSignPaced = clientcert.ErrSignPaced
 )
 
 // classify maps a raw Vault API error onto one of the sentinel categories.

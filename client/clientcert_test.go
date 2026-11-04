@@ -594,7 +594,7 @@ func TestMapClientCertErr(t *testing.T) {
 	ctx := context.Background()
 	paced := fmt.Errorf("outer: %w", clientcert.ErrSignPaced)
 	got := mapClientCertErr(ctx, paced)
-	if !errors.Is(got, clientcert.ErrSignPaced) {
+	if !errors.Is(got, clientcert.ErrSignPaced) || !errors.Is(got, ErrSignPaced) {
 		t.Errorf("ErrSignPaced lost: %v", got)
 	}
 	for _, c := range []error{ErrDenied, ErrUnreachable, ErrLoginRequired, ErrNotConfigured} {

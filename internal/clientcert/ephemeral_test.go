@@ -79,6 +79,8 @@ type fakeSigner struct {
 	// onLookup, when set, runs inside LookupSelfWithToken: a test uses it
 	// to swap the client's token while a sign is under way.
 	onLookup func()
+	// gate, when set, holds every SignCSRWithToken until it is closed.
+	gate chan struct{}
 }
 
 func newFakeSigner(t *testing.T, clock *testClock) *fakeSigner {
@@ -155,12 +157,19 @@ func (f *fakeSigner) SignCSRWithToken(ctx context.Context, token, mount, role, c
 	f.signs.Add(1)
 	f.mu.Lock()
 	f.signTokens = append(f.signTokens, token)
-	delay, signErr, maxTTL := f.delay, f.signErr, f.maxTTL
+	delay, signErr, maxTTL, gate := f.delay, f.signErr, f.maxTTL, f.gate
 	f.lastTTL, f.lastCN = ttl, commonName
 	f.serialNo++
 	serial := f.serialNo
 	f.mu.Unlock()
 
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
@@ -365,13 +374,26 @@ func TestEphemeralRotatesOnIssuedLifetime(t *testing.T) {
 func TestEphemeralSingleFlight(t *testing.T) {
 	clock := newTestClock()
 	f := newFakeSigner(t, clock)
-	f.delay = 50 * time.Millisecond
+	release := make(chan struct{})
+	f.gate = release
 	src := newSource(t, f, defaultOptions(clock))
 
+	// Hold the sign until every caller is waiting on a flight, so they all
+	// arrived while it was in progress. Without that a late caller could be
+	// answered from the cache the first sign filled, and the count of one
+	// sign would prove nothing about sharing.
+	const callers = 20
+	var waiting atomic.Int32
+	src.(*ephemeral).testHookWait = func() {
+		if waiting.Add(1) == callers {
+			close(release)
+		}
+	}
+
 	var wg sync.WaitGroup
-	pairs := make([]*Pair, 20)
-	errs := make([]error, 20)
-	for i := range 20 {
+	pairs := make([]*Pair, callers)
+	errs := make([]error, callers)
+	for i := range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -379,7 +401,10 @@ func TestEphemeralSingleFlight(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	for i := range 20 {
+	if got := waiting.Load(); got != callers {
+		t.Fatalf("callers that waited on a flight = %d, want %d", got, callers)
+	}
+	for i := range callers {
 		if errs[i] != nil {
 			t.Fatalf("caller %d: %v", i, errs[i])
 		}
@@ -804,6 +829,29 @@ func TestEphemeralBacksOffAfterFailure(t *testing.T) {
 	e.mu.Unlock()
 	if failures != 0 {
 		t.Fatalf("failures after success = %d, want 0", failures)
+	}
+
+	// Prove it: the next failure (once the new pair is due for refresh)
+	// waits only the base window, not the 80s a fourth failure in the old
+	// streak would have earned.
+	signsBefore := f.signs.Load()
+	clock.Advance(3 * time.Minute) // past the 5m pair's RefreshAt
+	f.setSignErr(forbidden())
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("a failed refresh should still serve the valid pair: %v", err)
+	}
+	if got := f.signs.Load(); got != signsBefore+1 {
+		t.Fatalf("signs = %d, want %d (the refresh was attempted)", got, signsBefore+1)
+	}
+	clock.Advance(signBackoffBase - time.Second)
+	_, _ = src.Current(ctx)
+	if got := f.signs.Load(); got != signsBefore+1 {
+		t.Fatalf("signed inside the base window: signs = %d", got)
+	}
+	clock.Advance(time.Second)
+	_, _ = src.Current(ctx)
+	if got := f.signs.Load(); got != signsBefore+2 {
+		t.Fatalf("signs = %d, want %d: after a success the window is the base again", got, signsBefore+2)
 	}
 }
 

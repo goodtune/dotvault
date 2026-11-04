@@ -96,6 +96,10 @@ type ephemeral struct {
 	retryAt     time.Time         // no sign before this while failures > 0
 	lastErr     error             // error of the most recent failed sign
 	failedToken [sha256.Size]byte // SHA-256 of the token the last failure used
+
+	// testHookWait, when set, runs each time a caller is about to wait on a
+	// flight. Tests only; set before any concurrent use.
+	testHookWait func()
 }
 
 // flight is one in-progress sign shared by every caller that arrives while it
@@ -209,6 +213,9 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 	}
 	e.mu.Unlock()
 
+	if e.testHookWait != nil {
+		e.testHookWait()
+	}
 	select {
 	case <-f.done:
 	case <-ctx.Done():

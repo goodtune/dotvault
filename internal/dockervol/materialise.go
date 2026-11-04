@@ -124,7 +124,7 @@ func (r *rendered) addClientCert(cert *clientcert.Pair) {
 		vaultfs.ClientPEMFile:  cert.Combined(),
 	} {
 		if r.dirs[name] {
-			warnCollision(name)
+			warnCertCollision(name)
 			r.dropDir(name)
 		}
 		r.files[name] = fileEntry{data: data, modTime: cert.NotBefore}
@@ -157,6 +157,17 @@ func warnCollision(p string) {
 	}
 	slog.Warn("dockervol: a directory and a file claim the same name; the file is not written",
 		"path", displayPath(p))
+}
+
+// warnCertCollision is warnCollision for the certificate case, where the
+// outcome is the other way round: the certificate file is written and the
+// KV folder of the same name, with everything beneath it, is not.
+func warnCertCollision(name string) {
+	if _, seen := collisionWarned.LoadOrStore("client_cert:"+name, struct{}{}); seen {
+		return
+	}
+	slog.Warn("dockervol: a KV folder has the name of a client certificate file; the certificate is written and the folder's secrets are not",
+		"path", displayPath(name))
 }
 
 // emitPath reads one secret and adds its rendering to r. A secret that does

@@ -1,8 +1,10 @@
 package dockervol
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -462,6 +464,24 @@ func TestMaterialiseClientCertWinsCollision(t *testing.T) {
 	}
 	if _, ok := got["gh.json"]; !ok {
 		t.Errorf("an unrelated secret went missing: %v", got)
+	}
+}
+
+func TestMaterialiseClientCertCollisionWarningSaysWhatWasDropped(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	collisionWarned.Delete("client_cert:" + vaultfs.ClientKeyFile)
+
+	r := &rendered{files: map[string]fileEntry{}, dirs: map[string]bool{vaultfs.ClientKeyFile: true}}
+	r.addClientCert(testPair())
+	out := buf.String()
+	if !strings.Contains(out, "the certificate is written") || strings.Contains(out, "the file is not written") {
+		t.Fatalf("the warning misstates which side lost:\n%s", out)
+	}
+	if !strings.Contains(out, vaultfs.ClientKeyFile) {
+		t.Fatalf("the warning does not name the path:\n%s", out)
 	}
 }
 

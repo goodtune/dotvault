@@ -483,8 +483,10 @@ func TestEphemeralKeepsCachedPairOnSignFailure(t *testing.T) {
 		t.Fatalf("err = %v, want the sign error", err)
 	}
 
-	// Recovery ends the streak: the next failure warns again.
+	// Recovery ends the streak: the next failure warns again. Three
+	// failures so far put the next attempt 40s out.
 	f.setSignErr(nil)
+	clock.Advance(backoffFor(3))
 	if _, err := src.Current(ctx); err != nil {
 		t.Fatalf("recovery: %v", err)
 	}
@@ -682,4 +684,164 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+func forbidden() error {
+	return &vaultapi.ResponseError{StatusCode: 403, Errors: []string{"permission denied"}}
+}
+
+func TestEphemeralBacksOffAfterFailure(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	for i := range 50 {
+		_, err := src.Current(ctx)
+		var re *vaultapi.ResponseError
+		if !errors.As(err, &re) || re.StatusCode != 403 {
+			t.Fatalf("call %d: err = %v, want the 403", i, err)
+		}
+		clock.Advance(100 * time.Millisecond) // 50 calls span 5s
+	}
+	if got := f.signs.Load(); got != 1 {
+		t.Fatalf("signs within the first window = %d, want 1", got)
+	}
+
+	clock.Advance(5*time.Second + time.Millisecond) // past the 10s window
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs after the window = %d, want 2", got)
+	}
+
+	// The second failure doubles the window to 20s.
+	clock.Advance(19 * time.Second)
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signed inside the doubled window: signs = %d", got)
+	}
+	clock.Advance(2 * time.Second)
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	if got := f.signs.Load(); got != 3 {
+		t.Fatalf("signs after the doubled window = %d, want 3", got)
+	}
+
+	// Success resets the backoff: the next failure waits only the base window.
+	f.setSignErr(nil)
+	clock.Advance(backoffFor(3))
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("recovery: %v", err)
+	}
+	e := src.(*ephemeral)
+	e.mu.Lock()
+	failures := e.failures
+	e.mu.Unlock()
+	if failures != 0 {
+		t.Fatalf("failures after success = %d, want 0", failures)
+	}
+}
+
+func TestEphemeralBackoffNoTokenTakesPrecedence(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+	if _, err := src.Current(ctx); err == nil {
+		t.Fatal("expected the 403")
+	}
+	f.setToken("")
+	if _, err := src.Current(ctx); !errors.Is(err, ErrNoToken) {
+		t.Fatalf("err = %v, want ErrNoToken during backoff without a token", err)
+	}
+}
+
+func TestEphemeralBackoffResetsOnNewToken(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	// Two failures: the window is now 20s from the second.
+	_, _ = src.Current(ctx)
+	clock.Advance(signBackoffBase)
+	_, _ = src.Current(ctx)
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs = %d, want 2", got)
+	}
+
+	clock.Advance(11 * time.Second) // inside the 20s window, past minSignInterval
+	_, _ = src.Current(ctx)
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("same token signed inside the window: signs = %d", got)
+	}
+
+	f.setToken("s.fresh-token")
+	f.setSignErr(nil)
+	p, err := src.Current(ctx)
+	if err != nil {
+		t.Fatalf("new token: %v", err)
+	}
+	if p == nil || f.signs.Load() != 3 {
+		t.Fatalf("signs = %d, want 3: a new token clears the backoff", f.signs.Load())
+	}
+}
+
+func TestEphemeralMinIntervalWhenRoleCapsBelowHalfLife(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.maxTTL = 4 * time.Second
+	src := newSource(t, f, defaultOptions(clock))
+	ctx := context.Background()
+
+	first, err := src.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < 100; i++ { // 99 calls across 9.9s
+		clock.Advance(100 * time.Millisecond)
+		p, err := src.Current(ctx)
+		now := clock.Now()
+		switch {
+		case now.Before(first.NotAfter):
+			if err != nil || p != first {
+				t.Fatalf("at +%v: want the cached pair, err = %v", now.Sub(first.NotBefore), err)
+			}
+		default:
+			if !errors.Is(err, errSignThrottled) {
+				t.Fatalf("at +%v: err = %v, want errSignThrottled", now.Sub(first.NotBefore), err)
+			}
+		}
+	}
+	if got := f.signs.Load(); got != 1 {
+		t.Fatalf("signs within minSignInterval = %d, want 1", got)
+	}
+
+	clock.Advance(100 * time.Millisecond) // +10s
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("after minSignInterval: %v", err)
+	}
+	if got := f.signs.Load(); got != 2 {
+		t.Fatalf("signs after minSignInterval = %d, want 2", got)
+	}
+}
+
+func TestBackoffFor(t *testing.T) {
+	want := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second, 160 * time.Second, 5 * time.Minute, 5 * time.Minute}
+	for i, w := range want {
+		if got := backoffFor(i + 1); got != w {
+			t.Errorf("backoffFor(%d) = %v, want %v", i+1, got, w)
+		}
+	}
+	if got := backoffFor(1000); got != signBackoffMax {
+		t.Errorf("backoffFor(1000) = %v, want cap", got)
+	}
 }

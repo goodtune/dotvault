@@ -27,6 +27,40 @@ import (
 // against a hung Vault.
 const signTimeout = 30 * time.Second
 
+// Sign pacing. Without it, Current's "past RefreshAt, so sign" rule turns
+// every read into a Vault call whenever signing cannot succeed: a FUSE
+// `ls -l` stats every file, and a tool polling client.pem reads it in a loop,
+// so a persistent pki/sign denial would become one denied request per read,
+// multiplied across a fleet. That is the storm the denied-token suppression
+// (auth.TokenDenylist) exists to stop on the lookup-self side, and it must
+// not be rebuilt here.
+//
+//   - signBackoffBase / signBackoffMax: after a failed sign, no new sign is
+//     attempted until the window has passed. It starts at signBackoffBase,
+//     doubles per consecutive failure and stops at signBackoffMax. A success
+//     resets it, and so does a token with a different value from the one
+//     that failed, since the failure may have been that token's fault.
+//     During the window Current answers from memory: the cached pair while
+//     it is still valid, otherwise the last sign error.
+//   - minSignInterval: the floor between sign attempts of any outcome. It
+//     covers the case where signing succeeds but the PKI role's max_ttl caps
+//     the lifetime so short that RefreshAt is already past (or nearly) when
+//     the certificate arrives; without a floor that role would be re-signed
+//     on every call.
+//
+// They are constants; tests move time with EphemeralOptions.Now.
+const (
+	signBackoffBase = 10 * time.Second
+	signBackoffMax  = 5 * time.Minute
+	minSignInterval = 10 * time.Second
+)
+
+// errSignThrottled is returned when the cached certificate has expired and
+// minSignInterval has not yet passed since the last (successful) sign, which
+// happens only when the PKI role issues certificates shorter-lived than the
+// interval.
+var errSignThrottled = errors.New("clientcert: the last certificate expired before the next sign is allowed; the PKI role's max_ttl is shorter than the minimum sign interval")
+
 // EphemeralOptions configures NewEphemeral. The caller resolves defaults and
 // inheritance (config.ClientCertPKIMount and friends); this package only
 // checks that what arrives is usable.
@@ -52,14 +86,22 @@ type ephemeral struct {
 	inflight *flight
 	warned   bool // a WARN has been logged for the current failure streak
 	user     usernameCache
+
+	// Sign pacing; see signBackoffBase.
+	lastAttempt time.Time         // start of the most recent sign attempt
+	failures    int               // consecutive failed signs
+	retryAt     time.Time         // no sign before this while failures > 0
+	lastErr     error             // error of the most recent failed sign
+	failedToken [sha256.Size]byte // SHA-256 of the token the last failure used
 }
 
 // flight is one in-progress sign shared by every caller that arrives while it
 // runs. pair and err are written before done is closed.
 type flight struct {
-	done chan struct{}
-	pair *Pair
-	err  error
+	tokenHash [sha256.Size]byte
+	done      chan struct{}
+	pair      *Pair
+	err       error
 }
 
 // usernameCache remembers token_username for one token, keyed on the SHA-256
@@ -115,7 +157,9 @@ func NewEphemeral(s Signer, o EphemeralOptions) (Source, error) {
 // Current returns the cached certificate while it is inside the first half of
 // its issued lifetime, and otherwise signs a new one. Concurrent callers share
 // a single sign. When signing is impossible (no token) or fails, a cached
-// certificate that has not reached NotAfter is still served.
+// certificate that has not reached NotAfter is still served. Signs are paced
+// (see signBackoffBase): inside a backoff window or minSignInterval, Current
+// answers from memory without contacting Vault.
 func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 	e.mu.Lock()
 	now := e.now()
@@ -126,7 +170,8 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 	}
 	f := e.inflight
 	if f == nil {
-		if e.s.Token() == "" {
+		token := e.s.Token()
+		if token == "" {
 			// Not a sign failure, so no WARN: the daemon is between tokens
 			// and the caller's error says so.
 			p := e.validLocked(now)
@@ -136,7 +181,23 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 			}
 			return nil, ErrNoToken
 		}
-		f = &flight{done: make(chan struct{})}
+		h := sha256.Sum256([]byte(token))
+		if e.failures > 0 && h != e.failedToken {
+			e.resetBackoffLocked()
+		}
+		if earliest := e.nextSignLocked(); now.Before(earliest) {
+			p, err := e.validLocked(now), e.lastErr
+			e.mu.Unlock()
+			if p != nil {
+				return p, nil
+			}
+			if err == nil {
+				err = errSignThrottled
+			}
+			return nil, err
+		}
+		e.lastAttempt = now
+		f = &flight{tokenHash: h, done: make(chan struct{})}
 		e.inflight = f
 		go e.run(ctx, f)
 	}
@@ -167,6 +228,36 @@ func (e *ephemeral) validLocked(now time.Time) *Pair {
 	return nil
 }
 
+// nextSignLocked is the earliest time a new sign may start: minSignInterval
+// after the last attempt, or the end of the failure backoff if later.
+func (e *ephemeral) nextSignLocked() time.Time {
+	var earliest time.Time
+	if !e.lastAttempt.IsZero() {
+		earliest = e.lastAttempt.Add(minSignInterval)
+	}
+	if e.failures > 0 && e.retryAt.After(earliest) {
+		earliest = e.retryAt
+	}
+	return earliest
+}
+
+// resetBackoffLocked ends a failure streak's backoff. minSignInterval still
+// applies, since it is measured from lastAttempt.
+func (e *ephemeral) resetBackoffLocked() {
+	e.failures = 0
+	e.retryAt = time.Time{}
+	e.lastErr = nil
+}
+
+// backoffFor is the window after the n-th consecutive failure (n >= 1).
+func backoffFor(n int) time.Duration {
+	d := signBackoffBase
+	for i := 1; i < n && d < signBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, signBackoffMax)
+}
+
 // run performs one sign for flight f. It is detached from the starting
 // caller's cancellation (that caller may give up while others still wait) but
 // keeps its values, and is bounded by signTimeout.
@@ -177,10 +268,21 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if err == nil {
+	switch {
+	case err == nil:
 		e.cur = pair
 		e.warned = false
-	} else if !errors.Is(err, ErrNoToken) && e.validLocked(e.now()) != nil && !e.warned {
+		e.resetBackoffLocked()
+	case !errors.Is(err, ErrNoToken):
+		// ErrNoToken here means the token vanished between Current's check
+		// and the sign; Vault was never contacted, so it is not a failure to
+		// back off from — the next Current reports ErrNoToken itself.
+		e.failures++
+		e.retryAt = e.now().Add(backoffFor(e.failures))
+		e.lastErr = err
+		e.failedToken = f.tokenHash
+	}
+	if err != nil && !errors.Is(err, ErrNoToken) && e.validLocked(e.now()) != nil && !e.warned {
 		e.warned = true
 		slog.Warn("client certificate refresh failed; serving the current certificate until it expires",
 			"source", SourceEphemeral,

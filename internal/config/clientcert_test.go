@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -218,6 +220,47 @@ func TestClientCertBorrowOnlyIsNotHeld(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "client_cert.pki_role") {
 		t.Fatalf("Validate() = %v, want an error naming client_cert.pki_role", err)
+	}
+}
+
+// The motivating deployment: one base config shared by a workstation that
+// logs in with plain mtls and its remotes, which differ only in borrow_only.
+// A remote must inherit the workstation's PKI role, sign short-lived
+// certificates with the borrowed token, and load without naming a role of its
+// own.
+func TestClientCertBorrowOnlyInheritsSharedMTLSRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := `vault:
+  address: https://vault.example.com
+  auth_method: mtls
+  borrow_only: true
+  token_socket: ["~/.ssh/dotvault.sock"]
+  mtls:
+    cert_role: dotvault
+    pki_mount: pki-int
+    pki_role: workstation
+client_cert:
+  enabled: true
+rules:
+  - name: gh
+    vault_key: gh
+    target: {path: ~/.netrc, format: netrc}
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ClientCertHeld() {
+		t.Error("ClientCertHeld() = true under borrow_only")
+	}
+	if got := cfg.ClientCertPKIRole(); got != "workstation" {
+		t.Errorf("ClientCertPKIRole() = %q, want the inherited vault.mtls.pki_role", got)
+	}
+	if got := cfg.ClientCertPKIMount(); got != "pki-int" {
+		t.Errorf("ClientCertPKIMount() = %q, want the inherited vault.mtls.pki_mount", got)
 	}
 }
 

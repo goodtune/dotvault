@@ -185,6 +185,9 @@ func TestClientCertRoleRequired(t *testing.T) {
 }
 
 func TestClientCertHeldNeedsNoRole(t *testing.T) {
+	// Plain mtls already requires vault.mtls.pki_role (validateMTLS), so the
+	// inherited role is what lets validation pass; held just means the
+	// section does not demand a role of its own.
 	cfg := clientCertBaseConfig()
 	cfg.Vault.AuthMethod = "mtls"
 	cfg.Vault.MTLS = MTLSConfig{CertRole: "dotvault", PKIRole: "workstation"}
@@ -195,16 +198,26 @@ func TestClientCertHeldNeedsNoRole(t *testing.T) {
 	if !cfg.ClientCertHeld() {
 		t.Error("ClientCertHeld() = false under plain mtls with the section enabled")
 	}
+	if got := cfg.ClientCertPKIRole(); got != "workstation" {
+		t.Errorf("ClientCertPKIRole() = %q, want the inherited vault.mtls.pki_role", got)
+	}
+}
 
-	// Held means the role is not needed at all: only borrow_only lifts the
-	// vault.mtls requirement, so exercise that route for "no role anywhere".
-	cfg = clientCertBaseConfig()
+// A borrow-only host never authenticates with its certificate, so it holds
+// none: the section must name its own role like any other ephemeral issuer,
+// and omitting it is a load error rather than a runtime failure.
+func TestClientCertBorrowOnlyIsNotHeld(t *testing.T) {
+	cfg := clientCertBaseConfig()
 	cfg.Vault.AuthMethod = "mtls"
 	cfg.Vault.BorrowOnly = true
 	cfg.Vault.TokenSockets = SocketList{"~/.ssh/dotvault.sock"}
 	cfg.ClientCert = ClientCertConfig{Enabled: true}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("held, no role anywhere: %v", err)
+	if cfg.ClientCertHeld() {
+		t.Error("ClientCertHeld() = true under borrow_only")
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "client_cert.pki_role") {
+		t.Fatalf("Validate() = %v, want an error naming client_cert.pki_role", err)
 	}
 }
 

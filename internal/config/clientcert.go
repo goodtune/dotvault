@@ -125,8 +125,13 @@ func (c *Config) ClientCertCommonName() string {
 // daemon can read. mtls+tpm and mtls+os keep the key where it cannot be
 // exported, so they, and every non-cert method, use the ephemeral source.
 // Never inferred from the in-memory key type.
+//
+// A borrow_only host is never held: it ignores auth_method and runs no
+// certificate login, so there is no credential on it to serve whatever the
+// shared base config says. It issues ephemerally like any other host and so
+// needs a PKI role of its own.
 func (c *Config) ClientCertHeld() bool {
-	return c.ClientCert.Enabled && c.Vault.AuthMethod == "mtls"
+	return c.ClientCert.Enabled && c.Vault.AuthMethod == "mtls" && !c.Vault.BorrowOnly
 }
 
 // validateClientCert checks the client_cert section and fills in TTL and

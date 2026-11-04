@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
@@ -48,7 +49,7 @@ func TestMaterialiseJSONLayoutMatchesTheMount(t *testing.T) {
 	store.put("databricks/prod", map[string]any{"token": "t"})
 	dir := filepath.Join(t.TempDir(), "vol")
 
-	n, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute})
+	n, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute})
 	if err != nil {
 		t.Fatalf("materialise: %v", err)
 	}
@@ -82,7 +83,7 @@ func TestMaterialiseFieldsLayout(t *testing.T) {
 	store.put("gh", map[string]any{"oauth_token": "gho_x\n", "count": 3, "bad/name": "x"})
 	dir := filepath.Join(t.TempDir(), "vol")
 
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutFields, Mode: 0o444, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutFields, Mode: 0o444, TTL: time.Minute}); err != nil {
 		t.Fatalf("materialise: %v", err)
 	}
 	got := readTree(t, dir)
@@ -123,7 +124,7 @@ func TestMaterialiseFieldsLayoutSkipsEmptyFieldName(t *testing.T) {
 	store.put("gh", map[string]any{"": "orphan", "oauth_token": "gho_x"})
 	dir := filepath.Join(t.TempDir(), "vol")
 
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
 		t.Fatalf("materialise: %v", err)
 	}
 	got := readTree(t, dir)
@@ -153,7 +154,7 @@ func TestMaterialiseSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := materialise(context.Background(), store, dir, spec)
+	n, _, err := materialise(context.Background(), store, nil, dir, spec)
 	if err != nil {
 		t.Fatalf("materialise: %v", err)
 	}
@@ -182,7 +183,7 @@ func TestMaterialiseRefreshPrunesAndPreservesUnchanged(t *testing.T) {
 	store.put("old/one", map[string]any{"a": "1"})
 	dir := filepath.Join(t.TempDir(), "vol")
 	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.Stat(filepath.Join(dir, "gh.json"))
@@ -194,7 +195,7 @@ func TestMaterialiseRefreshPrunesAndPreservesUnchanged(t *testing.T) {
 	}
 	store.remove("old/one")
 
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	got := readTree(t, dir)
@@ -207,7 +208,7 @@ func TestMaterialiseRefreshPrunesAndPreservesUnchanged(t *testing.T) {
 	}
 
 	store.put("gh", map[string]any{"a": "2"})
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatal(err)
 	}
 	changed, _ := os.Stat(filepath.Join(dir, "gh.json"))
@@ -226,11 +227,11 @@ func TestMaterialiseFailureLeavesDiskUntouched(t *testing.T) {
 	store.put("gh", map[string]any{"a": "1"})
 	dir := filepath.Join(t.TempDir(), "vol")
 	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatal(err)
 	}
 	store.setErr(errors.New("vault is sealed"))
-	if _, err := materialise(context.Background(), store, dir, spec); err == nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err == nil {
 		t.Fatal("materialise succeeded against a failing store")
 	}
 	if _, ok := readTree(t, dir)["gh.json"]; !ok {
@@ -246,7 +247,7 @@ func TestMaterialiseDirectoryWinsCollision(t *testing.T) {
 	store.put("x", map[string]any{"a": "1"})
 	store.put("x.json/child", map[string]any{"a": "1"})
 	dir := filepath.Join(t.TempDir(), "vol")
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	got := readTree(t, dir)
@@ -264,17 +265,17 @@ func TestMaterialiseLayoutChangeReplacesEntries(t *testing.T) {
 	store := newMemStore()
 	store.put("gh", map[string]any{"a": "1"})
 	dir := filepath.Join(t.TempDir(), "vol")
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}); err != nil {
 		t.Fatalf("fields -> json: %v", err)
 	}
 	got := readTree(t, dir)
 	if _, ok := got["gh.json"]; !ok || len(got) != 1 {
 		t.Errorf("after switching to json: %v", got)
 	}
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutFields, Mode: 0o400, TTL: time.Minute}); err != nil {
 		t.Fatalf("json -> fields: %v", err)
 	}
 	got = readTree(t, dir)
@@ -290,7 +291,7 @@ func TestMaterialiseGroupReadableMode(t *testing.T) {
 	store := newMemStore()
 	store.put("a/b", map[string]any{"a": "1"})
 	dir := filepath.Join(t.TempDir(), "vol")
-	if _, err := materialise(context.Background(), store, dir, Spec{Layout: LayoutJSON, Mode: 0o440, TTL: time.Minute}); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, Spec{Layout: LayoutJSON, Mode: 0o440, TTL: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	readTree(t, dir)
@@ -321,7 +322,7 @@ func TestMaterialiseNeverFollowsSymlinksOutOfTheVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := Spec{Layout: LayoutJSON, Mode: 0o444, TTL: time.Minute}
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatal(err)
 	}
 	// The container swaps the subdirectory for a link to a host directory
@@ -333,7 +334,7 @@ func TestMaterialiseNeverFollowsSymlinksOutOfTheVolume(t *testing.T) {
 	os.Remove(filepath.Join(dir, "top.json"))
 	os.Symlink(filepath.Join(outside, "victim"), filepath.Join(dir, "top.json"))
 
-	if _, err := materialise(context.Background(), store, dir, spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, spec); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	info, _ := os.Stat(outside)
@@ -355,5 +356,156 @@ func TestMaterialiseNeverFollowsSymlinksOutOfTheVolume(t *testing.T) {
 	}
 	if info, err := os.Lstat(filepath.Join(dir, "top.json")); err != nil || info.Mode()&os.ModeSymlink != 0 {
 		t.Error("planted symlink survived the refresh")
+	}
+}
+
+type fakeCertSource struct {
+	pair  *clientcert.Pair
+	err   error
+	calls int
+}
+
+func (f *fakeCertSource) Current(ctx context.Context) (*clientcert.Pair, error) {
+	f.calls++
+	return f.pair, f.err
+}
+
+func testPair() *clientcert.Pair {
+	return &clientcert.Pair{
+		CertPEM:   []byte("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+		KeyPEM:    []byte("-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n"),
+		NotBefore: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+		NotAfter:  time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestMaterialiseClientCertFiles(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"token": "x"})
+	src := &fakeCertSource{pair: testPair()}
+	dir := filepath.Join(t.TempDir(), "vol")
+	spec := Spec{Layout: LayoutJSON, Mode: 0o440, TTL: time.Minute, ClientCert: ClientCertWith}
+
+	n, pair, err := materialise(context.Background(), store, src, dir, spec)
+	if err != nil {
+		t.Fatalf("materialise: %v", err)
+	}
+	if n != 1 || pair != src.pair {
+		t.Errorf("n = %d, pair = %p; want 1 secret and the source's pair %p", n, pair, src.pair)
+	}
+	got := readTree(t, dir)
+	if got[vaultfs.ClientCertFile] != string(src.pair.CertPEM) || got[vaultfs.ClientKeyFile] != string(src.pair.KeyPEM) {
+		t.Errorf("crt/key = %q / %q", got[vaultfs.ClientCertFile], got[vaultfs.ClientKeyFile])
+	}
+	if got[vaultfs.ClientPEMFile] != got[vaultfs.ClientCertFile]+got[vaultfs.ClientKeyFile] {
+		t.Errorf("client.pem = %q, want crt followed by key", got[vaultfs.ClientPEMFile])
+	}
+	if _, ok := got["gh.json"]; !ok {
+		t.Errorf("the selection is missing beside the certificate: %v", got)
+	}
+	for _, name := range []string{vaultfs.ClientCertFile, vaultfs.ClientKeyFile, vaultfs.ClientPEMFile} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != spec.Mode {
+			t.Errorf("%s mode = %o, want %o", name, info.Mode().Perm(), spec.Mode)
+		}
+		if !info.ModTime().Equal(src.pair.NotBefore) {
+			t.Errorf("%s mtime = %v, want NotBefore %v", name, info.ModTime(), src.pair.NotBefore)
+		}
+	}
+}
+
+func TestMaterialiseClientCertOnly(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"token": "x"})
+	src := &fakeCertSource{pair: testPair()}
+	dir := filepath.Join(t.TempDir(), "vol")
+	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute, ClientCert: ClientCertOnly}
+
+	n, _, err := materialise(context.Background(), store, src, dir, spec)
+	if err != nil {
+		t.Fatalf("materialise: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("secrets = %d, want 0", n)
+	}
+	got := readTree(t, dir)
+	if len(got) != 3 {
+		t.Errorf("tree = %v, want exactly the three certificate files", got)
+	}
+	if reads, lists := store.counts(); reads != 0 || lists != 0 {
+		t.Errorf("store consulted (%d reads, %d lists); client_cert=only selects no secrets", reads, lists)
+	}
+}
+
+func TestMaterialiseClientCertWinsCollision(t *testing.T) {
+	store := newMemStore()
+	// A KV folder named like a certificate file is the only thing that can
+	// claim the name; it and what is beneath it lose to the certificate.
+	store.put("client.crt/inner", map[string]any{"k": "v"})
+	store.put("gh", map[string]any{"token": "x"})
+	src := &fakeCertSource{pair: testPair()}
+	dir := filepath.Join(t.TempDir(), "vol")
+	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute, ClientCert: ClientCertWith}
+
+	if _, _, err := materialise(context.Background(), store, src, dir, spec); err != nil {
+		t.Fatalf("materialise: %v", err)
+	}
+	got := readTree(t, dir)
+	if got[vaultfs.ClientCertFile] != string(src.pair.CertPEM) {
+		t.Errorf("client.crt = %q, want the certificate", got[vaultfs.ClientCertFile])
+	}
+	if _, ok := got["client.crt/inner.json"]; ok {
+		t.Errorf("the shadowed folder's contents were written: %v", got)
+	}
+	if _, ok := got["gh.json"]; !ok {
+		t.Errorf("an unrelated secret went missing: %v", got)
+	}
+}
+
+func TestMaterialiseClientCertSourceFailureLeavesFiles(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"token": "old"})
+	src := &fakeCertSource{pair: testPair()}
+	dir := filepath.Join(t.TempDir(), "vol")
+	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute, ClientCert: ClientCertWith}
+	if _, _, err := materialise(context.Background(), store, src, dir, spec); err != nil {
+		t.Fatal(err)
+	}
+	before := readTree(t, dir)
+
+	store.put("gh", map[string]any{"token": "new"})
+	src.pair, src.err = nil, clientcert.ErrNoToken
+	_, _, err := materialise(context.Background(), store, src, dir, spec)
+	if !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("err = %v, want ErrNoToken", err)
+	}
+	after := readTree(t, dir)
+	if len(before) != len(after) {
+		t.Fatalf("tree changed: %v -> %v", before, after)
+	}
+	for k, v := range before {
+		if after[k] != v {
+			t.Errorf("%s changed after a failed refresh", k)
+		}
+	}
+}
+
+func TestMaterialiseClientCertNilSource(t *testing.T) {
+	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute, ClientCert: ClientCertWith}
+	_, _, err := materialise(context.Background(), newMemStore(), nil, filepath.Join(t.TempDir(), "vol"), spec)
+	if err == nil || !strings.Contains(err.Error(), "client_cert.enabled") {
+		t.Errorf("err = %v, want one naming client_cert.enabled", err)
+	}
+}
+
+func TestMaterialiseSourceNotConsultedWhenOff(t *testing.T) {
+	src := &fakeCertSource{pair: testPair()}
+	spec := Spec{Layout: LayoutJSON, Mode: 0o400, TTL: time.Minute}
+	_, pair, err := materialise(context.Background(), newMemStore(), src, filepath.Join(t.TempDir(), "vol"), spec)
+	if err != nil || pair != nil || src.calls != 0 {
+		t.Errorf("err = %v, pair = %v, calls = %d; an off volume must not touch the source", err, pair, src.calls)
 	}
 }

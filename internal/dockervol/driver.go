@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/vaultfs"
 )
@@ -45,6 +46,10 @@ type Options struct {
 	// not, and the event watcher waits for one before subscribing. Nil
 	// means "always".
 	HasToken func() bool
+	// ClientCert supplies the client certificate for volumes created with
+	// the client_cert option. Nil means the feature is not enabled, and such
+	// a volume cannot be created or refreshed.
+	ClientCert clientcert.Source
 }
 
 // Timeouts bounding the Vault work behind one request or one refresh. A
@@ -196,6 +201,9 @@ func (d *Driver) Create(name string, opts map[string]string) error {
 	if err != nil {
 		return err
 	}
+	if spec.ClientCert != ClientCertOff && d.opts.ClientCert == nil {
+		return errors.New(errClientCertDisabled)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if existing, ok := d.volumes[name]; ok {
@@ -288,7 +296,7 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 		}
 		ctx, cancel := context.WithTimeout(ctx, mountTimeout)
 		defer cancel()
-		n, err := materialise(ctx, d.store, dir, v.Spec)
+		n, _, err := materialise(ctx, d.store, d.opts.ClientCert, dir, v.Spec)
 		d.recordRefresh(v, n, err)
 		if err != nil {
 			return "", fmt.Errorf("populate volume %q: %w", name, err)
@@ -404,6 +412,7 @@ const (
 	StatusLastError   = "last_error"
 	StatusSelection   = "selection"
 	StatusEventsError = "events_error"
+	StatusClientCert  = "client_cert"
 )
 
 func (d *Driver) infoLocked(v *volume) VolumeInfo {
@@ -415,7 +424,12 @@ func (d *Driver) infoLocked(v *volume) VolumeInfo {
 		StatusMounts:  len(v.Mounts),
 		StatusRefresh: d.refreshModeLocked(),
 	}
-	if len(v.Spec.Secrets) > 0 {
+	if v.Spec.ClientCert != ClientCertOff {
+		status[StatusClientCert] = string(v.Spec.ClientCert)
+	}
+	if v.Spec.ClientCert == ClientCertOnly {
+		status[StatusSelection] = "none"
+	} else if len(v.Spec.Secrets) > 0 {
 		status[StatusSelection] = append([]string(nil), v.Spec.Secrets...)
 	} else {
 		status[StatusSelection] = "all"

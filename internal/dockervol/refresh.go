@@ -118,7 +118,7 @@ func (d *Driver) refresh(ctx context.Context, v *volume) {
 	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
 	defer cancel()
 	v.opMu.Lock()
-	n, err := materialise(ctx, d.store, d.volumePath(v.Name), v.Spec)
+	n, _, err := materialise(ctx, d.store, d.opts.ClientCert, d.volumePath(v.Name), v.Spec)
 	v.opMu.Unlock()
 	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
 		// Shutdown or unmount mid-render: not a failure worth recording

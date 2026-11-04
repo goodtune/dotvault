@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
 // requireUnixPerms skips a test whose assertions rest on Unix mode bits or
@@ -595,7 +596,7 @@ func TestRemoveWithOutstandingMountsAndMountAfterRemove(t *testing.T) {
 	d.mu.Unlock()
 	w.opMu.Lock()
 	dir := d.volumePath("w")
-	if _, err := materialise(context.Background(), store, dir, w.Spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, w.Spec); err != nil {
 		t.Fatal(err)
 	}
 	w.opMu.Unlock()
@@ -897,5 +898,77 @@ func TestActivatedFdIsDrainedWhenRunFails(t *testing.T) {
 	_, err = conn.Read(buf)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("read on the activated socket = %v, want EOF from the drain (a timeout means the engine would hang)", err)
+	}
+}
+
+func TestCreateClientCertRequiresSource(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	err := d.Create("c", map[string]string{OptClientCert: "true"})
+	want := "client_cert is not enabled in dotvault's configuration (client_cert.enabled)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Create err = %v, want %q", err, want)
+	}
+	if err := d.Create("c", map[string]string{OptClientCert: "false"}); err != nil {
+		t.Errorf("client_cert=false needs no source: %v", err)
+	}
+}
+
+func TestCreateClientCertWithSourceMountsFiles(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "only"}); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := d.Mount(context.Background(), "c", "m1")
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, vaultfs.ClientPEMFile)); err != nil {
+		t.Errorf("client.pem missing: %v", err)
+	}
+	info, err := d.Get("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status[StatusClientCert] != "only" || info.Status[StatusSelection] != "none" {
+		t.Errorf("status = %v", info.Status)
+	}
+}
+
+func TestRefreshClientCertDisabledNamesTheCause(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	// The configuration has since switched the feature off.
+	d.opts.ClientCert = nil
+	d.mu.Lock()
+	v := d.volumes["c"]
+	d.mu.Unlock()
+	d.refresh(context.Background(), v)
+	d.mu.Lock()
+	got := v.lastErr
+	d.mu.Unlock()
+	if !strings.Contains(got, "client_cert.enabled") {
+		t.Errorf("lastErr = %q, want one naming client_cert.enabled", got)
+	}
+}
+
+func TestPersistedClientCertVolumeReloads(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := New(d.opts, newMemStore(), nil)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	d2.mu.Lock()
+	got := d2.volumes["c"].Spec.ClientCert
+	d2.mu.Unlock()
+	if got != ClientCertWith {
+		t.Errorf("reloaded ClientCert = %q", got)
 	}
 }

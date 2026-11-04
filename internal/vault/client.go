@@ -392,9 +392,13 @@ func TokenMeta(secret *vaultapi.Secret) map[string]string {
 // certificate too, so on an mTLS deployment that requires a client cert on
 // every Vault request the auth/token/create call still succeeds.
 //
-// The child carries the parent's token metadata (see CreateChildToken), read
-// with a lookup-self on the same sibling. That read is best effort: a failure
-// or an absent meta mints the child without meta and logs once at DEBUG, since
+// The child carries the parent's identity metadata — exactly the
+// childMetaKeys entries, username and common_name, which is what
+// {{.token_username}} reads — taken from a lookup-self on the same sibling and
+// passed to CreateChildToken. Nothing else from the parent's meta is copied: a
+// least-privilege token should carry no more than the one feature that needs
+// it reads. The read is best effort: a failure, or a parent with neither key,
+// mints the child without meta and logs at DEBUG (once per downscope), since
 // refusing a least-privilege downscope over a metadata read would trade a
 // security property for a convenience. Only the mint itself fails closed.
 func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, policies []string, noDefaultPolicy bool) (string, error) {
@@ -405,10 +409,30 @@ func (c *Client) CreateChildTokenFor(ctx context.Context, parentToken string, po
 	var meta map[string]string
 	if parent, lerr := sibling.LookupSelf(ctx); lerr != nil {
 		slog.Debug("could not read parent token metadata; minting downscoped token without it", "error", lerr)
-	} else if meta = TokenMeta(parent); meta == nil {
-		slog.Debug("parent token has no metadata; minting downscoped token without it")
+	} else if meta = childMeta(TokenMeta(parent)); meta == nil {
+		slog.Debug("parent token has no identity metadata; minting downscoped token without it")
 	}
 	return sibling.CreateChildToken(ctx, policies, noDefaultPolicy, meta)
+}
+
+// childMetaKeys are the parent token metadata keys a downscoped child
+// inherits: the two the client certificate's {{.token_username}} reads
+// (meta.username, else meta.common_name, which the cert auth method sets).
+var childMetaKeys = []string{"username", "common_name"}
+
+// childMeta narrows parent to childMetaKeys, returning nil when none is
+// present so the child is minted with no meta at all.
+func childMeta(parent map[string]string) map[string]string {
+	var out map[string]string
+	for _, k := range childMetaKeys {
+		if v, ok := parent[k]; ok && v != "" {
+			if out == nil {
+				out = make(map[string]string, len(childMetaKeys))
+			}
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // ServerHealth returns the Vault server health status.

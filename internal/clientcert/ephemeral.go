@@ -214,6 +214,14 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 	return nil, f.err
 }
 
+// Last returns the most recent pair signed and the most recent sign error,
+// without signing or contacting Vault.
+func (e *ephemeral) Last() (*Pair, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cur, e.lastErr
+}
+
 // validLocked returns the cached pair if it has not yet expired.
 func (e *ephemeral) validLocked(now time.Time) *Pair {
 	if e.cur != nil && now.Before(e.cur.NotAfter) {

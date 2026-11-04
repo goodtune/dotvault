@@ -119,3 +119,11 @@ var ErrSignPaced = errors.New("clientcert: next certificate sign is paced; retry
 // a common name. It never falls back to anything silently: a certificate
 // subject is an identity, and guessing grants somebody else's.
 var ErrNoUsername = errors.New("clientcert: the Vault token carries no username (meta.username or meta.common_name); set client_cert.common_name to {{.os_user}} or configure the auth method to record one")
+
+// ErrSignInProgress is returned, wrapping the caller's ctx.Err(), when the
+// caller's context ended while it waited on a sign that is still in flight.
+// The sign is not abandoned: it runs detached under its own timeout, and a
+// later call is answered with its result. So a caller deadline here is
+// transient (the FUSE mount answers EAGAIN), unlike a sign that failed on its
+// own, which never wraps this sentinel.
+var ErrSignInProgress = errors.New("clientcert: still waiting on a certificate sign in progress")

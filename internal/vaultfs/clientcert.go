@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/goodtune/dotvault/internal/clientcert"
@@ -131,10 +132,12 @@ func (l *certFailureLog) shouldLog(msg string) bool {
 // logCertFailure logs a client certificate failure that is about to become an
 // errno, with the error (which names the PKI role and Vault's answer, and by
 // the source's contract never carries key or certificate material). A source
-// that is waiting for a token or pacing its next sign is logged at DEBUG on
-// every call, since that clears on its own and is reported as EAGAIN.
+// that is waiting for a token, pacing its next sign, or still signing when the
+// operation's deadline ran out is logged at DEBUG on every call, since that
+// clears on its own and is reported as EAGAIN.
 func logCertFailure(op, path string, err error) {
-	if errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, clientcert.ErrSignPaced) {
+	if errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, clientcert.ErrSignPaced) ||
+		(errors.Is(err, clientcert.ErrSignInProgress) && !errors.Is(err, context.Canceled)) {
 		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
 		return
 	}
@@ -142,4 +145,27 @@ func logCertFailure(op, path string, err error) {
 		return
 	}
 	slog.Warn("vaultfs: client certificate unavailable", "op", op, "path", displayPath(path), "error", err)
+}
+
+// certErrno maps a client certificate failure onto an errno. A source that is
+// waiting for a token, or pacing its next sign, is transient and says so with
+// EAGAIN, and so is an operation whose own deadline (opTimeout) ran out while
+// a sign was still in flight: the sign continues detached, so a retry gets its
+// result. Anything else is EIO, including a sign that itself timed out against
+// Vault. An interrupted call stays EINTR, since that is the caller going away
+// rather than the source failing. Logging goes
+// through logCertFailure, which names the cause (logErrno's per-errno lines
+// would log a denial on every read and without the error), and no
+// certificate error carries PEM.
+func certErrno(op, path string, err error) syscall.Errno {
+	logCertFailure(op, path, err)
+	switch {
+	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced):
+		return syscall.EAGAIN
+	case errors.Is(err, context.Canceled):
+		return syscall.EINTR
+	case errors.Is(err, clientcert.ErrSignInProgress):
+		return syscall.EAGAIN
+	}
+	return syscall.EIO
 }

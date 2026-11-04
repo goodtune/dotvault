@@ -418,8 +418,11 @@ func TestEphemeralCancelledCallerDoesNotAbortSign(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := src.Current(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("first caller err = %v, want deadline exceeded", err)
+	// The caller's deadline is reported as waiting on a sign still in
+	// progress, which is what lets a consumer answer "try again" rather than
+	// treat it as a failed sign.
+	if _, err := src.Current(ctx); !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, clientcert.ErrSignInProgress) {
+		t.Fatalf("first caller err = %v, want deadline exceeded wrapping ErrSignInProgress", err)
 	}
 	// A second caller joins the same in-flight sign and gets its result.
 	p, err := src.Current(context.Background())

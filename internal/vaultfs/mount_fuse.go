@@ -956,24 +956,6 @@ func (h *handle) Release(ctx context.Context) syscall.Errno {
 	return 0
 }
 
-// certErrno maps a client certificate failure onto an errno. A source that is
-// waiting for a token, or pacing its next sign, is transient and says so with
-// EAGAIN; anything else is EIO. An interrupted call stays EINTR, since that
-// is the caller going away rather than the source failing. Logging goes
-// through logCertFailure, which names the cause (logErrno's per-errno lines
-// would log a denial on every read and without the error), and no
-// certificate error carries PEM.
-func certErrno(op, path string, err error) syscall.Errno {
-	logCertFailure(op, path, err)
-	switch {
-	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced):
-		return syscall.EAGAIN
-	case errors.Is(err, context.Canceled):
-		return syscall.EINTR
-	}
-	return syscall.EIO
-}
-
 // logErrno maps a tree error onto an errno, logging the detail an errno
 // cannot carry. Paths are logged; values never are, and no error produced by
 // this package embeds one.
@@ -986,7 +968,8 @@ func logErrno(op, path string, err error) syscall.Errno {
 		return syscall.EINVAL
 	case errors.Is(err, ErrInvalidName):
 		return syscall.EINVAL
-	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced):
+	case errors.Is(err, clientcert.ErrNoToken), errors.Is(err, clientcert.ErrSignPaced),
+		errors.Is(err, clientcert.ErrSignInProgress) && !errors.Is(err, context.Canceled):
 		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
 		return syscall.EAGAIN
 	case errors.Is(err, context.Canceled):

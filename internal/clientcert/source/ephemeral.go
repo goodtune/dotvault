@@ -220,7 +220,9 @@ func (e *ephemeral) Current(ctx context.Context) (*clientcert.Pair, error) {
 	select {
 	case <-f.done:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		// The sign carries on detached; say so, so a consumer can tell
+		// "ask again" from a sign that failed.
+		return nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, ctx.Err())
 	}
 	if f.err == nil {
 		return f.pair, nil

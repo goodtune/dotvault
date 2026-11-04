@@ -70,7 +70,7 @@ A read returns the field value, or `None` when the secret or field is absent —
 
 ## Using the client certificate
 
-`client_certificate()` returns PEM text. The certificate is short-lived and is replaced well before it expires, so ask again when you start a new connection or session rather than holding the result for long. The private key is a secret: do not log it, do not put it in an exception message, and do not write it anywhere other users can read. It also stays in Python memory for as long as the strings are referenced, because Python cannot zero a `str`.
+`client_certificate()` returns PEM text. The certificate is short-lived and is replaced well before it expires, so ask again when you start a new connection or session rather than holding the result for long. **Keep one `Client` and call `client_certificate()` on it repeatedly**: each `Client` caches its own certificate and signs its own, so constructing a new `Client` per request signs a new certificate (a Vault call and a fresh key) per request, where a reused one answers from memory until the certificate is due for replacement. The private key is a secret: do not log it, do not put it in an exception message, and do not write it anywhere other users can read. It also stays in Python memory for as long as the strings are referenced, because Python cannot zero a `str`.
 
 `requests` takes file paths for `cert=(crt_path, key_path)`, so the PEMs must be on disk. If you take that route, write them to a `tempfile` created with mode 0600 and delete them as soon as the session is built:
 

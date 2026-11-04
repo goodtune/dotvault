@@ -113,6 +113,8 @@ Like `AuthenticateCached`, these calls **never prompt**. When signing needs a to
 
 `TLSConfig` clones the `*tls.Config` you pass (nil is allowed) and sets `GetClientCertificate`. crypto/tls offers that callback no context, so the lookup runs under a bounded 30 second one, and **a handshake can block while a certificate is being signed**. That happens at most once per certificate lifetime; concurrent handshakes share one signing and later ones are answered from memory. A failure in the callback fails the handshake with the same error `ClientCertificate` would return.
 
+**Reuse one `Client`.** Each `Client` builds its own certificate source on first use and caches the certificate there, so a program that constructs a new `Client` per request signs a new certificate (a Vault round trip and a fresh key) per request. Construct one at startup, share it (concurrent `ClientCertificate` calls and handshakes are safe and share one signing), and build `TLSConfig` from it once.
+
 `CertPEM`, `KeyPEM` and `CombinedPEM` carry a private key. Do not log them or put them in error messages; nothing in this package does.
 
 ## Peer actions: Browse, Notify, and Clipboard

@@ -65,6 +65,16 @@ func (c *Client) SignCSR(ctx context.Context, mount, role, csrPEM, commonName, t
 	return c.pkiWrite(ctx, "pki_sign", path, data)
 }
 
+// SignCSRWithToken is SignCSR presented with token instead of the client's
+// current one; see LookupSelfWithToken.
+func (c *Client) SignCSRWithToken(ctx context.Context, token, mount, role, csrPEM, commonName, ttl string) (*IssuedCert, error) {
+	b, err := c.withToken(token)
+	if err != nil {
+		return nil, err
+	}
+	return b.SignCSR(ctx, mount, role, csrPEM, commonName, ttl)
+}
+
 // IssueCertificate asks the PKI engine to generate a keypair and certificate.
 // Used only when the PKI role forbids the sign endpoint; the returned
 // PrivateKeyPEM must be handed to the secure store immediately.

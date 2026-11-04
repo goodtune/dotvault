@@ -91,8 +91,11 @@ type ephemeral struct {
 }
 
 // flight is one in-progress sign shared by every caller that arrives while it
-// runs. pair and err are written before done is closed.
+// runs. token is the value Current read, and every Vault call of the sign is
+// made with it; it is held only for the flight's lifetime. pair and err are
+// written before done is closed.
 type flight struct {
+	token     string
 	tokenHash [sha256.Size]byte
 	done      chan struct{}
 	pair      *Pair
@@ -192,7 +195,7 @@ func (e *ephemeral) Current(ctx context.Context) (*Pair, error) {
 			return nil, err
 		}
 		e.lastAttempt = now
-		f = &flight{tokenHash: h, done: make(chan struct{})}
+		f = &flight{token: token, tokenHash: h, done: make(chan struct{})}
 		e.inflight = f
 		go e.run(ctx, f)
 	}
@@ -267,25 +270,21 @@ func backoffFor(n int) time.Duration {
 func (e *ephemeral) run(parent context.Context, f *flight) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), signTimeout)
 	defer cancel()
-	pair, err := e.sign(ctx)
+	pair, err := e.sign(ctx, f.token)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	switch {
-	case err == nil:
+	if err == nil {
 		e.cur = pair
 		e.warned, e.warnedAs = false, ""
 		e.resetBackoffLocked()
-	case !errors.Is(err, ErrNoToken):
-		// ErrNoToken here means the token vanished between Current's check
-		// and the sign; Vault was never contacted, so it is not a failure to
-		// back off from — the next Current reports ErrNoToken itself.
+	} else {
+		// Filed under the token the sign actually used, which is the one
+		// Current hashed: the sign never re-reads the client's token.
 		e.failures++
 		e.retryAt = e.now().Add(backoffFor(e.failures))
 		e.lastErr = err
 		e.failedToken = f.tokenHash
-	}
-	if err != nil && !errors.Is(err, ErrNoToken) {
 		e.warnLocked(err)
 	}
 	e.inflight = nil
@@ -323,12 +322,11 @@ func (e *ephemeral) warnLocked(err error) {
 		"error", err)
 }
 
-// sign generates a key, has Vault sign it, and assembles the Pair.
-func (e *ephemeral) sign(ctx context.Context) (*Pair, error) {
-	token := e.s.Token()
-	if token == "" {
-		return nil, ErrNoToken
-	}
+// sign generates a key, has Vault sign it with token, and assembles the Pair.
+// token is the value Current read, never re-read here: the common name lookup
+// and the sign must present the same token, or a swap mid-sign could render
+// one token's username into a certificate another token signs.
+func (e *ephemeral) sign(ctx context.Context, token string) (*Pair, error) {
 	cn, err := e.commonName(ctx, token)
 	if err != nil {
 		return nil, err
@@ -342,7 +340,7 @@ func (e *ephemeral) sign(ctx context.Context) (*Pair, error) {
 	if err != nil {
 		return nil, fmt.Errorf("clientcert: %w", err)
 	}
-	issued, err := e.s.SignCSR(ctx, e.o.PKIMount, e.o.PKIRole, csr, cn, e.o.TTL.String())
+	issued, err := e.s.SignCSRWithToken(ctx, token, e.o.PKIMount, e.o.PKIRole, csr, cn, e.o.TTL.String())
 	if err != nil {
 		return nil, fmt.Errorf("clientcert: sign via %s/sign/%s: %w", strings.Trim(e.o.PKIMount, "/"), e.o.PKIRole, err)
 	}
@@ -419,7 +417,7 @@ func (e *ephemeral) tokenUsername(ctx context.Context, token string) (string, er
 	}
 	e.mu.Unlock()
 
-	secret, err := e.s.LookupSelf(ctx)
+	secret, err := e.s.LookupSelfWithToken(ctx, token)
 	if err != nil {
 		return "", fmt.Errorf("clientcert: look up token username: %w", err)
 	}
@@ -431,14 +429,11 @@ func (e *ephemeral) tokenUsername(ctx context.Context, token string) (string, er
 	if name == "" {
 		return "", ErrNoUsername
 	}
-	// LookupSelf reads the client's token at call time. Only cache the answer
-	// against token if that is still the token, so a swap mid-lookup cannot
-	// file one token's username under another's hash.
-	if e.s.Token() == token {
-		e.mu.Lock()
-		e.user = usernameCache{tokenHash: h, name: name, valid: true}
-		e.mu.Unlock()
-	}
+	// The lookup presented token itself, so the answer is token's whatever
+	// the client holds now.
+	e.mu.Lock()
+	e.user = usernameCache{tokenHash: h, name: name, valid: true}
+	e.mu.Unlock()
 	return name, nil
 }
 

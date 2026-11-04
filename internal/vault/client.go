@@ -288,6 +288,35 @@ func (c *Client) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 	return secret, nil
 }
 
+// withToken returns a client that shares this one's connection — the same
+// http.Client, so the same TLS settings, client certificate and connection
+// pool, and the same headers (namespace included) — but authenticates with
+// token. Unlike NewSibling it builds no transport, so it is cheap enough to
+// use for a single call. The receiver's token is not touched.
+func (c *Client) withToken(token string) (*Client, error) {
+	if token == "" {
+		return nil, errors.New("vault: no token for a token-bound call")
+	}
+	raw, err := c.raw.CloneWithHeaders()
+	if err != nil {
+		return nil, fmt.Errorf("clone vault client: %w", err)
+	}
+	raw.SetToken(token)
+	return &Client{raw: raw, cfg: c.cfg}, nil
+}
+
+// LookupSelfWithToken is LookupSelf presented with token instead of the
+// client's current one. A caller that read the token once uses it so every
+// call of one operation is made under the same token, whatever another
+// goroutine installs on the shared client meanwhile.
+func (c *Client) LookupSelfWithToken(ctx context.Context, token string) (*vaultapi.Secret, error) {
+	b, err := c.withToken(token)
+	if err != nil {
+		return nil, err
+	}
+	return b.LookupSelf(ctx)
+}
+
 // RenewSelf renews the current token.
 func (c *Client) RenewSelf(ctx context.Context, increment int) (*vaultapi.Secret, error) {
 	secret, err := c.raw.Auth().Token().RenewSelfWithContext(ctx, increment)

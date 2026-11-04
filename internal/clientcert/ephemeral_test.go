@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -70,6 +71,14 @@ type fakeSigner struct {
 	signs    atomic.Int32
 	lookups  atomic.Int32
 	serialNo int64
+
+	// lookupTokens and signTokens record the token each call was made
+	// with, in order.
+	lookupTokens []string
+	signTokens   []string
+	// onLookup, when set, runs inside LookupSelfWithToken: a test uses it
+	// to swap the client's token while a sign is under way.
+	onLookup func()
 }
 
 func newFakeSigner(t *testing.T, clock *testClock) *fakeSigner {
@@ -124,8 +133,15 @@ func (f *fakeSigner) setSignErr(err error) {
 	f.signErr = err
 }
 
-func (f *fakeSigner) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
+func (f *fakeSigner) LookupSelfWithToken(ctx context.Context, token string) (*vaultapi.Secret, error) {
 	f.lookups.Add(1)
+	f.mu.Lock()
+	hook := f.onLookup
+	f.lookupTokens = append(f.lookupTokens, token)
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	data := map[string]any{}
@@ -135,9 +151,10 @@ func (f *fakeSigner) LookupSelf(ctx context.Context) (*vaultapi.Secret, error) {
 	return &vaultapi.Secret{Data: data}, nil
 }
 
-func (f *fakeSigner) SignCSR(ctx context.Context, mount, role, csrPEM, commonName, ttl string) (*vault.IssuedCert, error) {
+func (f *fakeSigner) SignCSRWithToken(ctx context.Context, token, mount, role, csrPEM, commonName, ttl string) (*vault.IssuedCert, error) {
 	f.signs.Add(1)
 	f.mu.Lock()
+	f.signTokens = append(f.signTokens, token)
 	delay, signErr, maxTTL := f.delay, f.signErr, f.maxTTL
 	f.lastTTL, f.lastCN = ttl, commonName
 	f.serialNo++
@@ -923,5 +940,45 @@ func TestEphemeralNewTokenWithinMinIntervalIsPacedNotMisdiagnosed(t *testing.T) 
 	}
 	if got := f.signs.Load(); got != 2 {
 		t.Fatalf("signs = %d, want 2", got)
+	}
+}
+
+// TestEphemeralSignUsesTheTokenItRead proves one sign is made entirely under
+// the token Current read: the username lookup and the sign both present it,
+// and a failure is filed under its hash, even when the client's token changes
+// while the sign is under way. Reading the token again inside the sign let the
+// common name come from one token while another signed, and filed the failure
+// under the wrong token, so the backoff reset on a new token never fired.
+func TestEphemeralSignUsesTheTokenItRead(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setToken("s.token-a")
+	f.setSignErr(forbidden())
+	f.onLookup = func() { f.setToken("s.token-b") }
+	src := newSource(t, f, defaultOptions(clock))
+
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the 403")
+	}
+	f.mu.Lock()
+	lookups, signs := append([]string(nil), f.lookupTokens...), append([]string(nil), f.signTokens...)
+	f.mu.Unlock()
+	if len(lookups) != 1 || lookups[0] != "s.token-a" {
+		t.Fatalf("lookup tokens = %v, want [s.token-a]", lookups)
+	}
+	if len(signs) != 1 || signs[0] != "s.token-a" {
+		t.Fatalf("sign tokens = %v, want [s.token-a]: the sign must use the token the lookup used", signs)
+	}
+
+	e := src.(*ephemeral)
+	e.mu.Lock()
+	failed := e.failedToken
+	cached := e.user
+	e.mu.Unlock()
+	if failed != sha256.Sum256([]byte("s.token-a")) {
+		t.Error("the failure was not filed under the token that signed")
+	}
+	if !cached.valid || cached.tokenHash != sha256.Sum256([]byte("s.token-a")) {
+		t.Error("the username was not cached under the token it was looked up with")
 	}
 }

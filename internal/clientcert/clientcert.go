@@ -110,8 +110,7 @@ var ErrNoToken = errors.New("clientcert: no Vault token to sign a certificate wi
 // record to report instead. It is reached in more than one way — a PKI role
 // whose max_ttl is shorter than the interval, a new token arriving shortly
 // after the previous token's failed sign (the reset deliberately forgets that
-// failure rather than blame the new token for it), or a token that vanished
-// mid-sign and came back — so it names no cause. It is transient: a later
+// failure rather than blame the new token for it) — so it names no cause. It is transient: a later
 // call signs. Consumers can tell pacing apart from a real failure with
 // errors.Is.
 var ErrSignPaced = errors.New("clientcert: next certificate sign is paced; retry shortly")
@@ -122,11 +121,15 @@ var ErrSignPaced = errors.New("clientcert: next certificate sign is paced; retry
 // subject is an identity, and guessing grants somebody else's.
 var ErrNoUsername = errors.New("clientcert: the Vault token carries no username (meta.username or meta.common_name); set client_cert.common_name to {{.os_user}} or configure the auth method to record one")
 
-// Signer is the slice of the Vault client the ephemeral source needs.
+// Signer is the slice of the Vault client the ephemeral source needs. Token
+// reads the client's current token; the two calls take a token explicitly, so
+// one sign is made entirely under the token it started with even if another
+// goroutine (a re-login, a borrow, the client facade replacing a rejected
+// token) installs a different one on the shared client meanwhile.
 type Signer interface {
 	Token() string
-	LookupSelf(ctx context.Context) (*vaultapi.Secret, error)
-	SignCSR(ctx context.Context, mount, role, csrPEM, commonName, ttl string) (*vault.IssuedCert, error)
+	LookupSelfWithToken(ctx context.Context, token string) (*vaultapi.Secret, error)
+	SignCSRWithToken(ctx context.Context, token, mount, role, csrPEM, commonName, ttl string) (*vault.IssuedCert, error)
 }
 
 var _ Signer = (*vault.Client)(nil)

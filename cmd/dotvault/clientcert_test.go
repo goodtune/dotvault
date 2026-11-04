@@ -21,12 +21,12 @@ import (
 type forbiddenSigner struct{ t *testing.T }
 
 func (f forbiddenSigner) Token() string { f.t.Error("Token called"); return "" }
-func (f forbiddenSigner) LookupSelf(context.Context) (*vaultapi.Secret, error) {
-	f.t.Error("LookupSelf called")
+func (f forbiddenSigner) LookupSelfWithToken(context.Context, string) (*vaultapi.Secret, error) {
+	f.t.Error("LookupSelfWithToken called")
 	return nil, errors.New("forbidden")
 }
-func (f forbiddenSigner) SignCSR(context.Context, string, string, string, string, string) (*vault.IssuedCert, error) {
-	f.t.Error("SignCSR called")
+func (f forbiddenSigner) SignCSRWithToken(context.Context, string, string, string, string, string, string) (*vault.IssuedCert, error) {
+	f.t.Error("SignCSRWithToken called")
 	return nil, errors.New("forbidden")
 }
 

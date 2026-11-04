@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,5 +165,65 @@ func TestExportHeldAbsentAndEmptyDir(t *testing.T) {
 	}
 	if _, err := ExportHeldCertificate("", "mtls", "alice"); !errors.Is(err, ErrNoCertCredential) {
 		t.Fatalf("empty dir: err = %v, want ErrNoCertCredential", err)
+	}
+}
+
+// A rotation that lands between the stat and the read must leave the older
+// mtime paired with the newer content, so the caller reloads once more rather
+// than missing the rotation.
+func TestExportHeldStatsBeforeRead(t *testing.T) {
+	dir := t.TempDir()
+	seedHeld(t, dir, "mtls", "file", "alice", time.Now().Add(time.Hour), pkcs8Handle(t))
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(credentialPath(dir), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	heldAfterStat = func() {
+		seedHeld(t, dir, "mtls", "file", "alice", time.Now().Add(2*time.Hour), pkcs8Handle(t))
+		cred, err := loadCredential(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cred.Serial = "cc:dd"
+		if err := saveCredential(dir, cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { heldAfterStat = nil })
+
+	held, err := ExportHeldCertificate(dir, "mtls", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Serial != "cc:dd" {
+		t.Fatalf("Serial = %q, want the rotated content", held.Serial)
+	}
+	if !held.ModTime.Equal(old) {
+		t.Fatalf("ModTime = %v, want the pre-read mtime %v", held.ModTime, old)
+	}
+}
+
+// A key that is not the certificate's key is an unusable credential, and the
+// error must not carry key material.
+func TestExportHeldKeyCertMismatch(t *testing.T) {
+	dir := t.TempDir()
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPEM := newPEMKey(t, other)
+	seedHeld(t, dir, "mtls", "file", "alice", time.Now().Add(time.Hour), func(*ecdsa.PrivateKey) []byte {
+		return []byte(otherPEM)
+	})
+	held, err := ExportHeldCertificate(dir, "mtls", "alice")
+	if !errors.Is(err, ErrNoCertCredential) {
+		t.Fatalf("err = %v, want ErrNoCertCredential", err)
+	}
+	if held != nil {
+		t.Fatal("returned a certificate alongside the mismatch")
+	}
+	if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), otherPEM[40:80]) {
+		t.Fatal("error carries key material")
 	}
 }

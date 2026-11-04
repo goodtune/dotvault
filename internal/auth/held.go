@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -37,6 +38,10 @@ type HeldCertificate struct {
 // says nothing about where it is meant to stay.
 var ErrHeldNotExportable = errors.New("held certificate key is not exportable")
 
+// heldAfterStat is a test seam run between the stat and the read, so a test
+// can land a rotation in that window. Nil in production.
+var heldAfterStat func()
+
 // ExportHeldCertificate returns the certificate and key stored for cert auth.
 // It is refused with ErrHeldNotExportable unless method is exactly "mtls" and
 // the envelope's backend is "file". It wraps ErrNoCertCredential when no usable
@@ -51,6 +56,20 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		// credential.json and serve whatever certificate sits in the working
 		// directory; see CertLoginFromStore.
 		return nil, fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
+	}
+	// Stat before reading. A rotation landing between the two then pairs the
+	// old mtime with the new content, which only makes the caller reload once
+	// more; the other order would pair a new mtime with old content and hide
+	// the rotation from it until the next one.
+	fi, err := os.Stat(credentialPath(storageDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: a bootstrap is required", ErrNoCertCredential)
+		}
+		return nil, fmt.Errorf("%w: stat credential: %w", ErrNoCertCredential, err)
+	}
+	if heldAfterStat != nil {
+		heldAfterStat()
 	}
 	cred, err := loadCredential(storageDir)
 	if err != nil {
@@ -78,6 +97,13 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 	if err != nil {
 		return nil, fmt.Errorf("%w: load key from secure store: %w", ErrNoCertCredential, err)
 	}
+	leaf, err := leafCert(cred.CertPEM)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse certificate: %w", ErrNoCertCredential, err)
+	}
+	if eq, ok := leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool }); !ok || !eq.Equal(signer.Public()) {
+		return nil, fmt.Errorf("%w: stored key does not match the certificate", ErrNoCertCredential)
+	}
 	// Re-marshal rather than pass the handle through: it may be a legacy
 	// encoding (SEC1 or PKCS#1) that a consumer expecting PKCS#8 would reject.
 	der, err := x509.MarshalPKCS8PrivateKey(signer)
@@ -85,10 +111,6 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		return nil, fmt.Errorf("%w: marshal key as PKCS#8", ErrHeldNotExportable)
 	}
 
-	fi, err := os.Stat(credentialPath(storageDir))
-	if err != nil {
-		return nil, fmt.Errorf("%w: stat credential: %w", ErrNoCertCredential, err)
-	}
 	return &HeldCertificate{
 		CertPEM:  []byte(cred.CertPEM),
 		KeyPEM:   pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),

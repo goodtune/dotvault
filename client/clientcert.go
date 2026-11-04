@@ -21,6 +21,14 @@ import (
 // nothing but that sign.
 const handshakeTimeout = 30 * time.Second
 
+// certReplaceInterval is the shortest gap between two attempts to replace a
+// token Vault rejected while signing. Each attempt costs a lookup-self (and,
+// when the token really is dead, an AuthenticateCached), and a consumer may
+// ask for the certificate on every handshake; without a floor, a token that
+// stays rejected would turn each handshake into Vault round trips. It matches
+// the signing source's own floor between sign attempts.
+const certReplaceInterval = 10 * time.Second
+
 // ClientCertificate is a mutual-TLS client certificate and its private key, in
 // the forms a consumer needs. It is the same certificate the daemon serves
 // through the filesystem mount and Docker volumes.
@@ -54,6 +62,15 @@ type ClientCertificate struct {
 // AuthenticateCached (cached token, peer socket, enrolled certificate) and
 // retries once; if that finds nothing the error wraps ErrLoginRequired.
 //
+// The token is re-resolved when Vault rejects it, so a long-lived Client
+// follows the daemon's re-login, a peer's re-borrow, or a token reaching its
+// max TTL without any action from the caller. That happens when the call that
+// notices is due to replace the certificate anyway: while the current
+// certificate is still valid it keeps being served and the replacement token
+// signs the next one; when nothing valid is left the call fails transiently
+// (signing is paced, at most one attempt per ten seconds) and a later one
+// succeeds.
+//
 // Errors are categorised for errors.Is: ErrNotConfigured (section disabled, or
 // no PKI role and no usable held certificate), ErrLoginRequired, ErrDenied (a
 // 401/403 from Vault, typically a policy without pki/sign), ErrUnreachable
@@ -65,6 +82,7 @@ func (c *Client) ClientCertificate(ctx context.Context) (*ClientCertificate, err
 	if err != nil {
 		return nil, err
 	}
+	used := c.vc.Token()
 	pair, err := src.Current(ctx)
 	if errors.Is(err, clientcert.ErrNoToken) {
 		// Only a sign needs a token, so authenticate only now: a held
@@ -73,7 +91,19 @@ func (c *Client) ClientCertificate(ctx context.Context) (*ClientCertificate, err
 		if aerr := c.authenticateForCert(ctx); aerr != nil {
 			return nil, aerr
 		}
+		used = c.vc.Token()
 		pair, err = src.Current(ctx)
+	}
+	if rejected := c.signRejection(src, pair, err); rejected != nil {
+		replaced, rerr := c.replaceRejectedToken(ctx, used)
+		switch {
+		case replaced && err != nil:
+			pair, err = src.Current(ctx)
+		case rerr != nil && err != nil:
+			// The token is dead and nothing replaced it: say so, rather
+			// than reporting the sign's 403 as a policy problem.
+			return nil, rerr
+		}
 	}
 	if err != nil {
 		return nil, mapClientCertErr(ctx, err)
@@ -157,6 +187,7 @@ func (c *Client) clientCertSource() (clientcert.Source, error) {
 				KeyType:    cc.KeyType,
 				KeyBits:    cc.KeyBits,
 				OSUser:     user,
+				Now:        c.now,
 			},
 		}, c.vc)
 		if err != nil {
@@ -183,6 +214,78 @@ func (c *Client) authenticateForCert(ctx context.Context) error {
 		return nil
 	}
 	return c.AuthenticateCached(ctx)
+}
+
+// lastReporter is implemented by every clientcert source: the most recent pair
+// served and the most recent error, read without signing.
+type lastReporter interface {
+	Last() (*clientcert.Pair, error)
+}
+
+// signRejection returns the token rejection behind a Current answer, or nil.
+// A failed refresh does not always surface as err: while the cached
+// certificate is still valid the source keeps serving it, so a token that died
+// is only visible as a pair already past its RefreshAt together with the
+// source's last error.
+func (c *Client) signRejection(src clientcert.Source, pair *clientcert.Pair, err error) error {
+	if err != nil {
+		if auth.IsTokenRejected(err) {
+			return err
+		}
+		return nil
+	}
+	if pair == nil || pair.Source != clientcert.SourceEphemeral || c.clock().Before(pair.RefreshAt) {
+		return nil
+	}
+	lr, ok := src.(lastReporter)
+	if !ok {
+		return nil
+	}
+	if _, last := lr.Last(); last != nil && auth.IsTokenRejected(last) {
+		return last
+	}
+	return nil
+}
+
+// replaceRejectedToken re-resolves the Client's token after Vault rejected
+// rejected while signing. It reports whether the Client now holds a different
+// token. A 403 from pki/sign is also what a policy without that path answers,
+// so the token is first checked with lookup-self and kept when Vault still
+// accepts it; only a token Vault refuses there is dropped and replaced through
+// AuthenticateCached, whose error is returned when nothing replaces it.
+// Attempts are at least certReplaceInterval apart.
+func (c *Client) replaceRejectedToken(ctx context.Context, rejected string) (bool, error) {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if cur := c.vc.Token(); cur != rejected {
+		// Another caller replaced it already.
+		return cur != "", nil
+	}
+	now := c.clock()
+	if !c.certReplacedAt.IsZero() && now.Sub(c.certReplacedAt) < certReplaceInterval {
+		return false, nil
+	}
+	c.certReplacedAt = now
+	if rejected != "" {
+		if _, err := c.vc.LookupSelf(ctx); err == nil || !auth.IsTokenRejected(err) {
+			// Still accepted (the denial is the role or policy), or Vault
+			// could not answer: either way this token is not known dead.
+			return false, nil
+		}
+	}
+	c.vc.SetToken("")
+	if err := c.AuthenticateCached(ctx); err != nil {
+		return false, err
+	}
+	return c.vc.Token() != rejected, nil
+}
+
+// clock is the time the certificate path reads.
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // mapClientCertErr maps an error from a clientcert.Source onto this package's

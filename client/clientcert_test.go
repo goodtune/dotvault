@@ -41,6 +41,14 @@ type certVault struct {
 	signStatus atomic.Int32
 	// lastPath is the most recent signing path.
 	lastPath atomic.Value
+	// valid is the one token Vault accepts ("good" unless a test changes it).
+	valid atomic.Value
+	// lookups counts lookup-self requests.
+	lookups atomic.Int32
+}
+
+func (cv *certVault) accepts(r *http.Request) bool {
+	return r.Header.Get("X-Vault-Token") == cv.valid.Load().(string)
 }
 
 func newCertVault(t *testing.T) *certVault {
@@ -49,6 +57,7 @@ func newCertVault(t *testing.T) *certVault {
 	t.Setenv("DOTVAULT_TOKEN", "")
 
 	cv := &certVault{}
+	cv.valid.Store("good")
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -75,19 +84,25 @@ func newCertVault(t *testing.T) *certVault {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/auth/token/lookup-self", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Vault-Token") != "good" {
+		cv.lookups.Add(1)
+		if !cv.accepts(r) {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-			"id": "good", "ttl": 3600, "creation_ttl": 7200,
+			"id": cv.valid.Load(), "ttl": 3600, "creation_ttl": 7200,
 			"meta": map[string]any{"username": "gary"},
 		}})
 	})
 	mux.HandleFunc("/v1/pki/sign/", func(w http.ResponseWriter, r *http.Request) {
 		cv.signs.Add(1)
 		cv.lastPath.Store(r.URL.Path)
+		if !cv.accepts(r) {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"permission denied"}})
+			return
+		}
 		if st := int(cv.signStatus.Load()); st != 0 {
 			w.WriteHeader(st)
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"nope"}})
@@ -346,6 +361,135 @@ func TestClientCertificateAuthenticatesCachedWhenTokenMissing(t *testing.T) {
 	}
 	if c.Token() != "good" {
 		t.Errorf("token = %q, want the cached token adopted", c.Token())
+	}
+}
+
+// fakeClock is a settable clock for the certificate path.
+type fakeClock struct{ t atomic.Int64 }
+
+func newFakeClock() *fakeClock {
+	c := &fakeClock{}
+	c.t.Store(time.Now().UnixNano())
+	return c
+}
+func (c *fakeClock) Now() time.Time          { return time.Unix(0, c.t.Load()) }
+func (c *fakeClock) Advance(d time.Duration) { c.t.Add(int64(d)) }
+
+// rotateToken makes Vault reject every token but next and writes next to the
+// token file, as the daemon does after a re-login.
+func (cv *certVault) rotateToken(t *testing.T, cfg *Config, next string) {
+	t.Helper()
+	cv.valid.Store(next)
+	if err := os.WriteFile(cfg.TokenFile, []byte(next+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientCertificateReplacesRejectedTokenBeforeExpiry(t *testing.T) {
+	cv := newCertVault(t)
+	cv.valid.Store("t1")
+	cfg := cv.ephemeralConfig(t)
+	if err := os.WriteFile(cfg.TokenFile, []byte("t1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock()
+	c := newClient(t, cfg)
+	c.now = clock.Now
+	ctx := context.Background()
+
+	first, err := c.ClientCertificate(ctx)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	// The daemon re-logs-in mid-life: t1 is dead, t2 is in the token file.
+	cv.rotateToken(t, cfg, "t2")
+	// Past the half-life (the fake CA issues ~11 minutes), before expiry.
+	clock.Advance(5 * time.Minute)
+
+	// The refresh with t1 is refused; the still-valid certificate is served
+	// and the Client picks up t2 without being asked.
+	cc, err := c.ClientCertificate(ctx)
+	if err != nil {
+		t.Fatalf("refresh with a dead token: %v", err)
+	}
+	if !bytes.Equal(cc.CertPEM, first.CertPEM) {
+		t.Error("the still-valid certificate was not served while the token was replaced")
+	}
+	if c.Token() != "t2" {
+		t.Fatalf("token = %q, want the replacement t2", c.Token())
+	}
+
+	// Once signing is no longer paced, the replacement token signs the next
+	// certificate, well before the first one expires.
+	clock.Advance(11 * time.Second)
+	next, err := c.ClientCertificate(ctx)
+	if err != nil {
+		t.Fatalf("after the replacement: %v", err)
+	}
+	if bytes.Equal(next.CertPEM, first.CertPEM) {
+		t.Error("no new certificate was signed with the replacement token")
+	}
+	if n := cv.signs.Load(); n != 3 {
+		t.Errorf("signs = %d, want 3 (first, refused, replacement)", n)
+	}
+}
+
+func TestTLSConfigRecoversFromRejectedToken(t *testing.T) {
+	cv := newCertVault(t)
+	cv.valid.Store("t1")
+	cfg := cv.ephemeralConfig(t)
+	if err := os.WriteFile(cfg.TokenFile, []byte("t1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock()
+	c := newClient(t, cfg)
+	c.now = clock.Now
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tc, err := c.TLSConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing signed yet and the adopted token is already dead.
+	cv.rotateToken(t, cfg, "t2")
+	if _, err := tc.GetClientCertificate(&tls.CertificateRequestInfo{}); err == nil {
+		t.Fatal("the handshake that finds the dead token should fail: signing is paced")
+	} else if errors.Is(err, ErrDenied) {
+		t.Fatalf("a replaced token was reported as a policy denial: %v", err)
+	}
+	if c.Token() != "t2" {
+		t.Fatalf("token = %q, want t2", c.Token())
+	}
+	clock.Advance(11 * time.Second)
+	if _, err := tc.GetClientCertificate(&tls.CertificateRequestInfo{}); err != nil {
+		t.Fatalf("handshake after the replacement: %v", err)
+	}
+}
+
+func TestClientCertificatePolicyDenialKeepsTokenAndIsPaced(t *testing.T) {
+	cv := newCertVault(t)
+	t.Setenv("DOTVAULT_TOKEN", "good")
+	cv.signStatus.Store(http.StatusForbidden) // the token is fine; the role is not
+	clock := newFakeClock()
+	c := newClient(t, cv.ephemeralConfig(t))
+	c.now = clock.Now
+	ctx := context.Background()
+
+	for range 20 {
+		if _, err := c.ClientCertificate(ctx); !errors.Is(err, ErrDenied) {
+			t.Fatalf("err = %v, want ErrDenied", err)
+		}
+		clock.Advance(100 * time.Millisecond)
+	}
+	if c.Token() != "good" {
+		t.Errorf("token = %q: a live token was dropped over a policy denial", c.Token())
+	}
+	// One lookup to adopt the token, one to confirm it is still accepted.
+	if n := cv.lookups.Load(); n != 2 {
+		t.Errorf("lookup-self calls = %d, want 2 (replacement attempts are paced)", n)
 	}
 }
 

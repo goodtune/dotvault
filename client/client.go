@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/auth"
 	"github.com/goodtune/dotvault/internal/clientcert"
@@ -71,6 +72,12 @@ type Client struct {
 	certSrc  clientcert.Source
 	certErr  error
 	authMu   sync.Mutex
+	// certReplacedAt is when the certificate path last tried to replace a
+	// token Vault rejected (guarded by authMu); see replaceRejectedToken.
+	certReplacedAt time.Time
+	// now is the clock the certificate path reads; nil means time.Now.
+	// Tests set it to move the certificate's lifetime without sleeping.
+	now func() time.Time
 }
 
 // Option configures a Client at construction time. Options are the

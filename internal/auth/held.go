@@ -32,12 +32,26 @@ type HeldCertificate struct {
 }
 
 // CredentialVersion identifies one write of credential.json: its
-// full-resolution mtime and its size, so a rewrite within the same second is
-// still told apart unless it also keeps the size and lands on the identical
-// mtime. Comparable with ==.
+// full-resolution mtime, its size and the file's identity. Comparable with ==.
+//
+// The envelope is replaced by temp file and rename, so every rotation lands
+// as a new file, and the identity is what catches a rotation that keeps the
+// size and lands in the same mtime tick on a filesystem with a coarse clock.
+// On Unix it is the device and inode. On Windows it is the volume serial
+// number and file index (GetFileInformationByHandle, which opens the file for
+// attributes only, sharing read, write and delete so it never blocks a
+// writer's rename); if that query fails the identity is left zero and the
+// version falls back to mtime and size, as it is on platforms with neither.
 type CredentialVersion struct {
 	ModTime time.Time
 	Size    int64
+	id      fileID
+}
+
+// fileID is a file's identity on its filesystem: device and inode on Unix,
+// volume serial and file index on Windows, zero where neither is available.
+type fileID struct {
+	vol, idx uint64
 }
 
 // StatCredential reports the version of the credential envelope under
@@ -49,17 +63,18 @@ func StatCredential(storageDir string) (CredentialVersion, error) {
 	if storageDir == "" {
 		return CredentialVersion{}, fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
 	}
-	fi, err := os.Stat(credentialPath(storageDir))
+	path := credentialPath(storageDir)
+	fi, err := os.Stat(path)
 	if err != nil {
 		return CredentialVersion{}, err
 	}
-	return versionOf(fi), nil
+	return versionOf(path, fi), nil
 }
 
-func versionOf(fi os.FileInfo) CredentialVersion {
+func versionOf(path string, fi os.FileInfo) CredentialVersion {
 	// Normalise to wall-clock UTC so == compares the instant, not the
 	// location or a monotonic reading.
-	return CredentialVersion{ModTime: fi.ModTime().UTC().Round(0), Size: fi.Size()}
+	return CredentialVersion{ModTime: fi.ModTime().UTC().Round(0), Size: fi.Size(), id: fileIdentity(path, fi)}
 }
 
 // ErrHeldNotExportable is returned when the held certificate's key is
@@ -148,6 +163,6 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		KeyPEM:   pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
 		NotAfter: cred.NotAfter,
 		Serial:   cred.Serial,
-		Version:  versionOf(fi),
+		Version:  versionOf(credentialPath(storageDir), fi),
 	}, nil
 }

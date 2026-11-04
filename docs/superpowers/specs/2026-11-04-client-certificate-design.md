@@ -55,7 +55,7 @@ client_cert:
   enabled: false          # default
   pki_mount: pki          # default: vault.mtls.pki_mount if set, else "pki"
   pki_role: user-client   # default: vault.mtls.pki_role; required if still empty and an ephemeral cert may be needed
-  common_name: "{{.vault_username}}"
+  common_name: "{{.token_username}}"
   ttl: 5m
 ```
 
@@ -83,9 +83,13 @@ client_cert:
 
 Decided with the owner after the builder check: the default common name is the **Vault identity** of the token, not the local OS account. On a borrowing remote the OS account (`ubuntu`, `ec2-user`) is often not the person, and the far-end service identifies the user by this name. A PKI role that restricts names to the token's identity would refuse an OS-account name on every such remote.
 
-- `common_name` is a template with two variables: `{{.vault_username}}` (the token's username, resolved the way the Copy engine resolves `{{.user}}`: `token_meta_username` from `LookupSelf`) and `{{.os_user}}` (`paths.Username()`). The default is `{{.vault_username}}`.
-- If the token carries no username metadata, signing fails with an error that names the cause and suggests `{{.os_user}}`. It never falls back silently to the OS name, because the service would then see a different person.
-- *(my call)* `{{.user}}` is not accepted in `client_cert.common_name`, because it means the OS account in `vault.mtls` and the Vault username in the Copy engine. Config load rejects it with a message naming the two explicit variables.
+- `common_name` is a template with two variables: `{{.token_username}}` and `{{.os_user}}` (`paths.Username()`). The default is `{{.token_username}}`.
+- `{{.token_username}}` comes from `LookupSelf` on the token being used to sign: `data.meta.username`, which the LDAP and userpass auth methods set and an OIDC role can set through `claim_mappings`. It is looked up once per token and cached against that token's value. *Correction found while planning:* nothing in dotvault reads the token's username today. The SSH agent's `{{.vault_username}}` and the Copy engine's `{{.user}}` both expand to the local OS account, whatever their names suggest. So this lookup is new code, and the variable is deliberately **not** called `vault_username`, which would mean the opposite of what it means in `agent.keys[].principals`.
+- *(my call)* Two existing token shapes would otherwise always fail the default, so both are handled:
+  - **Downscoped tokens** (`vault.policies` / `no_default_policy`): a child token from `auth/token/create` carries no `meta` of its own. `vault.Client.CreateChildToken` gains a `meta map[string]string` parameter, and `auth.Downscope` passes the parent's `meta`, read with one `LookupSelf` on the isolated sibling client. Borrowed tokens are downscoped workstation tokens, so this is what makes the motivating case work once the workstation runs a build that carries it.
+  - **Cert-auth tokens** (`mtls+tpm` / `mtls+os` falling back to an ephemeral certificate): the cert method sets `meta.common_name`, not `meta.username`. `{{.token_username}}` reads `meta.username` first, then `meta.common_name`.
+- If the token carries no `meta.username`, signing fails with an error that names the cause and suggests `{{.os_user}}`. It never falls back silently to the OS name, because the service would then see a different person. `display_name` (e.g. `ldap-gary`) is not used: it is prefixed by the auth mount and is not a stable identity.
+- *(my call)* `{{.user}}` and `{{.vault_username}}` are not accepted in `client_cert.common_name`, because each already means the OS account elsewhere. Config load rejects them with a message naming the two explicit variables.
 - The held-certificate path is unaffected: it serves whatever name `vault.mtls.common_name` produced.
 
 ## Constraints from the existing code

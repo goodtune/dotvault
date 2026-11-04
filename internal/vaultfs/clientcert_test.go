@@ -28,6 +28,7 @@ func TestCertErrno(t *testing.T) {
 		{"paced", fmt.Errorf("wrapped: %w", clientcert.ErrSignPaced), syscall.EAGAIN},
 		{"caller deadline while a sign is in flight", waited(context.DeadlineExceeded), syscall.EAGAIN},
 		{"caller cancelled while a sign is in flight", waited(context.Canceled), syscall.EINTR},
+		{"token replacement did not clear", fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, context.DeadlineExceeded), syscall.EAGAIN},
 		{"caller cancelled", context.Canceled, syscall.EINTR},
 		{"the sign itself timed out", fmt.Errorf("clientcert: sign via pki/sign/r: %w", context.DeadlineExceeded), syscall.EIO},
 		{"denied", errors.New("clientcert: sign via pki/sign/r: permission denied"), syscall.EIO},

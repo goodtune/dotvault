@@ -231,15 +231,18 @@ type certSchedule struct {
 //     d.certRetry, doubling to the ticker's cadence, but never past
 //     NotAfter (plus certTimerMin), so an expired pair is always replaced
 //     as soon as the source can sign again.
-//   - Failure the source expects to clear shortly (ErrSignPaced, or no
-//     token, whether the source or the driver noticed): d.certRetry.
+//   - Failure the source expects to clear shortly (ErrSignPaced, no token
+//     whether the source or the driver noticed, a token replacement still
+//     in progress, or this render's deadline running out while a sign was
+//     in flight): d.certRetry.
 //   - Any other failure, or no pair reported: the ordinary ticker cadence.
 func (d *Driver) nextCertRefresh(spec Spec, pair *clientcert.Pair, err error, s *certSchedule) (time.Duration, bool) {
 	if spec.ClientCert == ClientCertOff {
 		return 0, false
 	}
 	switch {
-	case err != nil && (errors.Is(err, clientcert.ErrSignPaced) || errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, ErrNoToken)):
+	case err != nil && (errors.Is(err, clientcert.ErrSignPaced) || errors.Is(err, clientcert.ErrNoToken) || errors.Is(err, ErrNoToken) ||
+		errors.Is(err, clientcert.ErrReauthInProgress) || errors.Is(err, clientcert.ErrSignInProgress)):
 		return d.certRetry, true
 	case err != nil, pair == nil:
 		return spec.TTL, true

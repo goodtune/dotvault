@@ -1,0 +1,230 @@
+package source
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	vaultapi "github.com/hashicorp/vault/api"
+
+	"github.com/goodtune/dotvault/internal/clientcert"
+)
+
+// stubGate is a ReauthGate a test opens and closes.
+type stubGate struct{ engaged atomic.Bool }
+
+func (g *stubGate) NeedsReauth() bool { return g.engaged.Load() }
+
+// recordingReporter is a RejectionReporter that keeps what it was told.
+type recordingReporter struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (r *recordingReporter) NotifyRejected(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.errs = append(r.errs, err)
+}
+
+func (r *recordingReporter) reported() []error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]error(nil), r.errs...)
+}
+
+func wire(t *testing.T, src clientcert.Source, g ReauthGate, r RejectionReporter) {
+	t.Helper()
+	w, ok := src.(LifecycleWirer)
+	if !ok {
+		t.Fatalf("%T does not accept the lifecycle seams", src)
+	}
+	if g != nil {
+		w.SetReauthGate(g)
+	}
+	if r != nil {
+		w.SetReauthReporter(r)
+	}
+}
+
+// A sign that would start while the token is being replaced waits for the
+// replacement, then signs with the token the client holds afterwards: the
+// token read before the wait is the one being replaced.
+func TestEphemeralWaitsOutTokenReplacement(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+
+	type result struct {
+		p   *clientcert.Pair
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		p, err := src.Current(context.Background())
+		done <- result{p, err}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	if n := f.signs.Load() + f.lookups.Load(); n != 0 {
+		t.Fatalf("Vault called %d times while the token was being replaced", n)
+	}
+	f.setToken("s.replacement")
+	g.engaged.Store(false)
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Current after the replacement: %v", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Current did not proceed once the replacement cleared")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.signTokens) != 1 || f.signTokens[0] != "s.replacement" {
+		t.Fatalf("signed with %q, want the replacement token", f.signTokens)
+	}
+}
+
+// A replacement that never clears is bounded, and its failure is transient:
+// ErrReauthInProgress, not a denial, and no Vault call was made.
+func TestEphemeralReplacementThatNeverClearsIsBounded(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	src.(*ephemeral).reauthWait = 200 * time.Millisecond
+	g := &stubGate{}
+	g.engaged.Store(true)
+	rep := &recordingReporter{}
+	wire(t, src, g, rep)
+
+	start := time.Now()
+	_, err := src.Current(context.Background())
+	if !errors.Is(err, clientcert.ErrReauthInProgress) {
+		t.Fatalf("err = %v, want ErrReauthInProgress", err)
+	}
+	var re *vaultapi.ResponseError
+	if errors.As(err, &re) {
+		t.Fatalf("err = %v carries a Vault response; want a transient error", err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("Current took %s, want it bounded by the wait", took)
+	}
+	if n := f.signs.Load() + f.lookups.Load(); n != 0 {
+		t.Fatalf("Vault called %d times", n)
+	}
+	if got := rep.reported(); len(got) != 0 {
+		t.Fatalf("reported %v; a wait that timed out is not a rejection", got)
+	}
+}
+
+// The wait never exceeds the sign's own detached timeout.
+func TestEphemeralReauthWaitDefaultsToSignTimeout(t *testing.T) {
+	clock := newTestClock()
+	src := newSource(t, newFakeSigner(t, clock), defaultOptions(clock))
+	if got := src.(*ephemeral).reauthWait; got <= 0 || got > signTimeout {
+		t.Fatalf("reauthWait = %s, want positive and at most signTimeout (%s)", got, signTimeout)
+	}
+}
+
+// A cached certificate still inside its refresh window is served without
+// waiting: it needs no Vault call, so a replacement cannot affect it.
+func TestEphemeralFreshCacheDoesNotWaitOnReplacement(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	src := newSource(t, f, defaultOptions(clock))
+	if _, err := src.Current(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	g := &stubGate{}
+	g.engaged.Store(true)
+	wire(t, src, g, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := src.Current(ctx); err != nil {
+		t.Fatalf("cached Current during a replacement: %v", err)
+	}
+}
+
+func TestEphemeralReportsSignRejection(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	src := newSource(t, f, defaultOptions(clock))
+	rep := &recordingReporter{}
+	wire(t, src, nil, rep)
+
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the sign to fail")
+	}
+	got := rep.reported()
+	if len(got) != 1 {
+		t.Fatalf("reported %d times, want once", len(got))
+	}
+	var re *vaultapi.ResponseError
+	if !errors.As(got[0], &re) || re.StatusCode != 403 {
+		t.Fatalf("reported %v, want the 403", got[0])
+	}
+}
+
+func TestEphemeralReportsLookupRejection(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.lookupErr = forbidden()
+	src := newSource(t, f, defaultOptions(clock))
+	rep := &recordingReporter{}
+	wire(t, src, nil, rep)
+
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the lookup to fail")
+	}
+	if got := rep.reported(); len(got) != 1 {
+		t.Fatalf("reported %d times, want once", len(got))
+	}
+	if f.signs.Load() != 0 {
+		t.Fatal("signed after the lookup was rejected")
+	}
+}
+
+func TestEphemeralDoesNotReportOtherFailures(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(&vaultapi.ResponseError{StatusCode: 500, Errors: []string{"internal error"}})
+	src := newSource(t, f, defaultOptions(clock))
+	rep := &recordingReporter{}
+	wire(t, src, nil, rep)
+
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the sign to fail")
+	}
+	if got := rep.reported(); len(got) != 0 {
+		t.Fatalf("reported %v; a 500 is not a token rejection", got)
+	}
+}
+
+// The fallback source forwards the seams to the ephemeral source it holds.
+func TestFallbackAcceptsLifecycleSeams(t *testing.T) {
+	clock := newTestClock()
+	f := newFakeSigner(t, clock)
+	f.setSignErr(forbidden())
+	o := defaultOptions(clock)
+	src, err := NewFromParams(Params{Enabled: true, Held: true, Method: "mtls", StorageDir: t.TempDir(), Ephemeral: o}, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := &recordingReporter{}
+	wire(t, src, &stubGate{}, rep)
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the fallback sign to fail")
+	}
+	if got := rep.reported(); len(got) != 1 {
+		t.Fatalf("reported %d times through the fallback, want once", len(got))
+	}
+}

@@ -82,6 +82,8 @@ type fakeSigner struct {
 	onLookup func()
 	// gate, when set, holds every SignCSRWithToken until it is closed.
 	gate chan struct{}
+	// lookupErr, when set, is what LookupSelfWithToken returns.
+	lookupErr error
 }
 
 func newFakeSigner(t *testing.T, clock *testClock) *fakeSigner {
@@ -147,6 +149,9 @@ func (f *fakeSigner) LookupSelfWithToken(ctx context.Context, token string) (*va
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.lookupErr != nil {
+		return nil, f.lookupErr
+	}
 	data := map[string]any{}
 	if f.meta != nil {
 		data["meta"] = f.meta

@@ -127,3 +127,9 @@ var ErrNoUsername = errors.New("clientcert: the Vault token carries no username 
 // transient (the FUSE mount answers EAGAIN), unlike a sign that failed on its
 // own, which never wraps this sentinel.
 var ErrSignInProgress = errors.New("clientcert: still waiting on a certificate sign in progress")
+
+// ErrReauthInProgress is returned when a certificate had to be signed while
+// the daemon's Vault token was being replaced and the replacement did not
+// finish within the wait. It is transient (the FUSE mount answers EAGAIN) and
+// is not a Vault verdict: nothing was sent to Vault.
+var ErrReauthInProgress = errors.New("clientcert: the Vault token is being replaced; retry shortly")

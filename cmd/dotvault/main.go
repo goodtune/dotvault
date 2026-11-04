@@ -1492,6 +1492,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		agentSvc.Backend.SetReauthReporter(lm)
 	}
 
+	// The client certificate source takes the same two seams, for the same
+	// reasons: a sign that would start mid-replacement waits for it rather
+	// than presenting the token Vault just rejected, and a pki/sign (or the
+	// common-name lookup-self) refused with a 403 starts recovery now. Built
+	// before authentication like the agent's backend, so wired here.
+	wireClientCertLifecycle(certSrc, lm)
+
 	// Mount the filesystem now that we hold a Vault token: every read it
 	// serves is a Vault call, so a mount that came up first would answer
 	// errors to anything that happened to look at the directory. The agent

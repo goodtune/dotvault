@@ -1213,6 +1213,8 @@ func TestNextCertRefresh(t *testing.T) {
 		{"paced", with, nil, wrapped, certRetry, true},
 		{"source has no token", with, nil, clientcert.ErrNoToken, certRetry, true},
 		{"daemon has no token", with, nil, ErrNoToken, certRetry, true},
+		{"token being replaced", with, nil, fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, context.DeadlineExceeded), certRetry, true},
+		{"mount timed out waiting on a sign", with, nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.DeadlineExceeded), certRetry, true},
 		{"other failure", with, nil, errors.New("pki: permission denied"), with.TTL, true},
 		{"no pair reported", with, nil, nil, with.TTL, true},
 	} {

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 	"text/template/parse"
 	"time"
@@ -98,6 +99,14 @@ type ephemeral struct {
 	lastErr     error             // error of the most recent failed sign
 	failedToken [sha256.Size]byte // SHA-256 of the token the last failure used
 
+	// gate and reporter are the token-lifecycle seams (see lifecycle.go):
+	// a gateHolder and a reporterHolder, stored after construction because
+	// the lifecycle manager is built after the source.
+	gate, reporter atomic.Value
+	// reauthWait bounds the wait on gate before a sign; signTimeout unless a
+	// test shortens it.
+	reauthWait time.Duration
+
 	// testHookWait, when set, runs each time a caller is about to wait on a
 	// flight. Tests only; set before any concurrent use.
 	testHookWait func()
@@ -162,6 +171,7 @@ func NewEphemeral(s Signer, o EphemeralOptions) (clientcert.Source, error) {
 		cn:                 t,
 		needsTokenUsername: templateReads(t, "token_username"),
 		now:                now,
+		reauthWait:         signTimeout,
 	}, nil
 }
 
@@ -287,11 +297,20 @@ func backoffFor(n int) time.Duration {
 
 // run performs one sign for flight f. It is detached from the starting
 // caller's cancellation (that caller may give up while others still wait) but
-// keeps its values, and is bounded by signTimeout.
+// keeps its values. It first waits out a token replacement if one is in
+// flight (bounded by reauthWait), then signs under signTimeout: two budgets,
+// so a replacement that clears late still leaves the sign its full time. A
+// token rejection from Vault is reported to the lifecycle manager.
 func (e *ephemeral) run(parent context.Context, f *flight) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), signTimeout)
-	defer cancel()
-	pair, err := e.sign(ctx, f.token)
+	base := context.WithoutCancel(parent)
+	var pair *clientcert.Pair
+	token, err := e.awaitReplacement(base, f)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(base, signTimeout)
+		pair, err = e.sign(ctx, token)
+		cancel()
+		e.reportRejection(err)
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -306,7 +325,11 @@ func (e *ephemeral) run(parent context.Context, f *flight) {
 		e.retryAt = e.now().Add(backoffFor(e.failures))
 		e.lastErr = err
 		e.failedToken = f.tokenHash
-		e.warnLocked(err)
+		if !errors.Is(err, clientcert.ErrNoToken) {
+			// The replacement ended with no token: not a sign failure,
+			// and the caller's error says so, as in Current.
+			e.warnLocked(err)
+		}
 	}
 	e.inflight = nil
 	f.pair, f.err = pair, err

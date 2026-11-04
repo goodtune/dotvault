@@ -170,3 +170,56 @@ func TestWarnInheritedClientCertRole(t *testing.T) {
 		t.Errorf("a dedicated role still warned: %q", out)
 	}
 }
+
+// lifecycleStub is what the daemon wires into the certificate source: the
+// lifecycle manager's gate and its rejection report.
+type lifecycleStub struct {
+	reported []error
+}
+
+func (l *lifecycleStub) NeedsReauth() bool        { return false }
+func (l *lifecycleStub) NotifyRejected(err error) { l.reported = append(l.reported, err) }
+
+// deniedSigner holds a token and has every sign refused with a 403.
+type deniedSigner struct{}
+
+func (deniedSigner) Token() string { return "s.token" }
+func (deniedSigner) LookupSelfWithToken(context.Context, string) (*vaultapi.Secret, error) {
+	return &vaultapi.Secret{Data: map[string]any{"meta": map[string]any{"username": "gary"}}}, nil
+}
+func (deniedSigner) SignCSRWithToken(context.Context, string, string, string, string, string, string) (*vault.IssuedCert, error) {
+	return nil, &vaultapi.ResponseError{StatusCode: 403, Errors: []string{"permission denied"}}
+}
+
+// The daemon wires its lifecycle manager into the certificate source the way
+// it does the SSH agent's, so a sign Vault refuses with a 403 starts token
+// recovery at once instead of at the lifecycle manager's next poll.
+func TestWireClientCertLifecycleReportsRejection(t *testing.T) {
+	cfg := &config.Config{
+		Vault:      config.VaultConfig{AuthMethod: "oidc"},
+		ClientCert: config.ClientCertConfig{Enabled: true, PKIRole: "client", KeyType: "ec", TTL: 5 * time.Minute},
+	}
+	src := newClientCertSource(cfg, deniedSigner{}, "gary")
+	if src == nil {
+		t.Fatal("source not built")
+	}
+	lm := &lifecycleStub{}
+	wireClientCertLifecycle(src, lm)
+	if _, err := src.Current(context.Background()); err == nil {
+		t.Fatal("expected the sign to be refused")
+	}
+	if len(lm.reported) != 1 {
+		t.Fatalf("reported %d rejections, want 1", len(lm.reported))
+	}
+}
+
+func TestWireClientCertLifecycleToleratesNilAndHeld(t *testing.T) {
+	wireClientCertLifecycle(nil, &lifecycleStub{})
+	cfg := &config.Config{
+		Vault:      config.VaultConfig{AuthMethod: "mtls"},
+		ClientCert: config.ClientCertConfig{Enabled: true, KeyType: "ec"},
+	}
+	if src := newClientCertSource(cfg, forbiddenSigner{t}, "gary"); src != nil {
+		wireClientCertLifecycle(src, &lifecycleStub{})
+	}
+}

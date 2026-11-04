@@ -61,6 +61,27 @@ func newClientCertSource(cfg *config.Config, signer source.Signer, username stri
 	return src
 }
 
+// clientCertLifecycle is what the daemon's lifecycle manager offers the
+// certificate source: the gate a sign waits on while the token is being
+// replaced, and the report of a token rejection the sign saw first.
+// *auth.LifecycleManager satisfies it.
+type clientCertLifecycle interface {
+	source.ReauthGate
+	source.RejectionReporter
+}
+
+// wireClientCertLifecycle hands the lifecycle manager to the certificate
+// source once it exists, which is after the source: the source is built
+// before authentication so the Docker plugin can serve from the start. It
+// mirrors the SSH agent's SetReauthGate/SetReauthReporter pair, and is a no-op
+// for a nil source or one that signs nothing (the held source alone).
+func wireClientCertLifecycle(src clientcert.Source, lm clientCertLifecycle) {
+	if w, ok := src.(source.LifecycleWirer); ok {
+		w.SetReauthGate(lm)
+		w.SetReauthReporter(lm)
+	}
+}
+
 // printClientCertStatus renders the client certificate section of `dotvault
 // status`.
 //

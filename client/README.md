@@ -165,9 +165,13 @@ The KV v2 mount and user prefix come from dotvault's config (`vault.kv_mount`, d
 
 Vault namespaces are not a dotvault config field; the underlying client honours `VAULT_NAMESPACE`.
 
+## Reading a whole secret
+
+When you don't know a secret's field names in advance (one field per workspace, say), `ReadUserSecretFields(ctx, service)` returns every field of `kv/users/<user>/<service>`, stringified as `ReadUserSecret` stringifies one; `ReadKVFields(ctx, mount, path)` is the non-standard-layout form. A missing secret is `(nil, false, nil)`. Depend on the `FieldsReader` interface for it (both forms). It is deliberately separate from `Reader`, so a `Reader` fake needs no new method; a consumer that wants both embeds them, `interface{ client.Reader; client.FieldsReader }`. The mount caveat in `ReadKVField`'s godoc applies here too.
+
 ## Testing on the consumer side
 
-The package ships `client.Reader`, a narrow interface covering the read side (`IdentityName`, `ReadKVField`, `ReadUserSecret`) that `*client.Client` satisfies. Depend on `client.Reader` wherever your code consumes a secret, and substitute a hand-written fake in tests — no live Vault, no network. See the runnable `ExampleReader` in `example_test.go` for a ~15-line fake.
+The package ships `client.Reader`, a narrow interface covering the read side (`IdentityName`, `ReadKVField`, `ReadUserSecret`) that `*client.Client` satisfies. Depend on `client.Reader` wherever your code consumes a secret, and substitute a hand-written fake in tests — no live Vault, no network. See the runnable `ExampleReader` in `example_test.go` for a ~15-line fake. Code that reads whole secrets depends on `client.FieldsReader` and fakes it the same way.
 
 Authentication is intentionally left out of `Reader`: it has side effects (token-file writes, browser/terminal interaction) that belong in `main`, not in the unit under test. Construct and authenticate a real `*client.Client` at startup; pass it (as a `Reader`) into the code that reads.
 

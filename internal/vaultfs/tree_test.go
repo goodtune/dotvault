@@ -1,11 +1,18 @@
 package vaultfs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/clientcert"
 )
 
 func testTree(t *testing.T, store Store, rw bool, ttl time.Duration) *Tree {
@@ -334,5 +341,367 @@ func TestNewStoreRejectsAnEscapingIdentity(t *testing.T) {
 				t.Error("NewStore accepted an identity that escapes the user's prefix")
 			}
 		})
+	}
+}
+
+// fakeCertSource is a clientcert.Source whose pair (or error) a test swaps at
+// will, counting how often it was asked.
+type fakeCertSource struct {
+	mu    sync.Mutex
+	pair  *clientcert.Pair
+	err   error
+	calls int
+}
+
+func (f *fakeCertSource) Current(context.Context) (*clientcert.Pair, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.pair, nil
+}
+
+func (f *fakeCertSource) set(p *clientcert.Pair, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pair, f.err = p, err
+}
+
+func (f *fakeCertSource) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// testPair builds a pair whose PEM bytes are recognisable by tag, so a test
+// can tell which pair a file came from. The bytes are not real certificates:
+// the tree never parses them.
+func testPair(tag string) *clientcert.Pair {
+	nb := time.Date(2026, 11, 4, 9, 0, 0, 0, time.UTC)
+	return &clientcert.Pair{
+		CertPEM:    []byte("-----BEGIN CERTIFICATE-----\n" + tag + "-cert\n-----END CERTIFICATE-----\n"),
+		KeyPEM:     []byte("-----BEGIN PRIVATE KEY-----\n" + tag + "-key\n-----END PRIVATE KEY-----\n"),
+		NotBefore:  nb,
+		NotAfter:   nb.Add(5 * time.Minute),
+		RefreshAt:  nb.Add(150 * time.Second),
+		Serial:     tag,
+		CommonName: "gary",
+		Source:     clientcert.SourceEphemeral,
+	}
+}
+
+func certTree(t *testing.T, store Store, rw bool, ttl time.Duration, src clientcert.Source) *Tree {
+	t.Helper()
+	tree := NewTree(store, rw, ttl)
+	tree.SetClientCert(src)
+	return tree
+}
+
+func TestIsClientCertPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		ClientCertFile:          true,
+		ClientKeyFile:           true,
+		ClientPEMFile:           true,
+		"sub/" + ClientCertFile: false,
+		"client.crt.json":       false,
+		"client":                false,
+		"":                      false,
+	} {
+		if got := IsClientCertPath(p); got != want {
+			t.Errorf("IsClientCertPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestTreeRootListsClientCertFiles(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	src := &fakeCertSource{pair: testPair("A")}
+	tree := certTree(t, store, false, 0, src)
+
+	entries, err := tree.Readdir(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Readdir: %v", err)
+	}
+	want := []Entry{
+		{Name: ClientCertFile, Kind: KindFile},
+		{Name: ClientKeyFile, Kind: KindFile},
+		{Name: ClientPEMFile, Kind: KindFile},
+		{Name: "gh.json", Kind: KindFile},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("entries = %v, want %v", entries, want)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Errorf("entries[%d] = %v, want %v", i, entries[i], want[i])
+		}
+	}
+	// Listing must not sign anything: an `ls` is not a reason to reach PKI.
+	if n := src.count(); n != 0 {
+		t.Errorf("Readdir asked the source %d times, want 0", n)
+	}
+
+	// Lookup answers the certificate names before any Vault call, so they
+	// resolve even when the root cannot be listed.
+	store.mu.Lock()
+	store.listErr = errors.New("permission denied")
+	store.mu.Unlock()
+	tree.InvalidateAll()
+	listsBefore, readsBefore, _, _ := store.counts()
+	for _, name := range []string{ClientCertFile, ClientKeyFile, ClientPEMFile} {
+		kind, err := tree.Lookup(context.Background(), "", name)
+		if err != nil || kind != KindFile {
+			t.Errorf("Lookup(%s) = %v, %v; want file", name, kind, err)
+		}
+	}
+	if lists, reads, _, _ := store.counts(); lists != listsBefore || reads != readsBefore {
+		t.Errorf("Lookup of certificate names reached the store: %d lists, %d reads", lists-listsBefore, reads-readsBefore)
+	}
+}
+
+func TestTreeClientCertAbsentWithoutSource(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	tree := testTree(t, store, true, 0)
+
+	entries, err := tree.Readdir(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Readdir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "gh.json" {
+		t.Errorf("entries = %v, want only gh.json", entries)
+	}
+	for _, name := range []string{ClientCertFile, ClientKeyFile, ClientPEMFile} {
+		if kind, err := tree.Lookup(context.Background(), "", name); err != nil || kind != KindNone {
+			t.Errorf("Lookup(%s) = %v, %v; want none", name, kind, err)
+		}
+		if doc, err := tree.Document(context.Background(), name); err != nil || doc != nil {
+			t.Errorf("Document(%s) = %v, %v; want nil, nil", name, doc, err)
+		}
+	}
+}
+
+func TestTreeClientCertDocumentsShareOnePair(t *testing.T) {
+	pair := testPair("A")
+	tree := certTree(t, newMemStore(), false, 0, &fakeCertSource{pair: pair})
+	ctx := context.Background()
+
+	crt, err := tree.Document(ctx, ClientCertFile)
+	if err != nil || crt == nil {
+		t.Fatalf("Document(crt) = %v, %v", crt, err)
+	}
+	key, err := tree.Document(ctx, ClientKeyFile)
+	if err != nil || key == nil {
+		t.Fatalf("Document(key) = %v, %v", key, err)
+	}
+	pem, err := tree.Document(ctx, ClientPEMFile)
+	if err != nil || pem == nil {
+		t.Fatalf("Document(pem) = %v, %v", pem, err)
+	}
+
+	if !bytes.Equal(crt.Bytes, pair.CertPEM) {
+		t.Errorf("client.crt = %q, want the pair's CertPEM", crt.Bytes)
+	}
+	if !bytes.Equal(key.Bytes, pair.KeyPEM) {
+		t.Errorf("client.key = %q, want the pair's KeyPEM", key.Bytes)
+	}
+	if want := append(append([]byte(nil), crt.Bytes...), key.Bytes...); !bytes.Equal(pem.Bytes, want) {
+		t.Errorf("client.pem = %q, want crt followed by key", pem.Bytes)
+	}
+	for name, doc := range map[string]*Document{"crt": crt, "key": key, "pem": pem} {
+		if !doc.ModTime.Equal(pair.NotBefore) {
+			t.Errorf("%s ModTime = %s, want NotBefore %s", name, doc.ModTime, pair.NotBefore)
+		}
+		if doc.Version != 0 {
+			t.Errorf("%s Version = %d, want 0", name, doc.Version)
+		}
+	}
+
+	// The documents must not alias the shared pair: a consumer mutating its
+	// bytes would otherwise corrupt every other reader's view.
+	crt.Bytes[0] = 'X'
+	if pair.CertPEM[0] == 'X' {
+		t.Error("client.crt document aliases the pair's CertPEM")
+	}
+}
+
+func TestTreeClientCertBypassesCache(t *testing.T) {
+	store := newMemStore()
+	src := &fakeCertSource{pair: testPair("A")}
+	tree := certTree(t, store, false, 30*time.Second, src)
+	ctx := context.Background()
+
+	first, err := tree.Document(ctx, ClientPEMFile)
+	if err != nil || first == nil {
+		t.Fatalf("Document #1 = %v, %v", first, err)
+	}
+	src.set(testPair("BB"), nil)
+	second, err := tree.Document(ctx, ClientPEMFile)
+	if err != nil || second == nil {
+		t.Fatalf("Document #2 = %v, %v", second, err)
+	}
+
+	if !bytes.Contains(first.Bytes, []byte("A-cert")) {
+		t.Errorf("first read = %q, want pair A", first.Bytes)
+	}
+	if !bytes.Contains(second.Bytes, []byte("BB-cert")) {
+		t.Errorf("second read = %q, want pair B despite a 30s cache", second.Bytes)
+	}
+	if n := src.count(); n != 2 {
+		t.Errorf("source asked %d times, want 2 (once per Document)", n)
+	}
+	if _, reads, _, _ := store.counts(); reads != 0 {
+		t.Errorf("certificate reads reached the store %d times, want 0", reads)
+	}
+}
+
+func TestTreeClientCertReadOnlyOnReadWriteMount(t *testing.T) {
+	store := newMemStore()
+	tree := certTree(t, store, true, 0, &fakeCertSource{pair: testPair("A")})
+	ctx := context.Background()
+
+	for _, name := range []string{ClientCertFile, ClientKeyFile, ClientPEMFile} {
+		if err := tree.Put(ctx, name, []byte(`{"a":"1"}`)); !errors.Is(err, ErrReadOnly) {
+			t.Errorf("Put(%s) error = %v, want ErrReadOnly", name, err)
+		}
+		if err := tree.Remove(ctx, name); !errors.Is(err, ErrReadOnly) {
+			t.Errorf("Remove(%s) error = %v, want ErrReadOnly", name, err)
+		}
+	}
+	if _, _, writes, deletes := store.counts(); writes != 0 || deletes != 0 {
+		t.Errorf("certificate mutations reached the store: %d writes, %d deletes", writes, deletes)
+	}
+}
+
+func TestTreeClientCertWinsCollision(t *testing.T) {
+	store := newMemStore()
+	store.put("client.crt/child", map[string]any{"a": "1"})
+	store.put("gh", map[string]any{"a": "1"})
+	tree := certTree(t, store, false, 0, &fakeCertSource{pair: testPair("A")})
+
+	entries, err := tree.Readdir(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Readdir: %v", err)
+	}
+	var found int
+	for _, e := range entries {
+		if e.Name == ClientCertFile {
+			found++
+			if e.Kind != KindFile {
+				t.Errorf("%s listed as %v, want the certificate file", e.Name, e.Kind)
+			}
+		}
+	}
+	if found != 1 {
+		t.Errorf("%s appears %d times in %v, want once", ClientCertFile, found, entries)
+	}
+	if kind, err := tree.Lookup(context.Background(), "", ClientCertFile); err != nil || kind != KindFile {
+		t.Errorf("Lookup(%s) = %v, %v; want file", ClientCertFile, kind, err)
+	}
+}
+
+func TestTreeClientCertNotAtDepth(t *testing.T) {
+	store := newMemStore()
+	store.put("sub/gh", map[string]any{"a": "1"})
+	src := &fakeCertSource{pair: testPair("A")}
+	tree := certTree(t, store, true, 0, src)
+	ctx := context.Background()
+
+	entries, err := tree.Readdir(ctx, "sub")
+	if err != nil {
+		t.Fatalf("Readdir(sub): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "gh.json" {
+		t.Errorf("Readdir(sub) = %v, want only gh.json", entries)
+	}
+	if kind, err := tree.Lookup(ctx, "sub", ClientCertFile); err != nil || kind != KindNone {
+		t.Errorf("Lookup(sub, %s) = %v, %v; want none", ClientCertFile, kind, err)
+	}
+	if doc, err := tree.Document(ctx, "sub/"+ClientCertFile); err != nil || doc != nil {
+		t.Errorf("Document(sub/%s) = %v, %v; want nil, nil", ClientCertFile, doc, err)
+	}
+	// At depth the name is ordinary: a mutation is refused for its missing
+	// extension, not for being a certificate.
+	if err := tree.Put(ctx, "sub/"+ClientCertFile, []byte(`{"a":"1"}`)); !errors.Is(err, ErrInvalidName) {
+		t.Errorf("Put(sub/%s) error = %v, want ErrInvalidName", ClientCertFile, err)
+	}
+	if n := src.count(); n != 0 {
+		t.Errorf("source asked %d times for paths below the root, want 0", n)
+	}
+}
+
+func TestTreeClientCertSourceError(t *testing.T) {
+	src := &fakeCertSource{pair: testPair("A")}
+	tree := certTree(t, newMemStore(), false, 0, src)
+	ctx := context.Background()
+
+	// A successful read first, so a message that leaked a previously served
+	// pair would have something to leak.
+	if _, err := tree.Document(ctx, ClientPEMFile); err != nil {
+		t.Fatalf("Document: %v", err)
+	}
+	src.set(nil, clientcert.ErrNoToken)
+	doc, err := tree.Document(ctx, ClientPEMFile)
+	if doc != nil {
+		t.Errorf("doc = %v, want nil on a source error", doc)
+	}
+	if !errors.Is(err, clientcert.ErrNoToken) {
+		t.Fatalf("error = %v, want it to wrap clientcert.ErrNoToken", err)
+	}
+	if strings.Contains(err.Error(), "BEGIN") {
+		t.Errorf("error %q carries PEM", err)
+	}
+
+	// A source that returns neither a pair nor an error is a bug in the
+	// source, reported as an error rather than a nil dereference.
+	src.set(nil, nil)
+	if _, err := tree.Document(ctx, ClientCertFile); err == nil {
+		t.Error("Document with a nil pair returned no error")
+	}
+}
+
+func TestCertFailureLogRateLimited(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	l := &certFailureLog{now: func() time.Time { return now }}
+	if !l.shouldLog("denied") {
+		t.Fatal("the first occurrence must be logged")
+	}
+	for range 100 {
+		if l.shouldLog("denied") {
+			t.Fatal("a repeat inside the interval was logged")
+		}
+	}
+	if !l.shouldLog("sealed") {
+		t.Fatal("a different error must be logged at once")
+	}
+	now = now.Add(certFailureLogInterval)
+	if !l.shouldLog("denied") {
+		t.Fatal("a persistent failure must be logged again after the interval")
+	}
+}
+
+func TestLogCertFailureNamesTheCause(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	saved := certFailures
+	certFailures = &certFailureLog{now: time.Now}
+	t.Cleanup(func() { certFailures = saved })
+
+	cause := errors.New("clientcert: sign via pki/sign/tools: Code: 403. permission denied")
+	err := fmt.Errorf("client certificate for %q: %w", ClientPEMFile, cause)
+	for range 50 {
+		logCertFailure("getattr", ClientPEMFile, err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "level=WARN"); n != 1 {
+		t.Fatalf("WARN lines = %d for 50 identical failures, want 1:\n%s", n, out)
+	}
+	if !strings.Contains(out, "pki/sign/tools") || !strings.Contains(out, "403") {
+		t.Fatalf("the log line does not name the role and Vault's answer:\n%s", out)
 	}
 }

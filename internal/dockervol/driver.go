@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/goodtune/dotvault/internal/vaultfs"
 )
@@ -45,6 +46,10 @@ type Options struct {
 	// not, and the event watcher waits for one before subscribing. Nil
 	// means "always".
 	HasToken func() bool
+	// ClientCert supplies the client certificate for volumes created with
+	// the client_cert option. Nil means the feature is not enabled, and such
+	// a volume cannot be created or refreshed.
+	ClientCert clientcert.Source
 }
 
 // Timeouts bounding the Vault work behind one request or one refresh. A
@@ -62,6 +67,10 @@ type Driver struct {
 	store  vaultfs.Store
 	events EventSource
 	now    func() time.Time
+	// jitter and certRetry pace the client certificate timer (see
+	// nextCertRefresh); fields so a test can fix them per driver.
+	jitter    func(bound time.Duration) time.Duration
+	certRetry time.Duration
 
 	// ctx is the lifetime context Run was given; volume loops derive from
 	// it. Background until Run starts, which is also when volumes can first
@@ -147,12 +156,14 @@ func New(opts Options, store vaultfs.Store, events EventSource) (*Driver, error)
 		return nil, fmt.Errorf("dockervol: default ttl must be positive")
 	}
 	d := &Driver{
-		opts:    opts,
-		store:   store,
-		events:  events,
-		now:     time.Now,
-		ctx:     context.Background(),
-		volumes: map[string]*volume{},
+		opts:      opts,
+		store:     store,
+		events:    events,
+		now:       time.Now,
+		jitter:    defaultJitter,
+		certRetry: defaultCertRetry,
+		ctx:       context.Background(),
+		volumes:   map[string]*volume{},
 	}
 	if err := d.load(); err != nil {
 		return nil, err
@@ -195,6 +206,9 @@ func (d *Driver) Create(name string, opts map[string]string) error {
 	spec, err := ParseOptions(opts, d.opts.DefaultTTL)
 	if err != nil {
 		return err
+	}
+	if spec.ClientCert != ClientCertOff && d.opts.ClientCert == nil {
+		return errors.New(errClientCertDisabled)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -262,6 +276,7 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 
 	dir := d.volumePath(name)
 	populated := false
+	var pair *clientcert.Pair
 	if !active {
 		defer func() {
 			d.mu.Lock()
@@ -282,13 +297,17 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 	if !active {
 		// Only the first mount needs Vault: a container joining a volume
 		// that is already materialised gets the files that exist, whatever
-		// the daemon's token is doing at that moment.
-		if !d.hasToken() {
+		// the daemon's token is doing at that moment. A client_cert=only
+		// volume reads no secrets, so it needs no token of the daemon's
+		// own; its source reports clientcert.ErrNoToken if it needs one.
+		if v.Spec.ClientCert != ClientCertOnly && !d.hasToken() {
 			return "", ErrNoToken
 		}
 		ctx, cancel := context.WithTimeout(ctx, mountTimeout)
 		defer cancel()
-		n, err := materialise(ctx, d.store, dir, v.Spec)
+		var n int
+		var err error
+		n, pair, err = materialise(ctx, d.store, d.opts.ClientCert, dir, v.Spec)
 		d.recordRefresh(v, n, err)
 		if err != nil {
 			return "", fmt.Errorf("populate volume %q: %w", name, err)
@@ -314,7 +333,7 @@ func (d *Driver) Mount(ctx context.Context, name, id string) (string, error) {
 		// last Unmount that raced this call and may already have wiped the
 		// directory — in which case the new loop must render immediately.
 		// So must one whose render raced a Vault event.
-		d.startLoopLocked(v, !populated || v.pendingEvent)
+		d.startLoopLocked(v, !populated || v.pendingEvent, pair)
 	}
 	v.pendingEvent = false
 	slog.Info("docker volume mounted", "volume", name, "mounts", len(v.Mounts), "secrets", v.secrets)
@@ -404,6 +423,7 @@ const (
 	StatusLastError   = "last_error"
 	StatusSelection   = "selection"
 	StatusEventsError = "events_error"
+	StatusClientCert  = "client_cert"
 )
 
 func (d *Driver) infoLocked(v *volume) VolumeInfo {
@@ -415,7 +435,12 @@ func (d *Driver) infoLocked(v *volume) VolumeInfo {
 		StatusMounts:  len(v.Mounts),
 		StatusRefresh: d.refreshModeLocked(),
 	}
-	if len(v.Spec.Secrets) > 0 {
+	if v.Spec.ClientCert != ClientCertOff {
+		status[StatusClientCert] = string(v.Spec.ClientCert)
+	}
+	if v.Spec.ClientCert == ClientCertOnly {
+		status[StatusSelection] = "none"
+	} else if len(v.Spec.Secrets) > 0 {
 		status[StatusSelection] = append([]string(nil), v.Spec.Secrets...)
 	} else {
 		status[StatusSelection] = "all"

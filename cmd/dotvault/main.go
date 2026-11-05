@@ -24,6 +24,7 @@ import (
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/goodtune/dotvault/internal/agent"
 	"github.com/goodtune/dotvault/internal/auth"
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
@@ -422,6 +423,7 @@ type staticSections struct {
 	API           config.APIConfig
 	FUSE          config.FUSEConfig
 	Docker        config.DockerConfig
+	ClientCert    config.ClientCertConfig
 	Observability config.ObservabilityConfig
 	HeadersDigest [sha256.Size]byte
 	Bypass        bool
@@ -435,6 +437,7 @@ func staticSectionsOf(c *config.Config) staticSections {
 		API:           c.API,
 		FUSE:          c.FUSE,
 		Docker:        c.Docker,
+		ClientCert:    c.ClientCert,
 		Observability: c.Observability,
 		HeadersDigest: digestObservabilityHeaders(c.Observability),
 		Bypass:        c.BypassSystemConfig,
@@ -544,6 +547,9 @@ func changedStaticSections(a, b staticSections) []string {
 	}
 	if !reflect.DeepEqual(a.Docker, b.Docker) {
 		out = append(out, "docker")
+	}
+	if !reflect.DeepEqual(a.ClientCert, b.ClientCert) {
+		out = append(out, "client_cert")
 	}
 	if !reflect.DeepEqual(a.Observability, b.Observability) || a.HeadersDigest != b.HeadersDigest {
 		out = append(out, "observability")
@@ -1180,6 +1186,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Build the client certificate source once, for both the Docker volume
+	// plugin below and the FUSE mount after authentication, so a certificate
+	// signed for one is the one the other serves. Safe before auth: it signs
+	// lazily and reports clientcert.ErrNoToken until the client holds a
+	// token. Never fatal; nil when client_cert is off or cannot be built.
+	certSrc := buildClientCertSource(cfg, vc, username)
+	if certSrc != nil && webServer != nil {
+		webServer.SetClientCertStatus(func() clientcert.Status { return clientcert.StatusOf(certSrc) })
+	}
+
 	// Serve the Docker volume plugin, before authentication for the same
 	// reason the agent and HTTP listeners start here: the engine's
 	// bookkeeping calls (`docker volume ls`, `create`, `inspect`) need no
@@ -1187,7 +1203,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// the driver with a message naming the cause rather than by an absent
 	// socket the engine reports as "plugin not found". Never fatal — see
 	// startDockerVolumes.
-	dockerDriver := startDockerVolumes(ctx, cfg, dockerSocket, dockerVolumeDir, vc, username)
+	dockerDriver := startDockerVolumes(ctx, cfg, dockerSocket, dockerVolumeDir, vc, username, certSrc)
 	if dockerDriver != nil && webServer != nil {
 		webServer.SetDockerStatus(dockerDriver.Status)
 	}
@@ -1476,13 +1492,20 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		agentSvc.Backend.SetReauthReporter(lm)
 	}
 
+	// The client certificate source takes the same two seams, for the same
+	// reasons: a sign that would start mid-replacement waits for it rather
+	// than presenting the token Vault just rejected, and a pki/sign (or the
+	// common-name lookup-self) refused with a 403 starts recovery now. Built
+	// before authentication like the agent's backend, so wired here.
+	wireClientCertLifecycle(certSrc, lm)
+
 	// Mount the filesystem now that we hold a Vault token: every read it
 	// serves is a Vault call, so a mount that came up first would answer
 	// errors to anything that happened to look at the directory. The agent
 	// listener deliberately does not wait this way (it is already serving);
 	// the difference is that an agent has an honest empty answer and a
 	// filesystem has none. Never fatal — see startFUSE.
-	if fuseSvc := startFUSE(ctx, cfg, vc, username); fuseSvc != nil && webServer != nil {
+	if fuseSvc := startFUSE(ctx, cfg, vc, username, certSrc); fuseSvc != nil && webServer != nil {
 		webServer.SetFUSEStatus(fuseSvc.Status)
 	}
 
@@ -2028,6 +2051,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	printFUSEStatus(cfg)
 
 	printDockerStatus(ctx, cfg)
+
+	printClientCertStatus(cfg)
 
 	return nil
 }

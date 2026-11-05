@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	vaultapi "github.com/hashicorp/vault/api"
+
+	"github.com/goodtune/dotvault/internal/clientcert"
 )
 
 // Sentinel errors expose a small, stable set of failure categories so callers
@@ -84,6 +86,40 @@ var (
 	// invalid, which surfaces as a plain (uncategorised) error carrying the
 	// peer's message.
 	ErrPeerUnavailable = errors.New("dotvault: peer action unavailable")
+
+	// ErrNotConfigured indicates ClientCertificate or TLSConfig was asked for a
+	// client certificate this Config cannot produce: the client_cert section is
+	// disabled, or it is enabled but there is neither a PKI role to sign with
+	// nor a usable held certificate to serve. It is a configuration state, not
+	// a transient failure: retrying will not change it. Where there is an
+	// underlying cause (no certificate enrolled on this host, say) it is
+	// wrapped too, so errors.Is finds it.
+	ErrNotConfigured = errors.New("dotvault: client certificate not configured")
+
+	// ErrSignPaced indicates ClientCertificate (or a TLSConfig handshake)
+	// found no valid certificate cached and the next signing attempt is not
+	// due yet: signs with the same token are at least ten seconds apart, so a
+	// call arriving sooner — against a PKI role whose max_ttl is shorter than
+	// that, say — is answered without contacting Vault. A newly adopted token
+	// is not paced this way. It is transient: a later call succeeds or reports
+	// what signing actually returned. It is deliberately not one of the
+	// categories above, since it says nothing about Vault. During a failure
+	// backoff the error of the last failed signing is returned instead (a
+	// denial keeps reading as ErrDenied), so this is only seen when no
+	// failure is on record. It is the same value the daemon's sources use,
+	// so errors.Is matches whichever is compared.
+	ErrSignPaced = clientcert.ErrSignPaced
+
+	// ErrSignInProgress indicates ClientCertificate (or a TLSConfig
+	// handshake, whose own bound is 30 seconds) ran out of context while a
+	// certificate sign it was waiting on was still in flight. The sign is not
+	// abandoned: it carries on under its own timeout, and a later call is
+	// answered with its result instead of signing again, so the right
+	// response is to retry. The error also wraps the context's own error
+	// (context.DeadlineExceeded or context.Canceled). Like ErrSignPaced it is
+	// not one of the outcome categories above, since it says nothing about
+	// Vault, and it is the same value the daemon's sources use.
+	ErrSignInProgress = clientcert.ErrSignInProgress
 )
 
 // classify maps a raw Vault API error onto one of the sentinel categories.

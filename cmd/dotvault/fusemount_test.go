@@ -50,7 +50,7 @@ func TestStartFUSEIsNeverFatal(t *testing.T) {
 		Vault: config.VaultConfig{KVMount: "kv", UserPrefix: "users/"},
 		FUSE:  config.FUSEConfig{Enabled: true, Mountpoint: "/nonexistent/definitely/not/writable"},
 	}
-	if svc := startFUSE(t.Context(), cfg, nil, ""); svc != nil {
+	if svc := startFUSE(t.Context(), cfg, nil, "", nil); svc != nil {
 		t.Error("startFUSE returned a service for an unbuildable store")
 	}
 }

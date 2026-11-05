@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -74,7 +75,7 @@ func resolveDockerPlugin(cfg *config.Config) (socket, volumeDir string) {
 // for systemd activation is built from the same answer — and a plugin that
 // was kept but cannot be built drains its activated fd here, so an engine
 // never hangs on a socket nothing will serve.
-func startDockerVolumes(ctx context.Context, cfg *config.Config, socket, volumeDir string, vc *vault.Client, username string) *dockervol.Driver {
+func startDockerVolumes(ctx context.Context, cfg *config.Config, socket, volumeDir string, vc *vault.Client, username string, certSrc clientcert.Source) *dockervol.Driver {
 	if socket == "" {
 		return nil
 	}
@@ -98,6 +99,7 @@ func startDockerVolumes(ctx context.Context, cfg *config.Config, socket, volumeD
 		DefaultTTL: cfg.Docker.CacheTTL,
 		UserPrefix: vaultfs.UserRoot(cfg.Vault.UserPrefix, username),
 		HasToken:   func() bool { return vc.Token() != "" },
+		ClientCert: certSrc,
 	}, store, vc)
 	if err != nil {
 		slog.Warn("docker volume plugin not started", "error", err)

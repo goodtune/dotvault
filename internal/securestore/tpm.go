@@ -102,7 +102,7 @@ func (t *tpmStorage) Generate(kt KeyType, _ int, sealToPCRs bool) (crypto.Signer
 	if kt == KeyRSA {
 		return nil, nil, errors.New("securestore: the TPM backend supports key_type ec only (RSA does not fit a sealed-data object)")
 	}
-	signer, err := newSoftwareKey(KeyEC, 0)
+	signer, err := NewSoftwareKey(KeyEC, 0)
 	if err != nil {
 		return nil, nil, err
 	}

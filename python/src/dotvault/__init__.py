@@ -9,7 +9,8 @@ all come from the one canonical Go implementation rather than being re-derived
 in Python.
 
 The surface is the read-only + cached-auth subset of the Go facade, plus the
-socket-forwarded peer actions (``browse``/``notify``/``clipboard``):
+mutual-TLS ``client_certificate()`` and the socket-forwarded peer actions
+(``browse``/``notify``/``clipboard``):
 
     import dotvault
 
@@ -47,6 +48,7 @@ from ._errors import (
     Denied,
     DotvaultError,
     LoginRequired,
+    NotConfigured,
     PeerUnavailable,
     Unreachable,
     error_for,
@@ -61,6 +63,7 @@ __all__ = [
     "Denied",
     "Unreachable",
     "PeerUnavailable",
+    "NotConfigured",
     "__version__",
 ]
 
@@ -351,6 +354,49 @@ class Client:
             self._handle, _ffi.encode(text), _millis(timeout), byref(err)
         )
         _check(code, err)
+
+    def client_certificate(self, timeout: float | None = None) -> tuple[str, str]:
+        """Return the mutual-TLS client certificate as ``(cert_pem, key_pem)``.
+
+        ``cert_pem`` is the leaf certificate followed by its CA chain; ``key_pem``
+        is the PKCS#8 private key. This is the certificate the daemon serves
+        through the filesystem mount and Docker volumes: the one this host
+        already logs in to Vault with (plain ``mtls``), else a short-lived one
+        signed on demand by Vault's PKI engine and held only in memory. The same
+        value comes back until it is due for replacement, so it is cheap to call
+        again; call it again rather than holding the result for long.
+
+        It never prompts. Signing needs a Vault token, so when none is held the
+        call first tries the cached sources (token file, peer socket, enrolled
+        certificate) as :meth:`authenticate_cached` does.
+
+        **The key is a secret.** It lives in Python memory for as long as you
+        hold it (Python strings cannot be zeroed), so do not log it, include it
+        in an exception message, or write it anywhere world-readable.
+
+        Raises:
+            NotConfigured: The ``client_cert`` section is disabled, or has no PKI
+                role and no usable held certificate.
+            LoginRequired: Signing needs a token and none could be found.
+            Denied: Vault rejected the sign (401/403), typically a policy
+                without ``pki/sign``.
+            Unreachable: Vault could not be reached, or returned a 5xx.
+            DotvaultError: The client handle is invalid, or a signing attempt
+                came too soon after the last one (transient; retry).
+        """
+        self._require_open()
+        cert = c_void_p()
+        key = c_void_p()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_client_certificate(
+            self._handle, _millis(timeout), byref(cert), byref(key), byref(err)
+        )
+        # Free every out-string unconditionally (a NULL is a no-op) so neither
+        # the key nor the error leaks on any path.
+        cert_pem = _ffi.take_str(cert)
+        key_pem = _ffi.take_str(key)
+        _check(code, err)
+        return cert_pem or "", key_pem or ""
 
     def close(self) -> None:
         """Release the native handle. Idempotent; safe to call more than once."""

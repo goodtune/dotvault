@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
@@ -39,7 +40,11 @@ type fileEntry struct {
 // not been enrolled yet simply renders nothing for it, and a later refresh
 // picks it up — but a Vault failure is, because a refresh that silently
 // rendered half a volume would then prune the other half from disk.
-func render(ctx context.Context, store vaultfs.Store, spec Spec) (*rendered, error) {
+//
+// cert, when non-nil, adds the three client certificate files at the root
+// before the collision fold, so a KV entry of the same name loses to them.
+// ClientCertOnly selects no secrets, so the store is not consulted at all.
+func render(ctx context.Context, store vaultfs.Store, spec Spec, cert *clientcert.Pair) (*rendered, error) {
 	r := &rendered{files: map[string]fileEntry{}, dirs: map[string]bool{}}
 
 	var walk func(dir string) error
@@ -71,7 +76,7 @@ func render(ctx context.Context, store vaultfs.Store, spec Spec) (*rendered, err
 		return nil
 	}
 
-	if len(spec.Secrets) == 0 {
+	if len(spec.Secrets) == 0 && spec.ClientCert != ClientCertOnly {
 		if err := walk(""); err != nil {
 			return nil, err
 		}
@@ -88,6 +93,10 @@ func render(ctx context.Context, store vaultfs.Store, spec Spec) (*rendered, err
 		}
 	}
 
+	if cert != nil {
+		r.addClientCert(cert)
+	}
+
 	// A directory and a file cannot share a name. The extension makes the
 	// case rare in the JSON layout (only a KV folder itself named "x.json"
 	// collides with the secret "x"); in the fields layout a field collides
@@ -102,6 +111,41 @@ func render(ctx context.Context, store vaultfs.Store, spec Spec) (*rendered, err
 	return r, nil
 }
 
+// addClientCert adds the certificate files at the volume root. Only a KV
+// folder can claim one of these names (a secret renders as <name>.json or as
+// a directory), and the certificate wins over it: the operator asked for the
+// certificate explicitly, and a stray KV entry must not shadow it. The
+// folder and everything rendered beneath it are dropped, with one warning,
+// matching the mount's rule.
+func (r *rendered) addClientCert(cert *clientcert.Pair) {
+	for name, data := range map[string][]byte{
+		vaultfs.ClientCertFile: cert.CertPEM,
+		vaultfs.ClientKeyFile:  cert.KeyPEM,
+		vaultfs.ClientPEMFile:  cert.Combined(),
+	} {
+		if r.dirs[name] {
+			warnCertCollision(name)
+			r.dropDir(name)
+		}
+		r.files[name] = fileEntry{data: data, modTime: cert.NotBefore}
+	}
+}
+
+// dropDir removes dir and everything rendered beneath it.
+func (r *rendered) dropDir(dir string) {
+	prefix := dir + "/"
+	for p := range r.files {
+		if strings.HasPrefix(p, prefix) {
+			delete(r.files, p)
+		}
+	}
+	for p := range r.dirs {
+		if p == dir || strings.HasPrefix(p, prefix) {
+			delete(r.dirs, p)
+		}
+	}
+}
+
 // collisionWarned records the paths already warned about, so a collision
 // is logged once per process rather than on every refresh — the same
 // once-per-path rule vaultfs.Tree applies.
@@ -113,6 +157,17 @@ func warnCollision(p string) {
 	}
 	slog.Warn("dockervol: a directory and a file claim the same name; the file is not written",
 		"path", displayPath(p))
+}
+
+// warnCertCollision is warnCollision for the certificate case, where the
+// outcome is the other way round: the certificate file is written and the
+// KV folder of the same name, with everything beneath it, is not.
+func warnCertCollision(name string) {
+	if _, seen := collisionWarned.LoadOrStore("client_cert:"+name, struct{}{}); seen {
+		return
+	}
+	slog.Warn("dockervol: a KV folder has the name of a client certificate file; the certificate is written and the folder's secrets are not",
+		"path", displayPath(name))
 }
 
 // emitPath reads one secret and adds its rendering to r. A secret that does
@@ -390,17 +445,39 @@ func prune(root *os.Root, r *rendered) error {
 	})
 }
 
+// errClientCertDisabled is the cause named whenever a volume asks for the
+// certificate files and the daemon has no certificate source: at create time,
+// and at refresh time for a persisted volume resumed under a configuration
+// that has since switched the feature off.
+const errClientCertDisabled = "client_cert is not enabled in dotvault's configuration (client_cert.enabled)"
+
 // materialise renders the spec from store into dir, returning the number of
-// secrets the volume now carries.
-func materialise(ctx context.Context, store vaultfs.Store, dir string, spec Spec) (int, error) {
-	r, err := render(ctx, store, spec)
+// secrets the volume now carries and the certificate pair it wrote, if any.
+//
+// The pair is fetched from src only when the spec asks for it, and before
+// anything is written: a source failure fails the whole render like a Vault
+// failure does, leaving the previous files in place rather than a partial
+// pair. The pair is returned so the caller can schedule the next refresh
+// from its RefreshAt.
+func materialise(ctx context.Context, store vaultfs.Store, src clientcert.Source, dir string, spec Spec) (int, *clientcert.Pair, error) {
+	var pair *clientcert.Pair
+	if spec.ClientCert != ClientCertOff {
+		if src == nil {
+			return 0, nil, errors.New(errClientCertDisabled)
+		}
+		var err error
+		if pair, err = src.Current(ctx); err != nil {
+			return 0, nil, fmt.Errorf("client certificate: %w", err)
+		}
+	}
+	r, err := render(ctx, store, spec, pair)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err := apply(dir, r, spec); err != nil {
-		return 0, fmt.Errorf("write volume: %w", err)
+		return 0, nil, fmt.Errorf("write volume: %w", err)
 	}
-	return r.secrets, nil
+	return r.secrets, pair, nil
 }
 
 // validComponent reports whether name can be one path component: it must

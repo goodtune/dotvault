@@ -172,7 +172,7 @@ func TestCreateChildToken(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 
-	child, err := c.CreateChildToken(context.Background(), []string{"dotvault", "kv-read"}, true)
+	child, err := c.CreateChildToken(context.Background(), []string{"dotvault", "kv-read"}, true, map[string]string{"username": "gary"})
 	if err != nil {
 		t.Fatalf("CreateChildToken: %v", err)
 	}
@@ -191,11 +191,38 @@ func TestCreateChildToken(t *testing.T) {
 	if rnw, _ := gotBody["renewable"].(bool); !rnw {
 		t.Errorf("request renewable = %v, want true", gotBody["renewable"])
 	}
+	if meta, _ := gotBody["meta"].(map[string]any); len(meta) != 1 || meta["username"] != "gary" {
+		t.Errorf("request meta = %v, want {username: gary}", gotBody["meta"])
+	}
+}
+
+func TestTokenMeta(t *testing.T) {
+	if got := TokenMeta(nil); got != nil {
+		t.Errorf("TokenMeta(nil) = %v, want nil", got)
+	}
+	if got := TokenMeta(&vaultapi.Secret{}); got != nil {
+		t.Errorf("TokenMeta(no data) = %v, want nil", got)
+	}
+	if got := TokenMeta(&vaultapi.Secret{Data: map[string]any{"id": "x"}}); got != nil {
+		t.Errorf("TokenMeta(absent meta) = %v, want nil", got)
+	}
+	if got := TokenMeta(&vaultapi.Secret{Data: map[string]any{"meta": nil}}); got != nil {
+		t.Errorf("TokenMeta(null meta) = %v, want nil", got)
+	}
+	got := TokenMeta(&vaultapi.Secret{Data: map[string]any{"meta": map[string]any{
+		"username": "gary",
+		"n":        float64(3),
+		"b":        true,
+		"role":     "r",
+	}}})
+	if len(got) != 2 || got["username"] != "gary" || got["role"] != "r" {
+		t.Errorf("TokenMeta = %v, want only the string values {username: gary, role: r}", got)
+	}
 }
 
 func TestCreateChildTokenFor(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/auth/token/create" {
+		if r.URL.Path != "/v1/auth/token/create" && r.URL.Path != "/v1/auth/token/lookup-self" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if got := r.Header.Get("X-Vault-Token"); got != "parent" {
@@ -261,7 +288,7 @@ func TestCreateChildToken_ServerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if _, err := c.CreateChildToken(context.Background(), []string{"nonexistent"}, false); err == nil {
+	if _, err := c.CreateChildToken(context.Background(), []string{"nonexistent"}, false, nil); err == nil {
 		t.Fatal("CreateChildToken should error when Vault rejects the request")
 	}
 }

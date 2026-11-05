@@ -3,6 +3,7 @@ package client
 import (
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -36,6 +37,53 @@ type Config struct {
 	// it is here as a programmatic override point and defaults to the
 	// canonical location.
 	TokenFile string
+
+	// ClientCert mirrors the daemon's client_cert section: whether
+	// Client.ClientCertificate and Client.TLSConfig can produce a mutual-TLS
+	// client certificate, and how. Zero value is disabled.
+	ClientCert ClientCertConfig
+}
+
+// ClientCertConfig is the view of the daemon's client_cert section needed to
+// obtain a client certificate. Unlike MTLSConfig it does carry issuance
+// parameters (PKI mount and role, common name, TTL, key shape), because
+// serving a certificate to other tools is the one case where this facade signs
+// one: a short-lived, in-memory certificate for presentation to a third-party
+// service, never the credential the daemon logs in to Vault with.
+//
+// LoadConfig resolves every inherited value (the PKI mount and role fall back
+// to vault.mtls, the common name and TTL to their defaults), so these fields
+// are final. A Config built by hand gets the same defaults from New for the
+// mount, common name and TTL; the role has no default and an empty one with
+// no held certificate to serve yields ErrNotConfigured.
+type ClientCertConfig struct {
+	// Enabled switches the feature on. Everything below is ignored when
+	// false.
+	Enabled bool
+
+	// PKIMount is the PKI secrets engine mount used to sign. Defaults to
+	// "pki".
+	PKIMount string
+
+	// PKIRole is the PKI role signed against. Required unless a held
+	// certificate can serve instead; under plain "mtls" it is the fallback
+	// used when the host holds no usable certificate.
+	PKIRole string
+
+	// CommonName is a text/template for the certificate subject CN, over
+	// {{.token_username}} and {{.os_user}}. Defaults to {{.token_username}}.
+	// {{.os_user}} is the OS account the process runs as, as it is for the
+	// daemon; WithIdentity does not change it (nor whose held certificate is
+	// served), since that option names a KV path segment, not a person.
+	CommonName string
+
+	// TTL is the lifetime requested for an issued certificate. Zero means
+	// five minutes. The PKI role's max_ttl still caps it.
+	TTL time.Duration
+
+	// KeyType is "ec" (the default) or "rsa". KeyBits is the RSA modulus.
+	KeyType string
+	KeyBits int
 }
 
 // VaultConfig mirrors the connectivity + auth fields of dotvault's vault:
@@ -90,6 +138,12 @@ type VaultConfig struct {
 	// method, and no BYO paths, because the facade never issues a
 	// certificate. See Client.AuthenticateCached and Client.Login.
 	MTLS MTLSConfig
+
+	// ReissueBefore mirrors vault.mtls.reissue_before. It is consulted only
+	// to schedule when a held client certificate (plain "mtls") is read
+	// again, never to rotate one. Zero falls back to the certificate's
+	// half-life.
+	ReissueBefore time.Duration
 
 	// KVMount is the KV v2 mount that holds user secrets. Defaults to "kv".
 	KVMount string
@@ -285,8 +339,27 @@ func fromInternal(cfg *config.Config) *Config {
 				CertRole:   cfg.Vault.MTLS.CertRole,
 				StorageDir: cfg.Vault.MTLS.StorageDir,
 			},
+			ReissueBefore: cfg.Vault.MTLS.ReissueBeforeDur,
+		},
+		ClientCert: ClientCertConfig{
+			Enabled:    cfg.ClientCert.Enabled,
+			PKIMount:   cfg.ClientCertPKIMount(),
+			PKIRole:    cfg.ClientCertPKIRole(),
+			CommonName: cfg.ClientCertCommonName(),
+			TTL:        clientCertTTL(cfg.ClientCert.TTL),
+			KeyType:    cfg.ClientCert.KeyType,
+			KeyBits:    cfg.ClientCert.KeyBits,
 		},
 	}
+}
+
+// clientCertTTL applies the default lifetime to a non-positive TTL, as
+// source.ParamsFromConfig (internal/clientcert/source) does on the daemon side.
+func clientCertTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return config.DefaultClientCertTTL
+	}
+	return d
 }
 
 // withDefaults returns a copy of cfg with empty fields filled in to match the
@@ -330,7 +403,26 @@ func (c *Config) withDefaults() Config {
 			out.Vault.MTLS.StorageDir = defaultMTLSStorageDir()
 		}
 	}
+	// Client-certificate defaults mirror config.ClientCertPKIMount and friends.
+	// Whether the certificate is held is not a field at all: it is derived on
+	// use (clientCertHeld) through the daemon's own rule, so a hand-built
+	// Config cannot disagree with a loaded one.
+	cc := &out.ClientCert
+	if cc.PKIMount == "" {
+		cc.PKIMount = config.DefaultPKIMount
+	}
+	if cc.CommonName == "" {
+		cc.CommonName = config.DefaultClientCertCommonName
+	}
+	cc.TTL = clientCertTTL(cc.TTL)
 	return out
+}
+
+// clientCertHeld reports whether the client certificate is the one this host
+// already logs in to Vault with (plain "mtls", not borrow-only), via
+// config.ClientCertHeldFor, the rule the daemon itself applies.
+func (cfg Config) clientCertHeld() bool {
+	return config.ClientCertHeldFor(cfg.ClientCert.Enabled, cfg.Vault.AuthMethod, cfg.Vault.BorrowOnly)
 }
 
 // defaultMTLSStorageDir is {cache_dir}/mtls, matching the daemon, or "" when the

@@ -186,6 +186,14 @@ services:
         path "pki/revoke" {
           capabilities = ["create", "update"]
         }
+        # Short-lived client certificates for other tools (client_cert, served
+        # through the FUSE mount, Docker volumes and the client library).
+        # pki/sign on the dedicated dotvault-tools role is all it needs; there
+        # is deliberately no revoke, since these certificates are not stored
+        # and live for minutes.
+        path "pki/sign/dotvault-tools" {
+          capabilities = ["create", "update"]
+        }
         POLICY
 
         echo "==> Writing sample secrets..."
@@ -212,6 +220,7 @@ services:
           allowed_redirect_uris="http://127.0.0.1:9000/auth/oidc/callback" \
           allowed_redirect_uris="http://127.0.0.1:8250/oidc/callback" \
           user_claim="email" \
+          claim_mappings="email=username" \
           oidc_scopes="openid,email" \
           token_policies="dotvault"
 
@@ -245,6 +254,23 @@ services:
           key_type=any \
           max_ttl=720h \
           ttl=720h
+
+        echo "==> Creating PKI role for tool client certificates..."
+        # client_cert's role: a short-lived certificate for tools to present to
+        # other services, kept SEPARATE from dotvault-client above. Vault's cert
+        # auth method below trusts the CA, not a role, so in this dev stack a
+        # tools certificate is still accepted by auth/cert/login; a production
+        # deployment wanting the two kept apart gives this role its own
+        # intermediate CA. no_store=true keeps these certificates out of
+        # Vault's storage (they live for minutes and are never revoked).
+        vault write pki/roles/dotvault-tools \
+          allow_any_name=true \
+          client_flag=true \
+          server_flag=false \
+          key_type=any \
+          no_store=true \
+          max_ttl=1h \
+          ttl=5m
 
         echo "==> Enabling cert auth method..."
         vault auth enable cert 2>/dev/null || true

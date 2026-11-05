@@ -31,6 +31,7 @@ type Partial struct {
 var partialStaticSections = []string{
 	"agent",
 	"bypass_system_config",
+	"client_cert",
 	"docker",
 	"fuse",
 	"observability",

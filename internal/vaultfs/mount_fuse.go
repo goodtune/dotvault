@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -37,6 +38,20 @@ const (
 	dirModeRO  = 0o500
 	dirModeRW  = 0o700
 )
+
+// certTimeout is the kernel entry and attribute timeout for the client
+// certificate files. They change content and size whenever the certificate
+// rotates, so the kernel must ask again on every access rather than for the
+// mount-wide cache_ttl.
+//
+// One nanosecond rather than zero, because go-fuse reads a zero timeout in an
+// EntryOut or AttrOut as "not set" and replaces it with the mount-wide
+// default. The Linux kernel rounds a non-zero timeout up to one scheduler
+// tick, so a stat within a few milliseconds of the last one can still report
+// the previous size. Reads are unaffected: FOPEN_DIRECT_IO (see
+// openClientCert) means the bytes come from the source on every open, and
+// the kernel does not clamp a direct read to the size it remembers.
+const certTimeout = time.Nanosecond
 
 // filesystem is the shared state behind every node.
 type filesystem struct {
@@ -235,10 +250,17 @@ func clearStaleMount(dir string, statErr error) bool {
 // --- attributes ---------------------------------------------------------
 
 func (n *node) fileMode() uint32 {
-	if n.fsys.opts.ReadWrite {
+	// The certificate files are read-only even on a read-write mount.
+	if n.fsys.opts.ReadWrite && !n.isClientCert() {
 		return fileModeRW
 	}
 	return fileModeRO
+}
+
+// isClientCert reports whether this node is one of the client certificate
+// files at the root.
+func (n *node) isClientCert() bool {
+	return !n.dir && n.fsys.tree.servesClientCert(n.path)
 }
 
 func (n *node) dirMode() uint32 {
@@ -308,6 +330,9 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		n.setDirAttr(&out.Attr)
 		return 0
 	}
+	if n.isClientCert() {
+		return n.getattrClientCert(ctx, f, out)
+	}
 
 	// An open handle is the authority on size while the file is being
 	// written: the buffer holds bytes Vault has not seen yet, and reporting
@@ -337,6 +362,30 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 	return 0
 }
 
+// getattrClientCert reports a certificate file's attributes. With an open
+// handle the answer is the handle's snapshot, so fstat agrees with what read
+// returns on that descriptor; without one it asks the source afresh.
+func (n *node) getattrClientCert(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	out.SetTimeout(certTimeout)
+	if h, ok := f.(*handle); ok {
+		h.mu.Lock()
+		doc := Document{Bytes: h.buf, ModTime: h.modTime}
+		n.setFileAttr(&out.Attr, &doc)
+		h.mu.Unlock()
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	doc, err := n.fsys.tree.Document(ctx, n.path)
+	if err != nil {
+		return certErrno("getattr", n.path, err)
+	}
+	n.setFileAttr(&out.Attr, doc)
+	return 0
+}
+
 // Setattr exists to make truncation work, which is what every "replace this
 // file" idiom actually does: a shell `>` redirect, an editor's save, `jq ... |
 // sponge`. Other attribute changes are accepted and discarded rather than
@@ -348,7 +397,7 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		return syscall.EISDIR
 	}
 	if size, ok := in.GetSize(); ok {
-		if !n.fsys.opts.ReadWrite {
+		if !n.fsys.opts.ReadWrite || n.isClientCert() {
 			return syscall.EROFS
 		}
 		var targets []*handle
@@ -411,15 +460,24 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	case KindDir:
 		return n.newChild(ctx, name, true, out, nil), 0
 	case KindFile:
-		doc, err := n.fsys.tree.Document(ctx, joinPath(n.path, name))
+		path := joinPath(n.path, name)
+		doc, err := n.fsys.tree.Document(ctx, path)
 		if err != nil {
-			return nil, logErrno("lookup", joinPath(n.path, name), err)
+			if n.fsys.tree.servesClientCert(path) {
+				return nil, certErrno("lookup", path, err)
+			}
+			return nil, logErrno("lookup", path, err)
 		}
 		if doc == nil {
 			// Deleted between the listing and the read.
 			return nil, syscall.ENOENT
 		}
-		return n.newChild(ctx, name, false, out, doc), 0
+		inode := n.newChild(ctx, name, false, out, doc)
+		if n.fsys.tree.servesClientCert(path) {
+			out.SetEntryTimeout(certTimeout)
+			out.SetAttrTimeout(certTimeout)
+		}
+		return inode, 0
 	default:
 		return nil, syscall.ENOENT
 	}
@@ -583,6 +641,9 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if n.dir {
 		return nil, 0, syscall.EISDIR
 	}
+	if n.isClientCert() {
+		return n.openClientCert(ctx, flags)
+	}
 	writing := flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0
 	if writing && !n.fsys.opts.ReadWrite {
 		return nil, 0, syscall.EROFS
@@ -619,14 +680,51 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		h.buf = append([]byte(nil), doc.Bytes...)
 	}
 	n.addHandle(h)
-	// FOPEN_DIRECT_IO is deliberately not set. The page cache is what makes
-	// repeated reads of an open file free, and the entry/attr timeouts above
-	// already bound how stale any of it can be.
+	// FOPEN_DIRECT_IO is deliberately not set for a secret. The page cache
+	// is what makes repeated reads of an open file free, and the entry/attr
+	// timeouts above already bound how stale any of it can be. The
+	// certificate files are the exception (see openClientCert).
 	return h, 0, 0
+}
+
+// openClientCert opens a certificate file for reading.
+//
+// The handle snapshots one Document, so every read on the descriptor comes
+// from the same pair: a rotation landing between two reads of client.pem must
+// not hand the reader a certificate from one pair and the tail of the key
+// from another. FOPEN_DIRECT_IO keeps the page cache out of it, so a new open
+// after a rotation reads the new pair rather than pages cached from the old
+// one, and the kernel takes the read results as the file's length instead of
+// a size it remembered.
+func (n *node) openClientCert(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	if flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_TRUNC|syscall.O_APPEND) != 0 {
+		return nil, 0, syscall.EROFS
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	doc, err := n.fsys.tree.Document(ctx, n.path)
+	if err != nil {
+		return nil, 0, certErrno("open", n.path, err)
+	}
+	if !n.fsys.reserveBuffer(0, doc.Size()) {
+		return nil, 0, syscall.ENOMEM
+	}
+	// Document already returned a private copy; the handle takes it as is.
+	h := &handle{node: n, buf: doc.Bytes, modTime: doc.ModTime}
+	n.addHandle(h)
+	return h, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	if !n.fsys.opts.ReadWrite {
+		return nil, nil, 0, syscall.EROFS
+	}
+	// The kernel normally finds a certificate file by lookup and opens it
+	// instead, but a create can still arrive for one; it is read-only, not
+	// absent.
+	if n.path == "" && n.fsys.tree.servesClientCert(name) {
 		return nil, nil, 0, syscall.EROFS
 	}
 	if err := validateName(name); err != nil {
@@ -687,6 +785,10 @@ type handle struct {
 	mu    sync.Mutex
 	buf   []byte
 	dirty bool
+
+	// modTime is the snapshot's modification time, recorded only for a
+	// client certificate handle, whose Getattr answers from the snapshot.
+	modTime time.Time
 }
 
 // Read copies into dest rather than handing back a slice of the buffer, which
@@ -866,6 +968,9 @@ func logErrno(op, path string, err error) syscall.Errno {
 		return syscall.EINVAL
 	case errors.Is(err, ErrInvalidName):
 		return syscall.EINVAL
+	case clientcert.Transient(err):
+		slog.Debug("vaultfs: client certificate not available yet", "op", op, "path", displayPath(path), "error", err)
+		return syscall.EAGAIN
 	case errors.Is(err, context.Canceled):
 		return syscall.EINTR
 	case errors.Is(err, context.DeadlineExceeded):

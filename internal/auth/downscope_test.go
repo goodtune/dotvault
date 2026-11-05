@@ -117,7 +117,7 @@ func TestDownscopeInactive(t *testing.T) {
 // the parent.
 func TestDownscopeActive(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/auth/token/create" {
+		if r.URL.Path != "/v1/auth/token/create" && r.URL.Path != "/v1/auth/token/lookup-self" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if got := r.Header.Get("X-Vault-Token"); got != "login-token" {
@@ -143,6 +143,89 @@ func TestDownscopeActive(t *testing.T) {
 	}
 	if got != "child-token" {
 		t.Errorf("Downscope returned %q, want child-token", got)
+	}
+}
+
+// TestDownscopeCopiesParentMeta proves the child token inherits the parent's
+// identity meta (username and common_name, which {{.token_username}} reads),
+// read via lookup-self presented with the parent token, and nothing else from
+// the parent's meta: a child carries no more than the one feature needs.
+func TestDownscopeCopiesParentMeta(t *testing.T) {
+	var createBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Vault-Token"); got != "login-token" {
+			t.Errorf("%s token = %q, want login-token", r.URL.Path, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/token/lookup-self":
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"meta": map[string]any{
+					"username": "gary", "common_name": "gary.example", "role": "r", "email": "gary@example.com",
+				}},
+			})
+		case "/v1/auth/token/create":
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Errorf("decode create body: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child-token"}})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	c, err := vault.NewClient(vault.Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	got, err := Downscope(context.Background(), c, "login-token", PolicyConstraint{Policies: []string{"dotvault"}})
+	if err != nil {
+		t.Fatalf("Downscope: %v", err)
+	}
+	if got != "child-token" {
+		t.Errorf("Downscope returned %q, want child-token", got)
+	}
+	meta, _ := createBody["meta"].(map[string]any)
+	if len(meta) != 2 || meta["username"] != "gary" || meta["common_name"] != "gary.example" {
+		t.Errorf("create meta = %v, want only {username: gary, common_name: gary.example}", createBody["meta"])
+	}
+	if c.Token() != "" {
+		t.Errorf("shared client token = %q, want empty (lookup must run on the sibling)", c.Token())
+	}
+}
+
+// TestDownscopeMintsWhenLookupFails proves a failed metadata read is not a
+// reason to refuse the downscope: the child is minted without meta.
+func TestDownscopeMintsWhenLookupFails(t *testing.T) {
+	var createBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/auth/token/lookup-self":
+			http.Error(w, `{"errors":["permission denied"]}`, http.StatusForbidden)
+		case "/v1/auth/token/create":
+			json.NewDecoder(r.Body).Decode(&createBody)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child-token"}})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	c, err := vault.NewClient(vault.Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	got, err := Downscope(context.Background(), c, "login-token", PolicyConstraint{Policies: []string{"dotvault"}})
+	if err != nil {
+		t.Fatalf("Downscope must not fail on a metadata lookup failure: %v", err)
+	}
+	if got != "child-token" {
+		t.Errorf("Downscope returned %q, want child-token", got)
+	}
+	if _, present := createBody["meta"]; present {
+		t.Errorf("create body carried meta %v, want none", createBody["meta"])
 	}
 }
 
@@ -204,4 +287,37 @@ func TestDownscopeNeverMutatesSharedClient(t *testing.T) {
 			t.Errorf("shared client token = %q, want empty — a failed downscope must not leave the broad token installed", got)
 		}
 	})
+}
+
+// TestDownscopeOmitsMetaWithoutIdentityKeys proves a parent whose meta holds
+// neither identity key mints a child with no meta at all, rather than an empty
+// object or a copy of keys nothing reads.
+func TestDownscopeOmitsMetaWithoutIdentityKeys(t *testing.T) {
+	var createBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/auth/token/lookup-self":
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"meta": map[string]any{"role": "r"}},
+			})
+		case "/v1/auth/token/create":
+			json.NewDecoder(r.Body).Decode(&createBody)
+			json.NewEncoder(w).Encode(map[string]any{"auth": map[string]any{"client_token": "child-token"}})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	c, err := vault.NewClient(vault.Config{Address: ts.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := Downscope(context.Background(), c, "login-token", PolicyConstraint{Policies: []string{"dotvault"}}); err != nil {
+		t.Fatalf("Downscope: %v", err)
+	}
+	if _, present := createBody["meta"]; present {
+		t.Errorf("create body carried meta %v, want none", createBody["meta"])
+	}
 }

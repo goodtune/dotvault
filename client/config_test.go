@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -139,5 +140,82 @@ func TestDefaultTokenFile_HomeUnavailable(t *testing.T) {
 	}
 	if got := DefaultTokenFile(); got != "" {
 		t.Fatalf("DefaultTokenFile() = %q, want \"\" when home is unresolvable", got)
+	}
+}
+
+func TestLoadConfig_ClientCert(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := `
+vault:
+  address: https://vault.example.com:8200
+  auth_method: oidc
+  mtls:
+    pki_mount: corp-pki
+    pki_role: workstation
+client_cert:
+  enabled: true
+  common_name: "{{.os_user}}"
+  ttl: 10m
+rules:
+  - name: gh
+    vault_key: gh
+    target:
+      path: /tmp/gh.yaml
+      format: yaml
+`
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := ClientCertConfig{
+		Enabled:    true,
+		PKIMount:   "corp-pki",
+		PKIRole:    "workstation",
+		CommonName: "{{.os_user}}",
+		TTL:        10 * time.Minute,
+		KeyType:    cfg.ClientCert.KeyType, // validation fills the default
+	}
+	if cfg.ClientCert != want {
+		t.Errorf("ClientCert = %+v, want %+v", cfg.ClientCert, want)
+	}
+}
+
+func TestLoadConfig_ClientCertHeldProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := `
+vault:
+  address: https://vault.example.com:8200
+  auth_method: mtls
+  mtls:
+    cert_role: workstation
+    pki_role: workstation
+    reissue_before: 48h
+client_cert:
+  enabled: true
+rules:
+  - name: gh
+    vault_key: gh
+    target:
+      path: /tmp/gh.yaml
+      format: yaml
+`
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.clientCertHeld() {
+		t.Error("plain mtls with client_cert enabled must project Held")
+	}
+	if cfg.ClientCert.PKIRole != "workstation" || cfg.ClientCert.TTL != 5*time.Minute {
+		t.Errorf("ClientCert = %+v", cfg.ClientCert)
+	}
+	if cfg.Vault.ReissueBefore != 48*time.Hour {
+		t.Errorf("ReissueBefore = %v, want 48h", cfg.Vault.ReissueBefore)
 	}
 }

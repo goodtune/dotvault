@@ -331,6 +331,16 @@ type registryLayer struct {
 	DockerVolumeDir string
 	DockerCacheTTL  string
 
+	// ClientCert (client certificates served to other tools). Present for
+	// the same mixed-fleet reason as FUSE and Docker.
+	ClientCertEnabled    *uint32
+	ClientCertPKIMount   string
+	ClientCertPKIRole    string
+	ClientCertCommonName string
+	ClientCertTTL        string
+	ClientCertKeyType    string
+	ClientCertKeyBits    *uint32
+
 	// SSH: the certificate_authorities list and insecure_ignore_host_key flag
 	// are admin-owned policy, so — like every other config section — they
 	// round-trip through this registry loader, .reg, and YAML alike. The
@@ -566,6 +576,22 @@ func readRegistryLayerAt(root registry.Key, policyPath string) (registryLayer, b
 		layer.DockerCacheTTL, _ = readRegString(dockerk, "CacheTTL")
 	}
 
+	// Read ClientCert subkey (client certificates served to other tools).
+	clientCertk, err := registry.OpenKey(root, policyPath+`\ClientCert`, registry.READ)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return layer, false, fmt.Errorf("open ClientCert policy key: %w", err)
+	}
+	if err == nil {
+		defer clientCertk.Close()
+		layer.ClientCertEnabled = readRegDWORD(clientCertk, "Enabled")
+		layer.ClientCertPKIMount, _ = readRegString(clientCertk, "PKIMount")
+		layer.ClientCertPKIRole, _ = readRegString(clientCertk, "PKIRole")
+		layer.ClientCertCommonName, _ = readRegString(clientCertk, "CommonName")
+		layer.ClientCertTTL, _ = readRegString(clientCertk, "TTL")
+		layer.ClientCertKeyType, _ = readRegString(clientCertk, "KeyType")
+		layer.ClientCertKeyBits = readRegDWORD(clientCertk, "KeyBits")
+	}
+
 	// Read SSH subkey (host-CA trust material).
 	sshk, err := registry.OpenKey(root, policyPath+`\SSH`, registry.READ)
 	if err != nil && !errors.Is(err, registry.ErrNotExist) {
@@ -793,6 +819,27 @@ func applyRegistryLayer(cfg *Config, layer registryLayer) {
 	}
 	if layer.DockerCacheTTL != "" {
 		cfg.Docker.RawCacheTTL = layer.DockerCacheTTL
+	}
+	if layer.ClientCertEnabled != nil {
+		cfg.ClientCert.Enabled = *layer.ClientCertEnabled != 0
+	}
+	if layer.ClientCertPKIMount != "" {
+		cfg.ClientCert.PKIMount = layer.ClientCertPKIMount
+	}
+	if layer.ClientCertPKIRole != "" {
+		cfg.ClientCert.PKIRole = layer.ClientCertPKIRole
+	}
+	if layer.ClientCertCommonName != "" {
+		cfg.ClientCert.CommonName = layer.ClientCertCommonName
+	}
+	if layer.ClientCertTTL != "" {
+		cfg.ClientCert.RawTTL = layer.ClientCertTTL
+	}
+	if layer.ClientCertKeyType != "" {
+		cfg.ClientCert.KeyType = layer.ClientCertKeyType
+	}
+	if layer.ClientCertKeyBits != nil {
+		cfg.ClientCert.KeyBits = int(*layer.ClientCertKeyBits)
 	}
 	// Present (non-nil), not non-empty, gates the merge — same rationale as
 	// VaultPolicies above.

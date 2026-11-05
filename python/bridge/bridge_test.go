@@ -7,9 +7,13 @@ package main
 // the cgo-free seams in bridge.go (lookupID/dropID, cSetenv/cUnsetenv).
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goodtune/dotvault/client"
@@ -27,6 +31,11 @@ func TestCategoryOf(t *testing.T) {
 		{"unreachable", fmt.Errorf("wrap: %w", client.ErrUnreachable), catUnreachable},
 		{"auth failed", fmt.Errorf("wrap: %w", client.ErrAuthFailed), catAuthFailed},
 		{"peer unavailable", fmt.Errorf("wrap: %w", client.ErrPeerUnavailable), catPeerUnavailable},
+		{"not configured", fmt.Errorf("wrap: %w", client.ErrNotConfigured), catNotConfigured},
+		// Transient and not a Vault verdict: the base DotvaultError in
+		// Python, like ErrSignPaced.
+		{"sign in progress", fmt.Errorf("wrap: %w", client.ErrSignInProgress), catOther},
+		{"sign paced", fmt.Errorf("wrap: %w", client.ErrSignPaced), catOther},
 		{"unknown", errors.New("something else"), catOther},
 		{"unknown handle", errUnknownHandle, catOther},
 	}
@@ -89,5 +98,47 @@ func TestSyncEnvReadsLiveCEnvironment(t *testing.T) {
 	syncEnv()
 	if got, ok := os.LookupEnv("DOTVAULT_TOKEN"); ok {
 		t.Fatalf("after unset+syncEnv, os env still set to %q", got)
+	}
+}
+
+func TestClientCertificateNilOutputNeverSigns(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("DOTVAULT_TOKEN", "s.token")
+	t.Setenv("VAULT_MAX_RETRIES", "0")
+	c, err := client.New(&client.Config{
+		Vault:      client.VaultConfig{Address: srv.URL, AuthMethod: "token"},
+		TokenFile:  t.TempDir() + "/token",
+		ClientCert: client.ClientCertConfig{Enabled: true, PKIRole: "tools", CommonName: "{{.os_user}}"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientCertificate(context.Background(), c, false); !errors.Is(err, errNilOutput) {
+		t.Fatalf("err = %v, want errNilOutput", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("Vault saw %d requests for a call that could not receive the result", n)
+	}
+}
+
+// TestWipeZeroesOutString proves the string dotvault_free releases is zeroed
+// first. Out strings carry tokens, secret values and a private key, and freed
+// malloc memory is not cleared, so without the wipe they would linger in the
+// host process's heap until reused.
+func TestWipeZeroesOutString(t *testing.T) {
+	const secret = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n"
+	got := wipedCString(secret)
+	if len(got) != len(secret) {
+		t.Fatalf("read back %d bytes, want %d", len(got), len(secret))
+	}
+	for i, b := range got {
+		if b != 0 {
+			t.Fatalf("byte %d = %#x after wipe, want 0", i, b)
+		}
 	}
 }

@@ -54,7 +54,7 @@ func TestStartDockerVolumesIsNeverFatal(t *testing.T) {
 		Docker: config.DockerConfig{Enabled: true, Socket: "/nonexistent/docker.sock", VolumeDir: "/nonexistent/volumes"},
 	}
 	socket, dir := resolveDockerPlugin(cfg)
-	if driver := startDockerVolumes(t.Context(), cfg, socket, dir, nil, ""); driver != nil {
+	if driver := startDockerVolumes(t.Context(), cfg, socket, dir, nil, "", nil); driver != nil {
 		t.Error("startDockerVolumes returned a driver for an unbuildable store")
 	}
 }

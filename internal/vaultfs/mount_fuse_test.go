@@ -583,3 +583,80 @@ func TestMountRejectsNamesThatContradictTheExtension(t *testing.T) {
 		t.Errorf("a refused name still reached the store (%d writes)", writes)
 	}
 }
+
+// The certificate files rotate under a reader: a fresh read after the source
+// switches pairs must see the new bytes and the new size, even with a 30s
+// cache — neither the package cache, the kernel's attribute cache nor the
+// page cache may serve the superseded pair. The mount is read-write to show
+// the files stay 0400 and unwritable there.
+func TestMountClientCertRotates(t *testing.T) {
+	store := seededStore()
+	src := &fakeCertSource{pair: testPair("A")}
+	mnt := mountForTest(t, store, Options{CacheTTL: 30 * time.Second, ReadWrite: true, ClientCert: src})
+	path := filepath.Join(mnt, ClientPEMFile)
+
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", ClientPEMFile, err)
+	}
+	if want := testPair("A").Combined(); string(first) != string(want) {
+		t.Fatalf("first read = %q, want pair A", first)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() != int64(len(first)) {
+		t.Errorf("stat size = %d, read %d bytes", info.Size(), len(first))
+	}
+	if perm := info.Mode().Perm(); perm != fileModeRO {
+		t.Errorf("mode = %o, want %o even on a read-write mount", perm, fileModeRO)
+	}
+	if _, err := os.OpenFile(path, os.O_WRONLY, 0); !errors.Is(err, syscall.EROFS) {
+		t.Errorf("open for write error = %v, want EROFS", err)
+	}
+
+	src.set(testPair("a-much-longer-tag"), nil)
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after rotation: %v", err)
+	}
+	if want := testPair("a-much-longer-tag").Combined(); string(second) != string(want) {
+		t.Errorf("read after rotation = %q, want the new pair", second)
+	}
+	// The content check above runs straight after the switch, because
+	// FOPEN_DIRECT_IO is what keeps the bytes fresh and that does not age.
+	// The size is the kernel's attribute cache, whose timeout cannot be zero
+	// (see certTimeout) and is rounded up to one scheduler tick, so wait past
+	// a tick before asking.
+	time.Sleep(50 * time.Millisecond)
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after rotation: %v", err)
+	}
+	if info.Size() == int64(len(first)) || info.Size() != int64(len(second)) {
+		t.Errorf("stat size after rotation = %d, want %d (was %d)", info.Size(), len(second), len(first))
+	}
+}
+
+// Each certificate file has its own inode, stable across lookups, and none
+// collides with a KV folder of the same name (which the certificate shadows).
+func TestClientCertInodesAreDistinctAndStable(t *testing.T) {
+	seen := map[uint64]string{}
+	for _, name := range []string{ClientCertFile, ClientKeyFile, ClientPEMFile} {
+		a := stableAttr(name, false)
+		if b := stableAttr(name, false); a != b {
+			t.Errorf("stableAttr(%s) changed between calls: %v then %v", name, a, b)
+		}
+		if a.Mode != syscall.S_IFREG {
+			t.Errorf("stableAttr(%s) mode = %o, want a regular file", name, a.Mode)
+		}
+		if prev, dup := seen[a.Ino]; dup {
+			t.Errorf("%s and %s share inode %d", name, prev, a.Ino)
+		}
+		seen[a.Ino] = name
+		if dir := stableAttr(name, true); dir.Ino == a.Ino {
+			t.Errorf("%s shares an inode with a folder of the same name", name)
+		}
+	}
+}

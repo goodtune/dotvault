@@ -70,7 +70,9 @@ var ErrNotFound = errors.New("no such volume")
 
 // ErrNoToken is returned by Mount while the daemon holds no Vault token: the
 // volume cannot be populated, and an empty directory would be a worse answer
-// than a refusal the container runtime reports.
+// than a refusal the container runtime reports. A client_cert=only volume
+// reads no secrets and is exempt; its certificate source reports its own
+// clientcert.ErrNoToken when it needs a token to sign.
 var ErrNoToken = errors.New("dotvault has not authenticated with vault yet, so the volume cannot be populated")
 
 // ErrUnsupported is returned by Run on platforms where the plugin is not
@@ -96,6 +98,26 @@ const (
 	OptLayout  = "layout"
 	OptMode    = "mode"
 	OptTTL     = "ttl"
+	// OptClientCert adds the host's client certificate files (client.crt,
+	// client.key, client.pem) to the volume: true, only or false.
+	OptClientCert = "client_cert"
+)
+
+// ClientCertMode says whether, and how, a volume carries the client
+// certificate files.
+type ClientCertMode string
+
+const (
+	// ClientCertOff is the default: the volume holds secrets only. It is the
+	// empty string so a volume persisted before the option existed loads as
+	// off with no migration.
+	ClientCertOff ClientCertMode = ""
+	// ClientCertWith adds the certificate files beside the selection. An
+	// absent secrets option still means the whole subtree, as without the
+	// certificate.
+	ClientCertWith ClientCertMode = "true"
+	// ClientCertOnly adds the certificate files and selects no secrets.
+	ClientCertOnly ClientCertMode = "only"
 )
 
 // DefaultMode is the file mode a volume's files carry when the mode option
@@ -128,6 +150,8 @@ type Spec struct {
 	Mode os.FileMode `json:"mode"`
 	// TTL is the refresh window used when events are not driving refreshes.
 	TTL time.Duration `json:"ttl"`
+	// ClientCert adds the client certificate files at the volume root.
+	ClientCert ClientCertMode `json:"client_cert,omitempty"`
 }
 
 // ValidateName checks a volume name against Docker's own rule.
@@ -191,9 +215,27 @@ func ParseOptions(opts map[string]string, defaultTTL time.Duration) (Spec, error
 				return Spec{}, fmt.Errorf("option %s: %q: %w", k, v, err)
 			}
 			spec.TTL = d
+		case OptClientCert:
+			switch v {
+			case "true":
+				spec.ClientCert = ClientCertWith
+			case "false":
+				// Normalised to the zero value so it is never persisted
+				// as "false" and two spellings of off compare equal.
+				spec.ClientCert = ClientCertOff
+			case string(ClientCertOnly):
+				spec.ClientCert = ClientCertOnly
+			default:
+				return Spec{}, fmt.Errorf("option %s: %q is not one of true, false, only", k, v)
+			}
 		default:
-			return Spec{}, fmt.Errorf("unknown option %q (accepted: %s, %s, %s, %s)", k, OptSecrets, OptLayout, OptMode, OptTTL)
+			return Spec{}, fmt.Errorf("unknown option %q (accepted: %s, %s, %s, %s, %s)", k, OptSecrets, OptLayout, OptMode, OptTTL, OptClientCert)
 		}
+	}
+	if spec.ClientCert == ClientCertOnly && len(spec.Secrets) > 0 {
+		// "only" selects no secrets, so naming some contradicts it; refuse
+		// rather than guess which of the two was meant.
+		return Spec{}, fmt.Errorf("option %s=only selects no secrets and conflicts with option %s", OptClientCert, OptSecrets)
 	}
 	if spec.TTL <= 0 {
 		return Spec{}, fmt.Errorf("no refresh window: neither a ttl option nor a configured docker.cache_ttl")
@@ -209,6 +251,14 @@ func ParseOptions(opts map[string]string, defaultTTL time.Duration) (Spec, error
 // inside the configured bounds. ParseOptions builds specs that pass by
 // construction; the persisted-state loader runs it on what it reads back.
 func (s Spec) validate() error {
+	switch s.ClientCert {
+	case ClientCertOff, ClientCertWith, ClientCertOnly:
+	default:
+		return fmt.Errorf("client_cert %q is not one of true, only", s.ClientCert)
+	}
+	if s.ClientCert == ClientCertOnly && len(s.Secrets) > 0 {
+		return fmt.Errorf("client_cert only conflicts with a selection")
+	}
 	for _, sel := range s.Secrets {
 		p, folder := strings.CutSuffix(sel, "/")
 		clean, err := vaultfs.CleanPath(p)
@@ -270,6 +320,9 @@ func parseSelection(v string) ([]string, error) {
 // definition used both to decide what to render and to decide whether a
 // Vault event concerns this volume.
 func (s Spec) Covers(relPath string) bool {
+	if s.ClientCert == ClientCertOnly {
+		return false
+	}
 	if len(s.Secrets) == 0 {
 		return true
 	}
@@ -292,7 +345,7 @@ func (s Spec) Covers(relPath string) bool {
 
 // Equal reports whether two specs describe the same volume.
 func (s Spec) Equal(o Spec) bool {
-	if s.Layout != o.Layout || s.Mode != o.Mode || s.TTL != o.TTL || len(s.Secrets) != len(o.Secrets) {
+	if s.Layout != o.Layout || s.Mode != o.Mode || s.TTL != o.TTL || s.ClientCert != o.ClientCert || len(s.Secrets) != len(o.Secrets) {
 		return false
 	}
 	for i := range s.Secrets {

@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/goodtune/dotvault/internal/clientcert"
 )
 
 // Options configures a mounted filesystem.
@@ -26,6 +28,11 @@ type Options struct {
 	// CacheTTL is how long a directory listing or a rendered secret is
 	// reused before Vault is asked again. Zero disables caching.
 	CacheTTL time.Duration
+
+	// ClientCert, when set, serves client.crt, client.key and client.pem at
+	// the mount root from this source. The files are read-only whatever
+	// ReadWrite says, and bypass CacheTTL: the source does its own caching.
+	ClientCert clientcert.Source
 }
 
 // State is the mount's lifecycle state, reported by Status.
@@ -74,9 +81,13 @@ func NewService(store Store, opts Options) (*Service, error) {
 	if opts.Mountpoint == "" {
 		return nil, fmt.Errorf("vaultfs: empty mountpoint")
 	}
+	tree := NewTree(store, opts.ReadWrite, opts.CacheTTL)
+	if opts.ClientCert != nil {
+		tree.SetClientCert(opts.ClientCert)
+	}
 	return &Service{
 		opts:  opts,
-		tree:  NewTree(store, opts.ReadWrite, opts.CacheTTL),
+		tree:  tree,
 		state: StateStopped,
 	}, nil
 }

@@ -6,25 +6,19 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/goodtune/dotvault/internal/tokengate"
 )
 
 // ReauthGate lets the backend observe the daemon's token-lifecycle state so a
 // Sign issued mid-reauth waits briefly rather than failing. *auth.LifecycleManager
-// satisfies it.
-type ReauthGate interface {
-	NeedsReauth() bool
-}
-
-// gateHolder wraps a ReauthGate so it can live in an atomic.Value. atomic.Value
-// panics if successive Stores use different concrete types; wrapping every gate
-// in this single struct type keeps the stored type stable regardless of which
-// ReauthGate implementation (the real LifecycleManager, a test stub) is wired.
-type gateHolder struct{ gate ReauthGate }
+// satisfies it. It is tokengate.Gate, shared with the client certificate
+// source so the two consumers of the lifecycle cannot drift apart.
+type ReauthGate = tokengate.Gate
 
 // RejectionReporter lets the backend report a Vault-confirmed token rejection
 // it observed independently of the daemon's own token-lifecycle poll — a
@@ -42,13 +36,8 @@ type gateHolder struct{ gate ReauthGate }
 // deliberately separate interfaces (mirroring LifecycleManager's own
 // NeedsReauth/ReauthSignalled split) — a component that only ever waits (a
 // test stub wired as a ReauthGate) is not obligated to also implement this.
-type RejectionReporter interface {
-	NotifyRejected(err error)
-}
-
-// reporterHolder wraps a RejectionReporter for the same atomic.Value reason
-// gateHolder wraps a ReauthGate.
-type reporterHolder struct{ reporter RejectionReporter }
+// It is tokengate.Reporter.
+type RejectionReporter = tokengate.Reporter
 
 const (
 	defaultListCacheTTL  = 8 * time.Second
@@ -79,25 +68,25 @@ type Backend struct {
 	// so nothing has to wire it to behave as before.
 	hasToken func() bool
 
-	// gate holds a gateHolder. It is read on every Sign and written by
+	// gate holds the ReauthGate. It is read on every Sign and written by
 	// SetReauthGate, which the daemon calls once the lifecycle manager exists
 	// — after authentication, and so under an already-accepting listener,
-	// since the listener now starts before auth. The atomic.Value is what
-	// makes that wiring safe against a concurrent Sign; it is load-bearing
-	// rather than defensive.
-	gate          atomic.Value
+	// since the listener now starts before auth. The slot's atomic store is
+	// what makes that wiring safe against a concurrent Sign; it is
+	// load-bearing rather than defensive.
+	gate          tokengate.GateSlot
 	reauthTimeout time.Duration
 	sourceTimeout time.Duration
 	cacheTTL      time.Duration
 	now           func() time.Time
 
-	// reporter holds a reporterHolder, wired the same way and at the same
+	// reporter holds the RejectionReporter, wired the same way and at the same
 	// time as gate (SetReauthGate and SetReauthReporter are called together
 	// in cmd/dotvault, once the lifecycle manager exists). Read whenever a
 	// source reports an error from identities/SignWithFlags, so a rejection
 	// this backend discovers independently reaches the lifecycle manager's
 	// recovery path instead of sitting unacted on until its next poll.
-	reporter atomic.Value
+	reporter tokengate.ReporterSlot
 
 	// mu guards the cache fields only, and is never held across a source
 	// call. refreshMu serialises the fan-out itself. Splitting them is what
@@ -129,19 +118,10 @@ func (b *Backend) SetReauthGate(g ReauthGate) { b.setGate(g) }
 
 // setGate stores the gate, ignoring a nil so WithReauthGate(nil) (the headless
 // / no-lifecycle case) leaves the backend gate-less rather than boxing a nil.
-func (b *Backend) setGate(g ReauthGate) {
-	if g != nil {
-		b.gate.Store(gateHolder{gate: g})
-	}
-}
+func (b *Backend) setGate(g ReauthGate) { b.gate.Set(g) }
 
 // reauthGate returns the wired gate, or nil if none has been set.
-func (b *Backend) reauthGate() ReauthGate {
-	if h, ok := b.gate.Load().(gateHolder); ok {
-		return h.gate
-	}
-	return nil
-}
+func (b *Backend) reauthGate() ReauthGate { return b.gate.Get() }
 
 // WithReauthReporter wires the rejection reporter used to notify the
 // lifecycle manager of a Vault rejection a source discovers independently.
@@ -157,11 +137,7 @@ func (b *Backend) SetReauthReporter(r RejectionReporter) { b.setReporter(r) }
 // setReporter stores the reporter, ignoring a nil so WithReauthReporter(nil)
 // (the headless / no-lifecycle case, and every test that doesn't care) leaves
 // the backend reporter-less rather than boxing a nil.
-func (b *Backend) setReporter(r RejectionReporter) {
-	if r != nil {
-		b.reporter.Store(reporterHolder{reporter: r})
-	}
-}
+func (b *Backend) setReporter(r RejectionReporter) { b.reporter.Set(r) }
 
 // reportRejection forwards err to the wired reporter, a no-op if none is set.
 // Every source error from identities/SignWithFlags is reported unconditionally
@@ -176,12 +152,12 @@ func (b *Backend) setReporter(r RejectionReporter) {
 // correlated with "and it was forwarded to the lifecycle manager", which
 // otherwise has no visible trace on this side of the interface.
 func (b *Backend) reportRejection(err error) {
-	h, ok := b.reporter.Load().(reporterHolder)
-	if !ok || h.reporter == nil {
+	r := b.reporter.Get()
+	if r == nil {
 		return
 	}
 	slog.Debug("ssh agent: reporting source failure to the token lifecycle manager", "error", err)
-	h.reporter.NotifyRejected(err)
+	r.NotifyRejected(err)
 }
 
 // WithReauthTimeout bounds how long Sign waits for re-auth to clear.
@@ -511,22 +487,10 @@ func (b *Backend) waitForToken(ctx context.Context) error {
 // waitForReauth blocks while the lifecycle gate reports a re-auth in progress,
 // up to the deadline carried by ctx. Without a gate it returns immediately.
 func (b *Backend) waitForReauth(ctx context.Context) error {
-	gate := b.reauthGate()
-	if gate == nil || !gate.NeedsReauth() {
-		return nil
+	if err := tokengate.Wait(ctx, b.reauthGate()); err != nil {
+		return fmt.Errorf("ssh agent: vault token unavailable (re-auth in progress): %w", err)
 	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("ssh agent: vault token unavailable (re-auth in progress): %w", ctx.Err())
-		case <-ticker.C:
-			if !gate.NeedsReauth() {
-				return nil
-			}
-		}
-	}
+	return nil
 }
 
 // ErrKeyNotFound is returned by Sign when no source owns the requested key.

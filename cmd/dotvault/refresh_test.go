@@ -196,6 +196,7 @@ func TestChangedStaticSections(t *testing.T) {
 		{"agent", func(c *config.Config) { c.Agent.Enabled = true }, "agent"},
 		{"api", func(c *config.Config) { c.API.Enabled = true }, "api"},
 		{"docker", func(c *config.Config) { c.Docker.Enabled = true }, "docker"},
+		{"client_cert", func(c *config.Config) { c.ClientCert.Enabled = true }, "client_cert"},
 		{"observability scalar", func(c *config.Config) { c.Observability.Endpoint = "https://elsewhere.example" }, "observability"},
 		{"observability headers", func(c *config.Config) { c.Observability.Headers = map[string]string{"Authorization": "Bearer rotated"} }, "observability"},
 		{"observability metrics headers", func(c *config.Config) {
@@ -450,6 +451,7 @@ func TestStaticSectionsCoverConfig(t *testing.T) {
 		"API":                "static",  // the socket listener is bound once at startup
 		"FUSE":               "static",  // the filesystem is mounted once, after the first successful auth
 		"Docker":             "static",  // the plugin socket is bound once at startup
+		"ClientCert":         "static",  // the served certificate source is chosen once at startup
 		"RemoteConfig":       "dynamic", // fetcher rebuilt by the loader, cadence re-derived by the loop
 		"Rules":              "dynamic",
 		"Enrolments":         "dynamic",

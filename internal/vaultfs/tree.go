@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/kvpath"
 )
 
@@ -110,6 +111,11 @@ type Tree struct {
 	// guarantee does not depend on the kernel honouring a mount flag.
 	readWrite bool
 
+	// clientCert, when set, serves the client certificate files at the root
+	// (see clientcert.go). Set once by SetClientCert before the tree is
+	// mounted.
+	clientCert clientcert.Source
+
 	// warned records the collision paths already logged, so a directory that
 	// shadows a secret produces one warning rather than one per readdir.
 	warned sync.Map
@@ -165,6 +171,16 @@ func (t *Tree) Readdir(ctx context.Context, dir string) ([]Entry, error) {
 			slog.Warn("vaultfs: skipping unusable name in Vault listing", "path", displayPath(dir))
 			continue
 		}
+		// A secret's filename always carries the extension, so only a KV
+		// folder can claim a certificate file's name. The certificate wins:
+		// it is what the user enabled, and the folder stays reachable
+		// through Vault itself.
+		if kind == KindDir && t.servesClientCert(joinPath(dir, name)) {
+			t.warnCollision(joinPath(dir, name),
+				"vaultfs: a KV folder has the name of a client certificate file; the certificate is shown and the folder is not reachable through the mount",
+				"client_cert is enabled, and the mount serves the client certificate under this name at the root")
+			continue
+		}
 		if kind == KindFile {
 			name = fileDisplayName(name)
 		}
@@ -175,10 +191,19 @@ func (t *Tree) Readdir(ctx context.Context, dir string) ([]Entry, error) {
 		// case of a folder whose name already ends in the extension,
 		// colliding with the secret of the same stem.
 		if prev, dup := byName[name]; dup && prev != kind {
-			t.warnCollision(joinPath(dir, name))
+			t.warnCollision(joinPath(dir, name),
+				"vaultfs: a folder and a secret claim the same filename; the folder is shown and the secret is not reachable through the mount",
+				"a KV folder whose name ends in "+FileExtension+" collides with the secret of the same stem")
 			kind = KindDir
 		}
 		byName[name] = kind
+	}
+	if dir == "" && t.clientCert != nil {
+		// Presence only: listing never asks the source for a pair, so an
+		// `ls` does not cost a PKI sign.
+		for _, name := range []string{ClientCertFile, ClientKeyFile, ClientPEMFile} {
+			byName[name] = KindFile
+		}
 	}
 
 	entries := make([]Entry, 0, len(byName))
@@ -191,14 +216,12 @@ func (t *Tree) Readdir(ctx context.Context, dir string) ([]Entry, error) {
 	return entries, nil
 }
 
-// warnCollision logs a secret/folder collision once per path per process.
-func (t *Tree) warnCollision(path string) {
+// warnCollision logs a filename collision once per path per process.
+func (t *Tree) warnCollision(path, msg, cause string) {
 	if _, seen := t.warned.LoadOrStore(path, struct{}{}); seen {
 		return
 	}
-	slog.Warn("vaultfs: a folder and a secret claim the same filename; the folder is shown and the secret is not reachable through the mount",
-		"path", displayPath(path),
-		"cause", "a KV folder whose name ends in "+FileExtension+" collides with the secret of the same stem")
+	slog.Warn(msg, "path", displayPath(path), "cause", cause)
 }
 
 // Lookup resolves one name within dir.
@@ -212,6 +235,11 @@ func (t *Tree) warnCollision(path string) {
 func (t *Tree) Lookup(ctx context.Context, dir, name string) (Kind, error) {
 	if err := validateName(name); err != nil {
 		return KindNone, err
+	}
+	// The certificate files are answered without asking Vault, so they
+	// resolve even when the root cannot be listed.
+	if cleanDir, err := cleanPath(dir); err == nil && cleanDir == "" && t.servesClientCert(name) {
+		return KindFile, nil
 	}
 	entries, listErr := t.Readdir(ctx, dir)
 	if listErr == nil {
@@ -248,6 +276,9 @@ func (t *Tree) Document(ctx context.Context, path string) (*Document, error) {
 		// The root is a directory, never a document.
 		return nil, nil
 	}
+	if t.servesClientCert(path) {
+		return t.clientCertDocument(ctx, path)
+	}
 	// A path whose leaf carries no extension cannot name a secret. That is
 	// "nothing here" rather than an error: the speculative lookups a
 	// filesystem fields land here constantly, and Lookup's fallback asks
@@ -280,7 +311,9 @@ func (t *Tree) Document(ctx context.Context, path string) (*Document, error) {
 // Put parses content as a JSON object and writes it to the secret at path,
 // creating it if absent.
 func (t *Tree) Put(ctx context.Context, path string, content []byte) error {
-	if !t.readWrite {
+	// The certificate files are read-only even on a read-write mount: they
+	// are produced by the daemon, and there is nowhere to write them to.
+	if !t.readWrite || t.servesClientCert(path) {
 		return ErrReadOnly
 	}
 	kvPath, err := kvPathForFile(path)
@@ -305,7 +338,7 @@ func (t *Tree) Put(ctx context.Context, path string, content []byte) error {
 // this is the destructive one, which is why it is reachable only in
 // read-write mode.
 func (t *Tree) Remove(ctx context.Context, path string) error {
-	if !t.readWrite {
+	if !t.readWrite || t.servesClientCert(path) {
 		return ErrReadOnly
 	}
 	kvPath, err := kvPathForFile(path)

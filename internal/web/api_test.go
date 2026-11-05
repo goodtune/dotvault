@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/peer"
 	"github.com/goodtune/dotvault/internal/sshfwd"
@@ -994,5 +995,52 @@ func TestStatusCarriesPeerSockets(t *testing.T) {
 	members := ps["members"].([]any)
 	if len(members) != 1 || members[0].(map[string]any)["evicted"] != true {
 		t.Errorf("members = %v", members)
+	}
+}
+
+// TestStatusAPIClientCertBlock: the block is served unauthenticated, so it may
+// carry the certificate's public facts and must never carry the PEM or key.
+func TestStatusAPIClientCertBlock(t *testing.T) {
+	get := func(s *Server) map[string]any {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.handleStatus(w, httptest.NewRequest("GET", "/api/v1/status", nil))
+		if w.Code != 200 {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		var resp map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	s := testServer(t)
+	if _, ok := get(s)["client_cert"]; ok {
+		t.Error("client_cert present although no source is wired")
+	}
+
+	na := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	s.SetClientCertStatus(func() clientcert.Status {
+		return clientcert.Status{
+			State: clientcert.StateServing, Source: clientcert.SourceEphemeral,
+			CommonName: "gary", Serial: "aa:bb", NotAfter: na,
+		}
+	})
+	block, ok := get(s)["client_cert"].(map[string]any)
+	if !ok {
+		t.Fatal("client_cert block missing or not an object")
+	}
+	if block["source"] != "ephemeral" || block["common_name"] != "gary" || block["serial"] != "aa:bb" || block["state"] != "serving" {
+		t.Errorf("block = %v", block)
+	}
+	if _, ok := block["not_after"]; !ok {
+		t.Error("not_after missing")
+	}
+	for k := range block {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "pem") || strings.Contains(lk, "key") || strings.Contains(lk, "fingerprint") {
+			t.Errorf("block carries %q", k)
+		}
 	}
 }

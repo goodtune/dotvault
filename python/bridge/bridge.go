@@ -14,7 +14,8 @@
 //
 // Scope is the read-only + cached-auth subset of the facade plus the
 // peer-action surface: AuthenticateCached (never prompts), IdentityName, Token,
-// ReadKVField, ReadUserSecret, and the socket-forwarded Browse/Notify/Clipboard.
+// ReadKVField, ReadUserSecret, ClientCertificate, and the socket-forwarded
+// Browse/Notify/Clipboard.
 // Interactive Login/Authenticate (browser/terminal) are out — driving an OIDC
 // browser pop or an LDAP password prompt across an FFI boundary from inside a
 // Python process is awkward and is not what a library caller wants; such
@@ -65,6 +66,16 @@ static int dvTestUnsetenv(const char* k) {
 #else
 	return unsetenv(k);
 #endif
+}
+
+// dvWipe zeroes the NUL-terminated string at p in place. The writes go
+// through a volatile pointer so the compiler cannot drop them as dead stores
+// ahead of the free that follows.
+static void dvWipe(char* p) {
+	volatile char* v = p;
+	while (*v) {
+		*v++ = 0;
+	}
 }
 */
 import "C"
@@ -129,6 +140,7 @@ const (
 	catAuthFailed      = 4
 	catOther           = 5
 	catPeerUnavailable = 6
+	catNotConfigured   = 7
 )
 
 // Handle table. A *client.Client is never exposed to C directly; it is parked
@@ -222,6 +234,8 @@ func categoryOf(err error) int {
 		return catAuthFailed
 	case errors.Is(err, client.ErrPeerUnavailable):
 		return catPeerUnavailable
+	case errors.Is(err, client.ErrNotConfigured):
+		return catNotConfigured
 	default:
 		return catOther
 	}
@@ -244,11 +258,28 @@ func dotvault_default_config_path() *C.char {
 	return C.CString(client.DefaultConfigPath())
 }
 
+// dotvault_free releases an out string. It zeroes the bytes first: out
+// strings carry tokens, secret values and private keys, and freed malloc
+// memory is not cleared, so they would otherwise linger in the host
+// process's heap until the allocator reuses the block. (The Python side's
+// own copy is an immutable str it cannot clear; this covers the half the
+// bridge owns.)
+//
 //export dotvault_free
 func dotvault_free(p *C.char) {
 	if p != nil {
+		C.dvWipe(p)
 		C.free(unsafe.Pointer(p))
 	}
+}
+
+// wipedCString allocates s as an out string would be, wipes it as
+// dotvault_free does, and returns the bytes left behind, for cgo-free tests.
+func wipedCString(s string) []byte {
+	p := C.CString(s)
+	defer C.free(unsafe.Pointer(p))
+	C.dvWipe(p)
+	return C.GoBytes(unsafe.Pointer(p), C.int(len(s)))
 }
 
 // dotvault_client_new loads dotvault's system config from configPath (empty =>
@@ -432,6 +463,50 @@ func dotvault_remote_clipboard(h C.longlong, text *C.char, timeoutMillis C.longl
 		return category(err)
 	}
 	return catOK
+}
+
+// dotvault_client_certificate returns the mutual-TLS client certificate the
+// client's config describes as two owned PEM strings: *certOut is the leaf
+// followed by its CA chain, *keyOut is the PKCS#8 private key. On success both
+// are non-nil and the caller frees each with dotvault_free; on any error both
+// are left untouched (nil) and only *errOut is set. Nothing here logs, and
+// errors carry no key material (the facade guarantees that).
+//
+// It never prompts. The facade may authenticate from the cached sources
+// (token, peer socket, enrolled certificate) to sign, so syncEnv runs first.
+//
+//export dotvault_client_certificate
+func dotvault_client_certificate(h C.longlong, timeoutMillis C.longlong, certOut, keyOut, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	syncEnv()
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	cc, err := clientCertificate(ctx, c, certOut != nil && keyOut != nil)
+	if err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	*certOut = C.CString(string(cc.CertPEM))
+	*keyOut = C.CString(string(cc.KeyPEM))
+	return catOK
+}
+
+// errNilOutput is a caller passing nowhere to put the PEM.
+var errNilOutput = errors.New("dotvault: client_certificate: nil output pointer")
+
+// clientCertificate is dotvault_client_certificate's cgo-free body. The output
+// pointers are checked before ClientCertificate is called, so a caller that
+// could not receive the result never triggers a signing at Vault (and never
+// has a private key generated for nothing).
+func clientCertificate(ctx context.Context, c *client.Client, outputsOK bool) (*client.ClientCertificate, error) {
+	if !outputsOK {
+		return nil, errNilOutput
+	}
+	return c.ClientCertificate(ctx)
 }
 
 func main() {}

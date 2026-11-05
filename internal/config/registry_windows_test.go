@@ -504,6 +504,40 @@ func TestApplyRegistryLayerDocker(t *testing.T) {
 	}
 }
 
+// TestApplyRegistryLayerClientCert covers the ClientCert subkey's values, and
+// that an absent Enabled DWORD leaves the section off.
+func TestApplyRegistryLayerClientCert(t *testing.T) {
+	cfg := &Config{}
+	enabled, bits := uint32(1), uint32(3072)
+	applyRegistryLayer(cfg, registryLayer{
+		ClientCertEnabled:    &enabled,
+		ClientCertPKIMount:   "pki-clients",
+		ClientCertPKIRole:    "workstation",
+		ClientCertCommonName: "{{.os_user}}",
+		ClientCertTTL:        "10m",
+		ClientCertKeyType:    "rsa",
+		ClientCertKeyBits:    &bits,
+	})
+	want := ClientCertConfig{
+		Enabled:    true,
+		PKIMount:   "pki-clients",
+		PKIRole:    "workstation",
+		CommonName: "{{.os_user}}",
+		RawTTL:     "10m",
+		KeyType:    "rsa",
+		KeyBits:    3072,
+	}
+	if cfg.ClientCert != want {
+		t.Errorf("ClientCert = %+v, want %+v", cfg.ClientCert, want)
+	}
+
+	absent := &Config{}
+	applyRegistryLayer(absent, registryLayer{ClientCertPKIRole: "workstation"})
+	if absent.ClientCert.Enabled {
+		t.Error("an absent Enabled DWORD must leave the section disabled")
+	}
+}
+
 // TestApplyRegistryLayerAgentPutty confirms an explicit WindowsPutty DWORD
 // maps onto the tri-state pointer (0 => &false, non-zero => &true).
 func TestApplyRegistryLayerAgentPutty(t *testing.T) {

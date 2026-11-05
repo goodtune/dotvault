@@ -118,6 +118,7 @@ type Config struct {
 	API           APIConfig            `yaml:"api,omitempty"`
 	FUSE          FUSEConfig           `yaml:"fuse,omitempty"`
 	Docker        DockerConfig         `yaml:"docker,omitempty"`
+	ClientCert    ClientCertConfig     `yaml:"client_cert,omitempty"`
 	SSH           SSHConfig            `yaml:"ssh,omitempty"`
 	RemoteConfig  RemoteConfig         `yaml:"remote_config,omitempty"`
 	Rules         []Rule               `yaml:"rules"`
@@ -1094,6 +1095,40 @@ func IsMTLSMethod(method string) bool {
 	}
 }
 
+// validateKeyParams checks the key_type / key_bits pair shared by every config
+// block that asks Vault's PKI engine to sign a CSR (vault.mtls, client_cert),
+// returning key_type with the default applied. prefix is the YAML path of the
+// block and is the start of each message, so the messages read back to the
+// file the operator edited.
+//
+// key_bits is RSA-only and, when set, must be a length Vault itself accepts
+// (certutil.ValidateKeyTypeLength). Zero means "backend default". Both
+// misuses are errors rather than silent no-ops: an operator who sets
+// key_bits under an EC configuration believes they have changed the key
+// size, and quietly ignoring it would leave them debugging a Vault rejection
+// whose cause is in their own config.
+func validateKeyParams(prefix, keyType string, bits int) (string, error) {
+	if keyType == "" {
+		keyType = DefaultMTLSKeyType
+	}
+	switch keyType {
+	case "ec", "rsa":
+	default:
+		return "", fmt.Errorf("%s.key_type %q: must be ec or rsa", prefix, keyType)
+	}
+	if bits != 0 {
+		if keyType != "rsa" {
+			return "", fmt.Errorf("%s.key_bits is only valid with key_type rsa (got key_type %q); EC keys are fixed at P-256", prefix, keyType)
+		}
+		switch bits {
+		case 2048, 3072, 4096, 8192:
+		default:
+			return "", fmt.Errorf("%s.key_bits %d: must be one of 2048, 3072, 4096, 8192 (the RSA lengths Vault accepts)", prefix, bits)
+		}
+	}
+	return keyType, nil
+}
+
 // validateMTLS validates and defaults the vault.mtls block. It is a no-op
 // unless auth_method drives the cert-auth flow (see IsMTLSMethod), and is
 // skipped entirely under vault.borrow_only — that mode never runs any
@@ -1128,38 +1163,28 @@ func (c *Config) validateMTLS() error {
 	if m.PKIMount == "" {
 		m.PKIMount = DefaultPKIMount
 	}
-	if m.KeyType == "" {
-		m.KeyType = DefaultMTLSKeyType
+	// The TPM/Secure Enclave backend is EC-only. These two checks stay here
+	// rather than in validateKeyParams because they depend on the auth
+	// method, which the shared key rules do not know about; they run first
+	// only for a key_type that is itself valid, so an unknown key_type still
+	// reports as that.
+	keyType := m.KeyType
+	if keyType == "" {
+		keyType = DefaultMTLSKeyType
 	}
-	switch m.KeyType {
-	case "ec":
-	case "rsa":
-		if method == "mtls+tpm" {
+	if method == "mtls+tpm" {
+		switch {
+		case keyType == "rsa":
 			return fmt.Errorf("vault.mtls.key_type rsa is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only)")
-		}
-	default:
-		return fmt.Errorf("vault.mtls.key_type %q: must be ec or rsa", m.KeyType)
-	}
-	// key_bits is RSA-only and, when set, must be a length Vault itself accepts
-	// (certutil.ValidateKeyTypeLength). Zero means "backend default".
-	//
-	// Both misuses are errors rather than silent no-ops: an operator who sets
-	// key_bits under an EC or TPM configuration believes they have changed the
-	// key size, and quietly ignoring it would leave them debugging a Vault
-	// rejection whose cause is in their own config.
-	if m.KeyBits != 0 {
-		if method == "mtls+tpm" {
+		case keyType == "ec" && m.KeyBits != 0:
 			return fmt.Errorf("vault.mtls.key_bits is not supported with auth_method mtls+tpm (the TPM/Secure Enclave backend is EC-only, so there is no RSA modulus to size)")
 		}
-		if m.KeyType != "rsa" {
-			return fmt.Errorf("vault.mtls.key_bits is only valid with key_type rsa (got key_type %q); EC keys are fixed at P-256", m.KeyType)
-		}
-		switch m.KeyBits {
-		case 2048, 3072, 4096, 8192:
-		default:
-			return fmt.Errorf("vault.mtls.key_bits %d: must be one of 2048, 3072, 4096, 8192 (the RSA lengths Vault accepts)", m.KeyBits)
-		}
 	}
+	keyType, err := validateKeyParams("vault.mtls", keyType, m.KeyBits)
+	if err != nil {
+		return err
+	}
+	m.KeyType = keyType
 	if m.CommonName == "" {
 		m.CommonName = DefaultMTLSCommonName
 	}
@@ -1427,6 +1452,12 @@ func (c *Config) validate() error {
 	// Docker volume plugin section. Validated unconditionally for the same
 	// reason as the two above.
 	if err := c.validateDocker(); err != nil {
+		return err
+	}
+
+	// Client certificate section. Validated unconditionally for the same
+	// reason as the three above.
+	if err := c.validateClientCert(); err != nil {
 		return err
 	}
 

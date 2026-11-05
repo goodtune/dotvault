@@ -260,9 +260,11 @@ func rsaBitsOrDefault(bits int) int {
 	return bits
 }
 
-// newSoftwareKey generates a private key of the requested type. bits sizes an
-// RSA modulus; zero selects defaultRSABits. EC ignores it — P-256 is fixed.
-func newSoftwareKey(kt KeyType, bits int) (crypto.Signer, error) {
+// NewSoftwareKey generates an in-memory private key of the requested type. It
+// is exported so the client-certificate source can mint ephemeral keys. bits
+// sizes an RSA modulus; zero selects defaultRSABits. EC ignores it — P-256 is
+// fixed.
+func NewSoftwareKey(kt KeyType, bits int) (crypto.Signer, error) {
 	switch kt {
 	case KeyEC, "":
 		return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -314,7 +316,7 @@ func (fileStorage) Capabilities() Capabilities {
 }
 
 func (fileStorage) Generate(kt KeyType, bits int, _ bool) (crypto.Signer, []byte, error) {
-	signer, err := newSoftwareKey(kt, bits)
+	signer, err := NewSoftwareKey(kt, bits)
 	if err != nil {
 		return nil, nil, err
 	}

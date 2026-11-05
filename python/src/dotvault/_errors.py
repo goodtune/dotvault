@@ -16,6 +16,7 @@ CAT_UNREACHABLE = 3
 CAT_AUTH_FAILED = 4
 CAT_OTHER = 5
 CAT_PEER_UNAVAILABLE = 6
+CAT_NOT_CONFIGURED = 7
 
 
 class DotvaultError(Exception):
@@ -74,12 +75,23 @@ class PeerUnavailable(DotvaultError):
     """
 
 
+class NotConfigured(DotvaultError):
+    """The requested feature is not configured (``ErrNotConfigured``).
+
+    Raised by :meth:`Client.client_certificate` when the ``client_cert`` section
+    is not enabled, or is enabled with no PKI role and no usable held
+    certificate. An administrator must change the dotvault config; retrying
+    will not help.
+    """
+
+
 _BY_CATEGORY = {
     CAT_LOGIN_REQUIRED: LoginRequired,
     CAT_DENIED: Denied,
     CAT_UNREACHABLE: Unreachable,
     CAT_AUTH_FAILED: AuthFailed,
     CAT_PEER_UNAVAILABLE: PeerUnavailable,
+    CAT_NOT_CONFIGURED: NotConfigured,
 }
 
 

@@ -108,6 +108,19 @@ docker:
   # refresh on events instead and this only governs the disconnected case.
   cache_ttl: "10s"
 
+# Client certificate for other tools. Serves a short-lived mutual-TLS client
+# certificate as client.crt / client.key / client.pem at the root of the FUSE
+# mount above and, per volume (`-o client_cert=true`), in Docker volumes. The
+# dev stack's dotvault-tools PKI role signs it and the dotvault policy grants
+# pki/sign/dotvault-tools. The common name is the Vault token's username, which
+# the dev OIDC role records through claim_mappings (email=username).
+client_cert:
+  enabled: true
+  pki_mount: pki
+  pki_role: dotvault-tools
+  common_name: "{{.token_username}}"
+  ttl: 5m
+
 # SSH agent surface. Serves an agent.ExtendedAgent over a Unix domain socket
 # (default $XDG_RUNTIME_DIR/dotvault/agent.sock) backed by the live Vault
 # token. Point SSH_AUTH_SOCK at the socket to use it. dotvault's own

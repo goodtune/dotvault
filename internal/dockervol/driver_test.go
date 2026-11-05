@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/vault"
+	"github.com/goodtune/dotvault/internal/vaultfs"
 )
 
 // requireUnixPerms skips a test whose assertions rest on Unix mode bits or
@@ -595,7 +597,7 @@ func TestRemoveWithOutstandingMountsAndMountAfterRemove(t *testing.T) {
 	d.mu.Unlock()
 	w.opMu.Lock()
 	dir := d.volumePath("w")
-	if _, err := materialise(context.Background(), store, dir, w.Spec); err != nil {
+	if _, _, err := materialise(context.Background(), store, nil, dir, w.Spec); err != nil {
 		t.Fatal(err)
 	}
 	w.opMu.Unlock()
@@ -897,5 +899,409 @@ func TestActivatedFdIsDrainedWhenRunFails(t *testing.T) {
 	_, err = conn.Read(buf)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("read on the activated socket = %v, want EOF from the drain (a timeout means the engine would hang)", err)
+	}
+}
+
+func TestCreateClientCertRequiresSource(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	err := d.Create("c", map[string]string{OptClientCert: "true"})
+	want := "client_cert is not enabled in dotvault's configuration (client_cert.enabled)"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Create err = %v, want %q", err, want)
+	}
+	if err := d.Create("c", map[string]string{OptClientCert: "false"}); err != nil {
+		t.Errorf("client_cert=false needs no source: %v", err)
+	}
+}
+
+func TestCreateClientCertWithSourceMountsFiles(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "only"}); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := d.Mount(context.Background(), "c", "m1")
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Unmount("c", "m1") })
+	if _, err := os.Stat(filepath.Join(dir, vaultfs.ClientPEMFile)); err != nil {
+		t.Errorf("client.pem missing: %v", err)
+	}
+	info, err := d.Get("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status[StatusClientCert] != "only" || info.Status[StatusSelection] != "none" {
+		t.Errorf("status = %v", info.Status)
+	}
+}
+
+func TestRefreshClientCertDisabledNamesTheCause(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	// The configuration has since switched the feature off.
+	d.opts.ClientCert = nil
+	d.mu.Lock()
+	v := d.volumes["c"]
+	d.mu.Unlock()
+	d.refresh(context.Background(), v)
+	d.mu.Lock()
+	got := v.lastErr
+	d.mu.Unlock()
+	if !strings.Contains(got, "client_cert.enabled") {
+		t.Errorf("lastErr = %q, want one naming client_cert.enabled", got)
+	}
+}
+
+func TestPersistedClientCertVolumeReloads(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.ClientCert = &fakeCertSource{pair: testPair()}
+	if err := d.Create("c", map[string]string{OptClientCert: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := New(d.opts, newMemStore(), nil)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	d2.mu.Lock()
+	got := d2.volumes["c"].Spec.ClientCert
+	d2.mu.Unlock()
+	if got != ClientCertWith {
+		t.Errorf("reloaded ClientCert = %q", got)
+	}
+}
+
+// --- client certificate schedule ------------------------------------------
+
+// seqCertSource answers each Current call from next, which sees the 1-based
+// call number. Safe for the concurrent use a volume loop makes of it.
+type seqCertSource struct {
+	mu    sync.Mutex
+	calls int
+	next  func(call int) (*clientcert.Pair, error)
+}
+
+func (s *seqCertSource) Current(ctx context.Context) (*clientcert.Pair, error) {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	return s.next(n)
+}
+
+func (s *seqCertSource) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// certPair builds a pair whose files say tag, valid from now for lifetime,
+// due for refresh at now+refreshIn.
+func certPair(tag string, lifetime, refreshIn time.Duration) *clientcert.Pair {
+	now := time.Now()
+	return &clientcert.Pair{
+		CertPEM:   []byte("-----BEGIN CERTIFICATE-----\n" + tag + "\n-----END CERTIFICATE-----\n"),
+		KeyPEM:    []byte("-----BEGIN PRIVATE KEY-----\n" + tag + "\n-----END PRIVATE KEY-----\n"),
+		NotBefore: now,
+		NotAfter:  now.Add(lifetime),
+		RefreshAt: now.Add(refreshIn),
+	}
+}
+
+func noJitter(time.Duration) time.Duration { return 0 }
+
+// A volume carrying the certificate re-renders when the certificate falls
+// due, even while a live event subscription has suppressed the ticker:
+// Vault sends no event when a certificate ages.
+func TestVolumeClientCertRefreshesWhileEventsDrive(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.jitter = noJitter
+	d.setEdition(editionEnterprise)
+	d.setEvents(true, nil)
+	src := &seqCertSource{next: func(call int) (*clientcert.Pair, error) {
+		if call == 1 {
+			return certPair("FIRST", time.Hour, 200*time.Millisecond), nil
+		}
+		return certPair("SECOND", time.Hour, time.Hour), nil
+	}}
+	d.opts.ClientCert = src
+	if err := d.Create("c", map[string]string{OptClientCert: "only", OptTTL: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	mp, err := d.Mount(context.Background(), "c", "m1")
+	if err != nil {
+		t.Fatalf("Mount: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Unmount("c", "m1") })
+	crt := filepath.Join(mp, vaultfs.ClientCertFile)
+	if !fileHas(crt, "FIRST") {
+		t.Fatal("mount did not write the first certificate")
+	}
+	// Due in 200ms and floored at certTimerMin (1s); the 5s deadline is
+	// headroom for a loaded CI runner, not the expected latency.
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileHas(crt, "SECOND") {
+		if time.Now().After(deadline) {
+			t.Fatal("certificate not re-rendered within 5s of falling due")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A volume without the certificate gets no timer: with events driving and a
+// 10m ttl, nothing re-renders it.
+func TestVolumeWithoutClientCertNoExtraRefresh(t *testing.T) {
+	store := newMemStore()
+	store.put("gh", map[string]any{"a": "1"})
+	d, _ := newTestDriver(t, store, nil)
+	d.jitter = noJitter
+	d.setEdition(editionEnterprise)
+	d.setEvents(true, nil)
+	if err := d.Create("v", map[string]string{OptTTL: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(context.Background(), "v", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Unmount("v", "m1") })
+	before, _ := store.counts()
+	time.Sleep(time.Second)
+	if after, _ := store.counts(); after != before {
+		t.Errorf("store read %d more times with no event, tick or certificate", after-before)
+	}
+}
+
+// A refresh the source paces is retried on the short interval, not the ttl,
+// so files about to expire are replaced as soon as the source can sign.
+func TestVolumeClientCertRetriesShortlyWhenPaced(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.jitter = noJitter
+	d.certRetry = 100 * time.Millisecond
+	d.setEdition(editionEnterprise)
+	d.setEvents(true, nil)
+	src := &seqCertSource{next: func(call int) (*clientcert.Pair, error) {
+		switch call {
+		case 1:
+			return certPair("FIRST", time.Hour, 50*time.Millisecond), nil
+		case 2:
+			return nil, clientcert.ErrSignPaced
+		default:
+			return certPair("SECOND", time.Hour, time.Hour), nil
+		}
+	}}
+	d.opts.ClientCert = src
+	if err := d.Create("c", map[string]string{OptClientCert: "only", OptTTL: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	mp, err := d.Mount(context.Background(), "c", "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Unmount("c", "m1") })
+	// The 1s timer floor applies to the first arm; the paced retry follows.
+	deadline := time.Now().Add(3 * time.Second)
+	for !fileHas(filepath.Join(mp, vaultfs.ClientCertFile), "SECOND") {
+		if time.Now().After(deadline) {
+			t.Fatalf("paced refresh not retried on the short interval (source calls: %d)", src.count())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Unmounting stops the certificate timer with the loop: the source is not
+// consulted again once the last container has gone.
+func TestVolumeClientCertTimerStopsOnUnmount(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.jitter = noJitter
+	// The pair is always overdue, so a loop that kept running would fire
+	// every certRetry; at 50ms that is many calls inside the window.
+	d.certRetry = 50 * time.Millisecond
+	src := &seqCertSource{next: func(int) (*clientcert.Pair, error) {
+		return certPair("ANY", time.Hour, 0), nil
+	}}
+	d.opts.ClientCert = src
+	if err := d.Create("c", map[string]string{OptClientCert: "only", OptTTL: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(context.Background(), "c", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Unmount("c", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := src.count()
+	time.Sleep(1500 * time.Millisecond)
+	if got := src.count(); got != calls {
+		t.Errorf("source consulted %d times after the last unmount", got-calls)
+	}
+}
+
+// A client_cert=only volume selects no secrets, so it needs no Vault token
+// of the daemon's own: a held certificate renders without one, and a source
+// that does need a token says so itself.
+func TestClientCertOnlyVolumeNeedsNoToken(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	d.opts.HasToken = func() bool { return false }
+	// The loop's certificate timer must not fire while this test drives
+	// refresh itself and edits the fake.
+	d.certRetry = time.Hour
+	src := &fakeCertSource{pair: testPair()}
+	d.opts.ClientCert = src
+	if err := d.Create("c", map[string]string{OptClientCert: "only"}); err != nil {
+		t.Fatal(err)
+	}
+	mp, err := d.Mount(context.Background(), "c", "m1")
+	if err != nil {
+		t.Fatalf("Mount of a client_cert=only volume without a token: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Unmount("c", "m1") })
+	if !fileHas(filepath.Join(mp, vaultfs.ClientCertFile), "AAAA") {
+		t.Fatal("certificate not written")
+	}
+	d.mu.Lock()
+	v := d.volumes["c"]
+	d.mu.Unlock()
+	if _, err := d.refresh(context.Background(), v); err != nil {
+		t.Errorf("refresh without a token = %v, want the held certificate rendered", err)
+	}
+
+	src.err = clientcert.ErrNoToken
+	_, err = d.refresh(context.Background(), v)
+	if !errors.Is(err, clientcert.ErrNoToken) {
+		t.Errorf("refresh = %v, want the source's own ErrNoToken", err)
+	}
+
+	// A volume that also carries secrets still waits for a token.
+	if err := d.Create("w", map[string]string{OptClientCert: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Mount(context.Background(), "w", "m2"); !errors.Is(err, ErrNoToken) {
+		t.Errorf("Mount of a client_cert=true volume without a token = %v, want ErrNoToken", err)
+	}
+}
+
+func TestNextCertRefresh(t *testing.T) {
+	d, _ := newTestDriver(t, newMemStore(), nil)
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	d.now = func() time.Time { return now }
+	d.jitter = func(max time.Duration) time.Duration { return max }
+	certRetry := d.certRetry
+	with := Spec{TTL: 3 * time.Minute, ClientCert: ClientCertWith}
+	pair := func(refreshIn, lifetime time.Duration) *clientcert.Pair {
+		return &clientcert.Pair{NotBefore: now.Add(-time.Minute), NotAfter: now.Add(-time.Minute + lifetime), RefreshAt: now.Add(refreshIn)}
+	}
+	wrapped := fmt.Errorf("client certificate: %w", clientcert.ErrSignPaced)
+
+	for _, tc := range []struct {
+		name string
+		spec Spec
+		pair *clientcert.Pair
+		err  error
+		want time.Duration
+		arm  bool
+	}{
+		{"no certificate", Spec{TTL: time.Minute}, nil, nil, 0, false},
+		// Half-life shaped (the short-lived source): both jitter bounds agree on 5%.
+		{"due later, jitter 5% of lifetime", with, pair(time.Hour, 122*time.Minute), nil, time.Hour + 6*time.Minute + 6*time.Second, true},
+		// RefreshAt well past half-life: the window bound (a tenth of 39m) wins.
+		{"due later, jitter bounded by the window", with, pair(time.Hour, 100*time.Minute), nil, time.Hour + 3*time.Minute + 54*time.Second, true},
+		{"due almost now, 1s floor", with, pair(100*time.Millisecond, 0), nil, time.Second, true},
+		{"paced", with, nil, wrapped, certRetry, true},
+		{"source has no token", with, nil, clientcert.ErrNoToken, certRetry, true},
+		{"daemon has no token", with, nil, ErrNoToken, certRetry, true},
+		{"token being replaced", with, nil, fmt.Errorf("%w: %w", clientcert.ErrReauthInProgress, context.DeadlineExceeded), certRetry, true},
+		{"mount timed out waiting on a sign", with, nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.DeadlineExceeded), certRetry, true},
+		// Cancelled is shutdown, not something the short retry fixes: the
+		// same rule the FUSE mount applies when it answers EINTR.
+		{"render cancelled while a sign was in flight", with, nil, fmt.Errorf("%w: %w", clientcert.ErrSignInProgress, context.Canceled), with.TTL, true},
+		{"other failure", with, nil, errors.New("pki: permission denied"), with.TTL, true},
+		{"no pair reported", with, nil, nil, with.TTL, true},
+	} {
+		var s certSchedule
+		got, arm := d.nextCertRefresh(tc.spec, tc.pair, tc.err, &s)
+		if got != tc.want || arm != tc.arm {
+			t.Errorf("%s: = %v,%v want %v,%v", tc.name, got, arm, tc.want, tc.arm)
+		}
+	}
+
+	// A held-shaped pair: a 30-day certificate the daemon re-issues 7 days
+	// before expiry. The daemon rotates (and, with revoke_superseded,
+	// revokes the volume's copy) within about an hour of RefreshAt, and
+	// nothing is signed for a held pair, so jitter would only delay picking
+	// the rotation up: the timer fires at RefreshAt exactly.
+	heldPair := func(lifetime time.Duration) *clientcert.Pair {
+		nb := now.Add(-24 * time.Hour)
+		na := nb.Add(lifetime)
+		return &clientcert.Pair{NotBefore: nb, NotAfter: na, RefreshAt: na.Add(-7 * 24 * time.Hour), Source: clientcert.SourceHeld}
+	}
+	for _, lifetime := range []time.Duration{30 * 24 * time.Hour, 365 * 24 * time.Hour} {
+		hp := heldPair(lifetime)
+		var hs certSchedule
+		got, _ := d.nextCertRefresh(with, hp, nil, &hs)
+		if want := hp.RefreshAt.Sub(now); got != want {
+			t.Errorf("held %v: delay = %v, want RefreshAt with no jitter (= %v)", lifetime, got, want)
+		}
+		if !now.Add(got).Before(hp.NotAfter) {
+			t.Errorf("held %v: timer fires at or past NotAfter", lifetime)
+		}
+		// Once due, while the daemon has not rotated yet (rotation lands
+		// up to one hourly ReissueIfDue tick later), the volume re-checks
+		// at most every ttl rather than waiting out another long delay.
+		overdue := heldPair(lifetime)
+		overdue.RefreshAt = now.Add(-time.Minute)
+		for range 8 {
+			if dl, _ := d.nextCertRefresh(with, overdue, nil, &hs); dl > with.TTL {
+				t.Fatalf("held %v overdue: re-check after %v, want at most the ttl %v", lifetime, dl, with.TTL)
+			}
+		}
+	}
+
+	// A pair already past its RefreshAt means the source has nothing newer
+	// yet (a held certificate the daemon has not rotated); re-rendering at
+	// the 1s floor would hammer Vault for a With volume, so it backs off
+	// from certRetry to the ttl.
+	var s certSchedule
+	var got []time.Duration
+	for range 7 {
+		dl, _ := d.nextCertRefresh(with, pair(-time.Second, time.Hour), nil, &s)
+		got = append(got, dl)
+	}
+	want := []time.Duration{certRetry, 2 * certRetry, 4 * certRetry, 8 * certRetry, 16 * certRetry, with.TTL, with.TTL}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("overdue backoff = %v, want %v", got, want)
+			break
+		}
+	}
+	// The backoff never overruns the certificate's expiry: with the
+	// backoff at 40s and NotAfter 15s away, the timer fires just after
+	// NotAfter so the source has to sign again.
+	var e certSchedule
+	near := &clientcert.Pair{NotBefore: now.Add(-time.Hour), NotAfter: now.Add(15 * time.Second), RefreshAt: now.Add(-time.Minute)}
+	d.nextCertRefresh(with, near, nil, &e)
+	d.nextCertRefresh(with, near, nil, &e)
+	if dl, _ := d.nextCertRefresh(with, near, nil, &e); dl != 15*time.Second+certTimerMin {
+		t.Errorf("overdue delay near NotAfter = %v, want %v", dl, 15*time.Second+certTimerMin)
+	}
+
+	// A pair with a future RefreshAt resets the backoff.
+	d.nextCertRefresh(with, pair(time.Hour, time.Hour), nil, &s)
+	if dl, _ := d.nextCertRefresh(with, pair(-time.Second, time.Hour), nil, &s); dl != certRetry {
+		t.Errorf("overdue after recovery = %v, want %v", dl, certRetry)
+	}
+}
+
+func TestDefaultJitterBounded(t *testing.T) {
+	for range 200 {
+		if j := defaultJitter(time.Second); j < 0 || j > time.Second {
+			t.Fatalf("jitter %v outside [0, 1s]", j)
+		}
+	}
+	if j := defaultJitter(0); j != 0 {
+		t.Errorf("jitter(0) = %v", j)
 	}
 }

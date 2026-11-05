@@ -101,10 +101,36 @@ Under `dotvault-docker.socket` the unit's `ListenStream=` path wins over `docker
 | `layout` | `json` | `json` writes `<name>.json` per secret. `fields` writes a directory per secret with one file per field, the raw value as the contents — for programs that read `DB_PASSWORD_FILE=/run/secrets/dotvault/db/password` |
 | `mode` | `0400` | File mode. Only read bits are accepted (`0400`, `0440`, `0444`); directories get matching traverse bits |
 | `ttl` | `docker.cache_ttl` (`1m`) | This volume's refresh window when polling (see [Staying current](#staying-current)). Capped at ten minutes |
+| `client_cert` | off | `true` adds the client certificate files beside the `secrets` selection; `only` serves just the certificate. See [Client certificates](#client-certificates) |
 
 An unknown option is an error: a mistyped `secret=` that silently selected every secret you have would be the opposite of what you asked for.
 
 With no `secrets` option the volume carries your whole subtree, like the filesystem does. Prefer naming what the container needs — a container is usually the one place you *do* want less than everything.
+
+### Client certificates
+
+With [`client_cert.enabled`](../configuration/config-reference.md#client-certificate-section) in dotvault's configuration, a volume can carry a mutual-TLS client certificate for the container to present to a service:
+
+```console
+$ docker volume create -d dotvault -o client_cert=only -o mode=0444 tls
+$ docker run --rm -v tls:/run/secrets/dotvault:ro curlimages/curl \
+    --cert /run/secrets/dotvault/client.pem https://service.example.com/
+```
+
+Three files appear at the volume root: `client.pem` (certificate chain then private key, one file), `client.crt` (the leaf and its CA chain) and `client.key` (PKCS#8 PEM). They take the volume's `mode` like every other file — including the key, so with `-o mode=0444` (as above) every uid in the container can read `client.key`, and `client.pem` with it; under plain `mtls` that key is your Vault login (see the warning below). The certificate comes from the same source the [filesystem](filesystem.md#client-certificates) serves, and is replaced before it expires.
+
+- **`client_cert=true` adds the three files beside whatever `secrets=` selects.** Read that carefully: **an absent `secrets` still means your WHOLE subtree.** `-o client_cert=true` on its own gives the container the certificate *and every secret you have*. If you want only the certificate, use `only`, or name the secrets the container needs.
+- **`client_cert=only` serves just the certificate**: no secrets are selected and none are rendered, and a held certificate needs no Vault token to mount. It conflicts with `secrets=` and the volume is refused if both are given.
+- A volume whose configuration has `client_cert.enabled` off cannot be created with the option; the error says `client_cert is not enabled in dotvault's configuration`.
+- **Prefer `client.pem`.** `client.crt` and `client.key` are replaced as two separate files, so a reader can briefly see a mismatched pair across a rotation. `client.pem` is replaced as one file and is always consistent. If a tool needs two files, have it read both for each new connection rather than loading them once.
+- A volume re-renders on the certificate's own schedule (when the certificate is due for replacement: half way through a short-lived certificate's lifetime plus a little jitter, or exactly `reissue_before` ahead of a held one's expiry, then again at intervals no longer than the volume `ttl` until the daemon has rotated it), **even when Vault events drive the rest of the refresh**; without that, an Enterprise volume would keep serving an expired certificate for as long as the event subscription stayed up. When a certificate cannot be had for a reason that clears on its own — the daemon holds no token yet, the next signing is paced, the daemon's token is being replaced, or the render's own deadline ran out while a signing was still in progress — the volume retries on the short certificate schedule (about every 10 seconds), not the ordinary ticker; any other failure, and a render cancelled by shutdown, waits for the ticker.
+- A `Mount` that has to sign a certificate while the daemon holds no Vault token is refused, as with secrets. A `client_cert=only` volume is exempt when the certificate is a held one, which needs no token.
+- **A volume that carries the certificate needs one it can serve, to mount and to refresh.** The certificate and the secrets are rendered together, and a certificate failure fails the whole render, so the files never hold half of one. If signing keeps failing — a policy without `pki/sign/<role>`, say — a `client_cert=true` or `only` volume cannot be mounted at all until it succeeds, and a mounted one keeps its previous files: while its current certificate is still valid that is served and its secrets keep refreshing, but once that certificate expires its secrets stop refreshing too, and `docker volume inspect` shows the signing error as `last_error`. If the container needs its secrets to stay current regardless, give it a second volume without `client_cert`.
+
+Under a short-lived certificate (everything except plain `mtls`) the certificate's key is written into the volume directory, on the runtime tmpfs, for as long as a container holds the volume, and is deleted at the last unmount. That is the one place a short-lived key reaches a filesystem, and it is the same exposure the secrets already have.
+
+!!! warning "Under plain `mtls` the key is your Vault login"
+    With `auth_method: mtls` the files hold the certificate the daemon logs in to Vault with: a container that can read `client.key` can log in to Vault as you until it expires. See [the security notes](../configuration/config-reference.md#security-properties-and-decisions).
 
 ### Who can read the files
 

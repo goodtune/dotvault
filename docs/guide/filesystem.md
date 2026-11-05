@@ -189,6 +189,39 @@ A secret and a folder may share a name. `users/you/databricks` and `users/you/da
 
 One collision survives, and it is narrow: **a KV folder whose name already ends in `.json`** competes with the secret of the same stem. A folder `report.json/` and a secret `report` both want the filename `report.json`. The behaviour is deterministic — the directory wins, so the secrets underneath stay reachable — and the daemon logs a warning naming the path, but the shadowed secret has no path in the mount. Read it through the web UI or `vault kv get`. The mount refuses to *create* such a directory, so it can only arise from a KV tree laid out that way already.
 
+## Client certificates
+
+With [`client_cert.enabled`](../configuration/config-reference.md#client-certificate-section), three more files appear at the **root of the mount**, for tools that speak mutual TLS and want to present a certificate for you:
+
+```console
+$ ls ~/.dotvault
+client.crt  client.key  client.pem  databricks  gh.json  jfrog.json
+
+$ curl --cert ~/.dotvault/client.pem https://service.example.com/
+```
+
+| File | Contents |
+|------|----------|
+| `client.pem` | The certificate chain followed by the private key, in one file. **Prefer this one.** |
+| `client.crt` | The leaf certificate followed by its CA chain (PEM) |
+| `client.key` | The private key (PKCS#8 PEM) |
+
+Use `client.pem` wherever the tool accepts it (`curl --cert client.pem`). The certificate is replaced every few minutes, and `client.crt` and `client.key` are two files: a rotation that lands between a tool reading one and the other pairs a certificate with the wrong key, and the handshake fails. `client.pem` is one read, so it can never be mismatched. Keep the two-file form for tools that need it (`curl --cert client.crt --key client.key`), and for those read both files for every new connection rather than caching them.
+
+All three are produced from a single certificate and key, so any one read is self-consistent. The certificate is short-lived by default (five minutes) and is replaced before it expires without anything for you to do; whether it is a freshly signed certificate or the one the daemon itself logs in to Vault with depends on your auth method, and is described in the [config reference](../configuration/config-reference.md#where-the-certificate-comes-from).
+
+How the files behave differs from the secrets beside them, because their contents change every few minutes and depend on the daemon's token rather than on one KV version:
+
+- **They are read-only even on a `read_write` mount**, mode `0400`. Writing, removing or renaming one is refused.
+- **Reads always come straight from the certificate source**, not from the mount's cache: they are served with direct I/O and a kernel attribute timeout of about a nanosecond, so a tool never sees a superseded certificate for up to `cache_ttl` longer. `stat` reports the certificate's `NotBefore` as the mtime and the exact size.
+- **A read or an `ls -l` of the mount root can trigger a signing** (a Vault call) when the cached certificate is due for replacement, because stat needs a size and the size needs the file. At most one signing runs at a time and concurrent readers share it; a failed signing is retried no sooner than 10 seconds later, doubling to five minutes, so a policy that denies it does not turn a polling tool into a stream of denied requests. Between signings a read always returns the still-valid certificate if there is one. When there is none, what it gets depends on why no signing is running. After a failed signing, while the retry is backing off, the read gets that signing's failure again: an I/O error (`EIO`) for a denial or any other Vault error, and the daemon log names the cause — the PKI mount, the role and Vault's answer — once when it first appears and then at most every ten minutes while it persists, so a polling tool does not flood the log. When nothing has failed and the next signing is simply not due yet (signings with the same token are at least 10 seconds apart), or the daemon holds no Vault token yet, or its token is being replaced and the replacement has not finished within 30 seconds, the read gets `EAGAIN`: try again shortly. A read also gets `EAGAIN` when its own 30-second budget runs out while a signing is still in progress — the signing is not abandoned, so the retry gets its result; only a signing that itself failed or timed out against Vault is reported as `EIO`.
+- **A KV folder named `client.crt`, `client.key` or `client.pem` at the root is hidden behind the certificate**, and the daemon logs a warning naming it. The certificate wins, matching how the mount resolves its other collisions. Secrets cannot collide, since every secret filename ends in `.json`.
+
+!!! warning "Under plain `mtls` the key is your Vault login"
+    If you authenticate with `auth_method: mtls`, the files hold the certificate the daemon logs in to Vault with. Anything that can read `client.key` can log in to Vault as you until the certificate expires. The mount is owner-only, but every process you run can read it. See [the security notes](../configuration/config-reference.md#security-properties-and-decisions). Plain `mtls` has no way to keep the two apart: the held certificate is always served when one is enrolled, and `client_cert.pki_role` is only the fallback for when it is not. If that is not acceptable, use `mtls+tpm`, `mtls+os` or a non-certificate method, which serve a separately signed short-lived certificate instead.
+
+If the certificate files do not appear, `client_cert.enabled` is off or the section could not be built; the daemon logs the reason once at startup. `dotvault status` shows which source would be used and `GET /api/v1/status` shows what is being served.
+
 ## Permissions
 
 The mount only shows what your Vault token can read, so a token scoped more tightly than your KV prefix simply sees less.

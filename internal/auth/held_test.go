@@ -204,6 +204,30 @@ func TestExportHeldStatsBeforeRead(t *testing.T) {
 	}
 }
 
+// The whole version, file identity included, must be taken before the read.
+// On Windows the identity reopens the path rather than reading the stat
+// already in hand, so taking it after the read could tag the old content with
+// a replacement file's identity, and a same-size rotation inside one mtime
+// tick would then go unnoticed. The fake answers at call time, which is what
+// a reopen does, so this holds on every platform.
+func TestExportHeldTakesTheFileIdentityBeforeRead(t *testing.T) {
+	dir := t.TempDir()
+	seedHeld(t, dir, "mtls", "file", "alice", time.Now().Add(time.Hour), pkcs8Handle(t))
+
+	var current uint64 = 1
+	identityOf = func(string, os.FileInfo) fileID { return fileID{idx: current} }
+	heldAfterStat = func() { current = 2 } // the file is replaced after the stat
+	t.Cleanup(func() { identityOf = fileIdentity; heldAfterStat = nil })
+
+	held, err := ExportHeldCertificate(dir, "mtls", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Version.id.idx != 1 {
+		t.Fatalf("Version identity = %d, want the pre-read identity 1", held.Version.id.idx)
+	}
+}
+
 // A key that is not the certificate's key is an unusable credential, and the
 // error must not carry key material.
 func TestExportHeldKeyCertMismatch(t *testing.T) {

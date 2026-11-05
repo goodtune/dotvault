@@ -74,7 +74,7 @@ func StatCredential(storageDir string) (CredentialVersion, error) {
 func versionOf(path string, fi os.FileInfo) CredentialVersion {
 	// Normalise to wall-clock UTC so == compares the instant, not the
 	// location or a monotonic reading.
-	return CredentialVersion{ModTime: fi.ModTime().UTC().Round(0), Size: fi.Size(), id: fileIdentity(path, fi)}
+	return CredentialVersion{ModTime: fi.ModTime().UTC().Round(0), Size: fi.Size(), id: identityOf(path, fi)}
 }
 
 // ErrHeldNotExportable is returned when the held certificate's key is
@@ -88,6 +88,10 @@ var ErrHeldNotExportable = errors.New("held certificate key is not exportable")
 // heldAfterStat is a test seam run between the stat and the read, so a test
 // can land a rotation in that window. Nil in production.
 var heldAfterStat func()
+
+// identityOf is fileIdentity, swappable so a test can stand in for the
+// Windows implementation, which reopens the path instead of reading the stat.
+var identityOf = fileIdentity
 
 // ExportHeldCertificate returns the certificate and key stored for cert auth.
 // It is refused with ErrHeldNotExportable unless method is exactly "mtls" and
@@ -104,17 +108,22 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		// directory; see CertLoginFromStore.
 		return nil, fmt.Errorf("%w: no credential storage directory", ErrNoCertCredential)
 	}
-	// Stat before reading. A rotation landing between the two then pairs the
-	// old version with the new content, which only makes the caller reload
-	// once more; the other order would pair a new version with old content and
-	// hide the rotation from it until the next one.
-	fi, err := os.Stat(credentialPath(storageDir))
+	// Take the whole version before reading. A rotation landing between the
+	// two then pairs the old version with the new content, which only makes
+	// the caller reload once more; the other order would pair a new version
+	// with old content and hide the rotation from it until the next one. That
+	// includes the file identity: on Windows it reopens the path rather than
+	// reading fi, so computing it after the read would reintroduce exactly
+	// that pairing.
+	path := credentialPath(storageDir)
+	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: a bootstrap is required", ErrNoCertCredential)
 		}
 		return nil, fmt.Errorf("%w: stat credential: %w", ErrNoCertCredential, err)
 	}
+	version := versionOf(path, fi)
 	if heldAfterStat != nil {
 		heldAfterStat()
 	}
@@ -163,6 +172,6 @@ func ExportHeldCertificate(storageDir, method, username string) (*HeldCertificat
 		KeyPEM:   pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
 		NotAfter: cred.NotAfter,
 		Serial:   cred.Serial,
-		Version:  versionOf(credentialPath(storageDir), fi),
+		Version:  version,
 	}, nil
 }

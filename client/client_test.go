@@ -671,3 +671,32 @@ func TestAuthenticateCached_FallsBackToPeerSocket(t *testing.T) {
 		t.Errorf("Token = %q, want remote-token", c.Token())
 	}
 }
+
+func TestReadUserSecretFields(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	id, err := c.IdentityName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Field names the caller does not know in advance, values stringified
+	// as ReadUserSecret stringifies one.
+	fv.secrets["kv/users/"+id+"/tool/accounts"] = map[string]any{"work": `{"user":"a"}`, "count": 3}
+
+	got, found, err := c.ReadUserSecretFields(context.Background(), "tool/accounts")
+	if err != nil || !found {
+		t.Fatalf("got (%v, %v, %v)", got, found, err)
+	}
+	if len(got) != 2 || got["work"] != `{"user":"a"}` || got["count"] != "3" {
+		t.Errorf("fields = %v", got)
+	}
+
+	got, found, err = c.ReadUserSecretFields(context.Background(), "absent")
+	if err != nil || found || got != nil {
+		t.Errorf("absent secret: got (%v, %v, %v), want (nil, false, nil)", got, found, err)
+	}
+}

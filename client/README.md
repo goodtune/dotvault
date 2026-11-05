@@ -125,6 +125,10 @@ The KV v2 mount and user prefix come from dotvault's config (`vault.kv_mount`, d
 
 Vault namespaces are not a dotvault config field; the underlying client honours `VAULT_NAMESPACE`.
 
+## Reading a whole secret
+
+When you don't know a secret's field names in advance (one field per workspace, say), `ReadUserSecretFields(ctx, service)` returns every field of `kv/users/<user>/<service>`, stringified as `ReadUserSecret` stringifies one; `ReadKVFields(ctx, mount, path)` is the non-standard-layout form. A missing secret is `(nil, false, nil)`. Depend on the `FieldsReader` interface for it: it is deliberately separate from `Reader`, so adding it broke no existing fake.
+
 ## Testing on the consumer side
 
 The package ships `client.Reader`, a narrow interface covering the read side (`IdentityName`, `ReadKVField`, `ReadUserSecret`) that `*client.Client` satisfies. Depend on `client.Reader` wherever your code consumes a secret, and substitute a hand-written fake in tests — no live Vault, no network. See the runnable `ExampleReader` in `example_test.go` for a ~15-line fake.

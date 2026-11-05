@@ -700,3 +700,54 @@ func TestReadUserSecretFields(t *testing.T) {
 		t.Errorf("absent secret: got (%v, %v, %v), want (nil, false, nil)", got, found, err)
 	}
 }
+
+// ReadKVFields called directly, at a path outside the user layout: the
+// mount and path are used as given, and a secret with no fields is found
+// (an empty map, not nil), as documented.
+func TestReadKVFields_ExplicitPathAndEmptySecret(t *testing.T) {
+	t.Setenv("DOTVAULT_TOKEN", "good-token")
+	fv := newFakeVault(t)
+	c := newTestClient(t, fv)
+	if err := c.AuthenticateCached(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fv.secrets["kv/shared/team"] = map[string]any{"a": "1"}
+	fv.secrets["kv/shared/empty"] = map[string]any{}
+
+	got, found, err := c.ReadKVFields(context.Background(), "kv", "shared/team")
+	if err != nil || !found || len(got) != 1 || got["a"] != "1" {
+		t.Errorf("shared/team: got (%v, %v, %v)", got, found, err)
+	}
+	got, found, err = c.ReadKVFields(context.Background(), "kv", "shared/empty")
+	if err != nil || !found || got == nil || len(got) != 0 {
+		t.Errorf("empty secret: got (%v, %v, %v), want (empty map, true, nil)", got, found, err)
+	}
+}
+
+// A failed whole-secret read is classified like a single-field one, so a
+// consumer can tell a denied token from an unreachable Vault.
+func TestReadKVFields_ErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakIt func(*fakeVault)
+		want    error
+	}{
+		{"denied", func(fv *fakeVault) { fv.tokenValid = false }, ErrDenied},
+		{"unreachable", func(fv *fakeVault) { fv.unreachable = true }, ErrUnreachable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOTVAULT_TOKEN", "good-token")
+			fv := newFakeVault(t)
+			c := newTestClient(t, fv)
+			if err := c.AuthenticateCached(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			fv.secrets["kv/shared/team"] = map[string]any{"a": "1"}
+			tc.breakIt(fv)
+			got, found, err := c.ReadKVFields(context.Background(), "kv", "shared/team")
+			if !errors.Is(err, tc.want) || found || got != nil {
+				t.Errorf("got (%v, %v, %v), want (nil, false, %v)", got, found, err, tc.want)
+			}
+		})
+	}
+}

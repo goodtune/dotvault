@@ -527,7 +527,8 @@ func stringifyField(raw any) string {
 // no fields is (empty map, true, nil). The map is the caller's.
 //
 // It is for a consumer that does not know a secret's field names in advance,
-// such as one field per workspace.
+// such as one field per workspace. ReadKVField's mount caveat applies: a
+// missing or disabled mount also reads as (nil, false, nil).
 func (c *Client) ReadKVFields(ctx context.Context, mount, path string) (map[string]string, bool, error) {
 	secret, err := c.vc.ReadKVv2(ctx, mount, path)
 	if err != nil {
@@ -555,8 +556,13 @@ func (c *Client) ReadUserSecret(ctx context.Context, service, field string) (str
 	if err != nil {
 		return "", false, err
 	}
-	path := c.cfg.Vault.UserPrefix + identity + "/" + service
-	return c.ReadKVField(ctx, c.cfg.Vault.KVMount, path, field)
+	return c.ReadKVField(ctx, c.cfg.Vault.KVMount, c.userSecretPath(identity, service), field)
+}
+
+// userSecretPath is the one definition of where a user's secret lives under
+// the KV mount: {user_prefix}{identity}/{service}.
+func (c *Client) userSecretPath(identity, service string) string {
+	return c.cfg.Vault.UserPrefix + identity + "/" + service
 }
 
 // ReadUserSecretFields reads every field of kv/users/<IdentityName>/<service>.
@@ -566,18 +572,8 @@ func (c *Client) ReadUserSecretFields(ctx context.Context, service string) (map[
 	if err != nil {
 		return nil, false, err
 	}
-	return c.ReadKVFields(ctx, c.cfg.Vault.KVMount, c.cfg.Vault.UserPrefix+identity+"/"+service)
+	return c.ReadKVFields(ctx, c.cfg.Vault.KVMount, c.userSecretPath(identity, service))
 }
-
-// FieldsReader is the whole-secret read, kept out of Reader on purpose:
-// consumers implement Reader in their test fakes, and adding a method to it
-// would break every one of them. *Client satisfies both.
-type FieldsReader interface {
-	// ReadUserSecretFields reads every field of kv/users/<identity>/<service>.
-	ReadUserSecretFields(ctx context.Context, service string) (map[string]string, bool, error)
-}
-
-var _ FieldsReader = (*Client)(nil)
 
 // Reader is the read-side contract a consumer depends on after a Client is
 // authenticated. It exists so downstream code can accept this narrow
@@ -600,3 +596,17 @@ type Reader interface {
 
 // Compile-time assertion that *Client satisfies Reader.
 var _ Reader = (*Client)(nil)
+
+// FieldsReader is the whole-secret read, kept out of Reader on purpose:
+// consumers implement Reader in their test fakes, and adding a method to it
+// would break every one of them. It carries both forms now, while nothing
+// implements it, so neither has to be added later. *Client satisfies both; a
+// consumer needing both embeds them, interface{ Reader; FieldsReader }.
+type FieldsReader interface {
+	// ReadKVFields reads every field of a KV v2 secret. See Client.ReadKVFields.
+	ReadKVFields(ctx context.Context, mount, path string) (map[string]string, bool, error)
+	// ReadUserSecretFields reads every field of kv/users/<identity>/<service>.
+	ReadUserSecretFields(ctx context.Context, service string) (map[string]string, bool, error)
+}
+
+var _ FieldsReader = (*Client)(nil)

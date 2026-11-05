@@ -18,7 +18,8 @@ import (
 //	missing_token   → ErrLoginRequired
 //	denied          → ErrDenied, ErrAuthFailed
 //	unreachable     → ErrUnreachable
-//	missing_field   → (value, false, nil) from ReadKVField/ReadUserSecret
+//	missing_field   → (value, false, nil) from ReadKVField/ReadUserSecret,
+//	                  (nil, false, nil) from ReadKVFields/ReadUserSecretFields
 //
 // ErrAuthFailed covers an interactive login that started but did not yield a
 // usable token (bad password, declined MFA, OIDC callback error). It is

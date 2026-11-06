@@ -51,6 +51,13 @@ type RefreshManager struct {
 	// provider rejected. The wipe runs a tick later, and only if that version
 	// is still current; see refreshOne.
 	revoked map[string]revokedMark
+	// seen is the KVv2 version each enrolment's secret had at the last
+	// tick, so a tick can tell when another writer moved it on. See
+	// observeVersion.
+	seen map[string]int
+	// onChange is notified of every version change this manager wrote or
+	// observed. Nil when no hook is wired.
+	onChange ChangeFunc
 }
 
 // revokedMark identifies the rejected KVv2 version by number and creation
@@ -68,6 +75,20 @@ func (r revokedMark) matches(s *vault.Secret) bool {
 	return r.version == s.Version && r.created.Equal(s.CreatedTime)
 }
 
+// Change reports that an enrolment's secret moved to a new KVv2 version.
+// Local is true when this process wrote it, and false when a tick found a
+// version some other writer produced (another daemon sharing the secret, a
+// re-enrolment elsewhere).
+type Change struct {
+	Key     string
+	Version int
+	Local   bool
+}
+
+// ChangeFunc receives Changes. It is called synchronously on the manager's
+// goroutine, so it must not block.
+type ChangeFunc func(Change)
+
 type backoffState struct {
 	delay       time.Duration
 	nextAttempt time.Time
@@ -84,6 +105,14 @@ func WithClock(c Clock) RefreshManagerOption {
 // WithMaxBackoff overrides the backoff cap. Intended for tests.
 func WithMaxBackoff(d time.Duration) RefreshManagerOption {
 	return func(m *RefreshManager) { m.maxBackoff = d }
+}
+
+// WithChangeHook registers fn to be told about every version change of a
+// refreshable secret. The daemon uses it to re-sync files at once rather
+// than at the next sync poll, which matters because a rotated access token
+// usually invalidates the one already on disk.
+func WithChangeHook(fn ChangeFunc) RefreshManagerOption {
+	return func(m *RefreshManager) { m.onChange = fn }
 }
 
 // NewRefreshManager constructs a RefreshManager. userPrefix must already
@@ -113,6 +142,7 @@ func NewRefreshManager(
 		enrolments:    enrolments,
 		backoffs:      make(map[string]backoffState),
 		revoked:       make(map[string]revokedMark),
+		seen:          make(map[string]int),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -142,6 +172,11 @@ func (m *RefreshManager) UpdateConfig(enrolments map[string]config.Enrolment) {
 	for key := range m.revoked {
 		if !sameEnrolment(old, enrolments, key) {
 			delete(m.revoked, key)
+		}
+	}
+	for key := range m.seen {
+		if _, ok := enrolments[key]; !ok {
+			delete(m.seen, key)
 		}
 	}
 }
@@ -247,8 +282,11 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 		// was deleted externally while we were in a backoff window).
 		m.resetBackoff(key)
 		m.clearRevoked(key)
+		m.markAbsent(key)
 		return
 	}
+
+	m.observeVersion(key, secret.Version)
 
 	if mark, ok := m.revocation(key); ok {
 		if mark.matches(secret) {
@@ -343,6 +381,9 @@ func (m *RefreshManager) refreshOne(ctx context.Context, key string, enrolment c
 
 	slog.Info("refresh: rotation complete", "key", key, "new_expires_at", rotated["expires_at"])
 	m.resetBackoff(key)
+	// The check-and-set succeeded against secret.Version, so the write
+	// produced exactly the next version.
+	m.recordWrite(key, secret.Version+1)
 }
 
 // wipeRevoked deletes a secret whose refresh token the provider rejected and
@@ -368,6 +409,45 @@ func (m *RefreshManager) wipeRevoked(ctx context.Context, key, path string, used
 	// terminal until the user re-enrols.
 	m.resetBackoff(key)
 	m.clearRevoked(key)
+	m.markAbsent(key)
+}
+
+// observeVersion records the version a tick read and notifies the hook when
+// it differs from the previous tick's. The first sighting is only recorded:
+// with nothing to compare against there is no evidence of a change, and the
+// daemon's initial sync has already rendered whatever is current.
+func (m *RefreshManager) observeVersion(key string, version int) {
+	m.mu.Lock()
+	prev, ok := m.seen[key]
+	m.seen[key] = version
+	fn := m.onChange
+	m.mu.Unlock()
+	if ok && prev != version && fn != nil {
+		slog.Info("refresh: secret changed by another writer", "key", key, "version", version)
+		fn(Change{Key: key, Version: version, Local: false})
+	}
+}
+
+// recordWrite records a version this manager wrote, so the next tick does
+// not report it again as observed, and notifies the hook.
+func (m *RefreshManager) recordWrite(key string, version int) {
+	m.mu.Lock()
+	m.seen[key] = version
+	fn := m.onChange
+	m.mu.Unlock()
+	if fn != nil {
+		fn(Change{Key: key, Version: version, Local: true})
+	}
+}
+
+// markAbsent records that the secret does not exist (never enrolled, or
+// wiped). Version 0 is never a real KVv2 version, so a secret that appears
+// later — a re-enrolment on another host — reads as a change rather than a
+// first sighting.
+func (m *RefreshManager) markAbsent(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seen[key] = 0
 }
 
 func (m *RefreshManager) revocation(key string) (revokedMark, bool) {

@@ -1004,3 +1004,141 @@ func TestRefreshManager_WipeSkippedAfterReload(t *testing.T) {
 		t.Errorf("deleted = %v after the enrolment changed, want none", got)
 	}
 }
+
+// ---------- change hook ----------
+
+type changeRecorder struct {
+	mu      sync.Mutex
+	changes []Change
+}
+
+func (r *changeRecorder) hook(c Change) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.changes = append(r.changes, c)
+}
+
+func (r *changeRecorder) got() []Change {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Change(nil), r.changes...)
+}
+
+func TestRefreshManager_ChangeHookReportsLocalRotation(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	data := map[string]string{
+		"access_token":  "old",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	}
+	fv.seed("users/alice/jfrog", data) // version 1
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) {
+		out := copyMap(data)
+		out["access_token"] = "new"
+		out["issued_at"] = issued.Add(4 * time.Hour).Format(time.RFC3339)
+		out["expires_at"] = issued.Add(10 * time.Hour).Format(time.RFC3339)
+		return out, nil
+	}
+	registerFake(t, "jfrog-fake", fake)
+
+	rec := &changeRecorder{}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour,
+		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+		WithChangeHook(rec.hook),
+	)
+	m.tick(context.Background())
+
+	want := []Change{{Key: "jfrog", Version: 2, Local: true}}
+	if got := rec.got(); len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("changes = %+v, want %+v", got, want)
+	}
+
+	// The next tick reads the version this manager wrote; that is not news.
+	m.tick(context.Background())
+	if got := rec.got(); len(got) != 1 {
+		t.Fatalf("changes after a quiet tick = %+v, want only the rotation", got)
+	}
+}
+
+func TestRefreshManager_ChangeHookReportsVersionWrittenElsewhere(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	data := map[string]string{
+		"access_token":  "a",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	}
+	fv.seed("users/alice/jfrog", data) // version 1
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	registerFake(t, "jfrog-fake", fake)
+
+	rec := &changeRecorder{}
+	// Before half-life: this manager never rotates, it only reads.
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour,
+		WithClock(&fixedClock{now: issued.Add(time.Hour)}),
+		WithChangeHook(rec.hook),
+	)
+
+	m.tick(context.Background())
+	if got := rec.got(); len(got) != 0 {
+		t.Fatalf("first sighting reported %+v, want nothing", got)
+	}
+
+	fv.seed("users/alice/jfrog", data) // another daemon rotated: version 2
+	m.tick(context.Background())
+
+	want := Change{Key: "jfrog", Version: 2, Local: false}
+	if got := rec.got(); len(got) != 1 || got[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", got, want)
+	}
+	if n := len(fake.Calls()); n != 0 {
+		t.Errorf("Refresh called %d times before half-life", n)
+	}
+}
+
+// A secret wiped on revocation and re-enrolled on another host must read as
+// a change, not as a first sighting, or this host keeps rendering nothing
+// until its next sync poll.
+func TestRefreshManager_ChangeHookReportsReappearedSecret(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	registerFake(t, "jfrog-fake", fake)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	rec := &changeRecorder{}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour,
+		WithClock(&fixedClock{now: issued.Add(time.Hour)}),
+		WithChangeHook(rec.hook),
+	)
+
+	m.tick(context.Background()) // absent
+	fv.seed("users/alice/jfrog", map[string]string{
+		"access_token":  "a",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	})
+	m.tick(context.Background())
+
+	want := Change{Key: "jfrog", Version: 1, Local: false}
+	if got := rec.got(); len(got) != 1 || got[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", got, want)
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/dockervol"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/events"
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
 	"github.com/goodtune/dotvault/internal/paths"
@@ -202,6 +203,10 @@ type Server struct {
 	// fuseStatusSnapshot.
 	fuseStatus func() vaultfs.Status
 
+	// events is the hub GET /api/v1/events streams from. Nil leaves the
+	// endpoint serving a stream that never carries an event.
+	events *events.Hub
+
 	// peerMu guards peerStatus, wired post-construction like fuseStatus.
 	peerMu sync.RWMutex
 	// peerStatus reports the peer socket pool for /api/v1/status's
@@ -257,6 +262,9 @@ type ServerConfig struct {
 	Rules    []config.Rule
 	Vault    *vault.Client
 	Engine   *internalsync.Engine
+	// Events, when non-nil, is the hub of secret-write notices streamed on
+	// GET /api/v1/events. See internal/events.
+	Events *events.Hub
 	// Agent, when non-nil, exposes the SSH agent status on /api/v1/status.
 	Agent agentStatusProvider
 	// AgentCfg is the loaded agent configuration. It is the section the
@@ -343,6 +351,7 @@ func NewServer(sc ServerConfig) (*Server, error) {
 		obsCfg:             sc.ObsCfg,
 		vault:              sc.Vault,
 		engine:             sc.Engine,
+		events:             sc.Events,
 		agentStatus:        sc.Agent,
 		agentCfg:           sc.AgentCfg,
 		apiCfg:             sc.APICfg,
@@ -502,6 +511,9 @@ func (s *Server) registerAPIRoutes() {
 	s.mux.HandleFunc("PUT /api/v1/secrets/", s.requireCSRF(s.handleSecretWrite))
 	s.mux.HandleFunc("DELETE /api/v1/secrets/", s.requireCSRF(s.handleSecretDelete))
 	s.mux.HandleFunc("POST /api/v1/sync", s.requireCSRF(s.handleSync))
+	// Not CSRF-gated: a GET that changes nothing. It streams key names and
+	// versions, never values; see events.go.
+	s.mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	// Deliberately not CSRF-wrapped — see handleRemoteBrowse for the
 	// rationale (bare-curl consumer over a forwarded socket; nothing
 	// sensitive read or returned). Cross-site browser traffic is rejected

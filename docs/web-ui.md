@@ -148,6 +148,7 @@ The web UI communicates with the dotvault daemon via a REST API:
 | `PUT` | `/api/v1/secrets/{path}` | Replace a secret; 404 if absent (CSRF-protected) |
 | `DELETE` | `/api/v1/secrets/{path}` | Delete a secret and every version of it (CSRF-protected) |
 | `POST` | `/api/v1/sync` | Trigger immediate sync (CSRF-protected) |
+| `GET` | `/api/v1/events` | Server-Sent Events stream of secret-write notices (`kv-write`: key and KVv2 version, never a value) |
 | `POST` | `/api/v1/remote/browse` | Open a form-posted `url` in this host's default browser (not CSRF-protected) |
 | `POST` | `/api/v1/remote/notify` | Raise a form-posted desktop notification on this host (not CSRF-protected) |
 | `POST` | `/api/v1/remote/clipboard` | Put form-posted `text` on this host's clipboard (not CSRF-protected) |

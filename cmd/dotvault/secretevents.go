@@ -14,7 +14,10 @@ func secretChangeHook(triggerSync func(), hub *events.Hub) func(source string) e
 	return func(source string) enrol.ChangeFunc {
 		return func(c enrol.Change) {
 			triggerSync()
-			if c.Local {
+			// Version 0 means Vault's response carried no version. A notice
+			// without one cannot be deduplicated, so it is not sent; the
+			// peers' own refresh checks still pick the change up.
+			if c.Local && c.Version > 0 {
 				hub.Publish(events.Event{Key: c.Key, Version: c.Version, Source: source})
 			}
 		}

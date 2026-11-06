@@ -1101,6 +1101,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// between a write and the next sync poll on hosts that have no Vault
 	// event stream — Community edition, or any host reached only through a
 	// forwarded socket. See internal/events and peer.Relay.
+	//
+	// The relay runs wherever the pool exists, which with the default
+	// token_socket patterns is every daemon, Windows and dotvaultw.exe
+	// included: with no peer present it costs one glob every 30s, and a host
+	// that does borrow needs no extra configuration to hear its peers.
 	eventHub := events.NewHub()
 	if peerPool != nil {
 		relay := peer.NewRelay(peerPool, engine.TriggerSync)

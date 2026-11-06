@@ -10,16 +10,17 @@ import (
 
 func TestSecretChangeHookPublishesOnlyLocalWrites(t *testing.T) {
 	hub := events.NewHub()
-	ch, cancel := hub.Subscribe()
+	ch, cancel, _ := hub.Subscribe()
 	defer cancel()
 	syncs := 0
 	hook := secretChangeHook(func() { syncs++ }, hub)("refresh")
 
 	hook(enrol.Change{Key: "gh", Version: 4, Local: false})
+	hook(enrol.Change{Key: "gh", Version: 0, Local: true}) // Vault reported no version
 	hook(enrol.Change{Key: "gh", Version: 5, Local: true})
 
-	if syncs != 2 {
-		t.Errorf("syncs = %d, want 2: every change re-renders files", syncs)
+	if syncs != 3 {
+		t.Errorf("syncs = %d, want 3: every change re-renders files", syncs)
 	}
 	select {
 	case e := <-ch:
@@ -31,7 +32,7 @@ func TestSecretChangeHookPublishesOnlyLocalWrites(t *testing.T) {
 	}
 	select {
 	case e := <-ch:
-		t.Fatalf("observed change was published too: %+v", e)
+		t.Fatalf("observed or version-less change was published too: %+v", e)
 	default:
 	}
 }

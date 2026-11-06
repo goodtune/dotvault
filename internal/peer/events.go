@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goodtune/dotvault/internal/events"
+	"github.com/goodtune/dotvault/internal/kvpath"
 )
 
 // EventIdleTimeout is how long StreamEvents waits for any line — an event or
@@ -58,43 +59,66 @@ func StreamEvents(ctx context.Context, socketPath string, fn func(events.Event))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var body struct {
-			Error string `json:"error"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, peerResponseBodyLimit)).Decode(&body)
-		return &StatusError{Status: resp.StatusCode, Message: body.Error}
+		return statusErrorFrom(resp)
 	}
 
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 0, 4096), eventLineLimit)
-	var name, data string
+	var name string
+	var data strings.Builder
 	for sc.Scan() {
 		idle.Reset(EventIdleTimeout)
 		line := sc.Text()
 		switch {
 		case line == "":
 			// A blank line ends one event.
-			if name == "kv-write" && data != "" {
+			if name == "kv-write" && data.Len() > 0 {
 				var e events.Event
-				if err := json.Unmarshal([]byte(data), &e); err == nil && e.Key != "" {
+				if err := json.Unmarshal([]byte(data.String()), &e); err == nil && validEvent(e) {
 					fn(e)
 				} else {
 					slog.Debug("peer events: malformed event; ignoring", "socket", socketPath)
 				}
 			}
-			name, data = "", ""
+			name = ""
+			data.Reset()
 		case strings.HasPrefix(line, ":"):
 			// Comment: the peer's heartbeat. Its only job is the Reset above.
 		case strings.HasPrefix(line, "event:"):
 			name = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		case strings.HasPrefix(line, "data:"):
-			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			// Per the SSE spec, successive data lines are joined with a
+			// newline; one leading space after the colon is not part of the
+			// value.
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
+			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			if data.Len() > eventLineLimit {
+				return errors.New("peer event too large")
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
 	return io.EOF
+}
+
+// maxEventKeyLen bounds an event key received from a peer. A real key is an
+// enrolment key (a name, or group/name); the bound keeps a hostile peer from
+// filling logs and the deduplication table with arbitrary strings.
+const maxEventKeyLen = 256
+
+// validEvent reports whether an event from a peer is well formed: a
+// canonical relative KV path no longer than maxEventKeyLen, and a real KVv2
+// version. Anything else is dropped before it is logged or acted on.
+func validEvent(e events.Event) bool {
+	if e.Version <= 0 || e.Key == "" || len(e.Key) > maxEventKeyLen {
+		return false
+	}
+	clean, err := kvpath.Clean(e.Key)
+	return err == nil && clean == e.Key
 }
 
 // PostSync asks a peer daemon to run a sync cycle now, through its
@@ -140,11 +164,7 @@ func PostSync(ctx context.Context, socketPath string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var body struct {
-			Error string `json:"error"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, peerResponseBodyLimit)).Decode(&body)
-		return &StatusError{Status: resp.StatusCode, Message: body.Error}
+		return statusErrorFrom(resp)
 	}
 	return nil
 }
@@ -161,6 +181,11 @@ const (
 	// relayHealthyStream is how long a stream must have stayed up for its
 	// end to count as a disconnect rather than a failure, resetting backoff.
 	relayHealthyStream = 30 * time.Second
+	// relaySyncSpacing is the minimum gap between two syncs the relay asks
+	// of the same peer. A peer cannot make this host flood the others: a
+	// burst of notices collapses into at most one sync in flight and one
+	// queued behind it per peer, at most one per spacing.
+	relaySyncSpacing = 5 * time.Second
 )
 
 // Relay listens to every live member of a Pool for secret-write notices and
@@ -179,39 +204,72 @@ const (
 // write reported by two desktops, or replayed after a reconnect, costs nothing
 // extra. A peer told to sync does not emit a notice of its own — syncing reads
 // Vault and writes files, it does not write Vault — so relays cannot loop.
+// Syncs asked of each peer are single-flight and spaced (relaySyncSpacing),
+// so a misbehaving peer streaming notices cannot turn this host into an
+// amplifier against the others.
+//
+// Membership follows Pool.Resolve, which lists only *active* members: a
+// socket the token borrow evicted (a transport failure) loses its stream
+// until the pool readmits it. That is the pool's single view of which peers
+// are reachable, and a stream to an unreachable peer would fail anyway.
 type Relay struct {
 	pool      *Pool
 	localSync func()
 	seen      *events.Seen
 
-	// Seams for tests; production uses StreamEvents and PostSync.
-	stream   func(ctx context.Context, path string, fn func(events.Event)) error
-	postSync func(ctx context.Context, path string) error
-	interval time.Duration
+	// Seams for tests; production uses StreamEvents, PostSync and the
+	// constants above.
+	stream     func(ctx context.Context, path string, fn func(events.Event)) error
+	postSync   func(ctx context.Context, path string) error
+	interval   time.Duration
+	minBackoff time.Duration
+	maxBackoff time.Duration
+	spacing    time.Duration
 
 	kick chan struct{}
 
 	mu      sync.Mutex
-	streams map[string]context.CancelFunc
+	runCtx  context.Context
+	streams map[string]*relayStream
+	syncs   map[string]*relaySync
 	wg      sync.WaitGroup
+}
+
+// relayStream is one member's subscription.
+type relayStream struct {
+	cancel   context.CancelFunc
+	wake     chan struct{} // interrupts a backoff wait
+	lastSeen time.Time     // the member's LastSeen when last reconciled
+}
+
+// relaySync is the single-flight state of syncs asked of one peer.
+type relaySync struct {
+	again bool // another notice arrived while a sync was in flight
 }
 
 // NewRelay builds a relay over pool. localSync is called for every new
 // notice; it must not block (sync.Engine.TriggerSync does not).
 func NewRelay(pool *Pool, localSync func()) *Relay {
 	return &Relay{
-		pool:      pool,
-		localSync: localSync,
-		seen:      events.NewSeen(),
-		stream:    StreamEvents,
-		postSync:  PostSync,
-		interval:  relayReconcileInterval,
-		kick:      make(chan struct{}, 1),
-		streams:   make(map[string]context.CancelFunc),
+		pool:       pool,
+		localSync:  localSync,
+		seen:       events.NewSeen(),
+		stream:     StreamEvents,
+		postSync:   PostSync,
+		interval:   relayReconcileInterval,
+		minBackoff: relayMinBackoff,
+		maxBackoff: relayMaxBackoff,
+		spacing:    relaySyncSpacing,
+		kick:       make(chan struct{}, 1),
+		streams:    make(map[string]*relayStream),
+		syncs:      make(map[string]*relaySync),
 	}
 }
 
-// Kick asks the relay to re-glob the pool now. Safe on a nil Relay.
+// Kick asks the relay to re-glob the pool now and retry any stream that is
+// backing off: the pool's watcher calls it when a socket is created or
+// replaced, which is what a forward reconnecting looks like. Safe on a nil
+// Relay.
 func (r *Relay) Kick() {
 	if r == nil {
 		return
@@ -223,65 +281,80 @@ func (r *Relay) Kick() {
 }
 
 // Run subscribes to the pool's members until ctx is cancelled, and waits for
-// every stream to stop before returning.
+// every stream and every sync it started to stop before returning.
 func (r *Relay) Run(ctx context.Context) {
 	if r == nil || r.pool == nil || len(r.pool.Patterns()) == 0 {
 		return
 	}
+	r.mu.Lock()
+	r.runCtx = ctx
+	r.mu.Unlock()
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	defer r.wg.Wait()
+	wakeAll := false
 	for {
-		r.reconcile(ctx)
+		r.reconcile(ctx, wakeAll)
 		select {
 		case <-ctx.Done():
 			r.mu.Lock()
-			for path, cancel := range r.streams {
-				cancel()
+			for path, st := range r.streams {
+				st.cancel()
 				delete(r.streams, path)
 			}
 			r.mu.Unlock()
 			return
 		case <-ticker.C:
+			wakeAll = false
 		case <-r.kick:
+			wakeAll = true
 		}
 	}
 }
 
-// reconcile starts a stream for every member without one and stops the
-// streams of members that are gone.
-func (r *Relay) reconcile(ctx context.Context) {
-	live := make(map[string]bool)
+// reconcile starts a stream for every member without one, stops the streams
+// of members that are gone, and wakes a backing-off stream whose socket has
+// been recreated (its LastSeen moved on) — or every stream, when wakeAll.
+func (r *Relay) reconcile(ctx context.Context, wakeAll bool) {
+	live := make(map[string]time.Time)
 	for _, m := range r.pool.Resolve() {
-		live[m.Path] = true
+		live[m.Path] = m.LastSeen
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for path, cancel := range r.streams {
-		if !live[path] {
-			cancel()
+	for path, st := range r.streams {
+		if _, ok := live[path]; !ok {
+			st.cancel()
 			delete(r.streams, path)
 		}
 	}
-	for path := range live {
-		if _, ok := r.streams[path]; ok {
+	for path, seen := range live {
+		if st, ok := r.streams[path]; ok {
+			if wakeAll || seen.After(st.lastSeen) {
+				st.lastSeen = seen
+				select {
+				case st.wake <- struct{}{}:
+				default:
+				}
+			}
 			continue
 		}
 		sctx, cancel := context.WithCancel(ctx)
-		r.streams[path] = cancel
+		st := &relayStream{cancel: cancel, wake: make(chan struct{}, 1), lastSeen: seen}
+		r.streams[path] = st
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			r.streamLoop(sctx, path)
+			r.streamLoop(sctx, path, st.wake)
 		}()
 	}
 }
 
-func (r *Relay) streamLoop(ctx context.Context, path string) {
-	backoff := relayMinBackoff
+func (r *Relay) streamLoop(ctx context.Context, path string, wake <-chan struct{}) {
+	backoff := r.minBackoff
 	for {
 		started := time.Now()
-		err := r.stream(ctx, path, func(e events.Event) { r.handle(ctx, path, e) })
+		err := r.stream(ctx, path, func(e events.Event) { r.handle(path, e) })
 		if ctx.Err() != nil {
 			return
 		}
@@ -289,29 +362,39 @@ func (r *Relay) streamLoop(ctx context.Context, path string) {
 		switch {
 		case errors.As(err, &se) && se.Status == http.StatusNotFound:
 			slog.Debug("peer events: peer has no events endpoint; retrying later", "socket", path)
-			backoff = relayMaxBackoff
+			backoff = r.maxBackoff
 		case time.Since(started) >= relayHealthyStream:
 			slog.Debug("peer events: stream ended; reconnecting", "socket", path, "error", err)
-			backoff = relayMinBackoff
+			backoff = r.minBackoff
 		default:
 			slog.Debug("peer events: stream failed; backing off", "socket", path, "backoff", backoff, "error", err)
 		}
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(backoff):
+		case <-wake:
+			// The socket was recreated: whatever the last attempt met is
+			// gone, so retry now and start the backoff over.
+			timer.Stop()
+			backoff = r.minBackoff
+			continue
+		case <-timer.C:
 		}
-		if backoff < relayMaxBackoff {
-			backoff *= 2
-			if backoff > relayMaxBackoff {
-				backoff = relayMaxBackoff
-			}
+		backoff *= 2
+		if backoff > r.maxBackoff {
+			backoff = r.maxBackoff
 		}
 	}
 }
 
 // handle acts on one notice received from source.
-func (r *Relay) handle(ctx context.Context, source string, e events.Event) {
+func (r *Relay) handle(source string, e events.Event) {
+	if !validEvent(e) {
+		slog.Debug("peer events: malformed notice; ignoring", "socket", source)
+		return
+	}
 	if !r.seen.Admit(e) {
 		slog.Debug("peer events: duplicate notice; ignoring", "key", e.Key, "version", e.Version, "socket", source)
 		return
@@ -321,20 +404,61 @@ func (r *Relay) handle(ctx context.Context, source string, e events.Event) {
 		r.localSync()
 	}
 	for _, m := range r.pool.Resolve() {
-		if m.Path == source {
-			continue
+		if m.Path != source {
+			r.requestSync(m.Path)
 		}
-		path := m.Path
-		go func() {
-			if err := r.postSync(ctx, path); err != nil {
-				level := slog.LevelWarn
-				if errors.Is(err, ErrPeerUnreachable) {
-					level = slog.LevelDebug
-				}
-				slog.Log(ctx, level, "peer events: could not ask peer to sync", "socket", path, "key", e.Key, "version", e.Version, "error", err)
-				return
-			}
-			slog.Info("peer events: asked peer to sync", "socket", path, "key", e.Key, "version", e.Version)
-		}()
 	}
+}
+
+// requestSync asks the peer at path to sync, single-flight: while one request
+// is in flight (or inside its spacing window) further requests collapse into
+// one more run afterwards. A sync is a full re-read, so asking twice while
+// the first is pending adds nothing but load.
+func (r *Relay) requestSync(path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runCtx == nil || r.runCtx.Err() != nil {
+		return
+	}
+	if st, ok := r.syncs[path]; ok {
+		st.again = true
+		return
+	}
+	st := &relaySync{}
+	r.syncs[path] = st
+	ctx := r.runCtx
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		for {
+			r.syncOnce(ctx, path)
+			timer := time.NewTimer(r.spacing)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+			r.mu.Lock()
+			if st.again && ctx.Err() == nil {
+				st.again = false
+				r.mu.Unlock()
+				continue
+			}
+			delete(r.syncs, path)
+			r.mu.Unlock()
+			return
+		}
+	}()
+}
+
+func (r *Relay) syncOnce(ctx context.Context, path string) {
+	if err := r.postSync(ctx, path); err != nil {
+		level := slog.LevelWarn
+		if errors.Is(err, ErrPeerUnreachable) || ctx.Err() != nil {
+			level = slog.LevelDebug
+		}
+		slog.Log(ctx, level, "peer events: could not ask peer to sync", "socket", path, "error", err)
+		return
+	}
+	slog.Info("peer events: asked peer to sync", "socket", path)
 }

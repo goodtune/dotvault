@@ -13,6 +13,7 @@
 package events
 
 import (
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -37,6 +38,16 @@ type Event struct {
 // infrequent (a rotation every few hours), so a full buffer means a stalled
 // reader rather than a burst worth queueing for.
 const subscriberBuffer = 32
+
+// MaxSubscribers bounds concurrent subscriptions to one hub. Each holds a
+// goroutine and a connection in the HTTP handler, and the loopback listener
+// is reachable by every local user, so the bound is what stops one of them
+// from opening streams until the daemon runs out of descriptors. A daemon's
+// legitimate subscribers are the handful of hosts that borrow from it.
+const MaxSubscribers = 64
+
+// ErrTooManySubscribers is returned by Subscribe when the hub is full.
+var ErrTooManySubscribers = errors.New("too many event subscribers")
 
 // Hub fans events out to every current subscriber. It is safe for
 // concurrent use, and every method is nil-receiver safe so a caller with no
@@ -72,17 +83,23 @@ func (h *Hub) Publish(e Event) {
 }
 
 // Subscribe registers a subscriber and returns its channel and a cancel
-// func. Cancel is idempotent and closes the channel.
-func (h *Hub) Subscribe() (<-chan Event, func()) {
+// func, or ErrTooManySubscribers when the hub already has MaxSubscribers.
+// Cancel is idempotent and closes the channel. A nil hub hands out a
+// channel that carries nothing until cancelled: a stream with no hub behind
+// it is quiet, not broken.
+func (h *Hub) Subscribe() (<-chan Event, func(), error) {
 	ch := make(chan Event, subscriberBuffer)
+	var once sync.Once
 	if h == nil {
-		close(ch)
-		return ch, func() {}
+		return ch, func() { once.Do(func() { close(ch) }) }, nil
 	}
 	h.mu.Lock()
+	if len(h.subs) >= MaxSubscribers {
+		h.mu.Unlock()
+		return nil, nil, ErrTooManySubscribers
+	}
 	h.subs[ch] = struct{}{}
 	h.mu.Unlock()
-	var once sync.Once
 	return ch, func() {
 		once.Do(func() {
 			h.mu.Lock()
@@ -90,7 +107,7 @@ func (h *Hub) Subscribe() (<-chan Event, func()) {
 			h.mu.Unlock()
 			close(ch)
 		})
-	}
+	}, nil
 }
 
 // seenPerKey is how many recent versions Seen remembers for each key.
@@ -98,17 +115,29 @@ func (h *Hub) Subscribe() (<-chan Event, func()) {
 // or replayed after a reconnect), so a short window catches them.
 const seenPerKey = 8
 
+// maxSeenKeys bounds how many keys Seen tracks. Keys arrive from peers, so
+// without a bound a hostile one could grow the table indefinitely. A user has
+// a handful of enrolments; reaching the bound means something is wrong, and
+// starting over costs at most one redundant sync per key.
+const maxSeenKeys = 1024
+
 // Seen deduplicates events by remembering the most recent versions observed
 // for each key. The same write can reach a receiver more than once, and
 // acting on it twice would mean a second local sync and a second round of
 // relays for nothing.
 //
-// It remembers exact versions rather than a high-water mark on purpose: a
-// secret that is wiped (a revoked credential) and enrolled again restarts at
-// KVv2 version 1, and a high-water mark would then discard every event for
-// that key until the new versions overtook the old. The cost is that an
-// event older than the window is admitted again, which costs one redundant
-// sync.
+// It remembers exact versions rather than a high-water mark, and starts a
+// key's window afresh when a version lower than any in it arrives. Both are
+// for the same case: a revoked secret is wiped and re-enrolled, which
+// restarts its KVv2 versions at 1. A high-water mark would discard every
+// event for that key until the new versions overtook the old, and a window
+// that kept the old versions would discard the new life's version 2 if the
+// old life's version 2 were still in it. The cost of the reset is that an
+// older event arriving out of order also clears the window, which costs one
+// redundant sync. One case it cannot see: an old life that never got past
+// the window's lowest version (wiped at v3, say) looks identical to the new
+// life's first versions, which are then dropped as duplicates. A receiver's
+// refresh check still notices the version change on its next tick.
 type Seen struct {
 	mu       sync.Mutex
 	versions map[string][]int
@@ -119,15 +148,32 @@ func NewSeen() *Seen {
 	return &Seen{versions: make(map[string][]int)}
 }
 
-// Admit reports whether e has not been seen before, and records it if so.
+// Admit reports whether e should be acted on, and records it if so. An event
+// whose version is not positive is never admitted: KVv2 versions start at 1,
+// so such an event carries no version and recording it would make every later
+// version-less event for the key look like a duplicate.
 func (s *Seen) Admit(e Event) bool {
+	if e.Version <= 0 {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recent := s.versions[e.Key]
+	recent, ok := s.versions[e.Key]
+	if !ok && len(s.versions) >= maxSeenKeys {
+		slog.Warn("events: too many distinct keys seen; resetting the deduplication table", "keys", len(s.versions))
+		s.versions = make(map[string][]int)
+	}
+	lowest := 0
 	for _, v := range recent {
 		if v == e.Version {
 			return false
 		}
+		if lowest == 0 || v < lowest {
+			lowest = v
+		}
+	}
+	if e.Version < lowest {
+		recent = nil // the secret was deleted and recreated
 	}
 	recent = append(recent, e.Version)
 	if len(recent) > seenPerKey {

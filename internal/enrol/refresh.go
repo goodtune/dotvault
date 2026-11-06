@@ -245,12 +245,47 @@ func (m *RefreshManager) tick(ctx context.Context) {
 			continue // engine doesn't rotate; nothing to do
 		}
 		if m.inBackoff(key, now) {
-			// Previous attempt failed; not yet time to retry.
-			continue
+			// Previous attempt failed; not yet time to retry — unless
+			// another writer has replaced the secret since, in which case
+			// the failure belonged to a credential that no longer exists
+			// and the new one deserves a look now. Watching for that also
+			// keeps the change hook timely for a secret whose own refresh
+			// keeps failing (a re-enrolment elsewhere is the usual fix).
+			if !m.changedDuringBackoff(ctx, key) {
+				continue
+			}
+			m.resetBackoff(key)
 		}
 
 		m.refreshOne(ctx, key, enrolment, refresher)
 	}
+}
+
+// changedDuringBackoff reads the secret's version for an enrolment in
+// backoff and reports whether it moved since the last tick, reporting the
+// change to the hook. A read failure or an unchanged version reports false
+// and leaves the backoff alone.
+func (m *RefreshManager) changedDuringBackoff(ctx context.Context, key string) bool {
+	secret, err := m.client.ReadKVv2(ctx, m.kvMount, m.userPrefix+key)
+	if err != nil {
+		return false
+	}
+	version := 0
+	if secret != nil {
+		version = secret.Version
+	}
+	m.mu.Lock()
+	prev, ok := m.seen[key]
+	m.mu.Unlock()
+	if !ok || prev == version {
+		return false
+	}
+	if secret == nil {
+		m.markAbsent(key)
+		return false
+	}
+	m.observeVersion(key, version)
+	return true
 }
 
 // inBackoff reports whether this enrolment is still inside its retry

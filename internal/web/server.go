@@ -551,6 +551,9 @@ func (s *Server) Start() error {
 	}
 
 	s.startMu.Lock()
+	// No WriteTimeout, deliberately: GET /api/v1/events is a long-lived
+	// stream (events.go), and a write deadline would cut every subscriber
+	// off when it expired.
 	s.server = &http.Server{
 		Handler: s.middleware(s.mux),
 	}

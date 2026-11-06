@@ -1142,3 +1142,98 @@ func TestRefreshManager_ChangeHookReportsReappearedSecret(t *testing.T) {
 		t.Fatalf("changes = %+v, want [%+v]", got, want)
 	}
 }
+
+// Losing a rotation race is not a local write: the hook must not announce a
+// version this manager did not produce, and the next tick reports the
+// winner's version as observed.
+func TestRefreshManager_ChangeHookOnLostRace(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	data := map[string]string{
+		"access_token":  "old",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	}
+	fv.seed("users/alice/jfrog", data) // v1
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) {
+		winner := copyMap(data)
+		winner["access_token"] = "winner"
+		winner["issued_at"] = issued.Add(4 * time.Hour).Format(time.RFC3339)
+		winner["expires_at"] = issued.Add(10 * time.Hour).Format(time.RFC3339)
+		fv.seed("users/alice/jfrog", winner) // v2, written by another daemon
+		return copyMap(data), nil
+	}
+	registerFake(t, "jfrog-fake", fake)
+
+	rec := &changeRecorder{}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour,
+		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+		WithChangeHook(rec.hook),
+	)
+	m.tick(context.Background())
+	if got := rec.got(); len(got) != 0 {
+		t.Fatalf("lost race reported %+v, want nothing", got)
+	}
+	m.tick(context.Background())
+	want := Change{Key: "jfrog", Version: 2, Local: false}
+	if got := rec.got(); len(got) != 1 || got[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", got, want)
+	}
+}
+
+// A refresh the provider keeps failing puts the enrolment in backoff. A new
+// version written elsewhere in the meantime (a re-enrolment) must be noticed
+// at the next tick, not when the backoff ends.
+func TestRefreshManager_NoticesChangeDuringBackoff(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+
+	issued := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
+	data := map[string]string{
+		"access_token":  "a",
+		"refresh_token": "r",
+		"issued_at":     issued.Format(time.RFC3339),
+		"expires_at":    issued.Add(6 * time.Hour).Format(time.RFC3339),
+	}
+	fv.seed("users/alice/jfrog", data) // v1
+
+	fake := &fakeRefresher{name: "jfrog", fields: []string{"access_token"}}
+	fake.response = func(fakeRefresherCall) (map[string]string, error) {
+		return nil, errors.New("provider down")
+	}
+	registerFake(t, "jfrog-fake", fake)
+
+	rec := &changeRecorder{}
+	m := NewRefreshManager(vc, "kv", "users/alice/", map[string]config.Enrolment{
+		"jfrog": {Engine: "jfrog-fake"},
+	}, time.Hour,
+		WithClock(&fixedClock{now: issued.Add(4 * time.Hour)}),
+		WithMaxBackoff(24*time.Hour),
+		WithChangeHook(rec.hook),
+	)
+	m.tick(context.Background()) // fails, enters backoff
+	if !m.inBackoff("jfrog", issued.Add(4*time.Hour)) {
+		t.Fatal("precondition: enrolment not in backoff")
+	}
+
+	fresh := copyMap(data)
+	fresh["issued_at"] = issued.Add(4 * time.Hour).Format(time.RFC3339)
+	fresh["expires_at"] = issued.Add(12 * time.Hour).Format(time.RFC3339)
+	fv.seed("users/alice/jfrog", fresh) // v2: re-enrolled elsewhere
+
+	m.tick(context.Background())
+	want := Change{Key: "jfrog", Version: 2, Local: false}
+	if got := rec.got(); len(got) != 1 || got[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", got, want)
+	}
+	if m.inBackoff("jfrog", issued.Add(4*time.Hour)) {
+		t.Error("backoff kept after the secret was replaced")
+	}
+}

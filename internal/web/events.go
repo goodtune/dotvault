@@ -38,11 +38,17 @@ const eventsKVWrite = "kv-write"
 // should be able to connect before this daemon has authenticated, and simply
 // hear nothing until it writes). A cross-origin page cannot read it — the
 // response carries no CORS headers — and the middleware's Host check stops a
-// rebinding page from making it same-origin.
+// rebinding page from making it same-origin. Concurrent streams are capped
+// at events.MaxSubscribers, since the loopback listener is reachable by
+// every local user and each stream holds a goroutine and a descriptor.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 
-	ch, cancel := s.events.Subscribe()
+	ch, cancel, err := s.events.Subscribe()
+	if err != nil {
+		writeError(w, "too many event subscribers", http.StatusServiceUnavailable)
+		return
+	}
 	defer cancel()
 
 	w.Header().Set("Content-Type", "text/event-stream")

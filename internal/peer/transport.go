@@ -238,11 +238,18 @@ func PostForm(ctx context.Context, socketPath, apiPath string, form url.Values) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var body struct {
-			Error string `json:"error"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, peerResponseBodyLimit)).Decode(&body)
-		return &StatusError{Status: resp.StatusCode, Message: body.Error}
+		return statusErrorFrom(resp)
 	}
 	return nil
+}
+
+// statusErrorFrom builds the *StatusError for a non-200 peer response,
+// carrying the peer's {"error": …} message when the body has one. It is the
+// one decoding of that envelope, shared by every peer request.
+func statusErrorFrom(resp *http.Response) *StatusError {
+	var body struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, peerResponseBodyLimit)).Decode(&body)
+	return &StatusError{Status: resp.StatusCode, Message: body.Error}
 }

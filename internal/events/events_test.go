@@ -1,15 +1,16 @@
 package events
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
 
 func TestHubDeliversToEverySubscriber(t *testing.T) {
 	h := NewHub()
-	a, cancelA := h.Subscribe()
+	a, cancelA, _ := h.Subscribe()
 	defer cancelA()
-	b, cancelB := h.Subscribe()
+	b, cancelB, _ := h.Subscribe()
 	defer cancelB()
 
 	h.Publish(Event{Key: "gh", Version: 3})
@@ -31,7 +32,7 @@ func TestHubDeliversToEverySubscriber(t *testing.T) {
 
 func TestHubCancelStopsDeliveryAndClosesChannel(t *testing.T) {
 	h := NewHub()
-	ch, cancel := h.Subscribe()
+	ch, cancel, _ := h.Subscribe()
 	cancel()
 	cancel() // idempotent
 
@@ -43,7 +44,7 @@ func TestHubCancelStopsDeliveryAndClosesChannel(t *testing.T) {
 
 func TestHubPublishNeverBlocksOnSlowSubscriber(t *testing.T) {
 	h := NewHub()
-	_, cancel := h.Subscribe() // never read
+	_, cancel, _ := h.Subscribe() // never read
 	defer cancel()
 
 	done := make(chan struct{})
@@ -60,13 +61,40 @@ func TestHubPublishNeverBlocksOnSlowSubscriber(t *testing.T) {
 	}
 }
 
-func TestNilHubIsSafe(t *testing.T) {
+func TestNilHubIsQuietNotClosed(t *testing.T) {
 	var h *Hub
 	h.Publish(Event{Key: "gh", Version: 1})
-	ch, cancel := h.Subscribe()
+	ch, cancel, err := h.Subscribe()
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	select {
+	case _, ok := <-ch:
+		t.Fatalf("nil hub subscription yielded (ok=%v); it must stay open and quiet", ok)
+	case <-time.After(50 * time.Millisecond):
+	}
 	cancel()
 	if _, ok := <-ch; ok {
-		t.Fatal("nil hub subscription delivered an event")
+		t.Fatal("cancel did not close the channel")
+	}
+}
+
+func TestHubCapsSubscribers(t *testing.T) {
+	h := NewHub()
+	var cancels []func()
+	for i := 0; i < MaxSubscribers; i++ {
+		_, c, err := h.Subscribe()
+		if err != nil {
+			t.Fatalf("subscriber %d refused: %v", i, err)
+		}
+		cancels = append(cancels, c)
+	}
+	if _, _, err := h.Subscribe(); err != ErrTooManySubscribers {
+		t.Fatalf("subscriber over the cap: err = %v, want ErrTooManySubscribers", err)
+	}
+	cancels[0]()
+	if _, _, err := h.Subscribe(); err != nil {
+		t.Fatalf("subscriber after a cancel refused: %v", err)
 	}
 }
 
@@ -93,10 +121,49 @@ func TestSeenAdmitsVersionRestartAfterWipe(t *testing.T) {
 	for v := 30; v <= 32; v++ {
 		s.Admit(Event{Key: "gh", Version: v})
 	}
+	for v := 1; v <= 3; v++ {
+		if !s.Admit(Event{Key: "gh", Version: v}) {
+			t.Fatalf("gh@%d after a wipe refused", v)
+		}
+	}
+}
+
+// The overlap case: the old life reached v5, the new life's v1 restarts the
+// window, and its v2 — also seen in the old life — must still be admitted.
+func TestSeenRestartForgetsOldLifeVersions(t *testing.T) {
+	s := NewSeen()
+	for v := 2; v <= 5; v++ {
+		s.Admit(Event{Key: "gh", Version: v})
+	}
 	if !s.Admit(Event{Key: "gh", Version: 1}) {
 		t.Fatal("gh@1 after a wipe refused")
 	}
 	if !s.Admit(Event{Key: "gh", Version: 2}) {
-		t.Fatal("gh@2 after a wipe refused")
+		t.Fatal("new life's gh@2 refused because the old life had a v2")
+	}
+}
+
+func TestSeenRefusesVersionlessEvents(t *testing.T) {
+	s := NewSeen()
+	for _, v := range []int{0, -1} {
+		if s.Admit(Event{Key: "gh", Version: v}) {
+			t.Fatalf("gh@%d admitted", v)
+		}
+	}
+	if !s.Admit(Event{Key: "gh", Version: 1}) {
+		t.Fatal("gh@1 refused after version-less events")
+	}
+}
+
+func TestSeenBoundsDistinctKeys(t *testing.T) {
+	s := NewSeen()
+	for i := 0; i < maxSeenKeys+10; i++ {
+		s.Admit(Event{Key: fmt.Sprintf("k%d", i), Version: 1})
+	}
+	s.mu.Lock()
+	n := len(s.versions)
+	s.mu.Unlock()
+	if n > maxSeenKeys {
+		t.Fatalf("Seen tracks %d keys, want at most %d", n, maxSeenKeys)
 	}
 }

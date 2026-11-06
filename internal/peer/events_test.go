@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -191,9 +192,9 @@ func TestRelayStopsStreamsForVanishedPeers(t *testing.T) {
 	// has gone and must be cancelled and forgotten.
 	r := NewRelay(NewPool([]string{filepath.Join(sockDir(t), "dotvault.*.sock")}), nil)
 	var cancelled atomic.Bool
-	r.streams["gone.sock"] = func() { cancelled.Store(true) }
+	r.streams["gone.sock"] = &relayStream{cancel: func() { cancelled.Store(true) }, wake: make(chan struct{}, 1)}
 
-	r.reconcile(context.Background())
+	r.reconcile(context.Background(), false)
 
 	if !cancelled.Load() {
 		t.Fatal("stream for a vanished peer was not cancelled")
@@ -203,5 +204,184 @@ func TestRelayStopsStreamsForVanishedPeers(t *testing.T) {
 	r.mu.Unlock()
 	if still {
 		t.Fatal("vanished peer still tracked")
+	}
+}
+
+// fakeSocket creates a plain socket node so the pool admits path as a member
+// without anything serving it; the tests below replace the transport.
+func fakeSocket(t *testing.T, path string) {
+	t.Helper()
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+}
+
+func runRelay(t *testing.T, r *Relay) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
+
+// An older peer answers 404. It must not be asked again at the fast retry
+// rate, or every host borrowing from it would poll it every second.
+func TestRelayBacksOffToTheCapOnMissingEndpoint(t *testing.T) {
+	dir := sockDir(t)
+	fakeSocket(t, filepath.Join(dir, "dotvault.old.sock"))
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil)
+	r.minBackoff, r.maxBackoff = time.Millisecond, time.Hour
+	var calls atomic.Int32
+	r.stream = func(context.Context, string, func(events.Event)) error {
+		calls.Add(1)
+		return &StatusError{Status: http.StatusNotFound}
+	}
+	runRelay(t, r)
+
+	waitFor(t, "first attempt", func() bool { return calls.Load() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("attempts = %d, want 1: a 404 must back off to the cap", n)
+	}
+}
+
+// Other failures retry with a growing backoff, starting small.
+func TestRelayRetriesFailedStreams(t *testing.T) {
+	dir := sockDir(t)
+	fakeSocket(t, filepath.Join(dir, "dotvault.a.sock"))
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil)
+	r.minBackoff, r.maxBackoff = time.Millisecond, 20*time.Millisecond
+	var calls atomic.Int32
+	r.stream = func(context.Context, string, func(events.Event)) error {
+		calls.Add(1)
+		return ErrPeerUnreachable
+	}
+	runRelay(t, r)
+	waitFor(t, "several retries", func() bool { return calls.Load() >= 4 })
+}
+
+// A forward that reconnects while its stream is backing off must be retried
+// at once, not after the rest of a backoff that can reach five minutes.
+func TestRelayKickWakesABackingOffStream(t *testing.T) {
+	dir := sockDir(t)
+	fakeSocket(t, filepath.Join(dir, "dotvault.a.sock"))
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil)
+	r.minBackoff, r.maxBackoff = time.Hour, time.Hour
+	var calls atomic.Int32
+	r.stream = func(context.Context, string, func(events.Event)) error {
+		calls.Add(1)
+		return ErrPeerUnreachable
+	}
+	runRelay(t, r)
+
+	waitFor(t, "first attempt", func() bool { return calls.Load() == 1 })
+	r.Kick()
+	waitFor(t, "retry after Kick", func() bool { return calls.Load() >= 2 })
+}
+
+// A burst of notices must not become a burst of syncs against the other
+// peers: one in flight, at most one queued behind it.
+func TestRelaySyncsAreSingleFlightPerPeer(t *testing.T) {
+	dir := sockDir(t)
+	fakeSocket(t, filepath.Join(dir, "dotvault.a.sock"))
+	fakeSocket(t, filepath.Join(dir, "dotvault.b.sock"))
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil)
+	r.spacing = 0
+	release := make(chan struct{})
+	var syncs atomic.Int32
+	r.postSync = func(ctx context.Context, path string) error {
+		syncs.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+	notices := make(chan events.Event)
+	handled := make(chan struct{})
+	r.stream = func(ctx context.Context, path string, fn func(events.Event)) error {
+		if filepath.Base(path) != "dotvault.a.sock" {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		for {
+			select {
+			case e := <-notices:
+				fn(e)
+				handled <- struct{}{}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	runRelay(t, r)
+
+	// Every notice is fully handled before the first sync is released, so
+	// the count below depends only on the single-flight logic.
+	for v := 1; v <= 10; v++ {
+		notices <- events.Event{Key: "gh", Version: v}
+		<-handled
+	}
+	waitFor(t, "first sync", func() bool { return syncs.Load() >= 1 })
+	if n := syncs.Load(); n != 1 {
+		t.Fatalf("syncs in flight = %d, want 1", n)
+	}
+	close(release)
+	waitFor(t, "queued sync", func() bool { return syncs.Load() >= 2 })
+	time.Sleep(50 * time.Millisecond)
+	if n := syncs.Load(); n != 2 {
+		t.Fatalf("syncs = %d, want 2: ten notices collapse to one in flight plus one queued", n)
+	}
+}
+
+func TestValidEventRejectsHostileKeys(t *testing.T) {
+	for _, e := range []events.Event{
+		{Key: "", Version: 1},
+		{Key: "gh", Version: 0},
+		{Key: "../other-user/gh", Version: 1},
+		{Key: "/gh", Version: 1},
+		{Key: "a//b", Version: 1},
+		{Key: strings.Repeat("a", maxEventKeyLen+1), Version: 1},
+	} {
+		if validEvent(e) {
+			t.Errorf("validEvent(%q@%d) = true, want false", e.Key, e.Version)
+		}
+	}
+	for _, e := range []events.Event{{Key: "gh", Version: 1}, {Key: "databricks/prod", Version: 9}} {
+		if !validEvent(e) {
+			t.Errorf("validEvent(%q@%d) = false, want true", e.Key, e.Version)
+		}
+	}
+}
+
+func TestStreamEventsJoinsMultiLineData(t *testing.T) {
+	sock := filepath.Join(sockDir(t), "m.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skipf("unix domain sockets unavailable on this platform: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: kv-write\r\ndata:{\"key\":\"gh\",\r\ndata: \"version\":4}\r\n\r\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan events.Event, 1)
+	go func() { _ = StreamEvents(ctx, sock, func(e events.Event) { got <- e }) }()
+	select {
+	case e := <-got:
+		if e.Key != "gh" || e.Version != 4 {
+			t.Fatalf("got %+v, want gh@4", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("multi-line CRLF event not delivered")
 	}
 }

@@ -82,3 +82,20 @@ func TestHandleEventsEndsOnServerShutdown(t *testing.T) {
 		t.Fatal("stream did not end on shutdown; it would hold http.Server.Shutdown open")
 	}
 }
+
+func TestHandleEventsRefusesOverTheSubscriberCap(t *testing.T) {
+	s := testServer(t)
+	s.events = events.NewHub()
+	for i := 0; i < events.MaxSubscribers; i++ {
+		_, cancel, err := s.events.Subscribe()
+		if err != nil {
+			t.Fatalf("Subscribe %d: %v", i, err)
+		}
+		t.Cleanup(cancel)
+	}
+	rec := httptest.NewRecorder()
+	s.handleEvents(rec, httptest.NewRequest(http.MethodGet, "/api/v1/events", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}

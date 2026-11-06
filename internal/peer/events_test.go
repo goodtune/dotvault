@@ -164,7 +164,7 @@ func TestRelaySpreadsANoticeToTheOtherPeers(t *testing.T) {
 	b := newFakeDesktop(t, filepath.Join(dir, "dotvault.b.sock"), nil)
 
 	var local atomic.Int32
-	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), func() { local.Add(1) })
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), func(events.Event) { local.Add(1) }, WithFanOut())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -287,7 +287,7 @@ func TestRelaySyncsAreSingleFlightPerPeer(t *testing.T) {
 	dir := sockDir(t)
 	fakeSocket(t, filepath.Join(dir, "dotvault.a.sock"))
 	fakeSocket(t, filepath.Join(dir, "dotvault.b.sock"))
-	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil)
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), nil, WithFanOut())
 	r.spacing = 0
 	release := make(chan struct{})
 	var syncs atomic.Int32
@@ -383,5 +383,51 @@ func TestStreamEventsJoinsMultiLineData(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("multi-line CRLF event not delivered")
+	}
+}
+
+// Without WithFanOut the relay only listens: the client facade subscribes
+// this way, and a library must never make other hosts sync.
+func TestRelayWithoutFanOutOnlyListens(t *testing.T) {
+	dir := sockDir(t)
+	newFakeDesktop(t, filepath.Join(dir, "dotvault.a.sock"), []events.Event{{Key: "gh", Version: 3}})
+	b := newFakeDesktop(t, filepath.Join(dir, "dotvault.b.sock"), nil)
+
+	got := make(chan events.Event, 1)
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), func(e events.Event) { got <- e })
+	runRelay(t, r)
+
+	select {
+	case e := <-got:
+		if e.Key != "gh" || e.Version != 3 {
+			t.Fatalf("got %+v, want gh@3", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("notice not delivered")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := b.syncs.Load(); n != 0 {
+		t.Fatalf("peer B asked to sync %d times by a listen-only relay", n)
+	}
+}
+
+// A shared table lets the daemon recognise its own write coming back.
+func TestRelaySharedSeenSuppressesOwnEcho(t *testing.T) {
+	dir := sockDir(t)
+	newFakeDesktop(t, filepath.Join(dir, "dotvault.a.sock"), []events.Event{{Key: "gh", Version: 9}, {Key: "gh", Version: 10}})
+
+	seen := events.NewSeen()
+	seen.Admit(events.Event{Key: "gh", Version: 9}) // this host wrote v9 itself
+	got := make(chan events.Event, 2)
+	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), func(e events.Event) { got <- e }, WithSeen(seen))
+	runRelay(t, r)
+
+	select {
+	case e := <-got:
+		if e.Version != 10 {
+			t.Fatalf("got gh@%d first, want the echo of gh@9 suppressed", e.Version)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gh@10 not delivered")
 	}
 }

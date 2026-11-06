@@ -1106,9 +1106,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// token_socket patterns is every daemon, Windows and dotvaultw.exe
 	// included: with no peer present it costs one glob every 30s, and a host
 	// that does borrow needs no extra configuration to hear its peers.
+	//
+	// A relayed notice is re-announced on this daemon's own hub, not only
+	// acted on: a host that borrows from this one — chained further
+	// downstream, or a program using the client facade's Subscribe — hears
+	// it the same way it hears this daemon's own writes. One dedup table is
+	// shared by the relay and this daemon's own announcements, so a notice
+	// that comes back round a mesh of peers is recognised and goes no
+	// further.
 	eventHub := events.NewHub()
+	eventSeen := events.NewSeen()
 	if peerPool != nil {
-		relay := peer.NewRelay(peerPool, engine.TriggerSync)
+		relay := peer.NewRelay(peerPool, relayedNotice(engine.TriggerSync, eventHub),
+			peer.WithFanOut(), peer.WithSeen(eventSeen))
 		peerRelay.Store(relay)
 		go relay.Run(ctx)
 	}
@@ -1625,7 +1635,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// instant a rotation lands in Vault. This host's own writes are also
 	// published for peers borrowing from it; a change it merely observed
 	// was written, and announced, by someone else.
-	onSecretChange := secretChangeHook(engine.TriggerSync, eventHub)
+	onSecretChange := secretChangeHook(engine.TriggerSync, eventHub, eventSeen)
 	rm := enrol.NewRefreshManager(
 		vc,
 		cfg.Vault.KVMount,

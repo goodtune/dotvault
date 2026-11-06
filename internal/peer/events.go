@@ -189,8 +189,9 @@ const (
 )
 
 // Relay listens to every live member of a Pool for secret-write notices and
-// spreads each one: it triggers this host's own sync, and asks every *other*
-// member to sync too.
+// hands each new one to its onEvent callback. With WithFanOut it also asks
+// every *other* member to sync — the daemon's mode; the client facade's
+// subscriptions only listen.
 //
 // The second half exists because the desktops a host borrows from do not know
 // about one another. A token rotated on one desktop reaches the others only at
@@ -213,9 +214,10 @@ const (
 // until the pool readmits it. That is the pool's single view of which peers
 // are reachable, and a stream to an unreachable peer would fail anyway.
 type Relay struct {
-	pool      *Pool
-	localSync func()
-	seen      *events.Seen
+	pool    *Pool
+	onEvent func(events.Event)
+	seen    *events.Seen
+	fanOut  bool
 
 	// Seams for tests; production uses StreamEvents, PostSync and the
 	// constants above.
@@ -247,12 +249,26 @@ type relaySync struct {
 	again bool // another notice arrived while a sync was in flight
 }
 
-// NewRelay builds a relay over pool. localSync is called for every new
-// notice; it must not block (sync.Engine.TriggerSync does not).
-func NewRelay(pool *Pool, localSync func()) *Relay {
-	return &Relay{
+// RelayOption configures a Relay.
+type RelayOption func(*Relay)
+
+// WithFanOut makes the relay ask every member other than a notice's source
+// to sync. Without it the relay only listens.
+func WithFanOut() RelayOption { return func(r *Relay) { r.fanOut = true } }
+
+// WithSeen shares a deduplication table with the caller. The daemon passes
+// the table it also records its own writes in, so a notice of its own that
+// comes back round a mesh of peers is recognised and not acted on twice.
+func WithSeen(s *events.Seen) RelayOption { return func(r *Relay) { r.seen = s } }
+
+// NewRelay builds a relay over pool. onEvent is called once for every new,
+// well-formed notice, possibly from several goroutines at once (one per
+// member stream); it must not block for long, since the stream it was called
+// from does not read while it runs.
+func NewRelay(pool *Pool, onEvent func(events.Event), opts ...RelayOption) *Relay {
+	r := &Relay{
 		pool:       pool,
-		localSync:  localSync,
+		onEvent:    onEvent,
 		seen:       events.NewSeen(),
 		stream:     StreamEvents,
 		postSync:   PostSync,
@@ -264,6 +280,10 @@ func NewRelay(pool *Pool, localSync func()) *Relay {
 		streams:    make(map[string]*relayStream),
 		syncs:      make(map[string]*relaySync),
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Kick asks the relay to re-glob the pool now and retry any stream that is
@@ -399,9 +419,12 @@ func (r *Relay) handle(source string, e events.Event) {
 		slog.Debug("peer events: duplicate notice; ignoring", "key", e.Key, "version", e.Version, "socket", source)
 		return
 	}
-	slog.Info("peer events: secret changed on a peer; syncing", "key", e.Key, "version", e.Version, "socket", source)
-	if r.localSync != nil {
-		r.localSync()
+	slog.Info("peer events: secret changed on a peer", "key", e.Key, "version", e.Version, "socket", source)
+	if r.onEvent != nil {
+		r.onEvent(e)
+	}
+	if !r.fanOut {
+		return
 	}
 	for _, m := range r.pool.Resolve() {
 		if m.Path != source {

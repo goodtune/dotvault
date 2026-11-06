@@ -117,8 +117,31 @@ func validEvent(e events.Event) bool {
 	if e.Version <= 0 || e.Key == "" || len(e.Key) > maxEventKeyLen {
 		return false
 	}
+	// Keys reach consumers that print them or build names from them; a
+	// control character in one is never a real enrolment key.
+	for _, r := range e.Key {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
 	clean, err := kvpath.Clean(e.Key)
 	return err == nil && clean == e.Key
+}
+
+// knownSources are the writers a daemon names in Event.Source. Anything else
+// from a peer is dropped to "" rather than passed on, so a hostile upstream
+// cannot label a notice as, say, a rotation for every host downstream.
+var knownSources = map[string]bool{"refresh": true, "watch": true}
+
+// sanitise rewrites the parts of a peer's notice this host cannot vouch for:
+// an unknown Source becomes "", and Time becomes the moment this host heard
+// it. Key and Version are already validated, and are what consumers act on.
+func sanitise(e events.Event) events.Event {
+	if !knownSources[e.Source] {
+		e.Source = ""
+	}
+	e.Time = time.Now().UTC()
+	return e
 }
 
 // PostSync asks a peer daemon to run a sync cycle now, through its
@@ -419,7 +442,15 @@ func (r *Relay) handle(source string, e events.Event) {
 		slog.Debug("peer events: duplicate notice; ignoring", "key", e.Key, "version", e.Version, "socket", source)
 		return
 	}
-	slog.Info("peer events: secret changed on a peer", "key", e.Key, "version", e.Version, "socket", source)
+	e = sanitise(e)
+	// INFO in the daemon, where it explains a sync; DEBUG in a listen-only
+	// relay, which runs inside someone else's program and must not write a
+	// line to its stderr for every notice.
+	level := slog.LevelDebug
+	if r.fanOut {
+		level = slog.LevelInfo
+	}
+	slog.Log(context.Background(), level, "peer events: secret changed on a peer", "key", e.Key, "version", e.Version, "socket", source)
 	if r.onEvent != nil {
 		r.onEvent(e)
 	}

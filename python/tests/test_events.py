@@ -8,7 +8,9 @@ GET /api/v1/events does. No Vault is involved.
 import http.server
 import queue
 import socket
+import shutil
 import socketserver
+import tempfile
 import threading
 from datetime import datetime, timezone
 
@@ -64,8 +66,11 @@ class _ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStr
 
 
 @pytest.fixture
-def daemon(tmp_path):
-    sock_path = str(tmp_path / "events.sock")
+def daemon():
+    # Not tmp_path: a Unix socket path is limited to about 104 bytes on macOS,
+    # and pytest's per-test directory under $TMPDIR is already near that.
+    sock_dir = tempfile.mkdtemp(prefix="dvt", dir="/tmp")
+    sock_path = sock_dir + "/events.sock"
     server = _ThreadingUnixHTTPServer(sock_path, _EventsHandler)
     server.notices = queue.Queue()
     server.stopping = threading.Event()
@@ -77,6 +82,7 @@ def daemon(tmp_path):
         server.stopping.set()
         server.shutdown()
         server.server_close()
+        shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 def _client(tmp_path, token_socket=None):
@@ -108,13 +114,13 @@ def test_subscribe_delivers_events(tmp_path, daemon):
         server.notices.put(
             '{"key":"gh","version":41,"source":"refresh","time":"2026-11-07T01:02:03.123456789Z"}'
         )
+        before = datetime.now(timezone.utc)
         event = sub.next(timeout=5)
-        assert event == dotvault.Event(
-            key="gh",
-            version=41,
-            source="refresh",
-            time=datetime(2026, 11, 7, 1, 2, 3, 123456, tzinfo=timezone.utc),
-        )
+        assert (event.key, event.version, event.source) == ("gh", 41, "refresh")
+        # The peer's own timestamp is a claim; the event carries the time it
+        # was received here.
+        assert event.time is not None and event.time.tzinfo is not None
+        assert event.time >= before.replace(microsecond=0)
 
 
 def test_subscribe_next_times_out_with_none(tmp_path, daemon):
@@ -148,5 +154,34 @@ def test_closed_subscription_raises(tmp_path, daemon):
         sub = c.subscribe()
         sub.close()
         sub.close()  # idempotent
-        with pytest.raises(dotvault.DotvaultError):
+        with pytest.raises(dotvault.SubscriptionClosed):
             sub.next(timeout=0.1)
+
+
+def test_zero_timeout_polls_rather_than_blocking(tmp_path, daemon):
+    sock_path, _ = daemon
+    with _client(tmp_path, sock_path) as c, c.subscribe() as sub:
+        done = threading.Event()
+
+        def poll():
+            sub.next(timeout=0)
+            done.set()
+
+        threading.Thread(target=poll, daemon=True).start()
+        assert done.wait(5), "next(timeout=0) blocked instead of polling"
+
+
+def test_close_ends_iteration_in_another_thread(tmp_path, daemon):
+    sock_path, _ = daemon
+    with _client(tmp_path, sock_path) as c:
+        sub = c.subscribe()
+        finished = threading.Event()
+
+        def consume():
+            for _ in sub:
+                pass
+            finished.set()
+
+        threading.Thread(target=consume, daemon=True).start()
+        sub.close()
+        assert finished.wait(5), "iteration did not end after close()"

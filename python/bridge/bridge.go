@@ -15,7 +15,8 @@
 // Scope is the read-only + cached-auth subset of the facade plus the
 // peer-action surface: AuthenticateCached (never prompts), IdentityName, Token,
 // ReadKVField, ReadUserSecret, ClientCertificate, and the socket-forwarded
-// Browse/Notify/Clipboard.
+// Browse/Notify/Clipboard, plus Subscribe (change notices over the same
+// sockets; no token needed).
 // Interactive Login/Authenticate (browser/terminal) are out — driving an OIDC
 // browser pop or an LDAP password prompt across an FFI boundary from inside a
 // Python process is awkward and is not what a library caller wants; such
@@ -84,6 +85,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -142,6 +144,7 @@ const (
 	catOther           = 5
 	catPeerUnavailable = 6
 	catNotConfigured   = 7
+	catClosed          = 8
 )
 
 // Handle table. A *client.Client is never exposed to C directly; it is parked
@@ -237,6 +240,8 @@ func categoryOf(err error) int {
 		return catPeerUnavailable
 	case errors.Is(err, client.ErrNotConfigured):
 		return catNotConfigured
+	case errors.Is(err, client.ErrSubscriptionClosed):
+		return catClosed
 	default:
 		return catOther
 	}
@@ -543,7 +548,10 @@ func takeSubID(id int64) (*client.Subscription, bool) {
 	return s, ok
 }
 
-var errUnknownSubscription = errors.New("dotvault: unknown subscription handle")
+// errUnknownSubscription is reported as catClosed: close frees the handle, so
+// a next racing a close on another thread finds it gone, and to the caller
+// that is the same outcome as finding it closed.
+var errUnknownSubscription = fmt.Errorf("%w (unknown subscription handle)", client.ErrSubscriptionClosed)
 
 // eventJSON is the wire shape of one event handed to Python: the facade's
 // Event with lower-case keys and an RFC 3339 time (empty when unknown).
@@ -583,15 +591,16 @@ func dotvault_subscribe(h C.longlong, subOut *C.longlong, errOut **C.char) C.int
 
 // dotvault_subscription_next waits up to timeoutMillis (<= 0: indefinitely)
 // for the next event. On an event it returns catOK with *out set to an owned
-// JSON string; on timeout it returns catOK with *out left NULL. A closed or
-// unknown subscription is catOther.
+// JSON string; on timeout it returns catOK with *out left NULL. A closed
+// subscription (including one closed from another thread while this call
+// waited, or already freed by close) is catClosed.
 //
 //export dotvault_subscription_next
 func dotvault_subscription_next(sub C.longlong, timeoutMillis C.longlong, out **C.char, errOut **C.char) C.int {
 	s, ok := lookupSubID(int64(sub))
 	if !ok {
 		setErr(errOut, errUnknownSubscription)
-		return catOther
+		return catClosed
 	}
 	ctx, cancel := callContext(timeoutMillis)
 	defer cancel()

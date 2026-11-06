@@ -64,6 +64,7 @@ from ._errors import (
     LoginRequired,
     NotConfigured,
     PeerUnavailable,
+    SubscriptionClosed,
     Unreachable,
     error_for,
 )
@@ -80,6 +81,7 @@ __all__ = [
     "Unreachable",
     "PeerUnavailable",
     "NotConfigured",
+    "SubscriptionClosed",
     "__version__",
 ]
 
@@ -141,7 +143,7 @@ class Event:
         version: The KVv2 version the write produced.
         source: What wrote it, when the daemon knows: ``"refresh"`` for a
             credential rotation, ``"watch"`` for a mirrored copy, else ``""``.
-        time: When the daemon announced it (UTC), or ``None`` if unknown.
+        time: When this host received the notice (UTC), or ``None`` if unknown.
 
     An event never carries the secret's value; re-read it when you need it.
     """
@@ -181,10 +183,14 @@ _ITER_POLL_SECONDS = 1.0
 class Subscription:
     """A live stream of :class:`Event` objects from :meth:`Client.subscribe`.
 
-    Iterate it to block for events indefinitely, or call :meth:`next` with a
-    timeout. Events a slow reader has not yet taken are coalesced per key:
-    a key written twice before you read it is reported once, with the later
-    version, so you never miss the current state of a secret.
+    Iterate it to block for events — the loop runs until the subscription is
+    closed, then ends quietly — or call :meth:`next` with a timeout. Events a
+    slow reader has not yet taken are coalesced per key: a key written twice
+    before you read it is reported once, with the later version, so you never
+    miss the current state of a secret.
+
+    It is blocking by design. From asyncio, run ``next`` in a thread:
+    ``await asyncio.to_thread(sub.next, 1.0)``.
 
     Use as a context manager, or call :meth:`close`, to stop listening.
     """
@@ -197,17 +203,20 @@ class Subscription:
 
         ``timeout=None`` waits indefinitely (and, being a single native call,
         is not interruptible by Ctrl-C; prefer iteration or a finite timeout
-        in an interactive program).
+        in an interactive program). A finite timeout waits at least one
+        millisecond, so ``timeout=0`` is a near-immediate poll rather than —
+        as a zero would mean to the native layer — no deadline at all.
 
         Raises:
-            DotvaultError: The subscription is closed.
+            SubscriptionClosed: The subscription is closed.
         """
         if self._handle == _CLOSED:
-            raise DotvaultError("dotvault: subscription closed")
+            raise SubscriptionClosed("dotvault: subscription closed")
+        millis = 0 if timeout is None else max(1, _millis(timeout))
         out = c_void_p()
         err = c_void_p()
         code = _ffi.lib.dotvault_subscription_next(
-            c_longlong(self._handle), _millis(timeout), byref(out), byref(err)
+            c_longlong(self._handle), millis, byref(out), byref(err)
         )
         _check(code, err)
         raw = _ffi.take_str(out)
@@ -223,7 +232,10 @@ class Subscription:
 
     def __iter__(self) -> Iterator[Event]:
         while True:
-            event = self.next(timeout=_ITER_POLL_SECONDS)
+            try:
+                event = self.next(timeout=_ITER_POLL_SECONDS)
+            except SubscriptionClosed:
+                return
             if event is not None:
                 yield event
 

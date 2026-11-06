@@ -344,6 +344,8 @@ func TestValidEventRejectsHostileKeys(t *testing.T) {
 		{Key: "/gh", Version: 1},
 		{Key: "a//b", Version: 1},
 		{Key: strings.Repeat("a", maxEventKeyLen+1), Version: 1},
+		{Key: "gh\x1b[2J", Version: 1}, // terminal escape into a log line
+		{Key: "gh\x7f", Version: 1},
 	} {
 		if validEvent(e) {
 			t.Errorf("validEvent(%q@%d) = true, want false", e.Key, e.Version)
@@ -353,6 +355,22 @@ func TestValidEventRejectsHostileKeys(t *testing.T) {
 		if !validEvent(e) {
 			t.Errorf("validEvent(%q@%d) = false, want true", e.Key, e.Version)
 		}
+	}
+}
+
+// A peer's Source and Time are its claims; only a known Source survives, and
+// Time is this host's receipt.
+func TestSanitiseDropsUnknownSourceAndRestampsTime(t *testing.T) {
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	got := sanitise(events.Event{Key: "gh", Version: 1, Source: "rm -rf", Time: old})
+	if got.Source != "" {
+		t.Errorf("Source = %q, want it dropped", got.Source)
+	}
+	if !got.Time.After(old) {
+		t.Errorf("Time = %v, want this host's receipt time", got.Time)
+	}
+	if kept := sanitise(events.Event{Key: "gh", Version: 1, Source: "refresh"}); kept.Source != "refresh" {
+		t.Errorf("Source = %q, want refresh kept", kept.Source)
 	}
 }
 
@@ -391,11 +409,15 @@ func TestStreamEventsJoinsMultiLineData(t *testing.T) {
 func TestRelayWithoutFanOutOnlyListens(t *testing.T) {
 	dir := sockDir(t)
 	newFakeDesktop(t, filepath.Join(dir, "dotvault.a.sock"), []events.Event{{Key: "gh", Version: 3}})
-	b := newFakeDesktop(t, filepath.Join(dir, "dotvault.b.sock"), nil)
+	newFakeDesktop(t, filepath.Join(dir, "dotvault.b.sock"), nil)
 
 	got := make(chan events.Event, 1)
 	r := NewRelay(NewPool([]string{filepath.Join(dir, "dotvault.*.sock")}), func(e events.Event) { got <- e })
-	runRelay(t, r)
+	var syncs atomic.Int32
+	r.postSync = func(context.Context, string) error { syncs.Add(1); return nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
 
 	select {
 	case e := <-got:
@@ -405,9 +427,12 @@ func TestRelayWithoutFanOutOnlyListens(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("notice not delivered")
 	}
-	time.Sleep(100 * time.Millisecond)
-	if n := b.syncs.Load(); n != 0 {
-		t.Fatalf("peer B asked to sync %d times by a listen-only relay", n)
+	// Run returns only once every sync it started has finished, so after it
+	// the count is final rather than a guess about timing.
+	cancel()
+	<-done
+	if n := syncs.Load(); n != 0 {
+		t.Fatalf("a listen-only relay asked peers to sync %d times", n)
 	}
 }
 

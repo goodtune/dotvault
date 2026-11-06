@@ -121,3 +121,49 @@ func ExampleReader() {
 	fmt.Println(tok)
 	// Output: ghp_fake
 }
+
+// ExampleClient_Subscribe re-reads a credential whenever it is rotated,
+// instead of polling it on a timer. Subscribing before the first read means a
+// write landing in between is not missed.
+func ExampleClient_Subscribe() {
+	ctx := context.Background()
+
+	cfg, err := client.LoadConfig(client.DefaultConfigPath())
+	if err != nil {
+		log.Fatalf("load dotvault config: %v", err)
+	}
+	cli, err := client.New(cfg)
+	if err != nil {
+		log.Fatalf("new client: %v", err)
+	}
+	if err := cli.AuthenticateCached(ctx); err != nil {
+		log.Fatalf("authenticate: %v", err)
+	}
+
+	sub, err := cli.Subscribe(ctx)
+	if err != nil {
+		log.Fatalf("subscribe: %v", err) // client.ErrPeerUnavailable: no socket configured
+	}
+	defer sub.Close()
+
+	token, _, err := cli.ReadUserSecret(ctx, "gh", "oauth_token")
+	if err != nil {
+		log.Fatalf("read: %v", err)
+	}
+	for {
+		ev, err := sub.Next(ctx)
+		if errors.Is(err, client.ErrSubscriptionClosed) {
+			return
+		}
+		if err != nil {
+			log.Fatalf("next: %v", err)
+		}
+		if ev.Key != "gh" {
+			continue
+		}
+		if token, _, err = cli.ReadUserSecret(ctx, "gh", "oauth_token"); err != nil {
+			log.Fatalf("re-read gh@%d: %v", ev.Version, err)
+		}
+		fmt.Println("gh token rotated; length", len(token))
+	}
+}

@@ -171,3 +171,17 @@ func TestSubscriptionHandlesAreNeverReused(t *testing.T) {
 		t.Fatal("subscription handle reused")
 	}
 }
+
+func TestSubscriptionClosedHasItsOwnCategory(t *testing.T) {
+	if got := categoryOf(fmt.Errorf("wrapped: %w", client.ErrSubscriptionClosed)); got != catClosed {
+		t.Fatalf("categoryOf(ErrSubscriptionClosed) = %d, want catClosed (%d)", got, catClosed)
+	}
+}
+
+func TestUnknownSubscriptionReadsAsClosed(t *testing.T) {
+	// close frees the handle, so a next racing it on another thread finds the
+	// handle gone; that must reach Python as SubscriptionClosed, not an error.
+	if got := categoryOf(errUnknownSubscription); got != catClosed {
+		t.Fatalf("categoryOf(errUnknownSubscription) = %d, want catClosed (%d)", got, catClosed)
+	}
+}

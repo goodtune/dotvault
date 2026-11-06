@@ -17,6 +17,7 @@ CAT_AUTH_FAILED = 4
 CAT_OTHER = 5
 CAT_PEER_UNAVAILABLE = 6
 CAT_NOT_CONFIGURED = 7
+CAT_CLOSED = 8
 
 
 class DotvaultError(Exception):
@@ -85,6 +86,15 @@ class NotConfigured(DotvaultError):
     """
 
 
+class SubscriptionClosed(DotvaultError):
+    """The subscription has been closed (``ErrSubscriptionClosed``).
+
+    Raised by :meth:`Subscription.next` once :meth:`Subscription.close` has run,
+    including from another thread while ``next`` was waiting. Iterating a
+    subscription ends quietly instead of raising it.
+    """
+
+
 _BY_CATEGORY = {
     CAT_LOGIN_REQUIRED: LoginRequired,
     CAT_DENIED: Denied,
@@ -92,6 +102,7 @@ _BY_CATEGORY = {
     CAT_AUTH_FAILED: AuthFailed,
     CAT_PEER_UNAVAILABLE: PeerUnavailable,
     CAT_NOT_CONFIGURED: NotConfigured,
+    CAT_CLOSED: SubscriptionClosed,
 }
 
 

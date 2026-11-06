@@ -57,10 +57,49 @@ func nextWithin(t *testing.T, s *Subscription, d time.Duration) Event {
 
 func TestSubscribeDeliversEachWriteOnceAcrossSockets(t *testing.T) {
 	dir := clientSockDir(t)
+	first := make(chan string, 4)
+	second := make(chan string, 4)
+	newEventServer(t, filepath.Join(dir, "a.sock"), first)
+	newEventServer(t, filepath.Join(dir, "b.sock"), second)
+
+	// No API socket, so Subscribe listens to every peer.
+	c, err := New(&Config{Vault: VaultConfig{
+		Address:      "http://127.0.0.1:8200",
+		TokenSockets: []string{filepath.Join(dir, "a.sock"), filepath.Join(dir, "b.sock")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := c.Subscribe(context.Background())
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	first <- `{"key":"gh","version":40,"source":"refresh"}`
+	e := nextWithin(t, sub, 5*time.Second)
+	if e.Key != "gh" || e.Version != 40 || e.Source != "refresh" {
+		t.Fatalf("got %+v, want gh@40 from refresh", e)
+	}
+
+	// The same write heard again from another peer only after the first was
+	// delivered, so coalescing cannot hide it: only dedup keeps it out. The
+	// marker follows on the same stream, so once it arrives the duplicate has
+	// been handled.
+	second <- `{"key":"gh","version":40,"source":"refresh"}`
+	second <- `{"key":"databricks/prod","version":3}`
+	e = nextWithin(t, sub, 5*time.Second)
+	if e.Key != "databricks/prod" || e.Version != 3 {
+		t.Fatalf("got %+v, want databricks/prod@3 (the duplicate gh@40 must not appear)", e)
+	}
+}
+
+func TestSubscribeUsesOnlyTheAPISocketWhenSet(t *testing.T) {
+	dir := clientSockDir(t)
 	local := make(chan string, 4)
-	remote := make(chan string, 4)
+	peerCh := make(chan string, 4)
 	newEventServer(t, filepath.Join(dir, "api.sock"), local)
-	newEventServer(t, filepath.Join(dir, "peer.sock"), remote)
+	newEventServer(t, filepath.Join(dir, "peer.sock"), peerCh)
 
 	c, err := New(&Config{Vault: VaultConfig{
 		Address:      "http://127.0.0.1:8200",
@@ -76,24 +115,16 @@ func TestSubscribeDeliversEachWriteOnceAcrossSockets(t *testing.T) {
 	}
 	defer sub.Close()
 
-	// The local daemon relays what the peer announced, so the same write
-	// arrives on both sockets; it must be delivered once.
-	local <- `{"key":"gh","version":40,"source":"refresh"}`
-	remote <- `{"key":"gh","version":40,"source":"refresh"}`
+	peerCh <- `{"key":"peer-only","version":1}`
+	local <- `{"key":"gh","version":2}`
 	e := nextWithin(t, sub, 5*time.Second)
-	if e.Key != "gh" || e.Version != 40 || e.Source != "refresh" {
-		t.Fatalf("got %+v, want gh@40 from refresh", e)
-	}
-
-	remote <- `{"key":"databricks/prod","version":3}`
-	e = nextWithin(t, sub, 5*time.Second)
-	if e.Key != "databricks/prod" || e.Version != 3 {
-		t.Fatalf("got %+v, want databricks/prod@3 (the duplicate gh@40 must not appear)", e)
+	if e.Key != "gh" {
+		t.Fatalf("got %+v, want gh from the API socket (the peer must not be listened to)", e)
 	}
 }
 
 func TestSubscriptionCoalescesPerKey(t *testing.T) {
-	s := &Subscription{pending: map[string]Event{}, notify: make(chan struct{}, 1), done: make(chan struct{}), cancel: func() {}}
+	s := newTestSubscription()
 	s.push(evt("gh", 1))
 	s.push(evt("jfrog", 1))
 	s.push(evt("gh", 2))
@@ -106,6 +137,77 @@ func TestSubscriptionCoalescesPerKey(t *testing.T) {
 	}
 	if second.Key != "jfrog" {
 		t.Errorf("second = %+v, want jfrog", second)
+	}
+}
+
+func newTestSubscription() *Subscription {
+	return &Subscription{pending: map[string]Event{}, notify: make(chan struct{}, 1), done: make(chan struct{}), cancel: func() {}}
+}
+
+func TestSubscriptionCoalescesToTheHigherVersion(t *testing.T) {
+	s := newTestSubscription()
+	s.push(evt("gh", 5))
+	s.push(evt("gh", 4)) // a slower socket reporting an older write
+	if e, _ := s.Next(context.Background()); e.Version != 5 {
+		t.Fatalf("got gh@%d, want gh@5", e.Version)
+	}
+}
+
+func TestSubscriptionBoundsPendingKeys(t *testing.T) {
+	s := newTestSubscription()
+	for i := 0; i <= maxPending; i++ {
+		s.push(evt(fmt.Sprintf("k%d", i), 1))
+	}
+	if len(s.pending) != maxPending || len(s.order) != maxPending {
+		t.Fatalf("pending = %d/%d, want %d", len(s.pending), len(s.order), maxPending)
+	}
+	if e, _ := s.Next(context.Background()); e.Key != "k1" {
+		t.Fatalf("first = %q, want k1 (the oldest, k0, dropped)", e.Key)
+	}
+}
+
+func TestSubscriptionConcurrentReadersEachGetAnEvent(t *testing.T) {
+	s := newTestSubscription()
+	got := make(chan string, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			e, err := s.Next(context.Background())
+			if err == nil {
+				got <- e.Key
+			}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond) // let both readers block
+	s.push(evt("a", 1))
+	s.push(evt("b", 1))
+	for i := 0; i < 2; i++ {
+		select {
+		case <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a reader slept beside a pending event")
+		}
+	}
+}
+
+func TestSubscriptionDrainsBeforeReportingContextEnd(t *testing.T) {
+	s := newTestSubscription()
+	close(s.done) // the context Subscribe was given has ended
+	s.push(evt("gh", 1))
+	if e, err := s.Next(context.Background()); err != nil || e.Key != "gh" {
+		t.Fatalf("Next = %+v, %v; want the event already received", e, err)
+	}
+	if _, err := s.Next(context.Background()); !errors.Is(err, ErrSubscriptionClosed) {
+		t.Fatalf("Next = %v, want ErrSubscriptionClosed once drained", err)
+	}
+}
+
+func TestSubscriptionCloseDiscardsPending(t *testing.T) {
+	s := newTestSubscription()
+	close(s.done)
+	s.push(evt("gh", 1))
+	_ = s.Close()
+	if _, err := s.Next(context.Background()); !errors.Is(err, ErrSubscriptionClosed) {
+		t.Fatalf("Next after Close = %v, want ErrSubscriptionClosed", err)
 	}
 }
 

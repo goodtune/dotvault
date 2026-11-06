@@ -138,6 +138,29 @@ cli.Clipboard(ctx, oneTimeToken)
 
 `Browse`/`Notify`/`Clipboard` differ from the `dotvault` CLIs in two deliberate ways: there is **no local fallback** (a headless library has no local browser, notifier, or clipboard), so an unreachable peer is an error rather than a silent local action; and there is **no local validation** — the peer endpoint validates and sanitizes the URL / level / title / text authoritatively (that is where the action happens and where the security boundary belongs), so the facade stays a thin transport. A peer that is not configured, cannot be reached, or reports it could not perform the action returns `ErrPeerUnavailable`; a request the peer *rejects as invalid* (a non-`http(s)` URL, an unknown level, an empty title, empty or over-64-KiB clipboard text) returns a plain error carrying the peer's message. `Notify`'s level is one of `info`, `warning`, `error`, `attention`; its final argument is an optional `actionURL` — an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux). Pass `""` for no link. `Clipboard`'s text is written verbatim on the peer (non-empty UTF-8, no NUL bytes, ≤ 64 KiB); the peer never logs the content, only its length.
 
+## Change notices: Subscribe
+
+A program that holds a credential can hear when it changes instead of re-reading on a timer. `Subscribe` listens on every dotvault socket the client knows — the local daemon's API socket (`APISocket`, which needs `api.enabled`; Linux and macOS) and the peers in `TokenSockets` — and delivers each write to the user's secrets once, however many of those sockets report it. It needs no token, and sockets that are absent or go away are retried in the background, so it succeeds before any daemon is listening; with no socket configured at all it returns `ErrPeerUnavailable`.
+
+```go
+sub, err := cli.Subscribe(ctx)
+if err != nil {
+    return err
+}
+defer sub.Close()
+for {
+    ev, err := sub.Next(ctx)
+    if err != nil {
+        return err // ctx done, or client.ErrSubscriptionClosed
+    }
+    if ev.Key == "gh" {
+        token, _, err = cli.ReadUserSecret(ctx, "gh", "oauth_token")
+    }
+}
+```
+
+An `Event` carries the key (relative to your prefix, the same name `ReadUserSecret` takes), the KVv2 version the write produced, and what wrote it (`"refresh"` for a rotation, `"watch"` for a mirrored copy) — never the value, which you re-read. It means Vault holds a new version; a file the daemon renders from the secret is rewritten by the daemon's own sync a moment later. Events you have not yet read are coalesced per key, so a slow consumer sees the latest version of each key rather than missing it. The local daemon re-announces what it relays from its own peers, so a subscriber on a borrowing host hears writes made on any workstation that host is connected to.
+
 ## Error categories
 
 Sentinels are `errors.Is`-able and map to a small, stable set of outcomes:

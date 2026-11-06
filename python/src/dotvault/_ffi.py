@@ -82,6 +82,14 @@ _declare(
     [c_longlong, c_longlong, POINTER(c_void_p), POINTER(c_void_p), POINTER(c_void_p)],
 )
 
+_declare("dotvault_subscribe", c_int, [c_longlong, POINTER(c_longlong), POINTER(c_void_p)])
+_declare(
+    "dotvault_subscription_next",
+    c_int,
+    [c_longlong, c_longlong, POINTER(c_void_p), POINTER(c_void_p)],
+)
+_declare("dotvault_subscription_close", None, [c_longlong])
+
 lib = _lib
 
 

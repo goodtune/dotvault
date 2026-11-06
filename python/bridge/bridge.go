@@ -82,6 +82,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"sync"
@@ -507,6 +508,118 @@ func clientCertificate(ctx context.Context, c *client.Client, outputsOK bool) (*
 		return nil, errNilOutput
 	}
 	return c.ClientCertificate(ctx)
+}
+
+// Subscription table, parallel to the client table and for the same reason:
+// a *client.Subscription holds Go pointers, so C only ever sees an int64
+// handle. nextSubID only increases, so a closed handle never names another
+// subscription.
+var (
+	subMu     sync.Mutex
+	subs      = map[int64]*client.Subscription{}
+	nextSubID int64
+)
+
+func storeSub(s *client.Subscription) int64 {
+	subMu.Lock()
+	defer subMu.Unlock()
+	nextSubID++
+	subs[nextSubID] = s
+	return nextSubID
+}
+
+func lookupSubID(id int64) (*client.Subscription, bool) {
+	subMu.Lock()
+	defer subMu.Unlock()
+	s, ok := subs[id]
+	return s, ok
+}
+
+func takeSubID(id int64) (*client.Subscription, bool) {
+	subMu.Lock()
+	defer subMu.Unlock()
+	s, ok := subs[id]
+	delete(subs, id)
+	return s, ok
+}
+
+var errUnknownSubscription = errors.New("dotvault: unknown subscription handle")
+
+// eventJSON is the wire shape of one event handed to Python: the facade's
+// Event with lower-case keys and an RFC 3339 time (empty when unknown).
+func eventJSON(e client.Event) (string, error) {
+	t := ""
+	if !e.Time.IsZero() {
+		t = e.Time.UTC().Format(time.RFC3339Nano)
+	}
+	b, err := json.Marshal(struct {
+		Key     string `json:"key"`
+		Version int    `json:"version"`
+		Source  string `json:"source"`
+		Time    string `json:"time"`
+	}{e.Key, e.Version, e.Source, t})
+	return string(b), err
+}
+
+// dotvault_subscribe starts a client.Subscribe and writes its handle to
+// *subOut. The subscription is independent of any call's timeout: it runs
+// until dotvault_subscription_close.
+//
+//export dotvault_subscribe
+func dotvault_subscribe(h C.longlong, subOut *C.longlong, errOut **C.char) C.int {
+	c, ok := lookup(h)
+	if !ok {
+		setErr(errOut, errUnknownHandle)
+		return catOther
+	}
+	s, err := c.Subscribe(context.Background())
+	if err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	*subOut = C.longlong(storeSub(s))
+	return catOK
+}
+
+// dotvault_subscription_next waits up to timeoutMillis (<= 0: indefinitely)
+// for the next event. On an event it returns catOK with *out set to an owned
+// JSON string; on timeout it returns catOK with *out left NULL. A closed or
+// unknown subscription is catOther.
+//
+//export dotvault_subscription_next
+func dotvault_subscription_next(sub C.longlong, timeoutMillis C.longlong, out **C.char, errOut **C.char) C.int {
+	s, ok := lookupSubID(int64(sub))
+	if !ok {
+		setErr(errOut, errUnknownSubscription)
+		return catOther
+	}
+	ctx, cancel := callContext(timeoutMillis)
+	defer cancel()
+	e, err := s.Next(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return catOK
+	}
+	if err != nil {
+		setErr(errOut, err)
+		return category(err)
+	}
+	js, err := eventJSON(e)
+	if err != nil {
+		setErr(errOut, err)
+		return catOther
+	}
+	*out = C.CString(js)
+	return catOK
+}
+
+// dotvault_subscription_close stops a subscription and frees its handle. A
+// Next blocked on it returns. Closing an unknown handle is a no-op.
+//
+//export dotvault_subscription_close
+func dotvault_subscription_close(sub C.longlong) {
+	if s, ok := takeSubID(int64(sub)); ok {
+		_ = s.Close()
+	}
 }
 
 func main() {}

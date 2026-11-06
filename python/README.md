@@ -14,6 +14,7 @@ This package exposes the **read-only + cached-auth** subset of the Go facade, th
 - `read_user_secret(service, field, timeout=None)`, `read_kv_field(mount, path, field, timeout=None)`.
 - `client_certificate(timeout=None)` — return `(cert_pem, key_pem)`: the mutual-TLS client certificate the `client_cert` config section describes, the same one the daemon serves through the filesystem mount and Docker volumes. `cert_pem` is the leaf followed by its CA chain; `key_pem` is the PKCS#8 private key. It never prompts: signing needs a Vault token, so when none is held it first tries the cached sources (token file, peer socket, enrolled certificate) as `authenticate_cached` does. Raises `NotConfigured` when the section is disabled, `LoginRequired` when signing needs a token and none is found, `Denied` on a policy without `pki/sign`, and `Unreachable` for transport failures. If `timeout` runs out while a signing is still in progress it raises the base `DotvaultError`; the signing is not abandoned, so calling again shortly returns its result. **The key is a secret**; see [Using the client certificate](#using-the-client-certificate).
 - `browse(url, timeout=None)`, `notify(level, title, body="", action_url="", timeout=None)`, `clipboard(text, timeout=None)` — ask the `vault.token_socket` peer to open a URL in a browser, raise a native desktop notification, or put text on the clipboard, **on the workstation**. For the headless topology: a Python program on a machine with no browser hands a URL, a notification, or a value to paste (a one-time token for a page `browse` just opened) back over the same forwarded socket it borrows tokens from. These need **no** local token. The peer validates/sanitizes the input; there is no local fallback (an unreachable peer raises `PeerUnavailable`). `notify` levels: `info`, `warning`, `error`, `attention`; the optional `action_url` is an http/https link the notification opens when clicked (on Windows; appended to the body on macOS/Linux). `clipboard` text is written verbatim (non-empty UTF-8, no NUL bytes, ≤ 64 KiB) and the peer logs only its length, never the content.
+- `subscribe()` — listen for writes to the user's secrets, so a program can re-read a credential when it is rotated instead of polling. Returns a `Subscription`: iterate it (blocks, interruptible by Ctrl-C), or call `next(timeout)` (returns an `Event` or `None`). It listens on the local daemon's API socket (`api.enabled`, Linux and macOS) and the `vault.token_socket` peers, reports each write once, retries absent sockets in the background, and needs no token; with no socket configured it raises `PeerUnavailable`. An `Event` has `key` (the name `read_user_secret` takes), `version`, `source` (`"refresh"`, `"watch"` or `""`) and `time` — never the value. Unread events are coalesced per key, so you always see the latest version of each.
 
 Interactive login (OIDC browser pop, LDAP password + MFA terminal prompts) is **deliberately out of scope** — driving it across an FFI boundary from inside a Python process is awkward and not what a library caller wants. Provision a token out of band (`dotvault login`, or the daemon) and these bindings consume it.
 
@@ -67,6 +68,19 @@ with dotvault.Client() as c:
 ```
 
 A read returns the field value, or `None` when the secret or field is absent — a missing path and a missing field are not distinguished (both are "not there"), matching the Go facade. Transport/authorisation failures raise instead.
+
+## Reacting to rotated credentials
+
+```python
+import dotvault
+
+with dotvault.Client() as c, c.subscribe() as events:
+    c.authenticate_cached(timeout=5)
+    token = c.read_user_secret("gh", "oauth_token")
+    for event in events:
+        if event.key == "gh":
+            token = c.read_user_secret("gh", "oauth_token")
+```
 
 ## Using the client certificate
 
@@ -134,7 +148,7 @@ Every failure is a `DotvaultError` or a subclass:
 | `Denied` | Vault rejected the read (401/403). | Fail closed; the token lacks the policy. |
 | `AuthFailed` | A login ran but failed. | Surface the auth problem (rare on this surface). |
 | `NotConfigured` | `client_certificate`: the `client_cert` section is disabled, or has no PKI role and no usable held certificate. | Change the dotvault config; retrying will not help. |
-| `PeerUnavailable` | `browse`/`notify`/`clipboard`: no socket, peer down, or the action failed. | Retry, or fall back to your own handling. |
+| `PeerUnavailable` | `browse`/`notify`/`clipboard`: no socket, peer down, or the action failed. `subscribe`: no socket configured. | Retry, or fall back to your own handling. |
 | `DotvaultError` | Anything else (config load, closed client, a peer-*rejected* request). | Fail closed. |
 
 A not-found read is `None`, never an exception.

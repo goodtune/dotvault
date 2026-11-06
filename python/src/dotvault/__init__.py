@@ -21,10 +21,20 @@ mutual-TLS ``client_certificate()`` and the socket-forwarded peer actions
         c.clipboard(token)                 # ready to paste on the workstation
         c.notify("info", "Done", "job finished")
 
+        with c.subscribe() as events:      # writes to your secrets, as they happen
+            for event in events:
+                if event.key == "gh":
+                    token = c.read_user_secret("gh", "oauth_token")
+
 ``browse``, ``notify``, and ``clipboard`` post over the same
 ``vault.token_socket`` peer this client borrows tokens from, so a headless
 program hands a URL, a notification, or a value to paste back to the
 workstation where a human is looking. They need no local token.
+
+``subscribe`` listens for writes to the user's secrets on the local daemon's
+API socket and the same peer sockets, so a program can re-read a credential
+when it is rotated instead of polling. An event carries the key and the new
+version, never the value.
 
 Authentication never prompts: it resolves ``DOTVAULT_TOKEN`` then the token
 file and validates it. If no usable token is present it raises ``LoginRequired``
@@ -39,7 +49,11 @@ secrets. See the package README for the full rationale.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from ctypes import byref, c_int, c_longlong, c_void_p
+from typing import Iterator, Optional
 
 from . import _ffi
 from ._errors import (
@@ -56,6 +70,8 @@ from ._errors import (
 
 __all__ = [
     "Client",
+    "Event",
+    "Subscription",
     "default_config_path",
     "DotvaultError",
     "LoginRequired",
@@ -112,6 +128,122 @@ def _check(code: int, err_ptr: c_void_p) -> None:
     message = _ffi.take_str(err_ptr)
     if code != CAT_OK:
         raise error_for(code, message)
+
+
+@dataclass(frozen=True)
+class Event:
+    """A write to one of the user's secrets, reported by :meth:`Client.subscribe`.
+
+    Attributes:
+        key: The secret's name relative to the user's prefix — the same name
+            :meth:`Client.read_user_secret` takes, such as ``"gh"`` or
+            ``"databricks/prod"``.
+        version: The KVv2 version the write produced.
+        source: What wrote it, when the daemon knows: ``"refresh"`` for a
+            credential rotation, ``"watch"`` for a mirrored copy, else ``""``.
+        time: When the daemon announced it (UTC), or ``None`` if unknown.
+
+    An event never carries the secret's value; re-read it when you need it.
+    """
+
+    key: str
+    version: int
+    source: str = ""
+    time: Optional[datetime] = None
+
+
+def _parse_time(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    # fromisoformat only accepts a trailing "Z" from Python 3.11, and only
+    # microsecond precision before then; the bridge emits RFC 3339 with up to
+    # nanoseconds.
+    text = value.replace("Z", "+00:00")
+    if "." in text:
+        head, _, rest = text.partition(".")
+        n = 0
+        while n < len(rest) and rest[n].isdigit():
+            n += 1
+        digits, tz = rest[:n], rest[n:]
+        text = f"{head}.{digits[:6].ljust(6, '0')}{tz}"
+    try:
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+# How long each wait inside Subscription.__iter__ blocks in native code. The
+# GIL is released while it waits, but a KeyboardInterrupt is only raised once
+# control returns to Python, so the wait is kept short.
+_ITER_POLL_SECONDS = 1.0
+
+
+class Subscription:
+    """A live stream of :class:`Event` objects from :meth:`Client.subscribe`.
+
+    Iterate it to block for events indefinitely, or call :meth:`next` with a
+    timeout. Events a slow reader has not yet taken are coalesced per key:
+    a key written twice before you read it is reported once, with the later
+    version, so you never miss the current state of a secret.
+
+    Use as a context manager, or call :meth:`close`, to stop listening.
+    """
+
+    def __init__(self, handle: int) -> None:
+        self._handle = handle
+
+    def next(self, timeout: float | None = None) -> Optional[Event]:
+        """Return the next event, or ``None`` if ``timeout`` seconds pass first.
+
+        ``timeout=None`` waits indefinitely (and, being a single native call,
+        is not interruptible by Ctrl-C; prefer iteration or a finite timeout
+        in an interactive program).
+
+        Raises:
+            DotvaultError: The subscription is closed.
+        """
+        if self._handle == _CLOSED:
+            raise DotvaultError("dotvault: subscription closed")
+        out = c_void_p()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_subscription_next(
+            c_longlong(self._handle), _millis(timeout), byref(out), byref(err)
+        )
+        _check(code, err)
+        raw = _ffi.take_str(out)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return Event(
+            key=data["key"],
+            version=int(data["version"]),
+            source=data.get("source", ""),
+            time=_parse_time(data.get("time", "")),
+        )
+
+    def __iter__(self) -> Iterator[Event]:
+        while True:
+            event = self.next(timeout=_ITER_POLL_SECONDS)
+            if event is not None:
+                yield event
+
+    def close(self) -> None:
+        """Stop listening. Idempotent. A blocked :meth:`next` returns."""
+        if getattr(self, "_handle", _CLOSED) != _CLOSED:
+            handle, self._handle = self._handle, _CLOSED
+            _ffi.lib.dotvault_subscription_close(c_longlong(handle))
+
+    def __enter__(self) -> "Subscription":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class Client:
@@ -397,6 +529,30 @@ class Client:
         key_pem = _ffi.take_str(key)
         _check(code, err)
         return cert_pem or "", key_pem or ""
+
+    def subscribe(self) -> Subscription:
+        """Listen for writes to the user's secrets.
+
+        Listens on every dotvault socket this client knows — the local
+        daemon's API socket (when ``api.enabled``), which carries that
+        daemon's own writes and everything it relays from its peers, and the
+        peer sockets in ``vault.token_socket`` — and reports each write once.
+        Sockets that are absent or go away are retried in the background, so
+        this succeeds even before any daemon is listening. It needs no token.
+
+        An event means Vault holds a new version; a file the daemon renders
+        from it is rewritten by the daemon's own sync a moment later.
+
+        Raises:
+            PeerUnavailable: No dotvault socket is configured at all.
+            DotvaultError: The client handle is invalid.
+        """
+        self._require_open()
+        sub = c_longlong()
+        err = c_void_p()
+        code = _ffi.lib.dotvault_subscribe(self._handle, byref(sub), byref(err))
+        _check(code, err)
+        return Subscription(sub.value)
 
     def close(self) -> None:
         """Release the native handle. Idempotent; safe to call more than once."""

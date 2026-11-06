@@ -27,6 +27,7 @@ import (
 	"github.com/goodtune/dotvault/internal/clientcert"
 	"github.com/goodtune/dotvault/internal/config"
 	"github.com/goodtune/dotvault/internal/enrol"
+	"github.com/goodtune/dotvault/internal/events"
 	"github.com/goodtune/dotvault/internal/loginsuppress"
 	"github.com/goodtune/dotvault/internal/notify"
 	"github.com/goodtune/dotvault/internal/observability"
@@ -1018,10 +1019,14 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	// ready. A hook that fires before either has is a no-op, which is correct:
 	// there is nothing to wake.
 	var peerChanged atomic.Pointer[func()]
+	// peerRelay is published below, once the sync engine it triggers exists;
+	// the hook only nudges it to notice a new socket sooner than its own poll.
+	var peerRelay atomic.Pointer[peer.Relay]
 	peerPool := newPeerPool(borrowSockets, peer.WithOnChange(func() {
 		if fn := peerChanged.Load(); fn != nil {
 			(*fn)()
 		}
+		peerRelay.Load().Kick()
 	}))
 	// Started once, not supervised: Watch blocks until ctx is done and returns
 	// nil immediately when it has nothing watchable (a nil pool, no patterns,
@@ -1090,6 +1095,19 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	engine := sync.NewEngine(cfg, vc, username, statePath)
 	engine.DryRun = flagDryRun
 
+	// Secret-write notices: this daemon publishes its own writes (token
+	// rotations, mirrored copies) on GET /api/v1/events, and the relay
+	// listens to the peers it borrows from. Together they close the gap
+	// between a write and the next sync poll on hosts that have no Vault
+	// event stream — Community edition, or any host reached only through a
+	// forwarded socket. See internal/events and peer.Relay.
+	eventHub := events.NewHub()
+	if peerPool != nil {
+		relay := peer.NewRelay(peerPool, engine.TriggerSync)
+		peerRelay.Store(relay)
+		go relay.Run(ctx)
+	}
+
 	// Build the SSH agent backend if enabled. Construction is side-effect-free
 	// (no Vault calls — vault-ca ephemeral keys are generated in memory), so
 	// it is safe before authentication and lets the web server surface agent
@@ -1144,6 +1162,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			Rules:         cfg.Rules,
 			Vault:         vc,
 			Engine:        engine,
+			Events:        eventHub,
 			Username:      username,
 			TokenFilePath: tokenPath,
 			Version:       version,
@@ -1592,14 +1611,23 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	peerChanged.Store(&reborrow)
 
 	// Start refresh manager for any enrolment whose engine rotates its own
-	// credentials (currently JFrog). Failures are logged and retried on the
-	// next tick — never fatal to the daemon.
+	// credentials (JFrog, Databricks, GitHub expiring tokens). Failures are
+	// logged and retried on the next tick — never fatal to the daemon.
+	//
+	// Every version change re-syncs files at once instead of at the next
+	// poll: GitHub, for one, invalidates the previous access token the
+	// moment it issues a new one, so the token on disk stops working the
+	// instant a rotation lands in Vault. This host's own writes are also
+	// published for peers borrowing from it; a change it merely observed
+	// was written, and announced, by someone else.
+	onSecretChange := secretChangeHook(engine.TriggerSync, eventHub)
 	rm := enrol.NewRefreshManager(
 		vc,
 		cfg.Vault.KVMount,
 		cfg.Vault.UserPrefix+username+"/",
 		cfg.Enrolments,
 		5*time.Minute,
+		enrol.WithChangeHook(onSecretChange("refresh")),
 	)
 	rm.Start(ctx)
 
@@ -1615,6 +1643,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		username,
 		cfg.Enrolments,
 		cfg.Sync.Interval,
+		enrol.WithWatchChangeHook(onSecretChange("watch")),
 	)
 	wm.Start(ctx)
 	go func() {

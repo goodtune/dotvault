@@ -15,6 +15,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goodtune/dotvault/client"
 )
@@ -140,5 +141,47 @@ func TestWipeZeroesOutString(t *testing.T) {
 		if b != 0 {
 			t.Fatalf("byte %d = %#x after wipe, want 0", i, b)
 		}
+	}
+}
+
+func TestEventJSONShape(t *testing.T) {
+	js, err := eventJSON(client.Event{Key: "gh", Version: 7, Source: "refresh", Time: time.Date(2026, 11, 7, 1, 2, 3, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"key":"gh","version":7,"source":"refresh","time":"2026-11-07T01:02:03Z"}`
+	if js != want {
+		t.Fatalf("eventJSON = %s, want %s", js, want)
+	}
+	js, _ = eventJSON(client.Event{Key: "gh", Version: 1})
+	if js != `{"key":"gh","version":1,"source":"","time":""}` {
+		t.Fatalf("zero time not rendered empty: %s", js)
+	}
+}
+
+func TestSubscriptionHandlesAreNeverReused(t *testing.T) {
+	a := storeSub(nil)
+	if _, ok := takeSubID(a); !ok {
+		t.Fatal("stored subscription not found")
+	}
+	if _, ok := lookupSubID(a); ok {
+		t.Fatal("taken subscription still resolves")
+	}
+	if b := storeSub(nil); b == a {
+		t.Fatal("subscription handle reused")
+	}
+}
+
+func TestSubscriptionClosedHasItsOwnCategory(t *testing.T) {
+	if got := categoryOf(fmt.Errorf("wrapped: %w", client.ErrSubscriptionClosed)); got != catClosed {
+		t.Fatalf("categoryOf(ErrSubscriptionClosed) = %d, want catClosed (%d)", got, catClosed)
+	}
+}
+
+func TestUnknownSubscriptionReadsAsClosed(t *testing.T) {
+	// close frees the handle, so a next racing it on another thread finds the
+	// handle gone; that must reach Python as SubscriptionClosed, not an error.
+	if got := categoryOf(errUnknownSubscription); got != catClosed {
+		t.Fatalf("categoryOf(errUnknownSubscription) = %d, want catClosed (%d)", got, catClosed)
 	}
 }

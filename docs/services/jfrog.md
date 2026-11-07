@@ -83,7 +83,7 @@ After enrolment, the daemon's `RefreshManager` checks every 5 minutes whether an
 1. dotvault POSTs `grant_type=refresh_token&access_token=<current>&refresh_token=<current>` to the JFrog access service
 2. JFrog rotates **both** tokens on every successful refresh — the old refresh token is invalidated immediately
 3. dotvault stamps a fresh `issued_at=now`, `expires_at=now+token_ttl`, and writes the new pair to Vault atomically
-4. The sync engine picks up the updated secret and rewrites the local `jfrog-cli.conf.v6`
+4. The sync engine picks up the updated secret immediately and rewrites the local `jfrog-cli.conf.v6`
 
 A `401` or `403` from the refresh endpoint is treated as permanent revocation: unless the secret has changed by the next check, it is deleted from Vault and the user is prompted to re-enrol on the next wizard pass. Other errors are transient; the existing secret is kept and the refresh is retried with exponential backoff.
 

@@ -56,6 +56,9 @@ type WatchManager struct {
 	// pressure means many distinct keys are queued simultaneously,
 	// which is rare in practice.
 	triggerCh chan string // enrolment key, or "" for all
+	// onChange is notified of every target write. Nil when no hook is
+	// wired. Always Local: this manager only reports what it wrote.
+	onChange ChangeFunc
 }
 
 // WatchManagerOption configures a WatchManager at construction.
@@ -69,6 +72,12 @@ func WithWatchClock(c Clock) WatchManagerOption {
 // WithWatchMaxBackoff overrides the backoff cap. Intended for tests.
 func WithWatchMaxBackoff(d time.Duration) WatchManagerOption {
 	return func(m *WatchManager) { m.maxBackoff = d }
+}
+
+// WithWatchChangeHook registers fn to be told about every target write, so
+// the daemon can re-sync files from it at once. See WithChangeHook.
+func WithWatchChangeHook(fn ChangeFunc) WatchManagerOption {
+	return func(m *WatchManager) { m.onChange = fn }
 }
 
 // NewWatchManager constructs a WatchManager. userPrefix must already
@@ -424,14 +433,18 @@ func (m *WatchManager) tickOneWithEnrolment(ctx context.Context, key string, enr
 		return
 	}
 
-	if err := m.client.WriteKVv2(ctx, m.kvMount, vaultPath, data); err != nil {
+	version, err := m.client.PutKVv2(ctx, m.kvMount, vaultPath, data)
+	if err != nil {
 		slog.Warn("watch: failed to write target, will retry", "key", key, "error", err)
 		m.bumpBackoff(key)
 		return
 	}
 
-	slog.Info("watch: target updated from upstream source", "key", key, "engine", enrolment.Engine)
+	slog.Info("watch: target updated from upstream source", "key", key, "engine", enrolment.Engine, "version", version)
 	m.resetBackoff(key)
+	if m.onChange != nil {
+		m.onChange(Change{Key: key, Version: version, Local: true})
+	}
 }
 
 // targetMatches reports whether the existing Vault data already

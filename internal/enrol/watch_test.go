@@ -544,3 +544,37 @@ var errIntentional = errIntentionalT("intentional test failure")
 type errIntentionalT string
 
 func (e errIntentionalT) Error() string { return string(e) }
+
+func TestWatchManager_ChangeHookReportsWriteWithVersion(t *testing.T) {
+	fv := newFakeVault("kv")
+	vc := fv.serve(t)
+	fv.seed("users/alice/someapp", map[string]string{"token": "old"}) // version 1
+
+	w := &fakeWatcher{
+		name:    "fake",
+		fields:  []string{"token"},
+		sources: []WatchSource{{Mount: "kv", Path: "apps/x/keys/alice"}},
+		respond: func(int) (map[string]string, error) {
+			return map[string]string{"token": "new"}, nil
+		},
+	}
+	RegisterEngine("test-watch-hook", w)
+	t.Cleanup(func() { UnregisterEngine("test-watch-hook") })
+
+	rec := &changeRecorder{}
+	m := NewWatchManager(vc, "kv", "users/alice/", "alice",
+		map[string]config.Enrolment{"someapp": {Engine: "test-watch-hook"}},
+		time.Minute, WithWatchChangeHook(rec.hook))
+
+	m.tickAll(context.Background())
+	want := Change{Key: "someapp", Version: 2, Local: true}
+	if got := rec.got(); len(got) != 1 || got[0] != want {
+		t.Fatalf("changes = %+v, want [%+v]", got, want)
+	}
+
+	// Target now matches: no write, so nothing to report.
+	m.tickAll(context.Background())
+	if got := rec.got(); len(got) != 1 {
+		t.Fatalf("changes after a no-op tick = %+v, want only the first write", got)
+	}
+}

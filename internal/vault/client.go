@@ -205,13 +205,24 @@ func (c *Client) EnableKVv2(ctx context.Context, path string) error {
 // especially anywhere a human is looking at a stale copy, use WriteKVv2CAS
 // instead: this one cannot tell that it clobbered anything.
 func (c *Client) WriteKVv2(ctx context.Context, mount, path string, data map[string]any) error {
-	_, err := c.raw.KVv2(mount).Put(ctx, path, data)
+	_, err := c.PutKVv2(ctx, mount, path, data)
+	return err
+}
+
+// PutKVv2 is WriteKVv2 that also reports the KVv2 version the write created,
+// for a caller that announces the change to others (see internal/events).
+// The version is 0 if Vault's response omitted it.
+func (c *Client) PutKVv2(ctx context.Context, mount, path string, data map[string]any) (int, error) {
+	s, err := c.raw.KVv2(mount).Put(ctx, path, data)
 	if err != nil {
 		observability.RecordVaultCall(ctx, "write", classifyVaultErr(err))
-		return fmt.Errorf("write kv %s/%s: %w", mount, path, err)
+		return 0, fmt.Errorf("write kv %s/%s: %w", mount, path, err)
 	}
 	observability.RecordVaultCall(ctx, "write", "ok")
-	return nil
+	if s == nil || s.VersionMetadata == nil {
+		return 0, nil
+	}
+	return s.VersionMetadata.Version, nil
 }
 
 // ErrCASMismatch reports a check-and-set write refused because the secret had

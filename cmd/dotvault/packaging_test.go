@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,6 +199,81 @@ func TestGoreleaserShipsTmpfilesDropIn(t *testing.T) {
 	for _, pkg := range []string{"rpm", "deb", "apk"} {
 		if !got[pkg] {
 			t.Errorf(".goreleaser.yml does not ship %s for packager %q", tmpfilesInstalled, pkg)
+		}
+	}
+}
+
+// pinnedUnits records, for each file .goreleaser.yml ships from
+// packaging/linux, the content its pinned mtime was chosen for. The mtime is
+// pinned so an upgrade that leaves a unit's bytes alone does not make every
+// user manager report it changed on disk. The pin fails the other way too: an
+// edited unit still carrying the old mtime is never reported, so users run
+// the old unit until something else reloads. This table is what notices.
+//
+// When a file changes, give its entries in .goreleaser.yml a new fixed
+// file_info.mtime later than the old one (the commit time of the change is
+// the natural choice), then update its row here: the new SHA-256 and mtime.
+var pinnedUnits = map[string]struct{ sha256, mtime string }{
+	"dotvault.service":              {"cb450adae17651f2a0b9692fe08829e442bca073183ccb2f3aa332f526b48e6a", "2026-11-07T00:38:05Z"},
+	"dotvault-api.socket":           {"fccbef8b2a98288fa1a1b6ad301b4dc7efd84d4c2a4b27cbe27b6e6728bb58b3", "2026-11-07T00:38:05Z"},
+	"dotvault-agent.socket":         {"e82832d615ad2ea61cde7363ecd7f3d93a0b11617c36f19e007349d18c3b5c3a", "2026-11-07T00:38:05Z"},
+	"dotvault-docker.socket":        {"726c3d1d712b75d893a65b6aa6e60c547c9ed750109f1a1cf372d957c9337bda", "2026-11-07T00:38:05Z"},
+	"dotvault-docker.tmpfiles.conf": {"6a9c65befb5539996f2cc85691087dfd956357547ffbcc6a6dc7558eea69e261", "2026-11-07T00:38:05Z"},
+}
+
+func TestPackagedUnitMtimesArePinnedToTheirContent(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", ".goreleaser.yml"))
+	if err != nil {
+		t.Fatalf("read .goreleaser.yml: %v", err)
+	}
+	var cfg struct {
+		NFPMs []struct {
+			Contents []struct {
+				Src      string `yaml:"src"`
+				Packager string `yaml:"packager"`
+				FileInfo struct {
+					MTime string `yaml:"mtime"`
+				} `yaml:"file_info"`
+			} `yaml:"contents"`
+		} `yaml:"nfpms"`
+	}
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse .goreleaser.yml: %v", err)
+	}
+	if len(cfg.NFPMs) == 0 {
+		t.Fatal("no nfpms block in .goreleaser.yml")
+	}
+
+	shipped := map[string]bool{}
+	for _, c := range cfg.NFPMs[0].Contents {
+		name, ok := strings.CutPrefix(c.Src, "packaging/linux/")
+		if !ok {
+			continue
+		}
+		shipped[name] = true
+		pin, ok := pinnedUnits[name]
+		if !ok {
+			t.Errorf("%s (%s) is shipped but has no row in pinnedUnits; pin its mtime to its commit time and add one", c.Src, c.Packager)
+			continue
+		}
+		if c.FileInfo.MTime == "" {
+			t.Errorf("%s (%s) has no file_info.mtime, so it would carry the build time", c.Src, c.Packager)
+		} else if c.FileInfo.MTime != pin.mtime {
+			t.Errorf("%s (%s) mtime = %s, pinnedUnits says %s", c.Src, c.Packager, c.FileInfo.MTime, pin.mtime)
+		}
+	}
+	for name, pin := range pinnedUnits {
+		if !shipped[name] {
+			t.Errorf("pinnedUnits has %s, which .goreleaser.yml no longer ships", name)
+			continue
+		}
+		// Normalise line endings so a CRLF checkout hashes the same bytes.
+		content := strings.ReplaceAll(packagingFile(t, name), "\r\n", "\n")
+		sum := sha256.Sum256([]byte(content))
+		if got := hex.EncodeToString(sum[:]); got != pin.sha256 {
+			t.Errorf("packaging/linux/%s changed since its mtime was pinned to %s: give its file_info.mtime "+
+				"entries a new fixed time later than that (e.g. git log -1 --format=%%cI -- packaging/linux/%s), "+
+				"then update its pinnedUnits row to that mtime and sha256 %s", name, pin.mtime, name, got)
 		}
 	}
 }

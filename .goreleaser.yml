@@ -73,6 +73,24 @@ nfpms:
       - apk
     bindir: /usr/bin
     contents:
+      # Every file below carries a pinned mtime rather than the build time.
+      # A user manager compares a loaded unit's mtime with the one on disk,
+      # so a build-time stamp makes every upgrade report "changed on disk,
+      # run daemon-reload" for every logged-in user, even when the unit's
+      # bytes did not change. The user-tmpfiles file is not a unit and
+      # nothing compares its mtime; it is pinned for consistency. The value
+      # is the mtime the v0.40.0 RPM, DEB and APK shipped
+      # (2026-11-07T00:38:05Z), so hosts upgrading from that release see no
+      # change at all.
+      #
+      # When a file below changes, give its entries their own fixed mtime,
+      # later than the current pin: the commit time of the change is the
+      # natural choice (git log -1 --format=%cI -- packaging/linux/<file>).
+      # Never the build time, or the problem returns. Leave the others on
+      # *unit_mtime. TestPackagedUnitMtimesArePinnedToTheirContent
+      # (cmd/dotvault/packaging_test.go) fails until both are done, since an
+      # edited unit with an unchanged mtime is never reported to users.
+
       # dotvault is a per-user daemon (each user has their own Vault
       # identity and their own secrets), so the unit ships under the
       # user-unit search path. Enable per-user with
@@ -90,11 +108,13 @@ nfpms:
         dst: /usr/lib/systemd/user/dotvault.service
         file_info:
           mode: 0644
+          mtime: &unit_mtime "2026-11-07T00:38:05Z"
         packager: rpm
       - src: packaging/linux/dotvault.service
         dst: /usr/lib/systemd/user/dotvault.service
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: deb
       # APK doesn't ship a unit-file consumer by default (Alpine
       # uses OpenRC, not systemd), but the systemd-elogind /
@@ -106,6 +126,7 @@ nfpms:
         dst: /usr/lib/systemd/user/dotvault.service
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: apk
       # Optional socket-activation units — shipped, not enabled. With one
       # enabled, systemd binds the local API / SSH agent / Docker volume
@@ -117,61 +138,73 @@ nfpms:
         dst: /usr/lib/systemd/user/dotvault-api.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: rpm
       - src: packaging/linux/dotvault-api.socket
         dst: /usr/lib/systemd/user/dotvault-api.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: deb
       - src: packaging/linux/dotvault-api.socket
         dst: /usr/lib/systemd/user/dotvault-api.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: apk
       - src: packaging/linux/dotvault-agent.socket
         dst: /usr/lib/systemd/user/dotvault-agent.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: rpm
       - src: packaging/linux/dotvault-agent.socket
         dst: /usr/lib/systemd/user/dotvault-agent.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: deb
       - src: packaging/linux/dotvault-agent.socket
         dst: /usr/lib/systemd/user/dotvault-agent.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: apk
       - src: packaging/linux/dotvault-docker.socket
         dst: /usr/lib/systemd/user/dotvault-docker.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: rpm
       - src: packaging/linux/dotvault-docker.socket
         dst: /usr/lib/systemd/user/dotvault-docker.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: deb
       - src: packaging/linux/dotvault-docker.socket
         dst: /usr/lib/systemd/user/dotvault-docker.socket
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: apk
       - src: packaging/linux/dotvault-docker.tmpfiles.conf
         dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: rpm
       - src: packaging/linux/dotvault-docker.tmpfiles.conf
         dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: deb
       - src: packaging/linux/dotvault-docker.tmpfiles.conf
         dst: /usr/share/user-tmpfiles.d/dotvault-docker.conf
         file_info:
           mode: 0644
+          mtime: *unit_mtime
         packager: apk
 
 checksum:

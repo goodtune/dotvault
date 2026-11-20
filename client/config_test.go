@@ -254,7 +254,10 @@ remote_config:
 	if cfg.Vault.Address != "https://vault.example.com:8200" {
 		t.Errorf("Address = %q", cfg.Vault.Address)
 	}
-	if strings.Contains(buf.String(), "level=WARN") {
-		t.Errorf("LoadConfig logged a warning for a remote-rules config:\n%s", buf.String())
+	// Matched on the subject rather than on any WARN, so an unrelated
+	// warning (a loose file mode on a shared TEMP, a malformed GPO value on
+	// a managed Windows host) cannot fail this test for the wrong reason.
+	if strings.Contains(buf.String(), "no sync rules") {
+		t.Errorf("LoadConfig warned about missing rules for a remote-rules config:\n%s", buf.String())
 	}
 }

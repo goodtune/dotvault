@@ -1476,13 +1476,14 @@ func (c *Config) validate() error {
 	// after the merge is accepted, letting the daemon start, idle, and
 	// converge when the remote service serves rules.
 	//
-	// Deliberately silent. Most callers of this validator never fetch the
-	// remote document (the client/ facade, login, login-check, the peer
-	// actions), so "no rules" is the expected state for them rather than a
-	// symptom; a warning here told every library consumer the remote config
-	// was not being read. The one caller for which zero rules *after* the
-	// merge means something — the daemon's remote loader — warns itself
-	// (withRemote, cmd/dotvault/main.go).
+	// Deliberately silent. Many callers of this validator never fetch the
+	// remote document (the client/ facade and every local-only CLI path,
+	// e.g. login, login-check, browse/notify/clipboard, ssh), so "no rules"
+	// is the expected state for them rather than a symptom; a warning here
+	// told every library consumer the remote config was not being read.
+	// The loader that does merge the remote document — withRemote in
+	// cmd/dotvault, used by the daemon and the remote-aware one-shot
+	// commands — warns itself when the merge still yields zero rules.
 	if len(c.Rules) == 0 && c.RemoteConfig.URL == "" {
 		return fmt.Errorf("at least one rule is required")
 	}

@@ -250,3 +250,85 @@ func TestWithRemoteNoWarningWhenRemoteSuppliesRules(t *testing.T) {
 		t.Errorf("unexpected zero-rules warning:\n%s", logs.String())
 	}
 }
+
+// TestWithRemoteNoWarningWithLocalRules pins the rules half of the
+// condition: a base that carries its own rules has nothing to warn about
+// even when the remote service supplies none.
+func TestWithRemoteNoWarningWithLocalRules(t *testing.T) {
+	isolateCacheDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+	logs := captureWarnings(t)
+
+	merged, _ := withRemote(t.Context(), func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: url},
+			Rules: []config.Rule{{
+				Name:     "local",
+				VaultKey: "local",
+				Target:   config.Target{Path: "~/.dotvault/local", Format: "text"},
+			}},
+		}, nil
+	})
+	if _, err := merged(); err != nil {
+		t.Fatalf("merged loader: %v", err)
+	}
+	if strings.Contains(logs.String(), noRulesWarning) {
+		t.Errorf("unexpected zero-rules warning with local rules present:\n%s", logs.String())
+	}
+}
+
+// TestWithRemoteWarnsOncePerEmptySpell pins the latch: the daemon's refresh
+// loop reuses one loader closure every tick, so the warning fires on entering
+// the empty state and not again until rules have arrived and gone.
+func TestWithRemoteWarnsOncePerEmptySpell(t *testing.T) {
+	isolateCacheDir(t)
+	var serveRules atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRules.Load() {
+			w.Write([]byte(`rules:
+  - name: remote-rule
+    vault_key: remote
+    target:
+      path: ~/.dotvault/remote
+      format: text
+`))
+			return
+		}
+		w.Write([]byte("{}\n"))
+	}))
+	defer srv.Close()
+	logs := captureWarnings(t)
+
+	merged, _ := withRemote(t.Context(), func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: srv.URL},
+		}, nil
+	})
+	load := func() {
+		t.Helper()
+		if _, err := merged(); err != nil {
+			t.Fatalf("merged loader: %v", err)
+		}
+	}
+	count := func() int { return strings.Count(logs.String(), noRulesWarning) }
+
+	load()
+	load()
+	if got := count(); got != 1 {
+		t.Fatalf("after two empty loads: %d warnings, want 1\n%s", got, logs.String())
+	}
+	serveRules.Store(true)
+	load()
+	if !strings.Contains(logs.String(), "sync rules received from remote config") {
+		t.Errorf("want an info line when rules arrive:\n%s", logs.String())
+	}
+	serveRules.Store(false)
+	load()
+	if got := count(); got != 2 {
+		t.Errorf("after rules came and went: %d warnings, want 2\n%s", got, logs.String())
+	}
+}

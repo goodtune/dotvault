@@ -1,9 +1,12 @@
 package client
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,5 +220,41 @@ rules:
 	}
 	if cfg.Vault.ReissueBefore != 48*time.Hour {
 		t.Errorf("ReissueBefore = %v, want 48h", cfg.Vault.ReissueBefore)
+	}
+}
+
+// TestLoadConfig_RemoteRulesNoWarning pins that a config whose rules come
+// from the remote config service loads through the facade without logging
+// anything. The facade deliberately never fetches the remote document —
+// nothing it projects can come from one — so a "no rules, expecting the
+// remote service" warning told every consumer the remote config was not
+// being read, when it was simply never needed.
+func TestLoadConfig_RemoteRulesNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+vault:
+  address: https://vault.example.com:8200
+remote_config:
+  url: https://config.example.com/dotvault
+`
+	if err := os.WriteFile(path, []byte(yaml), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Vault.Address != "https://vault.example.com:8200" {
+		t.Errorf("Address = %q", cfg.Vault.Address)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("LoadConfig logged a warning for a remote-rules config:\n%s", buf.String())
 	}
 }

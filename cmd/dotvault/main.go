@@ -358,6 +358,14 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 		if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
 			return nil, err
 		}
+		// Zero rules after the merge means the remote document (or the
+		// cached copy, or nothing at all on the fail-open ladder) supplied
+		// none. Warned here rather than in Validate because this is the
+		// only loader that actually consulted the remote service; every
+		// local-only caller would otherwise report a fetch it never made.
+		if cfg.RemoteConfig.URL != "" && len(cfg.Rules) == 0 {
+			slog.Warn("no sync rules after merging remote config; waiting for the remote config service to serve rules", "url", cfg.RemoteConfig.URL)
+		}
 		return cfg, nil
 	}
 	status := func() *remoteconfig.Status {

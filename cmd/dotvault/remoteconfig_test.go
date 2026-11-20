@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -177,5 +180,73 @@ func TestWithRemoteUnreachableServiceDegradesToBase(t *testing.T) {
 	}
 	if rs := status(); rs == nil || rs.Source != "none" || rs.LastError == "" {
 		t.Errorf("status = %+v, want Source none with an error recorded", rs)
+	}
+}
+
+// captureWarnings swaps the default slog logger for one writing to a buffer
+// for the rest of the test.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+const noRulesWarning = "no sync rules after merging remote config"
+
+// TestWithRemoteWarnsWhenMergeYieldsNoRules pins where the zero-rules
+// warning now lives: the remote loader, after the merge, which is the only
+// place it means the remote service actually supplied nothing.
+func TestWithRemoteWarnsWhenMergeYieldsNoRules(t *testing.T) {
+	isolateCacheDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+	logs := captureWarnings(t)
+
+	merged, _ := withRemote(t.Context(), func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: url},
+		}, nil
+	})
+	if _, err := merged(); err != nil {
+		t.Fatalf("merged loader: %v", err)
+	}
+	if !strings.Contains(logs.String(), noRulesWarning) {
+		t.Errorf("want the zero-rules warning, got logs:\n%s", logs.String())
+	}
+}
+
+// TestWithRemoteNoWarningWhenRemoteSuppliesRules is the converse: a remote
+// document that serves rules leaves nothing to warn about, even though the
+// base had none of its own.
+func TestWithRemoteNoWarningWhenRemoteSuppliesRules(t *testing.T) {
+	isolateCacheDir(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`rules:
+  - name: remote-rule
+    vault_key: remote
+    target:
+      path: ~/.dotvault/remote
+      format: text
+`))
+	}))
+	defer srv.Close()
+	logs := captureWarnings(t)
+
+	merged, _ := withRemote(t.Context(), func() (*config.Config, error) {
+		return &config.Config{
+			Vault:        config.VaultConfig{Address: "https://vault.example.com:8200"},
+			RemoteConfig: config.RemoteConfig{URL: srv.URL},
+		}, nil
+	})
+	if _, err := merged(); err != nil {
+		t.Fatalf("merged loader: %v", err)
+	}
+	if strings.Contains(logs.String(), noRulesWarning) {
+		t.Errorf("unexpected zero-rules warning:\n%s", logs.String())
 	}
 }

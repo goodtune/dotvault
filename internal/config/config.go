@@ -1473,13 +1473,19 @@ func (c *Config) validate() error {
 	// have zero local rules — the remote document supplies them — so the
 	// hard requirement only applies when no remote URL is configured. The
 	// merged config (base ⊕ remote) passes through here too: zero rules
-	// after the merge is a warning rather than an error, letting the daemon
-	// start, idle, and converge when the remote service serves rules.
-	if len(c.Rules) == 0 {
-		if c.RemoteConfig.URL == "" {
-			return fmt.Errorf("at least one rule is required")
-		}
-		slog.Warn("no sync rules configured; expecting rules from the remote config service", "url", c.RemoteConfig.URL)
+	// after the merge is accepted, letting the daemon start, idle, and
+	// converge when the remote service serves rules.
+	//
+	// Deliberately silent. Many callers of this validator never fetch the
+	// remote document (the client/ facade and every local-only CLI path,
+	// e.g. login, login-check, browse/notify/clipboard, ssh), so "no rules"
+	// is the expected state for them rather than a symptom; a warning here
+	// told every library consumer the remote config was not being read.
+	// The loader that does merge the remote document — withRemote in
+	// cmd/dotvault, used by the daemon and the remote-aware one-shot
+	// commands — warns itself when the merge still yields zero rules.
+	if len(c.Rules) == 0 && c.RemoteConfig.URL == "" {
+		return fmt.Errorf("at least one rule is required")
 	}
 
 	seen := make(map[string]bool)

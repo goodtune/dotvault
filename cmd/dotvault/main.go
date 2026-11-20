@@ -319,12 +319,16 @@ func loadConfigLocalOnly() (*config.Config, string, error) {
 // by remoteconfig.New (unreadable ca_cert) is a hard error.
 func withRemote(ctx context.Context, load func() (*config.Config, error)) (func() (*config.Config, error), func() *remoteconfig.Status) {
 	var fetcher atomic.Pointer[remoteconfig.Fetcher]
+	// noRules latches the zero-rules warning so it fires on entering the
+	// state rather than on every refresh tick.
+	var noRules atomic.Bool
 
 	loader := func() (*config.Config, error) {
 		cfg, err := load()
 		if err != nil {
 			return nil, err
 		}
+		var remoteSource string
 		if cfg.RemoteConfig.URL == "" {
 			// A reload that cleared the overlay also drops the fetcher:
 			// status reporting stops (the web status block disappears) and
@@ -354,9 +358,27 @@ func withRemote(ctx context.Context, load func() (*config.Config, error)) (func(
 				return nil, fmt.Errorf("remote config: %w", ferr)
 			}
 			config.ApplyPartial(cfg, partial)
+			remoteSource = f.Status().Source
 		}
 		if err := wrapValidateErr(cfg, cfg.Validate()); err != nil {
 			return nil, err
+		}
+		// Zero rules after the merge means the remote document (or the
+		// cached copy, or nothing at all on the fail-open ladder) supplied
+		// none. Warned here rather than in Validate because this is the
+		// only loader that actually consulted the remote service; every
+		// local-only caller would otherwise report a fetch it never made.
+		//
+		// Warned on the transition into the empty state, not on every
+		// load: the daemon's refresh loop reuses this closure each tick,
+		// and an idle daemon repeating one fact forever is noise. A
+		// one-shot command builds a fresh closure, so it still warns once.
+		empty := cfg.RemoteConfig.URL != "" && len(cfg.Rules) == 0
+		if empty && !noRules.Swap(true) {
+			slog.Warn("no sync rules after merging remote config; the remote config service supplied none",
+				"url", cfg.RemoteConfig.URL, "source", remoteSource)
+		} else if !empty && noRules.Swap(false) && cfg.RemoteConfig.URL != "" {
+			slog.Info("sync rules received from remote config", "rules", len(cfg.Rules))
 		}
 		return cfg, nil
 	}

@@ -16,6 +16,8 @@ ctx := context.Background()
 // %ProgramData%\dotvault\config.yaml (Windows), Application Support (macOS).
 // LoadConfig reads that file — or, on Windows, the GPO registry instead when
 // policy keys are present (it routes through config.LoadSystem).
+// It never fetches remote_config: a remote document carries only rules,
+// enrolments and sync, none of which this Config exposes.
 cfg, err := client.LoadConfig(client.DefaultConfigPath())
 if err != nil { /* fail closed */ }
 
